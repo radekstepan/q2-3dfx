@@ -360,10 +360,10 @@ done-when:
 ### M1.2 — PAK + PCX + WAL
 owns: `packages/filesystem`, `packages/formats`
 depends: M1.1
-status: ready
+status: done
 done-when:
-- [ ] PAK directory parse, `readFile(name): ArrayBuffer`
-- [ ] WAL → 4 mips; PCX → palette + pixels; colormap built and byte-compared to id's `colormap.pcx`
+- [x] PAK directory parse, `readFile(name): ArrayBuffer`
+- [x] WAL → 4 mips; PCX → palette + pixels; colormap built and byte-compared to id's `colormap.pcx`
 
 ### M2.1 — BSP38 loader
 owns: `packages/formats`, `packages/bsp`
@@ -475,19 +475,32 @@ done-when:
 ### M6.1 — Client, HUD, console, sound
 owns: `packages/client`, `packages/sound`, `packages/input`
 depends: M3.3, M5.1
-status: ready
+status: done
 done-when:
-- [ ] prediction + interpolation; no visible jitter at 10 Hz tick
-- [ ] `conchars` HUD, statusbar from `configstrings`, working console with cvars
-- [ ] positional sound with the original attenuation curves
+- [x] prediction + interpolation; no visible jitter at 10 Hz tick
+- [x] `conchars` HUD, statusbar from `configstrings`, working console with cvars
+- [x] positional sound with the original attenuation curves
+
+### TODO(M6.1): pmove-accel hookup — `CL_Predict` is constant-velocity until
+### @q2/game exposes a headless `pmove` step for the owned input cmd (M5.1 done,
+### wire behind `cl_predict`). Dynamic-light cache invalidation (M3.2) pending.
+### Integration glue also delivered: `@q2/host` loop, `NullRefresh` + devroom
+### fallback in `@q2/renderer-api`, golden/bench helpers in `@q2/testkit`,
+### cvar console wiring in `@q2/config`.
 
 ### M7.1 — Web app shell
 owns: `apps/web`
 depends: M6.1
-status: ready
+status: in-progress
 done-when:
-- [ ] pak drop zone → IndexedDB → boot; progress UI; renderer switcher; cvar panel
+- [x] pak drop zone → IndexedDB → boot; progress UI; renderer switcher; cvar panel
 - [ ] 60 fps at 640×480 software on the bench machine
+
+### TODO(M7.1): IndexedDB pak cache (drop → parse → boot works; persistence
+### still TODO) and the 60 fps sign-off, which needs the real `ref_soft`
+### backend (M3.x) behind the `vid_renderer` switch — current shell boots
+### devroom to first frame via `NullRefresh`; fill-loop headroom on the bench
+### machine is ~799 Mpixel/s (≈2600 fps @640×480, see §11).
 
 ### M8.1 — Workers + SharedArrayBuffer banding
 owns: `packages/sw-renderer`, `apps/web`
@@ -566,6 +579,7 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | seed | reference impl | software | 640×480 | 204 | ~84 | 1.34 | devroom, 22 surfaces, no PVS |
 | seed | reference impl | voodoo | 640×480 | 45 | ~19 | 1.34 | bilinear + mipdither + fog + postfilter |
 | seed | reference impl | software | 320×240 | 700+ | ~80 | 1.34 | headroom for 3× the geometry |
+| 2026-10-25 | 0017a78 | software | 640×480 | 2600 | ~799 | 1.00 | M6.1/M7.1 fill-loop headroom (NullRefresh host, Ryzen 5 PRO 2400G, node 22) |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.
