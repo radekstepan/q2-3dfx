@@ -9,7 +9,7 @@ import type { Framebuffer, Refresh, RefDef, WorldModel, FrameStats, Entity } fro
 import { createFramebuffer, devroomWorld } from '@q2/renderer-api';
 import { Predictor, GameConsole, Configstrings, calcViewOrigin } from '@q2/client';
 import type { Snapshot, PredictCmd } from '@q2/client';
-import { AngleVectors, v3 } from '@q2/math';
+
 import { Mixer } from '@q2/sound';
 import { createInput, buildUserCmd } from '@q2/input';
 import type { InputCore, UserCmdT } from '@q2/input';
@@ -138,6 +138,18 @@ export class Host {
     this.lastNow = nowMs;
     if (!(dt >= 0) || dt > 0.25) dt = 0.016;
 
+    // Client command FIRST from accumulated input, so server ticks below
+    // already see this frame's release/press. The old order ticked with the
+    // previous frame's cmd, running one extra 100ms move on stale input
+    // after stopping — a forward overshoot + snap-back that felt like
+    // hitting a wall (the stop jitter). Ticks still quantize at 10Hz.
+    const msec = Math.max(1, Math.round(dt * 1000));
+    this.lastCmd = buildUserCmd(this.input, msec, {
+      sensitivity: getCVarNumber('sensitivity') || 3,
+      mYaw: getCVarNumber('m_yaw') || 0.022,
+      mPitch: getCVarNumber('m_pitch') || 0.022,
+    });
+
     // Fixed-step server ticks at 10Hz.
     this.serverAcc += dt;
     while (this.serverAcc >= SERVER_DT) {
@@ -155,14 +167,6 @@ export class Host {
         this.ingestSnapshot(this.offlineSnapshot());
       }
     }
-
-    // Client command from accumulated input.
-    const msec = Math.max(1, Math.round(dt * 1000));
-    this.lastCmd = buildUserCmd(this.input, msec, {
-      sensitivity: getCVarNumber('sensitivity') || 3,
-      mYaw: getCVarNumber('m_yaw') || 0.022,
-      mPitch: getCVarNumber('m_pitch') || 0.022,
-    });
     // Stage the owned cmd stream (since the newest snapshot, ending with
     // the current frame's cmd) so the local player predicts through the
     // friction-exact pmove replay instead of constant-velocity
@@ -233,22 +237,20 @@ export class Host {
       frame: this.driver?.entityFrame?.(e.id) ?? 0,
       skin: 0,
     }));
-    // First-person weapon view model: camera-attached (eye + forward*22 +
-    // right*8 + down*5 — sits bottom-right like id's), same angles as the
-    // view so the muzzle tracks the crosshair. Frame comes from the driver
-    // (idle vs muzzle-flash anim); the renderer wraps out-of-range frames.
+    // First-person weapon view model: id places the gun AT the eye
+    // (SV_CalcGunOffset zeroes gunoffset; composition is baked into the
+    // v_weap verts, all Z<0 straddling the eye plane). The breech half is
+    // eaten by the near clip and the visible slice looms large — that
+    // near-field enormity IS the chunky id gun look. Offsets like +22/+8/-5
+    // shrink it to a floating toy and double-apply the baked composition.
     const vm = this.driver?.viewModel?.() ?? null;
     if (vm) {
-      const fwd = v3();
-      const right = v3();
-      const up = v3();
-      AngleVectors(new Float32Array(angles), fwd, right, up);
       renderables.push({
         model: vm.model,
         origin: new Float32Array([
-          viewOrigin[0] + fwd[0]! * 22 + right[0]! * 8 - up[0]! * 5,
-          viewOrigin[1] + fwd[1]! * 22 + right[1]! * 8 - up[1]! * 5,
-          viewOrigin[2] + fwd[2]! * 22 + right[2]! * 8 - up[2]! * 5,
+          viewOrigin[0]!,
+          viewOrigin[1]!,
+          viewOrigin[2]!,
         ]) as Entity['origin'],
         angles: new Float32Array(angles) as Entity['angles'],
         frame: vm.frame,

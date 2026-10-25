@@ -41,6 +41,7 @@ import {
   mulberry32,
   WEAPON_BLASTER,
   spawnMonster,
+  monsterChaseMove,
   monsterLocomotion,
   MONSTER_HULL_MINS,
   MONSTER_HULL_MAXS,
@@ -137,8 +138,8 @@ const PLAYER_ID = 1;
 const EYE = 22;
 /** id pellet spread basis: r/u are world units at 8192 range. */
 const PELLET_RANGE = 8192;
-const MONSTER_MINS: [number, number, number] = [-16, -16, 0];
-const MONSTER_MAXS: [number, number, number] = [16, 16, 56];
+const MONSTER_MINS: [number, number, number] = [-16, -16, -24];
+const MONSTER_MAXS: [number, number, number] = [16, 16, 32];
 
 const REFIRE: Record<string, number> = {
   weapon_blaster: 0.25,
@@ -348,11 +349,46 @@ export const BLASTER_TRACER_COLOR = 225;
 /** Hot orange pellet streak for shotgun/machinegun + monster return fire. */
 export const PELLET_TRACER_COLOR = 208;
 /**
- * View-model fire anim frame while the muzzle is lit (all v_weap lumps
- * carry 40+ frames; the renderer wraps, so this never indexes out of
- * range). Frame 0 is the idle pose.
+ * Authentic v_weap anim frames (game/p_weapon.c Weapon_Generic tables):
+ * Blaster (4,8,52,55) fires on gunframe 5, idles 9..52; Shotgun
+ * (7,18,36,39) fires on 8..9, idles 19..36; Machinegun (3,5,45,49) fires
+ * on 4..5, idles 6..45. Frame 0 was the half-raised active pose, never the
+ * idle — that is why the gun read as a small hand-held toy.
+ * VIEWMODEL_FIRE_FRAME stays as the blaster alias (back-compat for tests).
  */
-export const VIEWMODEL_FIRE_FRAME = 4;
+export const VIEWMODEL_FIRE_FRAME = 5;
+export const VIEWMODEL_IDLE_FRAMES: Record<string, number> = {
+  weapon_blaster: 9,
+  weapon_shotgun: 19,
+  weapon_machinegun: 6,
+};
+export const VIEWMODEL_FIRE_FRAMES: Record<string, number> = {
+  weapon_blaster: 5,
+  weapon_shotgun: 8,
+  weapon_machinegun: 4,
+};
+
+/** Authentic blaster projectile (g_weapon.c fire_blaster): 1000 u/s, 2s life. */
+export interface Bolt {
+  pos: Vec3;
+  dir: Vec3; // normalized
+  life: number;
+  damage: number;
+}
+
+/** Shootable explosive (misc_explobox / func_explosive-lite). */
+export interface Barrel {
+  origin: Vec3;
+  health: number;
+  dmg: number;
+  dead: boolean;
+}
+
+/** Explosion flash (TE_BLASTER / TE_EXPLOSION1): particles + dlight + sound. */
+export interface Explosion {
+  pos: Vec3;
+  born: number;
+}
 
 interface DoorSync {
   mover: Mover;
@@ -402,6 +438,14 @@ export class LocalDriver implements HostDriver {
   private flashPending = false;
   /** Queued tracer beams (see TracerBeam): drained by pumpTracers(). */
   private tracerQueue: TracerBeam[] = [];
+  /** Flying blaster bolts (authentic fire_blaster projectiles, not hitscan). */
+  readonly bolts: Bolt[] = [];
+  /** Shootable explosive barrels (misc_explobox) + breakables. */
+  readonly barrels: Barrel[] = [];
+  /** Scripted explosion targets (target_explosion) by targetname. */
+  private explosionTargets = new Map<string, { origin: Vec3; dmg: number }>();
+  /** Recent explosion flashes (TE_EXPLOSION1/TE_BLASTER visuals). */
+  readonly explosions: Explosion[] = [];
   /** Player death/respawn. */
   private deadUntil = -1;
   private spawnPoints: Array<{ origin: Vec3; yaw: number }> = [];
@@ -426,7 +470,11 @@ export class LocalDriver implements HostDriver {
       this.playerEdict = spawnEdict({ classname: 'player' });
       this.spawnFromLump(built.map);
       this.placeMonsters(built.map);
+      this.parseExplosives(built.map);
       this.snapshotDoorBases();
+      // id SP_trigger_always: fire at spawn (level-start flybys/relays).
+      // Flyby visuals are out of scope; explosion targets fire for real.
+      this.fireTriggerAlways(built.map);
       for (const e of this.server.entities) {
         if (e.classname === 'target_changelevel' && e.targetname) this.changeTargets.add(e.targetname);
       }
@@ -476,6 +524,29 @@ export class LocalDriver implements HostDriver {
     this.syncDoors();
     for (const m of this.monsters) {
       if (m.state.dead) continue;
+      // Steering (id walkmonster_start/run logic): chase the player along a
+      // trivial 2-node graph (self -> player) with line-of-sight, so idle
+      // stand flips to run/attack and locomotion has a nonzero dist to play.
+      // Uses the tested monsterChaseMove selector; pathfinding on the real
+      // node graph arrives with M5.3 full AI.
+      const eyeForSee = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + EYE);
+      const chestSee = v3(m.origin[0]!, m.origin[1]!, m.origin[2]! + 8);
+      const seen = this.traceShot(chestSee, eyeForSee).fraction >= 1;
+      try {
+        monsterChaseMove(
+          m.state,
+          v3(m.origin[0], m.origin[1], m.origin[2]),
+          v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]),
+          {
+            graph: new Map([[0, [1]], [1, [0]]]),
+            positions: new Map([[0, v3(m.origin[0], m.origin[1], m.origin[2])], [1, v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2])]]),
+          },
+          seen,
+          this.rand,
+        );
+      } catch {
+        // Unknown move names from older saves stay put; locomotion still runs.
+      }
       // Locomotion BEFORE think (id ai_move runs inside the frame): yaw
       // toward the player, advance by the current frame's dist,
       // collision-clamped + gravity-settled by the helper. `think` then
@@ -503,6 +574,8 @@ export class LocalDriver implements HostDriver {
         this.events.push('exit');
       }
     }
+    this.checkScriptedExplosions();
+    this.stepBolts(dt);
     this.monsterCombat();
     this.checkPickups();
     this.handleAttack(cmd);
@@ -577,7 +650,8 @@ export class LocalDriver implements HostDriver {
     const model = this.models?.weapons[this.weapon.classname];
     const skin = this.models?.weaponSkins[this.weapon.classname];
     if (model === undefined || skin === undefined) return null;
-    return { model, skin, frame: this.muzzleLit() ? VIEWMODEL_FIRE_FRAME : 0 };
+    if (this.muzzleLit()) return { model, skin, frame: VIEWMODEL_FIRE_FRAMES[this.weapon.classname] ?? VIEWMODEL_FIRE_FRAME };
+    return { model, skin, frame: VIEWMODEL_IDLE_FRAMES[this.weapon.classname] ?? 9 };
   }
 
   /**
@@ -770,16 +844,12 @@ export class LocalDriver implements HostDriver {
           this.emitSound('monster/melee.wav', v3(m.origin[0]!, m.origin[1]!, m.origin[2]!));
         }
       } else if (choice === 'shotgun' || choice === 'blaster' || choice === 'chaingun' || choice === 'grenade') {
-        // Tracer: hit chance falls with range (near ~0.6, mid ~0.25).
+        // Authentic: no hitscan beam (only the railgun draws TE_RAILTRAIL).
+        // The lite state machine keeps id's damage roll + sound; a visible
+        // projectile arrives with full monster AI (M5.3). Muzzle location
+        // kept for the (currently unused) tracer path.
+        void from;
         m.lastAttack = this.server.time;
-        // Visible return-fire beam even on a miss (the damage roll below is
-        // independent) — chest to player eye, same path as player tracers.
-        this.queueTracer(
-          from,
-          v3(eye[0]! - from[0]!, eye[1]! - from[1]!, eye[2]! - from[2]!),
-          PELLET_TRACER_COLOR,
-          dist,
-        );
         const pHit = dist < 500 ? 0.6 : 0.25;
         const dmg = choice === 'chaingun' ? 6 : choice === 'grenade' ? 12 : 5;
         this.emitSound(
@@ -895,9 +965,24 @@ export class LocalDriver implements HostDriver {
       if (cls !== 'monster_soldier' && cls !== 'monster_gunner') continue;
       if (this.monsters.length >= 12) break;
       const o = (d['origin'] ?? '0 0 0').trim().split(/\s+/).map(Number);
+      let origin: [number, number, number] = [o[0] ?? 0, o[1] ?? 0, o[2] ?? 0];
+      // id walkmonster_start_go + M_droptofloor: the lump origin is the
+      // entity origin 24 above the feet; drop the hull to the floor so a
+      // map-placed origin floating above ground rests correctly instead of
+      // hovering, and clamp startsolid Luton setups onto the floor.
+      if (this.bspTrace) {
+        const start = v3(origin[0], origin[1], origin[2] + 1);
+        const end = v3(origin[0], origin[1], origin[2] - 256);
+        try {
+          const tr = this.bspTrace(start, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, end);
+          if (!tr.allsolid) origin = [tr.endpos[0]!, tr.endpos[1]!, tr.endpos[2]!];
+        } catch {
+          // Keep the lump origin on trace failure (devroom-style fallback).
+        }
+      }
       this.monsters.push({
         id: id++,
-        origin: [o[0] ?? 0, o[1] ?? 0, o[2] ?? 0],
+        origin,
         state: spawnMonster(cls === 'monster_soldier' ? 'soldier' : 'gunner'),
         lastAttack: -10,
       });
@@ -1011,11 +1096,35 @@ export class LocalDriver implements HostDriver {
     const right = v3();
     const up = v3();
     AngleVectors(new Float32Array(cmd.angles) as Vec3, fwd, right, up);
-    for (const p of res.pellets) {
+    // Authentic split (g_weapon.c): the blaster is a PROJECTILE weapon
+    // (fire_blaster bolt edict, 1000 u/s, 2s life, EF_BLASTER trail) — never
+    // hitscan, never a muzzle->impact beam. Hitscan weapons (shotgun /
+    // machinegun, fire_lead) are instant traces with impact sparks only;
+    // only the railgun draws a beam (TE_RAILTRAIL, not in v1).
+    if (this.weapon.classname === 'weapon_blaster' && res.bolt) {
+      // P_ProjectSource offset (24, 8, viewheight-8): the bolt leaves the gun
+      // muzzle, not the eye (id p_view.c / Blaster_Fire).
+      const start = v3(
+        eye[0]! + fwd[0]! * 24 + right[0]! * 8,
+        eye[1]! + fwd[1]! * 24 + right[1]! * 8,
+        eye[2]! + fwd[2]! * -8 + 8,
+      );
+      const dir = v3(fwd[0]!, fwd[1]!, fwd[2]!);
+      const dl = Math.hypot(dir[0]!, dir[1]!, dir[2]!) || 1;
+      this.bolts.push({
+        pos: start,
+        dir: v3(dir[0]! / dl, dir[1]! / dl, dir[2]! / dl),
+        life: res.bolt.life,
+        damage: res.bolt.damage,
+      });
+      this.events.push('bolt');
+      return;
+    }
+    for (const pl of res.pellets) {
       const dir = v3(
-        fwd[0]! * PELLET_RANGE + right[0]! * p.r + up[0]! * p.u,
-        fwd[1]! * PELLET_RANGE + right[1]! * p.r + up[1]! * p.u,
-        fwd[2]! * PELLET_RANGE + right[2]! * p.r + up[2]! * p.u,
+        fwd[0]! * PELLET_RANGE + right[0]! * pl.r + up[0]! * pl.u,
+        fwd[1]! * PELLET_RANGE + right[1]! * pl.r + up[1]! * pl.u,
+        fwd[2]! * PELLET_RANGE + right[2]! * pl.r + up[2]! * pl.u,
       );
       const len = Math.hypot(dir[0]!, dir[1]!, dir[2]!) || 1;
       // Pellet spread basis: r/u are world units at PELLET_RANGE (id convention).
@@ -1051,35 +1160,271 @@ export class LocalDriver implements HostDriver {
         eye[1]! + seg[1]! * bestT,
         eye[2]! + seg[2]! * bestT,
       );
-      // Visible beam for every pellet: blaster bolt streak or shotgun-pellet
-      // streak, muzzle to impact (or full range on a clean miss — the
-      // renderer caps the length). Impact sparks stay on the
-      // mini.particles path. The beam starts at the gun muzzle (off-axis,
-      // where the 3D view model sits), NOT the eye: an eye-origin segment
-      // foreshortens to a single pixel by correct perspective, so it would
-      // be invisible head-on. Hit detection above stays eye-based.
-      const isBlaster = this.weapon.classname === 'weapon_blaster';
-      const muz = v3(
-        eye[0]! + fwd[0]! * 16 + right[0]! * 5 - up[0]! * 3,
-        eye[1]! + fwd[1]! * 16 + right[1]! * 5 - up[1]! * 3,
-        eye[2]! + fwd[2]! * 16 + right[2]! * 5 - up[2]! * 3,
-      );
-      const beam = v3(hitPos[0]! - muz[0]!, hitPos[1]! - muz[1]!, hitPos[2]! - muz[2]!);
-      const beamLen = Math.hypot(beam[0]!, beam[1]!, beam[2]!) || 1;
-      this.queueTracer(
-        muz,
-        beam,
-        isBlaster ? BLASTER_TRACER_COLOR : PELLET_TRACER_COLOR,
-        Math.max(1, beamLen),
-      );
-      if (hitMonster) {
-        monsterPain(hitMonster.state, p.damage, this.rand);
+      // Barrels are shootable (misc_explobox takes T_Damage): test the bolt
+      // path against live barrels before resolving the wall/monster hit.
+      const hitBarrel = this.barrelAT(eye, seg, bestT);
+      if (hitBarrel && !hitBarrel.dead) {
+        this.damageBarrel(hitBarrel, pl.damage);
+      } else if (hitMonster) {
+        monsterPain(hitMonster.state, pl.damage, this.rand);
         this.events.push(hitMonster.state.dead ? 'kill' : 'hit');
         if (hitMonster.state.dead) this.message = `${hitMonster.state.kind} down`;
       } else if (bestT < 1) {
+        // TE_GUNSHOT / TE_SHOTGUN impact: gray sparks + smoke, no beam.
         this.pushSpark(hitPos);
       }
     }
+  }
+
+  /** Parse shootable/scripted explosives from the entities lump (base1). */
+  private parseExplosives(map: BspMap): void {
+    for (const d of parseEntities(map.entities)) {
+      const cls = d['classname'];
+      if (cls === 'misc_explobox') {
+        const o = (d['origin'] ?? '0 0 0').trim().split(/\s+/).map(Number);
+        const health = d['health'] !== undefined ? Number.parseInt(d['health']!, 10) : 10;
+        const dmg = d['dmg'] !== undefined
+          ? Number.parseFloat(d['dmg']!)
+          : d['damage'] !== undefined
+            ? Number.parseFloat(d['damage']!)
+            : 150;
+        this.barrels.push({
+          origin: v3(o[0] ?? 0, o[1] ?? 0, o[2] ?? 0),
+          health: Number.isFinite(health) ? health : 10,
+          dmg: Number.isFinite(dmg) ? dmg : 150,
+          dead: false,
+        });
+      } else if (cls === 'target_explosion' && d['targetname']) {
+        const o = (d['origin'] ?? '0 0 0').trim().split(/\s+/).map(Number);
+        const dmg = d['dmg'] !== undefined ? Number.parseFloat(d['dmg']!) : 0;
+        this.explosionTargets.set(d['targetname']!, {
+          origin: v3(o[0] ?? 0, o[1] ?? 0, o[2] ?? 0),
+          dmg: Number.isFinite(dmg) ? dmg : 0,
+        });
+      } else if (cls === 'func_explosive') {
+        const model = d['model'];
+        const health = d['health'] !== undefined ? Number.parseInt(d['health']!, 10) : 10;
+        const dmg = d['dmg'] !== undefined ? Number.parseFloat(d['dmg']!) : 25;
+        if (model && this.map) {
+          const b = modelBounds(this.map, model);
+          if (b) {
+            const cx = (b.mins[0]! + b.maxs[0]!) / 2;
+            const cy = (b.mins[1]! + b.maxs[1]!) / 2;
+            const cz = (b.mins[2]! + b.maxs[2]!) / 2;
+            this.barrels.push({
+              origin: v3(cx, cy, cz),
+              health: Number.isFinite(health) ? health : 10,
+              dmg: Number.isFinite(dmg) ? dmg : 25,
+              dead: false,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  /** id SP_trigger_always: fire at spawn (base1 level-start relays). */
+  private fireTriggerAlways(map: BspMap): void {
+    for (const d of parseEntities(map.entities)) {
+      if (d['classname'] !== 'trigger_always' || !d['target']) continue;
+      for (const t of d['target']!.trim().split(/\s+/)) {
+        const ex = this.explosionTargets.get(t);
+        if (ex) this.spawnExplosion(ex.origin, ex.dmg);
+      }
+    }
+  }
+
+  /** Scripted corridor blasts: trigger_once/relay chains fire target_explosion. */
+  private checkScriptedExplosions(): void {
+    for (const t of this.server.firedThisTick) {
+      const ex = this.explosionTargets.get(t);
+      if (ex) this.spawnExplosion(ex.origin, ex.dmg);
+    }
+  }
+
+  /** TE_BLASTER / TE_EXPLOSION1 visual + sound + radius damage. */
+  private spawnExplosion(pos: Vec3, dmg: number): void {
+    this.explosions.push({ pos: v3(pos[0], pos[1], pos[2]), born: this.server.time });
+    // 40-spark yellow burst (cl_fx.c CL_BlasterParticles, color 0xe0 + rand&7).
+    for (let i = 0; i < 40; i++) {
+      const ox = (this.rand() * 16 - 8) | 0;
+      const oy = (this.rand() * 16 - 8) | 0;
+      const oz = (this.rand() * 16 - 8) | 0;
+      this.pushColoredSpark(v3(pos[0]! + ox, pos[1]! + oy, pos[2]! + oz), 0xe0 + ((this.rand() * 8) | 0));
+    }
+    this.emitSound('world/explod1.wav', v3(pos[0], pos[1], pos[2]));
+    this.events.push('explosion');
+    if (dmg > 0) this.damageRadius(pos, dmg);
+  }
+
+  /** id T_RadiusDamage(dmg, dmg+40): linear falloff to monsters + player. */
+  private damageRadius(pos: Vec3, dmg: number): void {
+    const radius = dmg + 40;
+    if (!(radius > 0)) return;
+    for (const m of this.monsters) {
+      if (m.state.dead) continue;
+      const dist = Math.hypot(m.origin[0]! - pos[0]!, m.origin[1]! - pos[1]!, m.origin[2]! - pos[2]!);
+      if (dist >= radius) continue;
+      const scaled = Math.max(1, Math.round(dmg * (1 - dist / radius)));
+      monsterPain(m.state, scaled, this.rand);
+      this.events.push(m.state.dead ? 'kill' : 'hit');
+    }
+    const pd = Math.hypot(
+      this.pm.origin[0]! - pos[0]!, this.pm.origin[1]! - pos[1]!, this.pm.origin[2]! - pos[2]!,
+    );
+    if (pd < radius) {
+      const scaled = Math.max(1, Math.round(dmg * (1 - pd / radius)));
+      this.damagePlayer(scaled, [pos[0]!, pos[1]!, pos[2]!]);
+    }
+    for (const b of this.barrels) {
+      if (b.dead) continue;
+      const bd = Math.hypot(b.origin[0]! - pos[0]!, b.origin[1]! - pos[1]!, b.origin[2]! - pos[2]!);
+      if (bd < radius && bd > 1) this.damageBarrel(b, Math.max(1, Math.round(dmg * (1 - bd / radius))));
+    }
+  }
+
+  /** Step flying blaster bolts (1000 u/s, 2s life): trail, touch, impact. */
+  private stepBolts(dt: number): void {
+    if (this.bolts.length === 0) return;
+    const speed = 1000;
+    for (let i = this.bolts.length - 1; i >= 0; i--) {
+      const bolt = this.bolts[i]!;
+      const stepLen = speed * dt;
+      const next = v3(
+        bolt.pos[0]! + bolt.dir[0]! * stepLen,
+        bolt.pos[1]! + bolt.dir[1]! * stepLen,
+        bolt.pos[2]! + bolt.dir[2]! * stepLen,
+      );
+      bolt.life -= dt;
+      // EF_BLASTER trail: yellow puffs every ~5 units (cl_fx.c).
+      const trailSteps = Math.min(8, Math.max(1, Math.round(stepLen / 5)));
+      for (let k = 1; k <= trailSteps; k++) {
+        const f = k / (trailSteps + 1);
+        this.pushColoredSpark(
+          v3(
+            bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * f,
+            bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * f,
+            bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * f,
+          ),
+          0xe0 + ((this.rand() * 8) | 0),
+        );
+      }
+      let dead = bolt.life <= 0;
+      if (!dead) {
+        // Wall touch (blaster_touch: sky frees silently, wall explodes).
+        const wall = this.traceShot(bolt.pos, next);
+        if (wall.fraction < 1) {
+          const hitPos = v3(
+            bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * wall.fraction,
+            bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * wall.fraction,
+            bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * wall.fraction,
+          );
+          this.blasterImpact(hitPos, bolt.damage, null);
+          dead = true;
+        } else {
+          // Flesh touch: monsters first (T_Damage ENERGY), then barrels.
+          const seg = v3(next[0]! - bolt.pos[0]!, next[1]! - bolt.pos[1]!, next[2]! - bolt.pos[2]!);
+          let hitMonster: PlacedMonster | null = null;
+          let bestT = 1;
+          for (const m of this.monsters) {
+            if (m.state.dead) continue;
+            const tHit = segmentAabb(
+              bolt.pos, seg,
+              [m.origin[0]! + MONSTER_MINS[0], m.origin[1]! + MONSTER_MINS[1], m.origin[2]! + MONSTER_MINS[2]],
+              [m.origin[0]! + MONSTER_MAXS[0], m.origin[1]! + MONSTER_MAXS[1], m.origin[2]! + MONSTER_MAXS[2]],
+            );
+            if (tHit !== null && tHit < bestT) {
+              bestT = tHit;
+              hitMonster = m;
+            }
+          }
+          if (hitMonster) {
+            const hitPos = v3(
+              bolt.pos[0]! + seg[0]! * bestT,
+              bolt.pos[1]! + seg[1]! * bestT,
+              bolt.pos[2]! + seg[2]! * bestT,
+            );
+            this.blasterImpact(hitPos, bolt.damage, hitMonster);
+            dead = true;
+          } else {
+            const hb = this.barrelSegmentAT(bolt.pos, seg);
+            if (hb && !hb.dead) {
+              this.damageBarrel(hb, bolt.damage);
+              this.blasterImpact(v3(hb.origin[0], hb.origin[1], hb.origin[2]), bolt.damage, null);
+              dead = true;
+            }
+          }
+        }
+      }
+      if (dead) this.bolts.splice(i, 1);
+      else bolt.pos = next;
+    }
+  }
+
+  /** TE_BLASTER impact: sparks + explosion flash + lashit + flesh damage. */
+  private blasterImpact(pos: Vec3, damage: number, hitMonster: PlacedMonster | null): void {
+    for (let i = 0; i < 40; i++) {
+      const ox = (this.rand() * 16 - 8) | 0;
+      const oy = (this.rand() * 16 - 8) | 0;
+      const oz = (this.rand() * 16 - 8) | 0;
+      this.pushColoredSpark(v3(pos[0]! + ox, pos[1]! + oy, pos[2]! + oz), 0xe0 + ((this.rand() * 8) | 0));
+    }
+    this.explosions.push({ pos: v3(pos[0], pos[1], pos[2]), born: this.server.time });
+    this.events.push('explosion');
+    this.emitSound('weapons/lashit.wav', v3(pos[0], pos[1], pos[2]));
+    if (hitMonster) {
+      monsterPain(hitMonster.state, damage, this.rand);
+      this.events.push(hitMonster.state.dead ? 'kill' : 'hit');
+      if (hitMonster.state.dead) this.message = `${hitMonster.state.kind} down`;
+    }
+  }
+
+  /** Live barrels whose 32-unit box the hitscan segment reaches first. */
+  private barrelAT(eye: Vec3, seg: Vec3, bestT: number): Barrel | null {
+    let best: Barrel | null = null;
+    let bt = bestT;
+    for (const b of this.barrels) {
+      if (b.dead) continue;
+      const tHit = segmentAabb(
+        eye, seg,
+        [b.origin[0]! - 20, b.origin[1]! - 20, b.origin[2]! - 20],
+        [b.origin[0]! + 20, b.origin[1]! + 20, b.origin[2]! + 20],
+      );
+      if (tHit !== null && tHit < bt) {
+        bt = tHit;
+        best = b;
+      }
+    }
+    return best;
+  }
+
+  /** Live barrel along a bolt step segment (point-box test). */
+  private barrelSegmentAT(start: Vec3, seg: Vec3): Barrel | null {
+    return this.barrelAT(start, seg, 1);
+  }
+
+  /** T_Damage on a barrel: fuse-less instant explode (lite) with radius. */
+  private damageBarrel(b: Barrel, dmg: number): void {
+    if (b.dead) return;
+    b.health -= dmg;
+    if (b.health > 0) return;
+    b.dead = true;
+    this.events.push('barrel');
+    this.spawnExplosion(b.origin, b.dmg);
+  }
+
+  /** Drain recent explosion flashes for the dlight pump (0.3s window). */
+  drainExplosions(): Vec3[] {
+    const out: Vec3[] = [];
+    for (let i = this.explosions.length - 1; i >= 0; i--) {
+      const e = this.explosions[i]!;
+      if (this.server.time - e.born > 0.3) {
+        this.explosions.splice(i, 1);
+        continue;
+      }
+      out.push(e.pos);
+    }
+    return out;
   }
 
   private traceShot(eye: Vec3, far: Vec3): { fraction: number } {
@@ -1089,9 +1434,13 @@ export class LocalDriver implements HostDriver {
   }
 
   private pushSpark(pos: Vec3): void {
+    this.pushColoredSpark(pos, 200 + ((this.rand() * 55) | 0));
+  }
+
+  private pushColoredSpark(pos: Vec3, color: number): void {
     const parts = this.mini.particles as { origin: Vec3; color: number }[];
-    parts.push({ origin: v3(pos[0], pos[1], pos[2]), color: 200 + ((this.rand() * 55) | 0) });
-    while (parts.length > 48) parts.shift();
+    parts.push({ origin: v3(pos[0], pos[1], pos[2]), color });
+    while (parts.length > 256) parts.shift();
   }
 }
 
@@ -1514,6 +1863,21 @@ export function pumpMuzzleLight(boot: PlayBoot): boolean {
     color: new Float32Array([1, 0.85, 0.5]),
   });
   return true;
+}
+
+/** Pump explosion/bolt-impact dlights (TE_BLASTER yellow, 150 intensity). */
+export function pumpExplosionLights(boot: PlayBoot): number {
+  const poss = boot.driver.drainExplosions();
+  let n = 0;
+  for (const pos of poss) {
+    boot.refresh.testAddDynamicLight({
+      origin: new Float32Array([pos[0]!, pos[1]!, pos[2]!]),
+      intensity: 150,
+      color: new Float32Array([1, 1, 0]),
+    });
+    n++;
+  }
+  return n;
 }
 
 /** Renderer-owned tracer ttl in frames (~0.1s at 60fps). */

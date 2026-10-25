@@ -123,6 +123,41 @@ export function CL_PredictPmove(base: Snapshot, localId: number, cmds: PredictCm
     st.viewAngles[1] = ent.angles[1];
     st.viewAngles[2] = ent.angles[2];
   }
+  // Friction-exact coalescing: the server integrates ONE 100ms pmove step
+  // per tick while the predictor replays N ~16ms frame cmds. PM_Friction is
+  // nonlinear in frametime ((1-k*dt)^N != 1-k*N*dt), so per-cmd replay
+  // diverges from the tick it predicts — after stopping, the replayed
+  // origin overshoots then snaps back each tick (the stop jitter). When all
+  // staged inputs are identical (the common settle case: all zeros), merge
+  // them into one step with the summed msec so the replay uses the same
+  // chunking as the server. Mixed inputs keep the per-cmd path.
+  const first = cmds[0]!;
+  let identical = true;
+  for (let i = 1; i < cmds.length; i++) {
+    const c = cmds[i]!;
+    if (
+      c.forwardmove !== first.forwardmove || c.sidemove !== first.sidemove ||
+      c.upmove !== first.upmove || c.buttons !== first.buttons ||
+      c.angles[0] !== first.angles[0] || c.angles[1] !== first.angles[1] || c.angles[2] !== first.angles[2]
+    ) {
+      identical = false;
+      break;
+    }
+  }
+  if (identical) {
+    let total = 0;
+    for (const c of cmds) total += c.msec;
+    total = Math.max(1, Math.min(200, Math.round(total)));
+    pmoveFull(st, {
+      msec: total,
+      angles: new Float32Array(first.angles),
+      forwardmove: first.forwardmove,
+      sidemove: first.sidemove,
+      upmove: first.upmove,
+      buttons: first.buttons,
+    });
+    return [st.origin[0]!, st.origin[1]!, st.origin[2]!];
+  }
   for (const c of cmds) {
     pmoveFull(st, {
       msec: c.msec,

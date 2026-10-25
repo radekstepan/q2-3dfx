@@ -4,7 +4,7 @@ import type { UserCmdT } from '@q2/input';
 import { v3 } from '@q2/math';
 import type { Entity } from '@q2/renderer-api';
 import { getConcharsFont, makeConcharsFont } from '@q2/client';
-import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpTracers, loadConcharsFont, concharsFontFromPCX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, VIEWMODEL_FIRE_FRAME, usesViewModel3D } from './play.js';
+import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpTracers, loadConcharsFont, concharsFontFromPCX, VIEWMODEL_FIRE_FRAME, usesViewModel3D } from './play.js';
 import { findWeapon, spawnMonster } from '@q2/game';
 import type { LocalDriver } from './play.js';
 
@@ -122,24 +122,29 @@ describe('play driver (devroom, headless)', () => {
     if (typeof countHook === 'function') expect(countHook.call(boot.refresh)).toBe(0);
   });
 
-  it('tracers: firing queues a beam, pumpTracers renders it, ttl expires', () => {
+  it('tracers: blaster fires a flying bolt (no hitscan beam), impact explodes', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { host, driver } = boot;
     runFrames(host, 0, 500);
     expect(driver.pendingTracers).toBe(0);
-    // Fire once: one blaster pellet => one queued beam.
+    // Fire once: authentic fire_blaster spawns one flying bolt, NOT a
+    // muzzle->impact beam (only the railgun draws TE_RAILTRAIL).
     driver.pm.viewAngles = v3(0, 0, 0);
     driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
     expect(driver.events).toContain('shot');
-    expect(driver.pendingTracers).toBe(1);
-    expect(pumpTracers(boot)).toBe(1);
+    expect(driver.events).toContain('bolt');
+    expect(driver.bolts.length).toBe(1);
     expect(driver.pendingTracers).toBe(0);
-    // The renderer pool holds it for TRACER_TTL_FRAMES renders, then expires.
-    const countHook = (boot.refresh as unknown as { testTracerCount?: () => number }).testTracerCount;
-    expect(typeof countHook).toBe('function');
-    expect(countHook!.call(boot.refresh)).toBe(1);
-    for (let i = 0; i < TRACER_TTL_FRAMES; i++) host.frame(600 + i * 16);
-    expect(countHook!.call(boot.refresh)).toBe(0);
+    expect(pumpTracers(boot)).toBe(0);
+    // Fly the bolt into the devroom pillar: trail + TE_BLASTER impact
+    // (40-spark burst + explosion flash + lashit), bolt consumed.
+    for (let i = 0; i < 10 && driver.bolts.length > 0; i++) {
+      stepDriver(driver, neutralCmd(), 1);
+    }
+    expect(driver.bolts.length).toBe(0);
+    expect(driver.mini.particles.length).toBeGreaterThan(10);
+    expect(driver.explosions.length + driver.events.filter((e) => e === 'explosion').length).toBeGreaterThan(0);
+    void host;
     // Empty queue pumps nothing (and never throws without shots).
     expect(pumpTracers(boot)).toBe(0);
   });
@@ -188,9 +193,11 @@ describe('play driver (devroom, headless)', () => {
   it('B: monsters animate MD2 frames and walk toward the player', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { host, driver } = boot;
-    // Devroom ships no monsters; place a synthetic soldier west of the
-    // player spawn (-168, 0) and put it in its run move (dist 12/tick).
-    driver.monsters.push({ id: 99, origin: [-100, 0, 32], state: spawnMonster('soldier'), lastAttack: -10 });
+    // Devroom ships no monsters; place a synthetic soldier east of the
+    // pillar (player spawn is west at -168, 0) so the pillar blocks LOS and
+    // the chase selector holds the run move (frame0 dist 10/tick) instead of
+    // committing to a standing attack. It must still walk toward the player.
+    driver.monsters.push({ id: 99, origin: [100, 0, 32], state: spawnMonster('soldier'), lastAttack: -10 });
     const m = driver.monsters[0]!;
     m.state.move = 'run';
     m.state.frame = 0;
@@ -199,10 +206,10 @@ describe('play driver (devroom, headless)', () => {
     // monsterThink advanced the state machine...
     expect(m.state.frame).toBeGreaterThan(0);
     expect(m.state.move).toBe('run');
-    // ...the move table maps to a nonzero MD2 frame (run first=3)...
-    expect(driver.entityFrame(99)).toBe(3 + m.state.frame);
+    // ...the move table maps to a nonzero MD2 frame (run first=99)...
+    expect(driver.entityFrame(99)).toBe(99 + m.state.frame);
     expect(driver.entityFrame(99)).toBeGreaterThan(0);
-    // ...the monster walked toward the player (east spawn is at -168)...
+    // ...the monster walked toward the player (west spawn is at -168)...
     expect(m.origin[0]!).toBeLessThan(x0);
     // ...it stays in the authoritative snapshot...
     expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === 99)).toBe(true);
@@ -259,33 +266,27 @@ describe('play driver (devroom, headless)', () => {
     for (const y of tail) expect(y).toBeLessThanOrEqual(last + 0.01); // never overshoots
   });
 
-  it('D: fired blaster beam draws a bright muzzle→impact streak', () => {
-    // Player beams start at the gun muzzle (off-axis, where the 3D view
-    // model sits): an eye-origin segment foreshortens to a single pixel by
-    // correct perspective, so the streak is muzzle→impact. This pumps the
-    // full driver→renderer path (queue, pumpTracers, render) head-on at the
-    // devroom pillar and asserts bright beam pixels on screen.
+  it('D: fired blaster bolt flies, trails, and impacts with TE_BLASTER', () => {
+    // Authentic fire_blaster: a 1000 u/s projectile with an EF_BLASTER
+    // particle trail, resolved on touch (wall => TE_BLASTER burst +
+    // explosion flash + lashit; flesh => damage). No muzzle->impact beam.
     const boot = bootPlay({ width: 96, height: 72 });
     const { host, driver } = boot;
     runFrames(host, 0, 500);
-    const idx = host.fb.index!;
-    const countBeam = (): number => {
-      let n = 0;
-      for (let i = 0; i < idx.length; i++) if (idx[i] === BLASTER_TRACER_COLOR) n++;
-      return n;
-    };
-    host.frame(516);
-    const base = countBeam();
     driver.pm.viewAngles = v3(0, 0, 0);
     driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
     expect(driver.events).toContain('shot');
-    expect(driver.pendingTracers).toBe(1);
-    expect(pumpTracers(boot)).toBe(1);
+    expect(driver.bolts.length).toBe(1);
+    expect(driver.pendingTracers).toBe(0);
     expect(driver.viewModel()).toBeNull(); // devroom: no 3D gun (see pak test)
-    // Impact sparks are single pixels; clear them so the beam is measured alone.
-    (driver.mini.particles as { origin: unknown; color: number }[]).length = 0;
+    const count0 = driver.mini.particles.length;
+    // Fly to the pillar: trail along the path, then TE_BLASTER burst +
+    // flash on touch; the bolt is consumed.
+    for (let i = 0; i < 10 && driver.bolts.length > 0; i++) stepDriver(driver, neutralCmd(), 1);
+    expect(driver.bolts.length).toBe(0);
+    expect(driver.mini.particles.length).toBeGreaterThan(count0);
     host.frame(532);
-    expect(countBeam() - base).toBeGreaterThanOrEqual(10);
+    expect(driver.events).toContain('explosion');
   });
 
   it('M7.2: death respawns at the spawn point, view model + muzzle light draw', () => {
@@ -473,7 +474,7 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     expect(vm).not.toBeNull();
     expect(vm!.model).toBe(boot.models!.weapons['weapon_blaster']);
     expect(vm!.skin).toBe(boot.models!.weaponSkins['weapon_blaster']);
-    expect(vm!.frame).toBe(0);
+    expect(vm!.frame).toBe(9); // blaster idle-first (Weapon_Blaster 9..52)
     // Muzzle-lit → fire anim frame (renderer wraps; v_blast has 56).
     driver.pm.viewAngles = v3(0, 0, 0);
     driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
