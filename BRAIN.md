@@ -367,10 +367,17 @@ done-when:
 ### M1.2 — PAK + PCX + WAL
 owns: `packages/filesystem`, `packages/formats`
 depends: M1.1
-status: done
+status: done (qualified — WAL/PCX only; MD2/SP2/BSP38 split out, see TODO(M1.2 follow-up))
 done-when:
 - [x] PAK directory parse, `readFile(name): ArrayBuffer`
 - [x] WAL → 4 mips; PCX → palette + pixels; colormap built and byte-compared to id's `colormap.pcx`
+
+### TODO(M1.2 follow-up) — real pak0.pak play-test 2026-10-25:
+- `parseBSP38` (`packages/formats/src/index.ts:67`) and `parseMD2` (`:70`) are still
+  `Com_Error('not implemented')` stubs. Real BSP lives in `@q2/bsp/loadBsp`;
+  nothing loads real `.md2`/`.sp2` skins — enemies/weapons fall back to the
+  box-critter + checker (see M3.4, M7.2). Needs an owning card (suggested M1.3:
+  MD2/SP2 parse + skin load through `registerModel`/`registerSkin`).
 
 ### M2.1 — BSP38 loader
 owns: `packages/formats`, `packages/bsp`
@@ -441,10 +448,16 @@ done-when:
 ### M3.4 — Alias models, sprites, particles
 owns: `packages/sw-renderer`
 depends: M3.3
-status: done
+status: done (placeholder qualified — real MD2/skins missing, see TODO(M3.4))
 done-when:
 - [x] MD2 player model draws with affine triangles + shade dots (MD2-shaped procedural mesh; real `.md2` parse is M1.2's job — data flows through `registerModel`)
 - [x] 1,000 particles cost <1.5 ms at 640×480 (measured 0.16 ms, §11)
+
+### TODO(M3.4) — real pak0.pak play-test 2026-10-25:
+- `registerModel`/`registerSkin` (`packages/sw-renderer/src/frame.ts:330,335`) still
+  return the box-critter + 32×32 checker; `apps/web/src/play.ts:1014` registers
+  `getDevMesh(0)` as `monster`. Audible but untextured with the real pak.
+  Unblocks when TODO(M1.2 follow-up) lands; no renderer contract change needed.
 
 ### M4.1 — Voodoo resolve chain
 owns: `packages/voodoo`
@@ -496,8 +509,17 @@ done-when:
 
 ### TODO(M6.1): `CL_Predict` pmove hookup DONE (headless `pmoveFull` replay
 ### behind `cl_predict`, exact-match vs server, legacy fallback preserved).
-### Remaining: dynamic-light cache invalidation (M3.2). `packages/client` now
-### depends on `@q2/game` (pmove only — §4 diagram updated); the headless
+### Remaining (confirmed real pak0.pak play-test 2026-10-25):
+### - HUD font is procedural xorshift noise (`packages/client/src/hud.ts:17`);
+###   `setConcharsFont` is never called from `apps/web` so `pics/conchars.pcx`
+###   never loads — grey/white text unreadable. Needs a conchars-load + wire-up card.
+### - World reads dark: `buildLightMap` (`packages/sw-renderer/src/light.ts:42`)
+###   uses only `styleScales[0]`, clamps to 1.0 with no ×2 overbright.
+### - Muzzle dlight leaks: `drainFlash` (`apps/web/src/play.ts:456`) doesn't consume
+###   and `pumpMuzzleLight` (`:1035`) `testAddDynamicLight`s every tick with no
+###   `testClearDynamicLights`, so lights accumulate and the scene stays bright.
+###   Fix = expire the flash + invalidate (M3.2 path) instead of accumulating.
+### `packages/client` now depends on `@q2/game` (pmove only — §4 diagram updated); the headless
 ### Mixer glue from M7.2 is unchanged. Integration glue also delivered:
 ### `@q2/host` loop, `NullRefresh` + devroom fallback in `@q2/renderer-api`,
 ### golden/bench helpers in `@q2/testkit`, cvar console wiring in `@q2/config`.
@@ -512,12 +534,11 @@ done-when:
 - [x] devroom explorable (analytic room collision) and base1 bootable from a dropped pak (BSP collision, WAL/PCX, doors open + render, exit fires, static monsters shootable) — play-tested headlessly incl. Q2_PAK run
 - [ ] 60 fps at 640×480 software on the bench machine
 
-### TODO(M7.1): IndexedDB pak cache (drop → parse → boot works; persistence
-### still TODO) and the 60 fps sign-off: base1 spawn view costs ~10.8 ms/frame
+### TODO(M7.1): IndexedDB pak cache DONE (M7.3) and the 60 fps sign-off: base1 spawn view costs ~10.8 ms/frame
 ### single-threaded at 320×240 (internal res, CSS 2× upscale; measured Ryzen 5 PRO
-### 2400G, Node 22) — 640×480 needs M8.1 workers. No monster AI/attacks yet
-### (placeholders only), no weapon view model, no per-channel sound scheduling,
-### no plats/trains riders, no saves/menu.
+### 2400G, Node 22) — 640×480 needs M8.1 workers. No saves/menu.
+### (Monster AI/attacks + weapon view model + per-channel sound moved to M7.2,
+### plats/train riders to M7.4 — see those cards for real-pak qualifications.)
 ### WIRE update: real pak0.pak ingests client-side (3307 entries, hasBase1),
 ### cooker round-trips it (184MB → 93.6MB in 5.3s, base1.bsp byte-identical),
 ### and the real map renders headlessly (4 views, hashes logged in testkit).
@@ -557,7 +578,7 @@ done-when:
   health/death + respawn at `info_player_start`
 - [x] pickups work: walking over `item_*`/`weapon_*`/`ammo_*` edicts grants
   them via `pickupItem` (shotgun/machinegun become usable, ammo finite)
-- [x] weapon view model: gun sprite/alias bottom-right + muzzle flash light
+- [x] weapon view model (placeholder): 2D `fillRect` gun silhouette bottom-right + muzzle flash rect (`apps/web/src/play.ts:1086 drawViewModel`) + 3D muzzle dlight — NOT the real `v_weap` MD2/skins, blocked on TODO(M1.2 follow-up)
 - [x] per-channel sound: wire `Mixer.mix()` gains to `BrowserMixer` nodes
   (positional shots, door moves, pickups) instead of one-shot cues
 - [x] `Q2_PAK` play test extended: bot takes scripted damage, picks up the
@@ -575,6 +596,11 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
   are placeholders with no pak counterpart (`doors/door.wav` vs `doors/dr1_strt.wav`,
   `items/pickup.wav` vs `items/pkup.wav`); renaming them to real pak names needs a
   `play.ts` + M7.2 bot-test assertion update.
+- Real-pak play-test 2026-10-25: enemies render as untextured box-critters
+  (blocked on TODO(M1.2 follow-up)), weapon is the 2D placeholder above, HUD text
+  is procedural noise (see TODO(M6.1)), and firing permanently brightens the scene
+  (muzzle dlight leak, see TODO(M6.1)). Sound/positioning works, so monsters are
+  heard but not seen.
 
 ### M7.3 — IndexedDB pak cache
 owns: `apps/web`
