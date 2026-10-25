@@ -57,7 +57,8 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
     }
   });
 
-  it('getBrightness defaults, clamps, and persists via cvar', () => {
+  it('getBrightness defaults to 2.0, clamps, and persists via cvar', () => {
+    expect(BRIGHTNESS_DEFAULT).toBe(2.0);
     expect(getBrightness()).toBe(BRIGHTNESS_DEFAULT);
     setCVar('r_brightness', 1.5);
     try {
@@ -131,6 +132,7 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
     expect(cvarControlKind('cl_showfps')).toBe('select');
     expect(cvarControlKind('r_brightness')).toBe('select');
     expect(cvarOptions('r_brightness')).toContain('1.25');
+    expect(cvarOptions('r_brightness')).toContain('2.0');
     expect(cvarControlKind('sensitivity')).toBe('text');
     expect(cvarOptions('sensitivity')).toBeNull();
     expect(cvarControlKind('no_such_cvar')).toBe('text');

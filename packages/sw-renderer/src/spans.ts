@@ -316,6 +316,36 @@ export function drawSpansTurbulent(
   return { pixels, spans: drawn };
 }
 
+/** Flat span pass with a per-span palette color in `s.light` (sky fills).
+ * Monomorphic like drawSpansFlat; the color rides the span (not the pixel
+ * loop) so one mixed list can carry several flat surfaces. */
+export function drawSpansFlatPerSpan(
+  idx: Uint8Array,
+  zb: Float32Array,
+  fbW: number,
+  fbH: number,
+  list: SpanList,
+): { pixels: number; spans: number } {
+  const spans = list.spans;
+  const n = list.count < spans.length ? list.count : spans.length;
+  let pixels = 0;
+  let drawn = 0;
+  for (let si = 0; si < n; si++) {
+    const s = spans[si]!;
+    if (s.kind !== SPAN_FLAT) continue;
+    if (s.y < 0 || s.y >= fbH) continue;
+    let x0 = s.x0, x1 = s.x1;
+    if (x0 < 0) x0 = 0;
+    if (x1 > fbW) x1 = fbW;
+    const count = x1 - x0;
+    if (count <= 0) continue;
+    runSpanFlat(idx, zb, s.y * fbW + x0, count, s.iz + s.diz * (x0 - s.x0), s.diz, s.light & 255);
+    pixels += count;
+    drawn++;
+  }
+  return { pixels, spans: drawn };
+}
+
 /** Flat-shaded span pass (sky, solid fills). Separate function. */
 export function drawSpansFlat(
   idx: Uint8Array,
@@ -386,8 +416,9 @@ export class SoftwareBackend implements RasterBackend {
   drawSpans(list: SpanList, tex: Texture, light: LightBlock): void {
     const a = drawSpansSoftware(this.idx, this.zb, this.fbW, this.fbH, list, tex, light, this.colormap);
     const b = drawSpansTurbulent(this.idx, this.zb, this.fbW, this.fbH, list, tex, this.colormap, this.turbTable, this.time);
-    this.spansDrawn += a.spans + b.spans;
-    this.pixelsDrawn += a.pixels + b.pixels;
+    const c = drawSpansFlatPerSpan(this.idx, this.zb, this.fbW, this.fbH, list);
+    this.spansDrawn += a.spans + b.spans + c.spans;
+    this.pixelsDrawn += a.pixels + b.pixels + c.pixels;
   }
 }
 

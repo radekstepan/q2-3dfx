@@ -3,7 +3,8 @@ import { keyDown, keyUp, BUTTON_ATTACK } from '@q2/input';
 import type { UserCmdT } from '@q2/input';
 import { v3 } from '@q2/math';
 import { getConcharsFont, makeConcharsFont } from '@q2/client';
-import { bootPlay, drawPlayHud, pumpMuzzleLight, loadConcharsFont, concharsFontFromPCX } from './play.js';
+import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpTracers, loadConcharsFont, concharsFontFromPCX, TRACER_TTL_FRAMES } from './play.js';
+import { findWeapon } from '@q2/game';
 import type { LocalDriver } from './play.js';
 
 function runFrames(host: { frame(nowMs: number): unknown }, fromMs: number, toMs: number, step = 16): void {
@@ -118,6 +119,46 @@ describe('play driver (devroom, headless)', () => {
     // Renderer-side observability when present: no live lights remain.
     const countHook = (boot.refresh as unknown as { testDynamicLightCount?: () => number }).testDynamicLightCount;
     if (typeof countHook === 'function') expect(countHook.call(boot.refresh)).toBe(0);
+  });
+
+  it('tracers: firing queues a beam, pumpTracers renders it, ttl expires', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { host, driver } = boot;
+    runFrames(host, 0, 500);
+    expect(driver.pendingTracers).toBe(0);
+    // Fire once: one blaster pellet => one queued beam.
+    driver.pm.viewAngles = v3(0, 0, 0);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.events).toContain('shot');
+    expect(driver.pendingTracers).toBe(1);
+    expect(pumpTracers(boot)).toBe(1);
+    expect(driver.pendingTracers).toBe(0);
+    // The renderer pool holds it for TRACER_TTL_FRAMES renders, then expires.
+    const countHook = (boot.refresh as unknown as { testTracerCount?: () => number }).testTracerCount;
+    expect(typeof countHook).toBe('function');
+    expect(countHook!.call(boot.refresh)).toBe(1);
+    for (let i = 0; i < TRACER_TTL_FRAMES; i++) host.frame(600 + i * 16);
+    expect(countHook!.call(boot.refresh)).toBe(0);
+    // Empty queue pumps nothing (and never throws without shots).
+    expect(pumpTracers(boot)).toBe(0);
+  });
+
+  it('selected weapon changes the visible view model', () => {
+    const boot = bootPlay({ width: 160, height: 120 });
+    const { driver } = boot;
+    const draw = (): Uint32Array => {
+      const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
+      drawPlayHud(target, boot, { fps: 60, frame: 1 });
+      return target.color;
+    };
+    const blaster = draw();
+    driver.weapon = findWeapon('weapon_shotgun')!;
+    const shotgun = draw();
+    expect(Array.from(shotgun)).not.toEqual(Array.from(blaster));
+    driver.weapon = findWeapon('weapon_machinegun')!;
+    const machinegun = draw();
+    expect(Array.from(machinegun)).not.toEqual(Array.from(blaster));
+    expect(Array.from(machinegun)).not.toEqual(Array.from(shotgun));
   });
 
   it('conchars: procedural fallback without a pak, loader null-safe', () => {
@@ -280,6 +321,28 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     stepDriver(driver, neutralCmd(), 5);
     expect(driver.exited).toBe(true);
     expect(driver.message).toContain('LEVEL COMPLETE');
+  });
+
+  it('M7.2 follow-up: pak registers real MD2 models + PCX skins', async () => {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const pak = ingestPak(buf);
+    const boot = bootPlay({ width: 96, height: 72, pak });
+    expect(boot.models).not.toBeNull();
+    // Soldier first: the Host's hardcoded model:0/skin:0 entities render it.
+    expect(boot.models!.monster).toBe(0);
+    expect(boot.models!.skins[0]).toBe(0);
+    expect(boot.models!.gunner).toBeGreaterThan(0);
+    expect(boot.models!.weapons['weapon_blaster']).toBeGreaterThan(0);
+    expect(boot.models!.weapons['weapon_shotgun']).toBeGreaterThan(0);
+    expect(boot.models!.weapons['weapon_machinegun']).toBeGreaterThan(0);
+    expect(boot.models!.bolt).toBeGreaterThan(0);
+    // The registered soldier mesh actually draws (frame renders monsters).
+    const stats = boot.host.frame(100);
+    expect(stats.pixels).toBeGreaterThan(0);
   });
 
   it('M6.1 follow-up: real conchars.pcx replaces the procedural font', async () => {

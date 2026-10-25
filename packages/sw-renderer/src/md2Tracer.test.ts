@@ -11,6 +11,8 @@ import {
   createBoxMesh,
   createGunMesh,
   createGunSkin,
+  createSoldierMesh,
+  createSoldierSkin,
   drawAliasInstance,
   isMd2Data,
   md2ToAliasMesh,
@@ -416,5 +418,123 @@ describe.runIf(HAVE_PAK)('real pak0.pak MD2 + skins (Q2_PAK)', () => {
     }]);
     r.endFrame();
     expect(stats.pixels).toBeGreaterThan(0);
+  });
+});
+
+describe('soldier fallback mesh + skin (asset-free)', () => {
+  it('is a humanoid with static frames', () => {
+    const m = createSoldierMesh();
+    expect(m.numFrames).toBe(2);
+    expect(m.numTris).toBe(72); // 6 boxes x 12 tris
+    expect(m.numVerts).toBe(216); // 6 boxes x 36 facet verts
+    expect(m.frames.length).toBe(2 * 216 * 3);
+    // static pose: frame 1 == frame 0
+    expect([...m.frames.subarray(0, 216 * 3)]).toEqual([...m.frames.subarray(216 * 3)]);
+    for (let i = 0; i < m.normals.length; i++) expect(m.normals[i]).toBeLessThan(ANORM_COUNT);
+    const skin = createSoldierSkin();
+    expect(skin.width).toBe(64);
+    expect(skin.height).toBe(64);
+    expect(new Set(skin.texels).size).toBeGreaterThan(4);
+  });
+
+  it('draws >0 pixels broadside', () => {
+    const cam = testCam();
+    const anorms = buildANorms();
+    const dots = buildShadeDots(anorms);
+    const idx = new Uint8Array(64 * 64);
+    const zb = new Float32Array(64 * 64);
+    const skin = createSoldierSkin();
+    const p = drawAliasInstance(idx, zb, 64, 64, {
+      mesh: createSoldierMesh(),
+      origin: new Float32Array([40, 0, 20]), angles: new Float32Array([0, 90, 0]),
+      frameA: 0, frameB: 1, lerp: 0.5, lightAngle: 0,
+    }, skin, cam, anorms, dots, colormap);
+    expect(p).toBeGreaterThan(100);
+  });
+});
+
+describe('synthetic MD2 + registerSkinData end to end (asset-free)', () => {
+  /** Vertical double-sided quad facing +/-X (both windings, so the pose
+   * always draws; culling itself is covered by alias.test.ts). */
+  function xQuad(): Md2Like {
+    return {
+      skinWidth: 64, skinHeight: 64,
+      numFrames: 1, numVerts: 4, numSt: 4, numTris: 4,
+      st: new Int16Array([0, 0, 63, 0, 63, 63, 0, 63]),
+      trisXyz: new Uint16Array([0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2]),
+      trisSt: new Uint16Array([0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2]),
+      frames: new Float32Array([0, -8, -8, 0, 8, -8, 0, 8, 8, 0, -8, 8]),
+      normals: new Uint8Array([3, 3, 3, 3]),
+    };
+  }
+
+  function setup() {
+    const W = 160, H = 120;
+    const fb = createFramebuffer(W, H, true);
+    const r = new SoftwareRenderer();
+    r.init(fb);
+    r.setPalette(defaultPalette());
+    const view = {
+      origin: DEVROOM_CAMERA.origin, angles: DEVROOM_CAMERA.angles,
+      fovX: DEVROOM_CAMERA.fovX, time: 1.5, lightStyles: new Float32Array(256).fill(1),
+    };
+    const world = { name: 'devroom', data: createDevroom() };
+    const ent = (model: number, skin: number): Parameters<SoftwareRenderer['renderView']>[2] => [{
+      model, origin: new Float32Array([-140, 0, 120]), angles: new Float32Array([0, 0, 0]),
+      frame: 0, skin,
+    }];
+    const frame = (entities: Parameters<SoftwareRenderer['renderView']>[2]): string => {
+      r.beginFrame();
+      r.renderView(view, world, entities);
+      r.endFrame();
+      const idx = fb.index!;
+      let h = 2166136261;
+      for (let i = 0; i < idx.length; i++) {
+        h ^= idx[i]!;
+        h = Math.imul(h, 16777619);
+      }
+      return (h >>> 0).toString(16).padStart(8, '0');
+    };
+    return { r, fb, ent, frame };
+  }
+
+  it('synthetic MD2 + real skin data draws textured (not flat)', () => {
+    const { r, fb, ent, frame } = setup();
+    const mh = r.registerModel({ name: 'synth', kind: 'md2', data: xQuad() });
+    // two-tone skin: every tri samples both halves
+    const skinTex = new Uint8Array(64 * 64);
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < 64; x++) skinTex[y * 64 + x] = x < 32 ? 40 : 150;
+    }
+    const sh = r.registerSkinData('synth/skin', skinTex, 64, 64);
+    const base = frame([]);
+    const lit = frame(ent(mh, sh));
+    expect(lit).not.toBe(base);
+    // textured: drawn pixels resolve through the colormap to >1 index
+    const seen = new Set<number>();
+    const idx = fb.index!;
+    for (let i = 0; i < idx.length; i++) if (idx[i] !== 0) seen.add(idx[i]!);
+    expect(seen.size).toBeGreaterThan(1);
+  });
+
+  it('missing skin on a real MD2 falls back to the soldier tone', () => {
+    const { r, ent, frame } = setup();
+    const mh = r.registerModel({ name: 'synth', kind: 'md2', data: xQuad() });
+    const missing = frame(ent(mh, 999));
+    const base = frame([]);
+    expect(missing).not.toBe(base); // still draws, soldier-shaped
+    // explicit soldier skin renders identically to the missing-skin fallback
+    const s = createSoldierSkin();
+    const sh = r.registerSkinData('soldier/fallback', s.texels, s.width, s.height);
+    expect(frame(ent(mh, sh))).toBe(missing);
+  });
+
+  it('missing skin on gun fallback keeps the gunmetal skin', () => {
+    const { r, ent, frame } = setup();
+    const mh = r.registerModel({ name: 'gun', kind: 'md2', data: null });
+    const missing = frame(ent(mh, 999));
+    const g = createGunSkin();
+    const sh = r.registerSkinData('gun/fallback', g.texels, g.width, g.height);
+    expect(frame(ent(mh, sh))).toBe(missing);
   });
 });

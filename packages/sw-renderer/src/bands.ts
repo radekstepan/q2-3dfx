@@ -14,9 +14,9 @@
 
 import { Com_Error, getCVarNumber, registerCVar } from '@q2/config';
 import {
-  SPAN_OPAQUE, SPAN_TURBULENT, SoftwareBackend,
-  buildTurbTable, drawSpansSoftware, drawSpansTurbulent,
-  runSubdiv16, runSubdivTurbulent, sampleLightBlock, textureMasks,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SoftwareBackend,
+  buildTurbTable, drawSpansSoftware, drawSpansTurbulent, drawSpansFlatPerSpan,
+  runSubdiv16, runSubdivTurbulent, runSpanFlat, sampleLightBlock, textureMasks,
   type LightBlock, type RasterBackend, type Span, type SpanList, type Texture,
 } from './spans.js';
 import { COLORMAP_SIZE } from './colormap.js';
@@ -221,7 +221,7 @@ export function packBandSpans(
   let est = 0;
   for (let i = 0; i < total; i++) {
     const s = spans[i]!;
-    if (s.kind !== SPAN_OPAQUE && s.kind !== SPAN_TURBULENT) continue;
+    if (s.kind !== SPAN_OPAQUE && s.kind !== SPAN_TURBULENT && s.kind !== SPAN_FLAT) continue;
     if (p >= MAX_BAND_SPANS) return null; // oversize -> inline fallback
     const o = p * F_PER_SPAN;
     F[o] = s.iz; F[o + 1] = s.diz; F[o + 2] = s.uz; F[o + 3] = s.duz;
@@ -301,7 +301,7 @@ export function processBandJob(v: BandViews, job: BandJob): { pixels: number; sp
     const origX0 = spansI[q + 2]!;
     const origX1 = spansI[q + 3]!;
     const turb = spansI[q + 4]!;
-    if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT) continue;
+    if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT && kind !== SPAN_FLAT) continue;
     if (y < job.y0 || y >= job.y1) continue;
     if (y < 0 || y >= fbH) continue;
     let x0 = origX0, x1 = origX1;
@@ -321,6 +321,14 @@ export function processBandJob(v: BandViews, job: BandJob): { pixels: number; sp
     const lu = spansF[o + 8]!;
     const lv = spansF[o + 9]!;
     const dlu = spansF[o + 10]!;
+    if (kind === SPAN_FLAT) {
+      // Flat fill: palette color rides F[o+6] (frame.ts stores the sky
+      // index in s.light); no texture or light state is touched.
+      runSpanFlat(idx, zb, y * fbW + x0, n, iz, diz, (spansF[o + 6]! | 0) & 255);
+      pixels += n;
+      drawn++;
+      continue;
+    }
     if (kind === SPAN_OPAQUE) {
       let lz = spansF[o + 6]!;
       let dlz = dlight;
@@ -541,8 +549,9 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
         this.bandList.count = m;
         const a = drawSpansSoftware(this.idx, this.zb, this.fbW, this.fbH, this.bandList, tex, light, this.colormap);
         const t = drawSpansTurbulent(this.idx, this.zb, this.fbW, this.fbH, this.bandList, tex, this.colormap, this.turbTable, this.time);
-        this.spansDrawn += a.spans + t.spans;
-        this.pixelsDrawn += a.pixels + t.pixels;
+        const f = drawSpansFlatPerSpan(this.idx, this.zb, this.fbW, this.fbH, this.bandList);
+        this.spansDrawn += a.spans + t.spans + f.spans;
+        this.pixelsDrawn += a.pixels + t.pixels + f.pixels;
       }
       base = end;
     }

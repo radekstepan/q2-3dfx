@@ -199,6 +199,41 @@ export function md2ToAliasMesh(md2: unknown): AliasMesh | null {
  * golden pins its exact pixels.
  */
 export function createGunMesh(): AliasMesh {
+  return meshFromBoxes([
+    [0, 0, 0, 13, 3.5, 4.5],
+    [20, 0, 1, 8, 1.6, 1.6],
+    [-6, 0, -8, 3, 2.5, 5],
+    [2, 0, 6, 4, 1, 1.5],
+  ], 1.5);
+}
+
+/**
+ * Procedural soldier silhouette (boxy humanoid ~51 units tall facing +X:
+ * torso, head, two legs, two arms) with the same per-face facet normals as
+ * the gun mesh. Register-time fallback so a monster with real MD2 geometry
+ * but no skin yet still reads as a soldier instead of a box critter; the
+ * boot path is expected to replace it with parsed `tris.md2` via
+ * md2ToAliasMesh + registerSkinData (see TODO(M1.2 follow-up)). Two
+ * identical frames (no recoil). Asset-free.
+ */
+export function createSoldierMesh(): AliasMesh {
+  return meshFromBoxes([
+    [0, 0, 32, 7, 5, 10],      // torso  (z 22..42)
+    [1, 0, 47, 4, 4, 4],       // head   (z 43..51)
+    [0, -3.5, 11, 4, 2.5, 11], // left leg  (z 0..22)
+    [0, 3.5, 11, 4, 2.5, 11],  // right leg
+    [0, -8.5, 31, 3.5, 2.5, 9],// left arm  (z 22..40)
+    [0, 8.5, 31, 3.5, 2.5, 9], // right arm
+  ], 0);
+}
+
+/**
+ * Build an AliasMesh out of axis-aligned boxes (cx, cy, cz, sx, sy, sz),
+ * one duplicated-vert cube per box face so shade dots give flat facet
+ * shading. Frame 1 shifts -recoilX on x (gun recoil; 0 = static pose).
+ * Register-time only: allocates.
+ */
+function meshFromBoxes(boxes: number[][], recoilX: number): AliasMesh {
   const anorms = buildANorms();
   const best = (x: number, y: number, z: number): number => {
     let bi = 0, bd = -Infinity;
@@ -221,13 +256,6 @@ export function createGunMesh(): AliasMesh {
     { c: [0, 4, 5, 0, 5, 1], n: 2 }, { c: [1, 5, 6, 1, 6, 2], n: 3 },
     { c: [2, 6, 7, 2, 7, 3], n: 4 }, { c: [3, 7, 4, 3, 4, 0], n: 5 },
   ];
-  // Receiver, barrel, grip, sight (cx, cy, cz, sx, sy, sz).
-  const boxes = [
-    [0, 0, 0, 13, 3.5, 4.5],
-    [20, 0, 1, 8, 1.6, 1.6],
-    [-6, 0, -8, 3, 2.5, 5],
-    [2, 0, 6, 4, 1, 1.5],
-  ];
   const pos: number[] = [];
   const nrm: number[] = [];
   const tri: number[] = [];
@@ -248,7 +276,7 @@ export function createGunMesh(): AliasMesh {
   }
   const nv = pos.length / 3;
   const nt = tri.length / 3;
-  const frames = new Float32Array([...pos, ...pos.map((v, i) => (i % 3 === 0 ? v - 1.5 : v))]);
+  const frames = new Float32Array([...pos, ...pos.map((v, i) => (i % 3 === 0 ? v - recoilX : v))]);
   return {
     frames,
     normals: new Uint8Array([...nrm, ...nrm]),
@@ -273,6 +301,28 @@ export function createGunSkin(): { texels: Uint8Array; width: number; height: nu
       let v = 96 + ((y * 44) / (h - 1)) | 0;
       if (y < 6) v += 34; // top highlight
       if (x >= 8 && x < 22 && y >= 40) v -= 26; // grip shadow
+      texels[y * w + x] = v & 255;
+    }
+  }
+  return { texels, width: w, height: h };
+}
+
+/**
+ * Olive-drab fallback skin for real MD2 monsters whose skin handle is
+ * missing (64x64): vertical uniform gradient with a helmet highlight band
+ * and dark limb shadows. Palette-relative like every other skin, so a
+ * wired-but-skinless soldier still reads as a soldier instead of a
+ * checker-textured box.
+ */
+export function createSoldierSkin(): { texels: Uint8Array; width: number; height: number } {
+  const w = 64, h = 64;
+  const texels = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = 100 + ((y * 40) / (h - 1)) | 0;
+      if (y < 8) v += 22; // helmet highlight
+      if ((x < 12 || x >= w - 12) && y >= 28) v -= 26; // arm shadows
+      if (x >= 24 && x < 40 && y >= 44) v -= 18; // leg shadow
       texels[y * w + x] = v & 255;
     }
   }

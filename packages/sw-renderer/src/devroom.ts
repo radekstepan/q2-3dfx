@@ -72,6 +72,7 @@ function quad(
   texId: number, lightId: number, turbulent: boolean,
   luxBase: number,
   fnx: number, fny: number, fnz: number,
+  sky = false,
 ): MiniSurf {
   const verts = new Float32Array([ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz]);
   // full-texture mapping across the quad (64x64 texel space)
@@ -87,6 +88,7 @@ function quad(
     id: surfId++, verts, uvs, lux, n: 4, texId, lightId,
     center: bb.center, radius: bb.radius, mins: bb.mins, maxs: bb.maxs,
     turbulent, fn,
+    sky,
   };
 }
 

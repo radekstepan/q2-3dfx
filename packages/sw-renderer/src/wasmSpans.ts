@@ -16,9 +16,9 @@
 //   wasm memory (Float64 params + Int32 coords), copies the surface texels /
 //   light block / colormap only when the backing reference changed, then
 //   makes ONE wasm call for the whole batch (amortises the JS↔wasm hop).
-// - Turbulent spans stay in TS (`drawSpansTurbulent`); flat spans are
-//   untouched. Any out-of-range input (oversize texture/block, too many
-//   spans, degenerate dims) falls back to the TS path for that batch, so the
+// - Turbulent + flat spans stay in TS (`drawSpansTurbulent` /
+//   `drawSpansFlatPerSpan`); flat spans are per-span colored (sky). Any
+//   out-of-range input (oversize texture/block, too many spans, degenerate
 //   output can never diverge — fallback IS the reference implementation.
 // - Opt-in only: TS remains the default. Enable via the `sw_wasm` cvar (read
 //   through @q2/config, registered lazily so no cross-package change) or
@@ -30,6 +30,7 @@ import {
   SPAN_OPAQUE,
   drawSpansSoftware,
   drawSpansTurbulent,
+  drawSpansFlatPerSpan,
   textureMasks,
   type LightBlock,
   type SpanList,
@@ -567,6 +568,13 @@ export class WasmSpanBackend extends SoftwareBackend {
     );
     this.spansDrawn += b.spans;
     this.pixelsDrawn += b.pixels;
+    // Flat spans (sky) stay in TS like turbulent ones: per-span color,
+    // same reference loop as SoftwareBackend, so wasm output is identical.
+    const c = drawSpansFlatPerSpan(
+      this.idx, this.zb, this.fbW, this.fbH, list,
+    );
+    this.spansDrawn += c.spans;
+    this.pixelsDrawn += c.pixels;
   }
 
   /**

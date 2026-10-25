@@ -157,8 +157,23 @@ export class Host {
 
   /** Render the current predicted/interpolated view. */
   renderCurrentView(): FrameStats {
-    const entities = this.predictor.renderEntities(this.serverTime, this.localPlayerId);
-    const viewOrigin = calcViewOrigin(this.playerOrigin);
+    // Continuous render clock: serverTime only advances on 10Hz ticks, so
+    // add the sub-tick remainder. Passing the stepped serverTime here would
+    // freeze the camera between ticks (slideshow) while the angles (fresh
+    // from lastCmd every frame) stay smooth.
+    const now = this.serverTime + this.serverAcc;
+    const entities = this.predictor.renderEntities(now, this.localPlayerId);
+    // Local player comes from the Predictor (interpolated/predicted at `now`),
+    // not from playerOrigin, which only refreshes from driver.snapshot() on
+    // ticks. Offline mode (no driver) keeps playerOrigin: it is already
+    // integrated per-frame in frame(), so the predictor's 100ms-delayed
+    // snapshots would only add lag there.
+    let base: [number, number, number] = this.playerOrigin;
+    if (this.driver) {
+      const local = entities.find((e) => e.id === this.localPlayerId);
+      if (local) base = local.origin;
+    }
+    const viewOrigin = calcViewOrigin(base);
     const angles: [number, number, number] = this.lastCmd
       ? [this.lastCmd.angles[0], this.lastCmd.angles[1], this.lastCmd.angles[2]]
       : [0, 0, 0];

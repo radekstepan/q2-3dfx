@@ -22,7 +22,7 @@ import {
   type EdgeScratch, type PolyInput,
 } from './edges.js';
 import {
-  SPAN_OPAQUE, SPAN_TURBULENT, buildTurbTable, createSpan,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, buildTurbTable, createSpan,
   drawSpansTurbulent, SoftwareBackend,
   type LightBlock, type RasterBackend, type Span, type SpanList, type Texture,
 } from './spans.js';
@@ -31,7 +31,7 @@ import {
   BandedSoftwareBackend, createBandBuffers, sabAvailable, workersRequestedByCvar,
   type BandDispatcher,
 } from './bands.js';
-import { buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, md2ToAliasMesh, type AliasMesh } from './alias.js';
+import { buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, createSoldierMesh, createSoldierSkin, md2ToAliasMesh, type AliasMesh } from './alias.js';
 import { drawAliasInstance } from './alias.js';
 import { drawTracerBeam, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE } from './tracer.js';
 import { AngleVectors } from '@q2/math';
@@ -152,6 +152,12 @@ export class SoftwareRenderer implements Refresh {
   /** Procedural gun fallback (registerModel md2 without real data). Lazy. */
   private gunMeshMemo: AliasMesh | null = null;
   private gunSkinMemo: Texture | null = null;
+  /** Olive-drab fallback skin for real MD2s with a missing skin handle. Lazy. */
+  private soldierSkinMemo: Texture | null = null;
+  /** Procedural soldier silhouette (missing-MD2 fallback shape). Lazy. */
+  private soldierMeshMemo: AliasMesh | null = null;
+  /** Palette index of the flat sky fill (recomputed per palette). */
+  private skyIndex = 0;
   /** Renderer-owned tracer beams (spawnTracer ring, fixed pool, zero alloc). */
   private tracerSegs = new Float32Array(TRACER_POOL_SIZE * 6);
   private tracerColors = new Uint8Array(TRACER_POOL_SIZE);
@@ -186,6 +192,7 @@ export class SoftwareRenderer implements Refresh {
     this.idx = fb.index;
     this.zb = fb.depth;
     this.color = fb.color;
+    this.pickSkyIndex();
     for (let i = 0; i < MAX_SPANS; i++) this.pool.push(createSpan());
     for (let i = 0; i < MAX_SPANS; i++) this.tmpSort.push(this.pool[i]!);
     this.spanList = { spans: this.pool, count: 0 };
@@ -345,6 +352,7 @@ export class SoftwareRenderer implements Refresh {
   setPalette(p: Uint8Array): void {
     this.palette = p.length >= 768 ? p.slice(0, 768) : defaultPalette();
     this.colormap = buildColormap(this.palette);
+    this.pickSkyIndex();
     this.backend.colormap = this.colormap;
     if (this.wasmBackend) this.wasmBackend.colormap = this.colormap;
     this.bandBackend.colormap = this.colormap;
@@ -440,6 +448,42 @@ export class SoftwareRenderer implements Refresh {
       this.gunSkinMemo = { width: g.width, height: g.height, texels: g.texels };
     }
     return this.gunSkinMemo;
+  }
+
+  /** Olive-drab fallback skin for real MD2s with a missing skin handle. */
+  getSoldierSkin(): Texture {
+    if (!this.soldierSkinMemo) {
+      const g = createSoldierSkin();
+      this.soldierSkinMemo = { width: g.width, height: g.height, texels: g.texels };
+    }
+    return this.soldierSkinMemo;
+  }
+
+  /** Procedural soldier silhouette (missing-data fallback shape, asset-free). */
+  getSoldierMesh(): AliasMesh {
+    if (!this.soldierMeshMemo) this.soldierMeshMemo = createSoldierMesh();
+    return this.soldierMeshMemo;
+  }
+
+  /**
+   * Pick the flat-sky palette index: the bluest bright entry. Recomputed
+   * per palette (setPalette + init) so the sky reads sky-blue under both
+   * the procedural test palette and the real `colormap.pcx` palette.
+   */
+  private pickSkyIndex(): void {
+    const pal = this.palette;
+    let best = 0, bs = -Infinity;
+    for (let i = 0; i < 256; i++) {
+      const r = pal[i * 3]!, g = pal[i * 3 + 1]!, b = pal[i * 3 + 2]!;
+      const s = 2 * b - r - g + (r + g + b) / 32;
+      if (s > bs) { bs = s; best = i; }
+    }
+    this.skyIndex = best;
+  }
+
+  /** Live flat-sky palette index (observability, test hook). */
+  testSkyIndex(): number {
+    return this.skyIndex;
   }
 
   /**
@@ -589,8 +633,9 @@ export class SoftwareRenderer implements Refresh {
       if (surfFrustumCulled(cam, surf)) { if (d) d.frustumCulled++; continue; }
       // backface cull for single-sided world polys (id draws these too and
       // lets the z-buffer reject them; skipping is output-identical and
-      // saves the span work). Turbulent (water) stays double-sided.
-      if (!surf.turbulent) {
+      // saves the span work). Turbulent (water) and sky stay double-sided:
+      // sky hulls face outward, so culling would erase the sky.
+      if (!surf.turbulent && !surf.sky) {
         const dx = cam.origin[0]! - surf.center[0]!;
         const dy = cam.origin[1]! - surf.center[1]!;
         const dz = cam.origin[2]! - surf.center[2]!;
@@ -598,6 +643,44 @@ export class SoftwareRenderer implements Refresh {
           if (d) d.backfaceCulled++;
           continue;
         }
+      }
+      if (surf.sky) {
+        // Sky hull: flat depth-tested fill, no texture / lightmap / cache
+        // entry (previously these rendered with the orange fallback checker).
+        // The palette color rides each span (s.light) so every backend
+        // (classic, banded, wasm, pooled) draws it through its normal
+        // batch path; texView/lightView are ignored for SPAN_FLAT.
+        this.polyInput.verts = surf.verts;
+        this.polyInput.uvs = surf.uvs;
+        this.polyInput.lux = surf.lux;
+        this.polyInput.n = surf.n;
+        const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
+        if (nproj < 3) { if (d) d.clipRejected++; continue; }
+        const start = this.spanList.count;
+        const endCount = emitSpansForPoly(
+          this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
+        );
+        if (endCount <= start) { if (d) d.clipRejected++; continue; }
+        for (let i = start; i < endCount; i++) {
+          const sp = this.pool[i]!;
+          sp.kind = SPAN_FLAT;
+          sp.ord = order;
+          sp.light = this.skyIndex;
+          sp.dlight = 0;
+        }
+        sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+        this.spanList.count = endCount;
+        const before = this.backend.pixelsDrawn;
+        this.backend.drawSpans(this.spanList, texView, lightView);
+        candidatePixels += this.backend.pixelsDrawn - before;
+        this.spanList.count = 0;
+        spansEmitted += endCount - start;
+        if (d) {
+          d.emitted++;
+          const batchSpans = endCount - start;
+          if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
+        }
+        continue;
       }
       const dist = Math.sqrt(
         (surf.center[0]! - view.origin[0]!) ** 2 +
@@ -714,7 +797,10 @@ export class SoftwareRenderer implements Refresh {
       const m = this.models[e.model];
       if (!m) continue;
       if (m.kind === 'md2' && isAliasMesh(m.data)) {
-        const skin = this.skins[e.skin] ?? (m.fallback ? this.getGunSkin() : devSkin0(worldData));
+        // Missing skin: gun fallback keeps its gunmetal; a real MD2 keeps
+        // an olive-drab soldier tone so a wired-but-skinless monster still
+        // reads as a soldier instead of a checker-textured box.
+        const skin = this.skins[e.skin] ?? (m.fallback ? this.getGunSkin() : this.getSoldierSkin());
         // Real MD2s carry hundreds of frames; wrap game-provided indices.
         const nf = m.data.numFrames > 0 ? m.data.numFrames : 1;
         const fr = ((e.frame % nf) + nf) % nf;

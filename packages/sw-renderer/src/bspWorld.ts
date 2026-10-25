@@ -112,6 +112,7 @@ export function bspToMiniWorld(map: BspMap, opts: BspWorldOptions = {}): MiniWor
         id: f, verts: empty, uvs: new Float32Array(0), lux: new Float32Array(0), n: 0,
         texId: 0, lightId: f, center: new Float32Array(3), radius: 0,
         mins: new Float32Array(3), maxs: new Float32Array(3), turbulent: false,
+        sky: false,
         fn: new Float32Array([0, 0, 1]),
       };
       lightmaps[f] = { samples: new Uint8Array([128, 128, 128]), luxW: 1, luxH: 1, styles: [0, 0, 0, 0] };
@@ -187,6 +188,7 @@ export function bspToMiniWorld(map: BspMap, opts: BspWorldOptions = {}): MiniWor
       mins: bb.mins,
       maxs: bb.maxs,
       turbulent: (flags & SURF_WARP) !== 0,
+      sky: (flags & SURF_SKY) !== 0,
       fn: new Float32Array([
         map.planes[pn * 4]! * sgn,
         map.planes[pn * 4 + 1]! * sgn,

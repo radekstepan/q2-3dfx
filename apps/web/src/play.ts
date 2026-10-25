@@ -48,6 +48,12 @@ import {
   pickupItem,
   triggerTouch,
   moverUse,
+  modelForMonster,
+  skinForMonster,
+  viewModelForWeapon,
+  modelForBolt,
+  skinForBolt,
+  skinForWeaponModel,
 } from '@q2/game';
 import type {
   PmoveState,
@@ -64,7 +70,7 @@ import type {
 import { SV_Init, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, fireTargets } from '@q2/server';
 import type { ServerState } from '@q2/server';
 import { ATTN_NORM, Mixer } from '@q2/sound';
-import { parseWAL, parsePCX } from '@q2/formats';
+import { parseMD2, parseWAL, parsePCX } from '@q2/formats';
 import type { Pcx } from '@q2/formats';
 import { resolveFrame } from '@q2/voodoo';
 import { AngleVectors, v3 } from '@q2/math';
@@ -83,7 +89,7 @@ export type RendererKind = 'software' | 'voodoo';
 // engine produced is unchanged. Registered here (apps/web owns the display
 // path); `getBrightness` treats an absent cvar (e.g. after `resetCVars()` in
 // tests) as the default so headless boots stay deterministic.
-export const BRIGHTNESS_DEFAULT = 1.25;
+export const BRIGHTNESS_DEFAULT = 2.0;
 export const BRIGHTNESS_MIN = 0.5;
 export const BRIGHTNESS_MAX = 2.0;
 
@@ -319,6 +325,25 @@ export interface PlacedMonster {
   lastAttack: number;
 }
 
+/**
+ * One queued beam for the renderer's `spawnTracer` pool: origin + direction
+ * (need not be normalized — the renderer normalizes) + palette-index color +
+ * world-unit length. Queued by the driver in step(), drained by
+ * pumpTracers() before the frame renders. Blaster bolts and shotgun pellets
+ * both travel this path; impact sparks stay on the mini.particles path.
+ */
+export interface TracerBeam {
+  origin: [number, number, number];
+  dir: [number, number, number];
+  color: number;
+  length: number;
+}
+
+/** Full-bright palette index for the blaster bolt beam (matches id's EF_BLASTER look). */
+export const BLASTER_TRACER_COLOR = 225;
+/** Hot orange pellet streak for shotgun/machinegun + monster return fire. */
+export const PELLET_TRACER_COLOR = 208;
+
 interface DoorSync {
   mover: Mover;
   model: number;
@@ -365,6 +390,8 @@ export class LocalDriver implements HostDriver {
   private flashPos: Vec3 = v3();
   /** One-shot pump gate: true only between a shot and its single drain. */
   private flashPending = false;
+  /** Queued tracer beams (see TracerBeam): drained by pumpTracers(). */
+  private tracerQueue: TracerBeam[] = [];
   /** Player death/respawn. */
   private deadUntil = -1;
   private spawnPoints: Array<{ origin: Vec3; yaw: number }> = [];
@@ -523,6 +550,36 @@ export class LocalDriver implements HostDriver {
     return this.flashPos;
   }
 
+  /**
+   * Queue a beam from `origin` along `dir` (unnormalized ok) with palette
+   * `color`, `length` world units. Called for every fired pellet/bolt and
+   * every monster ranged shot; pumpTracers() moves them into the renderer's
+   * spawnTracer pool before the frame renders. Zero-alloc per call aside
+   * from the queue entry itself (capped below).
+   */
+  queueTracer(origin: Vec3, dir: Vec3, color: number, length: number): void {
+    if (this.tracerQueue.length >= 64) this.tracerQueue.shift();
+    this.tracerQueue.push({
+      origin: [origin[0]!, origin[1]!, origin[2]!],
+      dir: [dir[0]!, dir[1]!, dir[2]!],
+      color: color & 255,
+      length,
+    });
+  }
+
+  /** Live queued beams (observability, test hook). */
+  get pendingTracers(): number {
+    return this.tracerQueue.length;
+  }
+
+  /** Drain the queued beams (pumpTracers moves them to the renderer). */
+  drainTracers(): TracerBeam[] {
+    if (this.tracerQueue.length === 0) return [];
+    const out = this.tracerQueue;
+    this.tracerQueue = [];
+    return out;
+  }
+
   hudAmmo(): string {
     if (!this.weapon.ammoKind) return '∞';
     return String(this.weapon.ammoKind === 'shells' ? this.shells : this.bullets);
@@ -655,6 +712,14 @@ export class LocalDriver implements HostDriver {
       } else if (choice === 'shotgun' || choice === 'blaster' || choice === 'chaingun' || choice === 'grenade') {
         // Tracer: hit chance falls with range (near ~0.6, mid ~0.25).
         m.lastAttack = this.server.time;
+        // Visible return-fire beam even on a miss (the damage roll below is
+        // independent) — chest to player eye, same path as player tracers.
+        this.queueTracer(
+          from,
+          v3(eye[0]! - from[0]!, eye[1]! - from[1]!, eye[2]! - from[2]!),
+          PELLET_TRACER_COLOR,
+          dist,
+        );
         const pHit = dist < 500 ? 0.6 : 0.25;
         const dmg = choice === 'chaingun' ? 6 : choice === 'grenade' ? 12 : 5;
         this.emitSound(
@@ -922,6 +987,16 @@ export class LocalDriver implements HostDriver {
         eye[1]! + seg[1]! * bestT,
         eye[2]! + seg[2]! * bestT,
       );
+      // Visible beam for every pellet: blaster bolt streak or shotgun-pellet
+      // streak, eye to impact (or full range on a clean miss — the renderer
+      // caps the length). Impact sparks stay on the mini.particles path.
+      const isBlaster = this.weapon.classname === 'weapon_blaster';
+      this.queueTracer(
+        eye,
+        v3(seg[0]! * bestT, seg[1]! * bestT, seg[2]! * bestT),
+        isBlaster ? BLASTER_TRACER_COLOR : PELLET_TRACER_COLOR,
+        Math.max(1, bestT * PELLET_RANGE),
+      );
       if (hitMonster) {
         monsterPain(hitMonster.state, p.damage, this.rand);
         this.events.push(hitMonster.state.dead ? 'kill' : 'hit');
@@ -1067,6 +1142,82 @@ export interface PlayBoot {
   source: 'devroom' | 'pak';
   display: Uint32Array;
   fb565: Uint16Array;
+  /** Real-pak MD2/skin handles (null without a pak). */
+  models: PakModelHandles | null;
+}
+
+/**
+ * Register the real pak MD2 view/monster/bolt models + PCX skins
+ * (TODO(M1.2 follow-up) wiring). Tables come from `@q2/game/assets`
+ * (`modelForMonster`, `viewModelForWeapon`, …), parsing from `@q2/formats`
+ * (`parseMD2`/`parsePCX`), storage from the renderer's `registerModel` MD2
+ * path + `registerSkinData/Pixels`.
+ *
+ * Registration ORDER is the contract: the soldier skin is skin handle 0 and
+ * the soldier mesh is model handle 0, because `Host.renderCurrentView`
+ * hardcodes `model: 0, skin: 0, frame: 0` for every snapshot entity
+ * (packages/host — outside this package's ownership, so per-kind entity
+ * models and a first-person 3D gun entity need a host-contract change).
+ * Until then every monster renders as the soldier mesh/skin, and the
+ * first-person gun stays the 2D `drawViewModel` silhouette (which does vary
+ * per selected weapon). Per-file fallback is the box-critter so one corrupt
+ * lump can never shift later handles or break the boot.
+ */
+export interface PakModelHandles {
+  /** Model handle 0: soldier MD2 (or box-critter fallback). */
+  monster: number;
+  gunner: number;
+  weapons: Record<string, number>;
+  bolt: number;
+  skins: number[];
+}
+
+export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakModelHandles {
+  createDevroom(); // guarantees getDevMesh(0) exists for per-file fallbacks
+  const skins: number[] = [];
+  const ext = refresh as unknown as {
+    registerSkinData?: (name: string, texels: Uint8Array, width: number, height: number) => number;
+  };
+  const loadSkin = (path: string): number => {
+    try {
+      const bytes = tryPakEntry(pak, path);
+      if (bytes && typeof ext.registerSkinData === 'function') {
+        const pcx = parsePCX(bytes);
+        const h = ext.registerSkinData(path, pcx.pixels, pcx.width, pcx.height);
+        skins.push(h);
+        return h;
+      }
+    } catch {
+      /* fall through to the checker fallback */
+    }
+    const h = refresh.registerSkin(path);
+    skins.push(h);
+    return h;
+  };
+  const loadModel = (path: string): number => {
+    try {
+      const bytes = tryPakEntry(pak, path);
+      if (bytes) return refresh.registerModel({ name: path, kind: 'md2', data: parseMD2(bytes) });
+    } catch {
+      /* fall through to the box-critter fallback */
+    }
+    return refresh.registerModel({ name: path, kind: 'md2', data: getDevMesh(0) });
+  };
+  // Soldier first: skin handle 0 + model handle 0 (see contract above).
+  loadSkin(skinForMonster('soldier'));
+  const monster = loadModel(modelForMonster('soldier'));
+  loadSkin(skinForMonster('gunner'));
+  const gunner = loadModel(modelForMonster('gunner'));
+  const weapons: Record<string, number> = {};
+  for (const cls of ['weapon_blaster', 'weapon_shotgun', 'weapon_machinegun']) {
+    const mdl = viewModelForWeapon(cls);
+    if (!mdl) continue;
+    loadSkin(skinForWeaponModel(mdl));
+    weapons[cls] = loadModel(mdl);
+  }
+  loadSkin(skinForBolt());
+  const bolt = loadModel(modelForBolt());
+  return { monster, gunner, weapons, bolt, skins };
 }
 
 export function bootPlay(opts: {
@@ -1115,12 +1266,18 @@ export function bootPlay(opts: {
     /* single-threaded path stays active */
   }
   // Monster placeholder mesh must be handle 0: register before anything else.
-  if (driver.monsters.length > 0) {
+  // With a pak, register the real MD2s + PCX skins (soldier first so the
+  // Host's hardcoded model:0/skin:0 entities render as the real mesh);
+  // without one, keep the procedural box-critter exactly as before.
+  let models: PakModelHandles | null = null;
+  if (opts.pak) {
+    models = registerPakModels(refresh, opts.pak);
+  } else if (driver.monsters.length > 0) {
     createDevroom();
     host.refresh.registerModel({ name: 'monster', kind: 'md2', data: getDevMesh(0) });
   }
   const n = width * height;
-  return { host, driver, refresh, renderer, source: driver.source, display: new Uint32Array(n), fb565: new Uint16Array(n) };
+  return { host, driver, refresh, renderer, source: driver.source, display: new Uint32Array(n), fb565: new Uint16Array(n), models };
 }
 
 /** Resolve the software framebuffer for display (voodoo post chain or direct).
@@ -1171,6 +1328,35 @@ export function pumpMuzzleLight(boot: PlayBoot): boolean {
     color: new Float32Array([1, 0.85, 0.5]),
   });
   return true;
+}
+
+/** Renderer-owned tracer ttl in frames (~0.1s at 60fps). */
+export const TRACER_TTL_FRAMES = 6;
+
+/**
+ * Pump queued driver beams into the renderer's `spawnTracer` pool. Call
+ * before the frame renders (the dom rAF tick does this, next to
+ * pumpMuzzleLight; headless tests call it directly). Feature-detected like
+ * the muzzle pump: without `spawnTracer` the queue is still drained (so it
+ * can never grow across frames) and 0 is returned. Returns beams accepted.
+ */
+export function pumpTracers(boot: PlayBoot): number {
+  const hooks = boot.refresh as unknown as {
+    spawnTracer?: (
+      origin: ArrayLike<number>,
+      dir: ArrayLike<number>,
+      color?: number,
+      length?: number,
+      ttlFrames?: number,
+    ) => boolean;
+  };
+  const queued = boot.driver.drainTracers();
+  if (typeof hooks.spawnTracer !== 'function') return 0;
+  let n = 0;
+  for (const t of queued) {
+    if (hooks.spawnTracer(t.origin, t.dir, t.color, t.length, TRACER_TTL_FRAMES)) n++;
+  }
+  return n;
 }
 
 export interface HudState {
@@ -1232,14 +1418,18 @@ export function drawPlayHud(
 }
 
 /**
- * Weapon view model: PLACEHOLDER 2D `fillRect` gun silhouette bottom-right +
- * muzzle flash rect (NOT the real `v_weap` MD2/skins — blocked on
- * TODO(M1.2 follow-up): nothing loads real `.md2` skins yet, see M3.4/M7.2
- * notes in BRAIN.md; the 3D muzzle dlight is pumped separately via
- * drainFlash()). Drawn post-resolve in HUD space (the software renderer has
- * no screen-space sprite path). Per-weapon body size: blaster 52px,
- * machinegun 66px, shotgun 78px. The caption names the weapon so the
- * placeholder is honest in screenshots.
+ * Weapon view model: 2D `fillRect` gun silhouette bottom-right + muzzle
+ * flash rect. The real `v_weap` MD2s/skins ARE registered now
+ * (`registerPakModels`, handles on `PlayBoot.models`) but the first-person
+ * gun stays 2D: `Host.renderCurrentView` hardcodes `model: 0, skin: 0` for
+ * snapshot entities and has no first-person gun entity path, so a 3D view
+ * model needs a @q2/host contract change (outside apps/web ownership).
+ * Per-weapon body size/shape/caption already differ (blaster 52px,
+ * machinegun 66px, shotgun 78px), so the selected weapon changes the
+ * visible model. The 3D muzzle dlight is pumped separately via
+ * drainFlash(), and bolt/pellet beams via pumpTracers().
+ * Drawn post-resolve in HUD space (the software renderer has no
+ * screen-space sprite path).
  *
  * The silhouette is a side-view breakdown — stepped wooden/polymer stock,
  * receiver with top highlight + bottom shade, thin barrel with muzzle ring,

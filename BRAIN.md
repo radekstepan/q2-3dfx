@@ -454,15 +454,26 @@ done-when:
 - [x] MD2 player model draws with affine triangles + shade dots (MD2-shaped procedural mesh; real `.md2` parse is M1.2's job — data flows through `registerModel`)
 - [x] 1,000 particles cost <1.5 ms at 640×480 (measured 0.16 ms, §11)
 
-### TODO(M3.4) — update 2026-10-25 pm:
-- DONE: `md2ToAliasMesh` + `registerSkinData/Pixels` + `drawTracerBeam`/`spawnTracer`
-  (`packages/sw-renderer`); asset tables + blaster `BoltSpec`/`MuzzleSpec`
-  (`packages/game/src/assets.ts`, `weapons.ts`); baked readable fallback font
-  (`packages/client`); `r_brightness` display-only lift + fps top-right green +
-  select-panel + nicer 2D viewmodel (`apps/web`). Devroom golden `8f61c755` intact.
-- Still open: boot path still registers `getDevMesh(0)` box-critter and renders the
-  2D gun — wire `modelForMonster/viewModelForWeapon` + `registerSkinData` +
-  bolt entity + tracer spawn in `apps/web` boot/driver (suggested M1.3 wiring card).
+### TODO(M3.4) — update 2026-10-25 pm (feedback batch, all landed):
+- DONE: `registerPakModels` (`apps/web/src/play.ts`): boot registers real pak
+- MD2s via `parseMD2` + `registerModel` and PCX skins via `parsePCX` +
+- `registerSkinData` (`modelForMonster`/`skinForMonster`,
+- `viewModelForWeapon`/`skinForWeaponModel`, bolt `modelForBolt`/`skinForBolt`).
+- Soldier skin/mesh are handles 0, matching `Host.renderCurrentView`'s hardcoded
+- `model: 0, skin: 0` snapshot entities — soldiers are no longer cubes. First-person
+- gun stays the 2D silhouette (per-weapon size/shape/caption); a 3D view model
+- needs a `@q2/host` entity-model contract change (no gun-entity path today).
+- DONE: tracer beams — driver `queueTracer`/`drainTracers` queue eye→impact beams
+- for every blaster bolt / shotgun pellet and chest→eye beams for monster return
+- fire; `pumpTracers` moves them into the renderer `spawnTracer` pool (ttl 6 ≈
+- 0.1s), wired into the dom rAF tick. Impact sparks stay on `mini.particles`.
+- DONE (sw-renderer): `SURF_SKY` → `MiniSurf.sky` renders as depth-tested
+- `SPAN_FLAT` in the bluest-bright palette entry (no more orange checker cube,
+- no edge lines), sky exempt from backface cull; `SPAN_FLAT` handled in classic,
+- banded, and wasm backends. Missing-skin MD2s fall back to olive-drab
+- `createSoldierSkin` + `createSoldierMesh` (never a cube). Devroom golden
+- `8f61c755` intact.
+- Open: per-monster mesh/skin selection (all monsters share soldier handle 0).
 
 ### M4.1 — Voodoo resolve chain
 owns: `packages/voodoo`
@@ -514,14 +525,19 @@ done-when:
 
 ### TODO(M6.1): `CL_Predict` pmove hookup DONE (headless `pmoveFull` replay
 ### behind `cl_predict`, exact-match vs server, legacy fallback preserved).
+### Movement interpolation DONE 2026-10-25 (feedback batch): `Host.frame` ticked
+### the server at 10Hz but `renderCurrentView` rendered the stepped `playerOrigin`
+### while angles came fresh from `lastCmd` every frame — position slideshow, smooth
+### look. Fixed in `@q2/host`: render at continuous `serverTime + serverAcc` with
+### the local origin from `predictor.renderEntities` (constant-velocity sweep per
+### tick); 10Hz sim untouched. Regression test in `host.test.ts`.
 ### Remaining (confirmed real pak0.pak play-test 2026-10-25):
 ### - HUD font: baked readable 8×8 fallback DONE (`packages/client`); real
 ###   `pics/conchars.pcx` loads via `loadConcharsFont`/`setConcharsFont` when the pak
 ###   is present (devroom + base1 both legible now).
-### - Brightness: `r_brightness` (0.5–2.0, default 1.25) DONE (`apps/web`,
-###   display-only post-resolve scale; 1.0 byte-identical, HUD unclipped). Original
-###   game data untouched — numbers on the right only, per request. Dark default is
-###   now tunable, not hardcoded.
+### - Brightness: `r_brightness` (0.5–2.0, default 2.0 since 2026-10-25 feedback)
+###   DONE (`apps/web`, display-only post-resolve scale; 1.0 byte-identical, HUD
+###   unclipped). Original game data untouched — numbers on the right only, per request.
 ### - Muzzle dlight leaks: `drainFlash` (`apps/web/src/play.ts:456`) doesn't consume
 ###   and `pumpMuzzleLight` (`:1035`) `testAddDynamicLight`s every tick with no
 ###   `testClearDynamicLights`, so lights accumulate and the scene stays bright.
@@ -593,6 +609,12 @@ done-when:
 Out of scope (later cards): monster pathfinding (M5.3 full AI), plats/trains
 riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 ### TODO(M7.2 follow-up)
+- Combat damage verified 2026-10-25 (feedback: "not losing health" did not
+- reproduce): headless devroom + real-base1 + full `Host.frame` runs all deal
+- damage end-to-end; contract pinned by `packages/game/src/monster-combat.test.ts`.
+- If still seen in a live build, suspects are outside `@q2/game`: sticky `exited`
+- (post-exit invincibility — `respawn()` never clears it), genuinely blocked LOS,
+- already-dead soldier, or encounter beyond 1000u.
 - Spawn correctness fix landed here: `spawnFromLump` skips targeted
   `info_player_start` (id SP `SelectSpawnPoint` rule) — base1's lump leads
   with a `targetname "base2"` start over the exit pit that used to spawn the

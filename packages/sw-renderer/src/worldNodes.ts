@@ -56,6 +56,13 @@ export interface MiniSurf {
   maxs: Float32Array;
   turbulent: boolean;
   /**
+   * Sky surface (SURF_SKY): drawn as a flat-shaded fill with no texture,
+   * lightmap, or surface-cache entry, and exempt from backface culling
+   * (sky hulls face outward). ref_soft drew scrolling sky layers here;
+   * the flat fill is the minimal faithful stand-in.
+   */
+  sky: boolean;
+  /**
    * Front-side normal (plane normal corrected for planeback, or the
    * geometric normal for procedural surfs). Used for backface culling;
    * sign only matters.

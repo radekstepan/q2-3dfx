@@ -226,7 +226,7 @@ export function setRendererChoice(kind: string): void {
 
 import type { Host } from '@q2/host';
 import type { LocalDriver, PlayBoot } from './play.js';
-import { drawPlayHud, pumpMuzzleLight, resolveDisplay } from './play.js';
+import { drawPlayHud, pumpMuzzleLight, pumpTracers, resolveDisplay } from './play.js';
 import { attachToCanvas } from '@q2/input/dom';
 import { readPakEntry, findPakSoundEntry } from './pak.js';
 import type { Mixer, MixedChannel } from '@q2/sound';
@@ -423,8 +423,9 @@ export function startPlayLoop(
       if (dt > 0) fps += (1000 / dt - fps) * 0.05;
     }
     lastT = nowMs;
-    // Muzzle dlight must be registered before the renderer draws the frame.
+    // Muzzle dlight + tracer beams must be registered before the renderer draws the frame.
     pumpMuzzleLight(boot);
+    pumpTracers(boot);
     host.frame(nowMs);
     const target = resolveDisplay(boot);
     drawPlayHud(
