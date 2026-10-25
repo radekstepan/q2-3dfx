@@ -2,8 +2,19 @@
 //
 // The server ticks at 10Hz (BRAIN.md §5). The client renders uncapped:
 // remote entities are lerped between the last two snapshots, and the local
-// player is extrapolated forward from the newest snapshot so input feels
+// player is predicted forward from the newest snapshot so input feels
 // immediate. All math is pure (headless-testable); time is seconds.
+//
+// Local-player prediction replays the owned (unacked) usercmd stream through
+// the real headless pmove step from @q2/game (`pmoveFull`, the same code path
+// the server runs: `PM_StepSlideMove`, accel, friction, gravity). `dt` comes
+// ONLY from `cmd.msec` — never wall-clock (`level.time` semantics). When
+// `cl_predict` is 0, or no owned cmds are supplied, prediction falls back to
+// the legacy constant-velocity extrapolation so the two modes can be A/B'd.
+// Interpolation of remote entities is untouched by the pmove hookup.
+
+import { getCVarNumber } from '@q2/config';
+import { makePmoveState, pmoveFull } from '@q2/game';
 
 export type Origin3 = [number, number, number];
 
@@ -18,6 +29,19 @@ export interface EntityState {
 export interface Snapshot {
   serverTime: number;
   entities: EntityState[];
+}
+
+/** Owned input cmd to replay through pmove (headless `usercmd_t` subset). */
+export interface PredictCmd {
+  /** command duration in ms; ONLY source of dt (id clamps 1..200ms) */
+  msec: number;
+  /** view angles [pitch, yaw, roll] in degrees */
+  angles: Origin3;
+  forwardmove: number;
+  sidemove: number;
+  upmove: number;
+  /** bitmask: 1=attack, 2=use, 4=jump ... */
+  buttons: number;
 }
 
 /** Constant-velocity extrapolation: origin + velocity * dt. */
@@ -79,13 +103,55 @@ export function CL_Interpolate(prev: Snapshot, next: Snapshot, renderTime: numbe
 }
 
 /**
- * `CL_Predict`: extrapolate the local player forward from the newest
- * snapshot by `dt` seconds (constant velocity; pmove accel is applied by
- * @q2/game when available). Returns the predicted origin.
+ * `CL_PredictPmove`: replay the owned cmd stream through the real headless
+ * pmove step (`pmoveFull` from @q2/game — same `PM_StepSlideMove` code path
+ * as the server, same injected world trace hooks). Returns the predicted
+ * origin, or null for unknown ids / empty streams.
  */
-export function CL_Predict(newest: Snapshot, localId: number, dt: number): Origin3 | null {
+export function CL_PredictPmove(base: Snapshot, localId: number, cmds: PredictCmd[]): Origin3 | null {
+  const ent = base.entities.find((e) => e.id === localId);
+  if (!ent || cmds.length === 0) return null;
+  const st = makePmoveState();
+  st.origin[0] = ent.origin[0];
+  st.origin[1] = ent.origin[1];
+  st.origin[2] = ent.origin[2];
+  st.velocity[0] = ent.velocity[0];
+  st.velocity[1] = ent.velocity[1];
+  st.velocity[2] = ent.velocity[2];
+  if (ent.angles) {
+    st.viewAngles[0] = ent.angles[0];
+    st.viewAngles[1] = ent.angles[1];
+    st.viewAngles[2] = ent.angles[2];
+  }
+  for (const c of cmds) {
+    pmoveFull(st, {
+      msec: c.msec,
+      angles: new Float32Array(c.angles),
+      forwardmove: c.forwardmove,
+      sidemove: c.sidemove,
+      upmove: c.upmove,
+      buttons: c.buttons,
+    });
+  }
+  return [st.origin[0]!, st.origin[1]!, st.origin[2]!];
+}
+
+/**
+ * `CL_Predict`: predict the local player from the newest snapshot.
+ *
+ * When owned cmds are supplied AND `cl_predict` is nonzero, the cmds are
+ * replayed through the real pmove step. Otherwise (no cmds, `cl_predict`
+ * 0, or unknown id) it falls back to constant-velocity extrapolation
+ * `origin + velocity * dt` (legacy A/B baseline). Returns null only for
+ * unknown ids.
+ */
+export function CL_Predict(newest: Snapshot, localId: number, dt: number, cmds?: PredictCmd[]): Origin3 | null {
   const ent = newest.entities.find((e) => e.id === localId);
   if (!ent) return null;
+  if (cmds && cmds.length > 0 && getCVarNumber('cl_predict') !== 0) {
+    const moved = CL_PredictPmove(newest, localId, cmds);
+    if (moved) return moved;
+  }
   return extrapolateOrigin(ent.origin, ent.velocity, dt);
 }
 
@@ -94,6 +160,18 @@ export class Predictor {
   prev: Snapshot | null = null;
   next: Snapshot | null = null;
   interpDelay = 0.1;
+  /** Owned (unacked) cmds to replay through pmove for the local player. */
+  private pendingCmds: PredictCmd[] = [];
+
+  /** Stage the owned cmd stream since the newest acked snapshot. */
+  setPendingCmds(cmds: PredictCmd[]): void {
+    this.pendingCmds = [...cmds];
+  }
+
+  /** Drop the staged owned cmds (e.g. on snapshot ack / teleport). */
+  clearPendingCmds(): void {
+    this.pendingCmds = [];
+  }
 
   pushSnapshot(snap: Snapshot): void {
     if (this.next && snap.serverTime < this.next.serverTime) return; // out of order
@@ -112,7 +190,10 @@ export class Predictor {
     // Override the local player with the prediction (no interp lag on self).
     if (this.next) {
       const dt = Math.max(0, now - this.next.serverTime);
-      const predicted = CL_Predict(this.next, localId, dt);
+      const predicted =
+        this.pendingCmds.length > 0
+          ? CL_Predict(this.next, localId, dt, this.pendingCmds)
+          : CL_Predict(this.next, localId, dt);
       if (predicted) {
         const slot = ents.find((e) => e.id === localId);
         if (slot) slot.origin = predicted;

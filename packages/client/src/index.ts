@@ -7,9 +7,10 @@ export {
   renderTimeFor,
   CL_Interpolate,
   CL_Predict,
+  CL_PredictPmove,
   Predictor,
 } from './prediction.js';
-export type { Origin3, EntityState, Snapshot, InterpolatedEntity } from './prediction.js';
+export type { Origin3, EntityState, Snapshot, InterpolatedEntity, PredictCmd } from './prediction.js';
 export {
   GLYPH_W,
   GLYPH_H,

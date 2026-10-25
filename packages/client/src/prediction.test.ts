@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
+import { setCVar } from '@q2/config';
+import { makePmoveState, pmove, resetPmoveWorld } from '@q2/game';
 import {
   CL_Interpolate,
   CL_Predict,
+  CL_PredictPmove,
   extrapolateOrigin,
   interpFraction,
   lerpOrigin,
   Predictor,
 } from './prediction.js';
-import type { Snapshot } from './prediction.js';
+import type { PredictCmd, Snapshot } from './prediction.js';
 
 const snap = (t: number, x: number): Snapshot => ({
   serverTime: t,
@@ -71,5 +74,118 @@ describe('interp math (10Hz samples -> smooth render origins)', () => {
     p.pushSnapshot(snap(0.1, 10));
     p.pushSnapshot(snap(0, 0));
     expect(p.next!.serverTime).toBe(0.1);
+  });
+});
+
+describe('pmove prediction (TODO(M6.1) hookup)', () => {
+  /** Deterministic recorded cmd stream: run, strafe, jump, variable msec. */
+  const recordedCmds = (): PredictCmd[] => {
+    const cmds: PredictCmd[] = [];
+    let yaw = 0;
+    for (let i = 0; i < 120; i++) {
+      yaw += 1.5;
+      cmds.push({
+        msec: 8 + ((i * 37) % 25), // 8..32ms, dt from msec only (level.time semantics)
+        angles: [0, yaw % 360, 0],
+        forwardmove: i % 3 === 0 ? 0 : 400,
+        sidemove: i % 4 === 0 ? 200 : 0,
+        upmove: i === 10 || i === 60 ? 200 : 0, // two jumps
+        buttons: 0,
+      });
+    }
+    return cmds;
+  };
+
+  it('predicted origins match server pmove for a recorded cmd stream', () => {
+    resetPmoveWorld(); // empty world: same default trace hooks both sides
+    setCVar('cl_predict', 1);
+    try {
+      const cmds = recordedCmds();
+      // "Server": authoritative pmove from the snapshot state.
+      const server = makePmoveState();
+      for (const c of cmds) {
+        pmove(server, {
+          msec: c.msec,
+          angles: new Float32Array(c.angles),
+          forwardmove: c.forwardmove,
+          sidemove: c.sidemove,
+          upmove: c.upmove,
+          buttons: c.buttons,
+        });
+      }
+      const base: Snapshot = {
+        serverTime: 1.0,
+        entities: [{ id: 1, origin: [0, 0, 0], velocity: [0, 0, 0] }],
+      };
+      const predicted = CL_Predict(base, 1, 999, cmds);
+      expect(predicted).not.toBeNull();
+      // Exact float equality: both sides copy the same Float32 pmove state.
+      expect(predicted).toEqual([server.origin[0], server.origin[1], server.origin[2]]);
+      // And it must have actually moved (not a vacuous pass).
+      expect(Math.abs(predicted![0]) + Math.abs(predicted![1])).toBeGreaterThan(0);
+    } finally {
+      setCVar('cl_predict', 1);
+      resetPmoveWorld();
+    }
+  });
+
+  it('cl_predict 0 falls back to constant velocity (A/B baseline)', () => {
+    resetPmoveWorld();
+    setCVar('cl_predict', 0);
+    try {
+      const base: Snapshot = {
+        serverTime: 1.0,
+        entities: [{ id: 1, origin: [100, 0, 0], velocity: [10, 0, 0] }],
+      };
+      const cmds = recordedCmds();
+      // Gate off: identical call must equal legacy extrapolation...
+      const gated = CL_Predict(base, 1, 0.05, cmds);
+      expect(gated).toEqual(extrapolateOrigin(base.entities[0]!.origin, base.entities[0]!.velocity, 0.05));
+      // ...and differ from the real pmove result (accel/friction apply).
+      setCVar('cl_predict', 1);
+      const moved = CL_Predict(base, 1, 0.05, cmds);
+      expect(moved).not.toEqual(gated);
+    } finally {
+      setCVar('cl_predict', 1);
+      resetPmoveWorld();
+    }
+  });
+
+  it('Predictor replays pending cmds and keeps interpolation of remotes', () => {
+    resetPmoveWorld();
+    setCVar('cl_predict', 1);
+    try {
+      const p = new Predictor();
+      p.pushSnapshot({ serverTime: 0, entities: [{ id: 1, origin: [0, 0, 0], velocity: [0, 0, 0] }] });
+      p.pushSnapshot({ serverTime: 0.1, entities: [{ id: 1, origin: [0, 0, 0], velocity: [0, 0, 0] }] });
+      const cmds = recordedCmds();
+      p.setPendingCmds(cmds);
+      const ents = p.renderEntities(0.1, 1);
+      // Server reference for the same stream.
+      const server = makePmoveState();
+      for (const c of cmds) {
+        pmove(server, {
+          msec: c.msec,
+          angles: new Float32Array(c.angles),
+          forwardmove: c.forwardmove,
+          sidemove: c.sidemove,
+          upmove: c.upmove,
+          buttons: c.buttons,
+        });
+      }
+      expect(ents[0]!.origin).toEqual([server.origin[0], server.origin[1], server.origin[2]]);
+      // Clearing the queue restores legacy constant-velocity (dt=0 -> snapshot origin).
+      p.clearPendingCmds();
+      const held = p.renderEntities(0.1, 1);
+      expect(held[0]!.origin).toEqual([0, 0, 0]);
+    } finally {
+      setCVar('cl_predict', 1);
+      resetPmoveWorld();
+    }
+  });
+
+  it('CL_PredictPmove returns null for unknown ids / empty streams', () => {
+    expect(CL_PredictPmove(snap(1.0, 0), 999, recordedCmds())).toBeNull();
+    expect(CL_PredictPmove(snap(1.0, 0), 1, [])).toBeNull();
   });
 });

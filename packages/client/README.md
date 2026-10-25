@@ -6,7 +6,7 @@ Client-side frame logic: prediction, interpolation, view, HUD, console. Ports id
 
 Entry point: `src/index.ts` (re-exports `prediction.ts`, `hud.ts`, `statusbar.ts`, `console.ts`).
 
-- Prediction (`src/prediction.ts`): `CL_Predict(newest, localId, dt)` (`:86`) — extrapolate the local player; `CL_Interpolate(prev, next, renderTime)` (`:63`) — lerp entities present in both snapshots, hold the rest; `interpFraction` (`:44`), `renderTimeFor` (`:50`), `extrapolateOrigin`/`lerpOrigin`/`clamp01`, stateful `Predictor` (`:93`, keeps last two snapshots, overrides self with prediction), types `Origin3`, `EntityState`, `Snapshot`, `InterpolatedEntity`.
+- Prediction (`src/prediction.ts`): `CL_Predict(newest, localId, dt, cmds?)` (`:86`) — owned-cmd replay through the real `pmoveFull` step from `@q2/game` when `cmds` are staged and `cl_predict` is nonzero, else constant-velocity extrapolation (A/B baseline); `CL_PredictPmove(base, localId, cmds)` — the raw pmove replay; `Predictor` (`:93`, keeps last two snapshots, overrides self with prediction, `setPendingCmds`/`clearPendingCmds` stage the unacked stream); `CL_Interpolate(prev, next, renderTime)` (`:63`) — lerp entities present in both snapshots, hold the rest (untouched by the pmove hookup); `interpFraction` (`:44`), `renderTimeFor` (`:50`), `extrapolateOrigin`/`lerpOrigin`/`clamp01`, types `Origin3`, `EntityState`, `Snapshot`, `InterpolatedEntity`, `PredictCmd`.
 - HUD (`src/hud.ts`): `makeConcharsFont` (`:17`) — deterministic procedural 8x8 font so text works without `pics/conchars.pcx`; `set/getConcharsFont`, `drawChar` (`:65`), `drawString` (`:88`), `stringWidth`, `fillRect` (`:109`); constants `GLYPH_W`/`GLYPH_H` (`:9`), `CONCHARS_COUNT` (`:11`); types `ConcharsFont`, `BlitSurface`.
 - Statusbar (`src/statusbar.ts`): `CS_STATUSBAR = 5` (`:8`); `tokenizeLayout` (`:29`), `parseStatusbar` (`:65`) — layout script → `StatusOp[]`; `Configstrings` (`:124`) with `.statusbar()` parsing the `CS_STATUSBAR` slot.
 - Console (`src/console.ts`): `GameConsole` (`:32`) — `print`/`toggle`/`exec` with `help echo clear list get set toggle` wired to `@q2/config` cvars; `CONSOLE_MAX_LINES = 256` (`:5`).
@@ -31,5 +31,5 @@ con.exec('set cl_predict 1');
 
 ## Constraints
 
-- Dependency direction: `client` may depend on `@q2/renderer-api`, `@q2/input`, `@q2/sound`, `@q2/config`; only `@q2/host` may depend on it.
+- Dependency direction: `client` may depend on `@q2/renderer-api`, `@q2/input`, `@q2/sound`, `@q2/config`, `@q2/game` (headless `pmoveFull` step for prediction only — no world sim, no rendering); only `@q2/host` may depend on it.
 - Platform: DOM-free. HUD blits into a `Framebuffer | BlitSurface` (`src/hud.ts:60`); the web shell owns all DOM/canvas work.
