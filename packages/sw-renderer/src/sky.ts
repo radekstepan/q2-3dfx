@@ -102,6 +102,38 @@ export function skyUvForDir(
 }
 
 /**
+ * Skybox (u, v) for direction d forced onto box face `face` (no per-vertex
+ * face selection). Used to rasterise one world-sky fragment with a single
+ * tile so span interpolation can never sweep across tile boundaries (the
+ * black-lava streak: bk/lf black bands dragged over orange faces). Same
+ * box_vecs projection as skyUvForDir, tile from SKY_SIDE_IMAGE[face].
+ */
+export function skyUvOnFace(
+  dx: number, dy: number, dz: number,
+  face: number,
+  tileW: number, tileH: number,
+  out: { u: number; v: number },
+): { u: number; v: number } {
+  const axes = SKY_FACE_AXES[face]!;
+  const dom = Math.abs(face === 0 || face === 2 ? dz : face === 1 || face === 4 ? dx : dy);
+  if (!(dom > 1e-9)) {
+    out.u = tileW / 2;
+    out.v = SKY_SIDE_IMAGE[face]! * tileH + tileH / 2;
+    return out;
+  }
+  const inv = 1 / dom;
+  const su = (dx * axes[0]! + dy * axes[1]! + dz * axes[2]!) * inv;
+  const tv = (dx * axes[3]! + dy * axes[4]! + dz * axes[5]!) * inv;
+  const eps = 1 / 256;
+  const cu = su * 0.5 + 0.5;
+  const cv = tv * 0.5 + 0.5;
+  out.u = Math.min(Math.max(cu * tileW, 0), tileW - eps);
+  const lv = Math.min(Math.max(cv * tileH, 0), tileH - eps);
+  out.v = SKY_SIDE_IMAGE[face]! * tileH + lv;
+  return out;
+}
+
+/**
  * Fill `out` (2*n floats) with packed-strip UVs for n world vertices
  * relative to the camera origin. Scratch for the frame sky path.
  */

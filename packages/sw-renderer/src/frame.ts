@@ -34,7 +34,7 @@ import {
 import { buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, createSoldierMesh, createSoldierSkin, md2ToAliasMesh, type AliasMesh } from './alias.js';
 import { drawAliasInstance } from './alias.js';
 import { drawTracerBeam, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE, TRACER_CORE_COLOR } from './tracer.js';
-import { computeSkyUvs, isValidSkySize } from './sky.js';
+import { isValidSkySize, skyFaceForDir, skyUvOnFace } from './sky.js';
 import { AngleVectors } from '@q2/math';
 import { drawSprite } from './sprites.js';
 import { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
@@ -167,6 +167,10 @@ export class SoftwareRenderer implements Refresh {
   private skyTex: { width: number; height: number; texels: Uint8Array } | null = null;
   /** Per-vertex skybox UV scratch (grown on demand, reused per frame). */
   private skyUv = new Float32Array(64);
+  /** Single-triangle sky fragment scratch (face-consistent sampling). */
+  private skyTriVerts = new Float32Array(9);
+  private skyTriUv = new Float32Array(6);
+  private skyTriLux = new Float32Array(6);
   /** Renderer-owned tracer beams (spawnTracer ring, fixed pool, zero alloc). */
   private tracerSegs = new Float32Array(TRACER_POOL_SIZE * 6);
   private tracerColors = new Uint8Array(TRACER_POOL_SIZE);
@@ -684,51 +688,77 @@ export class SoftwareRenderer implements Refresh {
       if (surf.sky) {
         const sky = this.skyTex;
         if (sky) {
-          // Textured skybox sample (faithful D_SkySurf): per-vertex
-          // skybox-face UVs from the view-locked box mapping (sky.ts),
-          // drawn as unlit perspective spans (colormap grade 63 is the
-          // identity row — no lightmap, like id) while still bypassing
-          // the surface cache. Static per view direction: ref_soft never
-          // reads skyrotate/skyaxis, so time plays no role.
-          const need = surf.n * 2;
-          if (this.skyUv.length < need) this.skyUv = new Float32Array(need);
-          computeSkyUvs(surf.verts, surf.n,
-            cam.origin[0]!, cam.origin[1]!, cam.origin[2]!,
-            sky.width, sky.height / 6, this.skyUv);
-          this.polyInput.verts = surf.verts;
-          this.polyInput.uvs = this.skyUv;
-          this.polyInput.lux = surf.lux;
-          this.polyInput.n = surf.n;
-          const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
-          if (nproj < 3) { if (d) d.clipRejected++; continue; }
-          const start = this.spanList.count;
-          const endCount = emitSpansForPoly(
-            this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
-          );
-          if (endCount <= start) { if (d) d.clipRejected++; continue; }
-          for (let i = start; i < endCount; i++) {
-            const sp = this.pool[i]!;
-            sp.kind = SPAN_OPAQUE;
-            sp.ord = order;
-            sp.light = 63;
-            sp.dlight = 0;
-            sp.lv = -1;
-          }
-          sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
-          this.spanList.count = endCount;
+          // Textured skybox sample (faithful D_SkySurf): the world sky poly
+          // is NEVER interpolated across box faces. id discards SURF_SKY and
+          // emits 6 single-face box quads (R_EmitSkyBox); interpolating
+          // packed-strip UVs across a multi-face world quad sweeps through
+          // unrelated tiles (the black bk/lf bands over orange = lava).
+          // So: fan-triangulate the world poly and rasterise each triangle
+          // with ONE face (centroid ray), all 3 UVs from skyUvOnFace. Same
+          // view-locked box mapping per face, unlit grade 63, cache-free.
+          const tileH = sky.height / 6;
+          const ox = cam.origin[0]!, oy = cam.origin[1]!, oz = cam.origin[2]!;
+          const tmp = { u: 0, v: 0 };
           texView.width = sky.width;
           texView.height = sky.height;
           texView.texels = sky.texels;
-          const before = this.backend.pixelsDrawn;
-          this.backend.drawSpans(this.spanList, texView, lightView);
-          candidatePixels += this.backend.pixelsDrawn - before;
-          this.spanList.count = 0;
-          spansEmitted += endCount - start;
-          if (d) {
-            d.emitted++;
-            const batchSpans = endCount - start;
-            if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
+          let emittedAny = false;
+          const v0x = surf.verts[0]!, v0y = surf.verts[1]!, v0z = surf.verts[2]!;
+          for (let ti = 1; ti + 1 < surf.n; ti++) {
+            const ax = surf.verts[ti * 3]!, ay = surf.verts[ti * 3 + 1]!, az = surf.verts[ti * 3 + 2]!;
+            const bx = surf.verts[(ti + 1) * 3]!, by = surf.verts[(ti + 1) * 3 + 1]!, bz = surf.verts[(ti + 1) * 3 + 2]!;
+            // Centroid ray picks the single box face for this fragment.
+            const cx = (v0x + ax + bx) / 3 - ox;
+            const cy = (v0y + ay + by) / 3 - oy;
+            const cz = (v0z + az + bz) / 3 - oz;
+            const face = skyFaceForDir(cx, cy, cz);
+            this.skyTriVerts[0] = v0x; this.skyTriVerts[1] = v0y; this.skyTriVerts[2] = v0z;
+            this.skyTriVerts[3] = ax; this.skyTriVerts[4] = ay; this.skyTriVerts[5] = az;
+            this.skyTriVerts[6] = bx; this.skyTriVerts[7] = by; this.skyTriVerts[8] = bz;
+            skyUvOnFace(v0x - ox, v0y - oy, v0z - oz, face, sky.width, tileH, tmp);
+            this.skyTriUv[0] = tmp.u; this.skyTriUv[1] = tmp.v;
+            skyUvOnFace(ax - ox, ay - oy, az - oz, face, sky.width, tileH, tmp);
+            this.skyTriUv[2] = tmp.u; this.skyTriUv[3] = tmp.v;
+            skyUvOnFace(bx - ox, by - oy, bz - oz, face, sky.width, tileH, tmp);
+            this.skyTriUv[4] = tmp.u; this.skyTriUv[5] = tmp.v;
+            // Lux unused for sky (grade 63 unlit); carry zeros.
+            this.skyTriLux[0] = 0; this.skyTriLux[1] = 0;
+            this.skyTriLux[2] = 0; this.skyTriLux[3] = 0;
+            this.skyTriLux[4] = 0; this.skyTriLux[5] = 0;
+            this.polyInput.verts = this.skyTriVerts;
+            this.polyInput.uvs = this.skyTriUv;
+            this.polyInput.lux = this.skyTriLux;
+            this.polyInput.n = 3;
+            const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
+            if (nproj < 3) continue;
+            const start = this.spanList.count;
+            const endCount = emitSpansForPoly(
+              this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
+            );
+            if (endCount <= start) continue;
+            for (let i = start; i < endCount; i++) {
+              const sp = this.pool[i]!;
+              sp.kind = SPAN_OPAQUE;
+              sp.ord = order;
+              sp.light = 63;
+              sp.dlight = 0;
+              sp.lv = -1;
+            }
+            sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+            this.spanList.count = endCount;
+            const before = this.backend.pixelsDrawn;
+            this.backend.drawSpans(this.spanList, texView, lightView);
+            candidatePixels += this.backend.pixelsDrawn - before;
+            this.spanList.count = 0;
+            spansEmitted += endCount - start;
+            emittedAny = true;
+            if (d) {
+              d.emitted++;
+              const batchSpans = endCount - start;
+              if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
+            }
           }
+          if (!emittedAny) { if (d) d.clipRejected++; }
           continue;
         }
         // Sky hull: flat depth-tested fill, no texture / lightmap / cache

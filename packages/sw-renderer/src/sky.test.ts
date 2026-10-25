@@ -248,6 +248,62 @@ describe('textured skybox (setSkyTexture, ref_soft R_EmitSkyBox/D_SkySurf)', () 
     expect(textured.stats.hits).toBe(0);
   });
 
+  it('corner-spanning polys never smear across uninvolved tiles (lava regression)', () => {
+    // A world sky quad straddling the +X/+Z edge has verts in two box-face
+    // pyramids (face 4/rt -> strip tile 0, face 2/up -> strip tile 4).
+    // Old per-vertex UV + perspective interpolation swept v continuously
+    // across the packed strip, dragging tiles 1..3 (incl. the bk black
+    // bands) over orange faces = black lava streaks. Fan-triangulated
+    // single-face sampling (skyUvOnFace per tri centroid) can only ever
+    // emit the fragment's own tile.
+    const tex = stripTexture();
+    const verts = new Float32Array([60, 10, 30, 60, 10, 90, 10, 10, 90, 10, 10, 30]);
+    const world: MiniWorld = {
+      brand: 'miniworld',
+      nodes: [],
+      leafs: [{ cluster: 0, firstSurf: 0, numSurfs: 1 }],
+      pvs: [new Uint8Array([1])],
+      clusterCount: 1,
+      surfaces: [{
+        id: 0, verts,
+        uvs: new Float32Array([0, 0, 64, 0, 64, 64, 0, 64]),
+        lux: new Float32Array([0, 0, 4, 0, 4, 4, 0, 4]),
+        n: 4, texId: 0, lightId: 0,
+        center: new Float32Array([35, 10, 60]), radius: 90,
+        mins: new Float32Array([10, 10, 30]), maxs: new Float32Array([60, 10, 90]),
+        turbulent: false, sky: true,
+        fn: new Float32Array([0, 1, 0]),
+      }],
+      textures: [{ texels: new Uint8Array(16).fill(7), width: 4, height: 4 }],
+      lightmaps: [{ samples: new Uint8Array([128, 128, 128]), luxW: 1, luxH: 1, styles: [0] }],
+      dynamicLights: [],
+      alias: [],
+      sprites: [],
+      particles: [],
+    };
+    const W = 160, H = 120;
+    const fb = createFramebuffer(W, H, true);
+    const r = new SoftwareRenderer();
+    r.init(fb);
+    r.setPalette(skyPalette());
+    r.setSkyTexture(tex);
+    r.beginFrame();
+    r.renderView(
+      {
+        origin: new Float32Array([0, 0, 30]), angles: new Float32Array([0, 0, 0]),
+        fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1),
+      },
+      { name: 'sky-corner', data: world },
+      [],
+    );
+    r.endFrame();
+    const seen = new Set<number>(fb.index!);
+    // Only background 0 + the fragment tiles may appear: never the
+    // in-between strip tiles (30/50/70) nor the far tiles (90/110).
+    for (const px of seen) expect([0, 10, 90]).toContain(px);
+    expect(seen.has(10)).toBe(true);
+  });
+
   it('is stable across frames and view time (ref_soft has no sky scroll)', () => {
     const tex = stripTexture();
     const a = renderSky(-1, { tex, time: 0 });
