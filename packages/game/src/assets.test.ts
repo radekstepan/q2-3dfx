@@ -43,9 +43,9 @@ describe('model/skin asset tables (pak-verified)', () => {
   });
 
   it('monster frames resolve to move first-frames, null when unknown', () => {
-    expect(monsterFrameFor('soldier', 'run')).toBe(3);
-    expect(monsterFrameFor('soldier', 'attack1')).toBe(101);
-    expect(monsterFrameFor('gunner', 'attack_chain')).toBe(209);
+    expect(monsterFrameFor('soldier', 'run')).toBe(99);
+    expect(monsterFrameFor('soldier', 'attack1')).toBe(0);
+    expect(monsterFrameFor('gunner', 'attack_chain')).toBe(137);
     expect(monsterFrameFor('gunner', 'nope')).toBe(null);
   });
 

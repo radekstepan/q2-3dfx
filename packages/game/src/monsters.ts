@@ -46,6 +46,21 @@ function run(name: string, first: number, last: number, end: string, dist = 0, a
   return { name, first, last, frames, end };
 }
 
+/**
+ * Authentic move builder: MD2 frame numbers are id's FRAME_* constants
+ * (m_soldier.h / m_gunner.h), one dist per frame from the mframe_t tables.
+ * `first` is the MD2 index of dists[0]; `last` is derived.
+ */
+function mv(name: string, first: number, dists: number[], end: string, action = 'move'): MonsterMove {
+  return {
+    name,
+    first,
+    last: first + dists.length - 1,
+    frames: dists.map((dist) => ({ dist, action })),
+    end,
+  };
+}
+
 export interface MonsterDef {
   classname: string;
   health: number;
@@ -54,24 +69,28 @@ export interface MonsterDef {
   moves: Record<string, MonsterMove>;
 }
 
-// Frame numbers match the MD2 frame names in the original models.
+// Frame numbers are id's MD2 FRAME_* constants (m_soldier.h / m_gunner.h),
+// NOT name suffixes. Dists are the per-frame ai_move/ai_run/ai_walk/ai_charge
+// values from m_soldier.c / m_gunner.c (origin is 24 above the feet:
+// mins -24, maxs +32 — see MONSTER_HULL_* below).
 export const SOLDIER: MonsterDef = {
   classname: 'monster_soldier',
   health: 30,
   gibHealth: -30,
   mass: 100,
   moves: {
-    stand1: run('stand1', 101, 130, 'stand1'),
-    walk1: run('walk1', 101, 133, 'walk1', 5),
-    start_run: run('start_run', 1, 2, 'run'),
-    run: run('run', 3, 8, 'run', 12),
-    pain1: run('pain1', 101, 105, 'run'),
-    pain2: run('pain2', 201, 207, 'run'),
-    pain3: run('pain3', 301, 318, 'run'),
-    attack1: run('attack1', 101, 112, 'run'), // shotgun
-    attack2: run('attack2', 201, 218, 'run'), // blaster
-    duck: run('duck', 1, 5, 'run'),
-    death1: run('death1', 101, 136, 'dead'),
+    stand1: mv('stand1', 146, new Array(30).fill(0), 'stand1'),
+    walk1: mv('walk1', 215, [3, 6, 2, 2, 2, 1, 6, 5, 3, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 'walk1'),
+    walk2: mv('walk2', 256, [4, 4, 9, 8, 5, 1, 3, 7, 6, 7], 'walk2'),
+    start_run: mv('start_run', 97, [7, 5], 'run'),
+    run: mv('run', 99, [10, 11, 11, 16, 10, 15], 'run'),
+    pain1: mv('pain1', 50, [-3, 4, 1, 1, 0], 'run'),
+    pain2: mv('pain2', 55, [-13, -1, 2, 4, 2, 3, 2], 'run'),
+    pain3: mv('pain3', 62, [-8, 10, -4, -1, -3, 0, 3, 0, 0, 0, 0, 1, 0, 1, 2, 4, 3, 2], 'run'),
+    attack1: mv('attack1', 0, new Array(12).fill(0), 'run'), // shotgun
+    attack2: mv('attack2', 12, new Array(18).fill(0), 'run'), // blaster
+    duck: mv('duck', 45, [5, -1, 1, 0, 5], 'run'),
+    death1: mv('death1', 272, [0, -10, -10, -10, -5, ...new Array(31).fill(0)], 'dead'),
   },
 };
 
@@ -81,19 +100,19 @@ export const GUNNER: MonsterDef = {
   gibHealth: -70,
   mass: 200,
   moves: {
-    stand: run('stand', 1, 30, 'stand'),
-    walk: run('walk', 7, 19, 'walk', 4),
-    run: run('run', 1, 8, 'run', 10),
-    runandshoot: run('runandshoot', 1, 6, 'run', 10, 'fire'),
-    pain1: run('pain1', 101, 118, 'run'),
-    pain2: run('pain2', 201, 208, 'run'),
-    pain3: run('pain3', 301, 305, 'run'),
-    attack_chain: run('attack_chain', 209, 215, 'fire_chain', 0, 'fire'),
-    fire_chain: run('fire_chain', 216, 223, 'refire_chain', 0, 'fire'),
-    endfire_chain: run('endfire_chain', 224, 230, 'run'),
-    attack_grenade: run('attack_grenade', 101, 121, 'run', 0, 'fire'),
-    duck: run('duck', 1, 5, 'run'),
-    death: run('death', 1, 11, 'dead'),
+    stand: mv('stand', 0, new Array(30).fill(0), 'stand'),
+    walk: mv('walk', 76, [0, 3, 4, 5, 7, 2, 6, 4, 2, 7, 5, 7, 4], 'walk'),
+    run: mv('run', 94, [26, 9, 9, 9, 15, 10, 13, 6], 'run'),
+    runandshoot: mv('runandshoot', 102, [32, 15, 10, 18, 8, 20], 'run', 'fire'),
+    pain1: mv('pain1', 159, [2, 0, -5, 3, -1, 0, 0, 0, 0, 1, 1, 2, 1, 0, -2, -2, 0, 0], 'run'),
+    pain2: mv('pain2', 177, [-2, 11, 6, 2, -1, -7, -2, -7], 'run'),
+    pain3: mv('pain3', 185, [-3, 1, 1, 0, 1], 'run'),
+    attack_chain: mv('attack_chain', 137, new Array(7).fill(0), 'fire_chain', 'fire'),
+    fire_chain: mv('fire_chain', 144, new Array(8).fill(0), 'refire_chain', 'fire'),
+    endfire_chain: mv('endfire_chain', 152, new Array(7).fill(0), 'run'),
+    attack_grenade: mv('attack_grenade', 108, new Array(21).fill(0), 'run', 'fire'),
+    duck: mv('duck', 201, [1, 1, 1, 0, -1, -1, 0, -1], 'run'),
+    death: mv('death', 190, [0, 0, 0, -7, -3, -5, 8, 6, 0, 0, 0], 'dead'),
   },
 };
 
@@ -139,9 +158,11 @@ export function monsterThink(ms: MonsterState): string {
 
 // --- locomotion (M7.4 follow-up; the driver moves bodies, think only picks frames) ---
 
-/** Monster hull used to build origin-space locomotion traces (id m_move.c). */
-export const MONSTER_HULL_MINS: Vec3 = v3(-16, -16, 0);
-export const MONSTER_HULL_MAXS: Vec3 = v3(16, 16, 56);
+/** Monster hull in origin space (id m_soldier.c: mins -16,-16,-24 / maxs +16,+16,+32).
+ * The origin sits 24 units above the feet; the MD2 verts span -24..+32 so a
+ * resting origin is floor+24. Feet-space (0..56) sinks models halfway. */
+export const MONSTER_HULL_MINS: Vec3 = v3(-16, -16, -24);
+export const MONSTER_HULL_MAXS: Vec3 = v3(16, 16, 32);
 
 /** Largest downward step a monster sticks to (id STEPSIZE). */
 export const MONSTER_STEP_HEIGHT = 18;

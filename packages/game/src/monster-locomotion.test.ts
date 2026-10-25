@@ -42,13 +42,13 @@ function wallTrace(wallX: number, inner: Trace = openTrace): Trace {
 }
 
 describe('monsterLocomotion (pure, headless)', () => {
-  it('advances toward the player by the current frame dist (run = 12)', () => {
+  it('advances toward the player by the current frame dist (run frame0 = 10)', () => {
     const ms = spawnMonster('soldier');
-    ms.move = 'run'; // dist 12 per frame
+    ms.move = 'run'; // dist 10 on frame 0 (id m_soldier.c)
     ms.frame = 0;
     const origin = v3(0, 0, 0);
     monsterLocomotion(ms, origin, v3(100, 0, 0), floorTrace());
-    expect(origin[0]).toBeCloseTo(12, 6);
+    expect(origin[0]).toBeCloseTo(10, 6);
     expect(origin[1]).toBeCloseTo(0, 6);
     expect(origin[2]).toBeCloseTo(0, 6); // gravity holds the floor
     expect(ms.frame).toBe(0); // locomotion never advances the frame
@@ -61,7 +61,7 @@ describe('monsterLocomotion (pure, headless)', () => {
     const origin = v3(0, 0, 0);
     monsterLocomotion(ms, origin, v3(0, 100, 0), floorTrace());
     expect(origin[0]).toBeCloseTo(0, 6);
-    expect(origin[1]).toBeCloseTo(12, 6);
+    expect(origin[1]).toBeCloseTo(10, 6);
   });
 
   it('stand frames (dist 0) do not translate', () => {
@@ -106,7 +106,8 @@ describe('monsterLocomotion (pure, headless)', () => {
   it('step-downs within the probe stick instead of hovering', () => {
     const ms = spawnMonster('soldier');
     ms.move = 'run';
-    ms.frame = 0;
+    // frame 3 dists 16 clears the x=10 ledge edge (frame0 lands exactly on it)
+    ms.frame = 3;
     const origin = v3(0, 0, 0);
     // ledge: floor drops 10 past x=10 (within MONSTER_STEP_HEIGHT reach)
     const ledge: Trace = (s, e) => {
@@ -114,7 +115,7 @@ describe('monsterLocomotion (pure, headless)', () => {
       return floorTrace(floor)(s, e);
     };
     monsterLocomotion(ms, origin, v3(100, 0, 0), ledge);
-    expect(origin[0]).toBeCloseTo(12, 6);
+    expect(origin[0]).toBeCloseTo(16, 6);
     // horizontal step stayed level; gravity snapped down to the lower floor
     expect(origin[2]).toBeCloseTo(-10, 6);
   });
