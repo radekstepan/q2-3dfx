@@ -76,6 +76,209 @@ export function createBoxMesh(s = 16): AliasMesh {
   return { frames, normals, numVerts: 8, numFrames: 2, tris, numTris: 12, st };
 }
 
+/**
+ * Structural subset of the `@q2/formats` Md2 parse output that
+ * md2ToAliasMesh needs. Declared locally (no runtime import) so the
+ * conversion stays a pure function of typed arrays; every real Md2 is
+ * assignable to it.
+ */
+export interface Md2Like {
+  skinWidth: number;
+  skinHeight: number;
+  numFrames: number;
+  numVerts: number;
+  numSt: number;
+  numTris: number;
+  /** numSt*2 shorts: (s, t) per st vert, in skin-texel units. */
+  st: Int16Array;
+  /** numTris*3 vertex indices into frames. */
+  trisXyz: Uint16Array;
+  /** numTris*3 st indices into st. */
+  trisSt: Uint16Array;
+  /** numFrames*numVerts*3 decoded positions (v*scale+translate). */
+  frames: Float32Array;
+  /** numFrames*numVerts shade-dot normal indices. */
+  normals: Uint8Array;
+}
+
+/** Lightweight shape check: does `data` look like parsed MD2 output? */
+export function isMd2Data(data: unknown): data is Md2Like {
+  if (!data || typeof data !== 'object') return false;
+  const m = data as Record<string, unknown>;
+  return typeof m.skinWidth === 'number' && typeof m.skinHeight === 'number'
+    && typeof m.numFrames === 'number' && typeof m.numVerts === 'number'
+    && typeof m.numSt === 'number' && typeof m.numTris === 'number'
+    && m.st instanceof Int16Array
+    && m.trisXyz instanceof Uint16Array && m.trisSt instanceof Uint16Array
+    && m.frames instanceof Float32Array && m.normals instanceof Uint8Array;
+}
+
+/** Hard caps mirrored from qcommon/qfiles.h (MD2_MAX_*). */
+export const MD2_CONVERT_MAX_TRIS = 4096;
+export const MD2_CONVERT_MAX_VERTS = 2048;
+export const MD2_CONVERT_MAX_FRAMES = 512;
+
+/**
+ * Convert parsed MD2 output to a renderer AliasMesh.
+ *
+ * MD2 triangles index vertex positions and texture coords independently
+ * (`trisXyz`/`trisSt`), while AliasMesh carries one st per vert — so corners
+ * are welded on the (xyz, st) pair: shared pairs reuse a vert, seam splits
+ * duplicate one. Positions arrive dequantised (`v*scale+translate`) and st
+ * arrives in skin-texel units, clamped to the skin dims. Triangle indices
+ * are range-validated; anything out of range (or insane counts) returns
+ * null and the caller keeps the gun-mesh fallback.
+ *
+ * Register-time only: allocates. The frame loop never calls this.
+ */
+export function md2ToAliasMesh(md2: unknown): AliasMesh | null {
+  if (!isMd2Data(md2)) return null;
+  const { numFrames, numVerts, numSt, numTris, skinWidth, skinHeight } = md2;
+  if (!(numFrames >= 1 && numFrames <= MD2_CONVERT_MAX_FRAMES)) return null;
+  if (!(numVerts >= 1 && numVerts <= MD2_CONVERT_MAX_VERTS)) return null;
+  if (!(numSt >= 1 && numSt <= MD2_CONVERT_MAX_VERTS * 2)) return null;
+  if (!(numTris >= 1 && numTris <= MD2_CONVERT_MAX_TRIS)) return null;
+  if (!(skinWidth >= 1 && skinHeight >= 1)) return null;
+  if (md2.st.length !== numSt * 2) return null;
+  if (md2.trisXyz.length !== numTris * 3 || md2.trisSt.length !== numTris * 3) return null;
+  if (md2.frames.length !== numFrames * numVerts * 3) return null;
+  if (md2.normals.length !== numFrames * numVerts) return null;
+  // Range-check every corner before writing anything.
+  for (let i = 0; i < numTris * 3; i++) {
+    if (md2.trisXyz[i]! >= numVerts || md2.trisSt[i]! >= numSt) return null;
+  }
+  // Weld (xyz, st) pairs across all triangles.
+  const weld = new Map<number, number>();
+  const vertXyz = new Uint16Array(numTris * 3);
+  const vertSt = new Uint16Array(numTris * 3);
+  let nv = 0;
+  for (let i = 0; i < numTris * 3; i++) {
+    const x = md2.trisXyz[i]!, s = md2.trisSt[i]!;
+    const key = x * numSt + s;
+    let w = weld.get(key);
+    if (w === undefined) {
+      w = nv++;
+      weld.set(key, w);
+      vertXyz[w] = x;
+      vertSt[w] = s;
+    }
+  }
+  const tris = new Uint16Array(numTris * 3);
+  for (let i = 0; i < numTris * 3; i++) {
+    tris[i] = weld.get(md2.trisXyz[i]! * numSt + md2.trisSt[i]!)!;
+  }
+  const st = new Float32Array(nv * 2);
+  for (let w = 0; w < nv; w++) {
+    const s = vertSt[w]!;
+    let u = md2.st[s * 2]!, v = md2.st[s * 2 + 1]!;
+    if (u < 0) u = 0; else if (u > skinWidth - 1) u = skinWidth - 1;
+    if (v < 0) v = 0; else if (v > skinHeight - 1) v = skinHeight - 1;
+    st[w * 2] = u;
+    st[w * 2 + 1] = v;
+  }
+  const frames = new Float32Array(numFrames * nv * 3);
+  const normals = new Uint8Array(numFrames * nv);
+  for (let f = 0; f < numFrames; f++) {
+    for (let w = 0; w < nv; w++) {
+      const x = vertXyz[w]!;
+      frames[(f * nv + w) * 3] = md2.frames[(f * numVerts + x) * 3]!;
+      frames[(f * nv + w) * 3 + 1] = md2.frames[(f * numVerts + x) * 3 + 1]!;
+      frames[(f * nv + w) * 3 + 2] = md2.frames[(f * numVerts + x) * 3 + 2]!;
+      normals[f * nv + w] = md2.normals[f * numVerts + x]!;
+    }
+  }
+  return { frames, normals, numVerts: nv, numFrames, tris, numTris, st };
+}
+
+/**
+ * Procedural gun silhouette used as the registerModel fallback for kind
+ * 'md2' when no real data is present (devroom / missing pak): receiver +
+ * barrel + grip + sight, pointing +X, per-face duplicated verts so the
+ * shade dots give flat facet shading. Two frames: frame 1 kicks back 1.5
+ * units (recoil). createBoxMesh is intentionally untouched — the devroom
+ * golden pins its exact pixels.
+ */
+export function createGunMesh(): AliasMesh {
+  const anorms = buildANorms();
+  const best = (x: number, y: number, z: number): number => {
+    let bi = 0, bd = -Infinity;
+    for (let i = 0; i < ANORM_COUNT; i++) {
+      const d = anorms[i * 3]! * x + anorms[i * 3 + 1]! * y + anorms[i * 3 + 2]! * z;
+      if (d > bd) { bd = d; bi = i; }
+    }
+    return bi;
+  };
+  // Face normals in box-local order: -z, +z, -y, +x, +y, -x.
+  const faceNormals = [best(0, 0, -1), best(0, 0, 1), best(0, -1, 0), best(1, 0, 0), best(0, 1, 0), best(-1, 0, 0)];
+  // Box corner offsets, same layout as createBoxMesh.
+  const corners = (cx: number, cy: number, cz: number, sx: number, sy: number, sz: number): number[] => [
+    cx - sx, cy - sy, cz - sz, cx + sx, cy - sy, cz - sz, cx + sx, cy + sy, cz - sz, cx - sx, cy + sy, cz - sz,
+    cx - sx, cy - sy, cz + sz, cx + sx, cy - sy, cz + sz, cx + sx, cy + sy, cz + sz, cx - sx, cy + sy, cz + sz,
+  ];
+  // Faces as corner quads (pairs of tris follow the createBoxMesh table).
+  const faces = [
+    { c: [0, 1, 2, 0, 2, 3], n: 0 }, { c: [4, 6, 5, 4, 7, 6], n: 1 },
+    { c: [0, 4, 5, 0, 5, 1], n: 2 }, { c: [1, 5, 6, 1, 6, 2], n: 3 },
+    { c: [2, 6, 7, 2, 7, 3], n: 4 }, { c: [3, 7, 4, 3, 4, 0], n: 5 },
+  ];
+  // Receiver, barrel, grip, sight (cx, cy, cz, sx, sy, sz).
+  const boxes = [
+    [0, 0, 0, 13, 3.5, 4.5],
+    [20, 0, 1, 8, 1.6, 1.6],
+    [-6, 0, -8, 3, 2.5, 5],
+    [2, 0, 6, 4, 1, 1.5],
+  ];
+  const pos: number[] = [];
+  const nrm: number[] = [];
+  const tri: number[] = [];
+  const uv: number[] = [];
+  for (const [cx, cy, cz, sx, sy, sz] of boxes) {
+    const cn = corners(cx, cy, cz, sx, sy, sz);
+    for (const f of faces) {
+      const base = pos.length / 3;
+      for (const ci of f.c) {
+        pos.push(cn[ci * 3]!, cn[ci * 3 + 1]!, cn[ci * 3 + 2]!);
+        nrm.push(faceNormals[f.n]!);
+        uv.push(ci % 2 === 0 ? 0 : 63, (ci >> 1) % 2 === 0 ? 0 : 63);
+      }
+      for (let k = 0; k < f.c.length; k += 3) {
+        tri.push(base + k, base + k + 1, base + k + 2);
+      }
+    }
+  }
+  const nv = pos.length / 3;
+  const nt = tri.length / 3;
+  const frames = new Float32Array([...pos, ...pos.map((v, i) => (i % 3 === 0 ? v - 1.5 : v))]);
+  return {
+    frames,
+    normals: new Uint8Array([...nrm, ...nrm]),
+    numVerts: nv,
+    numFrames: 2,
+    tris: new Uint16Array(tri),
+    numTris: nt,
+    st: new Float32Array(uv),
+  };
+}
+
+/**
+ * Flat gunmetal skin for the fallback gun mesh (64x64): vertical gradient
+ * with a top highlight row. Indices are palette-relative like every other
+ * skin — any reasonable palette shades it.
+ */
+export function createGunSkin(): { texels: Uint8Array; width: number; height: number } {
+  const w = 64, h = 64;
+  const texels = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let v = 96 + ((y * 44) / (h - 1)) | 0;
+      if (y < 6) v += 34; // top highlight
+      if (x >= 8 && x < 22 && y >= 40) v -= 26; // grip shadow
+      texels[y * w + x] = v & 255;
+    }
+  }
+  return { texels, width: w, height: h };
+}
+
 export interface AliasInstance {
   mesh: AliasMesh;
   origin: Float32Array;
@@ -113,6 +316,7 @@ export function drawAliasInstance(
 ): number {
   const mesh = inst.mesh;
   const nv = mesh.numVerts;
+  ensureAliasScratch(nv);
   // entity basis
   const pitch = (inst.angles[0]! * Math.PI) / 180;
   const yaw = (inst.angles[1]! * Math.PI) / 180;
@@ -174,9 +378,18 @@ export function drawAliasInstance(
   return pixels;
 }
 
-const aliasScratchX = new Float32Array(4096);
-const aliasScratchY = new Float32Array(4096);
-const aliasScratchZ = new Float32Array(4096);
+let aliasScratchX = new Float32Array(4096);
+let aliasScratchY = new Float32Array(4096);
+let aliasScratchZ = new Float32Array(4096);
+
+/** Grow world-vert scratch for meshes larger than the default 4096 verts
+ * (register-time-sized real MD2s). Amortised: allocates only on a new max. */
+function ensureAliasScratch(nv: number): void {
+  if (nv <= aliasScratchX.length) return;
+  aliasScratchX = new Float32Array(nv);
+  aliasScratchY = new Float32Array(nv);
+  aliasScratchZ = new Float32Array(nv);
+}
 const aliasTri: TriVert[] = [
   { x: 0, y: 0, iz: 0, u: 0, v: 0, grade: 0 },
   { x: 0, y: 0, iz: 0, u: 0, v: 0, grade: 0 },

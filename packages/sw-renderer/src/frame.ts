@@ -31,8 +31,10 @@ import {
   BandedSoftwareBackend, createBandBuffers, sabAvailable, workersRequestedByCvar,
   type BandDispatcher,
 } from './bands.js';
-import { buildANorms, buildShadeDots, createBoxMesh, type AliasMesh } from './alias.js';
+import { buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, md2ToAliasMesh, type AliasMesh } from './alias.js';
 import { drawAliasInstance } from './alias.js';
+import { drawTracerBeam, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE } from './tracer.js';
+import { AngleVectors } from '@q2/math';
 import { drawSprite } from './sprites.js';
 import { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
 import { buildColormap, defaultPalette } from './colormap.js';
@@ -97,6 +99,15 @@ export function sortBatchByRow(
 interface RegisteredModel {
   kind: string;
   data: unknown;
+  /** True when data is the procedural gun fallback (unknown md2 payload). */
+  fallback: boolean;
+}
+
+/** Next power of two >= n (n >= 1). */
+export function nextPot(n: number): number {
+  let p = 1;
+  while (p < n) p *= 2;
+  return p;
 }
 
 export class SoftwareRenderer implements Refresh {
@@ -118,6 +129,7 @@ export class SoftwareRenderer implements Refresh {
   private lastDynSerial = 0;
   private models: RegisteredModel[] = [];
   private skins: Texture[] = [];
+  private skinNames: string[] = [];
   private scratch: EdgeScratch = createEdgeScratch(64);
   private pool: Span[] = [];
   private spanList: SpanList = { spans: [], count: 0 };
@@ -137,6 +149,17 @@ export class SoftwareRenderer implements Refresh {
   private partColors = new Uint8Array(256);
   private frame = 0;
   private fallbackMesh = createBoxMesh(20);
+  /** Procedural gun fallback (registerModel md2 without real data). Lazy. */
+  private gunMeshMemo: AliasMesh | null = null;
+  private gunSkinMemo: Texture | null = null;
+  /** Renderer-owned tracer beams (spawnTracer ring, fixed pool, zero alloc). */
+  private tracerSegs = new Float32Array(TRACER_POOL_SIZE * 6);
+  private tracerColors = new Uint8Array(TRACER_POOL_SIZE);
+  private tracerTtl = new Uint8Array(TRACER_POOL_SIZE);
+  private tracerCursor = 0;
+  private tracerFwd = new Float32Array(3);
+  private tracerRight = new Float32Array(3);
+  private tracerUp = new Float32Array(3);
   private lightBlockScratch: Uint8Array = new Uint8Array(0);
   private styleScratch = new Float32Array(8);
   private frameStats: FrameStats = { spans: 0, pixels: 0, overdraw: 0, ms: 0 };
@@ -328,7 +351,21 @@ export class SoftwareRenderer implements Refresh {
   }
 
   registerModel(m: Model): ModelHandle {
-    this.models.push({ kind: m.kind, data: m.data });
+    if (m.kind === 'md2') {
+      // Real data wins: AliasMesh passes through, parsed MD2 output
+      // (frames/normals/st/tris) converts via weld; anything else keeps the
+      // procedural gun silhouette so enemies/weapons stay visible in devroom
+      // instead of vanishing (the old unchecked path drew nothing).
+      if (isAliasMesh(m.data)) {
+        this.models.push({ kind: m.kind, data: m.data, fallback: false });
+      } else {
+        const conv = md2ToAliasMesh(m.data);
+        if (conv) this.models.push({ kind: m.kind, data: conv, fallback: false });
+        else this.models.push({ kind: m.kind, data: this.getGunMesh(), fallback: true });
+      }
+    } else {
+      this.models.push({ kind: m.kind, data: m.data, fallback: false });
+    }
     return this.models.length - 1;
   }
 
@@ -347,7 +384,113 @@ export class SoftwareRenderer implements Refresh {
       }
     }
     this.skins.push({ width: size, height: size, texels });
+    this.skinNames.push(name);
     return this.skins.length - 1;
+  }
+
+  /**
+   * Register real texture data (WAL mip-0 texels or PCX pixels — both are
+   * palette indices): stored directly instead of the checker fallback.
+   * Non-power-of-two dims (e.g. soldier skin 288 wide) are expanded to POT
+   * by edge repeat, since the affine sampler indexes with masks; st stays
+   * in texel units so MD2 coords need no remap. Invalid input falls back
+   * to the checker path and still returns a valid handle — never breaks.
+   * Internal extension: the frozen Refresh keeps registerSkin(name) only.
+   */
+  registerSkinData(name: string, texels: Uint8Array, width: number, height: number): TextureHandle {
+    const ok = Number.isInteger(width) && Number.isInteger(height)
+      && width >= 1 && height >= 1 && width <= 1024 && height <= 1024
+      && texels.length === width * height;
+    if (!ok) return this.registerSkin(name);
+    const pw = nextPot(width), ph = nextPot(height);
+    let owned: Uint8Array;
+    if (pw === width && ph === height) {
+      owned = texels.slice();
+    } else {
+      owned = new Uint8Array(pw * ph);
+      for (let y = 0; y < height; y++) {
+        owned.set(texels.subarray(y * width, (y + 1) * width), y * pw);
+        const edge = texels[y * width + width - 1]!;
+        for (let x = width; x < pw; x++) owned[y * pw + x] = edge;
+      }
+      for (let y = height; y < ph; y++) {
+        owned.set(owned.subarray((height - 1) * pw, height * pw), y * pw);
+      }
+    }
+    this.skins.push({ width: pw, height: ph, texels: owned });
+    this.skinNames.push(name);
+    return this.skins.length - 1;
+  }
+
+  /** PCX-pixel alias of registerSkinData (both are palette indices). */
+  registerSkinPixels(name: string, pixels: Uint8Array, width: number, height: number): TextureHandle {
+    return this.registerSkinData(name, pixels, width, height);
+  }
+
+  /** Procedural gun fallback mesh (registerModel md2 without real data). */
+  getGunMesh(): AliasMesh {
+    if (!this.gunMeshMemo) this.gunMeshMemo = createGunMesh();
+    return this.gunMeshMemo;
+  }
+
+  /** Flat gunmetal skin for the fallback gun mesh. */
+  getGunSkin(): Texture {
+    if (!this.gunSkinMemo) {
+      const g = createGunSkin();
+      this.gunSkinMemo = { width: g.width, height: g.height, texels: g.texels };
+    }
+    return this.gunSkinMemo;
+  }
+
+  /**
+   * Spawn a renderer-owned tracer beam (blaster bolt / shotgun pellet):
+   * origin + direction + length + palette-index color, drawn with a 1/z
+   * depth test for ttlFrames renders, then expires. Fixed pool (ring
+   * overwrite when full), zero allocation. Internal extension — game code
+   * feature-detects it exactly like testAddDynamicLight; entities with a
+   * kind-'tracer' model are the contract-free alternative (see renderView).
+   */
+  spawnTracer(
+    origin: ArrayLike<number>,
+    dir: ArrayLike<number>,
+    color = TRACER_DEFAULT_COLOR,
+    length = TRACER_DEFAULT_LENGTH,
+    ttlFrames = 3,
+  ): boolean {
+    const dx = dir[0] ?? 0, dy = dir[1] ?? 0, dz = dir[2] ?? 0;
+    const len0 = Math.hypot(dx, dy, dz);
+    if (!(len0 > 0)) return false;
+    const inv = 1 / len0;
+    const len = length > 0 ? Math.min(length, 1024) : TRACER_DEFAULT_LENGTH;
+    const ox = origin[0] ?? 0, oy = origin[1] ?? 0, oz = origin[2] ?? 0;
+    let slot = -1;
+    for (let i = 0; i < TRACER_POOL_SIZE; i++) {
+      const s = (this.tracerCursor + i) % TRACER_POOL_SIZE;
+      if (this.tracerTtl[s] === 0) { slot = s; break; }
+    }
+    if (slot < 0) {
+      slot = this.tracerCursor;
+      this.tracerCursor = (this.tracerCursor + 1) % TRACER_POOL_SIZE;
+    } else {
+      this.tracerCursor = (slot + 1) % TRACER_POOL_SIZE;
+    }
+    const o = slot * 6;
+    this.tracerSegs[o] = ox;
+    this.tracerSegs[o + 1] = oy;
+    this.tracerSegs[o + 2] = oz;
+    this.tracerSegs[o + 3] = ox + dx * inv * len;
+    this.tracerSegs[o + 4] = oy + dy * inv * len;
+    this.tracerSegs[o + 5] = oz + dz * inv * len;
+    this.tracerColors[slot] = color & 255;
+    this.tracerTtl[slot] = Math.max(1, Math.min(ttlFrames | 0, 255));
+    return true;
+  }
+
+  /** Live renderer-owned tracer count (observability, test hook). */
+  testTracerCount(): number {
+    let n = 0;
+    for (let i = 0; i < TRACER_POOL_SIZE; i++) if (this.tracerTtl[i] !== 0) n++;
+    return n;
   }
 
   beginFrame(): void {
@@ -571,10 +714,13 @@ export class SoftwareRenderer implements Refresh {
       const m = this.models[e.model];
       if (!m) continue;
       if (m.kind === 'md2' && isAliasMesh(m.data)) {
-        const skin = this.skins[e.skin] ?? devSkin0(worldData);
+        const skin = this.skins[e.skin] ?? (m.fallback ? this.getGunSkin() : devSkin0(worldData));
+        // Real MD2s carry hundreds of frames; wrap game-provided indices.
+        const nf = m.data.numFrames > 0 ? m.data.numFrames : 1;
+        const fr = ((e.frame % nf) + nf) % nf;
         drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
           mesh: m.data, origin: e.origin, angles: e.angles,
-          frameA: e.frame, frameB: e.frame, lerp: 0,
+          frameA: fr, frameB: fr, lerp: 0,
           lightAngle: ((e.angles[1]! * 256) / 360) & 255,
         }, skin, cam, this.anorms, this.shadeDots, this.colormap);
       } else if (m.kind === 'sp2') {
@@ -582,7 +728,34 @@ export class SoftwareRenderer implements Refresh {
         drawSprite(this.idx, this.zb, this.fbW, this.fbH,
           { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
           [skin], emptyLight, this.colormap, cam, this.spriteScratch, 1024);
+      } else if (m.kind === 'tracer') {
+        // Contract-free beam convention (renderer-internal): origin is the
+        // beam start, angles its direction, frame the length in world units
+        // (default 96), skin a raw palette index (NOT a skin handle).
+        // Lets game code emit blaster/shotgun tracers through plain
+        // entities; spawnTracer() is the pooled equivalent with ttl.
+        AngleVectors(e.angles, this.tracerFwd, this.tracerRight, this.tracerUp);
+        const len = e.frame > 0 ? Math.min(e.frame, 1024) : TRACER_DEFAULT_LENGTH;
+        const col = e.skin >= 0 && e.skin <= 255 ? e.skin & 255 : TRACER_DEFAULT_COLOR;
+        drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
+          e.origin[0]!, e.origin[1]!, e.origin[2]!,
+          e.origin[0]! + this.tracerFwd[0]! * len,
+          e.origin[1]! + this.tracerFwd[1]! * len,
+          e.origin[2]! + this.tracerFwd[2]! * len,
+          col);
       }
+    }
+
+    // Renderer-owned tracer beams (spawnTracer pool): drawn with the same
+    // 1/z-tested line path, then aged one render. No allocation.
+    for (let ti = 0; ti < TRACER_POOL_SIZE; ti++) {
+      if (this.tracerTtl[ti] === 0) continue;
+      const o = ti * 6;
+      drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
+        this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
+        this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
+        this.tracerColors[ti]!);
+      this.tracerTtl[ti]--;
     }
 
     // Age renderer-owned lights once per rendered view: a flash that is not

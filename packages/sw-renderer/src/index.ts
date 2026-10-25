@@ -72,11 +72,19 @@ export {
 export {
   ANORM_COUNT,
   buildANorms, buildShadeDots,
-  createBoxMesh, drawAliasInstance, fillAffineTri,
-  type AliasMesh, type AliasInstance, type AliasSkin,
+  createBoxMesh, createGunMesh, createGunSkin,
+  isMd2Data, md2ToAliasMesh,
+  MD2_CONVERT_MAX_TRIS, MD2_CONVERT_MAX_VERTS, MD2_CONVERT_MAX_FRAMES,
+  drawAliasInstance, fillAffineTri,
+  type AliasMesh, type AliasInstance, type AliasSkin, type Md2Like,
 } from './alias.js';
 
 export { drawSprite, type SpriteDef, type Scissor } from './sprites.js';
+
+export {
+  drawTracerBeam,
+  TRACER_DEFAULT_LENGTH, TRACER_DEFAULT_COLOR, TRACER_MAX_STEPS, TRACER_POOL_SIZE,
+} from './tracer.js';
 
 export { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
 
@@ -89,7 +97,7 @@ export {
   type BspTexelSource, type BspWorldOptions,
 } from './bspWorld.js';
 
-export { SoftwareRenderer, sortBatchByRow, MAX_SPANS } from './frame.js';
+export { SoftwareRenderer, sortBatchByRow, nextPot, MAX_SPANS } from './frame.js';
 
 export {
   createOverdrawDetail, countWrittenZb, formatOverdrawLine,
