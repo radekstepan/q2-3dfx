@@ -19,9 +19,10 @@ import {
 } from './edges.js';
 import {
   SPAN_OPAQUE, SPAN_TURBULENT, buildTurbTable, createSpan,
-  drawSpansSoftware, drawSpansTurbulent,
+  drawSpansTurbulent, SoftwareBackend,
   type LightBlock, type RasterBackend, type Span, type SpanList, type Texture,
 } from './spans.js';
+import { WasmSpanBackend, wasmRequestedByCvar } from './wasmSpans.js';
 import { buildANorms, buildShadeDots, createBoxMesh, type AliasMesh } from './alias.js';
 import { drawAliasInstance } from './alias.js';
 import { drawSprite } from './sprites.js';
@@ -38,35 +39,6 @@ function isAliasMesh(data: unknown): data is AliasMesh {
   return m.frames instanceof Float32Array && m.tris instanceof Uint16Array
     && typeof m.numVerts === 'number' && typeof m.numTris === 'number'
     && m.st instanceof Float32Array && m.normals instanceof Uint8Array;
-}
-
-/** Monomorphic backend: owns framebuffer views, dispatches per span kind. */
-export class SoftwareBackend implements RasterBackend {
-  idx: Uint8Array = new Uint8Array(0);
-  zb: Float32Array = new Float32Array(0);
-  fbW = 0;
-  fbH = 0;
-  colormap: Uint8Array = new Uint8Array(0);
-  turbTable: Uint8Array = buildTurbTable();
-  time = 0;
-  spansDrawn = 0;
-  pixelsDrawn = 0;
-
-  attach(idx: Uint8Array, zb: Float32Array, w: number, h: number, colormap: Uint8Array): void {
-    this.idx = idx;
-    this.zb = zb;
-    this.fbW = w;
-    this.fbH = h;
-    this.colormap = colormap;
-  }
-
-  /** Branch on the span kind, never in the pixel loop (BRAIN.md §2). */
-  drawSpans(list: SpanList, tex: Texture, light: LightBlock): void {
-    const a = drawSpansSoftware(this.idx, this.zb, this.fbW, this.fbH, list, tex, light, this.colormap);
-    const b = drawSpansTurbulent(this.idx, this.zb, this.fbW, this.fbH, list, tex, this.colormap, this.turbTable, this.time);
-    this.spansDrawn += a.spans + b.spans;
-    this.pixelsDrawn += a.pixels + b.pixels;
-  }
 }
 
 /** In-place per-row z-sort of a span batch: rows ascending, 1/z descending,
@@ -127,7 +99,10 @@ export class SoftwareRenderer implements Refresh {
   private color: Uint32Array = new Uint32Array(0);
   private palette: Uint8Array = defaultPalette();
   private colormap: Uint8Array = buildColormap(this.palette);
-  private backend = new SoftwareBackend();
+  private readonly tsBackend = new SoftwareBackend();
+  private backend: SoftwareBackend = this.tsBackend;
+  private wasmBackend: WasmSpanBackend | null = null;
+  private hostFb: Framebuffer | null = null;
   private cache = new SurfaceCache();
   private dlights = new DLightState();
   private lastDynSerial = 0;
@@ -159,7 +134,9 @@ export class SoftwareRenderer implements Refresh {
   init(fb: Framebuffer): void {
     this.fbW = fb.width;
     this.fbH = fb.height;
-    this.idx = fb.index ?? new Uint8Array(fb.width * fb.height);
+    this.hostFb = fb;
+    if (!fb.index) fb.index = new Uint8Array(fb.width * fb.height);
+    this.idx = fb.index;
     this.zb = fb.depth;
     this.color = fb.color;
     for (let i = 0; i < MAX_SPANS; i++) this.pool.push(createSpan());
@@ -168,10 +145,78 @@ export class SoftwareRenderer implements Refresh {
     this.backend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
   }
 
+  /**
+   * Build the WASM span backend for the current framebuffer size (M9.1).
+   * Synchronous (module is ~1KB, compile is sub-millisecond) and infallible:
+   * returns false when wasm is unavailable — the TS path stays active.
+   * Must be called after init().
+   */
+  initWasm(): boolean {
+    if (this.fbW <= 0 || this.fbH <= 0 || this.wasmBackend) return this.wasmBackend !== null;
+    try {
+      const wb = WasmSpanBackend.create(this.fbW, this.fbH);
+      if (!wb) return false;
+      wb.colormap = this.colormap;
+      this.wasmBackend = wb;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Switch the active span backend. TS is the default (prime directive:
+   * main stays green); the wasm backend is only used after initWasm().
+   * Returns true when the requested backend is now active.
+   */
+  setWasmEnabled(on: boolean): boolean {
+    if (on) {
+      if (!this.wasmBackend && !this.initWasm()) return false;
+      const wb = this.wasmBackend!;
+      wb.attach(wb.idx, wb.zb, this.fbW, this.fbH, this.colormap);
+      wb.time = this.backend.time;
+      this.backend = wb;
+      this.idx = wb.idx;
+      this.zb = wb.zb;
+      return true;
+    }
+    if (this.hostFb?.index) {
+      this.backend = this.tsBackend;
+      this.idx = this.hostFb.index;
+      this.zb = this.hostFb.depth;
+      this.backend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
+    }
+    return !this.isWasmActive();
+  }
+
+  /** True when frames are currently rasterised by the wasm backend. */
+  isWasmActive(): boolean {
+    return this.backend instanceof WasmSpanBackend;
+  }
+
+  /**
+   * Honour the `sw_wasm` cvar / `wasmSpans` feature flag: build the backend
+   * (if needed) and switch to it when requested, back to TS otherwise.
+   * Hosts call this after init(); safe to call every frame (no allocation
+   * once the backend exists).
+   */
+  syncWasmFromCvar(): boolean {
+    return this.setWasmEnabled(wasmRequestedByCvar());
+  }
+
+  /** Live framebuffer views (wasm views when the wasm backend is active). */
+  getFramebuffer(): Framebuffer {
+    return {
+      width: this.fbW, height: this.fbH,
+      color: this.color, index: this.idx, depth: this.zb,
+    };
+  }
+
   setPalette(p: Uint8Array): void {
     this.palette = p.length >= 768 ? p.slice(0, 768) : defaultPalette();
     this.colormap = buildColormap(this.palette);
     this.backend.colormap = this.colormap;
+    if (this.wasmBackend) this.wasmBackend.colormap = this.colormap;
   }
 
   registerModel(m: Model): ModelHandle {
@@ -401,6 +446,11 @@ export class SoftwareRenderer implements Refresh {
       const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
       this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
     }
+    // wasm mode draws into wasm-memory views: mirror the index plane back so
+    // host code reading fb.index directly stays correct (testkit's harness
+    // uses getFramebuffer(), which already returns the live views).
+    const hb = this.hostFb?.index;
+    if (hb && hb !== this.idx) hb.set(this.idx.subarray(0, hb.length));
   }
 
   /** Test hook: renderer-owned dynamic lights (R_MarkLights input). */
@@ -416,6 +466,16 @@ export class SoftwareRenderer implements Refresh {
   testCacheStats(): { hits: number; misses: number; evictions: number; used: number; size: number; hitRate: number } {
     const c = this.cache;
     return { hits: c.hits, misses: c.misses, evictions: c.evictions, used: c.used, size: c.size, hitRate: c.hitRate() };
+  }
+
+  /** WASM backend batch stats (M9.1): null unless initWasm() succeeded. */
+  testWasmStats(): { active: boolean; wasmBatches: number; fallbackBatches: number } | null {
+    if (!this.wasmBackend) return null;
+    return {
+      active: this.isWasmActive(),
+      wasmBatches: this.wasmBackend.wasmBatches,
+      fallbackBatches: this.wasmBackend.fallbackBatches,
+    };
   }
 
   testResetCacheStats(): void {

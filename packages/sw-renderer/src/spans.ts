@@ -362,6 +362,35 @@ export function drawSpans16(
   drawSpansSoftware(idx, zb, W, H, list, tex, light, colormap);
 }
 
+/** Monomorphic backend: owns framebuffer views, dispatches per span kind. */
+export class SoftwareBackend implements RasterBackend {
+  idx: Uint8Array = new Uint8Array(0);
+  zb: Float32Array = new Float32Array(0);
+  fbW = 0;
+  fbH = 0;
+  colormap: Uint8Array = new Uint8Array(0);
+  turbTable: Uint8Array = buildTurbTable();
+  time = 0;
+  spansDrawn = 0;
+  pixelsDrawn = 0;
+
+  attach(idx: Uint8Array, zb: Float32Array, w: number, h: number, colormap: Uint8Array): void {
+    this.idx = idx;
+    this.zb = zb;
+    this.fbW = w;
+    this.fbH = h;
+    this.colormap = colormap;
+  }
+
+  /** Branch on the span kind, never in the pixel loop (BRAIN.md §2). */
+  drawSpans(list: SpanList, tex: Texture, light: LightBlock): void {
+    const a = drawSpansSoftware(this.idx, this.zb, this.fbW, this.fbH, list, tex, light, this.colormap);
+    const b = drawSpansTurbulent(this.idx, this.zb, this.fbW, this.fbH, list, tex, this.colormap, this.turbTable, this.time);
+    this.spansDrawn += a.spans + b.spans;
+    this.pixelsDrawn += a.pixels + b.pixels;
+  }
+}
+
 const scratchIndex = new Map<number, Uint8Array>();
 
 function fallbackIndex(fb: Framebuffer): Uint8Array {

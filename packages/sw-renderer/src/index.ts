@@ -9,10 +9,16 @@ export {
   runSubdiv16, runSubdivTurbulent, runSpanFlat,
   sampleLightBlock, textureMasks,
   drawSpansSoftware, drawSpansTurbulent, drawSpansFlat,
-  drawSpans16,
+  drawSpans16, SoftwareBackend,
   buildTurbTable, spanListView,
   type Span, type SpanList, type Texture, type LightBlock, type RasterBackend,
 } from './spans.js';
+
+export {
+  WasmSpanBackend, wasmRequestedByCvar, buildSpanModuleBytes, wasmMemoryLayout,
+  SW_WASM_CVAR, MAX_WASM_SPANS,
+  type DrawOpaqueFn, type WasmMemoryLayout,
+} from './wasmSpans.js';
 
 export {
   COLORMAP_GRADES, COLORMAP_SIZE,
@@ -66,4 +72,4 @@ export {
   type BspTexelSource, type BspWorldOptions,
 } from './bspWorld.js';
 
-export { SoftwareBackend, SoftwareRenderer, sortBatchByRow, MAX_SPANS } from './frame.js';
+export { SoftwareRenderer, sortBatchByRow, MAX_SPANS } from './frame.js';
