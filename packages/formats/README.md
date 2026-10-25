@@ -1,6 +1,6 @@
 # @q2/formats
 
-Asset parsers (WAL, PCX, SP2, WAV implemented; BSP38/MD2 stubbed) producing
+Asset parsers (WAL, PCX, MD2, SP2, WAV implemented; BSP38 stubbed) producing
 plain typed arrays. Ports `qcommon/qfiles.h` structs, `ref_soft/r_image.c`
 (`LoadPCX`, `R_LoadWal`), and `client/snd_mem.c` (`GetWavinfo`).
 
@@ -11,10 +11,11 @@ Entry point: `src/index.ts`. Errors via `Com_Error` from `@q2/config`.
 - `parseWAL(buf): Wal` — `miptex_t`: 4 mip levels of palette indices, dims `(w>>k, h>>k)` (`src/index.ts:93`).
 - `parsePCX(buf): Pcx` — 8-bit RLE PCX → pixels + trailing 768-byte palette (`src/index.ts:135`).
 - `extractColormap(pcx) / buildColormap(palette)` — first 16384 px of `colormap.pcx` as the 64×256 shade table, or a best-match fallback from the palette (`src/index.ts:200`).
+- `parseMD2(buf): Md2` — `dmdl_t`: flat `Float32Array` frames (`v*scale+translate`), `Uint8Array` normals, `Int16Array` st, `Uint16Array` trisXyz/trisSt, plus skin/frame names; glcmds validated but not stored.
 - `parseSP2(buf): Sp2` — `dsprite_t`: flat `Int32Array` lump data + art names (`src/index.ts:261`).
 - `parseWavHeader(buf): WavInfo` — header facts only (rate/width/channels/samples/loopstart/dataOffset); sample bytes stay in the caller buffer (`src/index.ts:293`).
-- `parseBSP38 / parseMD2` — **stubs**: currently `Com_Error('fatal', 'not implemented')` (`src/index.ts:66`). The full BSP loader lives in `@q2/bsp` (`loadBsp`); see its report note about extending the `Bsp38` contract.
-- Constants: `WAL_HEADER_SIZE / WAL_MIP_LEVELS`, `PCX_*` magic/sizes, `COLORMAP_*` dims, `SP2_IDENT / SP2_VERSION / SP2_FRAME_SIZE` (`src/index.ts:85`).
+- `parseBSP38` — **stub**: currently `Com_Error('fatal', 'not implemented')`. The full BSP loader lives in `@q2/bsp` (`loadBsp`); `BspMap` structurally extends the frozen §6 `Bsp38` view (same names/types for planes/nodes/leafs/faces/raw) plus the remaining 19-lump fields — see the `Bsp38` doc comment for the delta. Re-pointing `parseBSP38` at the loader is a separate contract-change PR.
+- Constants: `WAL_HEADER_SIZE / WAL_MIP_LEVELS`, `PCX_*` magic/sizes, `COLORMAP_*` dims, `SP2_IDENT / SP2_VERSION / SP2_FRAME_SIZE`, `MD2_IDENT / MD2_VERSION / MD2_HEADER_SIZE / MD2_MAX_*`.
 
 ## Usage
 

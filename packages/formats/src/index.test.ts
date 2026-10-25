@@ -156,7 +156,144 @@ function buildWAV(opts: {
   return buf;
 }
 
-// ---------- parseWAL ----------
+function buildMD2(opts: {
+  skinWidth?: number;
+  skinHeight?: number;
+  skins?: string[];
+  st?: Array<[number, number]>;
+  tris?: Array<[number, number, number, number, number, number]>;
+  frames?: Array<{ scale: [number, number, number]; translate: [number, number, number]; name: string; verts: Array<[number, number, number, number]> }>;
+  glcmds?: number[];
+}): ArrayBuffer {
+  const skins = opts.skins ?? ['models/test.pcx'];
+  const st = opts.st ?? [[0, 0], [64, 0], [0, 32]];
+  const tris = opts.tris ?? [[0, 1, 2, 0, 1, 2]];
+  const frames = opts.frames ?? [
+    { scale: [0.5, 0.25, 1], translate: [1, 2, 4], name: 'frame0', verts: [[2, 4, 8, 10], [4, 0, 0, 20], [0, 8, 16, 30]] },
+    { scale: [1, 1, 1], translate: [0, 0, 0], name: 'frame1', verts: [[1, 2, 3, 5], [6, 7, 8, 9], [10, 11, 12, 13]] },
+  ];
+  const glcmds = opts.glcmds ?? [0];
+  const numVerts = frames[0]!.verts.length;
+  const framesize = 40 + numVerts * 4;
+  const ofsSkins = 68;
+  const ofsSt = ofsSkins + skins.length * 64;
+  const ofsTris = ofsSt + st.length * 4;
+  const ofsFrames = ofsTris + tris.length * 12;
+  const ofsGlcmds = ofsFrames + frames.length * framesize;
+  const ofsEnd = ofsGlcmds + glcmds.length * 4;
+  const buf = new ArrayBuffer(ofsEnd);
+  const bytes = new Uint8Array(buf);
+  const view = new DataView(buf);
+  const enc = new TextEncoder();
+  view.setInt32(0, 0x32504449, true);
+  view.setInt32(4, 8, true);
+  view.setInt32(8, opts.skinWidth ?? 64, true);
+  view.setInt32(12, opts.skinHeight ?? 32, true);
+  view.setInt32(16, framesize, true);
+  view.setInt32(20, skins.length, true);
+  view.setInt32(24, numVerts, true);
+  view.setInt32(28, st.length, true);
+  view.setInt32(32, tris.length, true);
+  view.setInt32(36, glcmds.length, true);
+  view.setInt32(40, frames.length, true);
+  view.setInt32(44, ofsSkins, true);
+  view.setInt32(48, ofsSt, true);
+  view.setInt32(52, ofsTris, true);
+  view.setInt32(56, ofsFrames, true);
+  view.setInt32(60, ofsGlcmds, true);
+  view.setInt32(64, ofsEnd, true);
+  skins.forEach((s, i) => bytes.set(enc.encode(s).subarray(0, 63), ofsSkins + i * 64));
+  st.forEach(([s, t], i) => {
+    view.setInt16(ofsSt + i * 4, s, true);
+    view.setInt16(ofsSt + i * 4 + 2, t, true);
+  });
+  tris.forEach(([a, b, c, ta, tb, tc], i) => {
+    view.setInt16(ofsTris + i * 12, a, true);
+    view.setInt16(ofsTris + i * 12 + 2, b, true);
+    view.setInt16(ofsTris + i * 12 + 4, c, true);
+    view.setInt16(ofsTris + i * 12 + 6, ta, true);
+    view.setInt16(ofsTris + i * 12 + 8, tb, true);
+    view.setInt16(ofsTris + i * 12 + 10, tc, true);
+  });
+  frames.forEach((f, i) => {
+    const base = ofsFrames + i * framesize;
+    view.setFloat32(base, f.scale[0], true);
+    view.setFloat32(base + 4, f.scale[1], true);
+    view.setFloat32(base + 8, f.scale[2], true);
+    view.setFloat32(base + 12, f.translate[0], true);
+    view.setFloat32(base + 16, f.translate[1], true);
+    view.setFloat32(base + 20, f.translate[2], true);
+    bytes.set(enc.encode(f.name).subarray(0, 15), base + 24);
+    f.verts.forEach(([x, y, z, n], v) => {
+      const o = base + 40 + v * 4;
+      bytes[o] = x;
+      bytes[o + 1] = y;
+      bytes[o + 2] = z;
+      bytes[o + 3] = n;
+    });
+  });
+  glcmds.forEach((g, i) => view.setInt32(ofsGlcmds + i * 4, g, true));
+  return buf;
+}
+
+// ---------- parseMD2 ----------
+
+describe('parseMD2', () => {
+  it('decodes frames, st, tris and skins into flat arrays', () => {
+    const md2 = parseMD2(buildMD2({}));
+    expect(md2.skinWidth).toBe(64);
+    expect(md2.skinHeight).toBe(32);
+    expect(md2.numFrames).toBe(2);
+    expect(md2.numVerts).toBe(3);
+    expect(md2.numSt).toBe(3);
+    expect(md2.numTris).toBe(1);
+    expect(md2.numSkins).toBe(1);
+    expect(md2.skins).toEqual(['models/test.pcx']);
+    expect([...md2.st]).toEqual([0, 0, 64, 0, 0, 32]);
+    expect([...md2.trisXyz]).toEqual([0, 1, 2]);
+    expect([...md2.trisSt]).toEqual([0, 1, 2]);
+    expect(md2.frameNames).toEqual(['frame0', 'frame1']);
+    // frame0: v*scale+translate
+    expect(md2.frames[0]).toBeCloseTo(2 * 0.5 + 1, 5);
+    expect(md2.frames[1]).toBeCloseTo(4 * 0.25 + 2, 5);
+    expect(md2.frames[2]).toBeCloseTo(8 * 1 + 4, 5);
+    expect(md2.frames[3]).toBeCloseTo(4 * 0.5 + 1, 5);
+    // frame1 identity scale/translate
+    expect(md2.frames[9]).toBeCloseTo(1, 5);
+    expect(md2.frames[10]).toBeCloseTo(2, 5);
+    expect(md2.frames[11]).toBeCloseTo(3, 5);
+    expect([...md2.normals]).toEqual([10, 20, 30, 5, 9, 13]);
+    expect([...md2.scales]).toEqual([0.5, 0.25, 1, 1, 1, 1]);
+    expect([...md2.translates]).toEqual([1, 2, 4, 0, 0, 0]);
+  });
+
+  it('rejects bad ident, version, counts, offsets and indices', () => {
+    const good = buildMD2({});
+    const badIdent = good.slice(0);
+    new DataView(badIdent).setInt32(0, 0, true);
+    expect(() => parseMD2(badIdent)).toThrow(ComError);
+    const badVer = good.slice(0);
+    new DataView(badVer).setInt32(4, 9, true);
+    expect(() => parseMD2(badVer)).toThrow(ComError);
+    expect(() => parseMD2(new ArrayBuffer(8))).toThrow(ComError);
+    // truncated frames
+    expect(() => parseMD2(good.slice(0, 100))).toThrow(ComError);
+    // bad tri vert index
+    const badTri = buildMD2({ tris: [[0, 1, 99, 0, 1, 2]] });
+    expect(() => parseMD2(badTri)).toThrow(ComError);
+    // bad tri st index
+    const badSt = buildMD2({ tris: [[0, 1, 2, 0, 1, 99]] });
+    expect(() => parseMD2(badSt)).toThrow(ComError);
+    // out-of-order offsets
+    const badOfs = good.slice(0);
+    new DataView(badOfs).setInt32(48, 10, true);
+    expect(() => parseMD2(badOfs)).toThrow(ComError);
+    // zero verts
+    const zeroVerts = good.slice(0);
+    new DataView(zeroVerts).setInt32(24, 0, true);
+    expect(() => parseMD2(zeroVerts)).toThrow(ComError);
+  });
+});
 
 describe('parseWAL', () => {
   it('decodes header and 4 mips', () => {
@@ -336,9 +473,8 @@ describe('parseWavHeader', () => {
 // ---------- contract stubs owned by later cards ----------
 
 describe('later-card stubs', () => {
-  it('parseBSP38 and parseMD2 are still unimplemented', () => {
+  it('parseBSP38 is still unimplemented (lives in @q2/bsp loadBsp)', () => {
     expect(() => parseBSP38(new ArrayBuffer(8))).toThrow(ComError);
-    expect(() => parseMD2(new ArrayBuffer(8))).toThrow(ComError);
   });
 });
 
@@ -405,11 +541,75 @@ describe.runIf(!!Q2_PAK)('real pak0.pak (Q2_PAK)', () => {
   it('a real .sp2 and .wav parse', () => {
     const sp2 = parseSP2(loadReal('sprites/s_explod.sp2'));
     expect(sp2.version).toBe(2);
-    expect(sp2.widths.length).toBeGreaterThan(0);
+    expect(sp2.widths.length).toBe(6);
+    expect([...sp2.widths]).toEqual([56, 56, 56, 56, 56, 56]);
+    expect([...sp2.heights]).toEqual([56, 56, 56, 56, 56, 56]);
+    expect([...sp2.originX]).toEqual([28, 28, 28, 28, 28, 28]);
+    expect([...sp2.originY]).toEqual([28, 28, 28, 28, 28, 28]);
+    expect(sp2.names).toEqual([
+      'sprites/s_explod_0.pcx',
+      'sprites/s_explod_1.pcx',
+      'sprites/s_explod_2.pcx',
+      'sprites/s_explod_3.pcx',
+      'sprites/s_explod_4.pcx',
+      'sprites/s_explod_5.pcx',
+    ]);
     const wav = parseWavHeader(loadReal('sound/berserk/attack.wav'));
     expect(wav.channels).toBe(1);
     expect(wav.rate).toBeGreaterThan(0);
     expect(wav.samples).toBeGreaterThan(0);
     expect(wav.dataOffset).toBeGreaterThan(0);
+  });
+
+  it('all real .sp2 sprites parse', () => {
+    for (const name of [
+      'sprites/s_explod.sp2',
+      'sprites/s_bubble.sp2',
+      'sprites/s_explo2.sp2',
+      'sprites/s_explo3.sp2',
+      'sprites/s_flash.sp2',
+      'sprites/s_bfg1.sp2',
+      'sprites/s_bfg2.sp2',
+      'sprites/s_bfg3.sp2',
+    ]) {
+      const sp2 = parseSP2(loadReal(name));
+      expect(sp2.version).toBe(2);
+      expect(sp2.widths.length).toBeGreaterThan(0);
+      for (let i = 0; i < sp2.widths.length; i++) {
+        expect(sp2.widths[i]).toBeGreaterThan(0);
+        expect(sp2.heights[i]).toBeGreaterThan(0);
+        expect(sp2.names[i]!.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('real .md2 models parse (soldier + weapon)', () => {
+    for (const name of ['models/monsters/soldier/tris.md2', 'models/weapons/g_shotg/tris.md2']) {
+      const md2 = parseMD2(loadReal(name));
+      expect(md2.numFrames).toBeGreaterThan(0);
+      expect(md2.numTris).toBeGreaterThan(0);
+      expect(md2.numVerts).toBeGreaterThan(0);
+      expect(md2.frames.length).toBe(md2.numFrames * md2.numVerts * 3);
+      expect(md2.normals.length).toBe(md2.numFrames * md2.numVerts);
+      expect(md2.st.length).toBe(md2.numSt * 2);
+      expect(md2.trisXyz.length).toBe(md2.numTris * 3);
+      expect(md2.skins.length).toBe(md2.numSkins);
+      expect(md2.frameNames.length).toBe(md2.numFrames);
+      // all indices in range
+      for (let i = 0; i < md2.trisXyz.length; i++) expect(md2.trisXyz[i]).toBeLessThan(md2.numVerts);
+      for (let i = 0; i < md2.trisSt.length; i++) expect(md2.trisSt[i]).toBeLessThan(md2.numSt);
+      // decoded positions are finite
+      let finite = 0;
+      for (let i = 0; i < md2.frames.length; i++) if (Number.isFinite(md2.frames[i])) finite++;
+      expect(finite).toBe(md2.frames.length);
+    }
+    const soldier = parseMD2(loadReal('models/monsters/soldier/tris.md2'));
+    expect(soldier.skinWidth).toBe(288);
+    expect(soldier.skinHeight).toBe(195);
+    expect(soldier.numSkins).toBe(6);
+    expect(soldier.numVerts).toBe(227);
+    expect(soldier.numTris).toBe(434);
+    expect(soldier.numFrames).toBe(475);
+    expect(soldier.skins[0]).toBe('models/monsters/soldier/skin_lt.pcx');
   });
 });

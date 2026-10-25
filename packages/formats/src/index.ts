@@ -3,12 +3,32 @@
 // (LoadPCX, R_LoadWal) and client/snd_mem.c (GetWavinfo).
 import { Com_Error, Com_Warn } from '@q2/config';
 
+/**
+ * BSP38 world header (frozen §6 contract — do NOT add fields here without a
+ * major changeset; see the M2.1 report in BRAIN.md).
+ *
+ * This is intentionally a narrow structural view: planes/nodes/leafs/faces
+ * share field names AND packed layouts with the full `@q2/bsp` BspMap
+ * (NODE_STRIDE 11 / LEAF_STRIDE 13 / FACE_STRIDE 10 ints), so every BspMap
+ * is assignable to Bsp38. DELTA vs BspMap (lives in @q2/bsp, NOT re-pointed
+ * here per §12 rule 2 — that is a separate contract-change PR): planeTypes,
+ * vertexes, visibility, numClusters, visBitofs, nodeMins/Maxs, texinfo*,
+ * lighting, leaffaces, leafbrushes, edges, surfedges, models*,
+ * brushes, brushsides, entities, pop, areas, areaportals.
+ */
 export interface Bsp38 {
   planes: Float32Array;
   nodes: Int32Array;
   leafs: Int32Array;
   faces: Int32Array;
   raw: ArrayBuffer;
+}
+
+/** BSP38 stub: the full loader lives in `@q2/bsp` (`loadBsp`). Kept as a
+ * stub here per §12 rule 2 — re-pointing it at the bsp loader is a
+ * separate contract-change PR owned by a follow-up card. */
+export function parseBSP38(_buf: ArrayBuffer): Bsp38 {
+  Com_Error('fatal', 'not implemented: parseBSP38');
 }
 
 /** Quake II wall texture: 4 mip levels of palette indices. See miptex_t. */
@@ -57,18 +77,168 @@ export interface WavInfo {
   dataOffset: number;
 }
 
+/** Quake II alias model: flat numeric lump data plus skin/frame names. */
 export interface Md2 {
+  skinWidth: number;
+  skinHeight: number;
   numFrames: number;
+  /** Vertex count per frame (num_xyz in dmdl_t). */
+  numVerts: number;
+  /** Texture-coord count (num_st; greater than numVerts when seams exist). */
+  numSt: number;
   numTris: number;
-  data: ArrayBuffer;
+  numSkins: number;
+  /** DWORD count of the strip/fan command list (parsed but not stored). */
+  numGlcmds: number;
+  /** Skin art names (MAX_SKINNAME each). */
+  skins: string[];
+  /** numSt*2 shorts: (s, t) per st vert (dstvert_t). */
+  st: Int16Array;
+  /** numTris*3 vertex indices into frames (dtriangle_t index_xyz). */
+  trisXyz: Uint16Array;
+  /** numTris*3 st indices into st (dtriangle_t index_st). */
+  trisSt: Uint16Array;
+  /** numFrames*numVerts*3 decoded positions: v*scale+translate (daliasframe_t). */
+  frames: Float32Array;
+  /** numFrames*numVerts shade-dot indices (dtrivertx_t lightnormalindex). */
+  normals: Uint8Array;
+  /** Frame names (16 chars each). */
+  frameNames: string[];
+  /** numFrames*3 per-frame scale. */
+  scales: Float32Array;
+  /** numFrames*3 per-frame translate. */
+  translates: Float32Array;
 }
 
-export function parseBSP38(_buf: ArrayBuffer): Bsp38 {
-  Com_Error('fatal', 'not implemented: parseBSP38');
-}
+/** Magic ident of a Quake II MD2 model: little-endian "IDP2". */
+export const MD2_IDENT = 0x32504449;
+export const MD2_VERSION = 8;
+/** On-disk size of dmdl_t (17 int32). */
+export const MD2_HEADER_SIZE = 68;
+/** Fixed bytes per skin name (MAX_SKINNAME). */
+export const MD2_SKINNAME_SIZE = 64;
+/** Fixed-part bytes of daliasframe_t: scale[3]f + translate[3]f + name[16]. */
+export const MD2_FRAME_HEADER_SIZE = 40;
+/** Bytes per compressed vertex (dtrivertx_t). */
+export const MD2_VERT_SIZE = 4;
+/** Fixed bytes per frame name. */
+export const MD2_FRAME_NAME_SIZE = 16;
+/** Upper design bounds from qcommon/qfiles.h. */
+export const MD2_MAX_TRIS = 4096;
+export const MD2_MAX_VERTS = 2048;
+export const MD2_MAX_FRAMES = 512;
+export const MD2_MAX_SKINS = 32;
 
-export function parseMD2(_buf: ArrayBuffer): Md2 {
-  Com_Error('fatal', 'not implemented: parseMD2');
+/**
+ * Parse an .md2 alias model (dmdl_t). Numeric lump data stays in flat typed
+ * arrays; skin/frame names are plain strings. The glcmd strip/fan list is
+ * validated to sit inside the file but not stored (the renderer walks tris).
+ */
+export function parseMD2(buf: ArrayBuffer): Md2 {
+  if (buf.byteLength < MD2_HEADER_SIZE) Com_Error('fatal', 'parseMD2: too small for header');
+  const view = new DataView(buf);
+  const bytes = new Uint8Array(buf);
+  if (view.getInt32(0, true) !== MD2_IDENT) Com_Error('fatal', 'parseMD2: bad ident');
+  const version = view.getInt32(4, true);
+  if (version !== MD2_VERSION) Com_Error('fatal', `parseMD2: bad version ${version}`);
+  const skinWidth = view.getInt32(8, true);
+  const skinHeight = view.getInt32(12, true);
+  const framesize = view.getInt32(16, true);
+  const numSkins = view.getInt32(20, true);
+  const numVerts = view.getInt32(24, true);
+  const numSt = view.getInt32(28, true);
+  const numTris = view.getInt32(32, true);
+  const numGlcmds = view.getInt32(36, true);
+  const numFrames = view.getInt32(40, true);
+  const ofsSkins = view.getInt32(44, true);
+  const ofsSt = view.getInt32(48, true);
+  const ofsTris = view.getInt32(52, true);
+  const ofsFrames = view.getInt32(56, true);
+  const ofsGlcmds = view.getInt32(60, true);
+  const ofsEnd = view.getInt32(64, true);
+  if (skinWidth <= 0 || skinHeight <= 0 || skinWidth > 4096 || skinHeight > 4096) {
+    Com_Error('fatal', `parseMD2: bad skin dimensions ${skinWidth}x${skinHeight}`);
+  }
+  if (numSkins < 0 || numSkins > MD2_MAX_SKINS) Com_Error('fatal', `parseMD2: bad skin count ${numSkins}`);
+  if (numVerts <= 0 || numVerts > MD2_MAX_VERTS) Com_Error('fatal', `parseMD2: bad vert count ${numVerts}`);
+  if (numSt <= 0 || numSt > MD2_MAX_VERTS * 2) Com_Error('fatal', `parseMD2: bad st count ${numSt}`);
+  if (numTris <= 0 || numTris > MD2_MAX_TRIS) Com_Error('fatal', `parseMD2: bad tri count ${numTris}`);
+  if (numGlcmds < 0 || numGlcmds > 1 << 20) Com_Error('fatal', `parseMD2: bad glcmd count ${numGlcmds}`);
+  if (numFrames <= 0 || numFrames > MD2_MAX_FRAMES) {
+    Com_Error('fatal', `parseMD2: bad frame count ${numFrames}`);
+  }
+  if (framesize !== MD2_FRAME_HEADER_SIZE + numVerts * MD2_VERT_SIZE) {
+    Com_Error('fatal', `parseMD2: bad framesize ${framesize}`);
+  }
+  // Offsets must be ordered skin → st → tris → frames → glcmds → end.
+  const ofsets = [ofsSkins, ofsSt, ofsTris, ofsFrames, ofsGlcmds, ofsEnd];
+  for (let i = 0; i < ofsets.length; i++) {
+    if (ofsets[i]! < MD2_HEADER_SIZE || ofsets[i]! > buf.byteLength) {
+      Com_Error('fatal', `parseMD2: offset ${i} out of range`);
+    }
+    if (i > 0 && ofsets[i]! < ofsets[i - 1]!) Com_Error('fatal', 'parseMD2: offsets out of order');
+  }
+  const end = (off: number, size: number, what: string): void => {
+    if (off + size > buf.byteLength) Com_Error('fatal', `parseMD2: ${what} overruns file`);
+  };
+  end(ofsSkins, numSkins * MD2_SKINNAME_SIZE, 'skins');
+  end(ofsSt, numSt * 4, 'st');
+  end(ofsTris, numTris * 12, 'tris');
+  end(ofsFrames, numFrames * framesize, 'frames');
+  end(ofsGlcmds, numGlcmds * 4, 'glcmds');
+  const skins: string[] = new Array(numSkins);
+  for (let i = 0; i < numSkins; i++) skins[i] = readName(bytes, ofsSkins + i * MD2_SKINNAME_SIZE, MD2_SKINNAME_SIZE);
+  const st = new Int16Array(numSt * 2);
+  for (let i = 0; i < numSt; i++) {
+    st[i * 2] = view.getInt16(ofsSt + i * 4, true);
+    st[i * 2 + 1] = view.getInt16(ofsSt + i * 4 + 2, true);
+  }
+  const trisXyz = new Uint16Array(numTris * 3);
+  const trisSt = new Uint16Array(numTris * 3);
+  for (let i = 0; i < numTris; i++) {
+    const base = ofsTris + i * 12;
+    for (let k = 0; k < 3; k++) {
+      const vx = view.getInt16(base + k * 2, true);
+      const tx = view.getInt16(base + 6 + k * 2, true);
+      if (vx < 0 || vx >= numVerts) Com_Error('fatal', `parseMD2: tri ${i} vert index out of range`);
+      if (tx < 0 || tx >= numSt) Com_Error('fatal', `parseMD2: tri ${i} st index out of range`);
+      trisXyz[i * 3 + k] = vx;
+      trisSt[i * 3 + k] = tx;
+    }
+  }
+  const frames = new Float32Array(numFrames * numVerts * 3);
+  const normals = new Uint8Array(numFrames * numVerts);
+  const frameNames: string[] = new Array(numFrames);
+  const scales = new Float32Array(numFrames * 3);
+  const translates = new Float32Array(numFrames * 3);
+  for (let f = 0; f < numFrames; f++) {
+    const base = ofsFrames + f * framesize;
+    const sx = view.getFloat32(base, true);
+    const sy = view.getFloat32(base + 4, true);
+    const sz = view.getFloat32(base + 8, true);
+    const tx = view.getFloat32(base + 12, true);
+    const ty = view.getFloat32(base + 16, true);
+    const tz = view.getFloat32(base + 20, true);
+    scales[f * 3] = sx;
+    scales[f * 3 + 1] = sy;
+    scales[f * 3 + 2] = sz;
+    translates[f * 3] = tx;
+    translates[f * 3 + 1] = ty;
+    translates[f * 3 + 2] = tz;
+    frameNames[f] = readName(bytes, base + 24, MD2_FRAME_NAME_SIZE);
+    const vbase = base + MD2_FRAME_HEADER_SIZE;
+    for (let v = 0; v < numVerts; v++) {
+      const o = vbase + v * MD2_VERT_SIZE;
+      frames[(f * numVerts + v) * 3] = bytes[o]! * sx + tx;
+      frames[(f * numVerts + v) * 3 + 1] = bytes[o + 1]! * sy + ty;
+      frames[(f * numVerts + v) * 3 + 2] = bytes[o + 2]! * sz + tz;
+      normals[f * numVerts + v] = bytes[o + 3]!;
+    }
+  }
+  return {
+    skinWidth, skinHeight, numFrames, numVerts, numSt, numTris, numSkins, numGlcmds,
+    skins, st, trisXyz, trisSt, frames, normals, frameNames, scales, translates,
+  };
 }
 
 /** Read a NUL-terminated ASCII name out of a fixed-width field. */
