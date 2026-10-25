@@ -170,7 +170,7 @@ import type { Host } from '@q2/host';
 import type { LocalDriver, PlayBoot } from './play.js';
 import { drawPlayHud, pumpMuzzleLight, resolveDisplay } from './play.js';
 import { attachToCanvas } from '@q2/input/dom';
-import { readPakEntry } from './pak.js';
+import { readPakEntry, findPakSoundEntry } from './pak.js';
 import type { Mixer, MixedChannel } from '@q2/sound';
 
 export interface PlayLoop {
@@ -179,10 +179,23 @@ export interface PlayLoop {
   stop(): void;
 }
 
-interface BrowserSound {
+/** Cap for the per-name decoded pak wav cache (insertion-order eviction). */
+export const MAX_CACHED_SOUNDS = 24;
+
+/** Weapon-ish channel names keep the old preloaded-shot fallback. */
+const SHOT_FALLBACK_RE = /blast|shotg|machin|gunfire|shot/;
+
+export interface BrowserSound {
   ctx: AudioContext;
   master: GainNode;
+  /** The dropped pak (null in devroom): source for per-name wav decodes. */
+  pak: WebPak | null;
+  /** Preloaded preferred weapon wav: instant first shots + fallback. */
   shot: AudioBuffer | null;
+  /** Decoded pak wavs by resolved entry name (see findPakSoundEntry). */
+  sounds: Map<string, AudioBuffer>;
+  /** Entry names with a decode currently in flight (no duplicate work). */
+  pending: Set<string>;
   channels: Map<number, ChannelNodes>;
   dispose(): void;
 }
@@ -207,6 +220,57 @@ async function decodeShotSound(ctx: AudioContext, pak: WebPak): Promise<AudioBuf
     return await decodeWav(ctx, readPakEntry(pak, pick));
   } catch {
     return null;
+  }
+}
+
+/**
+ * Resolve a mixer channel name to its pak entry name (`readPakEntry` terms),
+ * or null when the pak is absent or lacks the lump (→ shot/synth fallback).
+ * Pure and headless-safe.
+ */
+export function resolveChannelSound(name: string, pak: WebPak | null): string | null {
+  if (!pak) return null;
+  return findPakSoundEntry(pak, name)?.name ?? null;
+}
+
+/**
+ * Insert a decoded wav into the per-name cache, evicting the oldest entries
+ * past MAX_CACHED_SOUNDS. Re-setting an existing name refreshes recency.
+ * Pure Map operation, headless-safe.
+ */
+export function cacheSoundBuffer(
+  sounds: Map<string, AudioBuffer>,
+  key: string,
+  buf: AudioBuffer,
+): void {
+  if (sounds.has(key)) sounds.delete(key);
+  sounds.set(key, buf);
+  while (sounds.size > MAX_CACHED_SOUNDS) {
+    const oldest = sounds.keys().next();
+    if (oldest.done) break;
+    sounds.delete(oldest.value);
+  }
+}
+
+/**
+ * Decode one pak lump and cache it under its entry name. Never throws:
+ * decode failures resolve to null and just clear the pending mark so a
+ * later channel retries. Works with a stub ctx (tests) or real AudioContext.
+ */
+export async function decodeAndCacheSound(
+  sound: BrowserSound,
+  entryName: string,
+  wav: ArrayBuffer,
+): Promise<AudioBuffer | null> {
+  try {
+    const { decodeWav } = await import('@q2/sound/browser');
+    const buf = await decodeWav(sound.ctx, wav);
+    cacheSoundBuffer(sound.sounds, entryName, buf);
+    return buf;
+  } catch {
+    return null;
+  } finally {
+    sound.pending.delete(entryName);
   }
 }
 
@@ -252,7 +316,14 @@ export function startPlayLoop(
       .then((mod) => {
         if (!sound) {
           const created = mod.createBrowserMixer(host.mixer);
-          sound = { ...created, shot: null, channels: new Map() };
+          sound = {
+            ...created,
+            pak: opts.pak ?? null,
+            shot: null,
+            sounds: new Map(),
+            pending: new Set(),
+            channels: new Map(),
+          };
         }
         const s = sound;
         if (s.ctx.state === 'suspended') void s.ctx.resume().catch(() => undefined);
@@ -377,15 +448,20 @@ function soundFreqFor(name: string): number {
 }
 
 /**
- * Wire per-channel mixer gains to real WebAudio nodes (M7.2).
+ * Wire per-channel mixer gains to real WebAudio nodes (M7.2 + per-name pak
+ * decode follow-up).
  *
  * The driver owns a headless Mixer: step() sets the listener from the player
  * and startSound()s positional channels (shots, doors, pickups, monster
  * fire). Here mix() spatializes them and each live channel drives a
- * GainNode (+StereoPannerNode when available). New channels get a
- * BufferSource (decoded pak shot) or a short synth blip; vanished channels
- * are stopped and disconnected. Positional shots/door moves/pickups therefore
- * come through the mixer — no fixed one-shot cue path remains for them.
+ * GainNode (+StereoPannerNode when available). New channels play their OWN
+ * named pak wav when it has been decoded and cached (decoded lazily on
+ * first use, one in-flight decode per name, capped at MAX_CACHED_SOUNDS);
+ * while the decode runs — or when the pak lacks the name — they fall back
+ * to the preloaded shot buffer (weapon-ish names) or a short synth blip,
+ * exactly the M7.2 behaviour. Vanished channels are stopped and
+ * disconnected. Positional shots/door moves/pickups therefore come through
+ * the mixer — no fixed one-shot cue path remains for them.
  */
 export function syncMixerToBrowser(sound: BrowserSound, mixer: Mixer): MixedChannel[] {
   const mixed = mixer.mix();
@@ -416,16 +492,44 @@ export function syncMixerToBrowser(sound: BrowserSound, mixer: Mixer): MixedChan
           }
         }
         let src: AudioBufferSourceNode | OscillatorNode;
-        if (sound.shot && /blast|shotg|machin|gunfire|shot/.test(ch.name)) {
+        const entryName = resolveChannelSound(ch.name, sound.pak);
+        const cached = entryName !== null ? sound.sounds.get(entryName) : undefined;
+        if (entryName !== null && cached !== undefined) {
+          // Per-name cache hit: this channel's own decoded pak wav. Refresh
+          // recency so hot sounds survive eviction.
+          sound.sounds.delete(entryName);
+          sound.sounds.set(entryName, cached);
           const buf = sound.ctx.createBufferSource();
-          buf.buffer = sound.shot;
+          buf.buffer = cached;
           buf.connect(gain);
           src = buf;
         } else {
-          const osc = sound.ctx.createOscillator();
-          osc.frequency.value = soundFreqFor(ch.name);
-          osc.connect(gain);
-          src = osc;
+          if (entryName !== null && sound.pak && !sound.pending.has(entryName)) {
+            // Lazy per-name decode: this shot still uses the fallback below
+            // while the decode runs; later channels with this name hit the
+            // cache. One in-flight decode per name; failures clear `pending`
+            // so a later channel retries.
+            sound.pending.add(entryName);
+            let wav: ArrayBuffer | null = null;
+            try {
+              wav = readPakEntry(sound.pak, entryName);
+            } catch {
+              wav = null;
+            }
+            if (wav) void decodeAndCacheSound(sound, entryName, wav);
+            else sound.pending.delete(entryName);
+          }
+          if (sound.shot && SHOT_FALLBACK_RE.test(ch.name)) {
+            const buf = sound.ctx.createBufferSource();
+            buf.buffer = sound.shot;
+            buf.connect(gain);
+            src = buf;
+          } else {
+            const osc = sound.ctx.createOscillator();
+            osc.frequency.value = soundFreqFor(ch.name);
+            osc.connect(gain);
+            src = osc;
+          }
         }
         gain.gain.value = level;
         if (panNode) panNode.pan.value = pan;

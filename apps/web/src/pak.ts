@@ -66,3 +66,25 @@ export function readPakEntry(pak: WebPak, name: string): ArrayBuffer {
 export function pakHasMaps(pak: WebPak): boolean {
   return pak.entries.some((e) => e.name.endsWith('.bsp'));
 }
+
+/**
+ * Resolve a mixer channel sound name to its pak entry (`readPakEntry` terms).
+ *
+ * Channel names from the driver look like `weapons/blastf1a.wav` while real
+ * pak lumps live under `sound/weapons/blastf1a.wav`, so the name is tried
+ * as-is, then under `sound/` (a name that already carries the prefix is
+ * tried both ways). Case-insensitive: entries are lowercased at ingest.
+ * Returns null when the pak has no such lump — the caller then falls back
+ * to the preloaded shot buffer or a synth blip.
+ */
+export function findPakSoundEntry(pak: WebPak, name: string): WebPakEntry | null {
+  const clean = name.trim().toLowerCase().replace(/^\/+/, '');
+  if (!clean) return null;
+  const stripped = clean.startsWith('sound/') ? clean.slice('sound/'.length) : clean;
+  const candidates = stripped === clean ? [clean, `sound/${clean}`] : [clean, stripped];
+  for (const cand of candidates) {
+    const entry = pak.entries.find((e) => e.name === cand);
+    if (entry) return entry;
+  }
+  return null;
+}

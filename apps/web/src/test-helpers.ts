@@ -20,3 +20,25 @@ export function makePakForTest(): ArrayBuffer {
   view.setUint32(dirOffset + 60, payload.length, true);
   return buf;
 }
+
+/** Synthetic PACK with one 8-byte lump per name (lowercased like ingestPak). */
+export function makePakWithEntries(names: string[]): ArrayBuffer {
+  const payload = new Uint8Array([82, 73, 70, 70, 1, 2, 3, 4]);
+  const dirOffset = 12 + payload.length * names.length;
+  const buf = new ArrayBuffer(dirOffset + 64 * names.length);
+  const bytes = new Uint8Array(buf);
+  const view = new DataView(buf);
+  bytes[0] = 0x50; bytes[1] = 0x41; bytes[2] = 0x43; bytes[3] = 0x4b;
+  view.setUint32(4, dirOffset, true);
+  view.setUint32(8, 64 * names.length, true);
+  names.forEach((name, i) => {
+    const start = 12 + payload.length * i;
+    bytes.set(payload, start);
+    const off = dirOffset + i * 64;
+    const lower = name.toLowerCase();
+    for (let k = 0; k < lower.length && k < 56; k++) bytes[off + k] = lower.charCodeAt(k);
+    view.setUint32(off + 56, start, true);
+    view.setUint32(off + 60, payload.length, true);
+  });
+  return buf;
+}
