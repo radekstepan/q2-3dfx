@@ -15,8 +15,10 @@
   "dependencies": {
     "@q2/client": "workspace:*",
     "@q2/config": "workspace:*",
+    "@q2/input": "workspace:*",
     "@q2/renderer-api": "workspace:*",
-    "@q2/server": "workspace:*"
+    "@q2/server": "workspace:*",
+    "@q2/sound": "workspace:*"
   },
   "devDependencies": {
     "tsup": "^8.3.5",

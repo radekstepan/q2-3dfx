@@ -15,7 +15,9 @@
   },
   "dependencies": {
     "@q2/config": "workspace:*",
-    "@q2/host": "workspace:*"
+    "@q2/host": "workspace:*",
+    "@q2/renderer-api": "workspace:*",
+    "@q2/testkit": "workspace:*"
   },
   "devDependencies": {
     "tsup": "^8.3.5",

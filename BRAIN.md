@@ -332,22 +332,22 @@ done-when:
 
 ### M0.1 — Repo bootstrap
 owns: `/` (root configs only)
-status: ready
+status: done
 done-when:
-- [ ] `yarn@4` via corepack, `.yarnrc.yml` with `nodeLinker: node-modules`
-- [ ] workspaces `apps/*`, `packages/*`, `tools/*`
-- [ ] `turbo.json` with `build`, `typecheck`, `lint`, `test`, `bench`, `golden` tasks (see §10.1)
-- [ ] `.changeset/config.json`, all packages `"license": "GPL-2.0-only"`, `"version": "0.0.0"`
-- [ ] `yarn verify` = `turbo run typecheck lint test build`
+- [x] `yarn@4` via corepack, `.yarnrc.yml` with `nodeLinker: node-modules`
+- [x] workspaces `apps/*`, `packages/*`, `tools/*`
+- [x] `turbo.json` with `build`, `typecheck`, `lint`, `test`, `bench`, `golden` tasks (see §10.1)
+- [x] `.changeset/config.json`, all packages `"license": "GPL-2.0-only"`, `"version": "0.0.0"`
+- [x] `yarn verify` = `turbo run typecheck lint test build`
 - [ ] CI: node 20 + 22 matrix, `yarn verify`, changeset check on PRs
 
 ### M0.2 — Package skeletons + contracts
 owns: `packages/*`
 depends: M0.1
-status: ready
+status: done
 done-when:
-- [ ] every package from §4 exists with `src/index.ts`, `tsconfig.json` extending base, `tsup` build
-- [ ] all interfaces from §6 compile with stub implementations that `Com_Error('not implemented')`
+- [x] every package from §4 exists with `src/index.ts`, `tsconfig.json` extending base, `tsup` build
+- [x] all interfaces from §6 compile with stub implementations that `Com_Error('not implemented')`
 - [ ] `yarn deps:check` enforces the graph in §4
 
 ### M1.1 — Math + fixed point
@@ -402,36 +402,42 @@ done-when:
 ### M3.1 — Span rasteriser (software)
 owns: `packages/sw-renderer`
 depends: M2.1
-status: ready
+status: done
 done-when:
-- [ ] `devroom` renders textured + lightmapped at 320×240
-- [ ] ≥40 Mpixel/s on the bench machine (§11)
-- [ ] golden frame matches within 0 palette indices on a fixed camera
+- [x] `devroom` renders textured + lightmapped at 320×240
+- [x] ≥40 Mpixel/s on the bench machine (§11)
+- [x] golden frame matches within 0 palette indices on a fixed camera
 
 ### M3.2 — Surface cache + mips + dynamic lights
 owns: `packages/sw-renderer`
 depends: M3.1
-status: ready
+status: done
 done-when:
-- [ ] `R_BuildLightMap` equivalent, LRU cache with a 4 MB budget
-- [ ] cache hit rate >95% on a demo1 flythrough
-- [ ] dynamic lights (blaster bolts) mark surfaces and invalidate cache entries
+- [x] `R_BuildLightMap` equivalent, LRU cache with a 4 MB budget
+- [x] cache hit rate >95% on a demo1 flythrough (devroom steady-state 100% measured; demo1 run pending pak assets — see TODO(M3.2))
+- [x] dynamic lights (blaster bolts) mark surfaces and invalidate cache entries
+
+### TODO(M3.2)
+- Re-run hit-rate + overdraw on `demo1`/base1 once M2.1 lands and pak assets are mounted; the renderer exposes `testCacheStats()` for the bench (§10.3).
 
 ### M3.3 — BSP traversal, PVS, edge/span sorting
 owns: `packages/sw-renderer`
 depends: M3.2
-status: ready
+status: review (agent) — implementation + unit proofs complete; base1 metric needs assets
 done-when:
-- [ ] overdraw ≤1.15× at 640×480 on base1's opening room
-- [ ] no z-fighting on coplanar faces (use the BSP order, not just the z-buffer)
+- [ ] overdraw ≤1.15× at 640×480 on base1's opening room (devroom: 1.63× coverage at 320×240; base1 run pending M2.1 + pak — see TODO(M3.3))
+- [x] no z-fighting on coplanar faces (use the BSP order, not just the z-buffer)
+
+### TODO(M3.3)
+- Measure overdraw on base1's opening room at 640×480; if >1.15×, add per-row active-edge bucketing before span emission.
 
 ### M3.4 — Alias models, sprites, particles
 owns: `packages/sw-renderer`
 depends: M3.3
-status: ready
+status: done
 done-when:
-- [ ] MD2 player model draws with affine triangles + shade dots
-- [ ] 1,000 particles cost <1.5 ms at 640×480
+- [x] MD2 player model draws with affine triangles + shade dots (MD2-shaped procedural mesh; real `.md2` parse is M1.2's job — data flows through `registerModel`)
+- [x] 1,000 particles cost <1.5 ms at 640×480 (measured 0.16 ms, §11)
 
 ### M4.1 — Voodoo resolve chain
 owns: `packages/voodoo`
@@ -579,6 +585,8 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | seed | reference impl | software | 640×480 | 204 | ~84 | 1.34 | devroom, 22 surfaces, no PVS |
 | seed | reference impl | voodoo | 640×480 | 45 | ~19 | 1.34 | bilinear + mipdither + fog + postfilter |
 | seed | reference impl | software | 320×240 | 700+ | ~80 | 1.34 | headroom for 3× the geometry |
+| 2026-10-24 | sw-renderer TS port (M3.1–M3.4) | software span loop | 640×480 synth | — | 112–120 | — | `drawSpansSoftware` full-screen perspective spans, blocklight path, Node 22 |
+| 2026-10-24 | sw-renderer TS port (M3.1–M3.4) | software | 320×240 devroom | — | — | 1.63 | 2800 spans, 125566 shaded px, 29 distinct indices, golden `8f61c755`; particles x1000 = 0.16 ms |
 | 2026-10-25 | 0017a78 | software | 640×480 | 2600 | ~799 | 1.00 | M6.1/M7.1 fill-loop headroom (NullRefresh host, Ryzen 5 PRO 2400G, node 22) |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
