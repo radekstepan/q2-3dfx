@@ -110,7 +110,11 @@ export {
   DEFAULT_SHOTGUN_VSPREAD,
   DEFAULT_SHOTGUN_COUNT,
 } from './weapons.js';
-export type { WeaponDef, Pellet, FireResult } from './weapons.js';
+export type { WeaponDef, Pellet, FireResult, BoltSpec, MuzzleSpec } from './weapons.js';
+export {
+  MUZZLE_LIGHT_COLOR,
+  MUZZLE_LIGHT_INTENSITY,
+} from './weapons.js';
 export {
   monsterRange,
   monsterDef,
@@ -133,6 +137,29 @@ export type { MonsterDef, MonsterMove, MonsterFrame, MonsterState, MonsterKind, 
 export type { MonsterNav, ChaseResult } from './monsters.js';
 export { findPath, isReachable, nearestNode } from './pathfind.js';
 export type { PortalGraph } from './pathfind.js';
+export {
+  BOLT_LIFE,
+  BOLT_MODEL,
+  BOLT_SKIN,
+  BOLT_SPEED,
+  EF_BLASTER,
+  MONSTER_MODELS,
+  MONSTER_SKINS,
+  WEAPON_VIEW_MODELS,
+  WEAPON_WORLD_MODELS,
+  modelForBolt,
+  modelForMonster,
+  modelForWeapon,
+  monsterFrameFor,
+  monsterKindForClassname,
+  resolvePakAsset,
+  skinForBolt,
+  skinForMonster,
+  skinForWeaponModel,
+  skinsForMonster,
+  viewModelForWeapon,
+  worldModelForWeapon,
+} from './assets.js';
 export {
   bspTraceFor,
   bspContentsFor,
