@@ -3,10 +3,12 @@
 // Browser-only. All functions no-op / return null without a DOM so Node
 // tests can import this module safely. Canvas code is isolated here —
 // `index.ts` and `devroom.ts` never touch `document`.
-import { getCVarString, listCVars, setCVarFromString } from '@q2/config';
+import { getCVar, getCVarNumber, getCVarString, listCVars, registerCVar, setCVarFromString } from '@q2/config';
 import type { Framebuffer } from '@q2/renderer-api';
 import { ingestPak } from './pak.js';
 import type { WebPak } from './pak.js';
+
+registerCVar('cl_showfps', 1, 'show DOM fps overlay (and in-canvas fps readout)');
 
 export interface ProgressState {
   fraction: number;
@@ -27,6 +29,46 @@ export function setProgress(el: unknown, fraction: number, label: string): Progr
     }
   }
   return state;
+}
+
+/** Pure helper: readable fps line with ms/frame for the DOM overlay. */
+export function formatFps(fps: number): string {
+  if (!Number.isFinite(fps) || fps <= 0) return 'fps --';
+  const rounded = Math.round(fps);
+  const ms = 1000 / fps;
+  return `fps ${rounded} · ${ms.toFixed(1)} ms`;
+}
+
+/** Cvar gate for the fps readout (`cl_showfps`, default 1). */
+export function showFpsEnabled(): boolean {
+  // resetCVars() restores only compiled-in defaults; an absent cl_showfps
+  // (e.g. after a reset in tests) means the default-on state.
+  if (getCVar('cl_showfps') === undefined) return true;
+  return getCVarNumber('cl_showfps') !== 0;
+}
+
+/**
+ * Write the fps line into a DOM node. DOM-guarded: with no `document`
+ * (Node/vitest) or a null element it just returns the text. Returns the
+ * text written (or that would have been written).
+ */
+export function updateFpsOverlay(el: unknown, fps: number, visible = true): string {
+  const text = formatFps(fps);
+  const node = el as { textContent?: unknown; style?: { display?: string } } | null;
+  if (!node || typeof node !== 'object') return text;
+  try {
+    if (visible) {
+      if (typeof node.textContent === 'string' || node.textContent === undefined) {
+        (node as { textContent: string }).textContent = text;
+      }
+      if (node.style && typeof node.style === 'object') node.style.display = '';
+    } else if (node.style && typeof node.style === 'object') {
+      node.style.display = 'none';
+    }
+  } catch {
+    /* non-DOM stub */
+  }
+  return text;
 }
 
 /** Blit a 0xAABBGGRR framebuffer into a <canvas> via putImageData. */
@@ -244,6 +286,7 @@ export function startPlayLoop(
   let lastT = -1;
   let fps = 60;
   let frame = 0;
+  let lastOverlayMs = -Infinity;
   const tick = (nowMs: number): void => {
     if (stopped) return;
     if (lastT >= 0) {
@@ -261,6 +304,16 @@ export function startPlayLoop(
       { fps, frame: frame++ },
     );
     blitToCanvas(el, { ...host.fb, color: target });
+    // DOM overlay mirror of the in-canvas `fps N` (throttled to ~4Hz so
+    // text updates never cause layout thrash). Gated by `cl_showfps`.
+    if (nowMs - lastOverlayMs >= 250) {
+      lastOverlayMs = nowMs;
+      try {
+        updateFpsOverlay(document.getElementById('q2-fps'), fps, showFpsEnabled());
+      } catch {
+        /* DOM unavailable mid-teardown */
+      }
+    }
     // Per-channel positional audio: Mixer.mix() gains drive real nodes.
     // The driver already set the listener + started channels in step().
     if (sound) syncMixerToBrowser(sound, driver.mixer);
