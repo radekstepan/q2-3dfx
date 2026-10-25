@@ -1,8 +1,15 @@
 // @q2/bsp — node/leaf traversal, PVS decompression, trace/clip hulls. M2.1 owns this.
-import { Com_Error } from '@q2/config';
-import type { Bsp38 } from '@q2/formats';
-import type { Vec3 } from '@q2/math';
-export interface Trace { fraction: number; endpos: Vec3; planeNormal: Vec3; contents: number; entityNum: number }
-export function traceBox(_world: Bsp38, _start: Vec3, _end: Vec3, _mins: Vec3, _maxs: Vec3, _mask: number): Trace { Com_Error('fatal', 'not implemented: traceBox'); }
-export function pointLeaf(_world: Bsp38, _p: Vec3): number { Com_Error('fatal', 'not implemented: pointLeaf'); }
-export function clusterPVS(_world: Bsp38, _cluster: number): Uint8Array { Com_Error('fatal', 'not implemented: clusterPVS'); }
+export { loadBsp, lumpCounts } from './bsp38.js';
+export type { BspMap } from './bsp38.js';
+export {
+  BSP_IDENT, BSP_VERSION, HEADER_LUMPS,
+  LUMP_ENTITIES, LUMP_PLANES, LUMP_VERTEXES, LUMP_VISIBILITY, LUMP_NODES,
+  LUMP_TEXINFO, LUMP_FACES, LUMP_LIGHTING, LUMP_LEAFS, LUMP_LEAFFACES,
+  LUMP_LEAFBRUSHES, LUMP_EDGES, LUMP_SURFEDGES, LUMP_MODELS, LUMP_BRUSHES,
+  LUMP_BRUSHSIDES, LUMP_POP, LUMP_AREAS, LUMP_AREAPORTALS,
+  NODE_STRIDE, LEAF_STRIDE, FACE_STRIDE, BRUSH_STRIDE, BRUSHSIDE_STRIDE,
+  MODEL_EXTRA_STRIDE, AREA_STRIDE, AREAPORTAL_STRIDE,
+} from './bsp38.js';
+export { clusterPVS, decompressVis } from './pvs.js';
+export { traceBox, pointLeaf, DIST_EPSILON } from './trace.js';
+export type { Trace } from './trace.js';
