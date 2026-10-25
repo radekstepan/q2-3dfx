@@ -1,18 +1,62 @@
-// @q2/sw-renderer — ref_soft port. M3.1..M3.4 own this. See BRAIN.md §7.1.
-import { Com_Error } from '@q2/config';
-import type { Refresh, Framebuffer } from '@q2/renderer-api';
-export interface Span { y: number; x0: number; x1: number; z0: number; dz: number; u0: number; v0: number; du: number; dv: number; light: number; dlight: number }
-export interface SpanList { spans: Span[] }
-export interface Texture { width: number; height: number; texels: Uint8Array }
-export interface LightBlock { width: number; height: number; values: Uint8Array }
-export interface RasterBackend { drawSpans(list: SpanList, tex: Texture, light: LightBlock): void }
-export function drawSpans16(_fb: Framebuffer, _list: SpanList, _tex: Texture, _light: LightBlock, _colormap: Uint8Array): void { Com_Error('fatal', 'not implemented: drawSpans16'); }
-export class SoftwareRenderer implements Refresh {
-  init(_fb: Framebuffer): void { Com_Error('fatal', 'not implemented'); }
-  beginFrame(): void { Com_Error('fatal', 'not implemented'); }
-  renderView(): never { Com_Error('fatal', 'not implemented'); }
-  endFrame(): void { Com_Error('fatal', 'not implemented'); }
-  setPalette(): void { Com_Error('fatal', 'not implemented'); }
-  registerModel(): never { Com_Error('fatal', 'not implemented'); }
-  registerSkin(): never { Com_Error('fatal', 'not implemented'); }
-}
+// @q2/sw-renderer — ref_soft port (BRAIN.md §7.1). M3.1..M3.4.
+// Software 8-bit palettised renderer: spans, surface cache, BSP traversal,
+// alias models, sprites, particles. No DOM types; writes into handed buffers.
+
+export {
+  SUBDIV,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT,
+  createSpan,
+  runSubdiv16, runSubdivTurbulent, runSpanFlat,
+  sampleLightBlock, textureMasks,
+  drawSpansSoftware, drawSpansTurbulent, drawSpansFlat,
+  drawSpans16,
+  buildTurbTable, spanListView,
+  type Span, type SpanList, type Texture, type LightBlock, type RasterBackend,
+} from './spans.js';
+
+export {
+  COLORMAP_GRADES, COLORMAP_SIZE,
+  buildColormap, defaultPalette,
+} from './colormap.js';
+
+export {
+  SURFACE_CACHE_BUDGET,
+  SurfaceCache, surfaceCacheKey, hashLightStyles,
+  type SurfaceBlock,
+} from './surfaceCache.js';
+
+export {
+  buildLightMap, combineStyleScales, bboxDistance,
+  DLightState,
+  type DynamicLight, type SurfaceBounds,
+} from './light.js';
+
+export { setupCamera, buildFrustum, boxOnFrustumSide, culledByFrustum, type Camera } from './camera.js';
+
+export {
+  createEdgeScratch, projectClippedPoly,
+  emitSpansForPoly, sortRowSpans,
+  type EdgeScratch, type PolyInput, type ProjectedVert, type RowSpan,
+} from './edges.js';
+
+export {
+  collectVisibleSurfaces, findLeaf, clusterVisible, surfFrustumCulled, nodePlaneSide,
+  isMiniWorld,
+  type MiniNode, type MiniLeaf, type MiniTexture, type MiniLightmap, type MiniSurf,
+  type MiniWorld, type PlacedAlias, type PlacedSprite, type PlacedParticle,
+} from './worldNodes.js';
+
+export {
+  ANORM_COUNT,
+  buildANorms, buildShadeDots,
+  createBoxMesh, drawAliasInstance, fillAffineTri,
+  type AliasMesh, type AliasInstance, type AliasSkin,
+} from './alias.js';
+
+export { drawSprite, type SpriteDef, type Scissor } from './sprites.js';
+
+export { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
+
+export { createDevroom, createDevSkins, getDevMesh, DEVROOM_CAMERA } from './devroom.js';
+
+export { SoftwareBackend, SoftwareRenderer, sortBatchByRow, MAX_SPANS } from './frame.js';
