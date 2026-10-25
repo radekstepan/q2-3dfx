@@ -500,13 +500,16 @@ depends: M6.1
 status: in-progress
 done-when:
 - [x] pak drop zone → IndexedDB → boot; progress UI; renderer switcher; cvar panel
+- [x] real `SoftwareRenderer` behind `vid_renderer` (`software` default, `voodoo` resolve chain), rAF loop, pointer-lock input, crosshair + HUD
+- [x] devroom explorable (analytic room collision) and base1 bootable from a dropped pak (BSP collision, WAL/PCX, doors open + render, exit fires, static monsters shootable) — play-tested headlessly incl. Q2_PAK run
 - [ ] 60 fps at 640×480 software on the bench machine
 
 ### TODO(M7.1): IndexedDB pak cache (drop → parse → boot works; persistence
-### still TODO) and the 60 fps sign-off, which needs the real `ref_soft`
-### backend (M3.x) behind the `vid_renderer` switch — current shell boots
-### devroom to first frame via `NullRefresh`; fill-loop headroom on the bench
-### machine is ~799 Mpixel/s (≈2600 fps @640×480, see §11).
+### still TODO) and the 60 fps sign-off: base1 spawn view costs ~10.8 ms/frame
+### single-threaded at 320×240 (internal res, CSS 2× upscale; measured Ryzen 5 PRO
+### 2400G, Node 22) — 640×480 needs M8.1 workers. No monster AI/attacks yet
+### (placeholders only), no weapon view model, no per-channel sound scheduling,
+### no plats/trains riders, no saves/menu.
 ### WIRE update: real pak0.pak ingests client-side (3307 entries, hasBase1),
 ### cooker round-trips it (184MB → 93.6MB in 5.3s, base1.bsp byte-identical),
 ### and the real map renders headlessly (4 views, hashes logged in testkit).
@@ -520,6 +523,24 @@ status: blocked (needs COOP/COEP hosting)
 done-when:
 - [ ] framebuffer split into N bands; linear scaling to 4 workers ±15%
 - [ ] identical golden frames to the single-threaded path
+
+### M7.2 — Playable base1 (NEXT STEP — pick this card first)
+owns: `apps/web` (+ `packages/game` data tables only, no contract changes)
+depends: M7.1
+status: ready
+done-when:
+- [ ] monsters fight back: per-tick `monsterThink` in the driver, `selectAttack`
+  against the player (melee range damage, ranged tracer damage), player
+  health/death + respawn at `info_player_start`
+- [ ] pickups work: walking over `item_*`/`weapon_*`/`ammo_*` edicts grants
+  them via `pickupItem` (shotgun/machinegun become usable, ammo finite)
+- [ ] weapon view model: gun sprite/alias bottom-right + muzzle flash light
+- [ ] per-channel sound: wire `Mixer.mix()` gains to `BrowserMixer` nodes
+  (positional shots, door moves, pickups) instead of one-shot cues
+- [ ] `Q2_PAK` play test extended: bot takes scripted damage, picks up the
+  shotgun, kills one monster (`dead` + removed), reaches exit
+Out of scope (later cards): monster pathfinding (M5.3 full AI), plats/trains
+riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 
 ### M9.1 — WASM span backend
 owns: `packages/sw-renderer`
@@ -596,6 +617,7 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-25 | wire | software R_MarkLeaves + backface cull | 320×240 devroom | — | — | 1.33 | devroom golden `8f61c755` preserved (output-identical); spans 2800→1670, was 1.63 |
 | 2026-10-25 | wire | software base1 opening room | 640×480 | 8.9–90 | — | 1.81–2.36 | spawn-north 112.8ms/2.36x, spawn-west 41.9ms/1.81x, lowroad 27.7ms/2.19x, trench-east 28.6ms/1.94x; PVS 148 leafs, 107 WALs, real palette; 1.15x budget needs span occlusion |
 | 2026-10-25 | wire | cooker real pak0.pak | — | — | — | — | 3307 entries, 184MB → 93.6MB in 5.3s, base1.bsp byte-identical round-trip |
+| 2026-10-25 | play | software base1 spawn view, real pmove+doors | 320×240 | 92 | ~7 | 2.28 | 7905 surfaces, 8 monster placeholders, 10.8 ms/frame single-threaded (shot sparks, HUD, blit incl.) |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.

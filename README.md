@@ -52,20 +52,17 @@ yarn turbo run build typecheck test --filter=...[origin/main]
 
 ## Web app (`apps/web`)
 
-- Asset-free boot: with no pak present it boots the procedural `maps/devroom`
-  to its first rendered frame (`bootWeb()` in `apps/web/src/index.ts`).
-  This keeps CI and the public demo asset-free.
-- With assets: drop your own `pak0.pak` (shareware, unmodified) into the page's
-  drop zone. It is parsed client-side (`apps/web/src/pak.ts`), cached in
-  IndexedDB, and reported as `source: 'pak'` with an entry count.
+- Playable: `yarn start` → http://localhost:5173. Click the canvas for
+  pointer lock, then WASD + mouse, Space jump, E use, 1/2/3 weapons,
+  click to shoot. HUD shows fps, position, weapon/ammo.
+- No pak: explorable procedural devroom (real software renderer, analytic
+  room collision). Drop your own `pak0.pak` (shareware, unmodified) anywhere
+  on the page to boot base1: BSP collision, WAL textures, PCX palette,
+  doors that open, exit trigger, shootable soldier/gunner placeholders.
   **Never commit `pak0.pak`.**
-- Preview: serve the app with the root `start` command (builds workspace
-  dependencies first, then runs Vite rooted at `apps/web`):
-  ```bash
-  yarn start
-  # open http://localhost:5173
-  ```
-  Headless use (Node/tests) is via `bootWeb({ width, height, renderer, pak })`.
+- Internal render res is 320×240, CSS-upscaled 2× (base1 spawn ≈10.8 ms/frame
+  single-threaded; 640×480 native needs the M8.1 worker bands).
+- Headless use (Node/tests) is via `bootWeb({ width, height, renderer, pak })`.
 
 ## Layout
 

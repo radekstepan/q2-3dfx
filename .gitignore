@@ -9,3 +9,4 @@ __golden__/out/
 tools/bench/machine.json
 .turbo/
 *.mjs
+repomix-output.xml
