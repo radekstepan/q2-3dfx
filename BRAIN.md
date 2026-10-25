@@ -18,9 +18,15 @@
 **Prime directive: `main` always builds and always boots to a rendered frame.** Any change that
 cannot keep `yarn verify` green must be landed behind a feature flag in `@q2/config`.
 
-- `../external/Quake 2` - original Quake 2 game with all data files
-- `../external/Quake-2-master` - original Quake 2 source code
-- `../external/voodoo3_progguide.pdf` - Voodoo3 Graphics Engine reference
+- External reference material lives **sibling to this repo** in `../external/`
+  (outside git — never committed, never published; names contain no spaces):
+  - `../external/q2/` — Quake II game install with all data files (`baseq2/pak0.pak`)
+  - `../external/quake-2-source/` — id Quake II source, GPL-2.0 (`ref_soft/`, `ref_gl/`, …)
+  - `../external/quake-2-JS/` — community TS port (cross-check only)
+  - `../external/quake-2-voodoo-3-demo/` — Voodoo-look web demo (reference)
+  - `../external/voodoo3_progguide.pdf` — Voodoo3 programming reference
+- `source tools/q2-paths.sh` exports `Q2_SRC` / `Q2_PAK` / `Q2_DOCS`
+  (env-overridable defaults pointing at the above; `Q2_PAK` gates asset tests).
 
 ---
 
@@ -87,9 +93,10 @@ without touching call sites (`@q2/sw-renderer` exposes `RasterBackend`).
 
 | Thing | Where | Licence | How we use it |
 | --- | --- | --- | --- |
-| id Quake II source | `id-Software/Quake-2` | **GPL-2.0** | The normative reference. We port algorithms and data structures from it. |
-| Quake-2-JS | `Karlos-fr/Quake-2-JS` | check repo | Cross-check for browser-side asset loading and WASM/JS porting pitfalls. Do **not** copy code without licence review. |
-| `pak0.pak` (shareware) | id's shareware distribution | redistributable **unmodified only** | **Never commit it.** The app asks the user to drop `pak0.pak` into the page; it is parsed client-side and cached in IndexedDB. |
+| id Quake II source | sibling `../external/quake-2-source/` (outside git, never committed) | **GPL-2.0** (`gnu.txt`) | The normative reference. We port algorithms and data structures from it (`ref_soft/`, `ref_gl/`, `qcommon/`, `game/`, …). Default: `$Q2_SRC` (see `tools/q2-paths.sh`). |
+| Quake-2-JS | sibling `../external/quake-2-JS/` (outside git) | check repo | Cross-check for browser-side asset loading and WASM/JS porting pitfalls. Do **not** copy code without licence review. |
+| Voodoo3 prog. guide + voodoo demo | sibling `../external/voodoo3_progguide.pdf`, `../external/quake-2-voodoo-3-demo/` (outside git) | reference only | Voodoo3 behaviour checklist (§7.2). Default: `$Q2_DOCS`. |
+| `pak0.pak` (game data) | sibling `../external/q2/baseq2/pak0.pak` (outside git; local full-game install — a shareware pak works too) | id's data, redistributable **unmodified only** | **Never commit it.** The app asks the user to drop `pak0.pak` into the page; it is parsed client-side and cached in IndexedDB. Tests read it via the `Q2_PAK` env var (a direct path to the `.pak` file; default in `tools/q2-paths.sh`). |
 
 **Therefore this repo is GPL-2.0.** Every package's `package.json` must carry `"license": "GPL-2.0-only"`.
 `tools/asset-cooker` may be used by the user on their own copy of the pak; cooked assets are
