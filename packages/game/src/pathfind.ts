@@ -2,6 +2,8 @@
 // portal graph (m_move.c navigation is overkill for v1; the graph comes from
 // the caller, e.g. cooked from a map's door/plat connectivity).
 
+import type { Vec3 } from '@q2/math';
+
 export type PortalGraph = Map<number, number[]>;
 
 /** BFS shortest path (node ids) from start to goal, or null if unreachable. */
@@ -36,4 +38,21 @@ export function findPath(graph: PortalGraph, start: number, goal: number): numbe
 /** Reachability check without building the path. */
 export function isReachable(graph: PortalGraph, start: number, goal: number): boolean {
   return findPath(graph, start, goal) !== null;
+}
+
+/** Nearest nav node to a point (linear scan; graphs here are tiny). */
+export function nearestNode(positions: Map<number, Vec3>, p: Vec3): number | null {
+  let best: number | null = null;
+  let bestD = Infinity;
+  for (const [id, q] of positions) {
+    const dx = q[0]! - p[0]!;
+    const dy = q[1]! - p[1]!;
+    const dz = q[2]! - p[2]!;
+    const d = dx * dx + dy * dy + dz * dz;
+    if (d < bestD) {
+      bestD = d;
+      best = id;
+    }
+  }
+  return best;
 }

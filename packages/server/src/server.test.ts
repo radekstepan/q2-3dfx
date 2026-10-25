@@ -1,7 +1,11 @@
 // M5.2 server: 10Hz tick + scripted base1-logic scenario.
 import { describe, expect, it } from 'vitest';
-import { findByClassname, spawnEdict } from '@q2/game';
+import { findByClassname, moverUse, spawnEdict } from '@q2/game';
+import type { Vec3 } from '@q2/math';
+import { v3 } from '@q2/math';
 import {
+  SV_CarryRiders,
+  SV_ConsumePickup,
   SV_Init,
   SV_LinkEdict,
   SV_SpawnEntities,
@@ -10,6 +14,7 @@ import {
   SV_UseTargetname,
   fireTargets,
 } from './index.js';
+import type { RiderBody } from './index.js';
 
 const BASE1_LOGIC = `
 {
@@ -99,5 +104,66 @@ describe('server tick (M5.2)', () => {
     SV_UseTargetname(st, 'd');
     for (let i = 0; i < 20; i++) SV_Tick(st);
     expect(m.state).toBe('bottom');
+  });
+});
+
+describe('M7.4 completions: respawn + pusher carrying', () => {
+  it('consumed pickups hide and respawn on the id timer via SV_Tick', () => {
+    const st = SV_Init();
+    const ents = SV_SpawnEntities(
+      st,
+      `{ "classname" "worldspawn" }\n` +
+        `{ "classname" "weapon_shotgun" "origin" "0 0 0" }\n` +
+        `{ "classname" "item_armor_combat" "origin" "64 0 0" }\n`,
+    );
+    const gun = ents.find((e) => e.classname === 'weapon_shotgun')!;
+    const armor = ents.find((e) => e.classname === 'item_armor_combat')!;
+    // consume both at t=0 (Touch_Item take path, grant is app-side)
+    expect(SV_ConsumePickup(st, gun)).toBe(30);
+    expect(SV_ConsumePickup(st, armor)).toBe(20);
+    expect(gun.solid).toBe(0); // SOLID_NOT: hidden, skipped by touch checks
+    for (let i = 0; i < 199; i++) SV_Tick(st); // t=19.9
+    expect(armor.solid).toBe(0);
+    expect(gun.solid).toBe(0);
+    SV_Tick(st); // t=20.0: armor (20s id delay) re-materializes
+    expect(armor.solid).toBe(1); // SOLID_TRIGGER
+    expect(armor.state).toBe('respawned');
+    expect(gun.solid).toBe(0);
+    for (let i = 0; i < 100; i++) SV_Tick(st); // t=30.0
+    expect(gun.solid).toBe(1);
+  });
+
+  it('SV_CarryRiders moves bodies standing on displaced movers', () => {
+    const st = SV_Init();
+    SV_SpawnEntities(st, `{ "classname" "func_door" "angle" "-2" "speed" "100" "wait" "-1" }`);
+    const m = st.movers[0]!;
+    const rider: RiderBody = {
+      origin: v3(0, 0, 32),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+      groundEntity: m.ent.num,
+      onGround: true,
+    };
+    const walker: RiderBody = {
+      origin: v3(500, 0, 32),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+      groundEntity: -1,
+      onGround: true,
+    };
+    // idle tick: no displacement, nobody moves
+    SV_Tick(st);
+    expect(st.moverDeltas.size).toBe(0);
+    SV_CarryRiders(st, [rider, walker]);
+    expect(rider.origin[2]).toBe(32);
+    // open the door (downward at 100 u/s => -10 z per tick); the displacement
+    // is recorded and the rider rides it while the walker is untouched
+    moverUse(m, st.time);
+    SV_Tick(st);
+    expect(st.moverDeltas.get(m.ent.num)?.[2]).toBeCloseTo(-10, 6);
+    SV_CarryRiders(st, [rider, walker]);
+    expect(rider.origin[2]).toBeCloseTo(22, 6);
+    expect(walker.origin[0]).toBe(500);
+    expect(walker.origin[2]).toBe(32);
   });
 });

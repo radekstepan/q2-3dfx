@@ -256,3 +256,80 @@ export function teleportTo(who: Edict, dest: Edict): void {
   who.velocity[1] = 0;
   who.velocity[2] = 0;
 }
+
+// --- pusher carrying (SV_Push, game/g_phys.c) ---------------------------------
+//
+// id's SV_Push moves a MOVETYPE_PUSH entity by `move` and carries everything
+// standing on it (groundentity == pusher) or embedded in its final position.
+// Moves are quantized to 1/8 units for client-side prediction accuracy, and
+// a rider that ends up stuck vetoes the whole push: everything rolls back
+// and the pusher's blocked function runs (doors reverse via door_blocked).
+// Our movers never rotate, so the amove (angular) term of the C code is
+// documented-but-absent; translation is exact.
+
+/** A body that can ride a pusher: headless pmove state or edict origin. */
+export interface PushRider {
+  origin: Vec3;
+  mins: Vec3;
+  maxs: Vec3;
+  /** edict num of the mover this body stands on (-1 = world / none) */
+  groundEntity: number;
+}
+
+/** id SV_Push move quantization: clamp each component to 1/8 units. */
+export function SV_PushQuantize(move: Vec3): Vec3 {
+  const q = (x: number): number => {
+    const t = x * 8;
+    return (t >= 0 ? Math.floor(t + 0.5) : Math.ceil(t - 0.5)) / 8;
+  };
+  return v3(q(move[0]!), q(move[1]!), q(move[2]!));
+}
+
+/**
+ * SV_Push (g_phys.c): move `mover` by `move`, carrying riders whose
+ * groundEntity is the pusher. Returns false (and rolls everything back)
+ * when a carried rider ends up stuck inside solid — the C blocked path.
+ * `solidAt` reports whether a rider box at the given origin is stuck.
+ */
+export function SV_Push(
+  mover: Mover,
+  move: Vec3,
+  riders: PushRider[],
+  solidAt: (origin: Vec3, mins: Vec3, maxs: Vec3) => boolean,
+): boolean {
+  const step = SV_PushQuantize(move);
+  const savedMover = v3(mover.ent.origin[0], mover.ent.origin[1], mover.ent.origin[2]);
+  mover.ent.origin[0] = savedMover[0]! + step[0]!;
+  mover.ent.origin[1] = savedMover[1]! + step[1]!;
+  mover.ent.origin[2] = savedMover[2]! + step[2]!;
+  const saved: Array<{ rider: PushRider; origin: Vec3 }> = [];
+  for (const r of riders) {
+    if (r.groundEntity !== mover.ent.num) continue;
+    // C moves riders standing on the pusher unconditionally, then checks.
+    saved.push({ rider: r, origin: v3(r.origin[0], r.origin[1], r.origin[2]) });
+    r.origin[0] = r.origin[0]! + step[0]!;
+    r.origin[1] = r.origin[1]! + step[1]!;
+    r.origin[2] = r.origin[2]! + step[2]!;
+    if (solidAt(r.origin, r.mins, r.maxs)) {
+      // C retries the rider at its pre-push spot (relevant for riders, not
+      // pushed entities); only a still-stuck rider vetoes the push.
+      const s = saved[saved.length - 1]!;
+      r.origin[0] = s.origin[0]!;
+      r.origin[1] = s.origin[1]!;
+      r.origin[2] = s.origin[2]!;
+      if (solidAt(r.origin, r.mins, r.maxs)) {
+        for (const p of saved) {
+          p.rider.origin[0] = p.origin[0]!;
+          p.rider.origin[1] = p.origin[1]!;
+          p.rider.origin[2] = p.origin[2]!;
+        }
+        mover.ent.origin[0] = savedMover[0]!;
+        mover.ent.origin[1] = savedMover[1]!;
+        mover.ent.origin[2] = savedMover[2]!;
+        return false;
+      }
+      saved.pop();
+    }
+  }
+  return true;
+}

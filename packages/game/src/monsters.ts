@@ -3,6 +3,10 @@
 // id's mframe_t/mmovemove_t arrays, minus function pointers (actions are
 // string tags the game logic switches on).
 
+import type { Vec3 } from '@q2/math';
+import { findPath, nearestNode } from './pathfind.js';
+import type { PortalGraph } from './pathfind.js';
+
 export const RANGE_MELEE = 0;
 export const RANGE_NEAR = 1;
 export const RANGE_MID = 2;
@@ -163,4 +167,108 @@ export function selectAttack(kind: MonsterKind, dist: number, rand: () => number
   // gunner: grenade at mid without line-of-sight handled by caller; chain otherwise
   if (r === RANGE_NEAR || r === RANGE_MID) return rand() < 0.7 ? 'chaingun' : 'grenade';
   return 'none';
+}
+
+// --- node-graph navigation (M7.4; full M5.3 AI remains out of scope) ----------
+//
+// The lite soldier/gunner state machines above only stand, walk in place and
+// attack. monsterChaseMove adds the missing link: steering toward the player
+// along a caller-supplied node graph (BFS in pathfind.ts). It stays
+// data-driven — it only switches ms.move among the def's existing moves
+// (run / runandshoot / attack* / stand) and never invents frames.
+
+export interface MonsterNav {
+  graph: PortalGraph;
+  positions: Map<number, Vec3>;
+}
+
+export interface ChaseResult {
+  /** move selected this tick (already installed on ms) */
+  move: string;
+  /** node path toward the player, or null when standing/attacking */
+  path: number[] | null;
+  /** next waypoint position, or null when standing/attacking */
+  target: Vec3 | null;
+}
+
+/** Map an attack choice onto the kind's data-table move names. */
+export function attackMoveFor(kind: MonsterKind, choice: AttackChoice): string {
+  switch (choice) {
+    case 'shotgun':
+      return 'attack1';
+    case 'blaster':
+      return 'attack2';
+    case 'chaingun':
+      return 'attack_chain';
+    case 'grenade':
+      return 'attack_grenade';
+    case 'melee':
+      return kind === 'soldier' ? 'attack1' : 'attack_chain';
+    case 'none':
+      return kind === 'soldier' ? 'run' : 'runandshoot';
+  }
+}
+
+function setMove(ms: MonsterState, move: string): void {
+  if (ms.move !== move) {
+    ms.move = move;
+    ms.frame = 0;
+  }
+}
+
+/**
+ * One chase tick: attack when in range with line of sight, else navigate
+ * the graph toward the player. `dist` is the 3D monster-player distance,
+ * `canSee` the caller's line-of-sight result. Returns the chosen move plus
+ * the node path (null while attacking/standing).
+ */
+export function monsterChaseMove(
+  ms: MonsterState,
+  selfPos: Vec3,
+  playerPos: Vec3,
+  nav: MonsterNav,
+  canSee: boolean,
+  rand: () => number,
+): ChaseResult {
+  if (ms.dead) return { move: ms.move, path: null, target: null };
+  const dx = playerPos[0]! - selfPos[0]!;
+  const dy = playerPos[1]! - selfPos[1]!;
+  const dz = playerPos[2]! - selfPos[2]!;
+  const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  const r = monsterRange(dist);
+  // Melee always commits; at near/mid with sight the monster usually
+  // plants and fires (id attack chance), otherwise it closes in.
+  const commit =
+    r === RANGE_MELEE || ((r === RANGE_NEAR || r === RANGE_MID) && canSee && rand() < 0.7);
+  if (canSee && commit) {
+    const choice = selectAttack(ms.kind, dist, rand);
+    if (choice !== 'none') {
+      const move = attackMoveFor(ms.kind, choice);
+      setMove(ms, move);
+      return { move, path: null, target: null };
+    }
+  }
+  // Close in: walk the node graph toward the player.
+  const from = nearestNode(nav.positions, selfPos);
+  const to = nearestNode(nav.positions, playerPos);
+  if (from !== null && to !== null) {
+    const path = from === to ? [from] : findPath(nav.graph, from, to);
+    if (path && path.length > 0) {
+      const next = path.length > 1 ? path[1]! : path[0]!;
+      const target = nav.positions.get(next) ?? null;
+      // Gunner sprays while closing when it sees a near/mid target.
+      const move =
+        ms.kind === 'gunner' && canSee && (r === RANGE_NEAR || r === RANGE_MID)
+          ? 'runandshoot'
+          : ms.kind === 'soldier'
+            ? 'run'
+            : 'run';
+      setMove(ms, move);
+      return { move: ms.move, path, target };
+    }
+  }
+  // Nowhere to go: hold the stand pose.
+  const stand = ms.kind === 'soldier' ? 'stand1' : 'stand';
+  setMove(ms, stand);
+  return { move: ms.move, path: null, target: null };
 }

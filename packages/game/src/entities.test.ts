@@ -1,22 +1,36 @@
 // M5.2: entities lump parsing, items, doors/buttons/triggers.
 import { describe, expect, it } from 'vitest';
+import { v3 } from '@q2/math';
 import {
+  attackMoveFor,
+  DoRespawn,
   findByClassname,
+  isRespawning,
   makePlayerState,
+  monsterChaseMove,
+  monsterDef,
   moverThink,
   moverUse,
+  mulberry32,
   parseEntities,
   pickupItem,
+  respawnDelayFor,
   resetEdictNums,
+  SetRespawn,
+  SOLID_NOT,
+  SOLID_TRIGGER,
   spawnButton,
   spawnDoor,
   spawnEdict,
+  spawnMonster,
   spawnPlat,
   spawnTrigger,
+  SV_Push,
   teleportTo,
   triggerTouch,
   useTargets,
 } from './index.js';
+import type { PushRider } from './index.js';
 
 const MINI_LUMP = `
 // base1-style entities
@@ -204,5 +218,155 @@ describe('doors, plats, buttons, triggers (M5.2)', () => {
     expect(who.origin[1]).toBe(200);
     expect(who.origin[2]).toBe(310);
     expect(who.velocity[0]).toBe(0);
+  });
+});
+
+describe('pickup respawn (M7.4, g_items.c DoRespawn/SetRespawn)', () => {
+  it('id delay table: 30s weapons/health/ammo, 20s armor', () => {
+    expect(respawnDelayFor('weapon_shotgun')).toBe(30);
+    expect(respawnDelayFor('weapon_machinegun')).toBe(30);
+    expect(respawnDelayFor('ammo_shells')).toBe(30);
+    expect(respawnDelayFor('ammo_bullets')).toBe(30);
+    expect(respawnDelayFor('item_health')).toBe(30);
+    expect(respawnDelayFor('item_health_large')).toBe(30);
+    expect(respawnDelayFor('item_armor_combat')).toBe(20);
+    expect(respawnDelayFor('item_armor_shard')).toBe(20);
+  });
+
+  it('SetRespawn hides, DoRespawn re-materializes on level.time', () => {
+    resetEdictNums();
+    const e = spawnEdict({ classname: 'weapon_shotgun' });
+    const at = SetRespawn(e, respawnDelayFor(e.classname), 100);
+    expect(at).toBe(130);
+    expect(e.solid).toBe(SOLID_NOT);
+    expect(isRespawning(e)).toBe(true);
+    // not due yet (tick-based level.time, never wall-clock)
+    expect(DoRespawn(e, 129.9)).toBe(false);
+    expect(e.solid).toBe(SOLID_NOT);
+    expect(DoRespawn(e, 130)).toBe(true);
+    expect(e.solid).toBe(SOLID_TRIGGER);
+    expect(isRespawning(e)).toBe(false);
+    // no timer armed: no-op
+    expect(DoRespawn(e, 200)).toBe(false);
+  });
+
+  it('armor respawns after 20s', () => {
+    resetEdictNums();
+    const e = spawnEdict({ classname: 'item_armor_combat' });
+    SetRespawn(e, respawnDelayFor(e.classname), 0);
+    expect(DoRespawn(e, 19.9)).toBe(false);
+    expect(DoRespawn(e, 20)).toBe(true);
+  });
+});
+
+describe('SV_Push carrying (M7.4, g_phys.c)', () => {
+  it('carries riders standing on the pusher, ignores the rest', () => {
+    resetEdictNums();
+    const door = spawnDoor(spawnEdict({ classname: 'func_door' }), -2, 156);
+    const rider: PushRider = {
+      origin: v3(0, 0, 276),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+      groundEntity: door.ent.num,
+    };
+    const bystander: PushRider = {
+      origin: v3(500, 0, 0),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+      groundEntity: -1,
+    };
+    const ok = SV_Push(door, v3(0, 0, -10), [rider, bystander], () => false);
+    expect(ok).toBe(true);
+    expect(door.ent.origin[2]).toBeCloseTo(-10, 6);
+    expect(rider.origin[2]).toBeCloseTo(266, 6);
+    expect(bystander.origin[0]).toBe(500);
+  });
+
+  it('quantizes the step to 1/8 units like id', () => {
+    resetEdictNums();
+    const door = spawnDoor(spawnEdict({ classname: 'func_door' }), 0, 128);
+    const rider: PushRider = {
+      origin: v3(0, 0, 0),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+      groundEntity: door.ent.num,
+    };
+    SV_Push(door, v3(0.1, 0, 0), [rider], () => false);
+    expect(door.ent.origin[0]).toBeCloseTo(0.125, 6);
+    expect(rider.origin[0]).toBeCloseTo(0.125, 6);
+  });
+
+  it('rolls everything back when a rider ends up stuck', () => {
+    resetEdictNums();
+    const door = spawnDoor(spawnEdict({ classname: 'func_door' }), -2, 156);
+    const rider: PushRider = {
+      origin: v3(0, 0, 276),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+      groundEntity: door.ent.num,
+    };
+    // destination stuck, pre-push spot free: rider stays, pusher still moves
+    // (C only vetoes when the rider is stuck at BOTH spots).
+    const ok = SV_Push(door, v3(0, 0, -10), [rider], (o) => o[2]! < 276);
+    expect(ok).toBe(true);
+    expect(door.ent.origin[2]).toBeCloseTo(-10, 6);
+    expect(rider.origin[2]).toBeCloseTo(276, 6);
+    // stuck at both spots: full rollback, push fails (blocked path).
+    const ok2 = SV_Push(door, v3(0, 0, -10), [rider], () => true);
+    expect(ok2).toBe(false);
+    expect(door.ent.origin[2]).toBeCloseTo(-10, 6);
+    expect(rider.origin[2]).toBeCloseTo(276, 6);
+  });
+});
+
+describe('monster navigation (M7.4, node graph)', () => {
+  const positions = new Map([
+    [0, v3(0, 0, 0)],
+    [1, v3(100, 0, 0)],
+    [2, v3(200, 0, 0)],
+    [3, v3(200, 100, 0)],
+  ]);
+  const graph = new Map([
+    [0, [1]],
+    [1, [0, 2]],
+    [2, [1, 3]],
+    [3, [2]],
+  ]);
+  const nav = { graph, positions };
+
+  it('soldier closes along the graph when it cannot see the player', () => {
+    const ms = spawnMonster('soldier');
+    const res = monsterChaseMove(ms, v3(0, 0, 0), v3(200, 5, 0), nav, false, mulberry32(7));
+    expect(res.move).toBe('run');
+    expect(ms.move).toBe('run');
+    expect(res.path).toEqual([0, 1, 2]);
+    expect(res.target?.[0]).toBe(100);
+  });
+
+  it('melee range commits to the attack move', () => {
+    const ms = spawnMonster('soldier');
+    const res = monsterChaseMove(ms, v3(0, 0, 0), v3(10, 0, 0), nav, true, mulberry32(7));
+    expect(res.path).toBe(null);
+    expect(ms.move).toBe(attackMoveFor('soldier', 'melee'));
+    expect(monsterDef('soldier').moves[ms.move]).toBeDefined();
+  });
+
+  it('holds stand when the player node is unreachable', () => {
+    const ms = spawnMonster('gunner');
+    const island = {
+      graph: new Map([[9, []]]),
+      positions: new Map([[0, v3(0, 0, 0)], [9, v3(900, 0, 0)]]),
+    };
+    const res = monsterChaseMove(ms, v3(0, 0, 0), v3(900, 0, 0), island, false, mulberry32(7));
+    expect(res.move).toBe('stand');
+    expect(res.path).toBe(null);
+  });
+
+  it('gunner sprays while closing a visible far target', () => {
+    const ms = spawnMonster('gunner');
+    // dist 700 = MID range (visible but beyond the 0.7 attack-commit roll)
+    const res = monsterChaseMove(ms, v3(0, 0, 0), v3(700, 0, 0), nav, true, () => 0.99);
+    expect(res.move).toBe('runandshoot');
+    expect(res.path).not.toBe(null);
   });
 });

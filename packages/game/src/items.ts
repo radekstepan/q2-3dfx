@@ -1,6 +1,9 @@
 // @q2/game/items — item definitions + pickup semantics (g_items.c).
 // Covers what base1 needs: health, ammo, weapons, armor basics.
 
+import { SOLID_NOT, SOLID_TRIGGER } from './entities.js';
+import type { Edict } from './entities.js';
+
 export interface ItemDef {
   classname: string;
   kind: 'health' | 'ammo' | 'weapon' | 'armor' | 'key' | 'powerup';
@@ -12,6 +15,37 @@ export interface ItemDef {
 }
 
 export const MAX_HEALTH = 100;
+
+// --- pickup respawn (g_items.c DoRespawn / SetRespawn) ----------------------
+//
+// id delays (deathmatch pickup path): weapons 30s (Pickup_Weapon), health
+// 30s (Pickup_Health), ammo 30s (Pickup_Ammo), armor 20s (Pickup_Armor),
+// powerups item->quantity. id only respawns in deathmatch — single-player
+// pickups are freed permanently (Touch_Item -> G_FreeEdict). M7.4 enables
+// DM-style timers unconditionally so base1 stays playable end to end;
+// the DELAYS below are ported verbatim from the C Pickup_* call sites.
+//
+// Mechanics (C): SetRespawn hides the edict (SOLID_NOT + SVF_NOCLIENT,
+// think = DoRespawn at level.time + delay); DoRespawn re-materializes it
+// (SOLID_TRIGGER + EV_ITEM_RESPAWN event). Our edicts have no SVF flags,
+// so the pending timer lives in extra['respawnAt'] (level.time seconds)
+// and DoRespawn reports readiness to the caller (server tick / driver),
+// which re-links the entity (solid TRIGGER) and plays the effect.
+
+export const RESPAWN_DELAY_WEAPON = 30;
+export const RESPAWN_DELAY_AMMO = 30;
+export const RESPAWN_DELAY_HEALTH = 30;
+export const RESPAWN_DELAY_ARMOR = 20;
+
+/** id respawn delay table by classname prefix (g_items.c Pickup_*). */
+export function respawnDelayFor(classname: string): number {
+  if (classname.startsWith('item_armor')) return RESPAWN_DELAY_ARMOR;
+  if (classname.startsWith('item_health')) return RESPAWN_DELAY_HEALTH;
+  if (classname.startsWith('weapon_')) return RESPAWN_DELAY_WEAPON;
+  if (classname.startsWith('ammo_')) return RESPAWN_DELAY_AMMO;
+  if (classname.startsWith('item_')) return RESPAWN_DELAY_HEALTH;
+  return RESPAWN_DELAY_WEAPON;
+}
 
 const ITEMS: Record<string, ItemDef> = {
   item_health_small: { classname: 'item_health_small', kind: 'health', amount: 2, ammoKind: '', maxCarry: 100 },
@@ -95,4 +129,40 @@ export function pickupItem(ps: PlayerState, classname: string): PickupResult {
     default:
       return { picked: false, applied: 0, reason: 'unhandled kind' };
   }
+}
+
+/**
+ * SetRespawn (g_items.c): hide a consumed pickup and schedule DoRespawn
+ * at level.time + delay. The edict stays allocated (id clears SVF_NOCLIENT
+ * instead of freeing); callers must skip intangible edicts (solid NOT).
+ * `now` is level.time in seconds — never wall-clock.
+ */
+export function SetRespawn(ent: Edict, delay: number, now: number): number {
+  const at = now + Math.max(0, delay);
+  ent.solid = SOLID_NOT;
+  ent.extra['respawnAt'] = String(at);
+  ent.extra['respawnDelay'] = String(delay);
+  return at;
+}
+
+/**
+ * DoRespawn (g_items.c): re-materialize a hidden pickup whose timer is due.
+ * Returns true exactly when the edict becomes tangible again (the caller
+ * emits the EV_ITEM_RESPAWN equivalent); otherwise false (still hidden or
+ * no timer armed). Ready edicts come back SOLID_TRIGGER.
+ */
+export function DoRespawn(ent: Edict, now: number): boolean {
+  const raw = ent.extra['respawnAt'];
+  if (raw === undefined) return false;
+  const at = Number(raw);
+  if (!Number.isFinite(at) || now < at) return false;
+  delete ent.extra['respawnAt'];
+  ent.solid = SOLID_TRIGGER;
+  ent.state = 'respawned';
+  return true;
+}
+
+/** True while a SetRespawn timer is armed on the edict (hidden, pending). */
+export function isRespawning(ent: Edict): boolean {
+  return ent.extra['respawnAt'] !== undefined;
 }

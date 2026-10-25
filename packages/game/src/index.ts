@@ -63,6 +63,16 @@ export {
 } from './entities.js';
 export type { EntDict, Edict } from './entities.js';
 export { findItem, makePlayerState, pickupItem, MAX_HEALTH } from './items.js';
+export {
+  respawnDelayFor,
+  SetRespawn,
+  DoRespawn,
+  isRespawning,
+  RESPAWN_DELAY_WEAPON,
+  RESPAWN_DELAY_AMMO,
+  RESPAWN_DELAY_HEALTH,
+  RESPAWN_DELAY_ARMOR,
+} from './items.js';
 export type { ItemDef, PlayerState, PickupResult } from './items.js';
 export {
   spawnDoor,
@@ -75,6 +85,8 @@ export {
   spawnTrigger,
   triggerTouch,
   teleportTo,
+  SV_Push,
+  SV_PushQuantize,
   MOVER_BOTTOM,
   MOVER_TOP,
   MOVER_GOING_UP,
@@ -84,6 +96,7 @@ export {
   DOOR_TOGGLE,
 } from './func.js';
 export type { Mover, Trigger } from './func.js';
+export type { PushRider } from './func.js';
 export {
   findWeapon,
   fireWeapon,
@@ -106,6 +119,8 @@ export {
   monsterThink,
   monsterPain,
   selectAttack,
+  monsterChaseMove,
+  attackMoveFor,
   SOLDIER,
   GUNNER,
   RANGE_MELEE,
@@ -115,7 +130,8 @@ export {
   MELEE_DISTANCE,
 } from './monsters.js';
 export type { MonsterDef, MonsterMove, MonsterFrame, MonsterState, MonsterKind, AttackChoice } from './monsters.js';
-export { findPath, isReachable } from './pathfind.js';
+export type { MonsterNav, ChaseResult } from './monsters.js';
+export { findPath, isReachable, nearestNode } from './pathfind.js';
 export type { PortalGraph } from './pathfind.js';
 export {
   bspTraceFor,

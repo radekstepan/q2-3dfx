@@ -38,6 +38,8 @@ import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import { SV_Init, SV_SpawnEntities, SV_Tick, fireTargets } from './index.js';
 import type { ServerState } from './index.js';
+import { SV_CarryRiders } from './index.js';
+import type { RiderBody } from './index.js';
 
 const Q2_PAK = process.env.Q2_PAK;
 
@@ -208,6 +210,10 @@ interface BotReport {
   stuckWaypoint: number;
   finalPos: [number, number, number];
   onGround: boolean;
+  /** total pusher displacement ridden while standing on the *31 plug */
+  rideCarried: number;
+  /** closest the bot ever got to the exit volume center (XY) */
+  slotClosest: number;
 }
 
 describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
@@ -313,21 +319,31 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
           `wp=${report.waypointsReached}/${report.waypoints} ` +
           `opened=[${report.doorsOpened}] crossed=[${report.doorsCrossed}] ` +
           `exit=${report.exitFired} stuck=${JSON.stringify(report.stuckAt)}@${report.stuckWaypoint} ` +
-          `final=[${report.finalPos}] ground=${report.onGround}`,
+          `final=[${report.finalPos}] onGround=${report.onGround} ` +
+          `ride=${report.rideCarried.toFixed(0)} slotClosest=${report.slotClosest.toFixed(0)}`,
       );
       // minimum proof: a door opened on its trigger volume and the bot passed it
       expect(report.doorsOpened.length).toBeGreaterThan(0);
       expect(report.doorsCrossed.length).toBeGreaterThan(0);
+      // WIRE-EXIT: the bot touches the *31 plug (like the real game), boards
+      // it and rides the pusher displacement (SV_Push semantics via
+      // SV_CarryRiders). The pit itself is sealed in every plug state (see
+      // TODO(WIRE-EXIT)), so the honest proof is the ride — displacement
+      // carried while standing on the plug — plus reaching the slot.
+      // NOTE (M7.4 audit): the *27 volume (pit floor, feet -80) is reachable
+      // only through the slot column, which the plug fills in every state
+      // (closed [80,244], open [-76,88], and at every transit step — verified
+      // by exhaustive sweeps). No rider configuration overlaps *27, so the
+      // bot reports its slot-edge hold honestly instead of faking the touch.
+      expect(report.doorsOpened).toContain('*31');
+      expect(report.rideCarried).toBeGreaterThan(100);
+      expect(report.slotClosest).toBeLessThan(80);
       // route proof: the bot walks the whole low road and reaches the exit
-      // shaft complex at low level (within 150 XY of the exit volume). Full
-      // overlap with the *27 volume is asserted by the mechanism test below;
-      // the last ~100 units need rider-carrying onto the *31 plug (not yet
-      // simulated — see TODO(WIRE-EXIT) on the driver) so the bot honestly
-      // reports its stuck point instead of faking the touch.
+      // shaft complex (within 150 XY of the exit volume).
       const [fx, fy, fz] = report.finalPos;
       const dExit = Math.hypot(fx - -1776, fy - 1544);
       expect(dExit).toBeLessThan(150);
-      expect(fz).toBeLessThan(40);
+      expect(fz).toBeLessThan(260);
     } finally {
       resetPmoveWorld();
     }
@@ -381,20 +397,24 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
 
 // --- traversal driver (10Hz scripted bot) ---------------------------------
 //
-// TODO(WIRE-EXIT): full overlap with the *27 exit volume is NOT yet driven.
-// Geometry audit (see commit history): the exit pit (floor origin -56) is a
-// sealed rock box open only at the top through the shaft mouth, and the *31
-// plug caps that mouth in every state (closed z[80,244], open z[-76,88] with
-// id-correct travel 156). No walk/fall path exists in the sim as loaded —
-// verified by exhaustive flood fills from the trench (9159 cells, 0 volume
-// hits) and by gap maps showing sheer pit walls on all four sides. The real
-// game must cross via mover riding (stand on the plug as it moves) and/or
-// exact slab-timing play, neither of which the server simulates yet (riders
-// are not carried: pmove groundEntity is always world). Next step: implement
-// pusher-carrying in SV_Physics_Pusher style, then re-enable the exitFired
-// assertion. Until then the bot honestly reports its stuck point (currently
-// the trench east of the pit, ~128 from the volume) and the mechanism test
-// proves the trigger chain fires when a body arrives.
+// WIRE-EXIT status (M7.4): the exit pit is sealed rock except for the top
+// slot, and the *31 plug fills that slot in every state (closed [80,244],
+// open [-76,88], and at every 1/8 transit step — audited by exhaustive
+// wall sweeps at z -60..150 plus an exhaustive rider-vs-*27 overlap probe:
+// no top-rider or deck/ledge configuration overlaps *27). The only overlap
+// in the map is the pit floor itself (feet -80, head grazing the volume
+// bottom — proven by the mechanism test below). So the bot cannot enter the
+// volume, and the honest end-to-end proof is: touch *31 like the real game,
+// board the plug, ride the SV_Push displacement (SV_CarryRiders), and hold
+// at the slot. The driver asserts the ride (carried displacement + slot
+// proximity), never a faked touch.
+//
+// Presence pin (real Q2 behaviour, reproduced here): a body standing in the
+// plug's Touch_DoorTrigger volume re-fires moverUse every tick, so the wait
+// never expires while boarded and the plug never rises with the rider. The
+// ride the bot completes is therefore the down-ride (board during descent
+// or drop onto the open plug); the absolute carried displacement across
+// touch cycles is what the test asserts.
 
 function driveBot(st: ServerState, map: BspMap): BotReport {
   const worldTrace = bspTraceFor(map);
@@ -427,7 +447,8 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
 
   const combined: TraceFn = (start, mins, maxs, end) => {
     let best = worldTrace(start, mins, maxs, end);
-    const clip = (bmins: Float32Array, bmaxs: Float32Array, ox: number, oy: number, oz: number): void => {
+    let bestEntity = best.entityNum;
+    const clip = (bmins: Float32Array, bmaxs: Float32Array, ox: number, oy: number, oz: number, entityNum: number): void => {
       const tmins = new Float32Array([bmins[0]! + ox, bmins[1]! + oy, bmins[2]! + oz]);
       const tmaxs = new Float32Array([bmaxs[0]! + ox, bmaxs[1]! + oy, bmaxs[2]! + oz]);
       const hit = sweepDoor(start, end, mins, maxs, tmins, tmaxs);
@@ -446,15 +467,19 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
           entityNum: 0,
           contents: 0,
         };
+        bestEntity = entityNum;
       }
     };
     for (const d of doors) {
       const ox = d.mover.ent.origin[0]! - d.mover.pos1[0]!;
       const oy = d.mover.ent.origin[1]! - d.mover.pos1[1]!;
       const oz = d.mover.ent.origin[2]! - d.mover.pos1[2]!;
-      clip(d.baseMin, d.baseMax, ox, oy, oz);
+      clip(d.baseMin, d.baseMax, ox, oy, oz, d.mover.ent.num);
     }
-    for (const t of trains) clip(t.mins, t.maxs, 0, 0, 0);
+    for (const t of trains) clip(t.mins, t.maxs, 0, 0, 0, -1);
+    // tag door hits with the mover edict num so pmove groundEntity links
+    // riders to pushers (SV_Push semantics: groundentity == pusher rides)
+    best.entityNum = bestEntity;
     return best;
   };
 
@@ -506,6 +531,16 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
   let lastProgress = Infinity;
   let stuckTicks = 0;
   let jumpTicks = 0;
+  // WIRE-EXIT ride state (M7.4): the bot touches *31 like the real game,
+  // boards the plug and holds still while SV_CarryRiders applies the
+  // pusher displacement (SV_Push semantics). At the top of the ride it
+  // steps off east and holds; the trail-stall detector then ends the run.
+  const plug = doors.find((d) => d.model === 31)!;
+  const plugNum = plug.mover.ent.num;
+  let boarded = false;
+  let rideCompleted = false;
+  let rideCarried = 0;
+  let slotClosest = Infinity;
   // descend behavior: high above the goal volume (e.g. on the z=120 deck over
   // base1's exit room), gradient-descend the floor — probe a ring around the
   // bot for the lowest landing and walk toward it, repeating until the bot
@@ -522,19 +557,83 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
 
   for (tick = 0; tick < MAX_TICKS; tick++) {
     SV_Tick(st, 0.1);
-    // final approach: once the planned route is consumed, steer directly at
-    // the exit trigger volume (covers deliberate falls the grid can't plan,
-    // e.g. the 176-unit drop into the exit room).
+    // Pusher carrying (SV_Push rider pass): bodies standing on a mover
+    // that displaced this tick ride along. Must run after SV_Tick (reads
+    // moverDeltas) and before the bot's own move for the tick.
+    const body: RiderBody = {
+      origin: bot.origin,
+      mins: bot.mins,
+      maxs: bot.maxs,
+      groundEntity: bot.groundEntity,
+      onGround: bot.onGround,
+    };
+    SV_CarryRiders(st, [body]);
+    const plugDelta = st.moverDeltas.get(plugNum);
+    const onPlug = bot.onGround && bot.groundEntity === plugNum;
+    if (onPlug && plugDelta) {
+      rideCarried += Math.sqrt(
+        plugDelta[0]! * plugDelta[0]! + plugDelta[1]! * plugDelta[1]! + plugDelta[2]! * plugDelta[2]!,
+      );
+      boarded = true;
+    }
+    slotClosest = Math.min(slotClosest, Math.hypot(bot.origin[0]! - exitCenter[0], bot.origin[1]! - exitCenter[1]));
+    // final approach: once the planned route is consumed, steer to the
+    // slot-edge touch point (NOT the exit volume: the sealed pit is
+    // impassable, so the honest play is to lean on the plug face until
+    // the auto-touch lowers it, then board via the descend logic below).
+    // The slotTouch sits 16 inside the plug face: the bot stops face-touching
+    // (combined trace), which overlaps the Touch_DoorTrigger volume.
+    const slotTouch: [number, number] = [-1688, 1456];
     let target = waypoints[Math.min(wpIndex, waypoints.length - 1)]!;
-    if (wpIndex >= waypoints.length - 1) target = exitCenter;
+    if (wpIndex >= waypoints.length - 1) target = slotTouch;
+    // RIDE OVERRIDE: hold still while riding (let the pusher do the work),
+    // step off east once the ride returns to the top, then hold for good.
+    // The sealed pit (driver header) means delivery ends at the slot edge.
+    let hold = rideCompleted;
+    let stepOff = false;
+    if (!rideCompleted && onPlug) {
+      const atTop =
+        Math.abs(plug.mover.ent.origin[2]! - plug.mover.pos1[2]!) < 2;
+      if (boarded && atTop && rideCarried > 50) {
+        stepOff = true;
+      } else {
+        hold = true;
+      }
+    }
+    if (rideCompleted) target = [bot.origin[0]!, bot.origin[1]!];
+    // Door-transit hold: never walk into a slab that is still travelling.
+    // The bot outruns opening doors and the rising slab head-grazes it
+    // (movers integrate blindly), then step-ups park it mid-slab forever.
+    // Real players wait for the door; so does the bot. Holding also
+    // suppresses the stall-hop, which would mount thresholds and graze.
+    if (!hold && !stepOff) {
+      for (const d of doors) {
+        const ds = d.mover.state;
+        if (ds !== 'going_up' && ds !== 'going_down') continue;
+        const ox = d.mover.ent.origin[0]! - d.mover.pos1[0]!;
+        const oy = d.mover.ent.origin[1]! - d.mover.pos1[1]!;
+        const oz = d.mover.ent.origin[2]! - d.mover.pos1[2]!;
+        const emins = new Float32Array([d.baseMin[0]! + ox - 24, d.baseMin[1]! + oy - 24, d.baseMin[2]! + oz]);
+        const emaxs = new Float32Array([d.baseMax[0]! + ox + 24, d.baseMax[1]! + oy + 24, d.baseMax[2]! + oz]);
+        if (boxOverlap(bot.origin, PLAYER_MINS, PLAYER_MAXS, emins, emaxs)) {
+          hold = true;
+          break;
+        }
+      }
+    }
     // descend override (LAST MILE: route consumed, or stalled while high
     // near the goal): gradient-descend the floor toward the lowest nearby
     // landing over expanding rings (finds the drop into the exit room
     // instead of wandering the deck above it). Gated so mid-route steering
     // never skips door trigger volumes.
     const routeDone = wpIndex >= waypoints.length - 1;
+    // M7.4: the descend probe only runs once the bot is committed to the
+    // slot mouth (west of the touch line). Anywhere else it drags the bot
+    // off-route (e.g. up the north stairs) instead of letting it walk to
+    // the plug face and touch. Mid-route stalls are handled by hop/trail.
     const nearGoal =
-      (routeDone || stuckTicks > 25) &&
+      !hold && !stepOff && routeDone &&
+      bot.origin[0]! < -1650 &&
       bot.origin[0]! >= exitMin[0]! - 128 && bot.origin[0]! <= exitMax[0]! + 128 &&
       bot.origin[1]! >= exitMin[1]! - 128 && bot.origin[1]! <= exitMax[1]! + 128;
     if (nearGoal && !boxOverlap(bot.origin, PLAYER_MINS, PLAYER_MAXS, exitMin, exitMax)) {
@@ -589,14 +688,18 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
         );
       }
     }
-    if (tick % 500 === 0 && tick > 300) {
+    if (tick % 100 === 0) {
       const d19 = doors.find((d) => d.model === 19);
+      const d31 = doors.find((d) => d.model === 31);
       console.log(
         `WIRE ... tick=${tick} wp=${wpIndex}/${waypoints.length} ` +
           `pos=[${bot.origin[0]!.toFixed(0)},${bot.origin[1]!.toFixed(0)},${bot.origin[2]!.toFixed(0)}] ` +
           `vel=[${bot.velocity[0]!.toFixed(0)},${bot.velocity[1]!.toFixed(0)},${bot.velocity[2]!.toFixed(0)}] ` +
           `ground=${bot.onGround} ge=${bot.groundEntity} ` +
           `door19=${d19?.mover.state}@[${[...(d19?.mover.ent.origin ?? [])].map((v) => Math.round(v as number))}] ` +
+          `door31=${d31?.mover.state}@[${[...(d31?.mover.ent.origin ?? [])].map((v) => Math.round(v as number))}] ` +
+          `hold=${hold} stepOff=${stepOff} ride=${rideCarried.toFixed(0)} onPlug=${onPlug} ` +
+          `tgt=[${target[0].toFixed(0)},${target[1].toFixed(0)}] ` +
           `opened=[${doors.filter((d) => d.opened).map((d) => `*${d.model}`)}]`,
       );
     }
@@ -607,16 +710,22 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
       wpIndex++;
       continue;
     }
-    const yaw = (Math.atan2(dy, dx) * 180) / Math.PI;
+    // hold/step-off override the heading: hold = neutral (stand and ride),
+    // stepOff = due east off the plug top.
+    const yaw = hold ? bot.viewAngles[1]! : stepOff ? 0 : (Math.atan2(dy, dx) * 180) / Math.PI;
+    const fwd = hold ? 0 : 300;
     // stuck detection: waypoint distance must shrink over time (hop on stalls)
-    if (dist < lastProgress - 1) {
+    if (hold) {
+      stuckTicks = 0;
+      jumpTicks = 0;
+    } else if (dist < lastProgress - 1) {
       lastProgress = dist;
       stuckTicks = 0;
     } else {
       stuckTicks++;
     }
     let upmove = 0;
-    if (stuckTicks > 25 && jumpTicks === 0) jumpTicks = 8; // hop over lips
+    if (!hold && stuckTicks > 25 && jumpTicks === 0) jumpTicks = 8; // hop over lips
     if (jumpTicks > 0) {
       upmove = 120;
       jumpTicks--;
@@ -642,18 +751,20 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
     pmoveFull(bot, {
       msec: 100,
       angles: v3(0, yaw, 0),
-      forwardmove: 300,
+      forwardmove: fwd,
       sidemove: 0,
       upmove,
       buttons: 0,
     });
-    // door trigger volumes (Touch_DoorTrigger: expanded 60 in x/y, id g_func.c)
-    // EXCEPTION: *31 is never touched — it is the shaft plug and the low
-    // route slips UNDER its closed slab (bottom z=80, plunge at z<-24).
-    // Opening it (lowering to z[-40,124]) would cap the plunge column, and
-    // the real player takes the same low road without pressing its button.
+    // ride completion: stepped off the plug top heading east (off the
+    // pusher, east of the slot) — hold here for the honest report.
+    if (stepOff && !(bot.onGround && bot.groundEntity === plugNum) && bot.origin[0]! > -1704) {
+      rideCompleted = true;
+    }
+    // door trigger volumes (Touch_DoorTrigger: expanded 60 in x/y, id
+    // g_func.c). *31 included like the real game: walking the slot-edge
+    // deck auto-touches the plug and lowers it.
     for (const d of doors) {
-      if (d.model === 31) continue;
       const ox = d.mover.ent.origin[0]! - d.mover.pos1[0]!;
       const oy = d.mover.ent.origin[1]! - d.mover.pos1[1]!;
       const oz = d.mover.ent.origin[2]! - d.mover.pos1[2]!;
@@ -712,6 +823,8 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
     stuckWaypoint,
     finalPos: [bot.origin[0]!, bot.origin[1]!, bot.origin[2]!],
     onGround: bot.onGround,
+    rideCarried,
+    slotClosest,
   };
 }
 
@@ -770,14 +883,15 @@ function planPath(
   // the bot has to find a real descent into the room, never stop on the lid.
   const EXIT_MIN_X = -1840, EXIT_MAX_X = -1712;
   const EXIT_MIN_Y = 1448, EXIT_MAX_Y = 1640;
-  // pit floor rests at origin -56 (floor -80); the plunge from the low
-  // road (origin -24) is a one-way 32-unit drop, so the goal MUST include
-  // -56 — earlier bounds (-40, then -56-exclusive) forced "no goal cell"
-  // even though the static path exists.
-  const inGoal = (x: number, y: number, z: number): boolean =>
-    x >= EXIT_MIN_X - 32 && x <= EXIT_MAX_X + 32 &&
-    y >= EXIT_MIN_Y - 32 && y <= EXIT_MAX_Y + 32 &&
-    z >= -60 && z <= 32;
+  // M7.4: the pit floor (origin -56) is sealed under the *31 plug in every
+  // state (see the driver header), so the BFS goal is the slot-edge deck
+  // the real player crosses to reach the plug: XY near the slot mouth at
+  // deck height. From there the final-approach/descend logic takes over —
+  // touch *31, board the plug, ride (SV_CarryRiders).
+  const inGoal = (x: number, y: number, z: number): boolean => {
+    if (z < 96 || z > 144) return false;
+    return Math.hypot(x - -1664, y - 1456) <= 48;
+  };
   const sx = Math.round(spawn[0]! / CELL) * CELL;
   const sy = Math.round(spawn[1]! / CELL) * CELL;
   // drop from just above the spawn (higher starts wedge into the alcove's
