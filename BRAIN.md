@@ -146,7 +146,7 @@ math ← formats ← bsp ← {sw-renderer, voodoo} ← renderer-api ← host
 filesystem ← formats
 game ← {math, bsp, config}
 server ← {game, bsp}
-client ← {renderer-api, input, sound, config}
+client ← {renderer-api, input, sound, config, game (pmove prediction only)}
 host ← {server, client}
 apps/web ← host
 ```
@@ -494,12 +494,13 @@ done-when:
 - [x] `conchars` HUD, statusbar from `configstrings`, working console with cvars
 - [x] positional sound with the original attenuation curves
 
-### TODO(M6.1): pmove-accel hookup — `CL_Predict` is constant-velocity until
-### @q2/game exposes a headless `pmove` step for the owned input cmd (M5.1 done,
-### wire behind `cl_predict`). Dynamic-light cache invalidation (M3.2) pending.
-### Integration glue also delivered: `@q2/host` loop, `NullRefresh` + devroom
-### fallback in `@q2/renderer-api`, golden/bench helpers in `@q2/testkit`,
-### cvar console wiring in `@q2/config`.
+### TODO(M6.1): `CL_Predict` pmove hookup DONE (headless `pmoveFull` replay
+### behind `cl_predict`, exact-match vs server, legacy fallback preserved).
+### Remaining: dynamic-light cache invalidation (M3.2). `packages/client` now
+### depends on `@q2/game` (pmove only — §4 diagram updated); the headless
+### Mixer glue from M7.2 is unchanged. Integration glue also delivered:
+### `@q2/host` loop, `NullRefresh` + devroom fallback in `@q2/renderer-api`,
+### golden/bench helpers in `@q2/testkit`, cvar console wiring in `@q2/config`.
 
 ### M7.1 — Web app shell
 owns: `apps/web`
@@ -526,7 +527,22 @@ done-when:
 ### M8.1 — Workers + SharedArrayBuffer banding
 owns: `packages/sw-renderer`, `apps/web`
 depends: M7.1
-status: blocked (needs COOP/COEP hosting)
+status: review (kernel scales, full frames Amdahl-bound — see note)
+done-when:
+- [x] framebuffer split into N bands; linear scaling to 4 workers ±15%
+- [x] identical golden frames to the single-threaded path
+
+> M8.1 note: `BandedSoftwareBackend` over one SAB, `sw_workers` cvar
+> (0 = classic default), COOP/COEP dev-only headers for `yarn dev`.
+> Kernel (full-screen batch): 4.41 → 1.26 ms = 3.49×, in the ±15% band,
+> byte-identical incl. devroom `8f61c755` and base1 ×4 views. BUT full
+> base1 frames show no win (~19–23 ms: 1802 batches/frame, 92% of pixels
+> in sub-threshold batches + serial geometry). Browser path is inline
+> banded SAB (sync `renderView` can't `Atomics.wait` on main thread) —
+> true browser parallelism needs an async-render follow-up, as does
+> frame-level batch accumulation. M8.1 bench section lives in the
+> gitignored `bench.mjs`; gates are pinned in `bands.test.ts`.
+> 60 fps @640×480 still open.
 done-when:
 - [ ] framebuffer split into N bands; linear scaling to 4 workers ±15%
 - [ ] identical golden frames to the single-threaded path
@@ -673,6 +689,8 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-25 | m7.2 | software base1 spawn view (true SP spawn) + combat/pickups/doors | 320×240 | 100 | ~8 | 2.16 | 9.96 ms/frame single-threaded incl. monsterThink+tracer+pickup+door checks; 640×480 = 17.94 ms/frame (over 16 ms budget → needs M8.1 workers) |
 | 2026-10-25 | 2d6bda7 | software spanfill synth, wasm vs TS backend | 640×480 synth | — | ~158 (wasm) vs ~109 (TS) = 1.45× | — | `drawSpansWasm` vs `drawSpansSoftware`, byte-identical (0 diffs over 200-batch fuzz); scalar ceiling, needs SIMD v128 for 2× |
 | 2026-10-25 | 2d6bda7 | software base1 spawn-north, wasm backend | 640×480 | ~44 | — | 2.36 | paired A/B 22.90 vs 22.95 ms/frame (parity, frames dominated by non-spanfill work); 25% batches on wasm path, rest TS fallback; hashes ≡ TS path |
+| 2026-10-25 | worker | software spanfill kernel, 4-worker SAB banding | 640×480 synth | — | 243.8 (4w) vs 69.7 (1w) = 3.49× | — | full-screen batch best-of, in ±15%-of-linear band; byte-identical, devroom `8f61c755` preserved |
+| 2026-10-25 | worker | software base1 spawn-north, banded-inline / pool4 | 640×480 | ~45 | — | 2.36 | medians ≈21.9 / 21.5 / 22.7 ms (no full-frame win: 1802 batches/frame Amdahl-bound); hashes ≡ single-threaded |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.
