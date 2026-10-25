@@ -126,9 +126,10 @@ export function setRendererChoice(kind: string): void {
 
 import type { Host } from '@q2/host';
 import type { LocalDriver, PlayBoot } from './play.js';
-import { drawPlayHud, resolveDisplay } from './play.js';
+import { drawPlayHud, pumpMuzzleLight, resolveDisplay } from './play.js';
 import { attachToCanvas } from '@q2/input/dom';
 import { readPakEntry } from './pak.js';
+import type { Mixer, MixedChannel } from '@q2/sound';
 
 export interface PlayLoop {
   readonly host: Host;
@@ -140,7 +141,14 @@ interface BrowserSound {
   ctx: AudioContext;
   master: GainNode;
   shot: AudioBuffer | null;
+  channels: Map<number, ChannelNodes>;
   dispose(): void;
+}
+
+interface ChannelNodes {
+  gain: GainNode;
+  pan: StereoPannerNode | null;
+  src: AudioBufferSourceNode | OscillatorNode;
 }
 
 async function decodeShotSound(ctx: AudioContext, pak: WebPak): Promise<AudioBuffer | null> {
@@ -202,7 +210,7 @@ export function startPlayLoop(
       .then((mod) => {
         if (!sound) {
           const created = mod.createBrowserMixer(host.mixer);
-          sound = { ...created, shot: null };
+          sound = { ...created, shot: null, channels: new Map() };
         }
         const s = sound;
         if (s.ctx.state === 'suspended') void s.ctx.resume().catch(() => undefined);
@@ -231,23 +239,6 @@ export function startPlayLoop(
   document.addEventListener('keydown', unlock);
   document.addEventListener('keydown', onWeaponKeys);
 
-  const playShot = (): void => {
-    if (!sound) return;
-    const s = sound;
-    try {
-      if (s.shot) {
-        const src = s.ctx.createBufferSource();
-        src.buffer = s.shot;
-        src.connect(s.master);
-        src.start();
-      } else {
-        blip(s.ctx, s.master, 220, 0.08);
-      }
-    } catch {
-      /* ignore */
-    }
-  };
-
   let raf = 0;
   let stopped = false;
   let lastT = -1;
@@ -260,6 +251,8 @@ export function startPlayLoop(
       if (dt > 0) fps += (1000 / dt - fps) * 0.05;
     }
     lastT = nowMs;
+    // Muzzle dlight must be registered before the renderer draws the frame.
+    pumpMuzzleLight(boot);
     host.frame(nowMs);
     const target = resolveDisplay(boot);
     drawPlayHud(
@@ -268,11 +261,14 @@ export function startPlayLoop(
       { fps, frame: frame++ },
     );
     blitToCanvas(el, { ...host.fb, color: target });
+    // Per-channel positional audio: Mixer.mix() gains drive real nodes.
+    // The driver already set the listener + started channels in step().
+    if (sound) syncMixerToBrowser(sound, driver.mixer);
     for (const ev of driver.events.splice(0)) {
-      if (ev === 'shot') playShot();
-      else if (ev === 'kill' && sound) blip(sound.ctx, sound.master, 660, 0.12);
-      else if (ev === 'hit' && sound) blip(sound.ctx, sound.master, 440, 0.06);
-      else if (ev === 'exit' && sound) {
+      if (!sound) continue;
+      if (ev === 'kill') blip(sound.ctx, sound.master, 660, 0.12);
+      else if (ev === 'hit') blip(sound.ctx, sound.master, 440, 0.06);
+      else if (ev === 'exit') {
         blip(sound.ctx, sound.master, 523, 0.15);
         blip(sound.ctx, sound.master, 784, 0.25, 0.15);
       }
@@ -291,8 +287,131 @@ export function startPlayLoop(
       document.removeEventListener('pointerdown', unlock);
       document.removeEventListener('keydown', unlock);
       document.removeEventListener('keydown', onWeaponKeys);
+      if (sound) {
+        for (const ch of sound.channels.values()) {
+          try {
+            ch.src.stop();
+          } catch {
+            /* already stopped */
+          }
+          try {
+            ch.gain.disconnect();
+          } catch {
+            /* already disconnected */
+          }
+        }
+        sound.channels.clear();
+      }
       sound?.dispose();
       sound = null;
     },
   };
+}
+
+/** Pick a synth fallback pitch per sound family (used when no pak wav decoded). */
+function soundFreqFor(name: string): number {
+  if (name.includes('blast')) return 220;
+  if (name.includes('shotg')) return 180;
+  if (name.includes('machin')) return 260;
+  if (name.includes('door')) return 90;
+  if (name.includes('button')) return 140;
+  if (name.includes('pickup')) return 520;
+  if (name.includes('pain')) return 330;
+  if (name.includes('death')) return 110;
+  if (name.includes('melee')) return 150;
+  if (name.includes('noammo')) return 700;
+  return 440;
+}
+
+/**
+ * Wire per-channel mixer gains to real WebAudio nodes (M7.2).
+ *
+ * The driver owns a headless Mixer: step() sets the listener from the player
+ * and startSound()s positional channels (shots, doors, pickups, monster
+ * fire). Here mix() spatializes them and each live channel drives a
+ * GainNode (+StereoPannerNode when available). New channels get a
+ * BufferSource (decoded pak shot) or a short synth blip; vanished channels
+ * are stopped and disconnected. Positional shots/door moves/pickups therefore
+ * come through the mixer — no fixed one-shot cue path remains for them.
+ */
+export function syncMixerToBrowser(sound: BrowserSound, mixer: Mixer): MixedChannel[] {
+  const mixed = mixer.mix();
+  const live = new Set<number>();
+  for (const ch of mixed) {
+    live.add(ch.id);
+    const level = Math.max(0, Math.min(1, (ch.left + ch.right) / 2));
+    const denom = ch.left + ch.right;
+    const pan = denom > 1e-6 ? Math.max(-1, Math.min(1, (ch.right - ch.left) / denom)) : 0;
+    let nodes = sound.channels.get(ch.id);
+    if (!nodes) {
+      try {
+        const gain = sound.ctx.createGain();
+        let panNode: StereoPannerNode | null = null;
+        try {
+          if (typeof sound.ctx.createStereoPanner === 'function') {
+            panNode = sound.ctx.createStereoPanner();
+            gain.connect(panNode);
+            panNode.connect(sound.master);
+          } else {
+            gain.connect(sound.master);
+          }
+        } catch {
+          try {
+            gain.connect(sound.master);
+          } catch {
+            /* no destination */
+          }
+        }
+        let src: AudioBufferSourceNode | OscillatorNode;
+        if (sound.shot && /blast|shotg|machin|gunfire|shot/.test(ch.name)) {
+          const buf = sound.ctx.createBufferSource();
+          buf.buffer = sound.shot;
+          buf.connect(gain);
+          src = buf;
+        } else {
+          const osc = sound.ctx.createOscillator();
+          osc.frequency.value = soundFreqFor(ch.name);
+          osc.connect(gain);
+          src = osc;
+        }
+        gain.gain.value = level;
+        if (panNode) panNode.pan.value = pan;
+        try {
+          src.start();
+        } catch {
+          /* already started */
+        }
+        nodes = { gain, pan: panNode, src };
+        sound.channels.set(ch.id, nodes);
+      } catch {
+        continue;
+      }
+    } else {
+      try {
+        nodes.gain.gain.value = level;
+      } catch {
+        /* node gone */
+      }
+      try {
+        if (nodes.pan) nodes.pan.pan.value = pan;
+      } catch {
+        /* node gone */
+      }
+    }
+  }
+  for (const [id, nodes] of [...sound.channels]) {
+    if (live.has(id)) continue;
+    try {
+      nodes.src.stop();
+    } catch {
+      /* already stopped */
+    }
+    try {
+      nodes.gain.disconnect();
+    } catch {
+      /* already disconnected */
+    }
+    sound.channels.delete(id);
+  }
+  return mixed;
 }

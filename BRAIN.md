@@ -527,20 +527,28 @@ done-when:
 ### M7.2 — Playable base1 (NEXT STEP — pick this card first)
 owns: `apps/web` (+ `packages/game` data tables only, no contract changes)
 depends: M7.1
-status: ready
+status: done
 done-when:
-- [ ] monsters fight back: per-tick `monsterThink` in the driver, `selectAttack`
+- [x] monsters fight back: per-tick `monsterThink` in the driver, `selectAttack`
   against the player (melee range damage, ranged tracer damage), player
   health/death + respawn at `info_player_start`
-- [ ] pickups work: walking over `item_*`/`weapon_*`/`ammo_*` edicts grants
+- [x] pickups work: walking over `item_*`/`weapon_*`/`ammo_*` edicts grants
   them via `pickupItem` (shotgun/machinegun become usable, ammo finite)
-- [ ] weapon view model: gun sprite/alias bottom-right + muzzle flash light
-- [ ] per-channel sound: wire `Mixer.mix()` gains to `BrowserMixer` nodes
+- [x] weapon view model: gun sprite/alias bottom-right + muzzle flash light
+- [x] per-channel sound: wire `Mixer.mix()` gains to `BrowserMixer` nodes
   (positional shots, door moves, pickups) instead of one-shot cues
-- [ ] `Q2_PAK` play test extended: bot takes scripted damage, picks up the
+- [x] `Q2_PAK` play test extended: bot takes scripted damage, picks up the
   shotgun, kills one monster (`dead` + removed), reaches exit
 Out of scope (later cards): monster pathfinding (M5.3 full AI), plats/trains
 riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
+### TODO(M7.2 follow-up)
+- Spawn correctness fix landed here: `spawnFromLump` skips targeted
+  `info_player_start` (id SP `SelectSpawnPoint` rule) — base1's lump leads
+  with a `targetname "base2"` start over the exit pit that used to spawn the
+  player onto the exit volume and instantly "complete" the level.
+- Pickups never respawn (edict stays `freed`); Q2 re-spawns after ~30s.
+- `syncMixerToBrowser` uses the decoded pak shot for weapon-ish channels and
+  synth blips otherwise; per-name pak wav decode is still TODO.
 
 ### M9.1 — WASM span backend
 owns: `packages/sw-renderer`
@@ -618,6 +626,7 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-25 | wire | software base1 opening room | 640×480 | 8.9–90 | — | 1.81–2.36 | spawn-north 112.8ms/2.36x, spawn-west 41.9ms/1.81x, lowroad 27.7ms/2.19x, trench-east 28.6ms/1.94x; PVS 148 leafs, 107 WALs, real palette; 1.15x budget needs span occlusion |
 | 2026-10-25 | wire | cooker real pak0.pak | — | — | — | — | 3307 entries, 184MB → 93.6MB in 5.3s, base1.bsp byte-identical round-trip |
 | 2026-10-25 | play | software base1 spawn view, real pmove+doors | 320×240 | 92 | ~7 | 2.28 | 7905 surfaces, 8 monster placeholders, 10.8 ms/frame single-threaded (shot sparks, HUD, blit incl.) |
+| 2026-10-25 | m7.2 | software base1 spawn view (true SP spawn) + combat/pickups/doors | 320×240 | 100 | ~8 | 2.16 | 9.96 ms/frame single-threaded incl. monsterThink+tracer+pickup+door checks; 640×480 = 17.94 ms/frame (over 16 ms budget → needs M8.1 workers) |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.

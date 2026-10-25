@@ -17,7 +17,7 @@ export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
 export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop } from './dom.js';
 export type { PlayLoop } from './dom.js';
-export { drawPlayHud, resolveDisplay } from './play.js';
+export { drawPlayHud, resolveDisplay, pumpMuzzleLight } from './play.js';
 
 export interface BootOptions {
   width?: number;
