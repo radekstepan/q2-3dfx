@@ -19,7 +19,7 @@ export type { WebPak, WebPakEntry } from './pak.js';
 export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
 export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled } from './dom.js';
 export type { PlayLoop } from './dom.js';
-export { drawPlayHud, resolveDisplay, pumpMuzzleLight } from './play.js';
+export { drawPlayHud, resolveDisplay, pumpMuzzleLight, loadConcharsFont, concharsFontFromPCX } from './play.js';
 
 export interface BootOptions {
   width?: number;

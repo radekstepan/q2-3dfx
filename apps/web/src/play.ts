@@ -9,7 +9,14 @@ import type { HostDriver } from '@q2/host';
 import { BUTTON_ATTACK } from '@q2/input';
 import type { UserCmdT } from '@q2/input';
 import type { Snapshot } from '@q2/client';
-import { drawString, fillRect } from '@q2/client';
+import {
+  drawString,
+  fillRect,
+  makeConcharsFont,
+  setConcharsFont,
+  loadConcharsFont as loadConcharsPixels,
+} from '@q2/client';
+import type { ConcharsFont } from '@q2/client';
 import {
   SoftwareRenderer,
   createDevroom,
@@ -57,6 +64,7 @@ import { SV_Init, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, fireTargets } f
 import type { ServerState } from '@q2/server';
 import { ATTN_NORM, Mixer } from '@q2/sound';
 import { parseWAL, parsePCX } from '@q2/formats';
+import type { Pcx } from '@q2/formats';
 import { resolveFrame } from '@q2/voodoo';
 import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
@@ -307,6 +315,8 @@ export class LocalDriver implements HostDriver {
   /** Muzzle flash expiry (server time) + world pos for the dlight/HUD flash. */
   private flashUntil = -10;
   private flashPos: Vec3 = v3();
+  /** One-shot pump gate: true only between a shot and its single drain. */
+  private flashPending = false;
   /** Player death/respawn. */
   private deadUntil = -1;
   private spawnPoints: Array<{ origin: Vec3; yaw: number }> = [];
@@ -454,7 +464,14 @@ export class LocalDriver implements HostDriver {
 
   /** Drain the one-shot muzzle-flash dlight request (dom tick pumps it). */
   drainFlash(): Vec3 | null {
-    if (!this.muzzleLit()) return null;
+    if (!this.flashPending) return null;
+    if (!this.muzzleLit()) {
+      // Window expired before the pump ran: drop the request so a stale
+      // pos can never brighten a later frame.
+      this.flashPending = false;
+      return null;
+    }
+    this.flashPending = false;
     return this.flashPos;
   }
 
@@ -803,6 +820,7 @@ export class LocalDriver implements HostDriver {
     );
     // Muzzle flash: HUD glow + a real dlight the renderer understands.
     this.flashUntil = t + 0.09;
+    this.flashPending = true;
     const fwd0 = v3();
     const right0 = v3();
     const up0 = v3();
@@ -961,6 +979,38 @@ function buildBase1(pak: WebPak): { map: BspMap; mini: MiniWorld } {
 
 // --- boot + HUD ---
 
+/**
+ * Convert a parsed `pics/conchars.pcx` into @q2/client 1bpp font bytes.
+ * Passes straight through the @q2/client loader (`loadConcharsFont`, which
+ * owns the 128x128 16x16-grid layout + TRANSPARENT_COLOR 255 rule); a lump
+ * of the wrong shape (or a loader throw) yields null and the caller keeps
+ * the procedural fallback. Pure function: headless/Node safe.
+ */
+export function concharsFontFromPCX(pcx: Pcx): ConcharsFont | null {
+  try {
+    return loadConcharsPixels(pcx);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Load the HUD font from a pak (`pics/conchars.pcx` via parsePCX).
+ * Returns null when the pak is absent or the lump is missing/unparseable —
+ * the caller falls back to the procedural font. Headless/Node safe
+ * (no IndexedDB/DOM; parsePCX + setConcharsFont are pure).
+ */
+export function loadConcharsFont(pak: WebPak | null): ConcharsFont | null {
+  if (!pak) return null;
+  const bytes = tryPakEntry(pak, 'pics/conchars.pcx');
+  if (!bytes) return null;
+  try {
+    return concharsFontFromPCX(parsePCX(bytes));
+  } catch {
+    return null;
+  }
+}
+
 export interface PlayBoot {
   host: Host;
   driver: LocalDriver;
@@ -991,6 +1041,14 @@ export function bootPlay(opts: {
         /* procedural palette fallback */
       }
     }
+  }
+  // HUD font: real `pics/conchars.pcx` when the pak ships it, procedural
+  // xorshift fallback otherwise (deterministic per boot so tests are
+  // order-independent despite the global active font).
+  try {
+    setConcharsFont(loadConcharsFont(opts.pak ?? null) ?? makeConcharsFont());
+  } catch {
+    /* procedural font already active via getConcharsFont() */
   }
   const host = new Host({
     refresh,
@@ -1030,9 +1088,21 @@ export function resolveDisplay(boot: PlayBoot): Uint32Array {
 /**
  * Pump the one-shot muzzle-flash dynamic light into the renderer. Call
  * before the frame renders (the dom rAF tick does this; headless tests call
- * it directly). No-op once the flash window expires.
+ * it directly). Clears the renderer's dlight list first so the flash can
+ * never accumulate — exactly one add per shot, baseline restored on expiry.
+ * The clear hook is feature-detected (a future expiry hook wins when
+ * present). No-op once the flash window expires or was already drained.
  */
 export function pumpMuzzleLight(boot: PlayBoot): boolean {
+  const hooks = boot.refresh as unknown as {
+    testExpireDynamicLights?: () => void;
+    testClearDynamicLights?: () => void;
+  };
+  if (typeof hooks.testExpireDynamicLights === 'function') {
+    hooks.testExpireDynamicLights();
+  } else if (typeof hooks.testClearDynamicLights === 'function') {
+    hooks.testClearDynamicLights();
+  }
   const pos = boot.driver.drainFlash();
   if (!pos) return false;
   boot.refresh.testAddDynamicLight({
@@ -1079,9 +1149,14 @@ export function drawPlayHud(
 }
 
 /**
- * Weapon view model: gun body bottom-right + muzzle flash light rectangle.
- * Drawn post-resolve in HUD space (the software renderer has no screen-space
- * sprite path); the 3D muzzle dlight is pumped separately via drainFlash().
+ * Weapon view model: PLACEHOLDER 2D `fillRect` gun silhouette bottom-right +
+ * muzzle flash rect (NOT the real `v_weap` MD2/skins — blocked on
+ * TODO(M1.2 follow-up): nothing loads real `.md2` skins yet, see M3.4/M7.2
+ * notes in BRAIN.md; the 3D muzzle dlight is pumped separately via
+ * drainFlash()). Drawn post-resolve in HUD space (the software renderer has
+ * no screen-space sprite path). Per-weapon body size: blaster 46px,
+ * machinegun 58px, shotgun 64px. The caption names the weapon so the
+ * placeholder is honest in screenshots.
  */
 function drawViewModel(
   target: { width: number; height: number; color: Uint32Array },
@@ -1115,4 +1190,7 @@ function drawViewModel(
     fillRect(target, 0, 0, w, 3, 0xffff2222);
     fillRect(target, 0, h - 3, w, 3, 0xffff2222);
   }
+  // Placeholder caption: short weapon name above the silhouette.
+  const short = cls.replace(/^weapon_/, '');
+  if (w >= 120 && h >= 100) drawString(target, gx, gy - 10, short, 0xffbbbbbb);
 }

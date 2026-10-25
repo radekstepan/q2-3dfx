@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { keyDown, keyUp, BUTTON_ATTACK } from '@q2/input';
 import type { UserCmdT } from '@q2/input';
 import { v3 } from '@q2/math';
-import { bootPlay, drawPlayHud, pumpMuzzleLight } from './play.js';
+import { getConcharsFont, makeConcharsFont } from '@q2/client';
+import { bootPlay, drawPlayHud, pumpMuzzleLight, loadConcharsFont, concharsFontFromPCX } from './play.js';
 import type { LocalDriver } from './play.js';
 
 function runFrames(host: { frame(nowMs: number): unknown }, fromMs: number, toMs: number, step = 16): void {
@@ -68,6 +69,70 @@ describe('play driver (devroom, headless)', () => {
     expect(driver.events).toContain('shot');
     const stats = host.frame(1216);
     expect(stats.pixels).toBeGreaterThan(0);
+  });
+
+  it('M6.1/M7.2 follow-up: muzzle flash is one-shot, no dlight leak', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { host, driver } = boot;
+    runFrames(host, 0, 500);
+    let adds = 0;
+    const origAdd = boot.refresh.testAddDynamicLight.bind(boot.refresh);
+    boot.refresh.testAddDynamicLight = (l): void => {
+      adds++;
+      origAdd(l);
+    };
+    const fbSum = (): number => {
+      const c = host.fb.color;
+      let s = 0;
+      for (let i = 0; i < c.length; i++) s += c[i]! & 0xffffff;
+      return s;
+    };
+    // Fire once: exactly one dlight add for the shot.
+    driver.pm.viewAngles = v3(0, 0, 0);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.events).toContain('shot');
+    expect(driver.muzzleLit()).toBe(true);
+    expect(pumpMuzzleLight(boot)).toBe(true);
+    expect(adds).toBe(1);
+    // Lit frame is brighter than the cleared baseline; cleared frames are
+    // byte-stable (no accumulation across frames). One pump per frame: the
+    // pump clears first, so a second pump without a new shot adds nothing.
+    host.frame(516);
+    const lit = host.fb.color.slice();
+    const litSum = fbSum();
+    expect(pumpMuzzleLight(boot)).toBe(false);
+    expect(adds).toBe(1);
+    host.frame(532);
+    const base = host.fb.color.slice();
+    const baseSum = fbSum();
+    expect(pumpMuzzleLight(boot)).toBe(false);
+    expect(adds).toBe(1);
+    host.frame(548);
+    expect(litSum).toBeGreaterThan(baseSum);
+    expect(Array.from(host.fb.color)).toEqual(Array.from(base));
+    // Past the flash window the pump stays quiet (expiry drops the request).
+    stepDriver(driver, neutralCmd(), 5);
+    expect(driver.muzzleLit()).toBe(false);
+    expect(pumpMuzzleLight(boot)).toBe(false);
+    expect(adds).toBe(1);
+    // Renderer-side observability when present: no live lights remain.
+    const countHook = (boot.refresh as unknown as { testDynamicLightCount?: () => number }).testDynamicLightCount;
+    if (typeof countHook === 'function') expect(countHook.call(boot.refresh)).toBe(0);
+  });
+
+  it('conchars: procedural fallback without a pak, loader null-safe', () => {
+    expect(loadConcharsFont(null)).toBeNull();
+    expect(concharsFontFromPCX({ width: 64, height: 64, pixels: new Uint8Array(4096), palette: new Uint8Array(768) })).toBeNull();
+    // Transparent index (id TRANSPARENT_COLOR 255) maps to 0, all else to 1.
+    const clear = concharsFontFromPCX({ width: 128, height: 128, pixels: new Uint8Array(16384).fill(255), palette: new Uint8Array(768) });
+    expect(clear).not.toBeNull();
+    expect(clear!.every((b) => b === 0)).toBe(true);
+    const ink = concharsFontFromPCX({ width: 128, height: 128, pixels: new Uint8Array(16384), palette: new Uint8Array(768) });
+    expect(ink).not.toBeNull();
+    expect(ink!.length).toBe(16384);
+    expect(ink!.every((b) => b === 1)).toBe(true);
+    bootPlay({ width: 32, height: 24 });
+    expect(getConcharsFont()).toEqual(makeConcharsFont());
   });
 
   it('M7.2: death respawns at the spawn point, view model + muzzle light draw', () => {
@@ -215,5 +280,25 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     stepDriver(driver, neutralCmd(), 5);
     expect(driver.exited).toBe(true);
     expect(driver.message).toContain('LEVEL COMPLETE');
+  });
+
+  it('M6.1 follow-up: real conchars.pcx replaces the procedural font', async () => {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const { loadConcharsFont: loadFont } = await import('./play.js');
+    const { getConcharsFont: getFont, makeConcharsFont: makeFont } = await import('@q2/client');
+    const pak = ingestPak(buf);
+    const font = loadFont(pak);
+    expect(font).not.toBeNull();
+    expect(font!.length).toBe(256 * 64);
+    // Real glyphs carry ink; the all-zero synthetic font does not.
+    expect(font!.some((b) => b === 1)).toBe(true);
+    expect(font).not.toEqual(makeFont());
+    // Pak boot wires it as the active HUD font (headless-safe, no DOM/IDB).
+    bootPlay({ width: 32, height: 24, pak });
+    expect(getFont()).toEqual(font!);
   });
 });

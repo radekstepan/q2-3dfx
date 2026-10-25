@@ -7,15 +7,31 @@
   "commit": false,
   "fixed": [],
   "linked": [
-    "@q2/*"
+    [
+      "@q2/bsp",
+      "@q2/client",
+      "@q2/config",
+      "@q2/filesystem",
+      "@q2/formats",
+      "@q2/game",
+      "@q2/host",
+      "@q2/input",
+      "@q2/math",
+      "@q2/renderer-api",
+      "@q2/server",
+      "@q2/sound",
+      "@q2/sw-renderer",
+      "@q2/testkit",
+      "@q2/voodoo"
+    ]
   ],
   "access": "public",
   "baseBranch": "main",
   "updateInternalDependencies": "patch",
   "ignore": [
-    "q2ts-web",
-    "q2ts-devtools",
-    "q2-cooker",
-    "q2-bench"
+    "web",
+    "devtools",
+    "asset-cooker",
+    "bench"
   ]
 }
