@@ -6,7 +6,7 @@
 import type {
   Entity, Framebuffer, FrameStats, Model, ModelHandle, RefDef, Refresh, TextureHandle, WorldModel,
 } from '@q2/renderer-api';
-import { DLightState, buildLightMap, type DynamicLight, type SurfaceBounds } from './light.js';
+import { DLightState, LIGHT_STYLE_UNUSED, buildLightMap, type DynamicLight, type SurfaceBounds } from './light.js';
 import { SurfaceCache, hashLightStyles, type SurfaceBlock } from './surfaceCache.js';
 import { setupCamera, type Camera } from './camera.js';
 import {
@@ -372,6 +372,12 @@ export class SoftwareRenderer implements Refresh {
     const worldData = isMiniWorld(world.data) ? world.data : createDevroom();
     const cam = setupCamera(view.origin, view.angles, view.fovX, this.fbW, this.fbH);
     this.backend.time = view.time;
+    // Renderer-owned dynamic lights (muzzle flashes) age out on their own:
+    // expire before the serial check so a stale flash invalidates the cache
+    // exactly once and the scene returns to baseline even when the caller
+    // never calls clear (M6.1 muzzle-leak fix, renderer side). A live flash
+    // is re-added every frame, so expiry only drops abandoned lights.
+    this.dlights.expireStaleLights();
     // dynamic lights -> cache invalidation (serial change = add/remove)
     if (this.dlights.serial !== this.lastDynSerial) {
       this.cache.invalidateAll();
@@ -457,16 +463,24 @@ export class SoftwareRenderer implements Refresh {
       );
       const mip = dist < 320 ? 0 : dist < 640 ? 1 : dist < 1280 ? 2 : 3;
       const lm = worldData.lightmaps[surf.lightId % worldData.lightmaps.length]!;
-      const nStyles = Math.min(lm.styles.length, this.styleScratch.length);
-      for (let k = 0; k < nStyles; k++) {
-        this.styleScratch[k] = view.lightStyles[lm.styles[k]!] ?? 0;
+      // id faces carry up to 4 style slots with 255 = "no more styles":
+      // resolve only the valid ones (test and devroom paths have none).
+      // Single-style surfaces resolve to exactly one scale, so the static
+      // baseline (devroom golden) is bit-identical to the old [0]-only path.
+      let nValid = 0;
+      const maxStyles = Math.min(lm.styles.length, this.styleScratch.length);
+      for (let k = 0; k < maxStyles; k++) {
+        const idx = lm.styles[k]!;
+        if (idx === LIGHT_STYLE_UNUSED) continue;
+        this.styleScratch[nValid++] = view.lightStyles[idx] ?? 0;
       }
-      const stylesHash = hashLightStyles(this.styleScratch, nStyles);
+      const stylesHash = hashLightStyles(this.styleScratch, nValid);
       let block = this.cache.get(surf.id, stylesHash, mip);
       if (!block) {
         // copy the style scales out of scratch (build is a miss-only path)
-        const scalesCopy = [this.styleScratch[0] ?? 1];
-        for (let k = 1; k < nStyles; k++) scalesCopy.push(this.styleScratch[k]!);
+        const scalesCopy: number[] = [];
+        for (let k = 0; k < nValid; k++) scalesCopy.push(this.styleScratch[k]!);
+        if (scalesCopy.length === 0) scalesCopy.push(1);
         block = this.buildSurfaceBlock(worldData, surf, mip, scalesCopy, dyn, dlightFrameBits(surf.id));
         this.cache.put(surf.id, stylesHash, mip, block);
       }
@@ -571,6 +585,10 @@ export class SoftwareRenderer implements Refresh {
       }
     }
 
+    // Age renderer-owned lights once per rendered view: a flash that is not
+    // re-added expires after DEFAULT_DLIGHT_TTL_FRAMES renders (swept at the
+    // top of the next renderView, with one serial bump / one cache rebuild).
+    this.dlights.ageFrame();
     const ms = Date.now() - t0;
     const area = this.fbW * this.fbH;
     if (d) d.candidatePixels = candidatePixels;
@@ -606,13 +624,35 @@ export class SoftwareRenderer implements Refresh {
     if (hb && hb !== this.idx) hb.set(this.idx.subarray(0, hb.length));
   }
 
-  /** Test hook: renderer-owned dynamic lights (R_MarkLights input). */
-  testAddDynamicLight(l: DynamicLight): void {
-    this.dlights.addLight(l);
+  /** Test hook: renderer-owned dynamic lights (R_MarkLights input).
+   * ttlFrames (default DEFAULT_DLIGHT_TTL_FRAMES = 2) is how many renders
+   * the light survives without being re-added; a live flash re-pumps every
+   * frame, so expiry only drops abandoned lights. Back-compat: the old
+   * single-arg call keeps working. */
+  testAddDynamicLight(l: DynamicLight, ttlFrames?: number): void {
+    this.dlights.addLight(l, ttlFrames);
   }
 
   testClearDynamicLights(): void {
     this.dlights.clear();
+  }
+
+  /**
+   * End all current flash requests now (same sweep renderView runs for
+   * ttl-expired lights, but immediate). Probed by the web muzzle pump, which
+   * calls this every frame before its conditional re-add: idle frames are
+   * free (no serial bump, cache stays hot); a live flash is dropped so the
+   * re-add is the only light and nothing accumulates. Headless tests that
+   * add directly without pumping rely on the ttl path instead. Returns the
+   * removed count. No allocation.
+   */
+  testExpireDynamicLights(): number {
+    return this.dlights.expireAll();
+  }
+
+  /** Live renderer-owned light count (muzzle-leak observability, test hook). */
+  testDynamicLightCount(): number {
+    return this.dlights.count;
   }
 
   /** Observability for bench/golden (BRAIN.md §10.3: cache hit rate). */

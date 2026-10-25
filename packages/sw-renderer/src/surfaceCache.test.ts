@@ -1,6 +1,7 @@
 // M3.2 tests: R_BuildLightMap equivalent + LRU surface cache.
 import { describe, expect, it } from 'vitest';
-import { buildLightMap, DLightState, bboxDistance } from './light.js';
+import { buildLightMap, combineStyleScales, DLightState, bboxDistance } from './light.js';
+import { DEFAULT_DLIGHT_TTL_FRAMES, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED } from './light.js';
 import { SurfaceCache, hashLightStyles, surfaceCacheKey } from './surfaceCache.js';
 
 function flatSamples(w: number, h: number, v: number): Uint8Array {
@@ -41,6 +42,50 @@ describe('buildLightMap', () => {
     expect(lit[0]).toBe(63);
   });
 
+  it('two-style sum equals the single-style equivalent (M6.1 dark baseline)', () => {
+    const one = new Uint8Array(4);
+    const two = new Uint8Array(4);
+    const s = flatSamples(2, 2, 200);
+    buildLightMap(one, s, 2, 2, [1], [], new Float32Array([0, 0, 0]), 0);
+    buildLightMap(two, s, 2, 2, [0.5, 0.5], [], new Float32Array([0, 0, 0]), 0);
+    // 200/255=0.784 -> *1.0 -> 49.4 -> 49 either way: multi-style sums,
+    // single-style is unchanged (devroom golden intact).
+    expect([...one]).toEqual([49, 49, 49, 49]);
+    expect([...two]).toEqual([...one]);
+  });
+
+  it('multi-style surface is lit by its live styles, not black', () => {
+    const out = new Uint8Array(1);
+    // first style off (flicker), second on: old [0]-only path gave 0.
+    buildLightMap(out, flatSamples(1, 1, 200), 1, 1, [0, 1],
+      [], new Float32Array([0, 0, 0]), 0);
+    expect(out[0]).toBe(49);
+  });
+
+  it('overbright modulate defaults to current look, x2 brightens', () => {
+    expect(LIGHT_OVERBRIGHT).toBe(1);
+    const normal = new Uint8Array(1);
+    const bright = new Uint8Array(1);
+    const dim2x = new Uint8Array(1);
+    buildLightMap(normal, flatSamples(1, 1, 128), 1, 1, [1],
+      [], new Float32Array([0, 0, 0]), 0);
+    expect(normal[0]).toBe(32); // pinned current look
+    buildLightMap(bright, flatSamples(1, 1, 128), 1, 1, [1],
+      [], new Float32Array([0, 0, 0]), 0, 2);
+    expect(bright[0]).toBe(63); // 0.502*2 clamps to full grade
+    buildLightMap(dim2x, flatSamples(1, 1, 64), 1, 1, [1],
+      [], new Float32Array([0, 0, 0]), 0, 2);
+    expect(dim2x[0]).toBe(32); // linear region doubles 16 -> 32
+  });
+
+  it('combineStyleScales skips the 255 terminator (id-correct)', () => {
+    const styles = new Float32Array(256).fill(1);
+    expect(combineStyleScales([0, 1], styles)).toBe(2);
+    expect(combineStyleScales([0, LIGHT_STYLE_UNUSED], styles)).toBe(1);
+    expect(combineStyleScales(
+      [LIGHT_STYLE_UNUSED, LIGHT_STYLE_UNUSED], styles)).toBe(0);
+  });
+
   it('dynamic light out of range adds nothing without its bit', () => {
     const out = new Uint8Array(1);
     const dl = { origin: new Float32Array([1000, 0, 0]), intensity: 10, color: new Float32Array([1, 1, 1]) };
@@ -71,6 +116,86 @@ describe('DLightState.markLights', () => {
     expect(affected).toEqual([7]);
     expect(st.bitsFor(7)).toBe(1);
     expect(st.bitsFor(9)).toBe(0);
+  });
+});
+
+describe('DLightState expiry (muzzle-leak fix, renderer side)', () => {
+  const mk = (intensity: number) => ({
+    origin: new Float32Array([0, 0, 0]), intensity, color: new Float32Array([1, 1, 1]),
+  });
+
+  it('defaults to a 2-frame ttl', () => {
+    expect(DEFAULT_DLIGHT_TTL_FRAMES).toBe(2);
+  });
+
+  it('stale lights expire with exactly one serial bump, then stay gone', () => {
+    const st = new DLightState();
+    const s0 = st.serial;
+    st.addLight(mk(200));
+    expect(st.serial).toBe(s0 + 1);
+    expect(st.count).toBe(1);
+    // two rendered frames pass without re-add: light still pending
+    expect(st.expireStaleLights()).toBe(0);
+    st.ageFrame();
+    expect(st.expireStaleLights()).toBe(0);
+    st.ageFrame();
+    expect(st.serial).toBe(s0 + 1); // no bump until the sweep drops it
+    // third sweep drops it: exactly one bump, then steady
+    expect(st.expireStaleLights()).toBe(1);
+    expect(st.serial).toBe(s0 + 2);
+    expect(st.count).toBe(0);
+    expect(st.expireStaleLights()).toBe(0);
+    expect(st.serial).toBe(s0 + 2);
+  });
+
+  it('explicit ttl=1 lasts a single frame; ttl=0 expires immediately', () => {
+    const st = new DLightState();
+    st.addLight(mk(200), 1);
+    expect(st.expireStaleLights()).toBe(0);
+    st.ageFrame();
+    expect(st.expireStaleLights()).toBe(1);
+    st.addLight(mk(200), 0);
+    expect(st.expireStaleLights()).toBe(1);
+    expect(st.count).toBe(0);
+  });
+
+  it('sweep removes only the stale lights (swap-remove keeps the live one)', () => {
+    const st = new DLightState();
+    st.addLight(mk(111), 1); // short-lived
+    st.addLight(mk(222), 9); // long-lived
+    st.ageFrame();
+    expect(st.expireStaleLights()).toBe(1);
+    expect(st.count).toBe(1);
+    expect(st.lights[0]!.intensity).toBe(222);
+    // live light still marks surfaces
+    const affected = st.markLights([
+      { id: 3, mins: new Float32Array([-5, -5, -5]), maxs: new Float32Array([5, 5, 5]) },
+    ]);
+    expect(affected).toEqual([3]);
+  });
+
+  it('expireAll drops everything with one bump, free when idle', () => {
+    const st = new DLightState();
+    const s0 = st.serial;
+    expect(st.expireAll()).toBe(0);
+    expect(st.serial).toBe(s0); // idle pump hook: no invalidation, cache hot
+    st.addLight(mk(200), 9);
+    st.addLight(mk(200), 9);
+    expect(st.count).toBe(2);
+    expect(st.expireAll()).toBe(2);
+    expect(st.count).toBe(0);
+    expect(st.serial).toBe(s0 + 3); // two adds + one drop
+    expect(st.expireAll()).toBe(0);
+    expect(st.serial).toBe(s0 + 3);
+  });
+
+  it('clear() drops lights and ttls together', () => {
+    const st = new DLightState();
+    st.addLight(mk(200));
+    st.addLight(mk(200));
+    st.clear();
+    expect(st.count).toBe(0);
+    expect(st.expireStaleLights()).toBe(0);
   });
 });
 

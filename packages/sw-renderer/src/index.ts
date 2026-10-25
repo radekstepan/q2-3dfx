@@ -49,6 +49,7 @@ export {
 
 export {
   buildLightMap, combineStyleScales, bboxDistance,
+  LIGHT_STYLE_UNUSED, LIGHT_OVERBRIGHT, DEFAULT_DLIGHT_TTL_FRAMES,
   DLightState,
   type DynamicLight, type SurfaceBounds,
 } from './light.js';

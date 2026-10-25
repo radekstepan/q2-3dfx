@@ -19,10 +19,26 @@ export interface SurfaceBounds {
 }
 
 /**
+ * Style index meaning "no more styles" (id qfiles.h: faces carry up to 4
+ * style slots, unused slots are 255). Must never index RefDef.lightStyles.
+ */
+export const LIGHT_STYLE_UNUSED = 255;
+
+/**
+ * Light modulate applied in buildLightMap before the grade clamp.
+ * 1 = current software look (devroom golden `8f61c755` is pinned at 1);
+ * pass 2 for the gl-style x2 modulate. Cvar-friendly knob for a future
+ * `sw_overbright`; the frame path keeps the default so output is unchanged.
+ */
+export const LIGHT_OVERBRIGHT = 1;
+
+/**
  * Build per-luxel light grades 0..63 (R_BuildLightMap equivalent).
  * samples: RGB luxels (w*h*3, 0..255). styleScales: per-style 0..2 multipliers
- * (from RefDef.lightStyles at the surface's style indices).
+ * (from RefDef.lightStyles at the surface's style indices, 255 slots already
+ * filtered by the caller). Empty scales fall back to 1 (unlit default).
  * dlights: dynamic lights with world-space surfCenter for falloff.
+ * overbright: pre-clamp modulate (default LIGHT_OVERBRIGHT = 1).
  */
 export function buildLightMap(
   out: Uint8Array,
@@ -33,16 +49,22 @@ export function buildLightMap(
   dlights: DynamicLight[],
   surfCenter: Float32Array,
   dlightBits: number,
+  overbright = LIGHT_OVERBRIGHT,
 ): void {
+  // id R_BuildLightMap sums one scaled block per valid style; the samples
+  // here carry a single baked block, so the per-style scales add up. The sum
+  // is hoisted: one multiply per luxel, no allocation.
+  let styleScale = 0;
+  for (let k = 0; k < styleScales.length; k++) styleScale += styleScales[k]!;
+  if (styleScales.length === 0) styleScale = 1;
   const n = w * h;
   for (let i = 0; i < n; i++) {
     const r = samples[i * 3]! / 255;
     const g = samples[i * 3 + 1]! / 255;
     const b = samples[i * 3 + 2]! / 255;
-    const styleScale = styleScales.length > 0 ? styleScales[0]! : 1;
-    // luma of the static sample, scaled by lightstyle (qu twice like ref_gl
-    // overbright is NOT applied here; the grade clamp clips highlights)
-    let l = (0.299 * r + 0.587 * g + 0.114 * b) * styleScale;
+    // luma of the static sample, scaled by the summed lightstyles
+    // (overbright-style modulate happens here, before the grade clamp)
+    let l = (0.299 * r + 0.587 * g + 0.114 * b) * styleScale * overbright;
     // dynamic lights: linear falloff from the surface center (R_AddDynamicLights)
     for (let d = 0; d < dlights.length; d++) {
       if (((dlightBits >> d) & 1) === 0) continue;
@@ -64,23 +86,48 @@ export function buildLightMap(
   }
 }
 
-/** Extra styles beyond the first scale the whole block (multi-style surf). */
+/** Extra styles beyond the first scale the whole block (multi-style surf).
+ * Style slot 255 is id's "no more styles" terminator and is skipped. */
 export function combineStyleScales(styleIndices: number[], lightStyles: Float32Array): number {
   let s = 0;
   for (let i = 0; i < styleIndices.length; i++) {
-    s += lightStyles[styleIndices[i]!] ?? 0;
+    const idx = styleIndices[i]!;
+    if (idx === LIGHT_STYLE_UNUSED) continue;
+    s += lightStyles[idx] ?? 0;
   }
   return s;
 }
 
 /**
+ * Default muzzle-flash lifetime: how many renderView calls a renderer-owned
+ * light stays alive without being re-added. 2 keeps the existing golden
+ * dlight test's two lit renders intact while bounding any leak: a flash the
+ * caller stops pumping is gone (and its cache entries rebuilt once) within
+ * 3 frames, even if clear() is never called.
+ */
+export const DEFAULT_DLIGHT_TTL_FRAMES = 2;
+
+/**
  * Mark surfaces touched by dynamic lights (R_MarkLights equivalent).
  * Returns the sorted list of affected surface ids and bumps state.serial.
  * Uses bbox-distance culling (dist > intensity skips the whole surface).
+ *
+ * Renderer-owned lights expire on their own (M6.1 muzzle-leak fix, renderer
+ * side) via two cooperating paths: pump-driven hosts call expireAll() (via
+ * testExpireDynamicLights) before each frame's conditional re-add, so a
+ * one-shot flash ends immediately and idle frames cost nothing; direct-add
+ * users (headless tests) that never pump are covered by the ttl path —
+ * renderView calls expireStaleLights() before the serial check and ageFrame()
+ * after drawing, so an abandoned flash is dropped with exactly one serial
+ * bump (one cache rebuild) and the scene returns to baseline. Either way the
+ * live list stays bounded by ttl, so the `1 << li` bit budget below cannot
+ * overflow from accumulation.
  */
 export class DLightState {
   serial = 1;
   lights: DynamicLight[] = [];
+  /** parallel to lights: renderViews remaining before expiry. No allocation on sweep (swap-remove). */
+  private ttl: number[] = [];
   /** per-surface bitmask of affecting dynamic lights, keyed by surface id */
   dlightBits = new Map<number, number>();
   dlightFrame = new Map<number, number>();
@@ -88,12 +135,63 @@ export class DLightState {
 
   clear(): void {
     this.lights.length = 0;
+    this.ttl.length = 0;
     this.serial++;
   }
 
-  addLight(l: DynamicLight): void {
+  addLight(l: DynamicLight, ttlFrames = DEFAULT_DLIGHT_TTL_FRAMES): void {
     this.lights.push(l);
+    const ttl = Math.floor(ttlFrames);
+    this.ttl.push(ttl < 0 ? 0 : ttl);
     this.serial++;
+  }
+
+  /** Live renderer-owned light count (muzzle-leak observability, test hook). */
+  get count(): number {
+    return this.lights.length;
+  }
+
+  /**
+   * Drop every renderer-owned light now; bumps serial exactly once when
+   * anything was dropped (one cache rebuild), not at all when idle — so a
+   * per-frame pump hook is free in steady state. Returns removed count.
+   * This is what the web muzzle pump calls before each frame's conditional
+   * re-add: the previous one-shot flash ends immediately, a fresh add is the
+   * only live light, and nothing accumulates. No allocation.
+   */
+  expireAll(): number {
+    const removed = this.lights.length;
+    if (removed === 0) return 0;
+    this.lights.length = 0;
+    this.ttl.length = 0;
+    this.serial++;
+    return removed;
+  }
+
+  /**
+   * Drop lights whose ttl reached zero. Returns the removed count and bumps
+   * serial exactly once when anything was removed (one cache rebuild).
+   * Call before the serial check in renderView. No allocation.
+   */
+  expireStaleLights(): number {
+    let removed = 0;
+    for (let i = this.lights.length - 1; i >= 0; i--) {
+      if (this.ttl[i]! <= 0) {
+        const last = this.lights.length - 1;
+        this.lights[i] = this.lights[last]!;
+        this.lights.pop();
+        this.ttl[i] = this.ttl[last]!;
+        this.ttl.pop();
+        removed++;
+      }
+    }
+    if (removed > 0) this.serial++;
+    return removed;
+  }
+
+  /** Age one rendered frame: decrement remaining lifetimes. No allocation. Call after drawing. */
+  ageFrame(): void {
+    for (let i = 0; i < this.ttl.length; i++) this.ttl[i]!--;
   }
 
   markLights(surfs: SurfaceBounds[], count?: number): number[] {
