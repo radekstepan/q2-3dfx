@@ -38,6 +38,40 @@ r.endFrame(); // fb.color now holds 0xAABBGGRR
 - `yarn workspace @q2/sw-renderer golden` is a stub; real-map WIRE test lives in testkit (`Q2_PAK=...` gated, 4.0x overdraw ceiling).
 - `node ./bench.mjs` — headless perf run.
 
+## Overdraw attribution (M3.3, option b)
+
+The 1.15x budget assumed span-level occlusion, which `ref_soft` never had: it
+buckets with PVS + frustum + backface and lets the z-buffer absorb everything
+in-frustum-but-occluded. Per-span occluder clipping would be new,
+non-C-faithful work for zero visible-output change, so the budget — not the
+renderer — was wrong. `src/overdraw.ts` + `SoftwareRenderer.testMeasureOverdraw`
+prove it with per-view accounting (every PVS-admitted surface lands in exactly
+one bucket; emitted span pixels reconcile with depth-written pixels):
+
+| view @640x480 | surf | pvs | emit | cull f/b/c/d | candidate | written | z-rejected (share) | overdraw |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| spawn-north | 7905 | 4495 | 1802 | 1003/1366/261/63 | 725725 | 307200 | 418525 (57.7%) | 2.362 |
+| spawn-west | 7905 | 2822 | 1079 | 790/764/156/33 | 556121 | 307200 | 248921 (44.8%) | 1.810 |
+| lowroad-west | 7905 | 1280 | 583 | 283/317/72/25 | 671615 | 307200 | 364415 (54.3%) | 2.186 |
+| trench-east | 7905 | 5113 | 1977 | 608/1890/579/59 | 594689 | 307200 | 287489 (48.3%) | 1.936 |
+| devroom @320x240 | 11 | 11 | 6 | 1/4/0/0 | 101960 | 76800 | 25160 (24.7%) | 1.328 |
+
+(`src/overdraw.test.ts`, `Q2_PAK`-gated for base1; run:
+`yarn workspace @q2/sw-renderer test --run src/overdraw.test.ts`.)
+
+Reading: PVS cuts 7905 surfaces to 1280–5113 admitted; frustum + backface name
+every admitted-but-unemitted surface (zero unaccounted bucketing waste); screen
+coverage is exactly 1.000 on all four views while 44.8–57.7% of span fill loses
+the depth test — in-frustum occluded spans, by construction. Front-to-back BSP
+order + the strict `>` test mean each pixel is written at most once
+(`written <= area` asserted), so the residual is hidden-surface removal, not
+re-draw. Armed-vs-plain renders are byte-identical, and base1 hashes match the
+pre-change ledger (`fbf00c26`, `3cb12e30`, `0eb44f33`, `a64faa42`).
+
+Recommended budget (coordinator to apply in BRAIN.md): replace the
+`overdraw ≤1.15x` M3.3 done-when with a `≤2.5x` ceiling at 640x480 on base1's
+opening room (worst measured 2.362, margin ~6%).
+
 ## Constraints
 
 - Dependency direction (BRAIN.md §4): above `bsp`/`formats`/`math`, below `renderer-api` consumers; must never import `dom` types (worker + Node safe).

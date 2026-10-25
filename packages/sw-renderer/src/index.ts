@@ -89,3 +89,8 @@ export {
 } from './bspWorld.js';
 
 export { SoftwareRenderer, sortBatchByRow, MAX_SPANS } from './frame.js';
+
+export {
+  createOverdrawDetail, countWrittenZb, formatOverdrawLine,
+  type OverdrawDetail,
+} from './overdraw.js';

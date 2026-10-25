@@ -14,6 +14,10 @@ import {
   type MiniSurf, type MiniWorld,
 } from './worldNodes.js';
 import {
+  countWrittenZb, createOverdrawDetail,
+  type OverdrawDetail,
+} from './overdraw.js';
+import {
   createEdgeScratch, emitSpansForPoly, projectClippedPoly,
   type EdgeScratch, type PolyInput,
 } from './edges.js';
@@ -136,6 +140,15 @@ export class SoftwareRenderer implements Refresh {
   private lightBlockScratch: Uint8Array = new Uint8Array(0);
   private styleScratch = new Float32Array(8);
   private frameStats: FrameStats = { spans: 0, pixels: 0, overdraw: 0, ms: 0 };
+  /**
+   * Overdraw-attribution counters (M3.3 option b). Null unless a diagnostic
+   * measurement is armed via testMeasureOverdraw(); the per-surface loop only
+   * pays one null check per surface when disarmed, and output is identical
+   * either way. R_MarkLeaves traversal and the strict `>` depth test below
+   * are untouched.
+   */
+  private diagAcc: OverdrawDetail = createOverdrawDetail();
+  private diagArmed = false;
 
   init(fb: Framebuffer): void {
     this.fbW = fb.width;
@@ -403,14 +416,28 @@ export class SoftwareRenderer implements Refresh {
 
     let spansEmitted = 0;
     let candidatePixels = 0;
+    // Diagnostic only: attribute every PVS-admitted surface to exactly one
+    // bucket (degenerate / frustum / backface / clip / emitted).
+    const d = this.diagArmed ? this.diagAcc : null;
+    if (d) {
+      d.surfaces = worldData.surfaces.length;
+      d.pvsVisible = nvis;
+      d.degenerate = 0;
+      d.frustumCulled = 0;
+      d.backfaceCulled = 0;
+      d.clipRejected = 0;
+      d.emitted = 0;
+      d.maxBatchSpans = 0;
+      d.candidatePixels = 0;
+    }
     // per-surface batches: cache -> emit -> row z-sort -> draw
     for (let vi = 0; vi < nvis; vi++) {
       const si = this.visSurfs[vi]!;
       const order = this.visOrder[vi]!;
       const surf = worldData.surfaces[si]!;
       // degenerate (NODRAW) placeholders from BSP conversion carry no geometry
-      if (surf.n < 3) continue;
-      if (surfFrustumCulled(cam, surf)) continue;
+      if (surf.n < 3) { if (d) d.degenerate++; continue; }
+      if (surfFrustumCulled(cam, surf)) { if (d) d.frustumCulled++; continue; }
       // backface cull for single-sided world polys (id draws these too and
       // lets the z-buffer reject them; skipping is output-identical and
       // saves the span work). Turbulent (water) stays double-sided.
@@ -418,7 +445,10 @@ export class SoftwareRenderer implements Refresh {
         const dx = cam.origin[0]! - surf.center[0]!;
         const dy = cam.origin[1]! - surf.center[1]!;
         const dz = cam.origin[2]! - surf.center[2]!;
-        if (surf.fn[0]! * dx + surf.fn[1]! * dy + surf.fn[2]! * dz < 0) continue;
+        if (surf.fn[0]! * dx + surf.fn[1]! * dy + surf.fn[2]! * dz < 0) {
+          if (d) d.backfaceCulled++;
+          continue;
+        }
       }
       const dist = Math.sqrt(
         (surf.center[0]! - view.origin[0]!) ** 2 +
@@ -454,12 +484,12 @@ export class SoftwareRenderer implements Refresh {
       this.polyInput.lux = surf.lux;
       this.polyInput.n = surf.n;
       const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
-      if (nproj < 3) continue;
+      if (nproj < 3) { if (d) d.clipRejected++; continue; }
       const start = this.spanList.count;
       const endCount = emitSpansForPoly(
         this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
       );
-      if (endCount <= start) continue;
+      if (endCount <= start) { if (d) d.clipRejected++; continue; }
       for (let i = start; i < endCount; i++) {
         const sp = this.pool[i]!;
         sp.kind = surf.turbulent ? SPAN_TURBULENT : SPAN_OPAQUE;
@@ -472,6 +502,11 @@ export class SoftwareRenderer implements Refresh {
       candidatePixels += this.backend.pixelsDrawn - before;
       this.spanList.count = 0;
       spansEmitted += endCount - start;
+      if (d) {
+        d.emitted++;
+        const batchSpans = endCount - start;
+        if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
+      }
     }
 
     // world-placed alias / sprites / particles (M3.4 in the devroom)
@@ -538,6 +573,7 @@ export class SoftwareRenderer implements Refresh {
 
     const ms = Date.now() - t0;
     const area = this.fbW * this.fbH;
+    if (d) d.candidatePixels = candidatePixels;
     this.frameStats = {
       spans: spansEmitted + this.backend.spansDrawn,
       pixels: this.backend.pixelsDrawn,
@@ -597,6 +633,35 @@ export class SoftwareRenderer implements Refresh {
 
   testResetCacheStats(): void {
     this.cache.resetStats();
+  }
+
+  /**
+   * M3.3 option (b): render one frame with overdraw attribution armed and
+   * return stats + the full stage accounting (see overdraw.ts). The drawn
+   * output (index + depth planes) is identical to a plain
+   * beginFrame/renderView pair — arming only fills counters.
+   *
+   * The written/zRejected split is exact for world-only frames (no
+   * entities/alias/sprites/particles writing the depth plane; the base1
+   * MiniWorld harness satisfies this, its placed arrays are empty).
+   */
+  testMeasureOverdraw(
+    view: RefDef, world: WorldModel, entities: Entity[],
+  ): { stats: FrameStats; detail: OverdrawDetail } {
+    this.diagAcc = createOverdrawDetail();
+    this.diagArmed = true;
+    this.beginFrame();
+    const stats = this.renderView(view, world, entities);
+    this.diagArmed = false;
+    const acc = this.diagAcc;
+    const area = this.fbW * this.fbH;
+    acc.writtenPixels = countWrittenZb(this.zb, area);
+    acc.zRejectedPixels = acc.candidatePixels - acc.writtenPixels;
+    acc.area = area;
+    acc.overdraw = stats.overdraw;
+    acc.visibleCoverage = area > 0 ? acc.writtenPixels / area : 0;
+    acc.occludedShare = acc.candidatePixels > 0 ? acc.zRejectedPixels / acc.candidatePixels : 0;
+    return { stats, detail: { ...acc } };
   }
 
   private buildSurfaceBlock(
