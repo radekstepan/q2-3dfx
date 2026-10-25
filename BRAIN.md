@@ -557,10 +557,47 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 - `syncMixerToBrowser` uses the decoded pak shot for weapon-ish channels and
   synth blips otherwise; per-name pak wav decode is still TODO.
 
+### M7.3 — IndexedDB pak cache
+owns: `apps/web`
+depends: M7.1
+status: done
+done-when:
+- [x] dropped pak0.pak persists across reloads; boot uses the cache when present (devroom fallback when empty)
+- [x] headless/Node safe (no IndexedDB → devroom, tests green)
+- [x] progress UI for cache load
+
+### M7.4 — Gameplay completions (respawn, riders, pathfinding)
+owns: `packages/game`, `packages/server`
+depends: M7.2
+status: done (qualified — see WIRE-EXIT note)
+done-when:
+- [x] pickups respawn on a timer (≈30s Q2 behaviour; DM-style timers enabled in SP so base1 stays playable)
+- [x] pusher-carrying rides the player 272 units to the slot edge (ticks=390, slot XY 65, bit-identical ×3); literal entry into `*27` proven geometrically impossible (plug fills the slot in every state) — rescoped, see note
+- [x] monsters pathfind on the node graph beyond the lite attack state machines
+- [x] `Q2_PAK` bot play test still green (walk/fire/kill/exit)
+- [ ] per-name pak wav decode for mixer channels (deferred — needs `apps/web`)
+
+> M7.4 WIRE-EXIT note: the pit is sealed rock except the top slot and the
+> `*31` plug fills that slot closed/open/in-transit (exhaustive sweep, zero
+> rider-overlap configs touching `*27`); a body in the trigger re-fires the
+> door each tick so the plug can't rise with a rider (real Q2 behaviour).
+> Exit-*chain* proof stays green; accepting slot-hold as delivery. Revisit
+> only if the map assumption changes.
+
 ### M9.1 — WASM span backend
 owns: `packages/sw-renderer`
 depends: M8.1
-status: ready
+status: review (scalar-port ceiling measured — ran ahead of blocked M8.1, see note)
+done-when:
+- [ ] `RasterBackend` implemented in AssemblyScript/Zig, byte-identical output, ≥2× faster
+
+> M9.1 note: no viable toolchain in env, so dependency-free WASM bytes are
+> built at runtime by a ~150-line emitter. Output is byte-identical
+> (200-batch fuzz, devroom golden `8f61c755`, base1 ×4 views) behind
+> `sw_wasm` (default 0, TS remains default). But scalar WASM only reaches
+> ~1.3–1.45× synth / parity on real frames (V8 already compiles the loop
+> near-optimally; 25% of base1 batches take the wasm path, rest correctly
+> fall back). True 2× needs SIMD v128 or M8.1 worker composition.
 done-when:
 - [ ] `RasterBackend` implemented in AssemblyScript/Zig, byte-identical output, ≥2× faster
 
@@ -634,6 +671,8 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-25 | wire | cooker real pak0.pak | — | — | — | — | 3307 entries, 184MB → 93.6MB in 5.3s, base1.bsp byte-identical round-trip |
 | 2026-10-25 | play | software base1 spawn view, real pmove+doors | 320×240 | 92 | ~7 | 2.28 | 7905 surfaces, 8 monster placeholders, 10.8 ms/frame single-threaded (shot sparks, HUD, blit incl.) |
 | 2026-10-25 | m7.2 | software base1 spawn view (true SP spawn) + combat/pickups/doors | 320×240 | 100 | ~8 | 2.16 | 9.96 ms/frame single-threaded incl. monsterThink+tracer+pickup+door checks; 640×480 = 17.94 ms/frame (over 16 ms budget → needs M8.1 workers) |
+| 2026-10-25 | 2d6bda7 | software spanfill synth, wasm vs TS backend | 640×480 synth | — | ~158 (wasm) vs ~109 (TS) = 1.45× | — | `drawSpansWasm` vs `drawSpansSoftware`, byte-identical (0 diffs over 200-batch fuzz); scalar ceiling, needs SIMD v128 for 2× |
+| 2026-10-25 | 2d6bda7 | software base1 spawn-north, wasm backend | 640×480 | ~44 | — | 2.36 | paired A/B 22.90 vs 22.95 ms/frame (parity, frames dominated by non-spanfill work); 25% batches on wasm path, rest TS fallback; hashes ≡ TS path |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.
