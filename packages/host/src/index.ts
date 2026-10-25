@@ -5,6 +5,7 @@
 // snapshots into the Predictor, and render through any Refresh backend.
 // Everything heavy is injected; this file only glues.
 import { SERVER_DT, getCVarNumber } from '@q2/config';
+import { AngleVectors } from '@q2/math';
 import type { Framebuffer, Refresh, RefDef, WorldModel, FrameStats, Entity } from '@q2/renderer-api';
 import { createFramebuffer, devroomWorld } from '@q2/renderer-api';
 import { Predictor, GameConsole, Configstrings, calcViewOrigin } from '@q2/client';
@@ -51,7 +52,52 @@ export interface HostDriver {
    * Defaults to 0 when absent. The renderer wraps out-of-range indices.
    */
   entityFrame?(id: number): number;
+  /**
+   * World orientation [pitch, yaw, roll] for a snapshot entity (monster
+   * facing, bolt flight dir). Absent/null → [0,0,0] (legacy behaviour).
+   */
+  entityAngles?(id: number): [number, number, number] | null | undefined;
+  /**
+   * Model/skin handles for a snapshot entity (soldier vs gunner vs bolt).
+   * Absent/null → { model: 0, skin: 0 } (legacy behaviour).
+   */
+  entityModel?(id: number): { model: number; skin: number } | null | undefined;
+  /**
+   * Extra world entities the snapshot omits (flying bolts, live barrels,
+   * explosion flashes). Absent/null → none. Plain data, no web imports.
+   */
+  extraEntities?(): ExtraRenderable[] | null | undefined;
 }
+
+/**
+ * One extra world entity (bolt / barrel / explosion flash). Only `origin`
+ * is required; everything else falls back to the snapshot-entity defaults
+ * (angles [0,0,0], model 0, skin 0, frame 0).
+ */
+export interface ExtraRenderable {
+  origin: [number, number, number];
+  angles?: [number, number, number];
+  model?: number;
+  skin?: number;
+  frame?: number;
+}
+
+/**
+ * View-space forward push of the first-person gun, in world units.
+ *
+ * id anchors the gun AT the eye with full view angles and relies on
+ * near-plane *clipping* (R_AliasClipTriangle, NEAR_CLIP 0.01) + RF_DEPTHHACK.
+ * Our backend instead *drops* any alias tri touching the near plane
+ * (near=4): at eye anchor the breech half (real v_weap verts reach ~16u
+ * behind the eye) vanishes, and pitching the view morphs or blanks the gun
+ * (measured headless on real v_blast idle: full mesh at push 16–24, a
+ * clipped slice at push 0–8, zero pixels at pitch −30 with no push).
+ * Push 24 keeps the whole baked-composition mesh visible across ±30° pitch
+ * for the idle frames and the recoil frame at level view, bottom-right
+ * where the verts put it. A tri or two may still drop on the recoil frame
+ * at extreme pitch — accepted (documented, transient 0.09s flash).
+ */
+export const VIEWMODEL_FORWARD = 24;
 
 export class Host {
   readonly fb: Framebuffer;
@@ -230,29 +276,54 @@ export class Host {
     const renderables: Entity[] = entities
       // Never draw the local player's own body (it sits at the camera).
       .filter((e) => e.id !== this.localPlayerId)
-      .map((e) => ({
-      model: 0,
-      origin: new Float32Array(e.origin) as Entity['origin'],
-      angles: new Float32Array([0, 0, 0]) as Entity['angles'],
-      frame: this.driver?.entityFrame?.(e.id) ?? 0,
-      skin: 0,
-    }));
-    // First-person weapon view model: id places the gun AT the eye
-    // (SV_CalcGunOffset zeroes gunoffset; composition is baked into the
-    // v_weap verts, all Z<0 straddling the eye plane). The breech half is
-    // eaten by the near clip and the visible slice looms large — that
-    // near-field enormity IS the chunky id gun look. Offsets like +22/+8/-5
-    // shrink it to a floating toy and double-apply the baked composition.
+      .map((e) => {
+        // Per-entity yaw/model wiring (optional driver hooks, legacy
+        // defaults when the driver does not provide them).
+        const handles = this.driver?.entityModel?.(e.id) ?? null;
+        const ea = this.driver?.entityAngles?.(e.id) ?? null;
+        return {
+          model: handles?.model ?? 0,
+          origin: new Float32Array(e.origin) as Entity['origin'],
+          angles: new Float32Array(ea ?? [0, 0, 0]) as Entity['angles'],
+          frame: this.driver?.entityFrame?.(e.id) ?? 0,
+          skin: handles?.skin ?? 0,
+        };
+      });
+    // Extra world entities (bolts / barrels / explosions): snapshot only
+    // carries the player + monsters, so the driver appends the rest here.
+    // Feature-detected: drivers without the hook render exactly as before.
+    const extras = this.driver?.extraEntities?.() ?? null;
+    if (extras) {
+      for (const x of extras) {
+        renderables.push({
+          model: x.model ?? 0,
+          origin: new Float32Array(x.origin) as Entity['origin'],
+          angles: new Float32Array(x.angles ?? [0, 0, 0]) as Entity['angles'],
+          frame: x.frame ?? 0,
+          skin: x.skin ?? 0,
+        });
+      }
+    }
+    // First-person weapon view model: yaw-only orientation at a small
+    // view-space forward push from the eye (see VIEWMODEL_FORWARD). No
+    // pitch/roll inheritance, so the gun stays level instead of swinging
+    // when looking up/down; the push is recomputed from the live view
+    // angles every frame, so the gun rides the view axis at any yaw (it
+    // cannot orbit the camera — its position is a pure function of the
+    // camera). The baked bottom-right composition lives in the v_weap
+    // verts; no extra right/down offset is applied.
     const vm = this.driver?.viewModel?.() ?? null;
     if (vm) {
+      const fwd = new Float32Array(3);
+      AngleVectors(new Float32Array(angles), fwd);
       renderables.push({
         model: vm.model,
         origin: new Float32Array([
-          viewOrigin[0]!,
-          viewOrigin[1]!,
-          viewOrigin[2]!,
+          viewOrigin[0]! + fwd[0]! * VIEWMODEL_FORWARD,
+          viewOrigin[1]! + fwd[1]! * VIEWMODEL_FORWARD,
+          viewOrigin[2]! + fwd[2]! * VIEWMODEL_FORWARD,
         ]) as Entity['origin'],
-        angles: new Float32Array(angles) as Entity['angles'],
+        angles: new Float32Array([0, angles[1]!, 0]) as Entity['angles'],
         frame: vm.frame,
         skin: vm.skin,
       });
