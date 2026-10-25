@@ -1,10 +1,12 @@
 // @q2/client/hud — conchars-style 8x8 HUD text renderer (M6.1).
 //
-// Blits 8x8 glyphs into a framebuffer scratch surface. The font is
+// Blits 8x8 glyphs into a framebuffer scratch surface. The bundled font is
 // procedural (deterministic xorshift glyphs) so HUD text works without
-// `pics/conchars.pcx`; when the real asset is available the caller can pass
-// its 128x128 1bpp bytes via `setConcharsFont`. No DOM anywhere.
+// `pics/conchars.pcx`; when the real asset is available the caller converts
+// its 128x128 pixels with `loadConcharsFont` and installs the result via
+// `setConcharsFont`. No DOM anywhere.
 import type { Framebuffer } from '@q2/renderer-api';
+import { Com_Error } from '@q2/config';
 
 export const GLYPH_W = 8;
 export const GLYPH_H = 8;
@@ -49,6 +51,74 @@ export function setConcharsFont(font: ConcharsFont): void {
 export function getConcharsFont(): ConcharsFont {
   if (!activeFont) activeFont = makeConcharsFont();
   return activeFont;
+}
+
+/**
+ * Layout of `pics/conchars.pcx` (ref_soft `Draw_Char` in `r_draw.c`):
+ * 128x128 palette indices holding 256 glyphs in a row-major 16x16 grid of
+ * 8x8 cells. Glyph `ch` lives at cell column `ch & 15`, row `ch >> 4`, i.e.
+ * image offset `(row * 8 + gy) * 128 + col * 8 + gx`. Any pixel equal to the
+ * transparent index is background (id `TRANSPARENT_COLOR` 255); every other
+ * index is an opaque stroke pixel.
+ */
+export const CONCHARS_PIC_SIZE = 128;
+export const CONCHARS_GRID = 16;
+/** id `TRANSPARENT_COLOR`: palette index `Draw_Char` never paints. */
+export const CONCHARS_TRANSPARENT = 255;
+
+/**
+ * Minimal decoded-image shape accepted by `loadConcharsFont`. Structurally
+ * compatible with the `Pcx` interface from `@q2/formats`, so a parsed
+ * `pics/conchars.pcx` can be passed directly without this package depending
+ * on `@q2/formats` (see BRAIN.md §4 dependency rules).
+ */
+export interface ConcharsImage {
+  readonly width: number;
+  readonly height: number;
+  /** Row-major palette indices, `width * height` entries. */
+  readonly pixels: Uint8Array;
+}
+
+/**
+ * Convert the real 128x128 `pics/conchars.pcx` pixels into a `ConcharsFont`
+ * (256 glyphs x 64 bytes of 0/1, row-major 8x8). Accepts either a decoded
+ * image object (`{ width, height, pixels }`, e.g. `parsePCX` output) or raw
+ * pre-decoded row-major pixels of length 128*128. Pixels equal to
+ * `transparent` (default 255, matching the asset and id's `Draw_Char`) map
+ * to 0, all others to 1; the tint is applied later by `drawChar`/`drawString`.
+ */
+export function loadConcharsFont(
+  image: ConcharsImage | Uint8Array,
+  transparent: number = CONCHARS_TRANSPARENT,
+): ConcharsFont {
+  if (!Number.isInteger(transparent) || transparent < 0 || transparent > 255) {
+    Com_Error('fatal', `loadConcharsFont: transparent index out of range ${transparent}`);
+  }
+  const pixels = image instanceof Uint8Array ? image : image.pixels;
+  if (!(image instanceof Uint8Array)) {
+    if (image.width !== CONCHARS_PIC_SIZE || image.height !== CONCHARS_PIC_SIZE) {
+      Com_Error(
+        'fatal',
+        `loadConcharsFont: need 128x128 conchars, got ${image.width}x${image.height}`,
+      );
+    }
+  }
+  if (pixels.length < CONCHARS_PIC_SIZE * CONCHARS_PIC_SIZE) {
+    Com_Error('fatal', `loadConcharsFont: need 16384 pixels, got ${pixels.length}`);
+  }
+  const font = new Uint8Array(CONCHARS_COUNT * GLYPH_W * GLYPH_H);
+  for (let ch = 0; ch < CONCHARS_COUNT; ch++) {
+    const col = ch & 15;
+    const row = ch >> 4;
+    const dst = ch * 64;
+    for (let gy = 0; gy < 8; gy++) {
+      const srcRow = (row * 8 + gy) * CONCHARS_PIC_SIZE + col * 8;
+      for (let gx = 0; gx < 8; gx++) {
+        font[dst + gy * 8 + gx] = pixels[srcRow + gx] === transparent ? 0 : 1;
+      }
+    }
+  }
+  return font;
 }
 
 export interface BlitSurface {

@@ -15,7 +15,11 @@ export {
   GLYPH_W,
   GLYPH_H,
   CONCHARS_COUNT,
+  CONCHARS_PIC_SIZE,
+  CONCHARS_GRID,
+  CONCHARS_TRANSPARENT,
   makeConcharsFont,
+  loadConcharsFont,
   setConcharsFont,
   getConcharsFont,
   drawChar,
@@ -23,7 +27,7 @@ export {
   stringWidth,
   fillRect,
 } from './hud.js';
-export type { ConcharsFont, BlitSurface } from './hud.js';
+export type { ConcharsFont, ConcharsImage, BlitSurface } from './hud.js';
 export { CS_STATUSBAR, tokenizeLayout, parseStatusbar, Configstrings } from './statusbar.js';
 export type { StatusOp } from './statusbar.js';
 export { CONSOLE_MAX_LINES, GameConsole } from './console.js';
