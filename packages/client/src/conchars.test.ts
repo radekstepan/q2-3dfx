@@ -94,7 +94,7 @@ describe('loadConcharsFont (synthetic 128x128)', () => {
     const loaded = loadConcharsFont(diagonalPixels());
     setConcharsFont(loaded);
     expect(getConcharsFont()).toBe(loaded);
-    // Fallback generator is untouched: still deterministic procedural noise.
+    // Fallback generator is untouched: still the deterministic baked font.
     expect(makeConcharsFont()).toEqual(makeConcharsFont());
     setConcharsFont(makeConcharsFont());
   });
@@ -168,7 +168,7 @@ describe.runIf(HAVE_PAK)('real pics/conchars.pcx (Q2_PAK)', () => {
     const font = loadConcharsFont({ width, height, pixels });
     expect(font.length).toBe(256 * 64);
     expect(font.every((v) => v === 0 || v === 1)).toBe(true);
-    // Not the procedural fallback: real glyphs differ from xorshift noise.
+    // Not the baked fallback: real glyphs differ from the bundled font.
     expect(font).not.toEqual(makeConcharsFont());
     // Space cell is all-transparent; 'A' (65) row 1 is __XXXXX_ per the asset.
     expect(glyphRows(font, 32).every((r) => r === '00000000')).toBe(true);
@@ -198,5 +198,10 @@ describe.runIf(HAVE_PAK)('real pics/conchars.pcx (Q2_PAK)', () => {
     const struck = glyphRows(font, 65).join('').split('1').length - 1;
     expect(painted).toBe(struck);
     expect(painted).toBeGreaterThan(0);
+
+    // The real font wins when installed: getConcharsFont returns it verbatim.
+    setConcharsFont(font);
+    expect(getConcharsFont()).toBe(font);
+    setConcharsFont(makeConcharsFont());
   });
 });
