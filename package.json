@@ -10,7 +10,7 @@
   ],
   "scripts": {
     "dev": "turbo dev",
-    "start": "turbo start",
+    "start": "turbo run build && turbo start",
     "build": "turbo run build",
     "typecheck": "turbo run typecheck",
     "lint": "turbo run lint",

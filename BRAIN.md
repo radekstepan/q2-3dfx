@@ -607,7 +607,8 @@ done-when:
 ### 10.4 Commands
 
 ```bash
-yarn dev                  # turbo dev: web app + watch builds
+yarn dev                  # dev env for testing: vite HMR on apps/web (:5173)
+yarn start                # production game: build everything, serve dist-web (:5173), auto-boot base1 when $Q2_PAK is readable (else devroom)
 yarn verify               # typecheck + lint + test + build   (the gate)
 yarn golden -u            # update golden frames (requires review of the diff images)
 yarn bench                # perf ledger run
