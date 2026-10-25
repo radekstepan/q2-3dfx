@@ -126,9 +126,42 @@ export function attachDropZone(
   };
 }
 
+/**
+ * Known option lists for cvars with a fixed value domain. Cvars absent here
+ * get a free-text input. Pure data + pure helpers so Node tests can pin the
+ * select-vs-input logic without a DOM.
+ */
+export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
+  vid_renderer: ['software', 'voodoo'],
+  sw_workers: ['0', '2', '4'],
+  cl_showfps: ['0', '1'],
+  r_brightness: ['0.75', '1.0', '1.25', '1.5', '2.0'],
+  vd_gamma: ['1.0', '1.3', '2.2'],
+  vd_16bit: ['0', '1'],
+  vd_dither: ['0', '1'],
+  vd_postfilter: ['0', '1'],
+  vd_bilinear: ['0', '1'],
+  vd_mipdither: ['0', '1'],
+  vd_fog: ['0', '1'],
+  vd_palettetex: ['0', '1'],
+  vd_overbright: ['0', '1'],
+  r_drawworld: ['0', '1'],
+  cl_predict: ['0', '1'],
+  cl_interp: ['0', '1'],
+};
+
+/** Option list for a cvar, or null when it takes free-text input. */
+export function cvarOptions(name: string): readonly string[] | null {
+  return CVAR_OPTIONS[name] ?? null;
+}
+
+/** Control kind for a cvar row: 'select' for known domains, else 'text'. */
+export function cvarControlKind(name: string): 'select' | 'text' {
+  return cvarOptions(name) === null ? 'text' : 'select';
+}
+
 /** Render a cvar editor panel into a container. Returns bound cvar names. */
-export function renderCvarPanel(container: unknown, filter = ''): string[] {
-  const names = listCVars()
+export function renderCvarPanel(container: unknown, filter = ''): string[] {  const names = listCVars()
     .map((c) => c.name)
     .filter((n) => !filter || n.includes(filter));
   if (typeof document === 'undefined' || !container) return names;
@@ -139,17 +172,42 @@ export function renderCvarPanel(container: unknown, filter = ''): string[] {
     row.className = 'q2-cvar-row';
     const label = document.createElement('label');
     label.textContent = name;
-    const input = document.createElement('input');
-    input.value = getCVarString(name);
-    input.addEventListener('change', () => {
-      try {
-        setCVarFromString(name, input.value);
-      } catch {
-        input.value = getCVarString(name);
+    const options = cvarOptions(name);
+    const current = getCVarString(name);
+    if (options !== null) {
+      const select = document.createElement('select');
+      // Reflect out-of-list values (e.g. sw_workers=8, r_brightness=1.1)
+      // instead of silently showing the wrong preset.
+      const choices = options.includes(current) ? options : [current, ...options];
+      for (const opt of choices) {
+        const el = document.createElement('option');
+        el.value = opt;
+        el.textContent = opt;
+        select.appendChild(el);
       }
-    });
-    row.appendChild(label);
-    row.appendChild(input);
+      select.value = current;
+      select.addEventListener('change', () => {
+        try {
+          setCVarFromString(name, select.value);
+        } catch {
+          select.value = getCVarString(name);
+        }
+      });
+      row.appendChild(label);
+      row.appendChild(select);
+    } else {
+      const input = document.createElement('input');
+      input.value = current;
+      input.addEventListener('change', () => {
+        try {
+          setCVarFromString(name, input.value);
+        } catch {
+          input.value = getCVarString(name);
+        }
+      });
+      row.appendChild(label);
+      row.appendChild(input);
+    }
     node.appendChild(row);
   }
   return names;

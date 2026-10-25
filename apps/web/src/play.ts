@@ -14,6 +14,7 @@ import {
   fillRect,
   makeConcharsFont,
   setConcharsFont,
+  stringWidth,
   loadConcharsFont as loadConcharsPixels,
 } from '@q2/client';
 import type { ConcharsFont } from '@q2/client';
@@ -68,11 +69,58 @@ import type { Pcx } from '@q2/formats';
 import { resolveFrame } from '@q2/voodoo';
 import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
-import { getCVarString } from '@q2/config';
+import { getCVar, getCVarNumber, getCVarString, registerCVar } from '@q2/config';
 import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 
 export type RendererKind = 'software' | 'voodoo';
+
+// --- display-only brightness (M7.1 feedback) ---
+//
+// `r_brightness` is a pure presentation lift applied post-resolve in
+// `resolveDisplay` (0xAABBGGRR scale + clamp). It never touches lightmaps,
+// the palette, the pak, or the renderer internals — the framebuffer the
+// engine produced is unchanged. Registered here (apps/web owns the display
+// path); `getBrightness` treats an absent cvar (e.g. after `resetCVars()` in
+// tests) as the default so headless boots stay deterministic.
+export const BRIGHTNESS_DEFAULT = 1.25;
+export const BRIGHTNESS_MIN = 0.5;
+export const BRIGHTNESS_MAX = 2.0;
+
+registerCVar('r_brightness', BRIGHTNESS_DEFAULT, 'display-only post-resolve brightness lift 0.5..2.0');
+
+/** Clamped `r_brightness` (absent/non-finite cvar → default). Self-healing:
+ * re-registers the default when a test `resetCVars()` wiped it, so the panel
+ * keeps listing it and headless boots stay deterministic. */
+export function getBrightness(): number {
+  let raw = getCVar('r_brightness');
+  if (raw === undefined) {
+    registerCVar('r_brightness', BRIGHTNESS_DEFAULT, 'display-only post-resolve brightness lift 0.5..2.0');
+    raw = BRIGHTNESS_DEFAULT;
+  }
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return BRIGHTNESS_DEFAULT;
+  return Math.min(BRIGHTNESS_MAX, Math.max(BRIGHTNESS_MIN, v));
+}
+
+/**
+ * Scale a 0xAABBGGRR buffer by `brightness` in place (alpha preserved,
+ * channels rounded + clamped to 255). `brightness === 1` is a no-op so the
+ * 1.0 path stays byte-identical. Zero-alloc; display-only, never pak data.
+ */
+export function applyBrightness(dst: Uint32Array, brightness: number): void {
+  if (brightness === 1) return;
+  for (let i = 0; i < dst.length; i++) {
+    const px = dst[i]!;
+    let r = (px & 255) * brightness;
+    let g = ((px >> 8) & 255) * brightness;
+    let b = ((px >> 16) & 255) * brightness;
+    r = r > 255 ? 255 : Math.round(r);
+    g = g > 255 ? 255 : Math.round(g);
+    b = b > 255 ? 255 : Math.round(b);
+    dst[i] = (px & 0xff000000) | (b << 16) | (g << 8) | r;
+  }
+}
 
 const PLAYER_ID = 1;
 /** Eye height above the pm origin (matches PmoveState.viewheight). */
@@ -1075,14 +1123,26 @@ export function bootPlay(opts: {
   return { host, driver, refresh, renderer, source: driver.source, display: new Uint32Array(n), fb565: new Uint16Array(n) };
 }
 
-/** Resolve the software framebuffer for display (voodoo post chain or direct). */
+/** Resolve the software framebuffer for display (voodoo post chain or direct).
+ *
+ * Display-only `r_brightness` lift (see `getBrightness`) is applied to the
+ * scene copy here, *before* `drawPlayHud` paints on top — so HUD text keeps
+ * its full authored colour and is never dimmed or clipped by the lift.
+ * At 1.0 the software path returns the engine buffer untouched
+ * (byte-identical, same reference).
+ */
 export function resolveDisplay(boot: PlayBoot): Uint32Array {
   const { host } = boot;
+  const brightness = getBrightness();
   if (getCVarString('vid_renderer') === 'voodoo') {
     resolveFrame(host.fb.color, boot.fb565, boot.display, host.fb.width, host.fb.height);
+    applyBrightness(boot.display, brightness);
     return boot.display;
   }
-  return host.fb.color;
+  if (brightness === 1) return host.fb.color;
+  boot.display.set(host.fb.color);
+  applyBrightness(boot.display, brightness);
+  return boot.display;
 }
 
 /**
@@ -1118,6 +1178,25 @@ export interface HudState {
   frame: number;
 }
 
+/** In-canvas fps readout colour: readable green, 0xAABBGGRR like all HUD. */
+export const FPS_GREEN = 0xff00ff00;
+
+/**
+ * Pure anchor for the in-canvas fps readout: top-right, 8px margins, using
+ * the active conchars font metrics (real pak glyphs when present, procedural
+ * fallback otherwise — both are 8px-advance via `stringWidth`). No
+ * background rect is ever drawn behind the text.
+ */
+export function fpsHudAnchor(width: number, text: string): { x: number; y: number } {
+  return { x: Math.max(0, width - stringWidth(text) - 8), y: 8 };
+}
+
+/** `cl_showfps` gates the in-canvas fps readout too (default 1 when absent). */
+function showInCanvasFps(): boolean {
+  if (getCVar('cl_showfps') === undefined) return true;
+  return getCVarNumber('cl_showfps') !== 0;
+}
+
 /** Draw crosshair + status lines onto a 0xAABBGGRR buffer (runs post-resolve). */
 export function drawPlayHud(
   target: { width: number; height: number; color: Uint32Array },
@@ -1135,7 +1214,11 @@ export function drawPlayHud(
   const o = boot.driver.pm.origin;
   const hp = boot.driver.playerHealth;
   const hpColor = boot.driver.playerDead ? 0xffff3333 : hp <= 25 ? 0xffff9933 : white;
-  drawString(target, 8, 8, `fps ${hud.fps.toFixed(0)}`, white);
+  if (showInCanvasFps()) {
+    const fpsText = `fps ${hud.fps.toFixed(0)}`;
+    const anchor = fpsHudAnchor(target.width, fpsText);
+    drawString(target, anchor.x, anchor.y, fpsText, FPS_GREEN);
+  }
   drawString(target, 8, 18, `${o[0]!.toFixed(0)} ${o[1]!.toFixed(0)} ${o[2]!.toFixed(0)}`, dim);
   drawString(target, 8, target.height - 18, `${boot.driver.weapon.classname} ${boot.driver.hudAmmo()}`, white);
   drawString(target, 8, target.height - 48, `hp ${hp}`, hpColor);
@@ -1154,9 +1237,14 @@ export function drawPlayHud(
  * TODO(M1.2 follow-up): nothing loads real `.md2` skins yet, see M3.4/M7.2
  * notes in BRAIN.md; the 3D muzzle dlight is pumped separately via
  * drainFlash()). Drawn post-resolve in HUD space (the software renderer has
- * no screen-space sprite path). Per-weapon body size: blaster 46px,
- * machinegun 58px, shotgun 64px. The caption names the weapon so the
+ * no screen-space sprite path). Per-weapon body size: blaster 52px,
+ * machinegun 66px, shotgun 78px. The caption names the weapon so the
  * placeholder is honest in screenshots.
+ *
+ * The silhouette is a side-view breakdown — stepped wooden/polymer stock,
+ * receiver with top highlight + bottom shade, thin barrel with muzzle ring,
+ * grip, trigger guard, and sights — so it reads as an intentional low-res
+ * sprite rather than stacked blobs. `fillRect` only (2D nicety, no MD2).
  */
 function drawViewModel(
   target: { width: number; height: number; color: Uint32Array },
@@ -1165,26 +1253,61 @@ function drawViewModel(
   const w = target.width;
   const h = target.height;
   const cls = boot.driver.weapon.classname;
-  const gunW = cls === 'weapon_shotgun' ? 64 : cls === 'weapon_machinegun' ? 58 : 46;
-  const gunH = 26;
+  const isShotgun = cls === 'weapon_shotgun';
+  const isMachinegun = cls === 'weapon_machinegun';
+  const gunW = isShotgun ? 78 : isMachinegun ? 66 : 52;
   const gx = w - gunW - 10;
-  const gy = h - gunH - 8;
+  const gy = h - 36;
   if (w < 120 || h < 100) return;
-  const body = cls === 'weapon_shotgun' ? 0xff6b4a26 : cls === 'weapon_machinegun' ? 0xff4a4a52 : 0xff3a3f44;
+  const body = isShotgun ? 0xff6b4a26 : isMachinegun ? 0xff4a4a52 : 0xff3a3f44;
   const dark = 0xff1c1c20;
-  const grip = 0xff2a2018;
-  // Receiver + barrel + grip silhouette.
-  fillRect(target, gx, gy + 6, gunW, 12, body);
-  fillRect(target, gx + gunW - 18, gy, 14, 8, dark);
-  fillRect(target, gx + 8, gy + 16, 14, 10, grip);
-  // Top highlight.
-  fillRect(target, gx, gy + 6, gunW, 1, 0xff9a9aa2);
+  const edge = 0xff101014;
+  const gripC = 0xff2a2018;
+  const wood = 0xff7a4d22;
+  const steel = 0xff777782;
+  const lite = 0xff9a9aa2;
+  const muzzleX = gx + gunW - 2;
+  // Stock: stepped taper toward the butt (left), wood on shotgun, dark else.
+  const stockC = isShotgun ? wood : dark;
+  fillRect(target, gx, gy + 14, 10, 10, stockC);
+  fillRect(target, gx + 10, gy + 11, 8, 13, stockC);
+  fillRect(target, gx, gy + 14, 18, 1, lite);
+  // Receiver: main block with top highlight and bottom shade line.
+  fillRect(target, gx + 18, gy + 9, 24, 13, body);
+  fillRect(target, gx + 18, gy + 9, 24, 1, lite);
+  fillRect(target, gx + 18, gy + 21, 24, 1, edge);
+  // Barrel: thin steel tube + darker muzzle ring at the tip.
+  fillRect(target, gx + 42, gy + 11, gunW - 48, 5, steel);
+  fillRect(target, gx + 42, gy + 11, gunW - 48, 1, lite);
+  fillRect(target, muzzleX - 3, gy + 10, 3, 7, dark);
+  // Grip + trigger guard below the receiver.
+  fillRect(target, gx + 22, gy + 22, 7, 7, gripC);
+  fillRect(target, gx + 31, gy + 22, 6, 2, edge);
+  // Rear notch + front post sights above the top line.
+  fillRect(target, gx + 20, gy + 6, 2, 3, edge);
+  fillRect(target, muzzleX - 5, gy + 7, 2, 4, edge);
+  if (isShotgun) {
+    // Wooden pump under the barrel.
+    fillRect(target, gx + 46, gy + 17, 14, 5, wood);
+    fillRect(target, gx + 46, gy + 17, 14, 1, lite);
+  } else if (isMachinegun) {
+    // Boxy magazine + top carry handle.
+    fillRect(target, gx + 30, gy + 22, 9, 8, dark);
+    fillRect(target, gx + 30, gy + 22, 9, 1, lite);
+    fillRect(target, gx + 22, gy + 6, 14, 3, dark);
+  } else {
+    // Blaster: side cooling fins + glowing tip.
+    fillRect(target, gx + 26, gy + 9, 2, 13, edge);
+    fillRect(target, gx + 32, gy + 9, 2, 13, edge);
+    fillRect(target, muzzleX - 1, gy + 12, 2, 3, 0xff66eeff);
+  }
   if (boot.driver.muzzleLit()) {
-    // Flash star at the muzzle + a soft glow over the gun.
-    const mx = gx + gunW - 18;
-    fillRect(target, mx - 6, gy - 6, 26, 14, 0xffffee88);
-    fillRect(target, mx, gy - 2, 14, 6, 0xffffffff);
-    fillRect(target, gx, gy + 6, gunW, 12, 0x66ffdd66);
+    // Flash star at the muzzle + a soft glow wash over the gun.
+    const bcy = gy + 13;
+    fillRect(target, muzzleX - 8, bcy - 7, 18, 15, 0xffffee88);
+    fillRect(target, muzzleX - 12, bcy - 2, 26, 5, 0xffffee88);
+    fillRect(target, muzzleX - 6, bcy - 4, 14, 9, 0xffffffff);
+    fillRect(target, gx, gy + 6, gunW, 24, 0x66ffdd66);
   }
   if (boot.driver.playerDead) {
     fillRect(target, 0, 0, w, 3, 0xffff2222);

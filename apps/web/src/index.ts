@@ -17,9 +17,9 @@ export type { PlayBoot };
 export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
 export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
-export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled } from './dom.js';
+export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled, cvarOptions, cvarControlKind, CVAR_OPTIONS } from './dom.js';
 export type { PlayLoop } from './dom.js';
-export { drawPlayHud, resolveDisplay, pumpMuzzleLight, loadConcharsFont, concharsFontFromPCX } from './play.js';
+export { drawPlayHud, resolveDisplay, pumpMuzzleLight, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, getBrightness, applyBrightness, FPS_GREEN, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX } from './play.js';
 
 export interface BootOptions {
   width?: number;
