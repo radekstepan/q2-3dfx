@@ -27,10 +27,12 @@ export interface DomBindings {
 
 /**
  * Attach keyboard + mouse (+pointer lock on click) to a canvas element.
- * Returns the shared InputCore. Safe no-op outside a browser.
+ * Uses `target` when given (e.g. a shared Host input core), otherwise
+ * creates a fresh InputCore. Returns the core in use.
+ * Safe no-op outside a browser.
  */
-export function attachToCanvas(canvas: unknown): DomBindings {
-  const input = createInput();
+export function attachToCanvas(canvas: unknown, target?: InputCore): DomBindings {
+  const input = target ?? createInput();
   if (typeof document === 'undefined' || typeof window === 'undefined') {
     return { input, dispose(): void { /* noop */ } };
   }

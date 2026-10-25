@@ -123,7 +123,7 @@ const KEY_MOVE: Record<LogicalKey, [number, number, number]> = {
   moveright: [0, 400, 0],
   up: [0, 0, 400],
   down: [0, 0, -400],
-  jump: [0, 0, 0],
+  jump: [0, 0, 400],
   attack: [0, 0, 0],
   use: [0, 0, 0],
   left: [0, 0, 0],

@@ -89,3 +89,16 @@ describe('input -> usercmd_t mapping', () => {
     expect(st.forward).toBe(400);
   });
 });
+
+describe('dom bindings (headless no-op)', () => {
+  it('attachToCanvas uses a caller-supplied core and no-ops without DOM', async () => {
+    const { attachToCanvas } = await import('./dom.js');
+    const target = createInput();
+    const bound = attachToCanvas({}, target);
+    expect(bound.input).toBe(target);
+    bound.dispose();
+    const fresh = attachToCanvas({});
+    expect(fresh.input).not.toBe(target);
+    fresh.dispose();
+  });
+});

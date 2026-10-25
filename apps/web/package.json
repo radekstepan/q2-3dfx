@@ -15,10 +15,20 @@
     "start": "vite --port 5173"
   },
   "dependencies": {
+    "@q2/bsp": "workspace:*",
+    "@q2/client": "workspace:*",
     "@q2/config": "workspace:*",
+    "@q2/formats": "workspace:*",
+    "@q2/game": "workspace:*",
     "@q2/host": "workspace:*",
+    "@q2/input": "workspace:*",
+    "@q2/math": "workspace:*",
     "@q2/renderer-api": "workspace:*",
-    "@q2/testkit": "workspace:*"
+    "@q2/server": "workspace:*",
+    "@q2/sound": "workspace:*",
+    "@q2/sw-renderer": "workspace:*",
+    "@q2/testkit": "workspace:*",
+    "@q2/voodoo": "workspace:*"
   },
   "devDependencies": {
     "tsup": "^8.3.5",

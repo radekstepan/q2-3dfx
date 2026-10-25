@@ -21,6 +21,25 @@ export interface HostOptions {
   indexed?: boolean;
   localPlayerId?: number;
   world?: WorldModel;
+  /** Real-play simulation. Absent = synthetic offline/devroom mode. */
+  driver?: HostDriver;
+}
+
+/**
+ * Server-authoritative play simulation owned by the app layer.
+ *
+ * The Host owns time, input->cmd, snapshots and rendering; the driver owns
+ * the world: spawning, per-tick simulation (pmove, movers, triggers,
+ * monsters) and authoritative entity snapshots. Keeps @q2/host free of
+ * @q2/server/@q2/game imports while making the game actually playable.
+ */
+export interface HostDriver {
+  /** Player start (info_player_start or devroom default). */
+  spawn(): { origin: [number, number, number]; angles?: [number, number, number] };
+  /** Advance the simulation by dt seconds (server tick quantum). */
+  step(cmd: UserCmdT, dt: number): void;
+  /** Authoritative entities at serverTime (must include localPlayerId). */
+  snapshot(serverTime: number): Snapshot;
 }
 
 export class Host {
@@ -33,6 +52,7 @@ export class Host {
   readonly input: InputCore = createInput();
   world: WorldModel;
   localPlayerId: number;
+  readonly driver: HostDriver | null;
   serverTime = 0;
   lastCmd: UserCmdT | null = null;
   private serverAcc = 0;
@@ -49,11 +69,27 @@ export class Host {
     this.refresh.init(this.fb);
     this.world = opts.world ?? devroomWorld();
     this.localPlayerId = opts.localPlayerId ?? 1;
+    this.driver = opts.driver ?? null;
+    if (this.driver) {
+      const spawn = this.driver.spawn();
+      this.playerOrigin = [...spawn.origin] as [number, number, number];
+      if (spawn.angles) this.input.angles = [...spawn.angles] as [number, number, number];
+    }
   }
 
-  /** Server tick via @q2/server when it can, else advance time only. */
+  /** Server tick via the attached driver when present, else advance time only. */
   private serverTick(dt: number): void {
     this.serverTime += dt;
+    if (!this.driver) return;
+    const cmd: UserCmdT = this.lastCmd ?? {
+      msec: Math.max(1, Math.round(dt * 1000)),
+      angles: [...this.input.angles] as [number, number, number],
+      forwardmove: 0,
+      sidemove: 0,
+      upmove: 0,
+      buttons: 0,
+    };
+    this.driver.step(cmd, dt);
   }
 
   /** Feed an authoritative snapshot (server -> client). */
@@ -86,7 +122,17 @@ export class Host {
     while (this.serverAcc >= SERVER_DT) {
       this.serverAcc -= SERVER_DT;
       this.serverTick(SERVER_DT);
-      this.ingestSnapshot(this.offlineSnapshot());
+      if (this.driver) {
+        const snap = this.driver.snapshot(this.serverTime);
+        this.ingestSnapshot(snap);
+        const local = snap.entities.find((e) => e.id === this.localPlayerId);
+        if (local) {
+          this.playerOrigin = [...local.origin] as [number, number, number];
+          this.playerVelocity = [...local.velocity] as [number, number, number];
+        }
+      } else {
+        this.ingestSnapshot(this.offlineSnapshot());
+      }
     }
 
     // Client command from accumulated input.
@@ -97,7 +143,8 @@ export class Host {
       mPitch: getCVarNumber('m_pitch') || 0.022,
     });
     // Offline prediction: integrate the synthetic player with the cmd.
-    if (getCVarNumber('cl_predict') !== 0 && this.lastCmd) {
+    // Skipped when a driver owns the simulation (its snapshot is authoritative).
+    if (!this.driver && getCVarNumber('cl_predict') !== 0 && this.lastCmd) {
       const step = msec / 1000;
       this.playerVelocity[0] = this.lastCmd.forwardmove * 0.5;
       this.playerVelocity[1] = this.lastCmd.sidemove * 0.5;
@@ -122,7 +169,10 @@ export class Host {
       time: this.serverTime,
       lightStyles: new Float32Array(256).fill(1),
     };
-    const renderables: Entity[] = entities.map((e) => ({
+    const renderables: Entity[] = entities
+      // Never draw the local player's own body (it sits at the camera).
+      .filter((e) => e.id !== this.localPlayerId)
+      .map((e) => ({
       model: 0,
       origin: new Float32Array(e.origin) as Entity['origin'],
       angles: new Float32Array([0, 0, 0]) as Entity['angles'],

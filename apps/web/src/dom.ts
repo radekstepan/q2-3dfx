@@ -121,3 +121,178 @@ export function getRendererChoice(): string {
 export function setRendererChoice(kind: string): void {
   setCVarFromString('vid_renderer', kind === 'voodoo' ? 'voodoo' : 'software');
 }
+
+// --- play loop (rAF driver for a booted game; DOM-guarded) ---
+
+import type { Host } from '@q2/host';
+import type { LocalDriver, PlayBoot } from './play.js';
+import { drawPlayHud, resolveDisplay } from './play.js';
+import { attachToCanvas } from '@q2/input/dom';
+import { readPakEntry } from './pak.js';
+
+export interface PlayLoop {
+  readonly host: Host;
+  readonly driver: LocalDriver;
+  stop(): void;
+}
+
+interface BrowserSound {
+  ctx: AudioContext;
+  master: GainNode;
+  shot: AudioBuffer | null;
+  dispose(): void;
+}
+
+async function decodeShotSound(ctx: AudioContext, pak: WebPak): Promise<AudioBuffer | null> {
+  const { decodeWav } = await import('@q2/sound/browser');
+  const names = pak.entries.map((e) => e.name).filter((n) => n.endsWith('.wav'));
+  const pick =
+    names.find((n) => n.includes('blast')) ??
+    names.find((n) => n.includes('shotg')) ??
+    names.find((n) => n.includes('machin')) ??
+    names.find((n) => n.includes('gun')) ??
+    null;
+  if (!pick) return null;
+  try {
+    return await decodeWav(ctx, readPakEntry(pak, pick));
+  } catch {
+    return null;
+  }
+}
+
+function blip(ctx: AudioContext, master: GainNode, freq: number, dur: number, when = 0): void {
+  try {
+    const t = ctx.currentTime + when;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.25, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    osc.connect(gain);
+    gain.connect(master);
+    osc.start(t);
+    osc.stop(t + dur + 0.02);
+  } catch {
+    /* audio unavailable */
+  }
+}
+
+/**
+ * Drive a booted game on a canvas: pointer-lock input, rAF frames,
+ * voodoo resolve, HUD, blit, and gesture-unlocked sound. No-op without DOM.
+ */
+export function startPlayLoop(
+  canvas: unknown,
+  boot: PlayBoot,
+  opts: { pak?: WebPak | null } = {},
+): PlayLoop {
+  const { host, driver } = boot;
+  const noop = { host, driver, stop(): void { /* noop */ } };
+  if (typeof document === 'undefined' || typeof window === 'undefined' || !canvas) return noop;
+  const el = canvas as HTMLCanvasElement;
+  const bindings = attachToCanvas(el, host.input);
+  el.style.imageRendering = 'pixelated';
+  el.style.width = `${host.fb.width * 2}px`;
+  el.style.height = `${host.fb.height * 2}px`;
+
+  let sound: BrowserSound | null = null;
+  let shotLoading = false;
+  const unlock = (): void => {
+    void import('@q2/sound/browser')
+      .then((mod) => {
+        if (!sound) {
+          const created = mod.createBrowserMixer(host.mixer);
+          sound = { ...created, shot: null };
+        }
+        const s = sound;
+        if (s.ctx.state === 'suspended') void s.ctx.resume().catch(() => undefined);
+        if (!s.shot && !shotLoading && opts.pak) {
+          shotLoading = true;
+          void decodeShotSound(s.ctx, opts.pak)
+            .then((buf) => {
+              s.shot = buf;
+            })
+            .catch(() => undefined)
+            .finally(() => {
+              shotLoading = false;
+            });
+        }
+      })
+      .catch(() => undefined);
+  };
+
+  const onWeaponKeys = (e: KeyboardEvent): void => {
+    if (e.code === 'Digit1') driver.selectWeapon('weapon_blaster');
+    if (e.code === 'Digit2') driver.selectWeapon('weapon_shotgun');
+    if (e.code === 'Digit3') driver.selectWeapon('weapon_machinegun');
+  };
+
+  document.addEventListener('pointerdown', unlock);
+  document.addEventListener('keydown', unlock);
+  document.addEventListener('keydown', onWeaponKeys);
+
+  const playShot = (): void => {
+    if (!sound) return;
+    const s = sound;
+    try {
+      if (s.shot) {
+        const src = s.ctx.createBufferSource();
+        src.buffer = s.shot;
+        src.connect(s.master);
+        src.start();
+      } else {
+        blip(s.ctx, s.master, 220, 0.08);
+      }
+    } catch {
+      /* ignore */
+    }
+  };
+
+  let raf = 0;
+  let stopped = false;
+  let lastT = -1;
+  let fps = 60;
+  let frame = 0;
+  const tick = (nowMs: number): void => {
+    if (stopped) return;
+    if (lastT >= 0) {
+      const dt = nowMs - lastT;
+      if (dt > 0) fps += (1000 / dt - fps) * 0.05;
+    }
+    lastT = nowMs;
+    host.frame(nowMs);
+    const target = resolveDisplay(boot);
+    drawPlayHud(
+      { width: host.fb.width, height: host.fb.height, color: target },
+      boot,
+      { fps, frame: frame++ },
+    );
+    blitToCanvas(el, { ...host.fb, color: target });
+    for (const ev of driver.events.splice(0)) {
+      if (ev === 'shot') playShot();
+      else if (ev === 'kill' && sound) blip(sound.ctx, sound.master, 660, 0.12);
+      else if (ev === 'hit' && sound) blip(sound.ctx, sound.master, 440, 0.06);
+      else if (ev === 'exit' && sound) {
+        blip(sound.ctx, sound.master, 523, 0.15);
+        blip(sound.ctx, sound.master, 784, 0.25, 0.15);
+      }
+    }
+    raf = requestAnimationFrame(tick);
+  };
+  raf = requestAnimationFrame(tick);
+
+  return {
+    host,
+    driver,
+    stop(): void {
+      stopped = true;
+      cancelAnimationFrame(raf);
+      bindings.dispose();
+      document.removeEventListener('pointerdown', unlock);
+      document.removeEventListener('keydown', unlock);
+      document.removeEventListener('keydown', onWeaponKeys);
+      sound?.dispose();
+      sound = null;
+    },
+  };
+}
