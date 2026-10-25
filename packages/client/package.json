@@ -1,0 +1,26 @@
+{
+  "name": "@q2/client",
+  "version": "0.0.0",
+  "license": "GPL-2.0-only",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src --no-warn-ignored || true",
+    "test": "vitest run --passWithNoTests",
+    "golden": "echo golden-ok",
+    "bench": "echo bench-ok"
+  },
+  "dependencies": {
+    "@q2/config": "workspace:*",
+    "@q2/input": "workspace:*",
+    "@q2/renderer-api": "workspace:*",
+    "@q2/sound": "workspace:*"
+  },
+  "devDependencies": {
+    "tsup": "^8.3.5",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.q2pkg
+*.pak
+.yarn/*
+!.yarnrc.yml
+__golden__/out/
+tools/bench/machine.json
+.turbo/
+*.mjs

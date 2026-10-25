@@ -1,0 +1,21 @@
+{
+  "$schema": "https://unpkg.com/@changesets/config@3.0.1/schema.json",
+  "changelog": [
+    "@changesets/cli/changelog",
+    "github"
+  ],
+  "commit": false,
+  "fixed": [],
+  "linked": [
+    "@q2/*"
+  ],
+  "access": "public",
+  "baseBranch": "main",
+  "updateInternalDependencies": "patch",
+  "ignore": [
+    "q2ts-web",
+    "q2ts-devtools",
+    "q2-cooker",
+    "q2-bench"
+  ]
+}

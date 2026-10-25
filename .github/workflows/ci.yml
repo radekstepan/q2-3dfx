@@ -1,0 +1,13 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  verify:
+    strategy:
+      matrix: { node: [20, 22] }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ matrix.node }}', cache: yarn }
+      - run: corepack enable && yarn install --immutable
+      - run: yarn verify

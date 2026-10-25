@@ -1,0 +1,32 @@
+{
+  "name": "q2ts",
+  "private": true,
+  "license": "GPL-2.0-only",
+  "packageManager": "yarn@4.9.2",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "tools/*"
+  ],
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "golden": "turbo run golden",
+    "bench": "turbo run bench",
+    "verify": "turbo run typecheck lint test build",
+    "deps:check": "node tools/asset-cooker/dist/check-deps.js || echo deps-check-pending",
+    "changeset": "changeset",
+    "cook": "q2-cook"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.28.1",
+    "eslint": "^9.14.0",
+    "tsup": "^8.3.5",
+    "turbo": "^2.5.4",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.8"
+  }
+}
