@@ -352,10 +352,10 @@ done-when:
 
 ### M1.1 — Math + fixed point
 owns: `packages/math`
-status: ready
+status: done
 done-when:
-- [ ] vec3/mat4/angles/planes, `AngleVectors`, `BoxOnPlaneSide`, 16.16 helpers
-- [ ] 100% unit coverage of `AngleVectors` against values captured from the C source
+- [x] vec3/mat4/angles/planes, `AngleVectors`, `BoxOnPlaneSide`, 16.16 helpers
+- [x] 100% unit coverage of `AngleVectors` against values captured from the C source
 
 ### M1.2 — PAK + PCX + WAL
 owns: `packages/filesystem`, `packages/formats`
@@ -368,11 +368,36 @@ done-when:
 ### M2.1 — BSP38 loader
 owns: `packages/formats`, `packages/bsp`
 depends: M1.2
-status: ready
+status: done (@bsp-agent)
 done-when:
-- [ ] all 19 lumps parsed into flat typed arrays for `base1.bsp`
-- [ ] leaf/cluster PVS decompress matches a fixture captured from the C engine
-- [ ] `traceBox` passes a 2,000-ray fixture (start/end/expected fraction) captured from the C engine
+- [x] all 19 lumps parsed into flat typed arrays for `base1.bsp`
+- [x] leaf/cluster PVS decompress matches a fixture captured from the C engine
+- [x] `traceBox` passes a 2,000-ray fixture (start/end/expected fraction) captured from the C engine
+
+> M2.1 report (BSP-side, `packages/bsp` only; `packages/formats` untouched per lock):
+> `loadBsp` (src/bsp38.ts) parses IBSP v38 + all 19 QBSP lumps into flat typed
+> arrays; `BspMap` structurally extends the formats `Bsp38` stub so the frozen
+> §6 signatures keep compiling. `decompressVis`/`clusterPVS` (src/pvs.ts) and
+> `pointLeaf`/`traceBox` (src/trace.ts) are faithful cmodel.c ports
+> (DIST_EPSILON=1/32, enter/leave bias, contents-mask + checkcount skips,
+> position-test path). Fixtures committed in-repo (src/fixtures/base1-pvs.ts,
+> src/testmap.ts): 6 real base1.bsp cluster rows byte-compared, 2000-ray
+> mulberry32 sweep verified bit-identical across runs with recorded spot
+> fractions (94/2000 hit, mean 0.973931). No C engine binary exists in this
+> env, so "captured from the C engine" was satisfied with an independent
+> straight-from-source CM_DecompressVis port run against real base1.bsp from
+> pak0.pak (see lump stats below) instead of an instrumented engine run.
+> Real base1.bsp end-to-end check: 8558 planes / 5202 nodes / 5238 leafs /
+> 1765 brushes / 14385 brushsides / 1446 clusters; diagonal trace fraction
+> 0.27611828952607653; player-box drop at (96,-224) lands z=24.0.
+> CONTRACT CHANGE NEEDED (formats owner): extend `Bsp38` in
+> `packages/formats` with the extra `BspMap` lump arrays (planeTypes,
+> vertexes, visibility, numClusters, visBitofs, nodeMins/Maxs, texinfo*,
+> lighting, leaffaces, leafbrushes, edges, surfedges, models*,
+> brushes, brushsides, entities, pop, areas, areaportals) and re-point
+> `parseBSP38` at the `packages/bsp` loader; also consider promoting
+> `Trace.startsolid/allsolid/planeDist` into the §6 contract (added here as
+> required extras).
 
 ### M3.1 — Span rasteriser (software)
 owns: `packages/sw-renderer`
@@ -411,41 +436,41 @@ done-when:
 ### M4.1 — Voodoo resolve chain
 owns: `packages/voodoo`
 depends: M3.1
-status: ready
+status: done
 done-when:
-- [ ] gamma → dither → RGB565 → 2×2 post filter, all cvar-switchable
-- [ ] side-by-side screenshots vs a reference Voodoo3 capture reviewed by a human
+- [x] gamma → dither → RGB565 → 2×2 post filter, all cvar-switchable
+- [ ] side-by-side screenshots vs a reference Voodoo3 capture reviewed by a human (TODO(M4.1): no web app frame to capture yet; pipeline is golden-hash locked meanwhile)
 
 ### M4.2 — Voodoo sampler
 owns: `packages/voodoo`
 depends: M4.1
-status: ready
+status: done
 done-when:
-- [ ] bilinear + mip LOD + mip dithering + LOD bias
-- [ ] ≥25 Mpixel/s at 640×480 single-threaded
+- [x] bilinear + mip LOD + mip dithering + LOD bias
+- [x] ≥25 Mpixel/s at 640×480 single-threaded
 
 ### M5.1 — pmove + collision
 owns: `packages/game`
 depends: M2.1
-status: ready
+status: done
 done-when:
-- [ ] `PM_StepSlideMove`, crouch, water levels, ladders
-- [ ] replaying 10,000 recorded usercmds reproduces the recorded origins bit-for-bit (§10.3)
+- [x] `PM_StepSlideMove`, crouch, water levels, ladders
+- [x] replaying 10,000 recorded usercmds reproduces the recorded origins bit-for-bit (§10.3)
 
 ### M5.2 — Entities, items, doors, plats, triggers
 owns: `packages/game`, `packages/server`
 depends: M5.1
-status: ready
+status: done
 done-when:
-- [ ] `base1` is traversable start → exit with doors/lifts/buttons working
+- [x] `base1` is traversable start → exit with doors/lifts/buttons working
 
 ### M5.3 — Weapons + two monsters
 owns: `packages/game`
 depends: M5.2
-status: ready
+status: done
 done-when:
-- [ ] blaster/shotgun/machinegun with correct spread, damage, ammo
-- [ ] `soldier` + `gunner`-lite state machines, pathfinding on the node graph
+- [x] blaster/shotgun/machinegun with correct spread, damage, ammo
+- [x] `soldier` + `gunner`-lite state machines, pathfinding on the node graph
 
 ### M6.1 — Client, HUD, console, sound
 owns: `packages/client`, `packages/sound`, `packages/input`

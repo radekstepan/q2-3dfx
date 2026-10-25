@@ -1,7 +1,117 @@
 // @q2/game — gamex86: entities, pmove, items, doors, monsters, weapons. M5.x owns this.
-import { Com_Error } from '@q2/config';
-import type { Vec3 } from '@q2/math';
-export interface UserCmd { msec: number; angles: Vec3; forwardmove: number; sidemove: number; upmove: number; buttons: number }
-export interface PmoveState { origin: Vec3; velocity: Vec3; onGround: boolean }
-export function PM_StepSlideMove(_st: PmoveState, _dt: number): void { Com_Error('fatal', 'not implemented: PM_StepSlideMove'); }
-export function pmove(_st: PmoveState, _cmd: UserCmd): PmoveState { Com_Error('fatal', 'not implemented: pmove'); }
+export { PM_StepSlideMove, pmove } from './pmove.js';
+export {
+  PM_ClipVelocity,
+  PM_StepSlideMoveFull,
+  PM_Friction,
+  PM_Accelerate,
+  PM_AirAccelerate,
+  PM_CategorizePosition,
+  PM_CheckDuck,
+  PM_CheckJump,
+  PM_CheckSpecialMovement,
+  pmoveFull,
+  makePmoveState,
+  clonePmoveState,
+  setPmoveWorld,
+  resetPmoveWorld,
+  PM_STOPSPEED,
+  PM_MAXSPEED,
+  PM_DUCKSPEED,
+  PM_ACCELERATE,
+  PM_AIRACCELERATE,
+  PM_WATERACCELERATE,
+  PM_FRICTION,
+  PM_WATERFRICTION,
+  PM_WATERSPEED,
+  PM_GRAVITY,
+  PM_JUMP_VELOCITY,
+  STEPSIZE,
+  MIN_STEP_NORMAL,
+  PMF_DUCKED,
+  PMF_JUMP_HELD,
+  PMF_ON_GROUND,
+  PMF_TIME_WATERJUMP,
+  PMF_TIME_LAND,
+  PMF_TIME_TELEPORT,
+  CONTENTS_SOLID,
+  CONTENTS_WATER,
+  CONTENTS_SLIME,
+  CONTENTS_LAVA,
+  CONTENTS_LADDER,
+  MASK_WATER,
+} from './pmove.js';
+export type { UserCmd, PmoveState, TraceResult, TraceFn, PointContentsFn } from './pmove.js';
+export {
+  parseEntities,
+  parseVec3,
+  parseFloat,
+  parseInt,
+  spawnEdict,
+  resetEdictNums,
+  freeEdict,
+  findByTargetname,
+  findByClassname,
+  useTargets,
+  SOLID_NOT,
+  SOLID_TRIGGER,
+  SOLID_BBOX,
+  SOLID_BSP,
+  MOVETYPE_NONE,
+  MOVETYPE_STEP,
+  MOVETYPE_PUSH,
+} from './entities.js';
+export type { EntDict, Edict } from './entities.js';
+export { findItem, makePlayerState, pickupItem, MAX_HEALTH } from './items.js';
+export type { ItemDef, PlayerState, PickupResult } from './items.js';
+export {
+  spawnDoor,
+  spawnPlat,
+  spawnButton,
+  moverUse,
+  moverThink,
+  spawnTrigger,
+  triggerTouch,
+  teleportTo,
+  MOVER_BOTTOM,
+  MOVER_TOP,
+  MOVER_GOING_UP,
+  MOVER_GOING_DOWN,
+  MOVER_WAITING,
+  DOOR_START_OPEN,
+  DOOR_TOGGLE,
+} from './func.js';
+export type { Mover, Trigger } from './func.js';
+export {
+  findWeapon,
+  fireWeapon,
+  mulberry32,
+  WEAPON_BLASTER,
+  WEAPON_SHOTGUN,
+  WEAPON_MACHINEGUN,
+  DEFAULT_BULLET_HSPREAD,
+  DEFAULT_BULLET_VSPREAD,
+  DEFAULT_SHOTGUN_HSPREAD,
+  DEFAULT_SHOTGUN_VSPREAD,
+  DEFAULT_SHOTGUN_COUNT,
+} from './weapons.js';
+export type { WeaponDef, Pellet, FireResult } from './weapons.js';
+export {
+  monsterRange,
+  monsterDef,
+  spawnMonster,
+  monsterMoveOf,
+  monsterThink,
+  monsterPain,
+  selectAttack,
+  SOLDIER,
+  GUNNER,
+  RANGE_MELEE,
+  RANGE_NEAR,
+  RANGE_MID,
+  RANGE_FAR,
+  MELEE_DISTANCE,
+} from './monsters.js';
+export type { MonsterDef, MonsterMove, MonsterFrame, MonsterState, MonsterKind, AttackChoice } from './monsters.js';
+export { findPath, isReachable } from './pathfind.js';
+export type { PortalGraph } from './pathfind.js';
