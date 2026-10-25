@@ -68,6 +68,8 @@ export {
   spawnDoor,
   spawnPlat,
   spawnButton,
+  moveDirForAngle,
+  doorTravel,
   moverUse,
   moverThink,
   spawnTrigger,
@@ -115,3 +117,15 @@ export {
 export type { MonsterDef, MonsterMove, MonsterFrame, MonsterState, MonsterKind, AttackChoice } from './monsters.js';
 export { findPath, isReachable } from './pathfind.js';
 export type { PortalGraph } from './pathfind.js';
+export {
+  bspTraceFor,
+  bspContentsFor,
+  mapBspContents,
+  setPmoveWorldFromBsp,
+  resetPmoveWorld as resetPmoveWorldFromBsp,
+  BSP_CONTENTS_WATER,
+  BSP_CONTENTS_SLIME,
+  BSP_CONTENTS_LAVA,
+  BSP_CONTENTS_LADDER,
+  MASK_PLAYERSOLID,
+} from './collision.js';

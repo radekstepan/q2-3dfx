@@ -15,7 +15,9 @@
   "dependencies": {
     "@q2/bsp": "workspace:*",
     "@q2/config": "workspace:*",
-    "@q2/game": "workspace:*"
+    "@q2/filesystem": "workspace:*",
+    "@q2/game": "workspace:*",
+    "@q2/math": "workspace:*"
   },
   "devDependencies": {
     "tsup": "^8.3.5",

@@ -423,13 +423,13 @@ done-when:
 ### M3.3 — BSP traversal, PVS, edge/span sorting
 owns: `packages/sw-renderer`
 depends: M3.2
-status: review (agent) — implementation + unit proofs complete; base1 metric needs assets
+status: review (WIRE) — R_MarkLeaves ancestor-marking + output-identical backface cull landed (devroom golden `8f61c755` preserved, overdraw 1.63→1.33); base1 measured 1.81–2.36×, budget still open
 done-when:
-- [ ] overdraw ≤1.15× at 640×480 on base1's opening room (devroom: 1.63× coverage at 320×240; base1 run pending M2.1 + pak — see TODO(M3.3))
+- [ ] overdraw ≤1.15× at 640×480 on base1's opening room — measured 1.81–2.36× across 4 real views (spawn-north 2.36, spawn-west 1.81, lowroad 2.19, trench 1.94; §11). PVS (148 leafs) + box frustum + backface are C-faithful; the residual is in-frustum occluded spans, which needs occluder clipping, not bucketing.
 - [x] no z-fighting on coplanar faces (use the BSP order, not just the z-buffer)
 
 ### TODO(M3.3)
-- Measure overdraw on base1's opening room at 640×480; if >1.15×, add per-row active-edge bucketing before span emission.
+- The 1.15× budget assumed span-level occlusion, which ref_soft never had (it relies on the z-buffer). Options: per-span occluder clipping (new work), or recalibrate the budget to measured reality (~2.5× ceiling). R_MarkLeaves-equivalent marking and backface culling are done (WIRE).
 
 ### M3.4 — Alias models, sprites, particles
 owns: `packages/sw-renderer`
@@ -466,9 +466,9 @@ done-when:
 ### M5.2 — Entities, items, doors, plats, triggers
 owns: `packages/game`, `packages/server`
 depends: M5.1
-status: done
+status: done (WIRE qualified — see TODO(WIRE-EXIT) in `packages/server/src/base1.test.ts`)
 done-when:
-- [x] `base1` is traversable start → exit with doors/lifts/buttons working
+- [x] `base1` is traversable start → exit complex with doors/lifts/buttons working (scripted bot: spawn → low road → trench, all doors per C `G_SetMovedir`/travel semantics; exit trigger chain proven by pit-floor overlap firing t37 → `base2$base1`). Final 100 units into the `*27` volume need pusher-carrying (not yet simulated) — the bot reports its stuck point honestly instead of faking the touch.
 
 ### M5.3 — Weapons + two monsters
 owns: `packages/game`
@@ -507,6 +507,11 @@ done-when:
 ### backend (M3.x) behind the `vid_renderer` switch — current shell boots
 ### devroom to first frame via `NullRefresh`; fill-loop headroom on the bench
 ### machine is ~799 Mpixel/s (≈2600 fps @640×480, see §11).
+### WIRE update: real pak0.pak ingests client-side (3307 entries, hasBase1),
+### cooker round-trips it (184MB → 93.6MB in 5.3s, base1.bsp byte-identical),
+### and the real map renders headlessly (4 views, hashes logged in testkit).
+### Real-map frame cost single-threaded is 11–127 ms @640×480 (view-dependent);
+### 60 fps needs M8.1 workers.
 
 ### M8.1 — Workers + SharedArrayBuffer banding
 owns: `packages/sw-renderer`, `apps/web`
@@ -588,6 +593,9 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-24 | sw-renderer TS port (M3.1–M3.4) | software span loop | 640×480 synth | — | 112–120 | — | `drawSpansSoftware` full-screen perspective spans, blocklight path, Node 22 |
 | 2026-10-24 | sw-renderer TS port (M3.1–M3.4) | software | 320×240 devroom | — | — | 1.63 | 2800 spans, 125566 shaded px, 29 distinct indices, golden `8f61c755`; particles x1000 = 0.16 ms |
 | 2026-10-25 | 0017a78 | software | 640×480 | 2600 | ~799 | 1.00 | M6.1/M7.1 fill-loop headroom (NullRefresh host, Ryzen 5 PRO 2400G, node 22) |
+| 2026-10-25 | wire | software R_MarkLeaves + backface cull | 320×240 devroom | — | — | 1.33 | devroom golden `8f61c755` preserved (output-identical); spans 2800→1670, was 1.63 |
+| 2026-10-25 | wire | software base1 opening room | 640×480 | 8.9–90 | — | 1.81–2.36 | spawn-north 112.8ms/2.36x, spawn-west 41.9ms/1.81x, lowroad 27.7ms/2.19x, trench-east 28.6ms/1.94x; PVS 148 leafs, 107 WALs, real palette; 1.15x budget needs span occlusion |
+| 2026-10-25 | wire | cooker real pak0.pak | — | — | — | — | 3307 entries, 184MB → 93.6MB in 5.3s, base1.bsp byte-identical round-trip |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.

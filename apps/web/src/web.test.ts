@@ -28,3 +28,24 @@ describe('web app shell (headless, DOM-isolated)', () => {
     expect(later.pixels).toBe(64 * 48);
   });
 });
+
+const WEB_Q2_PAK = process.env.Q2_PAK;
+
+describe.runIf(!!WEB_Q2_PAK)('web app shell with real pak0.pak (Q2_PAK)', () => {
+  it('ingests the full shareware pak client-side', async () => {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak, pakHasMaps } = await import('./pak.js');
+    const pak = ingestPak(buf);
+    const names = new Set(pak.entries.map((e) => e.name));
+    console.log(
+      `WIRE web ingest: entries=${pak.entries.length} hasMaps=${pakHasMaps(pak)} ` +
+        `hasBase1=${names.has('maps/base1.bsp')}`,
+    );
+    expect(pak.entries.length).toBe(3307);
+    expect(pakHasMaps(pak)).toBe(true);
+    expect(names.has('maps/base1.bsp')).toBe(true);
+  }, 120000);
+});

@@ -71,6 +71,7 @@ function quad(
   dx: number, dy: number, dz: number,
   texId: number, lightId: number, turbulent: boolean,
   luxBase: number,
+  fnx: number, fny: number, fnz: number,
 ): MiniSurf {
   const verts = new Float32Array([ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz]);
   // full-texture mapping across the quad (64x64 texel space)
@@ -79,10 +80,13 @@ function quad(
   const lux = new Float32Array([0, 0, 4, 0, 4, 4, 0, 4]);
   void luxBase;
   const bb = bboxOf(verts);
+  // explicit front normal (devroom quads mix windings, so the geometric
+  // cross is unreliable — the visible side is known by construction).
+  const fn = new Float32Array([fnx, fny, fnz]);
   return {
     id: surfId++, verts, uvs, lux, n: 4, texId, lightId,
     center: bb.center, radius: bb.radius, mins: bb.mins, maxs: bb.maxs,
-    turbulent,
+    turbulent, fn,
   };
 }
 
@@ -122,23 +126,23 @@ export function createDevroom(): MiniWorld {
   const PH = 192; // pillar height
   const surfaces: MiniSurf[] = [
     // floor z=0 (normal +z), viewed from above
-    quad(-R, -R, 0, -R, R, 0, R, R, 0, R, -R, 0, 0, 0, false, 0),
+    quad(-R, -R, 0, -R, R, 0, R, R, 0, R, -R, 0, 0, 0, false, 0, 0, 0, 1),
     // ceiling z=H
-    quad(-R, R, H, -R, -R, H, R, -R, H, R, R, H, 1, 1, false, 0),
+    quad(-R, R, H, -R, -R, H, R, -R, H, R, R, H, 1, 1, false, 0, 0, 0, -1),
     // wall x=+R (normal -x)
-    quad(R, -R, 0, R, R, 0, R, R, H, R, -R, H, 1, 1, false, 0),
+    quad(R, -R, 0, R, R, 0, R, R, H, R, -R, H, 1, 1, false, 0, -1, 0, 0),
     // wall x=-R (normal +x)
-    quad(-R, R, 0, -R, -R, 0, -R, -R, H, -R, R, H, 0, 0, false, 0),
+    quad(-R, R, 0, -R, -R, 0, -R, -R, H, -R, R, H, 0, 0, false, 0, 1, 0, 0),
     // wall y=+R, turbulent water banner
-    quad(-R, R, 0, R, R, 0, R, R, H, -R, R, H, 1, 2, true, 0),
+    quad(-R, R, 0, R, R, 0, R, R, H, -R, R, H, 1, 2, true, 0, 0, -1, 0),
     // wall y=-R
-    quad(R, -R, 0, -R, -R, 0, -R, -R, H, R, -R, H, 0, 0, false, 0),
+    quad(R, -R, 0, -R, -R, 0, -R, -R, H, R, -R, H, 0, 0, false, 0, 0, 1, 0),
     // pillar sides + top
-    quad(-P, -P, 0, -P, P, 0, -P, P, PH, -P, -P, PH, 0, 3, false, 0),
-    quad(P, P, 0, P, -P, 0, P, -P, PH, P, P, PH, 0, 3, false, 0),
-    quad(-P, P, 0, P, P, 0, P, P, PH, -P, P, PH, 1, 3, false, 0),
-    quad(P, -P, 0, -P, -P, 0, -P, -P, PH, P, -P, PH, 1, 3, false, 0),
-    quad(-P, -P, PH, P, -P, PH, P, P, PH, -P, P, PH, 0, 3, false, 0),
+    quad(-P, -P, 0, -P, P, 0, -P, P, PH, -P, -P, PH, 0, 3, false, 0, -1, 0, 0),
+    quad(P, P, 0, P, -P, 0, P, -P, PH, P, P, PH, 0, 3, false, 0, 1, 0, 0),
+    quad(-P, P, 0, P, P, 0, P, P, PH, -P, P, PH, 1, 3, false, 0, 0, 1, 0),
+    quad(P, -P, 0, -P, -P, 0, -P, -P, PH, P, -P, PH, 1, 3, false, 0, 0, -1, 0),
+    quad(-P, -P, PH, P, -P, PH, P, P, PH, -P, P, PH, 0, 3, false, 0, 0, 0, 1),
   ];
   const world: MiniWorld = {
     brand: 'miniworld',

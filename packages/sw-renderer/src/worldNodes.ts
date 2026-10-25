@@ -18,6 +18,12 @@ export interface MiniNode {
 export interface MiniLeaf {
   cluster: number;
   firstSurf: number; numSurfs: number;
+  /**
+   * Explicit surface list (WIRE: converted BSP leafs use the leaffaces lump,
+   * which is non-contiguous). When present it replaces the firstSurf/numSurfs
+   * range; traversal dedupes shared faces across leafs (R_MarkLeaves marks).
+   */
+  faceList?: number[];
 }
 
 export interface MiniTexture {
@@ -49,6 +55,12 @@ export interface MiniSurf {
   mins: Float32Array;
   maxs: Float32Array;
   turbulent: boolean;
+  /**
+   * Front-side normal (plane normal corrected for planeback, or the
+   * geometric normal for procedural surfs). Used for backface culling;
+   * sign only matters.
+   */
+  fn: Float32Array;
 }
 
 export interface MiniWorld {
@@ -112,9 +124,45 @@ export function clusterVisible(world: MiniWorld, cluster: number, target: number
 }
 
 /**
+ * R_MarkLeaves equivalent (r_bsp.c): mark every node with a PVS-visible
+ * descendant, so the walk below can skip whole unmarked subtrees — including
+ * their node faces, which in QBSP carry the bulk of all surfaces. Without
+ * this, every frame emits the entire map (PVS only dedupes, never reduces).
+ * Marks live in a per-world reusable buffer: zero alloc per frame.
+ */
+const markCache = new WeakMap<MiniWorld, Uint8Array>();
+
+function markSubtree(world: MiniWorld, marks: Uint8Array, ni: number, viewCluster: number): boolean {
+  if (ni < 0) {
+    const leaf = world.leafs[-ni - 1];
+    return !!leaf && clusterVisible(world, viewCluster, leaf.cluster);
+  }
+  const n = world.nodes[ni]!;
+  const visL = markSubtree(world, marks, n.front, viewCluster);
+  const visR = markSubtree(world, marks, n.back, viewCluster);
+  marks[ni] = visL || visR ? 1 : 0;
+  return visL || visR;
+}
+
+function markedVisible(world: MiniWorld, viewCluster: number): Uint8Array {
+  let marks = markCache.get(world);
+  if (!marks || marks.length < world.nodes.length) {
+    marks = new Uint8Array(world.nodes.length);
+    markCache.set(world, marks);
+  } else {
+    marks.fill(0);
+  }
+  markSubtree(world, marks, 0, viewCluster);
+  return marks;
+}
+/**
  * Recursive node walk: PVS + frustum reject, surfaces collected front-to-back
  * (BSP order). Returns visible surface indices and the traversal order tag
  * per surface (lower = nearer; coplanar ties resolve by this order).
+ *
+ * Surfaces shared by several visible leafs are emitted once (per-frame mark,
+ * like R_MarkLeaves): the stamp array is keyed off the world so repeated
+ * frames allocate nothing.
  */
 export function collectVisibleSurfaces(
   world: MiniWorld,
@@ -123,55 +171,93 @@ export function collectVisibleSurfaces(
   outSurfs: number[],
   outOrder: number[],
 ): number {
-  let count = 0;
-  let order = 0;
+  const stamp = stampFor(world);
+  stamp.tick++;
+  const ctx: WalkCtx = { world, cam, viewCluster, outSurfs, outOrder, count: 0, order: 0, stamp, marks: null };
   const nodes = world.nodes;
   if (nodes.length === 0) {
     // single-leaf world: all surfaces, PVS-gated
     for (let li = 0; li < world.leafs.length; li++) {
       const leaf = world.leafs[li]!;
       if (!clusterVisible(world, viewCluster, leaf.cluster)) continue;
-      for (let i = 0; i < leaf.numSurfs; i++) {
-        outSurfs[count] = leaf.firstSurf + i;
-        outOrder[count] = order++;
-        count++;
-      }
+      ctx.count = emitLeafSurfaces(leaf, ctx);
     }
-    return count;
+    return ctx.count;
   }
+  // PVS ancestor marks (R_MarkLeaves): unmarked subtrees are skipped wholesale.
+  ctx.marks = markedVisible(world, viewCluster);
   // Recursive front-to-back walk (depth is tiny for our worlds; the
   // traversal order tag gives BSP-order coplanar resolution).
-  const r = walkNode(world, cam, viewCluster, 0, outSurfs, outOrder, 0, 0);
-  return r.count;
+  walkNode(ctx, 0);
+  return ctx.count;
 }
 
-function walkNode(
-  world: MiniWorld, cam: Camera, viewCluster: number, ni: number,
-  outSurfs: number[], outOrder: number[], count: number, order: number,
-): { count: number; order: number } {
-  if (ni < 0) {
-    const leaf = world.leafs[-ni - 1];
-    if (!leaf || !clusterVisible(world, viewCluster, leaf.cluster)) return { count, order };
-    for (let i = 0; i < leaf.numSurfs; i++) {
-      outSurfs[count] = leaf.firstSurf + i;
-      outOrder[count] = order++;
-      count++;
-    }
-    return { count, order };
+interface WalkCtx {
+  world: MiniWorld;
+  cam: Camera;
+  viewCluster: number;
+  outSurfs: number[];
+  outOrder: number[];
+  count: number;
+  order: number;
+  stamp: { ids: Int32Array; tick: number };
+  marks: Uint8Array | null;
+}
+
+const stampCache = new WeakMap<MiniWorld, { ids: Int32Array; tick: number }>();
+
+function stampFor(world: MiniWorld): { ids: Int32Array; tick: number } {
+  let s = stampCache.get(world);
+  if (!s || s.ids.length < world.surfaces.length) {
+    s = { ids: new Int32Array(Math.max(16, world.surfaces.length)), tick: 0 };
+    stampCache.set(world, s);
   }
-  const n = world.nodes[ni]!;
-  if (culledByFrustum(cam, n.mins, n.maxs)) return { count, order };
-  const d = cam.origin[0]! * n.nx + cam.origin[1]! * n.ny + cam.origin[2]! * n.nz - n.dist;
+  if (s.tick === 0x7fffffff) {
+    s.ids.fill(0);
+    s.tick = 0;
+  }
+  return s;
+}
+
+function emitSurf(ctx: WalkCtx, si: number): void {
+  if (si < 0 || si >= ctx.world.surfaces.length) return;
+  if (ctx.stamp.ids[si] === ctx.stamp.tick) return;
+  ctx.stamp.ids[si] = ctx.stamp.tick;
+  ctx.outSurfs[ctx.count] = si;
+  ctx.outOrder[ctx.count] = ctx.order++;
+  ctx.count++;
+}
+
+function emitLeafSurfaces(leaf: MiniLeaf, ctx: WalkCtx): number {
+  const list = leaf.faceList;
+  if (list) {
+    for (let i = 0; i < list.length; i++) emitSurf(ctx, list[i]!);
+  } else {
+    for (let i = 0; i < leaf.numSurfs; i++) emitSurf(ctx, leaf.firstSurf + i);
+  }
+  return ctx.count;
+}
+
+function walkNode(ctx: WalkCtx, ni: number): void {
+  if (ni < 0) {
+    const leaf = ctx.world.leafs[-ni - 1];
+    if (!leaf || !clusterVisible(ctx.world, ctx.viewCluster, leaf.cluster)) return;
+    ctx.count = emitLeafSurfaces(leaf, ctx);
+    return;
+  }
+  // PVS gate first (id R_RecursiveWorldNode): unmarked subtrees — including
+  // their node faces — are skipped entirely. Frustum reject second.
+  if (ctx.marks && !ctx.marks[ni]) return;
+  const n = ctx.world.nodes[ni]!;
+  if (culledByFrustum(ctx.cam, n.mins, n.maxs)) return;
+  const d = ctx.cam.origin[0]! * n.nx + ctx.cam.origin[1]! * n.ny + ctx.cam.origin[2]! * n.nz - n.dist;
   const first = d >= 0 ? n.front : n.back;
   const second = d >= 0 ? n.back : n.front;
-  ({ count, order } = walkNode(world, cam, viewCluster, first, outSurfs, outOrder, count, order));
+  walkNode(ctx, first);
   for (let i = 0; i < n.numSurfs; i++) {
-    outSurfs[count] = n.firstSurf + i;
-    outOrder[count] = order++;
-    count++;
+    emitSurf(ctx, n.firstSurf + i);
   }
-  ({ count, order } = walkNode(world, cam, viewCluster, second, outSurfs, outOrder, count, order));
-  return { count, order };
+  walkNode(ctx, second);
 }
 
 /** Frustum-only surface cull helper (used for node-surface fast path). */

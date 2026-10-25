@@ -59,4 +59,11 @@ export { drawParticles, projectParticles, type ScreenParticle } from './particle
 
 export { createDevroom, createDevSkins, getDevMesh, DEVROOM_CAMERA } from './devroom.js';
 
+export {
+  bspToMiniWorld,
+  bspModelBounds,
+  SURF_SKY, SURF_WARP, SURF_NODRAW,
+  type BspTexelSource, type BspWorldOptions,
+} from './bspWorld.js';
+
 export { SoftwareBackend, SoftwareRenderer, sortBatchByRow, MAX_SPANS } from './frame.js';

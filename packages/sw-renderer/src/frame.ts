@@ -260,7 +260,18 @@ export class SoftwareRenderer implements Refresh {
       const si = this.visSurfs[vi]!;
       const order = this.visOrder[vi]!;
       const surf = worldData.surfaces[si]!;
+      // degenerate (NODRAW) placeholders from BSP conversion carry no geometry
+      if (surf.n < 3) continue;
       if (surfFrustumCulled(cam, surf)) continue;
+      // backface cull for single-sided world polys (id draws these too and
+      // lets the z-buffer reject them; skipping is output-identical and
+      // saves the span work). Turbulent (water) stays double-sided.
+      if (!surf.turbulent) {
+        const dx = cam.origin[0]! - surf.center[0]!;
+        const dy = cam.origin[1]! - surf.center[1]!;
+        const dz = cam.origin[2]! - surf.center[2]!;
+        if (surf.fn[0]! * dx + surf.fn[1]! * dy + surf.fn[2]! * dz < 0) continue;
+      }
       const dist = Math.sqrt(
         (surf.center[0]! - view.origin[0]!) ** 2 +
         (surf.center[1]! - view.origin[1]!) ** 2 +

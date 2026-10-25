@@ -44,14 +44,43 @@ function dirBetween(a: Vec3, b: Vec3): { dir: Vec3; dist: number } {
   return { dir: v3(dx / dist, dy / dist, dz / dist), dist };
 }
 
+/**
+ * Movement direction for an angle key (G_SetMovedir, game/g_utils.c):
+ * yaw -1 is straight up, -2 straight down, else yaw degrees in the floor.
+ */
+export function moveDirForAngle(angleDeg: number): Vec3 {
+  if (angleDeg === -1) return v3(0, 0, 1);
+  if (angleDeg === -2) return v3(0, 0, -1);
+  const rad = (angleDeg * Math.PI) / 180;
+  return v3(Math.cos(rad), Math.sin(rad), 0);
+}
+
+/**
+ * id door travel (SP_func_door): |movedir| . size - lip, where size is the
+ * brush model's full bounds. The `distance` entity key does NOT exist for
+ * doors in id; base1's door *31 needs this (156, not the 128 default) so the
+ * slab actually clears the corridor when open.
+ */
+export function doorTravel(size: Vec3, angleDeg: number, lip: number): number {
+  const dir = moveDirForAngle(angleDeg);
+  const dist =
+    Math.abs(dir[0]!) * size[0]! + Math.abs(dir[1]!) * size[1]! + Math.abs(dir[2]!) * size[2]!;
+  return Math.max(0, dist - lip);
+}
+
 /** Spawn a func_door mover. angle = yaw degrees of travel direction. */
 export function spawnDoor(ent: Edict, angleDeg: number, distance: number): Mover {
-  const rad = (angleDeg * Math.PI) / 180;
-  const dir = v3(Math.cos(rad), Math.sin(rad), 0);
+  const dir = moveDirForAngle(angleDeg);
   const lip = ent.lip || 8;
   const travel = Math.max(0, distance - lip);
   const pos1 = v3(ent.origin[0], ent.origin[1], ent.origin[2]);
-  const pos2 = v3(pos1[0]! + dir[0]! * travel, pos1[1]! + dir[1]! * travel, pos1[2]);
+  // VectorMA(pos1, travel, dir) on all three axes (id g_func.c); the z term
+  // matters for angle -1/-2 (vertical) doors such as base1's door *19/*31.
+  const pos2 = v3(
+    pos1[0]! + dir[0]! * travel,
+    pos1[1]! + dir[1]! * travel,
+    pos1[2]! + dir[2]! * travel,
+  );
   const m: Mover = {
     ent,
     pos1,
@@ -89,17 +118,7 @@ export function spawnPlat(ent: Edict, height: number): Mover {
 
 /** Spawn a func_button: moves `lip` units along its angle, fires targets, resets. */
 export function spawnButton(ent: Edict, angleDeg: number): Mover {
-  const rad = (angleDeg * Math.PI) / 180;
-  const dir = v3(Math.cos(rad), Math.sin(rad), 0);
-  if (angleDeg === -1) {
-    dir[0] = 0;
-    dir[1] = 0;
-    dir[2] = 1;
-  } else if (angleDeg === -2) {
-    dir[0] = 0;
-    dir[1] = 0;
-    dir[2] = -1;
-  }
+  const dir = moveDirForAngle(angleDeg);
   const lip = ent.lip || 4;
   const pos1 = v3(ent.origin[0], ent.origin[1], ent.origin[2]);
   const pos2 = v3(pos1[0]! + dir[0]! * lip, pos1[1]! + dir[1]! * lip, pos1[2]! + dir[2]! * lip);

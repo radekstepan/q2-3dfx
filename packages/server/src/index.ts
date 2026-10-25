@@ -4,6 +4,7 @@
 
 import { SERVER_DT } from '@q2/config';
 import {
+  doorTravel,
   moverThink,
   moverUse,
   parseEntities,
@@ -51,8 +52,17 @@ export function SV_SpawnTrigger(st: ServerState, t: Trigger): void {
  * Spawn a full entities lump: creates edicts for every block and wires
  * movers/triggers for the classes base1 needs. Unknown classes are kept as
  * plain edicts (decorations, lights, monster placeholders).
+ *
+ * `modelSizes` is the WIRE hook for id-correct door travel: SP_func_door
+ * computes travel as |movedir| . brushSize - lip from the brush model bounds,
+ * which only the BSP side knows. When a model resolves, its size-based travel
+ * is used; otherwise the legacy `distance`-key default (128) applies.
  */
-export function SV_SpawnEntities(st: ServerState, text: string): Edict[] {
+export function SV_SpawnEntities(
+  st: ServerState,
+  text: string,
+  modelSizes?: (model: string) => { mins: Float32Array; maxs: Float32Array } | null,
+): Edict[] {
   resetEdictNums();
   const out: Edict[] = [];
   for (const dict of parseEntities(text)) {
@@ -61,9 +71,24 @@ export function SV_SpawnEntities(st: ServerState, text: string): Edict[] {
     out.push(e);
     const angle = parseFloat(dict['angle'], 0);
     switch (e.classname) {
-      case 'func_door':
-        SV_SpawnMover(st, spawnDoor(e, angle, parseFloat(dict['distance'], 128)));
+      case 'func_door': {
+        let distance = parseFloat(dict['distance'], 128);
+        const model = dict['model'];
+        if (modelSizes && model) {
+          const bounds = modelSizes(model);
+          if (bounds) {
+            const size = [
+              bounds.maxs[0]! - bounds.mins[0]!,
+              bounds.maxs[1]! - bounds.mins[1]!,
+              bounds.maxs[2]! - bounds.mins[2]!,
+            ] as [number, number, number];
+            const lip = e.lip || 8;
+            distance = doorTravel(new Float32Array(size), angle, lip) + lip;
+          }
+        }
+        SV_SpawnMover(st, spawnDoor(e, angle, distance));
         break;
+      }
       case 'func_plat':
         SV_SpawnMover(st, spawnPlat(e, parseFloat(dict['height'], 160)));
         break;
