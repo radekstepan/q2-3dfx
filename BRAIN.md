@@ -372,12 +372,13 @@ done-when:
 - [x] PAK directory parse, `readFile(name): ArrayBuffer`
 - [x] WAL → 4 mips; PCX → palette + pixels; colormap built and byte-compared to id's `colormap.pcx`
 
-### TODO(M1.2 follow-up) — real pak0.pak play-test 2026-10-25:
-- `parseBSP38` (`packages/formats/src/index.ts:67`) and `parseMD2` (`:70`) are still
-  `Com_Error('not implemented')` stubs. Real BSP lives in `@q2/bsp/loadBsp`;
-  nothing loads real `.md2`/`.sp2` skins — enemies/weapons fall back to the
-  box-critter + checker (see M3.4, M7.2). Needs an owning card (suggested M1.3:
-  MD2/SP2 parse + skin load through `registerModel`/`registerSkin`).
+### TODO(M1.2 follow-up) — update 2026-10-25 pm:
+- `parseMD2` DONE (`packages/formats`): real IDP2 parser + `parseSP2` verified vs
+  pak0.pak (soldier 227v/434t/475f, g_shotg, all 8 sprites). `parseBSP38` stays a
+  stub (full loader in `@q2/bsp`); re-point is a separate contract PR.
+- Remaining wiring (not parser): `apps/web` still registers the box-critter
+  (`play.ts:1014`) — switch boot to `modelForMonster`/`skinForMonster` +
+  `registerModel` MD2 path + `registerSkinData` (both landed in sw-renderer).
 
 ### M2.1 — BSP38 loader
 owns: `packages/formats`, `packages/bsp`
@@ -453,11 +454,15 @@ done-when:
 - [x] MD2 player model draws with affine triangles + shade dots (MD2-shaped procedural mesh; real `.md2` parse is M1.2's job — data flows through `registerModel`)
 - [x] 1,000 particles cost <1.5 ms at 640×480 (measured 0.16 ms, §11)
 
-### TODO(M3.4) — real pak0.pak play-test 2026-10-25:
-- `registerModel`/`registerSkin` (`packages/sw-renderer/src/frame.ts:330,335`) still
-  return the box-critter + 32×32 checker; `apps/web/src/play.ts:1014` registers
-  `getDevMesh(0)` as `monster`. Audible but untextured with the real pak.
-  Unblocks when TODO(M1.2 follow-up) lands; no renderer contract change needed.
+### TODO(M3.4) — update 2026-10-25 pm:
+- DONE: `md2ToAliasMesh` + `registerSkinData/Pixels` + `drawTracerBeam`/`spawnTracer`
+  (`packages/sw-renderer`); asset tables + blaster `BoltSpec`/`MuzzleSpec`
+  (`packages/game/src/assets.ts`, `weapons.ts`); baked readable fallback font
+  (`packages/client`); `r_brightness` display-only lift + fps top-right green +
+  select-panel + nicer 2D viewmodel (`apps/web`). Devroom golden `8f61c755` intact.
+- Still open: boot path still registers `getDevMesh(0)` box-critter and renders the
+  2D gun — wire `modelForMonster/viewModelForWeapon` + `registerSkinData` +
+  bolt entity + tracer spawn in `apps/web` boot/driver (suggested M1.3 wiring card).
 
 ### M4.1 — Voodoo resolve chain
 owns: `packages/voodoo`
@@ -510,11 +515,13 @@ done-when:
 ### TODO(M6.1): `CL_Predict` pmove hookup DONE (headless `pmoveFull` replay
 ### behind `cl_predict`, exact-match vs server, legacy fallback preserved).
 ### Remaining (confirmed real pak0.pak play-test 2026-10-25):
-### - HUD font is procedural xorshift noise (`packages/client/src/hud.ts:17`);
-###   `setConcharsFont` is never called from `apps/web` so `pics/conchars.pcx`
-###   never loads — grey/white text unreadable. Needs a conchars-load + wire-up card.
-### - World reads dark: `buildLightMap` (`packages/sw-renderer/src/light.ts:42`)
-###   uses only `styleScales[0]`, clamps to 1.0 with no ×2 overbright.
+### - HUD font: baked readable 8×8 fallback DONE (`packages/client`); real
+###   `pics/conchars.pcx` loads via `loadConcharsFont`/`setConcharsFont` when the pak
+###   is present (devroom + base1 both legible now).
+### - Brightness: `r_brightness` (0.5–2.0, default 1.25) DONE (`apps/web`,
+###   display-only post-resolve scale; 1.0 byte-identical, HUD unclipped). Original
+###   game data untouched — numbers on the right only, per request. Dark default is
+###   now tunable, not hardcoded.
 ### - Muzzle dlight leaks: `drainFlash` (`apps/web/src/play.ts:456`) doesn't consume
 ###   and `pumpMuzzleLight` (`:1035`) `testAddDynamicLight`s every tick with no
 ###   `testClearDynamicLights`, so lights accumulate and the scene stays bright.
