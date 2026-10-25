@@ -10,6 +10,7 @@
   ],
   "scripts": {
     "dev": "turbo dev",
+    "start": "turbo start",
     "build": "turbo run build",
     "typecheck": "turbo run typecheck",
     "lint": "turbo run lint",
@@ -23,6 +24,7 @@
   },
   "devDependencies": {
     "@changesets/cli": "^2.28.1",
+    "asset-cooker": "workspace:*",
     "eslint": "^9.14.0",
     "tsup": "^8.3.5",
     "turbo": "^2.5.4",

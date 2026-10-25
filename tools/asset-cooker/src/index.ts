@@ -161,27 +161,3 @@ export function makeSyntheticPak(files: Record<string, Uint8Array>): ArrayBuffer
   });
   return buf;
 }
-
-async function main(): Promise<void> {
-  const argv = process.argv.slice(2);
-  if (argv.length < 2 || argv[0] === '--help' || argv[0] === '-h') {
-    console.log('usage: q2-cook <in.pak> <out.q2pkg>');
-    process.exit(argv.length < 2 ? 1 : 0);
-  }
-  const fs = await import('fs');
-  const [input = '', output = ''] = argv as [string, string];
-  const pakBuf = fs.readFileSync(input).buffer as ArrayBuffer;
-  const t0 = Date.now();
-  const cooked = await cookPak(pakBuf);
-  fs.writeFileSync(output, cooked);
-  const files = splitPak(pakBuf).length;
-  console.log(
-    `cooked ${files} files: ${(pakBuf.byteLength / 1048576).toFixed(2)}MB -> ` +
-      `${(cooked.length / 1048576).toFixed(2)}MB in ${Date.now() - t0}ms`,
-  );
-}
-
-const invoked = typeof process !== 'undefined' && process.argv[1] != null;
-if (invoked && /asset-cooker|q2-cook|cook/.test(process.argv[1]!)) {
-  void main();
-}
