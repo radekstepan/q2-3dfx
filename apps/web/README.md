@@ -31,13 +31,7 @@ real ESM (`dist/index.mjs` via `exports`, no Vite pre-bundling needed).
 - `yarn dev` — dev environment for testing: Vite dev server with HMR on
   `src/index.ts` at http://localhost:5173 (game canvas + cvar panel +
   pak drop zone; `devtools` stays a private library, no page of its own).
-  Always boots devroom; base1 only via manual pak drop.
-- `yarn start` — the actual game: builds everything, symlinks the local
-  pak0.pak (`$Q2_PAK`, else `../external/q2/baseq2/pak0.pak`; never
-  committed, never copied) to `dist-web/pak0.pak`, then serves the
-  production bundle at http://localhost:5173. The page fetches the linked
-  pak and boots straight into base1; with no readable pak it falls back
-  to devroom + drop zone, same as dev.
+  Always boots devroom; drop `pak0.pak` to boot base1.
 
 Browser: click the canvas for pointer lock, WASD + mouse + Space/E +
 1/2/3. Drop `pak0.pak` anywhere to boot base1 (spawn, doors, exit

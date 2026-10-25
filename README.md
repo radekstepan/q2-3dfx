@@ -32,8 +32,7 @@ All commands run from the repo root:
 
 | Command | What it does |
 | --- | --- |
-| `yarn dev` | `turbo dev` (watch mode; no per-package `dev` tasks are defined yet, so this is currently a no-op) |
-| `yarn start` | `turbo start` — builds dependencies, then serves `apps/web` via Vite at http://localhost:5173 |
+| `yarn dev` | `turbo dev` — Vite HMR dev server for `apps/web` at http://localhost:5173 |
 | `yarn build` | `turbo run build` — builds all workspaces (`tsup`, outputs `dist/`) |
 | `yarn typecheck` | `turbo run typecheck` |
 | `yarn lint` | `turbo run lint` |
@@ -52,7 +51,7 @@ yarn turbo run build typecheck test --filter=...[origin/main]
 
 ## Web app (`apps/web`)
 
-- Playable: `yarn start` → http://localhost:5173. Click the canvas for
+- Playable: `yarn dev` → http://localhost:5173. Click the canvas for
   pointer lock, then WASD + mouse, Space jump, E use, 1/2/3 weapons,
   click to shoot. HUD shows fps, position, weapon/ammo.
 - No pak: explorable procedural devroom (real software renderer, analytic

@@ -6,15 +6,13 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "tsup && vite build",
+    "build": "tsup",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint src --no-warn-ignored || true",
     "test": "vitest run --passWithNoTests",
     "golden": "echo golden-ok",
     "bench": "echo bench-ok",
-    "dev": "vite --port 5173",
-    "start": "vite preview --port 5173",
-    "preview": "vite preview --port 5173"
+    "dev": "vite --port 5173"
   },
   "dependencies": {
     "@q2/bsp": "workspace:*",
