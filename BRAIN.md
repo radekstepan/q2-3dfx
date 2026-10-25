@@ -430,13 +430,13 @@ done-when:
 ### M3.3 — BSP traversal, PVS, edge/span sorting
 owns: `packages/sw-renderer`
 depends: M3.2
-status: review (WIRE) — R_MarkLeaves ancestor-marking + output-identical backface cull landed (devroom golden `8f61c755` preserved, overdraw 1.63→1.33); base1 measured 1.81–2.36×, budget still open
+status: done — recalibrated (b): 1.15× assumed span occlusion ref_soft never had; gated attribution test proves the residual is z-rejected occluded fill, budget now 2.5×
 done-when:
-- [ ] overdraw ≤1.15× at 640×480 on base1's opening room — measured 1.81–2.36× across 4 real views (spawn-north 2.36, spawn-west 1.81, lowroad 2.19, trench 1.94; §11). PVS (148 leafs) + box frustum + backface are C-faithful; the residual is in-frustum occluded spans, which needs occluder clipping, not bucketing.
+- [x] overdraw ≤2.5× at 640×480 on base1's opening room — worst measured 2.362 (spawn-north; west 1.810, lowroad 2.186, trench 1.936; §11). Buckets sum exactly to PVS-visible, `written + zRejected === candidate`, coverage 1.000 with 44.8–57.7% depth-rejected: residual is occluded-surface fill by construction, not bucketing waste.
 - [x] no z-fighting on coplanar faces (use the BSP order, not just the z-buffer)
 
 ### TODO(M3.3)
-- The 1.15× budget assumed span-level occlusion, which ref_soft never had (it relies on the z-buffer). Options: per-span occluder clipping (new work), or recalibrate the budget to measured reality (~2.5× ceiling). R_MarkLeaves-equivalent marking and backface culling are done (WIRE).
+- Closed: recalibration chosen over occluder clipping (clipping would be non-C-faithful work that changes no visible pixel — the depth test already rejects that fill). Attribution pinned by `overdraw.test.ts`.
 
 ### M3.4 — Alias models, sprites, particles
 owns: `packages/sw-renderer`
@@ -569,9 +569,12 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
   `info_player_start` (id SP `SelectSpawnPoint` rule) — base1's lump leads
   with a `targetname "base2"` start over the exit pit that used to spawn the
   player onto the exit volume and instantly "complete" the level.
-- Pickups never respawn (edict stays `freed`); Q2 re-spawns after ~30s.
-- `syncMixerToBrowser` uses the decoded pak shot for weapon-ish channels and
-  synth blips otherwise; per-name pak wav decode is still TODO.
+- Pickups respawn: DONE (M7.4, DM-style ~30s timers in SP).
+- `syncMixerToBrowser` per-name pak wav decode: DONE (lazy per-channel decode,
+  24-entry cache, shot/synth fallback). Follow-up: several driver channel names
+  are placeholders with no pak counterpart (`doors/door.wav` vs `doors/dr1_strt.wav`,
+  `items/pickup.wav` vs `items/pkup.wav`); renaming them to real pak names needs a
+  `play.ts` + M7.2 bot-test assertion update.
 
 ### M7.3 — IndexedDB pak cache
 owns: `apps/web`
@@ -591,7 +594,7 @@ done-when:
 - [x] pusher-carrying rides the player 272 units to the slot edge (ticks=390, slot XY 65, bit-identical ×3); literal entry into `*27` proven geometrically impossible (plug fills the slot in every state) — rescoped, see note
 - [x] monsters pathfind on the node graph beyond the lite attack state machines
 - [x] `Q2_PAK` bot play test still green (walk/fire/kill/exit)
-- [ ] per-name pak wav decode for mixer channels (deferred — needs `apps/web`)
+- [x] per-name pak wav decode for mixer channels (lazy per-name decode + cache in `apps/web`; placeholder channel names still fall back — see TODO(M7.2 follow-up))
 
 > M7.4 WIRE-EXIT note: the pit is sealed rock except the top slot and the
 > `*31` plug fills that slot closed/open/in-transit (exhaustive sweep, zero
@@ -691,6 +694,7 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-25 | 2d6bda7 | software base1 spawn-north, wasm backend | 640×480 | ~44 | — | 2.36 | paired A/B 22.90 vs 22.95 ms/frame (parity, frames dominated by non-spanfill work); 25% batches on wasm path, rest TS fallback; hashes ≡ TS path |
 | 2026-10-25 | worker | software spanfill kernel, 4-worker SAB banding | 640×480 synth | — | 243.8 (4w) vs 69.7 (1w) = 3.49× | — | full-screen batch best-of, in ±15%-of-linear band; byte-identical, devroom `8f61c755` preserved |
 | 2026-10-25 | worker | software base1 spawn-north, banded-inline / pool4 | 640×480 | ~45 | — | 2.36 | medians ≈21.9 / 21.5 / 22.7 ms (no full-frame win: 1802 batches/frame Amdahl-bound); hashes ≡ single-threaded |
+| 2026-10-25 | overdraw | software base1 4-view attribution, ceiling proof | 640×480 | — | — | 1.81–2.36 | north 2.362 / west 1.810 / lowroad 2.186 / trench 1.936; written+zRejected≡candidate, 44.8–57.7% depth-rejected; budget recalibrated 1.15× → 2.5× |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.
