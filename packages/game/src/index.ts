@@ -122,6 +122,7 @@ export {
   monsterMoveOf,
   monsterThink,
   monsterPain,
+  monsterYawTo,
   selectAttack,
   monsterChaseMove,
   attackMoveFor,
@@ -165,6 +166,22 @@ export {
   viewModelForWeapon,
   worldModelForWeapon,
 } from './assets.js';
+export {
+  EXPLOBOX_MODEL,
+  EXPLOBOX_MINS,
+  EXPLOBOX_MAXS,
+  EXPLOBOX_DEFAULT_MASS,
+  EXPLOBOX_DEFAULT_HEALTH,
+  EXPLOBOX_DEFAULT_DMG,
+  FUNC_EXPLOSIVE_DEFAULT_MASS,
+  FUNC_EXPLOSIVE_DEFAULT_HEALTH,
+  FUNC_EXPLOSIVE_DEFAULT_DMG,
+  TARGET_EXPLOSION_DEFAULT_DMG,
+  TARGET_EXPLOSION_DEFAULT_DELAY,
+  isExplosiveClassname,
+  spawnExplosive,
+} from './explosives.js';
+export type { Explosive, ExplosiveKind } from './explosives.js';
 export {
   bspTraceFor,
   bspContentsFor,

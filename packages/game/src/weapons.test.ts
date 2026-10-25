@@ -16,6 +16,7 @@ import {
   findWeapon,
   fireWeapon,
   isReachable,
+  monsterMoveOf,
   monsterRange,
   monsterThink,
   monsterPain,
@@ -121,6 +122,33 @@ describe('monsters (M5.3)', () => {
     monsterPain(m, 1000, mulberry32(1));
     expect(m.dead).toBe(true);
     expect(monsterThink(m)).toBe('dead');
+  });
+
+  it('every move fits inside its MD2 (soldier 475 / gunner 209 frames)', () => {
+    // The web driver maps entityFrame = move.first + frameOffset, so first
+    // must already be the MD2 frame index and last must stay in the model.
+    for (const mv of Object.values(SOLDIER.moves)) {
+      expect(mv.last).toBeLessThan(475);
+    }
+    expect(SOLDIER.moves['death1']!.first).toBe(272); // id FRAME_death101
+    for (const mv of Object.values(GUNNER.moves)) {
+      expect(mv.last).toBeLessThan(209);
+    }
+    expect(GUNNER.moves['death']!.last).toBe(200); // id FRAME_death11
+  });
+
+  it('gunner fire_chain exits to endfire_chain (no dangling move)', () => {
+    const m = spawnMonster('gunner');
+    m.move = 'attack_chain';
+    for (let i = 0; i < 7; i++) monsterThink(m);
+    expect(m.move).toBe('fire_chain');
+    for (let i = 0; i < 8; i++) {
+      // every frame of the burst must resolve to a known move
+      expect(() => monsterMoveOf(m)).not.toThrow();
+      monsterThink(m);
+    }
+    expect(m.move).toBe('endfire_chain');
+    expect(() => monsterMoveOf(m)).not.toThrow();
   });
 });
 

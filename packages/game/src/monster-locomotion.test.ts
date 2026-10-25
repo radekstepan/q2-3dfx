@@ -5,6 +5,9 @@ import type { Vec3 } from '@q2/math';
 import {
   MONSTER_FALL_PROBE,
   monsterLocomotion,
+  monsterMoveOf,
+  monsterThink,
+  monsterYawTo,
   spawnMonster,
 } from './monsters.js';
 
@@ -118,5 +121,67 @@ describe('monsterLocomotion (pure, headless)', () => {
     expect(origin[0]).toBeCloseTo(16, 6);
     // horizontal step stayed level; gravity snapped down to the lower floor
     expect(origin[2]).toBeCloseTo(-10, 6);
+  });
+});
+
+describe('monster facing (Q2 yaw: 0 = +X, 90 = +Y/left)', () => {
+  it('monsterYawTo matches id vectoyaw on the cardinals', () => {
+    const o = v3(0, 0, 0);
+    expect(monsterYawTo(o, v3(100, 0, 0))).toBeCloseTo(0, 9);
+    expect(monsterYawTo(o, v3(0, 100, 0))).toBeCloseTo(90, 9);
+    expect(monsterYawTo(o, v3(-100, 0, 0))).toBeCloseTo(180, 9);
+    expect(monsterYawTo(o, v3(0, -100, 0))).toBeCloseTo(270, 9);
+    expect(monsterYawTo(o, v3(100, 100, 0))).toBeCloseTo(45, 9);
+  });
+
+  it('locomotion faces the player on zero-dist stand frames (no moonwalk)', () => {
+    const ms = spawnMonster('soldier'); // stand1, dist 0, yaw 0
+    expect(ms.yaw).toBe(0);
+    const origin = v3(0, 0, 0);
+    monsterLocomotion(ms, origin, v3(0, 100, 0), floorTrace());
+    expect(ms.yaw).toBeCloseTo(90, 9);
+    expect([...origin]).toEqual([0, 0, 0]); // stand frames never translate
+  });
+
+  it('locomotion faces along travel on nonzero-dist run frames', () => {
+    const ms = spawnMonster('soldier');
+    ms.move = 'run'; // frame 0 dist 10
+    ms.frame = 0;
+    const origin = v3(0, 0, 0);
+    monsterLocomotion(ms, origin, v3(0, 100, 0), floorTrace());
+    expect(ms.yaw).toBeCloseTo(90, 9);
+    expect(origin[0]).toBeCloseTo(0, 6);
+    expect(origin[1]).toBeCloseTo(10, 6);
+  });
+
+  it('corpses keep their last yaw and never move', () => {
+    const ms = spawnMonster('soldier');
+    ms.dead = true;
+    ms.yaw = 135;
+    const origin = v3(0, 0, 50);
+    monsterLocomotion(ms, origin, v3(100, 0, 0), openTrace);
+    expect(ms.yaw).toBe(135);
+    expect([...origin]).toEqual([0, 0, 50]);
+  });
+
+  it('coincident player keeps the last yaw (no NaN facing)', () => {
+    const ms = spawnMonster('gunner');
+    ms.yaw = 45;
+    const origin = v3(10, 10, 0);
+    monsterLocomotion(ms, origin, v3(10, 10, 0), floorTrace());
+    expect(ms.yaw).toBe(45);
+    expect(Number.isFinite(ms.yaw)).toBe(true);
+  });
+
+  it('think steps frames; first + offset maps to the MD2 index', () => {
+    const ms = spawnMonster('soldier');
+    ms.move = 'run'; // id FRAME_run03..run08 = MD2 99..104
+    for (let i = 0; i < 6; i++) {
+      const mv = monsterMoveOf(ms);
+      expect(mv.first + ms.frame).toBe(99 + i);
+      monsterThink(ms);
+    }
+    expect(ms.move).toBe('run'); // the 6-frame run loops
+    expect(ms.frame).toBe(0);
   });
 });

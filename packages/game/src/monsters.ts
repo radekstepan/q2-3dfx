@@ -108,7 +108,12 @@ export const GUNNER: MonsterDef = {
     pain2: mv('pain2', 177, [-2, 11, 6, 2, -1, -7, -2, -7], 'run'),
     pain3: mv('pain3', 185, [-3, 1, 1, 0, 1], 'run'),
     attack_chain: mv('attack_chain', 137, new Array(7).fill(0), 'fire_chain', 'fire'),
-    fire_chain: mv('fire_chain', 144, new Array(8).fill(0), 'refire_chain', 'fire'),
+    // id gunner_move_fire_chain ends in gunner_refire_chain (a function, not
+    // a move: it re-enters fire_chain while the enemy is visible, else exits
+    // via endfire_chain). The lite tables are pure data, so the chain exits
+    // deterministically after one 8-frame burst (a dangling 'refire_chain'
+    // end would make monsterMoveOf throw on the next tick).
+    fire_chain: mv('fire_chain', 144, new Array(8).fill(0), 'endfire_chain', 'fire'),
     endfire_chain: mv('endfire_chain', 152, new Array(7).fill(0), 'run'),
     attack_grenade: mv('attack_grenade', 108, new Array(21).fill(0), 'run', 'fire'),
     duck: mv('duck', 201, [1, 1, 1, 0, -1, -1, 0, -1], 'run'),
@@ -128,11 +133,13 @@ export interface MonsterState {
   move: string;
   frame: number; // absolute frame number within current move
   dead: boolean;
+  /** Facing yaw in degrees (Q2 convention: 0 = +X, 90 = +Y/left). */
+  yaw: number;
 }
 
 export function spawnMonster(kind: MonsterKind): MonsterState {
   const def = monsterDef(kind);
-  return { kind, health: def.health, move: kind === 'soldier' ? 'stand1' : 'stand', frame: 0, dead: false };
+  return { kind, health: def.health, move: kind === 'soldier' ? 'stand1' : 'stand', frame: 0, dead: false, yaw: 0 };
 }
 
 export function monsterMoveOf(ms: MonsterState): MonsterMove {
@@ -140,6 +147,21 @@ export function monsterMoveOf(ms: MonsterState): MonsterMove {
   const mv = def.moves[ms.move];
   if (!mv) throw new Error(`unknown move ${ms.move} for ${ms.kind}`);
   return mv;
+}
+
+/**
+ * id's vectoyaw (g_utils.c): facing yaw in degrees from `from` toward `to`
+ * (Q2: +X forward, +Y left, so yaw = atan2(dy, dx)), wrapped to [0, 360).
+ * Z is ignored: monsters yaw on the floor plane (M_ChangeYaw).
+ */
+export function monsterYawTo(from: Vec3, to: Vec3): number {
+  const dx = to[0]! - from[0]!;
+  const dy = to[1]! - from[1]!;
+  if (dx === 0 && dy === 0) return 0;
+  let yaw = (Math.atan2(dy, dx) * 180) / Math.PI;
+  if (yaw < 0) yaw += 360;
+  if (yaw >= 360) yaw -= 360;
+  return yaw;
 }
 
 /** Advance one server frame (0.1s). Returns the action tag of this frame. */
@@ -183,8 +205,9 @@ export const MONSTER_FALL_PROBE = 50;
  * `trace` works in monster-origin space: the caller expands obstacles by the
  * monster hull (MONSTER_HULL_MINS/MAXS) and traces the origin as a point
  * segment; only `fraction`/`endpos` are used. Mutates `origin` in place and
- * touches nothing else (no I/O, no globals), so it is headless-testable with
- * a stub trace. Corpses (`state.dead`) never move.
+ * `state.yaw` (facing only), and touches nothing else (no I/O, no globals),
+ * so it is headless-testable with a stub trace. Corpses (`state.dead`)
+ * never move and keep their last yaw.
  *
  * Reads `state.frame` without advancing it: call BEFORE monsterThink each
  * tick so the move plays the frame think is about to advance (id ai_move
@@ -202,14 +225,20 @@ export function monsterLocomotion(
   const dx = playerPos[0]! - origin[0]!;
   const dy = playerPos[1]! - origin[1]!;
   const len = Math.sqrt(dx * dx + dy * dy);
-  if (len > 1e-9 && fr.dist !== 0) {
-    const nx = dx / len;
-    const ny = dy / len;
-    const end = v3(origin[0]! + nx * fr.dist, origin[1]! + ny * fr.dist, origin[2]!);
-    const h = trace(v3(origin[0], origin[1], origin[2]), end);
-    origin[0] = h.endpos[0]!;
-    origin[1] = h.endpos[1]!;
-    origin[2] = h.endpos[2]!;
+  // Face the player every tick (id ai_stand/ai_run turn via M_ChangeYaw even
+  // on zero-dist frames); only translate when the frame carries a dist so
+  // stand/attack frames never moonwalk.
+  if (len > 1e-9) {
+    state.yaw = monsterYawTo(origin, playerPos);
+    if (fr.dist !== 0) {
+      const nx = dx / len;
+      const ny = dy / len;
+      const end = v3(origin[0]! + nx * fr.dist, origin[1]! + ny * fr.dist, origin[2]!);
+      const h = trace(v3(origin[0], origin[1], origin[2]), end);
+      origin[0] = h.endpos[0]!;
+      origin[1] = h.endpos[1]!;
+      origin[2] = h.endpos[2]!;
+    }
   }
   // Gravity: probe down from 1 unit above the feet so resting contact is a
   // clean hit, not a startsolid; snap to ground when in reach, else fall the
