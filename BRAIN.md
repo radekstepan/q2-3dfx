@@ -1,0 +1,592 @@
+# BRAIN.md — Q2TS: Quake II in TypeScript (software renderer + Voodoo 3 3000 look)
+
+> **This file is the single source of truth for every coding agent that touches this repo.**
+> Read it fully before writing code. Never invent architecture that contradicts it.
+> If reality and this file disagree, fix the file in the same PR that fixes reality.
+
+---
+
+## 0. TL;DR for an agent landing here cold
+
+1. `corepack enable && yarn install`
+2. `yarn turbo run build typecheck test --filter=...[origin/main]`
+3. Pick **one** task card from §9 that is `status: ready`. Claim it by setting `status: in-progress` + your agent id.
+4. Work **only inside the packages listed in that card's `owns:` field.**
+5. Before you finish: `yarn verify` must be green, and you must add a changeset (`yarn changeset`).
+6. Update the card to `status: done`, append measured numbers to §11 (Perf ledger).
+
+**Prime directive: `main` always builds and always boots to a rendered frame.** Any change that
+cannot keep `yarn verify` green must be landed behind a feature flag in `@q2/config`.
+
+- `../external/Quake 2` - original Quake 2 game with all data files
+- `../external/Quake-2-master` - original Quake 2 source code
+- `../external/voodoo3_progguide.pdf` - Voodoo3 Graphics Engine reference
+
+---
+
+## 1. Mission
+
+Rebuild Quake II so that it:
+
+- **Renders in software.** A faithful port of `ref_soft` — 8-bit palettised framebuffer, 64-level
+  colormap shading, perspective-correct spans subdivided every 16 pixels, surface cache, edge/span
+  rasteriser, affine alias models. No GPU required, no WebGL fallback inside this path.
+- **Renders in "3dfx Voodoo 3 3000" mode.** A faithful *emulation* of what `ref_gl` looked like on a
+  Voodoo3 through Glide/MiniGL: 16-bit RGB565 framebuffer with 4×4 ordered dither, the 2×2 "22-bit"
+  post filter, bilinear filtering, mipmap LOD with mip-dithering, 64-entry table fog, LOD bias,
+  256×256 max texture size, 16-bit depth buffer, and the ~1.3 Glide gamma lift.
+- **Runs in a browser** at ≥60 fps at 640×480, and ideally in Node for headless tests.
+- **Plays a shareware map end to end** (`base1`), with movement, collision, doors, buttons, lifts,
+  triggers, items, two monster types and three weapons.
+
+### Non-goals (v1)
+
+Multiplayer/netcode (the server is in-process), CD audio, cinematics (`.cin`), save games,
+the mission packs, `gamex86.dll` ABI compatibility, demo recording. Demo *playback* of `demo1.dm2`
+is in scope **only** as a determinism test harness (§10.3).
+
+---
+
+## 2. Feasibility: why this is not crazy
+
+A 320×240 frame is 76,800 pixels. Quake II's software renderer on a Pentium 200 MMX shipped at
+~25–35 fps there, i.e. ~2–3 Mpixel/s of textured, lit, z-buffered span fill, plus geometry.
+
+Modern JS, with monomorphic code over typed arrays and no allocation in the frame loop, sustains
+**60–200 Mpixel/s per core** for the span loop in this codebase (see §11 for the measured ledger from
+the reference implementation in `packages/sw-renderer`). That is 20–60× the budget the original
+engine had, and it is why this works.
+
+Rules that make the difference between 200 Mpixel/s and 5 Mpixel/s:
+
+- `Uint8Array`/`Uint32Array`/`Float32Array` only in the inner loop. **No objects, no closures, no
+  iterators, no `Array<number>`.**
+- Fixed point 16.16 for texture coordinates, exactly as `d_scan.c` did.
+- One division per 16 pixels (affine subdivision), never per pixel.
+- Preallocated scratch buffers on the renderer instance; zero garbage per frame.
+- Avoid polymorphic call sites: separate `spanSoftware` / `spanVoodoo` functions, never a
+  `mode === 'x'` branch *inside* the pixel loop (branch on the span, not the pixel).
+- `ImageData` backed by a `Uint32Array` view; one `putImageData` + one `drawImage` upscale per frame.
+
+### Scaling ladder (apply in this order, only when the perf ledger says you must)
+
+| Step | Technique | Expected gain |
+| --- | --- | --- |
+| 1 | Pure TS, typed arrays, span subdivision | baseline |
+| 2 | PVS + frustum cull + sorted spans (kills overdraw) | 1.5–3× |
+| 3 | Surface cache (`r_surf.c`): light×texture blocks cached per surface, reused across frames | 1.3–2× |
+| 4 | `OffscreenCanvas` + N workers, framebuffer split into horizontal bands over a `SharedArrayBuffer` | ~N× (needs COOP/COEP headers) |
+| 5 | AssemblyScript/Zig/C→WASM for `d_scan`/`d_polyse` only, with SIMD | 2–4× |
+
+v1 target is step 1–3. Steps 4–5 are already carved out as packages so they can be dropped in
+without touching call sites (`@q2/sw-renderer` exposes `RasterBackend`).
+
+---
+
+## 3. Sources, licences, assets
+
+| Thing | Where | Licence | How we use it |
+| --- | --- | --- | --- |
+| id Quake II source | `id-Software/Quake-2` | **GPL-2.0** | The normative reference. We port algorithms and data structures from it. |
+| Quake-2-JS | `Karlos-fr/Quake-2-JS` | check repo | Cross-check for browser-side asset loading and WASM/JS porting pitfalls. Do **not** copy code without licence review. |
+| `pak0.pak` (shareware) | id's shareware distribution | redistributable **unmodified only** | **Never commit it.** The app asks the user to drop `pak0.pak` into the page; it is parsed client-side and cached in IndexedDB. |
+
+**Therefore this repo is GPL-2.0.** Every package's `package.json` must carry `"license": "GPL-2.0-only"`.
+`tools/asset-cooker` may be used by the user on their own copy of the pak; cooked assets are
+`.gitignore`d. CI fetches nothing with assets in it; asset-dependent tests are `skip`ped when
+`Q2_PAK` env var is absent, and run in the nightly job where a pak is mounted from a secret.
+
+---
+
+## 4. Repo layout
+
+```
+q2ts/
+├─ BRAIN.md                      ← you are here
+├─ package.json                  ← yarn workspaces root, private
+├─ turbo.json
+├─ .changeset/config.json
+├─ .yarnrc.yml                   ← nodeLinker: node-modules
+├─ tsconfig.base.json
+├─ apps/
+│  ├─ web/                       ← Vite app: canvas, HUD, settings, pak drop zone
+│  └─ devtools/                  ← map/BSP inspector, lightmap viewer, frame differ
+├─ packages/
+│  ├─ config/                    ← cvars, feature flags, build-time constants
+│  ├─ math/                      ← vec3/mat4/angles/plane/fixed-point, all Q2 conventions
+│  ├─ filesystem/                ← PAK reader, virtual FS, IndexedDB cache, pak drop ingest
+│  ├─ formats/                   ← BSP38, WAL, PCX, MD2, SP2, WAV parsers → plain typed arrays
+│  ├─ bsp/                       ← node/leaf traversal, PVS decompression, trace/clip hulls
+│  ├─ sw-renderer/               ← ref_soft: colormap, surface cache, edges, spans, alias, particles
+│  ├─ voodoo/                    ← Voodoo3/Glide emulation layer (post-processing + sampler rules)
+│  ├─ renderer-api/              ← the Refresh interface both renderers implement
+│  ├─ game/                      ← gamex86: entities, pmove, items, doors, monsters, weapons
+│  ├─ server/                    ← SV_: world state, entity spawning, 10 Hz tick
+│  ├─ client/                    ← CL_: prediction, interpolation, view, HUD, console
+│  ├─ sound/                     ← WebAudio mixer, 3D attenuation, .wav from pak
+│  ├─ input/                     ← keyboard/mouse/pointer-lock/gamepad → usercmd_t
+│  ├─ host/                      ← the loop that ties server+client+renderer together
+│  └─ testkit/                   ← golden-frame harness, PNG differ, bench runner, fixtures
+└─ tools/
+   ├─ asset-cooker/              ← pak0.pak → .q2pkg (binary, deflate), CLI
+   └─ bench/                     ← headless perf runs, writes to the perf ledger
+```
+
+### Dependency rules (enforced by `eslint-plugin-boundaries` + `yarn deps:check`)
+
+```
+math ← formats ← bsp ← {sw-renderer, voodoo} ← renderer-api ← host
+filesystem ← formats
+game ← {math, bsp, config}
+server ← {game, bsp}
+client ← {renderer-api, input, sound, config}
+host ← {server, client}
+apps/web ← host
+```
+
+- **Nothing** imports from `apps/*`.
+- `sw-renderer` must not import `dom` types; it writes into an `ArrayBuffer` it is handed. This is
+  what lets it run in a worker and in Node tests.
+- `voodoo` is a *post-process + sampling policy* package, not a second renderer: it reuses the same
+  geometry front end. See §7.
+
+---
+
+## 5. Conventions (do not deviate)
+
+- **Coordinates:** Quake's. `+X` forward, `+Y` left, `+Z` up. 1 unit ≈ 1 inch. Angles in degrees,
+  `[pitch, yaw, roll]`, pitch **positive = down**.
+- **Time:** server ticks at 10 Hz (`0.1s`), client renders uncapped and interpolates. `level.time`
+  is a float of seconds; never use wall-clock in game logic.
+- **Texture mapping:** `u = dot(p, texinfo.s)/scale + s_off` in *texels*. Lightmap luxels are every
+  **16 texels**. Keep the `LUXEL = 16` constant in `@q2/math`.
+- **Colour:** the software path never leaves 8-bit until resolve. The Voodoo path works in 8:8:8 and
+  is quantised to 5:6:5 at resolve. No path uses floats per channel in the inner loop.
+- **Naming:** keep id's names where they help (`R_DrawSurface`, `SV_LinkEdict`, `PM_StepSlideMove`,
+  `cl.frame`, `pmove_t`). An agent that knows the C source should be able to grep.
+- **Modules:** `export`ed symbols only; no default exports. `.ts` only, no `.d.ts` handwriting except
+  for ambient declarations.
+- **No classes in hot paths.** Classes are fine for owners of state (`Renderer`, `Host`, `Game`).
+- **Errors:** `Com_Error(level, msg)` from `@q2/config`, never raw `throw` in engine code.
+
+---
+
+## 6. Package contracts
+
+These interfaces are **frozen**. Changing one requires a `major` changeset and an update to this
+section in the same PR.
+
+```ts
+// @q2/renderer-api
+export interface Refresh {
+  init(fb: Framebuffer): void;
+  beginFrame(): void;
+  renderView(view: RefDef, world: WorldModel, entities: Entity[]): FrameStats;
+  endFrame(): void;              // resolve: palette expand, or dither+postfilter
+  setPalette(p: Uint8Array): void;
+  registerModel(m: Model): ModelHandle;
+  registerSkin(name: string): TextureHandle;
+}
+
+export interface Framebuffer {
+  width: number; height: number;
+  color: Uint32Array;    // 0xAABBGGRR, what gets blitted
+  index?: Uint8Array;    // present only for the software path
+  depth: Float32Array;   // 1/z
+}
+
+export interface RefDef {
+  origin: Vec3; angles: Vec3; fovX: number; time: number;
+  lightStyles: Float32Array; // 256 styles, 0..2
+}
+```
+
+```ts
+// @q2/sw-renderer
+export interface RasterBackend {          // lets us swap TS → WASM → workers later
+  drawSpans(list: SpanList, tex: Texture, light: LightBlock): void;
+}
+```
+
+```ts
+// @q2/formats
+export function parseBSP38(buf: ArrayBuffer): Bsp38;
+export function parseWAL(buf: ArrayBuffer): Wal;      // 4 mip levels of palette indices
+export function parseMD2(buf: ArrayBuffer): Md2;      // frames, st coords, glcmds ignored
+export function parsePCX(buf: ArrayBuffer): Pcx;      // used for colormap.pcx + pics
+```
+
+```ts
+// @q2/bsp
+export function traceBox(world: Bsp38, start: Vec3, end: Vec3, mins: Vec3, maxs: Vec3, mask: number): Trace;
+export function pointLeaf(world: Bsp38, p: Vec3): number;
+export function clusterPVS(world: Bsp38, cluster: number): Uint8Array;
+```
+
+---
+
+## 7. The two renderers
+
+### 7.1 Software (`@q2/sw-renderer`) — the `ref_soft` port map
+
+| id source | our module | notes |
+| --- | --- | --- |
+| `r_main.c` | `frame.ts` | setup, frustum, `R_SetupFrame`, viewcluster |
+| `r_bsp.c` | `worldNodes.ts` | recursive node walk, PVS + frustum reject, surface marking |
+| `r_surf.c` | `surfaceCache.ts` | **the hard one.** Builds lit, mipped texture blocks on demand into an LRU cache keyed by `(surface, lightstyle hash, miplevel)` |
+| `r_edge.c` | `edges.ts` | edge list, `R_ScanEdges`, span emission, z-sorted spans |
+| `d_scan.c` | `spans.ts` | `D_DrawSpans16`: the 16-pixel affine subdivision inner loop |
+| `d_sprite.c` | `sprites.ts` | per-span clipped sprites |
+| `r_alias.c` / `d_polyse.c` | `alias.ts` | MD2 drawing, affine triangle rasteriser, shade dots |
+| `r_part.c` | `particles.ts` | single-pixel + blended particles |
+| `r_light.c` | `light.ts` | dynamic light marking (`R_MarkLights`), blocklights |
+| `colormap.pcx` | `colormap.ts` | 64×256 shade table; generate at load from the palette if missing |
+
+**Inner loop (normative):**
+
+```ts
+// per 16-pixel subdivision: ONE division, then fixed-point stepping
+const z1 = 1 / (iz + diz * n);
+const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
+let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
+const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
+for (let i = 0; i < n; i++, o++) {
+  if (iz > zb[o]) {
+    zb[o] = iz;
+    idx[o] = colormap[(light << 8) + texels[(((tv >> 16) & hmask) << wshift) + ((tu >> 16) & wmask)]];
+  }
+  tu += dtu; tv += dtv; iz += diz; light += dlight;
+}
+```
+
+Light is interpolated **per span**, not per pixel sample of the lightmap — that is what gives the
+unmistakable soft 16-unit light gradient of the software renderer.
+
+### 7.2 Voodoo 3 3000 (`@q2/voodoo`) — fidelity checklist
+
+The Voodoo3 3000 is: 2 pixel pipelines × 1 TMU, 16 MB SDRAM, 166 MHz, 16-bit rendering only,
+max 256×256 textures, 16-bit Z, no stencil, table fog, bilinear/trilinear-by-mip-dither.
+Emulate **all** of the following; each is a cvar in `@q2/config` so we can A/B them:
+
+| Hardware behaviour | Our implementation | cvar |
+| --- | --- | --- |
+| 16-bit RGB565 framebuffer | quantise 8:8:8 → 5:6:5 at resolve | `vd_16bit` |
+| 4×4 ordered dither before quantise | Bayer matrix, ±4 on R/B, ±2 on G | `vd_dither` |
+| 2×2 "22-bit" RAMDAC post filter | box filter of the dithered buffer on output | `vd_postfilter` |
+| Bilinear filtering | 4-tap, 8-bit fractional weights, fixed point | `vd_bilinear` |
+| Single-TMU "trilinear" | mipmap dithering: per-pixel pick LOD *n* or *n+1* by Bayer threshold vs LOD fraction | `vd_mipdither` |
+| LOD bias (Glide default ≈ -0.35) | subtract from computed `log2(rho)` | `vd_lodbias` |
+| Table fog (64 entries, exp²) | per-pixel table lookup on w, blend to fog colour | `vd_fog` |
+| Glide gamma ≈ 1.3 | LUT applied before dithering | `vd_gamma` |
+| 256×256 texture cap | asset cooker downsamples oversized WALs | `vd_maxtexsize` |
+| 16-bit W-buffer banding | quantise stored 1/z to 16 bits | `vd_zbits` |
+| 8-bit palettised textures (GL_EXT_shared_texture_palette) | textures stay palettised; expand through the palette at sample time | `vd_palettetex` |
+| No per-pixel colour overbright, lightmap modulate ×2 | multiply, then clamp — clipping highlights like the real thing | `vd_overbright` |
+
+Deliberately **not** emulated: the Voodoo's 3-bit sub-pixel accuracy, the 4 MB texture memory thrash,
+and the 22-bit output's chroma-only filtering (we filter all channels — it looks the same at 2× scale).
+
+Also ship the *presentation* layer: optional CRT mask + slight bloom + 4:3 letterbox, as a CSS/canvas
+overlay in `apps/web`, never inside the renderer.
+
+---
+
+## 8. Data pipeline
+
+```
+pak0.pak ──PAK reader──┬─ maps/base1.bsp ──parseBSP38──┬─ planes, nodes, leafs, faces, texinfo
+                       │                               ├─ lightmaps (RGB, 16-texel luxels)
+                       │                               ├─ visibility (PVS/PHS, RLE)
+                       │                               └─ entities (key/value lump)
+                       ├─ textures/*.wal ──parseWAL────→ 4 mips of palette indices
+                       ├─ pics/colormap.pcx ───────────→ 64×256 shade table + 256 palette
+                       ├─ models/*.md2 ────────────────→ frames + st + tris
+                       └─ sound/*.wav ─────────────────→ AudioBuffer
+```
+
+- **BSP38 lumps** (19): entities, planes, vertexes, visibility, nodes, texinfo, faces, lighting,
+  leafs, leaffaces, leafbrushes, edges, surfedges, models, brushes, brushsides, pop, areas,
+  areaportals. Parse into flat typed arrays (`Int32Array` of nodes, etc.) — **never** arrays of objects.
+- **Cooking:** `tools/asset-cooker` converts a pak into `.q2pkg`: a single deflate-compressed binary
+  with an index, pre-split per map, so the web app streams ~8 MB for base1 instead of 180 MB.
+- **Caching:** `@q2/filesystem` stores cooked blobs in IndexedDB keyed by pak SHA-1.
+- **Fallback:** if no pak is present, boot `maps/devroom` — the procedural room used by the demo page
+  and the golden-frame tests. This keeps CI and the public demo asset-free.
+
+---
+
+## 9. Task cards
+
+Format. Agents update `status` in place. One card = one PR = one changeset.
+
+```
+### M3.2 — Surface cache
+owns: packages/sw-renderer
+depends: M3.1
+status: ready            # ready | in-progress(@agent) | review | done
+done-when:
+  - [ ] criterion
+```
+
+---
+
+### M0.1 — Repo bootstrap
+owns: `/` (root configs only)
+status: ready
+done-when:
+- [ ] `yarn@4` via corepack, `.yarnrc.yml` with `nodeLinker: node-modules`
+- [ ] workspaces `apps/*`, `packages/*`, `tools/*`
+- [ ] `turbo.json` with `build`, `typecheck`, `lint`, `test`, `bench`, `golden` tasks (see §10.1)
+- [ ] `.changeset/config.json`, all packages `"license": "GPL-2.0-only"`, `"version": "0.0.0"`
+- [ ] `yarn verify` = `turbo run typecheck lint test build`
+- [ ] CI: node 20 + 22 matrix, `yarn verify`, changeset check on PRs
+
+### M0.2 — Package skeletons + contracts
+owns: `packages/*`
+depends: M0.1
+status: ready
+done-when:
+- [ ] every package from §4 exists with `src/index.ts`, `tsconfig.json` extending base, `tsup` build
+- [ ] all interfaces from §6 compile with stub implementations that `Com_Error('not implemented')`
+- [ ] `yarn deps:check` enforces the graph in §4
+
+### M1.1 — Math + fixed point
+owns: `packages/math`
+status: ready
+done-when:
+- [ ] vec3/mat4/angles/planes, `AngleVectors`, `BoxOnPlaneSide`, 16.16 helpers
+- [ ] 100% unit coverage of `AngleVectors` against values captured from the C source
+
+### M1.2 — PAK + PCX + WAL
+owns: `packages/filesystem`, `packages/formats`
+depends: M1.1
+status: ready
+done-when:
+- [ ] PAK directory parse, `readFile(name): ArrayBuffer`
+- [ ] WAL → 4 mips; PCX → palette + pixels; colormap built and byte-compared to id's `colormap.pcx`
+
+### M2.1 — BSP38 loader
+owns: `packages/formats`, `packages/bsp`
+depends: M1.2
+status: ready
+done-when:
+- [ ] all 19 lumps parsed into flat typed arrays for `base1.bsp`
+- [ ] leaf/cluster PVS decompress matches a fixture captured from the C engine
+- [ ] `traceBox` passes a 2,000-ray fixture (start/end/expected fraction) captured from the C engine
+
+### M3.1 — Span rasteriser (software)
+owns: `packages/sw-renderer`
+depends: M2.1
+status: ready
+done-when:
+- [ ] `devroom` renders textured + lightmapped at 320×240
+- [ ] ≥40 Mpixel/s on the bench machine (§11)
+- [ ] golden frame matches within 0 palette indices on a fixed camera
+
+### M3.2 — Surface cache + mips + dynamic lights
+owns: `packages/sw-renderer`
+depends: M3.1
+status: ready
+done-when:
+- [ ] `R_BuildLightMap` equivalent, LRU cache with a 4 MB budget
+- [ ] cache hit rate >95% on a demo1 flythrough
+- [ ] dynamic lights (blaster bolts) mark surfaces and invalidate cache entries
+
+### M3.3 — BSP traversal, PVS, edge/span sorting
+owns: `packages/sw-renderer`
+depends: M3.2
+status: ready
+done-when:
+- [ ] overdraw ≤1.15× at 640×480 on base1's opening room
+- [ ] no z-fighting on coplanar faces (use the BSP order, not just the z-buffer)
+
+### M3.4 — Alias models, sprites, particles
+owns: `packages/sw-renderer`
+depends: M3.3
+status: ready
+done-when:
+- [ ] MD2 player model draws with affine triangles + shade dots
+- [ ] 1,000 particles cost <1.5 ms at 640×480
+
+### M4.1 — Voodoo resolve chain
+owns: `packages/voodoo`
+depends: M3.1
+status: ready
+done-when:
+- [ ] gamma → dither → RGB565 → 2×2 post filter, all cvar-switchable
+- [ ] side-by-side screenshots vs a reference Voodoo3 capture reviewed by a human
+
+### M4.2 — Voodoo sampler
+owns: `packages/voodoo`
+depends: M4.1
+status: ready
+done-when:
+- [ ] bilinear + mip LOD + mip dithering + LOD bias
+- [ ] ≥25 Mpixel/s at 640×480 single-threaded
+
+### M5.1 — pmove + collision
+owns: `packages/game`
+depends: M2.1
+status: ready
+done-when:
+- [ ] `PM_StepSlideMove`, crouch, water levels, ladders
+- [ ] replaying 10,000 recorded usercmds reproduces the recorded origins bit-for-bit (§10.3)
+
+### M5.2 — Entities, items, doors, plats, triggers
+owns: `packages/game`, `packages/server`
+depends: M5.1
+status: ready
+done-when:
+- [ ] `base1` is traversable start → exit with doors/lifts/buttons working
+
+### M5.3 — Weapons + two monsters
+owns: `packages/game`
+depends: M5.2
+status: ready
+done-when:
+- [ ] blaster/shotgun/machinegun with correct spread, damage, ammo
+- [ ] `soldier` + `gunner`-lite state machines, pathfinding on the node graph
+
+### M6.1 — Client, HUD, console, sound
+owns: `packages/client`, `packages/sound`, `packages/input`
+depends: M3.3, M5.1
+status: ready
+done-when:
+- [ ] prediction + interpolation; no visible jitter at 10 Hz tick
+- [ ] `conchars` HUD, statusbar from `configstrings`, working console with cvars
+- [ ] positional sound with the original attenuation curves
+
+### M7.1 — Web app shell
+owns: `apps/web`
+depends: M6.1
+status: ready
+done-when:
+- [ ] pak drop zone → IndexedDB → boot; progress UI; renderer switcher; cvar panel
+- [ ] 60 fps at 640×480 software on the bench machine
+
+### M8.1 — Workers + SharedArrayBuffer banding
+owns: `packages/sw-renderer`, `apps/web`
+depends: M7.1
+status: blocked (needs COOP/COEP hosting)
+done-when:
+- [ ] framebuffer split into N bands; linear scaling to 4 workers ±15%
+- [ ] identical golden frames to the single-threaded path
+
+### M9.1 — WASM span backend
+owns: `packages/sw-renderer`
+depends: M8.1
+status: ready
+done-when:
+- [ ] `RasterBackend` implemented in AssemblyScript/Zig, byte-identical output, ≥2× faster
+
+---
+
+## 10. Tooling
+
+### 10.1 turbo.json (normative)
+
+```jsonc
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "build":     { "dependsOn": ["^build"], "outputs": ["dist/**"] },
+    "typecheck": { "dependsOn": ["^build"] },
+    "lint":      {},
+    "test":      { "dependsOn": ["^build"], "outputs": ["coverage/**"] },
+    "golden":    { "dependsOn": ["^build"], "outputs": ["__golden__/out/**"] },
+    "bench":     { "dependsOn": ["^build"], "cache": false },
+    "dev":       { "cache": false, "persistent": true }
+  }
+}
+```
+
+### 10.2 Changesets
+
+- Every PR that changes `packages/**` ships a changeset. CI fails without one.
+- `@q2/*` engine packages are **linked** so their versions move together; `apps/*` and `tools/*` are
+  `ignore`d (private, never published).
+- `main` → `changeset version` → release PR → `changeset publish` (npm, public). The web app deploys
+  from the same commit.
+
+### 10.3 Testing
+
+1. **Unit** (vitest): parsers against byte fixtures, math against C-captured values.
+2. **Golden frames**: `packages/testkit` renders fixed cameras in `devroom` + `base1` headlessly
+   (the renderer never touches the DOM) and compares PNGs. Software path = exact index match.
+   Voodoo path = ≤0.5% pixels differing by ≤1 LSB (dither is deterministic, so this is tight).
+3. **Determinism**: `demo1.dm2` playback and a recorded usercmd stream must reproduce identical
+   entity origins; this is how we catch pmove/physics regressions.
+4. **Bench**: `tools/bench` prints Mpixel/s, ms/frame, overdraw, cache hit rate; CI posts the delta
+   on the PR and fails on a >10% regression.
+
+### 10.4 Commands
+
+```bash
+yarn dev                  # turbo dev: web app + watch builds
+yarn verify               # typecheck + lint + test + build   (the gate)
+yarn golden -u            # update golden frames (requires review of the diff images)
+yarn bench                # perf ledger run
+yarn changeset            # add a changeset
+yarn cook ~/q2/pak0.pak   # produce .q2pkg locally (never committed)
+```
+
+---
+
+## 11. Perf ledger
+
+Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/machine.json`.
+
+| date | commit | path | res | fps | Mpixel/s | overdraw | notes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| seed | reference impl | software | 640×480 | 204 | ~84 | 1.34 | devroom, 22 surfaces, no PVS |
+| seed | reference impl | voodoo | 640×480 | 45 | ~19 | 1.34 | bilinear + mipdither + fog + postfilter |
+| seed | reference impl | software | 320×240 | 700+ | ~80 | 1.34 | headroom for 3× the geometry |
+
+Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
+after M8.1, startup ≤2.5 s from cached pak to first frame.
+
+---
+
+## 12. Subagent operating protocol
+
+**Prompt template to spawn a worker agent:**
+
+> You are working in the `q2ts` monorepo. Read `BRAIN.md` §§1–8 and the task card `<ID>` in §9.
+> You may modify only: `<owns>`. You may read anything.
+> Implement the card. Follow §5 conventions and the §6 contracts exactly; if a contract must change,
+> stop and report instead of changing it.
+> Before finishing run `yarn verify` and `yarn bench --filter=<pkg>`; paste the output.
+> Add a changeset. Tick the `done-when` boxes you satisfied in BRAIN.md and set the card's status.
+
+**Rules**
+
+1. One agent per package at a time. The `owns:` field is a lock — never edit another card's packages.
+2. Interfaces first: if your card needs a new cross-package type, add it to `@q2/renderer-api` or
+   `@q2/config` in a **separate, tiny PR** that only adds types, then continue.
+3. Never disable a test, never `// @ts-expect-error`, never `any` in exported signatures.
+4. If you must leave something unfinished: feature-flag it off in `@q2/config`, keep `main` green,
+   and add a `### TODO(<card>)` note under the card.
+5. Commit style: `feat(sw-renderer): span subdivision (M3.1)`.
+6. Any perf-affecting change must include a before/after bench line in the PR body and in §11.
+
+---
+
+## 13. Risks
+
+| Risk | Mitigation |
+| --- | --- |
+| Software renderer too slow at 640×480 in JS | Already measured 200+ fps on devroom; PVS + surface cache keep real maps in budget; workers and WASM are pre-planned escape hatches |
+| GC pauses | Zero-allocation frame loop is a hard review rule; `tools/bench` fails on >0 allocations measured via `--trace-gc` |
+| BSP trace bugs producing "stuck in wall" | Fixture-driven: 2,000 traces captured from the C engine |
+| Monster AI scope explosion | v1 ships two monsters; the state machine is data-driven so more are content, not code |
+| Asset legality | Pak never leaves the user's machine; nothing redistributable in git |
+| Agents drifting from the architecture | This file + `deps:check` + frozen contracts + one-package locks |
+| Browser audio/pointer-lock quirks | `@q2/input` and `@q2/sound` wrap them; everything else stays platform-free |
+
+---
+
+## 14. Glossary — C file → TS module
+
+`qcommon/` → `@q2/host` + `@q2/config` · `client/cl_*.c` → `@q2/client` · `server/sv_*.c` → `@q2/server`
+`game/g_*.c`, `p_*.c`, `m_*.c` → `@q2/game` · `ref_soft/*` → `@q2/sw-renderer` · `ref_gl/*` → `@q2/voodoo`
+`qcommon/cmodel.c` → `@q2/bsp` · `qcommon/files.c` → `@q2/filesystem` · `qcommon/pmove.c` → `@q2/game/pmove.ts`
