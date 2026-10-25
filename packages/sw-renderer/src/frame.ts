@@ -23,6 +23,10 @@ import {
   type LightBlock, type RasterBackend, type Span, type SpanList, type Texture,
 } from './spans.js';
 import { WasmSpanBackend, wasmRequestedByCvar } from './wasmSpans.js';
+import {
+  BandedSoftwareBackend, createBandBuffers, sabAvailable, workersRequestedByCvar,
+  type BandDispatcher,
+} from './bands.js';
 import { buildANorms, buildShadeDots, createBoxMesh, type AliasMesh } from './alias.js';
 import { drawAliasInstance } from './alias.js';
 import { drawSprite } from './sprites.js';
@@ -102,6 +106,8 @@ export class SoftwareRenderer implements Refresh {
   private readonly tsBackend = new SoftwareBackend();
   private backend: SoftwareBackend = this.tsBackend;
   private wasmBackend: WasmSpanBackend | null = null;
+  private readonly bandBackend = new BandedSoftwareBackend();
+  private bandSab: SharedArrayBuffer | null = null;
   private hostFb: Framebuffer | null = null;
   private cache = new SurfaceCache();
   private dlights = new DLightState();
@@ -135,6 +141,11 @@ export class SoftwareRenderer implements Refresh {
     this.fbW = fb.width;
     this.fbH = fb.height;
     this.hostFb = fb;
+    // Fresh init always returns to the classic planes (BRAIN.md §6); the
+    // operator re-enables banded/wasm paths via the sync*FromCvar hooks.
+    this.bandBackend.dispatcher = null;
+    this.bandSab = null;
+    this.backend = this.tsBackend;
     if (!fb.index) fb.index = new Uint8Array(fb.width * fb.height);
     this.idx = fb.index;
     this.zb = fb.depth;
@@ -201,7 +212,90 @@ export class SoftwareRenderer implements Refresh {
    * once the backend exists).
    */
   syncWasmFromCvar(): boolean {
+    if (this.isWorkersActive()) return false;
     return this.setWasmEnabled(wasmRequestedByCvar());
+  }
+
+  /**
+   * Honour the `sw_workers` cvar (M8.1): N > 0 selects the banded SAB path
+   * (N horizontal bands over one SharedArrayBuffer, inline sequential
+   * spanfill reusing the TS loop); 0 (default) restores the classic planes.
+   * Never throws and never spawns threads: the pool is attached explicitly
+   * (bench/headless parallel proof), browsers without SAB fall back here.
+   * Call after init(); safe to call every frame (SAB reused across calls).
+   */
+  syncWorkersFromCvar(): boolean {
+    try {
+      const n = workersRequestedByCvar();
+      if (!(n > 0) || this.fbW <= 0 || this.fbH <= 0 || !sabAvailable()) {
+        this.disableBanded();
+        return false;
+      }
+      if (this.isWasmActive()) this.setWasmEnabled(false);
+      this.enableBanded(n);
+      return true;
+    } catch {
+      this.disableBanded();
+      return false;
+    }
+  }
+
+  /** True when frames rasterise into SAB bands (inline or pool-driven). */
+  isWorkersActive(): boolean {
+    return this.backend === this.bandBackend;
+  }
+
+  /**
+   * Attach (or detach with null) a thread pool for band batches. On attach
+   * the renderer adopts the pool's shared planes (zero copy); the pool must
+   * have been created for this W×H or the attach is ignored. Unsuitable
+   * batches still run inline, so output stays bit-identical either way.
+   */
+  attachWorkerPool(pool: BandDispatcher | null): void {
+    this.bandBackend.dispatcher = pool;
+    if (pool && pool.planes && this.isWorkersActive()) {
+      const p = pool.planes;
+      if (p.idx.length === this.fbW * this.fbH && p.zb.length === this.fbW * this.fbH &&
+        p.idx.buffer === p.zb.buffer) {
+        this.idx = p.idx;
+        this.zb = p.zb;
+        this.bandBackend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
+      }
+    }
+  }
+
+  /** Observability for bench/golden (BRAIN.md §10.3). */
+  testWorkerStats(): { active: boolean; bands: number; pooled: boolean; spans: number; pixels: number } {
+    return {
+      active: this.isWorkersActive(),
+      bands: this.isWorkersActive() ? this.bandBackend.bandCount : 1,
+      pooled: this.isWorkersActive() && this.bandBackend.dispatcher !== null,
+      spans: this.bandBackend.spansDrawn,
+      pixels: this.bandBackend.pixelsDrawn,
+    };
+  }
+
+  private enableBanded(n: number): void {
+    const buf = createBandBuffers(this.fbW, this.fbH, this.bandSab);
+    this.bandSab = buf.sab;
+    this.idx = buf.idx;
+    this.zb = buf.zb;
+    this.bandBackend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
+    this.bandBackend.setBandCount(n);
+    this.bandBackend.time = this.backend.time;
+    this.backend = this.bandBackend;
+  }
+
+  private disableBanded(): void {
+    this.bandBackend.dispatcher = null;
+    if (this.backend === this.bandBackend) {
+      this.backend = this.tsBackend;
+      if (this.hostFb?.index) {
+        this.idx = this.hostFb.index;
+        this.zb = this.hostFb.depth;
+        this.backend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
+      }
+    }
   }
 
   /** Live framebuffer views (wasm views when the wasm backend is active). */
@@ -217,6 +311,7 @@ export class SoftwareRenderer implements Refresh {
     this.colormap = buildColormap(this.palette);
     this.backend.colormap = this.colormap;
     if (this.wasmBackend) this.wasmBackend.colormap = this.colormap;
+    this.bandBackend.colormap = this.colormap;
   }
 
   registerModel(m: Model): ModelHandle {
@@ -244,8 +339,16 @@ export class SoftwareRenderer implements Refresh {
 
   beginFrame(): void {
     this.frame++;
-    this.idx.fill(0);
-    this.zb.fill(0);
+    // Pooled band path: bands clear lazily per frame generation (parallel
+    // clear, no serial fill); every other path fills here as before.
+    const pooled = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    if (pooled) {
+      pooled.beginFrame();
+      this.bandBackend.batchesDrawn = 0;
+    } else {
+      this.idx.fill(0);
+      this.zb.fill(0);
+    }
     this.backend.spansDrawn = 0;
     this.backend.pixelsDrawn = 0;
     this.backend.time = 0;
@@ -372,6 +475,13 @@ export class SoftwareRenderer implements Refresh {
     }
 
     // world-placed alias / sprites / particles (M3.4 in the devroom)
+    // Pooled path with zero span batches (degenerate frame): planes were
+    // never cleared lazily, so fill once before direct plane writes.
+    if (this.backend === this.bandBackend && this.bandBackend.dispatcher &&
+      this.bandBackend.batchesDrawn === 0) {
+      this.idx.fill(0);
+      this.zb.fill(0);
+    }
     for (const pa of worldData.alias) {
       const mesh = getDevMeshSafe(pa.meshId, this.fallbackMesh);
       const skin = worldData.textures[pa.skinId % worldData.textures.length]!;
@@ -438,6 +548,13 @@ export class SoftwareRenderer implements Refresh {
   }
 
   endFrame(): void {
+    // Pooled path with zero span batches: clear once so the resolve below
+    // reads defined planes (mirrors the pre-alias guard in renderView).
+    if (this.backend === this.bandBackend && this.bandBackend.dispatcher &&
+      this.bandBackend.batchesDrawn === 0) {
+      this.idx.fill(0);
+      this.zb.fill(0);
+    }
     // palette expand to 0xAABBGGRR
     const pal = this.palette;
     const n = this.fbW * this.fbH;

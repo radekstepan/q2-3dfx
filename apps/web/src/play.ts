@@ -1000,6 +1000,14 @@ export function bootPlay(opts: {
     world: { name: driver.source === 'pak' ? 'maps/base1' : 'maps/devroom', data: driver.mini },
     driver,
   });
+  // M8.1: opt into SAB banding when the operator set sw_workers (cvar panel
+  // or console). Silent fallback to the single-threaded path everywhere the
+  // banded path is unavailable (default cvar 0, no SAB, Node/vitest).
+  try {
+    refresh.syncWorkersFromCvar();
+  } catch {
+    /* single-threaded path stays active */
+  }
   // Monster placeholder mesh must be handle 0: register before anything else.
   if (driver.monsters.length > 0) {
     createDevroom();

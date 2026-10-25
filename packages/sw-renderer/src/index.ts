@@ -21,6 +21,22 @@ export {
 } from './wasmSpans.js';
 
 export {
+  SW_WORKERS_CVAR, MAX_WORKERS, MAX_BAND_SPANS, MIN_BAND_PIXELS,
+  F_PER_SPAN, I_PER_SPAN,
+  CTL_SEQ, CTL_COUNT, CTL_TEXW, CTL_TEXH, CTL_LIGHTW, CTL_LIGHTH,
+  CTL_WSHIFT, CTL_WMASK, CTL_HMASK, CTL_TURBPHASE, CTL_FBW, CTL_FBH,
+  CTL_DONE, CTL_PIXELS, CTL_SPANS, CTL_READY, CTL_FRAME, CTL_LEN,
+  workersRequestedByCvar, sabAvailable, syncWaitAllowed,
+  splitBands, bandLayout, bandTotal, attachBandShared, createBandBuffers,
+  packBandSpans, readBandJob, writeBandJob, processBandJob, bandWorkerLoop,
+  BandedSoftwareBackend,
+  type Band, type BandLayout, type BandViews, type BandJob, type BandPort,
+  type BandDispatcher,
+} from './bands.js';
+
+export { BandWorkerPool, type PoolOptions } from './bandPool.js';
+
+export {
   COLORMAP_GRADES, COLORMAP_SIZE,
   buildColormap, defaultPalette,
 } from './colormap.js';
