@@ -8,6 +8,7 @@ import { bootPlay } from './play.js';
 import type { PlayBoot, RendererKind } from './play.js';
 import { pakHasMaps } from './pak.js';
 import type { WebPak } from './pak.js';
+import { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
 
 export { bootToFirstFrame };
 export type { RendererKind };
@@ -15,6 +16,7 @@ export { bootPlay };
 export type { PlayBoot };
 export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
+export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
 export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled } from './dom.js';
 export type { PlayLoop } from './dom.js';
 export { drawPlayHud, resolveDisplay, pumpMuzzleLight } from './play.js';
@@ -77,10 +79,42 @@ if (typeof document !== 'undefined') {
         name ? `loaded ${name}: ${pak?.entries.length} entries` : `devroom ready — drop pak0.pak for base1`,
       );
     };
-    startWithPak(null);
+    // Cached-first boot: a previous drop persists in IndexedDB, so one
+    // drop survives reloads. Empty/corrupt cache → devroom, no error spam.
+    const bootFromCache = async (): Promise<void> => {
+      dom.setProgress(progress, 0.2, 'loading cached pak0.pak…');
+      try {
+        const cached = await loadCachedPak();
+        if (cached) {
+          startWithPak(cached.pak, cached.name);
+          return;
+        }
+      } catch {
+        /* corrupt IDB → fall through to devroom */
+      }
+      startWithPak(null);
+    };
+    void bootFromCache();
     if (canvas) {
-      dom.attachDropZone(document.body, (pak, name) => startWithPak(pak, name));
+      dom.attachDropZone(document.body, (pak, name) => {
+        // Persist the raw drop, then boot as today.
+        void storeCachedPak(name, pak.data).catch(() => undefined);
+        startWithPak(pak, name);
+      });
     }
     if (cvars) dom.renderCvarPanel(cvars);
+    // Minimal "clear cached pak" affordance next to the cvar panel.
+    const ui = document.querySelector('#q2-ui');
+    if (ui && !document.querySelector('#q2-clear-pak')) {
+      const btn = document.createElement('button');
+      btn.id = 'q2-clear-pak';
+      btn.textContent = 'clear cached pak';
+      btn.addEventListener('click', () => {
+        void clearCachedPak().then(() => {
+          dom.setProgress(progress, 1, 'cached pak cleared — drop pak0.pak for base1');
+        });
+      });
+      ui.appendChild(btn);
+    }
   });
 }
