@@ -85,7 +85,7 @@ export { drawSprite, type SpriteDef, type Scissor } from './sprites.js';
 
 export {
   drawTracerBeam,
-  TRACER_DEFAULT_LENGTH, TRACER_DEFAULT_COLOR, TRACER_MAX_STEPS, TRACER_POOL_SIZE,
+  TRACER_DEFAULT_LENGTH, TRACER_DEFAULT_COLOR, TRACER_CORE_COLOR, TRACER_MAX_STEPS, TRACER_POOL_SIZE,
 } from './tracer.js';
 
 export { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
@@ -100,6 +100,11 @@ export {
 } from './bspWorld.js';
 
 export { SoftwareRenderer, sortBatchByRow, nextPot, MAX_SPANS } from './frame.js';
+
+export {
+  SKY_TILE_SUFFIXES, SKY_SIDE_IMAGE,
+  skyFaceForDir, skyUvForDir, computeSkyUvs, isValidSkySize,
+} from './sky.js';
 
 export {
   createOverdrawDetail, countWrittenZb, formatOverdrawLine,

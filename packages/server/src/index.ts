@@ -5,6 +5,9 @@
 import { SERVER_DT } from '@q2/config';
 import {
   DoRespawn,
+  MOVER_GOING_UP,
+  MOVER_TOP,
+  MOVER_WAITING,
   SetRespawn,
   doorTravel,
   moverThink,
@@ -36,10 +39,18 @@ export interface ServerState {
   moverDeltas: Map<number, Vec3>;
   /** brush-model bounds by mover edict num (for rider stand tests) */
   moverBounds: Map<number, { mins: Float32Array; maxs: Float32Array }>;
+  /**
+   * brush-model bounds by trigger edict num. Brush triggers (model *N) have
+   * no usable edict origin (it defaults to the world origin 0,0,0), so
+   * volume overlap can only be tested when the BSP side supplied bounds via
+   * the modelSizes hook. Triggers without bounds never fire from the point
+   * hook — firing them by proximity to 0,0,0 is always spurious.
+   */
+  triggerBounds: Map<number, { mins: Float32Array; maxs: Float32Array }>;
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, entities: [], movers: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map() };
+  return { time: 0, entities: [], movers: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map() };
 }
 
 /** Link an edict into the world (SV_LinkEdict: register + solid bookkeeping). */
@@ -52,9 +63,10 @@ export function SV_SpawnMover(st: ServerState, m: Mover): void {
   st.movers.push(m);
 }
 
-export function SV_SpawnTrigger(st: ServerState, t: Trigger): void {
+export function SV_SpawnTrigger(st: ServerState, t: Trigger, bounds?: { mins: Float32Array; maxs: Float32Array }): void {
   SV_LinkEdict(st, t.ent);
   st.triggers.push(t);
+  if (bounds) st.triggerBounds.set(t.ent.num, bounds);
 }
 
 /**
@@ -116,9 +128,16 @@ export function SV_SpawnEntities(
         break;
       }
       case 'trigger_once':
-      case 'trigger_multiple':
-        SV_SpawnTrigger(st, spawnTrigger(e));
+      case 'trigger_multiple': {
+        let bounds: { mins: Float32Array; maxs: Float32Array } | null = null;
+        const model = dict['model'];
+        if (modelSizes && model) {
+          const b = modelSizes(model);
+          if (b) bounds = b;
+        }
+        SV_SpawnTrigger(st, spawnTrigger(e), bounds ?? undefined);
         break;
+      }
       default:
         break;
     }
@@ -129,7 +148,7 @@ export function SV_SpawnEntities(
 /** Fire a "use" on every entity with the given targetname (button/trigger path). */
 export function SV_UseTargetname(st: ServerState, targetname: string): void {
   for (const m of st.movers) {
-    if (m.ent.targetname === targetname) moverUse(m, st.time);
+    if (m.ent.targetname === targetname) SV_UseMover(st, m);
   }
   for (const e of st.entities) {
     if (e.targetname === targetname && e.classname === 'trigger_relay') {
@@ -138,18 +157,77 @@ export function SV_UseTargetname(st: ServerState, targetname: string): void {
   }
 }
 
+/**
+ * Use a mover the id way (G_UseTargets equivalent for movers): run moverUse,
+ * and when a func_door starts opening, fire the door's own target right away
+ * (id door_go_up calls G_UseTargets the moment the door starts moving — not
+ * on arrival). Buttons instead fire on reaching the top (see SV_Tick,
+ * id button_wait); plats never fire. Depth-guarded: cyclic target graphs
+ * stop instead of overflowing the stack (a deliberate safety deviation).
+ */
+export function SV_UseMover(st: ServerState, m: Mover, depth = 0): void {
+  const wasUp = m.state === MOVER_GOING_UP;
+  moverUse(m, st.time);
+  if (
+    !wasUp &&
+    m.state === MOVER_GOING_UP &&
+    m.ent.classname === 'func_door' &&
+    m.ent.target
+  ) {
+    fireTargets(st, m.ent, depth + 1);
+  }
+}
+
+/** Maximum G_UseTargets cascade depth (cycle guard; id would recurse). */
+export const MAX_USETARGETS_DEPTH = 16;
+
 /** G_UseTargets equivalent: use every entity targeted by `user`. */
-export function fireTargets(st: ServerState, user: Edict): void {
-  if (!user.target) return;
+export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
+  if (!user.target || depth > MAX_USETARGETS_DEPTH) return;
   for (const e of st.entities) {
     if (e.freed || e.targetname !== user.target) continue;
     st.firedThisTick.push(e.targetname);
     const m = st.movers.find((mm) => mm.ent === e);
-    if (m) moverUse(m, st.time);
+    if (m) {
+      SV_UseMover(st, m, depth);
+    } else if (e.classname === 'trigger_relay') {
+      // id G_UseTargets uses the relay, which fires the relay's own target.
+      fireTargets(st, e, depth + 1);
+    }
   }
 }
 
-/** Touch all triggers as `toucherClass` at `origin` (point-in-tests hook). */
+/** True when the edict is a brush-model trigger (model *N, no usable origin). */
+function isBrushTrigger(e: Edict): boolean {
+  return e.model.startsWith('*');
+}
+
+/** AABB overlap of a body box (origin + mins/maxs) with brush bounds. */
+function bodyOverlapsBounds(
+  origin: Vec3,
+  mins: Vec3,
+  maxs: Vec3,
+  bmins: Float32Array,
+  bmaxs: Float32Array,
+): boolean {
+  for (let i = 0; i < 3; i++) {
+    if (origin[i]! + mins[i]! > bmaxs[i]! || origin[i]! + maxs[i]! < bmins[i]!) return false;
+  }
+  return true;
+}
+
+/**
+ * Touch all triggers as `toucherClass` at the toucher's position.
+ *
+ * Brush triggers (model *N) are tested by real brush-VOLUME overlap: their
+ * edict origin defaults to the world origin (0,0,0), so any point-proximity
+ * test fires them spuriously whenever the player walks near (0,0,0) — in
+ * base1 that walkable floor point sits ~344 units from spawn, and every
+ * brush trigger (including the *27 exit-pit chain) fired there. Triggers
+ * whose bounds were never registered (no modelSizes hook) are skipped
+ * rather than fired by proximity: firing them would always be spurious.
+ * Point triggers (no brush model) keep the legacy 96-unit proximity check.
+ */
 export function SV_TouchTriggersAt(
   st: ServerState,
   toucherClass: 'player' | 'monster',
@@ -157,12 +235,18 @@ export function SV_TouchTriggersAt(
 ): void {
   for (const t of st.triggers) {
     if (t.ent.freed) continue;
-    // proximity check: within the trigger's bbox expanded by 8 units
-    const dx = toucher.origin[0]! - t.ent.origin[0]!;
-    const dy = toucher.origin[1]! - t.ent.origin[1]!;
-    const dz = toucher.origin[2]! - t.ent.origin[2]!;
-    const d2 = dx * dx + dy * dy + dz * dz;
-    if (d2 > 96 * 96) continue;
+    if (isBrushTrigger(t.ent)) {
+      const b = st.triggerBounds.get(t.ent.num);
+      if (!b) continue;
+      if (!bodyOverlapsBounds(toucher.origin, toucher.mins, toucher.maxs, b.mins, b.maxs)) continue;
+    } else {
+      // point trigger: proximity check around the edict origin
+      const dx = toucher.origin[0]! - t.ent.origin[0]!;
+      const dy = toucher.origin[1]! - t.ent.origin[1]!;
+      const dz = toucher.origin[2]! - t.ent.origin[2]!;
+      const d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 > 96 * 96) continue;
+    }
     triggerTouch(t, st.time, toucherClass, (tt) => {
       const pseudo: Edict = { ...tt.ent };
       fireTargets(st, pseudo);
@@ -186,7 +270,15 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT): void {
   }
   for (const m of st.movers) {
     if (m.ent.freed) continue;
-    moverThink(m, now);
+    const completed = moverThink(m, now);
+    if (
+      completed &&
+      m.ent.classname === 'func_button' &&
+      (m.state === MOVER_WAITING || m.state === MOVER_TOP)
+    ) {
+      // id button_wait fires the button's target on reaching the top.
+      fireTargets(st, m.ent);
+    }
   }
   st.moverDeltas.clear();
   for (const m of st.movers) {

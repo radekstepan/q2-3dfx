@@ -17,6 +17,10 @@ import {
   processBandJob,
   splitBands,
 } from './bands.js';
+import {
+  SKY_SIDE_IMAGE, SKY_TILE_SUFFIXES,
+  isValidSkySize, skyFaceForDir, skyUvForDir,
+} from './sky.js';
 import { SoftwareBackend } from './spans.js';
 import { WasmSpanBackend } from './wasmSpans.js';
 import { buildColormap, defaultPalette } from './colormap.js';
@@ -65,18 +69,19 @@ function skyWorld(fnX: number): MiniWorld {
   };
 }
 
-function renderSky(fnX: number): { idx: Uint8Array; sky: number; stats: { misses: number; hits: number }; pixels: number } {
+function renderSky(fnX: number, opts: { tex?: { texels: Uint8Array; width: number; height: number }; time?: number } = {}): { idx: Uint8Array; sky: number; stats: { misses: number; hits: number }; pixels: number } {
   const W = 160, H = 120;
   const fb = createFramebuffer(W, H, true);
   const r = new SoftwareRenderer();
   r.init(fb);
   r.setPalette(skyPalette());
+  if (opts.tex) r.setSkyTexture(opts.tex);
   const sky = r.testSkyIndex();
   r.beginFrame();
   const st = r.renderView(
     {
       origin: new Float32Array([0, 0, 30]), angles: new Float32Array([0, 0, 0]),
-      fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1),
+      fovX: 90, time: opts.time ?? 0, lightStyles: new Float32Array(256).fill(1),
     },
     { name: 'sky', data: skyWorld(fnX) },
     [],
@@ -84,6 +89,23 @@ function renderSky(fnX: number): { idx: Uint8Array; sky: number; stats: { misses
   r.endFrame();
   const c = r.testCacheStats();
   return { idx: fb.index!, sky, stats: { misses: c.misses, hits: c.hits }, pixels: st.pixels };
+}
+
+/** 64x384 packed strip (tile 64x64): tile f flat-filled with 10+f*20. */
+function stripTexture(): { texels: Uint8Array; width: number; height: number } {
+  const tile = 64;
+  const texels = new Uint8Array(tile * tile * 6);
+  for (let f = 0; f < 6; f++) texels.fill(10 + f * 20, f * tile * tile, (f + 1) * tile * tile);
+  return { texels, width: tile, height: tile * 6 };
+}
+
+function fnv(idx: Uint8Array): string {
+  let h = 2166136261;
+  for (let i = 0; i < idx.length; i++) {
+    h ^= idx[i]!;
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
 }
 
 describe('sky surfaces (SURF_SKY)', () => {
@@ -168,8 +190,7 @@ describe('sky surfaces (SURF_SKY)', () => {
     expect([...dIdx]).toEqual([...refIdx]);
   });
 
-  it('pack/processBandJob carries flat spans bit-identically', () => {
-    const W = 64, H = 32;
+  it('pack/processBandJob carries flat spans bit-identically', () => {    const W = 64, H = 32;
     const colormap = buildColormap(defaultPalette());
     const spans = [];
     for (let y = 0; y < H; y++) {
@@ -204,5 +225,102 @@ describe('sky surfaces (SURF_SKY)', () => {
     }
     expect([...views.idx.subarray(0, W * H)]).toEqual([...refIdx]);
     expect([...views.zb.subarray(0, W * H)]).toEqual([...refZb]);
+  });
+});
+
+describe('textured skybox (setSkyTexture, ref_soft R_EmitSkyBox/D_SkySurf)', () => {
+  it('textured sky differs from the flat fill (golden/hash assertion)', () => {
+    const tex = stripTexture();
+    const flat = renderSky(-1);
+    const textured = renderSky(-1, { tex });
+    expect(fnv(textured.idx)).not.toBe(fnv(flat.idx));
+    // The test quad sits at +X: every ray hits box face 4 (rt = tile 0),
+    // flat-filled with index 10, unlit (grade-63 identity, no lightmap).
+    let tile = 0, flatLeft = 0;
+    for (let i = 0; i < textured.idx.length; i++) {
+      if (textured.idx[i] === 10) tile++;
+      if (textured.idx[i] === flat.sky) flatLeft++;
+    }
+    expect(tile).toBeGreaterThan(160 * 120 * 0.4);
+    expect(flatLeft).toBe(0);
+    // Sky spans still bypass the surface cache when textured.
+    expect(textured.stats.misses).toBe(0);
+    expect(textured.stats.hits).toBe(0);
+  });
+
+  it('is stable across frames and view time (ref_soft has no sky scroll)', () => {
+    const tex = stripTexture();
+    const a = renderSky(-1, { tex, time: 0 });
+    const b = renderSky(-1, { tex, time: 37.2 });
+    expect(fnv(a.idx)).toBe(fnv(b.idx));
+    expect([...a.idx]).toEqual([...b.idx]);
+  });
+
+  it('rejects bad strips and clears back to the flat fill', () => {
+    const W = 160, H = 120;
+    const mk = (tex: { texels: Uint8Array; width: number; height: number } | null) => {
+      const fb = createFramebuffer(W, H, true);
+      const r = new SoftwareRenderer();
+      r.init(fb);
+      r.setPalette(skyPalette());
+      r.setSkyTexture(tex);
+      r.beginFrame();
+      r.renderView(
+        {
+          origin: new Float32Array([0, 0, 30]), angles: new Float32Array([0, 0, 0]),
+          fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1),
+        },
+        { name: 'sky', data: skyWorld(-1) },
+        [],
+      );
+      r.endFrame();
+      return fnv(fb.index!);
+    };
+    const flat = renderSky(-1);
+    // Non-POT width, non-multiple-of-6 height, length mismatch, null.
+    expect(mk({ texels: new Uint8Array(100 * 60), width: 100, height: 60 })).toBe(fnv(flat.idx));
+    expect(mk({ texels: new Uint8Array(64 * 65), width: 64, height: 65 })).toBe(fnv(flat.idx));
+    expect(mk({ texels: new Uint8Array(10), width: 64, height: 384 })).toBe(fnv(flat.idx));
+    expect(mk(null)).toBe(fnv(flat.idx));
+    // And a valid strip takes effect again afterwards (sticky-null check).
+    expect(mk(stripTexture())).toBe(fnv(renderSky(-1, { tex: stripTexture() }).idx));
+  });
+});
+
+describe('skybox mapping units (id r_rast.c box faces)', () => {
+  it('dominant axis picks the id face', () => {
+    expect(skyFaceForDir(5, 1, 1)).toBe(4); // +X rt
+    expect(skyFaceForDir(-5, 1, 1)).toBe(1); // -X lf
+    expect(skyFaceForDir(1, 5, 1)).toBe(3); // +Y bk
+    expect(skyFaceForDir(1, -5, 1)).toBe(5); // -Y ft
+    expect(skyFaceForDir(1, 1, 5)).toBe(2); // +Z up
+    expect(skyFaceForDir(1, 1, -5)).toBe(0); // -Z dn
+  });
+
+  it('face centers land mid-tile with the r_skysideimage permutation', () => {
+    expect(SKY_TILE_SUFFIXES).toEqual(['rt', 'bk', 'lf', 'ft', 'up', 'dn']);
+    expect(SKY_SIDE_IMAGE).toEqual([5, 2, 4, 1, 0, 3]);
+    const out = { u: 0, v: 0 };
+    const tile = 64;
+    // +X center -> face 4 -> tile SKY_SIDE_IMAGE[4] = 0 (rt), mid-texel.
+    skyUvForDir(1, 0, 0, tile, tile, out);
+    expect(out.u).toBeCloseTo(32, 6);
+    expect(out.v).toBeCloseTo(32, 6);
+    // +Z center -> face 2 -> tile 4 (up), rows [256, 320).
+    skyUvForDir(0, 0, 1, tile, tile, out);
+    expect(out.u).toBeCloseTo(32, 6);
+    expect(out.v).toBeCloseTo(4 * tile + 32, 6);
+    // -Y center -> face 5 -> tile 3 (ft), rows [192, 256).
+    skyUvForDir(0, -1, 0, tile, tile, out);
+    expect(out.v).toBeGreaterThanOrEqual(3 * tile);
+    expect(out.v).toBeLessThan(4 * tile);
+  });
+
+  it('validates strip sizes for the affine sampler', () => {
+    expect(isValidSkySize(256, 1536)).toBe(true);
+    expect(isValidSkySize(64, 384)).toBe(true);
+    expect(isValidSkySize(100, 600)).toBe(false); // non-POT width
+    expect(isValidSkySize(64, 385)).toBe(false); // not a multiple of 6
+    expect(isValidSkySize(0, 0)).toBe(false);
   });
 });

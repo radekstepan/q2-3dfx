@@ -1,6 +1,6 @@
 // M5.2 server: 10Hz tick + scripted base1-logic scenario.
 import { describe, expect, it } from 'vitest';
-import { findByClassname, moverUse, spawnEdict } from '@q2/game';
+import { findByClassname, moverUse, spawnEdict, spawnTrigger } from '@q2/game';
 import type { Vec3 } from '@q2/math';
 import { v3 } from '@q2/math';
 import {
@@ -9,8 +9,10 @@ import {
   SV_Init,
   SV_LinkEdict,
   SV_SpawnEntities,
+  SV_SpawnTrigger,
   SV_Tick,
   SV_TouchTriggersAt,
+  SV_UseMover,
   SV_UseTargetname,
   fireTargets,
 } from './index.js';
@@ -165,5 +167,110 @@ describe('M7.4 completions: respawn + pusher carrying', () => {
     expect(rider.origin[2]).toBeCloseTo(22, 6);
     expect(walker.origin[0]).toBe(500);
     expect(walker.origin[2]).toBe(32);
+  });
+});
+
+describe('exit-spurious-fire fix: brush volumes, relays, mover targets', () => {
+  it('brush trigger without registered bounds never fires (no world-origin guess)', () => {
+    const st = SV_Init();
+    SV_SpawnEntities(st, `{ "classname" "worldspawn" }\n{ "classname" "trigger_multiple" "model" "*99" "target" "t37" }`);
+    expect(st.triggers).toHaveLength(1);
+    expect(st.triggerBounds.size).toBe(0);
+    const player = spawnEdict({ classname: 'player' });
+    SV_LinkEdict(st, player);
+    // park the player exactly on the brush edict origin (0,0,0): the old
+    // point hook fired here; now it must stay silent.
+    player.origin = v3(0, 0, 0);
+    SV_Tick(st, 0.1);
+    SV_TouchTriggersAt(st, 'player', player);
+    expect(st.firedThisTick).toHaveLength(0);
+  });
+
+  it('brush trigger with bounds fires only on real volume overlap', () => {
+    const st = SV_Init();
+    SV_SpawnEntities(
+      st,
+      `{ "classname" "worldspawn" }\n` +
+        `{ "classname" "trigger_multiple" "model" "*7" "target" "t37" }\n` +
+        `{ "classname" "trigger_relay" "targetname" "t37" "target" "nowhere" }`,
+    );
+    const t = st.triggers[0]!;
+    SV_SpawnTrigger(st, t, {
+      mins: new Float32Array([-1840, 1448, -24]),
+      maxs: new Float32Array([-1712, 1640, 32]),
+    });
+    const player = spawnEdict({ classname: 'player' });
+    SV_LinkEdict(st, player);
+    // far away at the world origin: silent (this fired pre-fix)
+    player.origin = v3(0, 0, 32);
+    SV_Tick(st, 0.1);
+    SV_TouchTriggersAt(st, 'player', player);
+    expect(st.firedThisTick).not.toContain('t37');
+    // real pit-floor overlap: fires (id G_TouchTriggers parity)
+    player.origin = v3(-1776, 1544, -56);
+    SV_Tick(st, 0.1);
+    SV_TouchTriggersAt(st, 'player', player);
+    expect(st.firedThisTick).toContain('t37');
+  });
+
+  it('point triggers keep the legacy proximity hook', () => {
+    const st = SV_Init();
+    SV_SpawnEntities(
+      st,
+      `{ "classname" "worldspawn" }\n` +
+        `{ "classname" "trigger_once" "origin" "100 0 0" "target" "door1" }\n` +
+        `{ "classname" "trigger_relay" "targetname" "door1" "target" "nowhere" }`,
+    );
+    const player = spawnEdict({ classname: 'player' });
+    SV_LinkEdict(st, player);
+    player.origin = v3(100, 0, 0);
+    SV_Tick(st, 0.1);
+    SV_TouchTriggersAt(st, 'player', player);
+    expect(st.firedThisTick).toContain('door1');
+  });
+
+  it('button reaching the top fires its target (id button_wait)', () => {
+    const st = SV_Init();
+    SV_SpawnEntities(
+      st,
+      `{ "classname" "worldspawn" }\n` +
+        `{ "classname" "func_door" "targetname" "door1" "angle" "0" "distance" "128" "speed" "100" "wait" "-1" "lip" "8" }\n` +
+        `{ "classname" "func_button" "targetname" "btn1" "target" "door1" "angle" "0" }`,
+    );
+    SV_UseTargetname(st, 'btn1'); // press: button starts moving, door still shut
+    const door = st.movers.find((m) => m.ent.targetname === 'door1')!;
+    expect(door.state).toBe('bottom');
+    for (let i = 0; i < 20 && door.state === 'bottom'; i++) SV_Tick(st);
+    // the button arrived at the top and fired door1 on its own — no explicit
+    // fireTargets call needed (id button_wait semantics).
+    expect(door.state).toBe('going_up');
+  });
+
+  it('relay chains cascade through fireTargets (id G_UseTargets)', () => {
+    const st = SV_Init();
+    SV_SpawnEntities(
+      st,
+      `{ "classname" "worldspawn" }\n` +
+        `{ "classname" "func_door" "targetname" "door1" "angle" "0" "distance" "128" "speed" "100" "wait" "-1" "lip" "8" }\n` +
+        `{ "classname" "trigger_relay" "targetname" "r1" "target" "r2" }\n` +
+        `{ "classname" "trigger_relay" "targetname" "r2" "target" "door1" }`,
+    );
+    SV_UseTargetname(st, 'r1');
+    const door = st.movers.find((m) => m.ent.targetname === 'door1')!;
+    expect(door.state).toBe('going_up');
+    expect(st.firedThisTick).toContain('r2');
+    expect(st.firedThisTick).toContain('door1');
+  });
+
+  it('using a door fires the door target at use time (id door_go_up)', () => {
+    const st = SV_Init();
+    SV_SpawnEntities(
+      st,
+      `{ "classname" "worldspawn" }\n` +
+        `{ "classname" "func_door" "targetname" "door1" "target" "lit" "angle" "0" "distance" "128" "speed" "100" "wait" "-1" "lip" "8" }\n` +
+        `{ "classname" "trigger_relay" "targetname" "lit" "target" "nowhere" }`,
+    );
+    SV_UseTargetname(st, 'door1');
+    expect(st.firedThisTick).toContain('lit');
   });
 });

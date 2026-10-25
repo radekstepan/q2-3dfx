@@ -1,10 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { keyDown, keyUp, BUTTON_ATTACK } from '@q2/input';
 import type { UserCmdT } from '@q2/input';
 import { v3 } from '@q2/math';
+import type { Entity } from '@q2/renderer-api';
 import { getConcharsFont, makeConcharsFont } from '@q2/client';
-import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpTracers, loadConcharsFont, concharsFontFromPCX, TRACER_TTL_FRAMES } from './play.js';
-import { findWeapon } from '@q2/game';
+import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpTracers, loadConcharsFont, concharsFontFromPCX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, VIEWMODEL_FIRE_FRAME, usesViewModel3D } from './play.js';
+import { findWeapon, spawnMonster } from '@q2/game';
 import type { LocalDriver } from './play.js';
 
 function runFrames(host: { frame(nowMs: number): unknown }, fromMs: number, toMs: number, step = 16): void {
@@ -176,6 +177,117 @@ describe('play driver (devroom, headless)', () => {
     expect(getConcharsFont()).toEqual(makeConcharsFont());
   });
 
+  it('A: no 3D view model without a pak (2D silhouette path)', () => {
+    const boot = bootPlay({ width: 160, height: 120 });
+    expect(boot.driver.viewModel()).toBeNull();
+    expect(usesViewModel3D(boot)).toBe(false);
+    expect(boot.driver.entityFrame(12345)).toBe(0);
+    expect(boot.driver.models).toBeNull();
+  });
+
+  it('B: monsters animate MD2 frames and walk toward the player', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { host, driver } = boot;
+    // Devroom ships no monsters; place a synthetic soldier west of the
+    // player spawn (-168, 0) and put it in its run move (dist 12/tick).
+    driver.monsters.push({ id: 99, origin: [-100, 0, 32], state: spawnMonster('soldier'), lastAttack: -10 });
+    const m = driver.monsters[0]!;
+    m.state.move = 'run';
+    m.state.frame = 0;
+    const x0 = m.origin[0]!;
+    stepDriver(driver, neutralCmd(), 5);
+    // monsterThink advanced the state machine...
+    expect(m.state.frame).toBeGreaterThan(0);
+    expect(m.state.move).toBe('run');
+    // ...the move table maps to a nonzero MD2 frame (run first=3)...
+    expect(driver.entityFrame(99)).toBe(3 + m.state.frame);
+    expect(driver.entityFrame(99)).toBeGreaterThan(0);
+    // ...the monster walked toward the player (east spawn is at -168)...
+    expect(m.origin[0]!).toBeLessThan(x0);
+    // ...it stays in the authoritative snapshot...
+    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === 99)).toBe(true);
+    // ...and the Host renders it with that MD2 frame (not frame 0).
+    // Warm the snapshot stream first (snapshots ingest on host ticks).
+    runFrames(host, 0, 500);
+    let rendered: Entity[] = [];
+    const orig = boot.refresh.renderView.bind(boot.refresh);
+    vi.spyOn(boot.refresh, 'renderView').mockImplementation((view, world, entities) => {
+      rendered = [...entities];
+      return orig(view, world, entities);
+    });
+    host.frame(600);
+    const byOrigin = rendered.filter((e) => Math.abs(e.origin[0]! - m.origin[0]!) < 3);
+    expect(byOrigin.length).toBe(1);
+    expect(byOrigin[0]!.frame).toBe(driver.entityFrame(99));
+    expect(byOrigin[0]!.frame).toBeGreaterThan(0);
+  });
+
+  it('C: camera settles monotonically after stopping (no oscillation)', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { host } = boot;
+    const ys: number[] = [];
+    const orig = boot.refresh.renderView.bind(boot.refresh);
+    vi.spyOn(boot.refresh, 'renderView').mockImplementation((view, world, entities) => {
+      ys.push(view.origin[1]!);
+      return orig(view, world, entities);
+    });
+    runFrames(host, 0, 500);
+    // Face +Y (open room, no pillar) and run at full speed for 0.6s.
+    host.input.angles[1] = 90;
+    keyDown(host.input, 'forward');
+    let t = 516;
+    for (; t <= 1116; t += 16) host.frame(t);
+    keyUp(host.input, 'forward');
+    expect(ys[ys.length - 1]!).toBeGreaterThan(50);
+    // Release for 1s: friction-exact pmove prediction must settle forward
+    // monotonically — no stale-velocity overshoot past the final tick, no
+    // sign flips (the old linear-extrapolation path stepped back/forth).
+    ys.length = 0;
+    for (; t <= 2116; t += 16) host.frame(t);
+    expect(ys.length).toBeGreaterThan(30);
+    // The bulk of the friction settling happens right after release...
+    const head = ys.slice(0, 30);
+    expect(head[head.length - 1]! - head[0]!).toBeGreaterThan(5);
+    // ...then the tail sits flat on the final tick: no backward steps, no
+    // overshoot beyond the settled position.
+    const tail = ys.slice(-30);
+    for (let i = 1; i < tail.length; i++) {
+      expect(tail[i]! - tail[i - 1]!).toBeGreaterThanOrEqual(-0.001);
+    }
+    const last = tail[tail.length - 1]!;
+    expect(last).toBeGreaterThanOrEqual(tail[0]! - 0.01);
+    for (const y of tail) expect(y).toBeLessThanOrEqual(last + 0.01); // never overshoots
+  });
+
+  it('D: fired blaster beam draws a bright muzzle→impact streak', () => {
+    // Player beams start at the gun muzzle (off-axis, where the 3D view
+    // model sits): an eye-origin segment foreshortens to a single pixel by
+    // correct perspective, so the streak is muzzle→impact. This pumps the
+    // full driver→renderer path (queue, pumpTracers, render) head-on at the
+    // devroom pillar and asserts bright beam pixels on screen.
+    const boot = bootPlay({ width: 96, height: 72 });
+    const { host, driver } = boot;
+    runFrames(host, 0, 500);
+    const idx = host.fb.index!;
+    const countBeam = (): number => {
+      let n = 0;
+      for (let i = 0; i < idx.length; i++) if (idx[i] === BLASTER_TRACER_COLOR) n++;
+      return n;
+    };
+    host.frame(516);
+    const base = countBeam();
+    driver.pm.viewAngles = v3(0, 0, 0);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.events).toContain('shot');
+    expect(driver.pendingTracers).toBe(1);
+    expect(pumpTracers(boot)).toBe(1);
+    expect(driver.viewModel()).toBeNull(); // devroom: no 3D gun (see pak test)
+    // Impact sparks are single pixels; clear them so the beam is measured alone.
+    (driver.mini.particles as { origin: unknown; color: number }[]).length = 0;
+    host.frame(532);
+    expect(countBeam() - base).toBeGreaterThanOrEqual(10);
+  });
+
   it('M7.2: death respawns at the spawn point, view model + muzzle light draw', () => {
     const boot = bootPlay({ width: 160, height: 120 });
     const { driver } = boot;
@@ -345,8 +457,87 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     expect(stats.pixels).toBeGreaterThan(0);
   });
 
-  it('M6.1 follow-up: real conchars.pcx replaces the procedural font', async () => {
+  it('A+B: pak 3D view model renders camera-attached, monsters animate, no 2D icon', async () => {
     const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const pak = ingestPak(buf);
+    const boot = bootPlay({ width: 160, height: 120, pak });
+    expect(boot.source).toBe('pak');
+    const { host, driver } = boot;
+    // 3D path active with the real v_blast MD2 handle + skin.
+    expect(usesViewModel3D(boot)).toBe(true);
+    const vm = driver.viewModel();
+    expect(vm).not.toBeNull();
+    expect(vm!.model).toBe(boot.models!.weapons['weapon_blaster']);
+    expect(vm!.skin).toBe(boot.models!.weaponSkins['weapon_blaster']);
+    expect(vm!.frame).toBe(0);
+    // Muzzle-lit → fire anim frame (renderer wraps; v_blast has 56).
+    driver.pm.viewAngles = v3(0, 0, 0);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.events).toContain('shot');
+    expect(driver.viewModel()!.frame).toBe(VIEWMODEL_FIRE_FRAME);
+    // Render: the gun entity rides the camera (close, same angles).
+    runFrames(host, 0, 500);
+    let rendered: Entity[] = [];
+    const orig = boot.refresh.renderView.bind(boot.refresh);
+    vi.spyOn(boot.refresh, 'renderView').mockImplementation((view, world, entities) => {
+      rendered = [...entities];
+      return orig(view, world, entities);
+    });
+    host.frame(516);
+    const gun = rendered.find((e) => e.model === vm!.model);
+    expect(gun).toBeDefined();
+    expect(gun!.skin).toBe(vm!.skin);
+    const dg = Math.hypot(
+      gun!.origin[0]! - host.playerOrigin[0]!,
+      gun!.origin[1]! - host.playerOrigin[1]!,
+      gun!.origin[2]! - host.playerOrigin[2]!,
+    );
+    expect(dg).toBeLessThan(60);
+    // No 2D icon double-draw: the blaster silhouette body color never
+    // paints the bottom-right HUD region on the 3D path.
+    const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
+    drawPlayHud(target, boot, { fps: 60, frame: 1 });
+    let icon = 0;
+    for (let y = 120 - 44; y < 120; y++) {
+      for (let x = 160 - 92; x < 160; x++) {
+        if (target.color[y * 160 + x] === 0xff3a3f44) icon++;
+      }
+    }
+    expect(icon).toBe(0);
+    // Monster frames advance through the move table (nonzero MD2 frame).
+    stepDriver(driver, neutralCmd(), 3);
+    const m0 = driver.monsters[0]!;
+    expect(driver.entityFrame(m0.id)).toBeGreaterThan(0);
+  });
+
+  it('sky: env/unit1_ strip loads and the renderer takes it', async () => {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const { loadSkyStrip, skyNameForMap } = await import('./play.js');
+    const pak = ingestPak(buf);
+    const boot = bootPlay({ width: 96, height: 72, pak });
+    expect(skyNameForMap(boot.driver.map)).toBe('unit1_');
+    const { readPakEntry } = await import('./pak.js');
+    const { parsePCX } = await import('@q2/formats');
+    const mainPalette = parsePCX(readPakEntry(pak, 'pics/colormap.pcx')).palette;
+    const strip = loadSkyStrip(pak, 'unit1_', mainPalette);
+    expect(strip).not.toBeNull();
+    // Six 256x256 faces stacked vertically.
+    expect(strip!.width).toBe(256);
+    expect(strip!.height).toBe(256 * 6);
+    expect(strip!.texels.length).toBe(256 * 256 * 6);
+    // Real art, not a flat fill: many distinct indices.
+    expect(new Set(strip!.texels).size).toBeGreaterThan(16);
+  });
+
+  it('M6.1 follow-up: real conchars.pcx replaces the procedural font', async () => {    const { readFileSync } = await import('fs');
     const raw = readFileSync(WEB_Q2_PAK as string);
     const buf = new ArrayBuffer(raw.length);
     new Uint8Array(buf).set(raw);

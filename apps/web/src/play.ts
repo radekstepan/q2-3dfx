@@ -41,6 +41,10 @@ import {
   mulberry32,
   WEAPON_BLASTER,
   spawnMonster,
+  monsterLocomotion,
+  MONSTER_HULL_MINS,
+  MONSTER_HULL_MAXS,
+  monsterMoveOf,
   monsterThink,
   monsterPain,
   selectAttack,
@@ -343,6 +347,12 @@ export interface TracerBeam {
 export const BLASTER_TRACER_COLOR = 225;
 /** Hot orange pellet streak for shotgun/machinegun + monster return fire. */
 export const PELLET_TRACER_COLOR = 208;
+/**
+ * View-model fire anim frame while the muzzle is lit (all v_weap lumps
+ * carry 40+ frames; the renderer wraps, so this never indexes out of
+ * range). Frame 0 is the idle pose.
+ */
+export const VIEWMODEL_FIRE_FRAME = 4;
 
 interface DoorSync {
   mover: Mover;
@@ -398,6 +408,11 @@ export class LocalDriver implements HostDriver {
   /** mover state snapshot for door-move sound edges. */
   private moverStates = new Map<Mover, string>();
   private soundBorn = new Map<number, number>();
+  /**
+   * Real-pak MD2/skin handles (set by bootPlay after registerPakModels).
+   * Null in devroom: viewModel() hides the 3D gun, HUD keeps the 2D icon.
+   */
+  models: PakModelHandles | null = null;
 
   constructor(pak: WebPak | null) {
     if (pak && pak.entries.some((e) => e.name === 'maps/base1.bsp')) {
@@ -460,7 +475,21 @@ export class LocalDriver implements HostDriver {
     SV_TouchTriggersAt(this.server, 'player', this.playerEdict);
     this.syncDoors();
     for (const m of this.monsters) {
-      if (!m.state.dead) monsterThink(m.state);
+      if (m.state.dead) continue;
+      // Locomotion BEFORE think (id ai_move runs inside the frame): yaw
+      // toward the player, advance by the current frame's dist,
+      // collision-clamped + gravity-settled by the helper. `think` then
+      // steps the frame counter.
+      const body = v3(m.origin[0], m.origin[1], m.origin[2]);
+      monsterLocomotion(m.state, body, this.pm.origin, (start, end) =>
+        this.bspTrace
+          ? this.bspTrace(start, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, end)
+          : devroomTrace(start, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, end),
+      );
+      m.origin[0] = body[0]!;
+      m.origin[1] = body[1]!;
+      m.origin[2] = body[2]!;
+      monsterThink(m.state);
     }
     this.checkDoorTouch();
     this.checkBrushTriggers();
@@ -535,6 +564,37 @@ export class LocalDriver implements HostDriver {
   /** Muzzle flash lit while server time is inside the post-shot window. */
   muzzleLit(): boolean {
     return this.server.time < this.flashUntil;
+  }
+
+  /**
+   * First-person 3D weapon view model (HostDriver contract): the registered
+   * `v_weap` MD2 handle + its PCX skin for the selected weapon. Frame 0
+   * idle, frame 4 while the muzzle is lit (the renderer wraps out-of-range
+   * indices, so this is safe for every v_weap lump). Null without a pak —
+   * the caller falls back to the 2D silhouette.
+   */
+  viewModel(): { model: number; skin: number; frame: number } | null {
+    const model = this.models?.weapons[this.weapon.classname];
+    const skin = this.models?.weaponSkins[this.weapon.classname];
+    if (model === undefined || skin === undefined) return null;
+    return { model, skin, frame: this.muzzleLit() ? VIEWMODEL_FIRE_FRAME : 0 };
+  }
+
+  /**
+   * MD2 frame for a snapshot entity (HostDriver contract): the move table's
+   * `first` frame number (already matching the MD2 frame names) plus the
+   * state's frame offset. Unknown ids map to 0; the renderer wraps.
+   */
+  entityFrame(id: number): number {
+    const m = this.monsters.find((m) => m.id === id);
+    if (!m) return 0;
+    try {
+      const mv = monsterMoveOf(m.state);
+      const idx = Math.min(m.state.frame, Math.max(0, mv.frames.length - 1));
+      return mv.first + Math.max(0, idx);
+    } catch {
+      return 0;
+    }
   }
 
   /** Drain the one-shot muzzle-flash dlight request (dom tick pumps it). */
@@ -760,6 +820,10 @@ export class LocalDriver implements HostDriver {
     this.pm.velocity = v3();
     this.ps.health = this.ps.maxHealth;
     this.deadUntil = -1;
+    // A new life is vulnerable again: without this, a completed level left
+    // `exited` set forever (spurious or real), and damagePlayer's
+    // `exited` guard made the player permanently invincible.
+    this.exited = false;
     this.message = '';
     this.events.push('respawn');
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
@@ -988,14 +1052,25 @@ export class LocalDriver implements HostDriver {
         eye[2]! + seg[2]! * bestT,
       );
       // Visible beam for every pellet: blaster bolt streak or shotgun-pellet
-      // streak, eye to impact (or full range on a clean miss — the renderer
-      // caps the length). Impact sparks stay on the mini.particles path.
+      // streak, muzzle to impact (or full range on a clean miss — the
+      // renderer caps the length). Impact sparks stay on the
+      // mini.particles path. The beam starts at the gun muzzle (off-axis,
+      // where the 3D view model sits), NOT the eye: an eye-origin segment
+      // foreshortens to a single pixel by correct perspective, so it would
+      // be invisible head-on. Hit detection above stays eye-based.
       const isBlaster = this.weapon.classname === 'weapon_blaster';
+      const muz = v3(
+        eye[0]! + fwd[0]! * 16 + right[0]! * 5 - up[0]! * 3,
+        eye[1]! + fwd[1]! * 16 + right[1]! * 5 - up[1]! * 3,
+        eye[2]! + fwd[2]! * 16 + right[2]! * 5 - up[2]! * 3,
+      );
+      const beam = v3(hitPos[0]! - muz[0]!, hitPos[1]! - muz[1]!, hitPos[2]! - muz[2]!);
+      const beamLen = Math.hypot(beam[0]!, beam[1]!, beam[2]!) || 1;
       this.queueTracer(
-        eye,
-        v3(seg[0]! * bestT, seg[1]! * bestT, seg[2]! * bestT),
+        muz,
+        beam,
         isBlaster ? BLASTER_TRACER_COLOR : PELLET_TRACER_COLOR,
-        Math.max(1, bestT * PELLET_RANGE),
+        Math.max(1, beamLen),
       );
       if (hitMonster) {
         monsterPain(hitMonster.state, p.damage, this.rand);
@@ -1134,6 +1209,93 @@ export function loadConcharsFont(pak: WebPak | null): ConcharsFont | null {
   }
 }
 
+/**
+ * Nearest-color remap of 8-bit `pixels` from lump palette `src` to the
+ * engine's global palette `dst` (both 768-byte RGB). Fast path: identical
+ * palettes (the common case — id art shares one palette) return the input
+ * untouched. Else a 256-entry LUT is built once per face (65k distance
+ * evaluations) and applied. Pure, headless-safe.
+ */
+export function remapToPalette(pixels: Uint8Array, src: Uint8Array, dst: Uint8Array): Uint8Array {
+  let identical = src.length === dst.length;
+  if (identical) {
+    for (let i = 0; i < src.length; i++) {
+      if (src[i] !== dst[i]) {
+        identical = false;
+        break;
+      }
+    }
+  }
+  if (identical) return pixels;
+  const lut = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    const r = src[i * 3]!, g = src[i * 3 + 1]!, b = src[i * 3 + 2]!;
+    let best = 0, bd = Infinity;
+    for (let j = 0; j < 256; j++) {
+      const dr = dst[j * 3]! - r, dg = dst[j * 3 + 1]! - g, db = dst[j * 3 + 2]! - b;
+      const d = dr * dr + dg * dg + db * db;
+      if (d < bd) {
+        bd = d;
+        best = j;
+      }
+    }
+    lut[i] = best;
+  }
+  const out = new Uint8Array(pixels.length);
+  for (let i = 0; i < pixels.length; i++) out[i] = lut[pixels[i]!]!;
+  return out;
+}
+
+/** Face suffixes in the renderer's strip packing order (top-to-bottom). */
+const SKY_SUFFIXES = ['rt', 'bk', 'lf', 'ft', 'up', 'dn'] as const;
+
+/** Worldspawn `sky` key for a map (base1 = "unit1_"), null when absent. */
+export function skyNameForMap(map: BspMap | null): string | null {
+  if (!map) return null;
+  for (const d of parseEntities(map.entities)) {
+    if (d['classname'] === 'worldspawn') {
+      const s = (d['sky'] ?? '').trim();
+      return s ? s : null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Load id's six `env/<sky>{rt,bk,lf,ft,up,dn}.pcx` sky faces and pack them
+ * into the renderer's single-texture contract: vertical strip of 6 tiles,
+ * top-to-bottom in suffix order (see `setSkyTexture` in sw-renderer/sky.ts).
+ * Returns null when any face is missing/unparseable or sizes disagree — the
+ * renderer then keeps its flat-fill fallback. Indices are remapped onto the
+ * engine palette (normally a no-op: id art shares one palette).
+ */
+export function loadSkyStrip(
+  pak: WebPak,
+  sky: string,
+  mainPalette: Uint8Array,
+): { texels: Uint8Array; width: number; height: number } | null {
+  const faces: Pcx[] = [];
+  for (const suf of SKY_SUFFIXES) {
+    const bytes = tryPakEntry(pak, `env/${sky}${suf}.pcx`);
+    if (!bytes) return null;
+    try {
+      faces.push(parsePCX(bytes));
+    } catch {
+      return null;
+    }
+  }
+  const w = faces[0]!.width, h = faces[0]!.height;
+  if (w <= 0 || h <= 0) return null;
+  for (const f of faces) {
+    if (f.width !== w || f.height !== h || f.pixels.length !== w * h) return null;
+  }
+  const strip = new Uint8Array(w * h * 6);
+  for (let i = 0; i < 6; i++) {
+    strip.set(remapToPalette(faces[i]!.pixels, faces[i]!.palette, mainPalette), i * w * h);
+  }
+  return { texels: strip, width: w, height: h * 6 };
+}
+
 export interface PlayBoot {
   host: Host;
   driver: LocalDriver;
@@ -1155,12 +1317,15 @@ export interface PlayBoot {
  *
  * Registration ORDER is the contract: the soldier skin is skin handle 0 and
  * the soldier mesh is model handle 0, because `Host.renderCurrentView`
- * hardcodes `model: 0, skin: 0, frame: 0` for every snapshot entity
- * (packages/host — outside this package's ownership, so per-kind entity
- * models and a first-person 3D gun entity need a host-contract change).
- * Until then every monster renders as the soldier mesh/skin, and the
- * first-person gun stays the 2D `drawViewModel` silhouette (which does vary
- * per selected weapon). Per-file fallback is the box-critter so one corrupt
+ * hardcodes `model: 0, skin: 0` for every snapshot entity (packages/host —
+ * outside this package's ownership, so per-kind entity models and skins
+ * still share the soldier handles). Per-entity MD2 frames DO vary: the
+ * driver maps them through the move tables via the HostDriver entityFrame
+ * contract. First-person gun: the 3D view model renders camera-attached via
+ * the HostDriver viewModel contract, and the 2D silhouette is skipped when
+ * a pak view model is registered (see usesViewModel3D).
+ * Until per-kind model selection lands, every monster renders as the
+ * soldier mesh/skin. Per-file fallback is the box-critter so one corrupt
  * lump can never shift later handles or break the boot.
  */
 export interface PakModelHandles {
@@ -1168,6 +1333,8 @@ export interface PakModelHandles {
   monster: number;
   gunner: number;
   weapons: Record<string, number>;
+  /** PCX skin handle per weapon classname (parallel to `weapons`). */
+  weaponSkins: Record<string, number>;
   bolt: number;
   skins: number[];
 }
@@ -1209,15 +1376,16 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
   loadSkin(skinForMonster('gunner'));
   const gunner = loadModel(modelForMonster('gunner'));
   const weapons: Record<string, number> = {};
+  const weaponSkins: Record<string, number> = {};
   for (const cls of ['weapon_blaster', 'weapon_shotgun', 'weapon_machinegun']) {
     const mdl = viewModelForWeapon(cls);
     if (!mdl) continue;
-    loadSkin(skinForWeaponModel(mdl));
+    weaponSkins[cls] = loadSkin(skinForWeaponModel(mdl));
     weapons[cls] = loadModel(mdl);
   }
   loadSkin(skinForBolt());
   const bolt = loadModel(modelForBolt());
-  return { monster, gunner, weapons, bolt, skins };
+  return { monster, gunner, weapons, weaponSkins, bolt, skins };
 }
 
 export function bootPlay(opts: {
@@ -1231,13 +1399,30 @@ export function bootPlay(opts: {
   const renderer = opts.renderer ?? 'software';
   const driver = new LocalDriver(opts.pak ?? null);
   const refresh = new SoftwareRenderer();
+  let mainPalette: Uint8Array | null = null;
   if (opts.pak) {
     const pcxBytes = tryPakEntry(opts.pak, 'pics/colormap.pcx');
     if (pcxBytes) {
       try {
-        refresh.setPalette(parsePCX(pcxBytes).palette);
+        mainPalette = parsePCX(pcxBytes).palette;
+        refresh.setPalette(mainPalette);
       } catch {
         /* procedural palette fallback */
+      }
+    }
+    // Original Quake II sky: six env/ faces packed as one strip (id mapping).
+    // Missing/unparseable art → renderer keeps its flat-fill fallback.
+    if (driver.map && mainPalette) {
+      const sky = skyNameForMap(driver.map);
+      if (sky) {
+        const strip = loadSkyStrip(opts.pak, sky, mainPalette);
+        if (strip) {
+          try {
+            refresh.setSkyTexture(strip);
+          } catch {
+            /* flat-fill fallback stays active */
+          }
+        }
       }
     }
   }
@@ -1272,6 +1457,7 @@ export function bootPlay(opts: {
   let models: PakModelHandles | null = null;
   if (opts.pak) {
     models = registerPakModels(refresh, opts.pak);
+    driver.models = models;
   } else if (driver.monsters.length > 0) {
     createDevroom();
     host.refresh.registerModel({ name: 'monster', kind: 'md2', data: getDevMesh(0) });
@@ -1396,7 +1582,9 @@ export function drawPlayHud(
   fillRect(target, cx - 4, cy, 9, 1, dim);
   fillRect(target, cx, cy - 4, 1, 9, dim);
   fillRect(target, cx, cy, 1, 1, white);
-  drawViewModel(target, boot);
+  // 3D view model (pak) replaces the 2D silhouette — never double-draw.
+  if (usesViewModel3D(boot)) drawDeathBars(target, boot);
+  else drawViewModel(target, boot);
   const o = boot.driver.pm.origin;
   const hp = boot.driver.playerHealth;
   const hpColor = boot.driver.playerDead ? 0xffff3333 : hp <= 25 ? 0xffff9933 : white;
@@ -1418,12 +1606,31 @@ export function drawPlayHud(
 }
 
 /**
- * Weapon view model: 2D `fillRect` gun silhouette bottom-right + muzzle
- * flash rect. The real `v_weap` MD2s/skins ARE registered now
- * (`registerPakModels`, handles on `PlayBoot.models`) but the first-person
- * gun stays 2D: `Host.renderCurrentView` hardcodes `model: 0, skin: 0` for
- * snapshot entities and has no first-person gun entity path, so a 3D view
- * model needs a @q2/host contract change (outside apps/web ownership).
+ * Whether the first-person gun renders as a real 3D `v_weap` MD2 (via the
+ * HostDriver viewModel contract) instead of the 2D `fillRect` silhouette.
+ * True exactly when the selected weapon has a registered pak view model.
+ */
+export function usesViewModel3D(boot: PlayBoot): boolean {
+  return boot.models?.weapons[boot.driver.weapon.classname] !== undefined;
+}
+
+/** Red edge bars while dead (extracted so they survive the 2D-gun removal). */
+function drawDeathBars(
+  target: { width: number; height: number; color: Uint32Array },
+  boot: PlayBoot,
+): void {
+  if (!boot.driver.playerDead) return;
+  const w = target.width;
+  const h = target.height;
+  fillRect(target, 0, 0, w, 3, 0xffff2222);
+  fillRect(target, 0, h - 3, w, 3, 0xffff2222);
+}
+/**
+ * 2D `fillRect` gun silhouette bottom-right + muzzle flash rect — the
+ * fallback when no 3D `v_weap` MD2 is registered for the selected weapon
+ * (devroom / missing lump; see usesViewModel3D). With a pak the Host
+ * renders the real camera-attached MD2 via the viewModel contract and this
+ * icon is skipped (no double-draw).
  * Per-weapon body size/shape/caption already differ (blaster 52px,
  * machinegun 66px, shotgun 78px), so the selected weapon changes the
  * visible model. The 3D muzzle dlight is pumped separately via
@@ -1500,8 +1707,7 @@ function drawViewModel(
     fillRect(target, gx, gy + 6, gunW, 24, 0x66ffdd66);
   }
   if (boot.driver.playerDead) {
-    fillRect(target, 0, 0, w, 3, 0xffff2222);
-    fillRect(target, 0, h - 3, w, 3, 0xffff2222);
+    drawDeathBars(target, boot);
   }
   // Placeholder caption: short weapon name above the silhouette.
   const short = cls.replace(/^weapon_/, '');

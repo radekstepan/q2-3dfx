@@ -224,6 +224,11 @@ export function spawnTrigger(ent: Edict): Trigger {
  * Touch dispatch for trigger_once / trigger_multiple.
  * `onFire` is the G_UseTargets equivalent supplied by the caller.
  * Returns true if the trigger fired this call.
+ *
+ * id Touch_Multi (g_trigger.c) gate, exactly:
+ * - players (client) fire unless NOT_PLAYER (spawnflag 2) is set;
+ * - monsters fire only when MONSTER (spawnflag 1) is set;
+ * - anything else never fires.
  */
 export function triggerTouch(
   t: Trigger,
@@ -233,9 +238,12 @@ export function triggerTouch(
 ): boolean {
   if (t.ent.classname === 'trigger_once' && t.fired) return false;
   if (now < t.nextFire) return false;
-  if (toucherClass !== 'player' && !(t.ent.spawnflags & 2)) {
-    // id: triggers react to players; MONSTER bit (2) allows monsters too
-    if (toucherClass !== 'monster') return false;
+  if (toucherClass === 'player') {
+    if (t.ent.spawnflags & 2) return false; // NOT_PLAYER
+  } else if (toucherClass === 'monster') {
+    if (!(t.ent.spawnflags & 1)) return false; // MONSTER
+  } else {
+    return false;
   }
   t.fired = true;
   t.fireCount++;

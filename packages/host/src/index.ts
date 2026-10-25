@@ -8,7 +8,8 @@ import { SERVER_DT, getCVarNumber } from '@q2/config';
 import type { Framebuffer, Refresh, RefDef, WorldModel, FrameStats, Entity } from '@q2/renderer-api';
 import { createFramebuffer, devroomWorld } from '@q2/renderer-api';
 import { Predictor, GameConsole, Configstrings, calcViewOrigin } from '@q2/client';
-import type { Snapshot } from '@q2/client';
+import type { Snapshot, PredictCmd } from '@q2/client';
+import { AngleVectors, v3 } from '@q2/math';
 import { Mixer } from '@q2/sound';
 import { createInput, buildUserCmd } from '@q2/input';
 import type { InputCore, UserCmdT } from '@q2/input';
@@ -40,6 +41,16 @@ export interface HostDriver {
   step(cmd: UserCmdT, dt: number): void;
   /** Authoritative entities at serverTime (must include localPlayerId). */
   snapshot(serverTime: number): Snapshot;
+  /**
+   * First-person weapon view model (camera-attached 3D gun). Null hides it
+   * (2D fallback or no gun). The driver owns model/skin handles + anim.
+   */
+  viewModel?(): { model: number; skin: number; frame: number } | null;
+  /**
+   * MD2 frame for a snapshot entity (monster move table first + offset).
+   * Defaults to 0 when absent. The renderer wraps out-of-range indices.
+   */
+  entityFrame?(id: number): number;
 }
 
 export class Host {
@@ -57,6 +68,13 @@ export class Host {
   lastCmd: UserCmdT | null = null;
   private serverAcc = 0;
   private lastNow = -1;
+  /**
+   * Owned cmds since the newest acked snapshot, replayed through pmove by
+   * the Predictor (friction-exact local prediction instead of linear
+   * extrapolation). Cleared on every ingested snapshot, extended every
+   * frame after lastCmd is built — so it always ends with the current cmd.
+   */
+  private ownedCmds: PredictCmd[] = [];
   /** Synthetic local-player state for devroom/offline mode. */
   playerOrigin: [number, number, number] = [0, 0, 0];
   playerVelocity: [number, number, number] = [0, 0, 0];
@@ -95,6 +113,9 @@ export class Host {
   /** Feed an authoritative snapshot (server -> client). */
   ingestSnapshot(snap: Snapshot): void {
     this.predictor.pushSnapshot(snap);
+    // New acked state: drop the replayed stream (rebuilt below each frame).
+    this.ownedCmds = [];
+    this.predictor.clearPendingCmds();
   }
 
   /** Build a devroom/offline snapshot from local synthetic state. */
@@ -142,6 +163,24 @@ export class Host {
       mYaw: getCVarNumber('m_yaw') || 0.022,
       mPitch: getCVarNumber('m_pitch') || 0.022,
     });
+    // Stage the owned cmd stream (since the newest snapshot, ending with
+    // the current frame's cmd) so the local player predicts through the
+    // friction-exact pmove replay instead of constant-velocity
+    // extrapolation — the old path overshot after stopping (stale
+    // velocity) and snapped back on the next tick. Remote entities keep
+    // interp delay (untouched).
+    if (this.lastCmd) {
+      this.ownedCmds.push({
+        msec: this.lastCmd.msec,
+        angles: [...this.lastCmd.angles],
+        forwardmove: this.lastCmd.forwardmove,
+        sidemove: this.lastCmd.sidemove,
+        upmove: this.lastCmd.upmove,
+        buttons: this.lastCmd.buttons,
+      });
+      if (this.ownedCmds.length > 120) this.ownedCmds.splice(0, this.ownedCmds.length - 120);
+      this.predictor.setPendingCmds(this.ownedCmds);
+    }
     // Offline prediction: integrate the synthetic player with the cmd.
     // Skipped when a driver owns the simulation (its snapshot is authoritative).
     if (!this.driver && getCVarNumber('cl_predict') !== 0 && this.lastCmd) {
@@ -191,9 +230,31 @@ export class Host {
       model: 0,
       origin: new Float32Array(e.origin) as Entity['origin'],
       angles: new Float32Array([0, 0, 0]) as Entity['angles'],
-      frame: 0,
+      frame: this.driver?.entityFrame?.(e.id) ?? 0,
       skin: 0,
     }));
+    // First-person weapon view model: camera-attached (eye + forward*22 +
+    // right*8 + down*5 — sits bottom-right like id's), same angles as the
+    // view so the muzzle tracks the crosshair. Frame comes from the driver
+    // (idle vs muzzle-flash anim); the renderer wraps out-of-range frames.
+    const vm = this.driver?.viewModel?.() ?? null;
+    if (vm) {
+      const fwd = v3();
+      const right = v3();
+      const up = v3();
+      AngleVectors(new Float32Array(angles), fwd, right, up);
+      renderables.push({
+        model: vm.model,
+        origin: new Float32Array([
+          viewOrigin[0] + fwd[0]! * 22 + right[0]! * 8 - up[0]! * 5,
+          viewOrigin[1] + fwd[1]! * 22 + right[1]! * 8 - up[1]! * 5,
+          viewOrigin[2] + fwd[2]! * 22 + right[2]! * 8 - up[2]! * 5,
+        ]) as Entity['origin'],
+        angles: new Float32Array(angles) as Entity['angles'],
+        frame: vm.frame,
+        skin: vm.skin,
+      });
+    }
     this.refresh.beginFrame();
     const stats = this.refresh.renderView(view, this.world, renderables);
     this.refresh.endFrame();

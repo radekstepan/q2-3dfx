@@ -97,14 +97,43 @@ describe('host loop', () => {
     }
     const xs = all.slice(-12);
     // 10Hz stepping would repeat the same origin across the ~6 frames of
-    // each tick interval and then jump ~10 units. Smooth interpolation
-    // advances every frame by ~SPEED*0.016 = 1.6 units.
+    // each tick interval and then jump ~10 units. Owned-cmd pmove replay
+    // advances every frame by ~SPEED*0.016 = 1.6 units (a touch under:
+    // ground friction bites on the replayed stream).
     expect(new Set(xs).size).toBe(xs.length);
     for (let i = 1; i < xs.length; i++) {
       const d = xs[i]! - xs[i - 1]!;
       expect(d).toBeGreaterThan(0);
       expect(d).toBeLessThan(SPEED * 0.1);
     }
-    expect(xs[xs.length - 1]! - xs[0]!).toBeCloseTo(SPEED * 0.016 * (xs.length - 1), 0);
+    const total = xs[xs.length - 1]! - xs[0]!;
+    const linear = SPEED * 0.016 * (xs.length - 1);
+    expect(total).toBeGreaterThan(linear * 0.85);
+    expect(total).toBeLessThanOrEqual(linear + 0.5);
+  });
+
+  it('stages the current frame cmd for pmove prediction (no stop oscillation)', () => {
+    // Friction-settled server: origin frozen, velocity zeroed. The render
+    // origin must sit exactly on the frozen tick (no stale-velocity
+    // overshoot, no snap-back) whether or not cmds are staged.
+    const driver: HostDriver = {
+      spawn: () => ({ origin: [100, 0, 0] }),
+      step: () => {},
+      snapshot: (t: number) => ({
+        serverTime: t,
+        entities: [{ id: 1, origin: [100, 0, 0] as [number, number, number], velocity: [0, 0, 0] as [number, number, number] }],
+      }),
+    };
+    const refresh = new CaptureRefresh();
+    const host = new Host({ refresh, width: 64, height: 48, driver });
+    let now = 0;
+    host.frame(now);
+    const xs: number[] = [];
+    for (let i = 1; i <= 30; i++) {
+      now += 16;
+      host.frame(now);
+      xs.push(refresh.lastOrigin![0]);
+    }
+    for (const x of xs) expect(x).toBeCloseTo(100, 3);
   });
 });

@@ -4,6 +4,7 @@
 // string tags the game logic switches on).
 
 import type { Vec3 } from '@q2/math';
+import { v3 } from '@q2/math';
 import { findPath, nearestNode } from './pathfind.js';
 import type { PortalGraph } from './pathfind.js';
 
@@ -134,6 +135,72 @@ export function monsterThink(ms: MonsterState): string {
     ms.frame = 0;
   }
   return fr.action;
+}
+
+// --- locomotion (M7.4 follow-up; the driver moves bodies, think only picks frames) ---
+
+/** Monster hull used to build origin-space locomotion traces (id m_move.c). */
+export const MONSTER_HULL_MINS: Vec3 = v3(-16, -16, 0);
+export const MONSTER_HULL_MAXS: Vec3 = v3(16, 16, 56);
+
+/** Largest downward step a monster sticks to (id STEPSIZE). */
+export const MONSTER_STEP_HEIGHT = 18;
+
+/**
+ * Maximum drop applied per 0.1s locomotion tick when no ground is in reach
+ * (500 u/s terminal probe; keeps bodies from hovering off ledges).
+ */
+export const MONSTER_FALL_PROBE = 50;
+
+/**
+ * One locomotion tick (10Hz): yaw the monster toward `playerPos`, advance
+ * `origin` along the facing by the CURRENT frame's `dist` (MonsterFrame.dist,
+ * the same units monsterThink plays), collision-clamped via `trace`, then
+ * drop to the ground via a downward trace (sticks to floors and step-downs
+ * within MONSTER_STEP_HEIGHT, falls bounded by MONSTER_FALL_PROBE).
+ *
+ * `trace` works in monster-origin space: the caller expands obstacles by the
+ * monster hull (MONSTER_HULL_MINS/MAXS) and traces the origin as a point
+ * segment; only `fraction`/`endpos` are used. Mutates `origin` in place and
+ * touches nothing else (no I/O, no globals), so it is headless-testable with
+ * a stub trace. Corpses (`state.dead`) never move.
+ *
+ * Reads `state.frame` without advancing it: call BEFORE monsterThink each
+ * tick so the move plays the frame think is about to advance (id ai_move
+ * runs inside the frame, then the frame counter steps).
+ */
+export function monsterLocomotion(
+  state: MonsterState,
+  origin: Vec3,
+  playerPos: Vec3,
+  trace: (start: Vec3, end: Vec3) => { fraction: number; endpos: Vec3 },
+): void {
+  if (state.dead) return;
+  const mv = monsterMoveOf(state);
+  const fr = mv.frames[state.frame] ?? { dist: 0, action: 'move' };
+  const dx = playerPos[0]! - origin[0]!;
+  const dy = playerPos[1]! - origin[1]!;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len > 1e-9 && fr.dist !== 0) {
+    const nx = dx / len;
+    const ny = dy / len;
+    const end = v3(origin[0]! + nx * fr.dist, origin[1]! + ny * fr.dist, origin[2]!);
+    const h = trace(v3(origin[0], origin[1], origin[2]), end);
+    origin[0] = h.endpos[0]!;
+    origin[1] = h.endpos[1]!;
+    origin[2] = h.endpos[2]!;
+  }
+  // Gravity: probe down from 1 unit above the feet so resting contact is a
+  // clean hit, not a startsolid; snap to ground when in reach, else fall the
+  // bounded probe so ledges never hover.
+  const gstart = v3(origin[0], origin[1], origin[2]! + 1);
+  const gend = v3(origin[0], origin[1], origin[2]! - MONSTER_FALL_PROBE);
+  const g = trace(gstart, gend);
+  if (g.fraction < 1) {
+    origin[2] = g.endpos[2]!;
+  } else {
+    origin[2] = gend[2]!;
+  }
 }
 
 export function monsterPain(ms: MonsterState, damage: number, rand: () => number): void {

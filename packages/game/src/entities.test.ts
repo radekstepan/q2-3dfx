@@ -205,6 +205,27 @@ describe('doors, plats, buttons, triggers (M5.2)', () => {
     expect(fires).toBe(2);
   });
 
+  it('trigger touch gate matches id Touch_Multi (MONSTER/NOT_PLAYER bits)', () => {
+    // id g_trigger.c: players fire unless NOT_PLAYER (2); monsters fire only
+    // with MONSTER (1); anything else never fires.
+    resetEdictNums();
+    const plain = spawnTrigger(spawnEdict({ classname: 'trigger_multiple' }));
+    let fires = 0;
+    const fire = (): void => {
+      fires++;
+    };
+    expect(triggerTouch(plain, 0, 'player', fire)).toBe(true);
+    expect(triggerTouch(plain, 1, 'monster', fire)).toBe(false); // no MONSTER bit
+    expect(triggerTouch(plain, 2, 'grenade', fire)).toBe(false);
+    resetEdictNums();
+    const monstrous = spawnTrigger(spawnEdict({ classname: 'trigger_multiple', spawnflags: '1' }));
+    expect(triggerTouch(monstrous, 0, 'monster', fire)).toBe(true);
+    resetEdictNums();
+    const noPlayers = spawnTrigger(spawnEdict({ classname: 'trigger_multiple', spawnflags: '2' }));
+    expect(triggerTouch(noPlayers, 0, 'player', fire)).toBe(false);
+    expect(fires).toBe(2);
+  });
+
   it('teleporter relocates the entity', () => {
     resetEdictNums();
     const who = spawnEdict({ classname: 'player', origin: '0 0 0' });

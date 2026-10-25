@@ -33,7 +33,8 @@ import {
 } from './bands.js';
 import { buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, createSoldierMesh, createSoldierSkin, md2ToAliasMesh, type AliasMesh } from './alias.js';
 import { drawAliasInstance } from './alias.js';
-import { drawTracerBeam, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE } from './tracer.js';
+import { drawTracerBeam, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE, TRACER_CORE_COLOR } from './tracer.js';
+import { computeSkyUvs, isValidSkySize } from './sky.js';
 import { AngleVectors } from '@q2/math';
 import { drawSprite } from './sprites.js';
 import { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
@@ -158,9 +159,18 @@ export class SoftwareRenderer implements Refresh {
   private soldierMeshMemo: AliasMesh | null = null;
   /** Palette index of the flat sky fill (recomputed per palette). */
   private skyIndex = 0;
+  /**
+   * Packed skybox strip for textured SURF_SKY (see sky.ts packing
+   * contract): one tile per env/ suffix stacked vertically. Null = no
+   * texture yet -> the flat-fill fallback (never the orange checker).
+   */
+  private skyTex: { width: number; height: number; texels: Uint8Array } | null = null;
+  /** Per-vertex skybox UV scratch (grown on demand, reused per frame). */
+  private skyUv = new Float32Array(64);
   /** Renderer-owned tracer beams (spawnTracer ring, fixed pool, zero alloc). */
   private tracerSegs = new Float32Array(TRACER_POOL_SIZE * 6);
   private tracerColors = new Uint8Array(TRACER_POOL_SIZE);
+  private tracerCores = new Uint8Array(TRACER_POOL_SIZE).fill(TRACER_CORE_COLOR);
   private tracerTtl = new Uint8Array(TRACER_POOL_SIZE);
   private tracerCursor = 0;
   private tracerFwd = new Float32Array(3);
@@ -487,6 +497,31 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
+   * Set the packed skybox strip sampled by SURF_SKY surfaces (the web side
+   * resolves `env/<sky><suffix>.pcx` from the pak and packs them; the
+   * renderer never touches the pak).
+   *
+   * PACKING CONTRACT (see sky.ts — do not deviate, a parallel agent wires
+   * the web side to exactly this):
+   * - ONE texture: 6 tiles stacked VERTICALLY, top-to-bottom in filename
+   *   suffix order [rt, bk, lf, ft, up, dn] (id `suf` in R_SetSky).
+   * - tex.width = ONE tile wide, power of two (256 for real env/ PCX).
+   * - tex.height = 6 * tileH, tileH = height/6 any positive int (256 real).
+   * - 8-bit palette indices, top row = v 0 (PCX row order), unlit sample
+   *   (D_SkySurf has no lightmap: colormap grade 63 = identity).
+   * Invalid sizes and null clear the texture -> graceful flat-fill
+   * fallback (current skyIndex). Never throws, copies the texels.
+   */
+  setSkyTexture(tex: { texels: Uint8Array; width: number; height: number } | null): void {
+    if (!tex || !isValidSkySize(tex.width, tex.height) ||
+      tex.texels.length !== tex.width * tex.height) {
+      this.skyTex = null;
+      return;
+    }
+    this.skyTex = { width: tex.width, height: tex.height, texels: tex.texels.slice() };
+  }
+
+  /**
    * Spawn a renderer-owned tracer beam (blaster bolt / shotgun pellet):
    * origin + direction + length + palette-index color, drawn with a 1/z
    * depth test for ttlFrames renders, then expires. Fixed pool (ring
@@ -500,6 +535,7 @@ export class SoftwareRenderer implements Refresh {
     color = TRACER_DEFAULT_COLOR,
     length = TRACER_DEFAULT_LENGTH,
     ttlFrames = 3,
+    core = TRACER_CORE_COLOR,
   ): boolean {
     const dx = dir[0] ?? 0, dy = dir[1] ?? 0, dz = dir[2] ?? 0;
     const len0 = Math.hypot(dx, dy, dz);
@@ -526,6 +562,7 @@ export class SoftwareRenderer implements Refresh {
     this.tracerSegs[o + 4] = oy + dy * inv * len;
     this.tracerSegs[o + 5] = oz + dz * inv * len;
     this.tracerColors[slot] = color & 255;
+    this.tracerCores[slot] = core & 255;
     this.tracerTtl[slot] = Math.max(1, Math.min(ttlFrames | 0, 255));
     return true;
   }
@@ -645,6 +682,55 @@ export class SoftwareRenderer implements Refresh {
         }
       }
       if (surf.sky) {
+        const sky = this.skyTex;
+        if (sky) {
+          // Textured skybox sample (faithful D_SkySurf): per-vertex
+          // skybox-face UVs from the view-locked box mapping (sky.ts),
+          // drawn as unlit perspective spans (colormap grade 63 is the
+          // identity row — no lightmap, like id) while still bypassing
+          // the surface cache. Static per view direction: ref_soft never
+          // reads skyrotate/skyaxis, so time plays no role.
+          const need = surf.n * 2;
+          if (this.skyUv.length < need) this.skyUv = new Float32Array(need);
+          computeSkyUvs(surf.verts, surf.n,
+            cam.origin[0]!, cam.origin[1]!, cam.origin[2]!,
+            sky.width, sky.height / 6, this.skyUv);
+          this.polyInput.verts = surf.verts;
+          this.polyInput.uvs = this.skyUv;
+          this.polyInput.lux = surf.lux;
+          this.polyInput.n = surf.n;
+          const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
+          if (nproj < 3) { if (d) d.clipRejected++; continue; }
+          const start = this.spanList.count;
+          const endCount = emitSpansForPoly(
+            this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
+          );
+          if (endCount <= start) { if (d) d.clipRejected++; continue; }
+          for (let i = start; i < endCount; i++) {
+            const sp = this.pool[i]!;
+            sp.kind = SPAN_OPAQUE;
+            sp.ord = order;
+            sp.light = 63;
+            sp.dlight = 0;
+            sp.lv = -1;
+          }
+          sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+          this.spanList.count = endCount;
+          texView.width = sky.width;
+          texView.height = sky.height;
+          texView.texels = sky.texels;
+          const before = this.backend.pixelsDrawn;
+          this.backend.drawSpans(this.spanList, texView, lightView);
+          candidatePixels += this.backend.pixelsDrawn - before;
+          this.spanList.count = 0;
+          spansEmitted += endCount - start;
+          if (d) {
+            d.emitted++;
+            const batchSpans = endCount - start;
+            if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
+          }
+          continue;
+        }
         // Sky hull: flat depth-tested fill, no texture / lightmap / cache
         // entry (previously these rendered with the orange fallback checker).
         // The palette color rides each span (s.light) so every backend
@@ -840,7 +926,7 @@ export class SoftwareRenderer implements Refresh {
       drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
         this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
         this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
-        this.tracerColors[ti]!);
+        this.tracerColors[ti]!, this.tracerCores[ti]!);
       this.tracerTtl[ti]--;
     }
 

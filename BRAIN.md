@@ -454,7 +454,20 @@ done-when:
 - [x] MD2 player model draws with affine triangles + shade dots (MD2-shaped procedural mesh; real `.md2` parse is M1.2's job — data flows through `registerModel`)
 - [x] 1,000 particles cost <1.5 ms at 640×480 (measured 0.16 ms, §11)
 
-### TODO(M3.4) — update 2026-10-25 pm (feedback batch, all landed):
+### TODO(M3.4) — update 2026-10-25 pm (feedback batch, all landed, batch #2 ext.):
+- Sky: the flat blue fill is GONE as the pak path — replaced by the ORIGINAL
+- Quake II sky. Ground truth from `../external/quake-2-source`: `SURF_SKY` is
+- never rasterised; `R_EmitSkyBox` emits 6 box faces at ±128 around the view
+- origin textured with `env/<sky>{rt,bk,lf,ft,up,dn}.pcx` (mip 0, fullbright).
+- ref_soft has NO time scroll (only ref_gl rotates). Implemented as such:
+- `setSkyTexture` single-texture contract (vertical 6-tile strip in suffix
+- order; renderer maps faces with id's `SKY_SIDE_IMAGE` table), sampled as
+- unlit perspective spans, still cache-free; invalid/null → flat-fill fallback.
+- Web side (`apps/web`): `skyNameForMap` reads worldspawn `sky` (base1 =
+- "unit1_"), `loadSkyStrip` packs + remaps onto the engine palette (normally a
+- no-op; nearest-color fallback otherwise). Flat fill kept for the no-pak path.
+- Beast detail: a world sky poly straddling two box faces smears UVs across the
+- tile seam (id rasterises faces separately) — confined to seams, accepted.
 - DONE: `registerPakModels` (`apps/web/src/play.ts`): boot registers real pak
 - MD2s via `parseMD2` + `registerModel` and PCX skins via `parsePCX` +
 - `registerSkinData` (`modelForMonster`/`skinForMonster`,
@@ -608,14 +621,45 @@ done-when:
   shotgun, kills one monster (`dead` + removed), reaches exit
 Out of scope (later cards): monster pathfinding (M5.3 full AI), plats/trains
 riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
-### TODO(M7.2 follow-up)
-- Combat damage verified 2026-10-25 (feedback: "not losing health" did not
-- reproduce): headless devroom + real-base1 + full `Host.frame` runs all deal
-- damage end-to-end; contract pinned by `packages/game/src/monster-combat.test.ts`.
-- If still seen in a live build, suspects are outside `@q2/game`: sticky `exited`
-- (post-exit invincibility — `respawn()` never clears it), genuinely blocked LOS,
-- already-dead soldier, or encounter beyond 1000u.
-- Spawn correctness fix landed here: `spawnFromLump` skips targeted
+### TODO(M7.2 follow-up) — update 2026-10-25 pm (feedback batch #2, all landed):
+- SPURIOUS-EXIT ROOT CAUSE (explained blue "LEVEL COMPLETE" near spawn AND the
+- invincibility: `damagePlayer` early-returns when `exited`): all 22 base1 brush
+- triggers have no `origin` key (default 0,0,0 = walkable floor ~344u from spawn),
+- and `SV_TouchTriggersAt` did a 96-unit POINT check around it — walking near the
+- world origin fired every brush trigger incl. `*27 → t37` (exit). Fixed in
+- `@q2/server`: brush triggers test their brush VOLUME via `triggerBounds`
+- (populated from `modelSizes`, same pattern as `moverBounds`); bound-less brush
+- triggers skipped in the point hook (web `checkBrushTriggers` AABB stays the
+- play path). Also: `fireTargets` cascades through `trigger_relay`
+- (depth-guarded), doors fire targets on use (`SV_UseMover`, id `door_go_up`),
+- buttons fire on top arrival (id `button_wait`), `triggerTouch` gate now exact
+- id `Touch_Multi` (player unless NOT_PLAYER; monster only with MONSTER bit —
+- was inverted). Regression: 600-tick adversarial spawn walk never fires the
+- exit chain; origin probe silent, real pit probe fires. `respawn()` clears
+- `exited` (a new life is vulnerable again).
+- Combat verified end-to-end again (fight-back damage, shotgun pickup, monster
+- kill, real pit exit) in the Q2_PAK bot test.
+- Movement: `Host` now stages the owned cmd stream (`setPendingCmds`, newest
+- snapshot → current cmd) so the local player uses friction-exact `CL_PredictPmove`
+- instead of linear extrapolation — this fixes the stop-oscillation (stale
+- velocity overshoot + tick snap-back) from the previous interpolation fix.
+- Headless settle test pins monotonic stopping. Remote entities keep interp delay.
+- Monsters animate + walk: `HostDriver.entityFrame(id)` (host renders it instead
+- of hardcoded frame 0; web maps `monsterMoveOf(state).first + frame`, clamped)
+- and new `monsterLocomotion(state, origin, playerPos, trace)` (`@q2/game`:
+- face player, step the frame's `dist` with hull-trace clamp, gravity probe).
+- All monsters still share soldier handle 0 — per-kind model/skin next.
+- Tracers: two-pass beam (1px near-white core 215 + 3-wide orange halo in the
+- shot color; blaster 225 = 255,147,0), full eye→impact. Player beams originate
+- at the off-axis gun muzzle: an eye-origin beam foreshortens to 1px by correct
+- perspective (measured), the muzzle offset restores a visible streak (15px
+- head-on, asserted ≥10). Monster return fire stays a foreshortened dot + sound.
+- 3D viewmodel: `HostDriver.viewModel()` (host renders camera-attached at eye +
+- fwd*22 + right*8 − up*5; 2D silhouette skipped on the 3D path via
+- `usesViewModel3D`); real `v_blast/v_shotg/v_machn` MD2s + PCX skins from the
+- pak (56/209/475 frames verified: soldier 475, gunner 209, v_blast 56);
+- frame 0 idle, `VIEWMODEL_FIRE_FRAME` while muzzle-lit. Bottom-right placement
+- measured headless (1094 gun pixels, x 59–159 / y 103–119 @160×120).
   `info_player_start` (id SP `SelectSpawnPoint` rule) — base1's lump leads
   with a `targetname "base2"` start over the exit pit that used to spawn the
   player onto the exit volume and instantly "complete" the level.

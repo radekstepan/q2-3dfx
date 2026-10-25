@@ -11,6 +11,13 @@ import type { Camera } from './camera.js';
 export const TRACER_DEFAULT_LENGTH = 96;
 /** Default beam color when the entity carries no palette index. */
 export const TRACER_DEFAULT_COLOR = 225;
+/**
+ * Beam core color: near-white fullbright (real Q2 palette 215 =
+ * 255,255,255; bright warm white under the procedural fallback palette).
+ * The passed `color` stays the orange surround, so the bolt reads as id's
+ * yellow-white core with an orange halo under every palette.
+ */
+export const TRACER_CORE_COLOR = 215;
 /** Screen-step cap: a beam never walks more pixels than this. */
 export const TRACER_MAX_STEPS = 2048;
 /** Renderer-owned tracer pool size (spawnTracer ring). */
@@ -20,6 +27,10 @@ export const TRACER_POOL_SIZE = 64;
  * Draw a beam from a to b. Returns drawn pixel count. Writes nothing when
  * the segment is fully behind the near plane; occluded pixels fail the
  * depth test individually (the beam disappears behind walls correctly).
+ *
+ * Two passes (id's yellow-orange bolt read): a 1px near-white `core` line
+ * first, then a 3-wide `color` halo (±1 perpendicular, centre pixels
+ * untouched so no depth re-test conflict). Both passes are depth-tested.
  */
 export function drawTracerBeam(
   idx: Uint8Array,
@@ -30,8 +41,8 @@ export function drawTracerBeam(
   ax: number, ay: number, az: number,
   bx: number, by: number, bz: number,
   color: number,
+  core: number = TRACER_CORE_COLOR,
 ): number {
-  const c = color & 255;
   // To view space.
   const pax = ax - cam.origin[0]!, pay = ay - cam.origin[1]!, paz = az - cam.origin[2]!;
   const pbx = bx - cam.origin[0]!, pby = by - cam.origin[1]!, pbz = bz - cam.origin[2]!;
@@ -61,31 +72,59 @@ export function drawTracerBeam(
   const iz0 = 1 / s0z, iz1 = 1 / s1z;
   const dx = x1 - x0, dy = y1 - y0;
   const steps = Math.min(TRACER_MAX_STEPS, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy))));
+  const glow = color & 255;
+  const centre = core & 255;
+  // Halo runs perpendicular to the beam's dominant screen axis so the
+  // bolt is 3px wide (visible at 320x240); core stays 1px.
+  const horizontal = Math.abs(dx) >= Math.abs(dy);
   if (steps <= 0) {
-    // Sub-pixel beam: single depth-tested point.
+    // Sub-pixel beam: depth-tested centre + halo neighbours.
     const x = Math.round(x0), y = Math.round(y0);
-    if (x < 0 || y < 0 || x >= fbW || y >= fbH) return 0;
-    const o = y * fbW + x;
     const iz = (iz0 + iz1) / 2;
-    if (iz > zb[o]!) {
-      zb[o] = iz;
-      idx[o] = c;
-      return 1;
+    let drawn = splat(idx, zb, fbW, fbH, x, y, iz, centre);
+    if (horizontal) {
+      drawn += splat(idx, zb, fbW, fbH, x, y - 1, iz, glow);
+      drawn += splat(idx, zb, fbW, fbH, x, y + 1, iz, glow);
+    } else {
+      drawn += splat(idx, zb, fbW, fbH, x - 1, y, iz, glow);
+      drawn += splat(idx, zb, fbW, fbH, x + 1, y, iz, glow);
     }
-    return 0;
+    return drawn;
   }
   let drawn = 0;
+  // Core pass first; halo pixels are disjoint (offset perpendicular), so
+  // the second pass needs no depth re-test workaround.
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    drawn += splat(idx, zb, fbW, fbH,
+      Math.round(x0 + dx * t), Math.round(y0 + dy * t), iz0 + (iz1 - iz0) * t, centre);
+  }
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
     const x = Math.round(x0 + dx * t), y = Math.round(y0 + dy * t);
-    if (x < 0 || y < 0 || x >= fbW || y >= fbH) continue;
-    const o = y * fbW + x;
     const iz = iz0 + (iz1 - iz0) * t;
-    if (iz > zb[o]!) {
-      zb[o] = iz;
-      idx[o] = c;
-      drawn++;
+    if (horizontal) {
+      drawn += splat(idx, zb, fbW, fbH, x, y - 1, iz, glow);
+      drawn += splat(idx, zb, fbW, fbH, x, y + 1, iz, glow);
+    } else {
+      drawn += splat(idx, zb, fbW, fbH, x - 1, y, iz, glow);
+      drawn += splat(idx, zb, fbW, fbH, x + 1, y, iz, glow);
     }
   }
   return drawn;
+}
+
+/** Single depth-tested index write. Returns 1 when drawn, else 0. */
+function splat(
+  idx: Uint8Array, zb: Float32Array, fbW: number, fbH: number,
+  x: number, y: number, iz: number, c: number,
+): number {
+  if (x < 0 || y < 0 || x >= fbW || y >= fbH) return 0;
+  const o = y * fbW + x;
+  if (iz > zb[o]!) {
+    zb[o] = iz;
+    idx[o] = c;
+    return 1;
+  }
+  return 0;
 }

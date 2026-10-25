@@ -26,17 +26,19 @@ import {
   findByClassname,
   makePmoveState,
   moverUse,
+  parseEntities,
   pmoveFull,
   resetEdictNums,
   resetPmoveWorld,
   setPmoveWorld,
   setPmoveWorldFromBsp,
+  spawnEdict,
   triggerTouch,
 } from '@q2/game';
 import type { Edict, Mover, TraceFn, Trigger } from '@q2/game';
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
-import { SV_Init, SV_SpawnEntities, SV_Tick, fireTargets } from './index.js';
+import { SV_Init, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, SV_UseTargetname, fireTargets } from './index.js';
 import type { ServerState } from './index.js';
 import { SV_CarryRiders } from './index.js';
 import type { RiderBody } from './index.js';
@@ -344,6 +346,82 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       const dExit = Math.hypot(fx - -1776, fy - 1544);
       expect(dExit).toBeLessThan(150);
       expect(fz).toBeLessThan(260);
+    } finally {
+      resetPmoveWorld();
+    }
+  });
+
+  it('exit chain fires ONLY on real pit overlap; spawn walk stays clean', { timeout: 180000 }, () => {
+    // Regression for the live play-test report ("LEVEL COMPLETE" near spawn
+    // + invincible player): SV_TouchTriggersAt used a 96-unit point check
+    // around the brush edict origin, which defaults to the world origin
+    // (0,0,0) — walkable floor ~344 units from spawn. Every brush trigger
+    // (incl. the *27 exit pit -> t37 chain) fired there, and the resulting
+    // exited=true also gated damagePlayer. Fixed by testing brush volumes.
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st: ServerState = SV_Init();
+    SV_SpawnEntities(st, map.entities, (model) => {
+      if (!model.startsWith('*')) return null;
+      const n = Number.parseInt(model.slice(1), 10);
+      if (!Number.isFinite(n)) return null;
+      return modelBounds(map, n);
+    });
+    // every brush trigger resolves to real brush bounds: the point hook can
+    // test volumes for all of them (and only them).
+    const brush = st.triggers.filter((t) => t.ent.model.startsWith('*'));
+    expect(brush).toHaveLength(22);
+    for (const t of brush) expect(st.triggerBounds.has(t.ent.num)).toBe(true);
+    try {
+      setPmoveWorldFromBsp(map);
+      // REAL spawn: info_player_start WITHOUT targetname (the targeted one
+      // is the base2 entry over the exit pit).
+      const starts = parseEntities(map.entities).filter(
+        (d) => d.classname === 'info_player_start' && !d.targetname,
+      );
+      expect(starts).toHaveLength(1);
+      // relay audit on real data: no trigger_relay use can fire the exit —
+      // nothing relays to t37 (only the *27 brush trigger targets it).
+      const dicts = parseEntities(map.entities);
+      for (const d of dicts) {
+        if (d.classname !== 'trigger_relay' || !d.targetname) continue;
+        st.firedThisTick = [];
+        SV_UseTargetname(st, d.targetname);
+        expect(st.firedThisTick).not.toContain('t37');
+      }
+      // 600 ticks: hold spawn, then walk straight at the world origin (the
+      // pre-fix build fired t37 9 ticks into this walk at [27,-67,24]).
+      const bot = makePmoveState();
+      bot.origin = v3(128, -320, 32);
+      bot.velocity = v3(0, 0, 0);
+      const player = spawnEdict({ classname: 'player' });
+      const yawToOrigin = (Math.atan2(0 - -320, 0 - 128) * 180) / Math.PI;
+      for (let tick = 0; tick < 600; tick++) {
+        SV_Tick(st, 0.1);
+        if (tick >= 300) {
+          pmoveFull(bot, {
+            msec: 100,
+            angles: v3(0, yawToOrigin, 0),
+            forwardmove: 300,
+            sidemove: 0,
+            upmove: 0,
+            buttons: 0,
+          });
+        }
+        player.origin = v3(bot.origin[0], bot.origin[1], bot.origin[2]);
+        SV_TouchTriggersAt(st, 'player', player);
+        expect(st.firedThisTick).not.toContain('t37');
+      }
+      // world-origin probe: walkable floor that fired 29 pushes pre-fix.
+      player.origin = v3(0, 0, 32);
+      SV_Tick(st, 0.1);
+      SV_TouchTriggersAt(st, 'player', player);
+      expect(st.firedThisTick).not.toContain('t37');
+      // ... and the exit still fires on REAL pit overlap (no over-correction).
+      player.origin = v3(-1776, 1544, -56);
+      SV_Tick(st, 0.1);
+      SV_TouchTriggersAt(st, 'player', player);
+      expect(st.firedThisTick).toContain('t37');
     } finally {
       resetPmoveWorld();
     }
