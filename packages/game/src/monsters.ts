@@ -403,7 +403,7 @@ export function monsterPain(ms: MonsterState, damage: number, rand: () => number
   return 'pain';
 }
 
-export type AttackChoice = 'melee' | 'shotgun' | 'blaster' | 'chaingun' | 'grenade' | 'none';
+export type AttackChoice = 'melee' | 'shotgun' | 'blaster' | 'machinegun' | 'chaingun' | 'grenade' | 'none';
 
 /**
  * Melee/ranged selection by range, mirroring soldier_attack/gunner_attack:
@@ -443,11 +443,18 @@ export interface ChaseResult {
   target: Vec3 | null;
 }
 
-/** Map an attack choice onto the kind's data-table move names. */
+/** Map an attack choice onto the kind's data-table move names. The soldier
+ * 'machinegun' choice (ss skins, m_soldier.c attack4/attack6 — full moves
+ * arrive with M5.3 full AI) plays the generic gunfire anim: it is a KNOWN
+ * move every lane already treats as hitscan (web monsterFire only spawns
+ * the foe bolt on attack2; server attackOfMove maps attack1 -> shotgun).
+ * It must never be attack2 — the bolt move. */
 export function attackMoveFor(kind: MonsterKind, choice: AttackChoice): string {
   switch (choice) {
     case 'shotgun':
       return 'attack1';
+    case 'machinegun':
+      return kind === 'soldier' ? 'attack1' : 'attack_chain';
     case 'blaster':
       return 'attack2';
     case 'chaingun':

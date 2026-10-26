@@ -121,6 +121,13 @@ export {
   BLASTER_INFLIGHT_COLOR,
   BLASTER_TRAIL_COLOR,
   BLASTER_DAMAGE_SP,
+  HITSCAN_TRACER_COLOR,
+  SOLDIER_WEAPON_STATS,
+  SOLDIER_COCK_SOUND,
+  SOLDIER_MACHINEGUN_BURST_MIN_FRAMES,
+  SOLDIER_MACHINEGUN_BURST_MAX_FRAMES,
+  soldierMachinegunBurstFrames,
+  soldierFireEvent,
   weaponFiresBeam,
   soldierWeaponForSkin,
   selectSoldierAttack,
@@ -132,6 +139,7 @@ export {
   isGreenBoltColor,
 } from './weapons.js';
 export type { WeaponDef, Pellet, FireResult, BoltSpec, MuzzleSpec, SoldierSkin } from './weapons.js';
+export type { SoldierWeaponStats, SoldierFireEvent, SoldierFireWeapon } from './weapons.js';
 export {
   MUZZLE_LIGHT_COLOR,
   MUZZLE_LIGHT_INTENSITY,

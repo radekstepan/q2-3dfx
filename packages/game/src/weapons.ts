@@ -263,6 +263,141 @@ export function isGreenBoltColor(color: number): boolean {
   return color >= GREEN_COLOR_BASE && color < GREEN_COLOR_END;
 }
 
+// --- hitscan tracer color + soldier fire events (M7.2 batch #5) -----------
+//
+// The web lane drew soldier return fire + shotgun pellets with
+// PELLET_TRACER_COLOR = 208 — pak-palette pure green (0,255,0), the
+// "green laser" users reported. C tracers/impacts (TE_GUNSHOT/TE_SHOTGUN,
+// cl_fx.c) live in the yellow-orange family, and id's own palette reserves
+// 208-214 for teleport/BFG/login FX. HITSCAN_TRACER_COLOR is the single
+// source of truth both lanes converge on: 225 (0xe1 = (255,147,0) per the
+// real colormap.pcx), the same orange the blaster beam already uses. The
+// two-pass beam keeps its established 215 (0xd7) near-white core; only the
+// halo color was wrong. Web call sites to switch (apps/web, out of this
+// lock): monsterFire queueTracer PELLET_TRACER_COLOR + the player shotgun
+// queue call site — see the note in soldier-fire.test.ts.
+
+/** Authoritative hitscan tracer halo color (C yellow-orange, never green). */
+export const HITSCAN_TRACER_COLOR = 225;
+
+/** Per-trigger stats for a soldier skin family's C weapon (m_soldier.c
+ * soldier_fire args to monster_fire_blaster/shotgun/bullet — the MONSTER
+ * values, not the player WEAPON_* values above). */
+export interface SoldierWeaponStats {
+  /** Damage per bullet/pellet/bolt (blaster 5, shotgun 2, bullet 2). */
+  damage: number;
+  /** Knockback kick (shotgun 1, bullet 4; blaster 0/unused). */
+  kick: number;
+  /** Projectiles per trigger (shotgun 12 pellets, bullet/blaster 1). */
+  pellets: number;
+  hspread: number;
+  vspread: number;
+  /** C soundindex precached per SP func (pak-relative; driver lowercases). */
+  sound: string;
+  /** Bolt speed for the blaster (600, monster_fire_blaster); 0 = hitscan. */
+  boltSpeed: number;
+}
+
+/** m_soldier.c soldier_fire weapon parameters by skin family. */
+export const SOLDIER_WEAPON_STATS: Record<'blaster' | 'shotgun' | 'machinegun', SoldierWeaponStats> = {
+  blaster: {
+    damage: 5, kick: 0, pellets: 1, hspread: 0, vspread: 0,
+    sound: 'soldier/solatck2.wav', boltSpeed: 600,
+  },
+  shotgun: {
+    damage: 2, kick: 1, pellets: DEFAULT_SHOTGUN_COUNT,
+    hspread: DEFAULT_SHOTGUN_HSPREAD, vspread: DEFAULT_SHOTGUN_VSPREAD,
+    sound: 'soldier/solatck1.wav', boltSpeed: 0,
+  },
+  machinegun: {
+    damage: 2, kick: 4, pellets: 1,
+    hspread: DEFAULT_BULLET_HSPREAD, vspread: DEFAULT_BULLET_VSPREAD,
+    sound: 'soldier/solatck3.wav', boltSpeed: 0,
+  },
+};
+
+/** Cock/chamber sound shared by all soldier skins (m_soldier.c sound_cock). */
+export const SOLDIER_COCK_SOUND = 'infantry/infatck3.wav';
+
+/** C AI_HOLD_FRAME burst window for machinegun soldiers (m_soldier.c:
+ * pausetime = level.time + (3 + rand() % 8) * FRAMETIME): each frame of the
+ * hold fires ONE bullet (fire_bullet -> single fire_lead), so a burst is
+ * 3-10 single shots, never a multi-pellet volley. */
+export const SOLDIER_MACHINEGUN_BURST_MIN_FRAMES = 3;
+export const SOLDIER_MACHINEGUN_BURST_MAX_FRAMES = 10;
+
+/** Burst-hold length in 10Hz frames for one machinegun burst. */
+export function soldierMachinegunBurstFrames(rand: () => number): number {
+  return 3 + Math.floor(rand() * 8);
+}
+
+export type SoldierFireWeapon = 'blaster' | 'shotgun' | 'machinegun';
+
+/**
+ * One resolved soldier trigger pull (skin-determined via
+ * selectSoldierAttack, m_soldier.c soldier_fire). Hitscan weapons carry
+ * tracerColor HITSCAN_TRACER_COLOR and never a bolt; the blaster carries
+ * boltTrail BLASTER_TRAIL_COLOR, firesBolt, and no beam (projectiles draw
+ * no muzzle->eye tracer). tracerColor/boltTrail are null when the soldier
+ * is not firing (melee touch / out of range) — both lanes must then emit
+ * no beam at all. Neither color is ever in the banned green range.
+ */
+export interface SoldierFireEvent {
+  weapon: SoldierFireWeapon | 'melee' | 'none';
+  firesBolt: boolean;
+  tracerColor: number | null;
+  boltTrail: number | null;
+  damage: number;
+  kick: number;
+  pellets: number;
+  hspread: number;
+  vspread: number;
+  boltSpeed: number;
+  /** Family fire sound; null when not firing (melee uses the driver's
+   * touch placeholder, out-of-range fires nothing). */
+  sound: string | null;
+}
+
+const SOLDIER_FIRE_IDLE: SoldierFireEvent = {
+  weapon: 'none',
+  firesBolt: false,
+  tracerColor: null,
+  boltTrail: null,
+  damage: 0,
+  kick: 0,
+  pellets: 0,
+  hspread: 0,
+  vspread: 0,
+  boltSpeed: 0,
+  sound: null,
+};
+
+export function soldierFireEvent(
+  skin: SoldierSkin | number,
+  dist: number,
+  rand: () => number,
+): SoldierFireEvent {
+  const choice = selectSoldierAttack(skin, dist, rand);
+  if (choice === 'melee' || choice === 'none') {
+    return { ...SOLDIER_FIRE_IDLE, weapon: choice };
+  }
+  const st = SOLDIER_WEAPON_STATS[choice];
+  const bolt = attackFiresBolt('soldier', choice);
+  return {
+    weapon: choice,
+    firesBolt: bolt,
+    tracerColor: bolt ? null : HITSCAN_TRACER_COLOR,
+    boltTrail: bolt ? BLASTER_TRAIL_COLOR : null,
+    damage: st.damage,
+    kick: st.kick,
+    pellets: st.pellets,
+    hspread: st.hspread,
+    vspread: st.vspread,
+    boltSpeed: st.boltSpeed,
+    sound: st.sound,
+  };
+}
+
 /**
  * Resolve one trigger pull. `ammo` is the current reserve for the weapon's
  * ammoKind (ignored for the blaster). `rand` must return [0,1).
