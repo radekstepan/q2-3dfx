@@ -62,10 +62,12 @@ import {
   skinForBolt,
   skinForWeaponModel,
   spawnExplosive,
+  soldierWeaponForSkin,
   monsterFlashOffset,
   projectSource,
   MZ2_SOLDIER_SHOTGUN_1,
   MZ2_SOLDIER_BLASTER_1,
+  MZ2_SOLDIER_MACHINEGUN_1,
   MZ2_GUNNER_MACHINEGUN_1,
   MZ2_GUNNER_GRENADE_1,
 } from '@q2/game';
@@ -146,12 +148,13 @@ export function applyBrightness(dst: Uint32Array, brightness: number): void {
 // id `skill` cvar (game/g_save.c, CVAR_LATCH, default 1 = medium): 0 easy,
 // 1 medium, 2 hard, 3 nightmare. The web menu exposes it as a labeled
 // dropdown (see SKILL_LABELS in dom.ts); the value persists via setCVar and
-// is latched at boot — changing it mid-game takes effect on the next boot,
-// exactly like id's latch. The driver hands it to `SV_SetSkill` before
-// spawning so the server applies the C SpawnEntities filter (g_spawn.c):
-// edicts carrying SPAWNFLAG_NOT_EASY (256) are inhibited on skill 0,
-// NOT_MEDIUM (512) on skill 1, NOT_HARD (1024) on skill 2/3. (Damage
-// scaling stays in @q2/server, outside this package.)
+// is latched at boot — the menu re-calls the boot path on change
+// (rebootPlay), so unlike id's wait-for-next-map latch the new skill
+// applies to the current level at once. The driver hands it to
+// `SV_SetSkill` before spawning so the server applies the C SpawnEntities
+// filter (g_spawn.c): edicts carrying SPAWNFLAG_NOT_EASY (256) are inhibited
+// on skill 0, NOT_MEDIUM (512) on skill 1, NOT_HARD (1024) on skill 2/3.
+// (Damage scaling stays in @q2/server, outside this package.)
 export const SKILL_DEFAULT = 1;
 export const SKILL_MIN = 0;
 export const SKILL_MAX = 3;
@@ -186,6 +189,41 @@ export function skillInhibits(spawnflags: number, skill: number): boolean {
 export function parseSpawnflags(dict: Record<string, string>): number {
   const v = parseInt(dict['spawnflags'] ?? '0', 10);
   return Number.isFinite(v) ? v : 0;
+}
+
+// --- resolution (M7.1 menu) ---
+//
+// Internal framebuffer size (`vid_resolution`, latched like skill: changing
+// it reboots the level at the new size). The 2D canvas is CSS-upscaled ×2
+// from the framebuffer (see startPlayLoop), so this only changes the render
+// resolution, never the presentation scale.
+
+/** Internal framebuffer sizes offered in the menu (CSS upscale stays ×2). */
+export const RESOLUTION_OPTIONS = ['320x240', '640x480', '800x600', '1024x768'] as const;
+/** Default internal resolution (software path, matches the 60fps sign-off rig). */
+export const RESOLUTION_DEFAULT = '320x240';
+
+registerCVar('vid_resolution', RESOLUTION_DEFAULT, 'internal framebuffer WxH (latched: changing it reboots the level)');
+
+/** Parse a 'WxH' resolution string; null when malformed or non-positive. */
+export function parseResolution(value: string): { width: number; height: number } | null {
+  const m = /^\s*(\d+)\s*x\s*(\d+)\s*$/.exec(value);
+  if (!m) return null;
+  const width = Number.parseInt(m[1]!, 10);
+  const height = Number.parseInt(m[2]!, 10);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  return { width, height };
+}
+
+/** Current internal resolution (absent/malformed cvar → default). Self-healing. */
+export function getResolution(): { width: number; height: number } {
+  const raw = getCVar('vid_resolution');
+  if (typeof raw === 'string') {
+    const parsed = parseResolution(raw);
+    if (parsed) return parsed;
+  }
+  registerCVar('vid_resolution', RESOLUTION_DEFAULT, 'internal framebuffer WxH (latched: changing it reboots the level)');
+  return parseResolution(RESOLUTION_DEFAULT)!;
 }
 
 // --- crouch (M7.1 UX) ---
@@ -458,6 +496,13 @@ export interface PlacedMonster {
   id: number;
   origin: [number, number, number];
   state: MonsterState;
+  /**
+   * id skinnum (m_soldier.c SP_ funcs): 0 = light (blaster), 2 = shotgun,
+   * 4 = ss (machinegun); odd = pain flash of the even base. Drives the
+   * per-skin mesh skin, fire sound, and weapon (skin-determined per
+   * soldierWeaponForSkin, never random). Gunners ignore this (skin 0).
+   */
+  skin: number;
   /** last server time this monster attacked (id rate-limits to ~1/s). */
   lastAttack: number;
 }
@@ -478,8 +523,18 @@ export interface TracerBeam {
 
 /** Full-bright palette index for the blaster bolt beam (matches id's EF_BLASTER look). */
 export const BLASTER_TRACER_COLOR = 225;
-/** Hot orange pellet streak for shotgun/machinegun + monster return fire. */
-export const PELLET_TRACER_COLOR = 208;
+/**
+ * Hitscan tracer color (shotgun/machinegun pellets + monster return fire).
+ *
+ * Game-lane audit (@q2/game weapons.ts: GREEN 208–214 banned via
+ * `isGreenBoltColor` — that range is GREEN on the engine palette, the
+ * reported green-laser bug): 225 (0xe1, near-white yellow core in the
+ * 0xe0–0xe8 yellow band, same as the blaster beam) is the C-correct
+ * hitscan color. Never 208–214.
+ */
+export const HITSCAN_TRACER_COLOR = 225;
+/** Hot yellow pellet streak for shotgun/machinegun + monster return fire. */
+export const PELLET_TRACER_COLOR = HITSCAN_TRACER_COLOR;
 /**
  * Authentic v_weap anim frames (game/p_weapon.c Weapon_Generic tables):
  * Blaster (4,8,52,55) fires on gunframe 5, idles 9..52; Shotgun
@@ -675,6 +730,8 @@ export class LocalDriver implements HostDriver {
   readonly rand = mulberry32(0x51ab);
   private lastShotAt = -10;
   private doors: DoorSync[] = [];
+  /** Live submodel face indices the graft appended (unique, for the test hook). */
+  private graftedFaces: number[] = [];
   private bspTrace: ((start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => TraceResult) | null = null;
   /** Muzzle flash expiry (server time) + world pos for the dlight/HUD flash. */
   private flashUntil = -10;
@@ -765,6 +822,11 @@ export class LocalDriver implements HostDriver {
       this.placeMonsters(built.map);
       this.parseExplosives(built.map);
       this.snapshotDoorBases();
+      // Brush faces are invisible to the stock traversal (submodel faces sit
+      // in no node range or leaf list): graft movers/trains/func_walls into
+      // the leaves they intersect so doors render CLOSED at spawn and glass
+      // renders at all. Must run after snapshotDoorBases (same faces).
+      this.graftBrushModels();
       // id SP_trigger_always: fire at spawn (level-start flybys/relays).
       // Flyby visuals are out of scope; explosion targets fire for real.
       this.fireTriggerAlways(built.map);
@@ -1249,12 +1311,30 @@ export class LocalDriver implements HostDriver {
    * to their own MD2 + PCX handles (registration order pins soldier skin 0
    * / mesh 0); unknown ids return null for the Host default. Null without
    * a pak — devroom keeps the legacy model-0 rendering.
+   *
+   * Soldiers are per-skin (m_soldier.c skinnum): light (0) renders the
+   * skin_lt guard look, plain (2) the default skin, ss (4+) the skin_ss
+   * machinegun look — same mesh, distinct skin handle, so machinegun
+   * soldiers read differently from shotgun/light at a glance.
    */
   entityModel(id: number): { model: number; skin: number } | null {
     const m = this.monsters.find((m) => m.id === id);
     if (!m || !this.models) return null;
     if (m.state.kind === 'gunner') return { model: this.models.gunner, skin: this.models.gunnerSkin };
-    return { model: this.models.monster, skin: this.models.monsterSkin };
+    return { model: this.models.monster, skin: this.soldierSkinFor(m.skin) };
+  }
+
+  /**
+   * Skin handle for a soldier skinnum (even base 0/2/4+; odd pain skins fall
+   * back to their even base — the pain flash is a code path, not a handle,
+   * in this driver). Unknown models (no pak) → 0 for the Host default.
+   */
+  soldierSkinFor(skin: number): number {
+    if (!this.models) return 0;
+    const base = skin & ~1;
+    if (base <= 0) return this.models.soldierLightSkin;
+    if (base >= 4) return this.models.soldierSsSkin;
+    return this.models.monsterSkin;
   }
 
   /**
@@ -1440,10 +1520,13 @@ export class LocalDriver implements HostDriver {
    * flash. `playedIdx` is the move-frame index that just played (grenades
    * only leave the tube on the C frames 105/108/111/114 → idx 4/7/10/13).
    *
-   * Hitscan (shotgun/chaingun/grenade) draws an orange tracer muzzle→eye and
-   * rolls id's pHit; the soldier blaster spawns a real foe Bolt (600 u/s,
-   * reused stepBolts/blasterImpact path). Every shot adds an enemy muzzle
-   * dlight (200+(rand&31) yellow) and impact sparks at the eye on hit.
+   * The soldier weapon is skin-determined (m_soldier.c soldier_fire via
+   * soldierWeaponForSkin, never random): blaster skins (0) spawn a real foe
+   * Bolt (600 u/s, reused stepBolts/blasterImpact path), shotgun skins (2)
+   * draw one yellow tracer muzzle→eye and roll id's pHit, machinegun skins
+   * (4+) burst three fanned yellow tracers (id monster_fire_bullet × the
+   * HOLD_FRAME repeat). Every shot adds an enemy muzzle dlight
+   * (200+(rand&31) yellow) and impact sparks at the eye on hit.
    * TODO(melee-sound): 'monster/melee.wav' is a placeholder (no in-pak
    * match); TODO(grenade-sound): C plays no explicit fire sound here,
    * 'gunner/gunatck3.wav' is the closest in-pak family match.
@@ -1458,6 +1541,9 @@ export class LocalDriver implements HostDriver {
     if (dist > 1000) return;
     const chest = v3(m.origin[0]!, m.origin[1]!, m.origin[2]! + 32);
     if (this.traceShot(chest, eye).fraction < 1) return;
+    // Skin-determined soldier weapon (m_soldier.c soldier_fire): blaster /
+    // shotgun / machinegun by skinnum. Gunners keep their move-based table.
+    const skinWeapon = m.state.kind === 'soldier' ? soldierWeaponForSkin(m.skin) : null;
     // Muzzle via G_ProjectSource (soldier_fire/GunnerFire): monster origin +
     // fwd*offset + right*offset from the m_flash table, yaw-facing.
     const fwd = v3();
@@ -1465,10 +1551,12 @@ export class LocalDriver implements HostDriver {
     AngleVectors(v3(0, m.state.yaw, 0), fwd, right, v3());
     const move = m.state.move;
     let flashId = MZ2_SOLDIER_SHOTGUN_1;
-    if (move === 'attack2') flashId = MZ2_SOLDIER_BLASTER_1;
-    else if (move === 'attack_grenade') flashId = MZ2_GUNNER_GRENADE_1 + (playedIdx % 4);
+    if (m.state.kind === 'soldier') {
+      if (skinWeapon === 'blaster') flashId = MZ2_SOLDIER_BLASTER_1;
+      else if (skinWeapon === 'machinegun') flashId = MZ2_SOLDIER_MACHINEGUN_1 + (playedIdx % 2);
+      else flashId = MZ2_SOLDIER_SHOTGUN_1;
+    } else if (move === 'attack_grenade') flashId = MZ2_GUNNER_GRENADE_1 + (playedIdx % 4);
     else if (m.state.kind === 'gunner') flashId = MZ2_GUNNER_MACHINEGUN_1 + (playedIdx % 8);
-    else if (m.state.kind === 'soldier') flashId = MZ2_SOLDIER_SHOTGUN_1;
     const muzzle = projectSource(
       v3(m.origin[0]!, m.origin[1]!, m.origin[2]!),
       monsterFlashOffset(flashId),
@@ -1478,8 +1566,8 @@ export class LocalDriver implements HostDriver {
     this.enemyFlashes.push({ pos: muzzle, intensity: 200 + ((this.rand() * 32) | 0) });
     const dirToEye = v3(eye[0]! - muzzle[0]!, eye[1]! - muzzle[1]!, eye[2]! - muzzle[2]!);
     const dirLen = Math.hypot(dirToEye[0]!, dirToEye[1]!, dirToEye[2]!) || 1;
-    // Soldier blaster (attack2): a real projectile, not a damage roll.
-    if (m.state.kind === 'soldier' && move === 'attack2') {
+    // Soldier blaster skin: a real projectile, not a damage roll.
+    if (skinWeapon === 'blaster') {
       this.bolts.push({
         pos: muzzle,
         dir: v3(dirToEye[0]! / dirLen, dirToEye[1]! / dirLen, dirToEye[2]! / dirLen),
@@ -1507,6 +1595,23 @@ export class LocalDriver implements HostDriver {
       return;
     }
     const pHit = dist < 500 ? 0.6 : 0.25;
+    // Soldier machinegun skin: 3-round burst (id monster_fire_bullet dmg 2
+    // × the HOLD_FRAME repeat), fanned ±40u at 8192 like the pellet spread
+    // basis; each round rolls pHit independently and draws its own tracer.
+    if (skinWeapon === 'machinegun') {
+      for (let b = -1; b <= 1; b++) {
+        const fan = v3(dirToEye[0]! + b * 40, dirToEye[1]! - b * 40, dirToEye[2]!);
+        const fanLen = Math.hypot(fan[0]!, fan[1]!, fan[2]!) || 1;
+        this.queueTracer(muzzle, fan, PELLET_TRACER_COLOR, fanLen);
+        if (this.rand() < pHit) {
+          this.damagePlayer(2, m.origin);
+          this.pushSpark(eye);
+        }
+      }
+      this.emitSound('soldier/solatck3.wav', v3(m.origin[0]!, m.origin[1]!, m.origin[2]! + 32));
+      this.events.push('monshot');
+      return;
+    }
     let dmg = 5;
     let sound = 'soldier/solatck1.wav';
     if (m.state.kind === 'gunner') {
@@ -1683,8 +1788,14 @@ export class LocalDriver implements HostDriver {
     for (const d of parseEntities(map.entities)) {
       if (skillInhibits(parseSpawnflags(d), skill)) continue;
       const cls = d['classname'];
-      if (cls !== 'monster_soldier' && cls !== 'monster_gunner') continue;
-      if (this.monsters.length >= 12) break;
+      if (cls !== 'monster_soldier' && cls !== 'monster_soldier_light' && cls !== 'monster_soldier_ss' && cls !== 'monster_gunner') continue;
+      // base1 ships 14 soldiers (8 plain + 6 light); keep every placed
+      // monster instead of silently dropping the tail.
+      if (this.monsters.length >= 16) break;
+      // id skinnum per SP_ func (m_soldier.c): light 0 (blaster), plain 2
+      // (shotgun), ss 4 (machinegun). Unknown/DM classnames default to the
+      // plain shotgun skin. Gunner ignores this (skin 0).
+      const skin = cls === 'monster_soldier_light' ? 0 : cls === 'monster_soldier_ss' ? 4 : cls === 'monster_gunner' ? 0 : 2;
       const o = (d['origin'] ?? '0 0 0').trim().split(/\s+/).map(Number);
       let origin: [number, number, number] = [o[0] ?? 0, o[1] ?? 0, o[2] ?? 0];
       // id walkmonster_start_go + M_droptofloor: the lump origin is the
@@ -1704,7 +1815,8 @@ export class LocalDriver implements HostDriver {
       this.monsters.push({
         id: id++,
         origin,
-        state: spawnMonster(cls === 'monster_soldier' ? 'soldier' : 'gunner'),
+        state: spawnMonster(cls === 'monster_gunner' ? 'gunner' : 'soldier'),
+        skin,
         lastAttack: -10,
       });
     }
@@ -1753,6 +1865,119 @@ export class LocalDriver implements HostDriver {
   /** Test hook: how many brush models the DoorSync covers (doors + trains). */
   doorSyncCount(): number {
     return this.doors.length;
+  }
+
+  /**
+   * Brush-model graft (view-side): QBSP submodel faces (*1..*N — doors,
+   * buttons, trains, func_walls) are referenced by NEITHER the world node
+   * face ranges NOR any leaf facelist, so the stock world traversal never
+   * collects them and every brush entity renders invisible. The fix owns
+   * only this MiniWorld instance (fresh per boot): append each rendered
+   * brush model's live faces to the facelists of the leaves its mapper
+   * bounds intersect (movers/trainds unioned over their full travel so an
+   * open door or a running train never leaves its leaves). Frustum,
+   * backface, and z culling still apply per surface; PVS is bypassed for
+   * these faces (a few hundred extra stamp checks per frame).
+   *
+   * Excluded on purpose: func_explosive brushes (rendered as the barrel
+   * MD2 through extraEntities — grafting would double-draw) and trigger
+   * volumes (SURF_NODRAW, degenerate n=0, invisible in C too).
+   */
+  private graftBrushModels(): void {
+    if (!this.map) return;
+    const map = this.map;
+    const modelCount = map.modelsExtra.length / MODEL_EXTRA_STRIDE;
+    // model -> union bounds (mapper space) the brush can ever occupy.
+    const unions = new Map<number, { mins: Float32Array; maxs: Float32Array }>();
+    const include = (n: number, dx: number, dy: number, dz: number): void => {
+      if (n < 0 || n >= modelCount) return;
+      const b = modelBounds(map, `*${n}`);
+      if (!b) return;
+      const lo = [b.mins[0]! + dx, b.mins[1]! + dy, b.mins[2]! + dz];
+      const hi = [b.maxs[0]! + dx, b.maxs[1]! + dy, b.maxs[2]! + dz];
+      const u = unions.get(n);
+      if (!u) {
+        unions.set(n, { mins: new Float32Array(lo), maxs: new Float32Array(hi) });
+        return;
+      }
+      for (let k = 0; k < 3; k++) {
+        if (lo[k]! < u.mins[k]!) u.mins[k] = lo[k]!;
+        if (hi[k]! > u.maxs[k]!) u.maxs[k] = hi[k]!;
+      }
+    };
+    // Movers ride ent.origin - pos1 (0 at spawn) out to pos2 - pos1.
+    for (const m of this.server.movers) {
+      const n = brushModelNum(m.ent.model);
+      if (n === null) continue;
+      include(n, 0, 0, 0);
+      include(n, m.pos2[0]! - m.pos1[0]!, m.pos2[1]! - m.pos1[1]!, m.pos2[2]! - m.pos1[2]!);
+    }
+    // Brush trains ride corner - base - rest over every path corner.
+    for (const tr of this.server.trains) {
+      if (tr.ship) continue;
+      const n = brushModelNum(tr.ent.model);
+      if (n === null) continue;
+      const o = (tr.ent.extra['origin'] ?? '0 0 0').trim().split(/\s+/).map(Number);
+      const rx = o[0] ?? 0, ry = o[1] ?? 0, rz = o[2] ?? 0;
+      include(n, tr.ent.origin[0]! - rx, tr.ent.origin[1]! - ry, tr.ent.origin[2]! - rz);
+      for (const c of tr.corners) {
+        include(n, c.pos[0]! - tr.base[0]! - rx, c.pos[1]! - tr.base[1]! - ry, c.pos[2]! - tr.base[2]! - rz);
+      }
+    }
+    // func_wall statics never move: mapper bounds only.
+    for (const e of this.server.entities) {
+      if (e.freed || e.classname !== 'func_wall' || !e.model) continue;
+      const n = brushModelNum(e.model);
+      if (n === null) continue;
+      include(n, 0, 0, 0);
+    }
+    if (unions.size === 0) return;
+    // Resolve live faces per model once (skip degenerate NODRAW placeholders).
+    const facesByModel = new Map<number, number[]>();
+    for (const n of unions.keys()) {
+      const first = map.modelsExtra[n * MODEL_EXTRA_STRIDE + 1]!;
+      const num = map.modelsExtra[n * MODEL_EXTRA_STRIDE + 2]!;
+      const list: number[] = [];
+      for (let f = first; f < first + num; f++) {
+        const s = this.mini.surfaces[f];
+        if (s && s.n > 0) list.push(f);
+      }
+      if (list.length > 0) facesByModel.set(n, list);
+    }
+    const added = new Set<number>();
+    for (const list of facesByModel.values()) {
+      for (const f of list) added.add(f);
+    }
+    this.graftedFaces = [...added].sort((a, b) => a - b);
+    // Append each model's faces to the intersecting leaves (BspMap leaf
+    // bounds: LEAF_STRIDE=13 ints, mins at +3, maxs at +6).
+    const LEAF_STRIDE = 13;
+    for (let li = 0; li < map.leafs.length / LEAF_STRIDE; li++) {
+      const b = li * LEAF_STRIDE;
+      const lmins = [map.leafs[b + 3]!, map.leafs[b + 4]!, map.leafs[b + 5]!];
+      const lmaxs = [map.leafs[b + 6]!, map.leafs[b + 7]!, map.leafs[b + 8]!];
+      const leaf = this.mini.leafs[li];
+      if (!leaf) continue;
+      for (const [n, u] of unions) {
+        if (u.maxs[0]! < lmins[0]! || u.mins[0]! > lmaxs[0]!) continue;
+        if (u.maxs[1]! < lmins[1]! || u.mins[1]! > lmaxs[1]!) continue;
+        if (u.maxs[2]! < lmins[2]! || u.mins[2]! > lmaxs[2]!) continue;
+        const list = facesByModel.get(n);
+        if (!list) continue;
+        if (!leaf.faceList) leaf.faceList = [];
+        for (const f of list) leaf.faceList.push(f);
+      }
+    }
+  }
+
+  /** Test hook: live submodel faces the graft appended (unique indices). */
+  graftedFaceCount(): number {
+    return this.graftedFaces.length;
+  }
+
+  /** Test hook: the grafted face indices (sorted, unique). */
+  graftedFacesSorted(): number[] {
+    return [...this.graftedFaces];
   }
 
   private syncDoors(): void {
@@ -2723,6 +2948,8 @@ export interface PlayBoot {
   fb565: Uint16Array;
   /** Real-pak MD2/skin handles (null without a pak). */
   models: PakModelHandles | null;
+  /** The pak this boot was built from (null = devroom): reboot reuses it. */
+  pak: WebPak | null;
 }
 
 /**
@@ -2750,6 +2977,10 @@ export interface PakModelHandles {
   monster: number;
   /** PCX skin handle for the soldier MD2 (handle 0, registered first). */
   monsterSkin: number;
+  /** PCX skin for monster_soldier_light (skin_lt.pcx, skinnum 0, blaster). */
+  soldierLightSkin: number;
+  /** PCX skin for monster_soldier_ss (skin_ss.pcx, skinnum 4+, machinegun). */
+  soldierSsSkin: number;
   gunner: number;
   /** PCX skin handle for the gunner MD2. */
   gunnerSkin: number;
@@ -2832,6 +3063,12 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
   // Soldier first: skin handle 0 + model handle 0 (see contract above).
   const monsterSkin = loadSkin(skinForMonster('soldier'));
   const monster = loadModel(modelForMonster('soldier'));
+  // Per-skin soldier looks (m_soldier.c skinnum): skin_lt (light/blaster)
+  // and skin_ss (ss/machinegun) registered right after, same mesh. Appended
+  // here so every later handle stays stable (gunner onward shifts by +2
+  // skins vs the old table — no numeric handle is pinned except 0).
+  const soldierLightSkin = loadSkin('models/monsters/soldier/skin_lt.pcx');
+  const soldierSsSkin = loadSkin('models/monsters/soldier/skin_ss.pcx');
   const gunnerSkin = loadSkin(skinForMonster('gunner'));
   const gunner = loadModel(modelForMonster('gunner'));
   const weapons: Record<string, number> = {};
@@ -2893,7 +3130,7 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
   const bannerSkin = loadSkin(BANNER_SKIN);
   const banner = loadModel(BANNER_MODEL);
   return {
-    monster, monsterSkin, gunner, gunnerSkin, weapons, weaponSkins, bolt, boltSkin, barrel, barrelSkin,
+    monster, monsterSkin, soldierLightSkin, soldierSsSkin, gunner, gunnerSkin, weapons, weaponSkins, bolt, boltSkin, barrel, barrelSkin,
     explode, explodeSkin, blast, blastSkin,
     debris1, debris1Skin, debris2, debris2Skin, debris3, debris3Skin,
     gibMeat, gibMeatSkin, gibChest, gibChestSkin, gibBone, gibBoneSkin, gibHead, gibHeadSkin,
@@ -2908,8 +3145,11 @@ export function bootPlay(opts: {
   renderer?: RendererKind;
   pak?: WebPak | null;
 }): PlayBoot {
-  const width = opts.width ?? 320;
-  const height = opts.height ?? 240;
+  // Latch the menu resolution when the caller passes no explicit size:
+  // changing vid_resolution reboots at the new framebuffer size.
+  const res = getResolution();
+  const width = opts.width ?? res.width;
+  const height = opts.height ?? res.height;
   const renderer = opts.renderer ?? 'software';
   const driver = new LocalDriver(opts.pak ?? null);
   const refresh = new SoftwareRenderer();
@@ -2977,7 +3217,17 @@ export function bootPlay(opts: {
     host.refresh.registerModel({ name: 'monster', kind: 'md2', data: getDevMesh(0) });
   }
   const n = width * height;
-  return { host, driver, refresh, renderer, source: driver.source, display: new Uint32Array(n), fb565: new Uint16Array(n), models };
+  return { host, driver, refresh, renderer, source: driver.source, display: new Uint32Array(n), fb565: new Uint16Array(n), models, pak: opts.pak ?? null };
+}
+
+/**
+ * Reboot a boot at the CURRENT cvar values (skill + vid_resolution): the
+ * menu path for "changing the dropdown reboots the level". Same pak and
+ * renderer as the previous boot, fresh driver/server/mini (DoorSync bases
+ * re-baked, skill filter re-applied before spawning). Headless-safe.
+ */
+export function rebootPlay(prev: PlayBoot): PlayBoot {
+  return bootPlay({ renderer: prev.renderer, pak: prev.pak });
 }
 
 /** Resolve the software framebuffer for display (voodoo post chain or direct).

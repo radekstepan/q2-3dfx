@@ -17,9 +17,9 @@ export type { PlayBoot };
 export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
 export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
-export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled, cvarOptions, cvarControlKind, cvarOptionLabels, skillLabel, skillValueForLabel, SKILL_LABELS, CVAR_OPTIONS } from './dom.js';
+export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled, cvarOptions, cvarControlKind, cvarOptionLabels, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS } from './dom.js';
 export type { PlayLoop } from './dom.js';
-export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpTracers, registerPakModels, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, getBrightness, applyBrightness, getSkill, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, PELLET_TRACER_COLOR } from './play.js';
+export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpTracers, registerPakModels, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, getBrightness, applyBrightness, getSkill, getResolution, parseResolution, rebootPlay, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR } from './play.js';
 export type { PakModelHandles, TracerBeam } from './play.js';
 
 export interface BootOptions {
@@ -70,15 +70,28 @@ if (typeof document !== 'undefined') {
     const progress = document.querySelector('#q2-progress');
     const cvars = document.querySelector('#q2-cvars');
     let current: { stop(): void } | null = null;
+    let lastPak: WebPak | null = null;
+    let lastName: string | undefined;
     const startWithPak = (pak: WebPak | null, name?: string): void => {
       current?.stop();
-      const boot = bootPlay({ width: 320, height: 240, pak });
+      lastPak = pak;
+      lastName = name;
+      // bootPlay latches the menu skill + resolution cvars (same path as
+      // fresh boot: SV_SetSkill before spawning, framebuffer at the menu
+      // size), so the panel below needs no explicit size arguments.
+      const boot = bootPlay({ pak });
       current = dom.startPlayLoop(canvas, boot, { pak });
       dom.setProgress(
         progress,
         1,
         name ? `loaded ${name}: ${pak?.entries.length} entries` : `devroom ready — drop pak0.pak for base1`,
       );
+    };
+    // Skill/resolution changes reboot the level at once (id latches them;
+    // the menu applies them immediately by re-calling the boot path).
+    const onCvar = (cvarName: string): void => {
+      if (!dom.cvarNeedsReboot(cvarName)) return;
+      startWithPak(lastPak, lastName);
     };
     // Cached-first boot: a previous drop persists in IndexedDB, so one
     // drop survives reloads. Empty/corrupt cache → devroom, no error spam.
@@ -103,7 +116,7 @@ if (typeof document !== 'undefined') {
         startWithPak(pak, name);
       });
     }
-    if (cvars) dom.renderCvarPanel(cvars);
+    if (cvars) dom.renderCvarPanel(cvars, '', onCvar);
     // Minimal "clear cached pak" affordance next to the cvar panel.
     const ui = document.querySelector('#q2-ui');
     if (ui && !document.querySelector('#q2-clear-pak')) {

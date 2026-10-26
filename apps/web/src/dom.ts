@@ -133,6 +133,7 @@ export function attachDropZone(
  */
 export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   vid_renderer: ['software', 'voodoo'],
+  vid_resolution: ['320x240', '640x480', '800x600', '1024x768'],
   skill: ['0', '1', '2', '3'],
   sw_workers: ['0', '2', '4'],
   cl_showfps: ['0', '1'],
@@ -163,10 +164,29 @@ export function cvarOptions(name: string): readonly string[] | null {
  */
 export const SKILL_LABELS = ['Easy', 'Medium', 'Hard', 'Nightmare'] as const;
 
-/** Display labels for a cvar's options (currently only skill is labeled). */
+/**
+ * Display labels for a cvar's options (skill + resolution are labeled).
+ */
+export const RESOLUTION_LABELS = ['320×240', '640×480', '800×600', '1024×768'] as const;
+
+/** Display labels for a cvar's options (currently skill + resolution). */
 export function cvarOptionLabels(name: string): readonly string[] | null {
   if (name === 'skill') return SKILL_LABELS;
+  if (name === 'vid_resolution') return RESOLUTION_LABELS;
   return null;
+}
+
+/**
+ * Cvars that reboot the level when changed (latched in id, immediate here):
+ * skill re-calls the boot path with SV_SetSkill applied before spawning,
+ * vid_resolution reboots at the new framebuffer size. The browser boot
+ * listens via renderCvarPanel's onChange and calls rebootPlay.
+ */
+export const REBOOT_CVARS: ReadonlySet<string> = new Set(['skill', 'vid_resolution']);
+
+/** True when changing this cvar reboots the level (skill, vid_resolution). */
+export function cvarNeedsReboot(name: string): boolean {
+  return REBOOT_CVARS.has(name);
 }
 
 /** Canonical label for a skill value (clamped to 0..3, default Medium). */
@@ -190,7 +210,11 @@ export function cvarControlKind(name: string): 'select' | 'text' {
 }
 
 /** Render a cvar editor panel into a container. Returns bound cvar names. */
-export function renderCvarPanel(container: unknown, filter = ''): string[] {  const names = listCVars()
+export function renderCvarPanel(
+  container: unknown,
+  filter = '',
+  onChange: (name: string, value: string) => void = () => undefined,
+): string[] {  const names = listCVars()
     .map((c) => c.name)
     .filter((n) => !filter || n.includes(filter));
   if (typeof document === 'undefined' || !container) return names;
@@ -208,8 +232,8 @@ export function renderCvarPanel(container: unknown, filter = ''): string[] {  co
       // Reflect out-of-list values (e.g. sw_workers=8, r_brightness=1.1)
       // instead of silently showing the wrong preset.
       const choices = options.includes(current) ? options : [current, ...options];
-      // Labeled domains (skill 0-3 → Easy/Medium/Hard/Nightmare) persist
-      // the bare value; the label is display-only.
+      // Labeled domains (skill 0-3 → Easy/Medium/Hard/Nightmare, resolution
+      // WxH → 320×240…) persist the bare value; the label is display-only.
       const labels = cvarOptionLabels(name);
       for (const opt of choices) {
         const el = document.createElement('option');
@@ -222,6 +246,7 @@ export function renderCvarPanel(container: unknown, filter = ''): string[] {  co
       select.addEventListener('change', () => {
         try {
           setCVarFromString(name, select.value);
+          onChange(name, select.value);
         } catch {
           select.value = getCVarString(name);
         }
@@ -234,6 +259,7 @@ export function renderCvarPanel(container: unknown, filter = ''): string[] {  co
       input.addEventListener('change', () => {
         try {
           setCVarFromString(name, input.value);
+          onChange(name, input.value);
         } catch {
           input.value = getCVarString(name);
         }

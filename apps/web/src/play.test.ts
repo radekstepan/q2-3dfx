@@ -197,7 +197,7 @@ describe('play driver (devroom, headless)', () => {
     // pillar (player spawn is west at -168, 0) so the pillar blocks LOS and
     // the chase selector holds the run move (frame0 dist 10/tick) instead of
     // committing to a standing attack. It must still walk toward the player.
-    driver.monsters.push({ id: 99, origin: [100, 0, 32], state: spawnMonster('soldier'), lastAttack: -10 });
+    driver.monsters.push({ id: 99, origin: [100, 0, 32], state: spawnMonster('soldier'), skin: 2, lastAttack: -10 });
     const m = driver.monsters[0]!;
     m.state.move = 'run';
     m.state.frame = 0;
@@ -597,7 +597,7 @@ describe('play driver (devroom, headless)', () => {
     driver.pm.origin = v3(-168, 100, 24);
     driver.pm.velocity = v3();
     driver.pm.viewAngles = v3(0, 0, 0);
-    driver.monsters.push({ id: 99, origin: [100, 92, 24], state: spawnMonster('soldier'), lastAttack: -10 });
+    driver.monsters.push({ id: 99, origin: [100, 92, 24], state: spawnMonster('soldier'), skin: 2, lastAttack: -10 });
     const m = driver.monsters[0]!;
     // Kill cleanly (30hp exactly: dead, not gibbed since 0 > gibHealth -30).
     expect(monsterPain(m.state, 30, () => 0.5)).toBe('dead');
@@ -630,7 +630,7 @@ describe('play driver (devroom, headless)', () => {
     const { driver } = boot;
     // Soldier off to the side (open LOS past the pillar) at ~224u: NEAR
     // range, so chase commits attack1/attack2 once it faces the player.
-    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), lastAttack: -10 });
+    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), skin: 2, lastAttack: -10 });
     let sawTracer = false;
     let sawBolt = false;
     let sawFlash = false;
@@ -726,7 +726,10 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     // 3. Monster kill: stand next to a soldier in its own cell (same room,
     //    clear line of sight), aim dead-on, fire the blaster until it dies.
     //    The soldier melees back every ~1s, proving fight-back damage.
-    const target = driver.monsters[0]!;
+    //    The first plain (shotgun-skin) soldier keeps the pre-skin-roster
+    //    geometry this script was tuned against (an enclosed cell where bolt
+    //    wall-splash chips the target); lights live in the open.
+    const target = driver.monsters.find((m) => m.skin === 2) ?? driver.monsters[0]!;
     let killed = false;
     for (const [ox, oy] of [[48, 0], [-48, 0], [0, 48], [0, -48]] as const) {
       if (target.state.dead) {
@@ -911,10 +914,12 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     for (const x of barrelX) {
       expect(x.skin).toBe(boot.models!.barrelSkin);
     }
-    // Snapshot pairing hooks: soldier resolves to its own handles, unknown
+    // Snapshot pairing hooks: soldiers resolve to their per-skin handles
+    // (first lump monster is a light: skin_lt, not the default), unknown
     // ids to null (Host default), monster facing rides entityAngles.
     const m0 = driver.monsters[0]!;
-    expect(driver.entityModel(m0.id)).toEqual({ model: boot.models!.monster, skin: boot.models!.monsterSkin });
+    expect(driver.entityModel(m0.id)).toEqual({ model: boot.models!.monster, skin: driver.soldierSkinFor(m0.skin) });
+    expect(driver.soldierSkinFor(m0.skin)).toBe(boot.models!.soldierLightSkin);
     expect(driver.entityModel(999999)).toBeNull();
     const yaw0 = ((m0.state.yaw % 360) + 360) % 360;
     expect(driver.entityAngles(m0.id)).toEqual([0, yaw0, 0]);

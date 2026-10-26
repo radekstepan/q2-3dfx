@@ -1,0 +1,148 @@
+import { describe, expect, it, afterEach } from 'vitest';
+import { resetCVars } from '@q2/config';
+import { isGreenBoltColor, soldierWeaponForSkin, spawnMonster } from '@q2/game';
+import type { UserCmdT } from '@q2/input';
+import { bootPlay, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR } from './play.js';
+
+function neutralCmd(angles: [number, number, number] = [0, 0, 0]): UserCmdT {
+  return { msec: 100, angles, forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
+}
+
+afterEach(() => {
+  resetCVars();
+});
+
+describe('hitscan tracer color (no green lasers)', () => {
+  it('hitscan color is the C-correct yellow, never palette green', () => {
+    // Game-lane audit (@q2/game weapons.ts): 208–214 is GREEN on the engine
+    // palette (the reported green laser); 225 is the near-white yellow core.
+    expect(HITSCAN_TRACER_COLOR).toBe(225);
+    expect(PELLET_TRACER_COLOR).toBe(HITSCAN_TRACER_COLOR);
+    expect(isGreenBoltColor(HITSCAN_TRACER_COLOR)).toBe(false);
+    expect(isGreenBoltColor(PELLET_TRACER_COLOR)).toBe(false);
+    for (let c = 208; c <= 214; c++) expect(isGreenBoltColor(c)).toBe(true);
+  });
+
+  it('soldier weapon is skin-determined (never random)', () => {
+    expect(soldierWeaponForSkin(0)).toBe('blaster');
+    expect(soldierWeaponForSkin(2)).toBe('shotgun');
+    expect(soldierWeaponForSkin(4)).toBe('machinegun');
+  });
+
+  it('shotgun-skin return fire queues yellow tracers only, never bolts', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), skin: 2, lastAttack: -10 });
+    let sawTracer = false;
+    for (let i = 0; i < 120 && !sawTracer; i++) {
+      driver.step(neutralCmd(), 0.1);
+      const got = driver.drainTracers();
+      for (const t of got) {
+        // Shotgun AND machinegun tracer call sites pin here: every queued
+        // beam must avoid the 208–214 green band.
+        expect(t.color).toBe(HITSCAN_TRACER_COLOR);
+        expect(isGreenBoltColor(t.color)).toBe(false);
+        sawTracer = true;
+      }
+    }
+    expect(driver.events).toContain('monshot');
+    expect(sawTracer).toBe(true);
+    // Shotgun skins never spawn projectile bolts (id soldier_fire).
+    expect(driver.bolts.length).toBe(0);
+  });
+
+  it('light-skin soldiers fire foe blaster bolts, never hitscan tracers', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), skin: 0, lastAttack: -10 });
+    let sawBolt = false;
+    for (let i = 0; i < 120 && !sawBolt; i++) {
+      driver.step(neutralCmd(), 0.1);
+      expect(driver.drainTracers()).toEqual([]);
+      if (driver.bolts.length > 0) sawBolt = true;
+    }
+    expect(driver.events).toContain('monshot');
+    expect(sawBolt).toBe(true);
+  });
+
+  it('machinegun-skin soldiers burst yellow tracers with the ss attack sound', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), skin: 4, lastAttack: -10 });
+    let sawBurst = false;
+    for (let i = 0; i < 200 && !sawBurst; i++) {
+      driver.step(neutralCmd(), 0.1);
+      const got = driver.drainTracers();
+      if (got.length >= 3) {
+        // One fire event = a 3-round fan (id HOLD_FRAME burst): all yellow.
+        for (const t of got) {
+          expect(t.color).toBe(HITSCAN_TRACER_COLOR);
+          expect(isGreenBoltColor(t.color)).toBe(false);
+        }
+        sawBurst = true;
+      } else {
+        expect(got.every((t) => !isGreenBoltColor(t.color))).toBe(true);
+      }
+    }
+    expect(driver.events).toContain('monshot');
+    expect(sawBurst).toBe(true);
+    // The ss attack sound (verified present in pak0.pak) fires with the burst.
+    const names = driver.mixer.mix().map((c) => c.name);
+    expect(names).toContain('soldier/solatck3.wav');
+    expect(driver.soldierSkinFor(4)).toBe(0); // no pak: Host default
+  });
+});
+
+const WEB_Q2_PAK = process.env.Q2_PAK;
+
+describe.runIf(!!WEB_Q2_PAK)('per-skin soldier rendering (real pak, Q2_PAK)', () => {
+  async function bootPak(width = 160, height = 120) {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    return bootPlay({ width, height, pak: ingestPak(buf) });
+  }
+
+  it('light/plain/ss resolve to three distinct skins on the one soldier mesh', { timeout: 180000 }, async () => {
+    const boot = await bootPak();
+    const { driver } = boot;
+    const models = boot.models!;
+    expect(models.soldierLightSkin).toBeGreaterThanOrEqual(0);
+    expect(models.soldierSsSkin).toBeGreaterThanOrEqual(0);
+    expect(new Set([models.monsterSkin, models.soldierLightSkin, models.soldierSsSkin]).size).toBe(3);
+    // Registration order contract intact: soldier skin 0 + mesh 0.
+    expect(models.monster).toBe(0);
+    expect(models.skins[0]).toBe(0);
+    // base1 ships 6 lights + 8 plains, and the raised cap keeps all 14.
+    expect(driver.monsters.filter((m) => m.skin === 0).length).toBe(6);
+    expect(driver.monsters.filter((m) => m.skin === 2).length).toBe(8);
+    const light = driver.monsters.find((m) => m.skin === 0)!;
+    const plain = driver.monsters.find((m) => m.skin === 2)!;
+    expect(driver.entityModel(light.id)).toEqual({ model: models.monster, skin: models.soldierLightSkin });
+    expect(driver.entityModel(plain.id)).toEqual({ model: models.monster, skin: models.monsterSkin });
+    // Synthetic ss (no base1 ss): distinct machinegun skin, same mesh.
+    driver.monsters.push({ id: 999, origin: [0, 0, 32], state: spawnMonster('soldier'), skin: 4, lastAttack: -10 });
+    expect(driver.entityModel(999)).toEqual({ model: models.monster, skin: models.soldierSsSkin });
+    // Odd pain skins fall back to their even base.
+    expect(driver.soldierSkinFor(1)).toBe(models.soldierLightSkin);
+    expect(driver.soldierSkinFor(5)).toBe(models.soldierSsSkin);
+    expect(driver.soldierSkinFor(3)).toBe(models.monsterSkin);
+  });
+
+  it('monsters render with their per-skin handles (light ≠ shotgun)', { timeout: 180000 }, async () => {
+    const boot = await bootPak();
+    const { driver, host } = boot;
+    const light = driver.monsters.find((m) => m.skin === 0)!;
+    const plain = driver.monsters.find((m) => m.skin === 2)!;
+    expect(light).toBeDefined();
+    expect(plain).toBeDefined();
+    // Exercise the snapshot→Host path (frames + origins flow as before).
+    const snap = driver.snapshot(driver.server.time);
+    expect(snap.entities.some((e) => e.id === light.id)).toBe(true);
+    expect(snap.entities.some((e) => e.id === plain.id)).toBe(true);
+    const stats = host.frame(100);
+    expect(stats.pixels).toBeGreaterThan(0);
+  });
+});
