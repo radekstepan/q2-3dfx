@@ -750,6 +750,38 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 - framebuffer + canvas, CSS upscale stays ×2.
 - Still open: INFANTRY lite def; DM-only items spawning in SP; machinegun
 - per-shot kick walk; sky-hit silent free.
+### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #7, all landed):
+- Blaster tile-row dlight (`@q2/sw-renderer`): `bspToMiniWorld` sized luxel
+- grids `floor(span/16)+1` but id `CalcSurfaceExtents` uses floor(min/16)..
+- ceil(max/16) with ≥2×2 luxels — 6464/7905 base1 faces row-shifted, so
+- whole tile rows lit while neighbors stayed dark. Now 0 mismatches on all
+- 7663 renderable faces; falloff itself was already radial, kept as-is.
+- Secret clip-through (`packages/server`): player trace ran mask SOLID alone,
+- C uses `SOLID|PLAYERCLIP|WINDOW|MONSTER` — base1 seals stairs/ledges with 36
+- PLAYERCLIP + 7 WINDOW brushes, so mask-1 drops fell out of the world
+- (e.g. (-500,150) → -600 vs C-mask 120). `SV_TraceFor`/`SV_SetPmoveWorld`
+- now C-mask; explosive/wall clip handling at spawn; secret rooms hold.
+- Ships loop forever: C `train_next` re-follows teleport-corner target links
+- (`advanceTrainSeg`); the t147/t141/t130 closers used to terminate the chain.
+- Monster spawn drop is C `MASK_MONSTERSOLID` (`SV_DropTraceFor`); web driver
+- adopts it (was mask-1 → -86.27 below the true -83.97 floor).
+- Enemy pursuit: eye-to-eye LOS (+25/+22, MASK_OPAQUE), SV_movestep-style
+- lift-18/move/drop-36 stair climb, sustained uphill pursuit proven 96→23.
+- Web (`apps/web`): `map_source` dropdown (pak game ↔ devroom demomap,
+- restarts on change, replaces clear-pak flow); in-game position readout,
+- controls hint, and green canvas fps removed (DOM `#q2-fps` + `cl_showfps`
+- own the counter); ships submit from live positions regardless of started;
+- enemy hitscan capped to a 48u muzzle streak (never chest→eye, no face
+- flame); `func_explosive` *20/*30 render at bbox bottom (the real floaters —
+- barrels were always correct); driver follow pinned by shrinking-distance
+- tests. quake-2-JS comparison (read-only): same base1 data; their game AI is
+- a fuller C port (player-trail pursuit, M_CheckAttack table, soldier duck,
+- secret/rotating doors, skill-scaled aggression) — our skeleton is
+- behavior-compatible; whole-roster port stays an M5.3 job. Kept our
+- `BUTTON_DUCK`/KeyC extension (their `+movedown`/upmove equivalent) since
+- pmove honors both C-faithful `upmove<0` and the hold bit.
+- Still open: INFANTRY lite def; DM-only items spawning in SP; machinegun
+- per-shot kick walk; sky-hit silent free.
 ### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #3, all landed):
 - Blaster projectiles now C-faithful (`g_weapon.c`/`p_weapon.c`/`cl_fx.c`):
 - spawn = literal `G_ProjectSource` from feet (`+ fwd*24 + right*8`, `z += viewheight-8`);

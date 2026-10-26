@@ -83,7 +83,7 @@ import type {
   TraceResult,
   PlayerState,
 } from '@q2/game';
-import { SV_Init, SV_SetSkill, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, fireTargets } from '@q2/server';
+import { SV_Init, SV_SetSkill, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, fireTargets, SV_DropTraceFor } from '@q2/server';
 import type { ServerState } from '@q2/server';
 import { ATTN_NORM, Mixer } from '@q2/sound';
 import { parseMD2, parseWAL, parsePCX } from '@q2/formats';
@@ -1865,15 +1865,15 @@ export class LocalDriver implements HostDriver {
       const skin = cls === 'monster_soldier_light' ? 0 : cls === 'monster_soldier_ss' ? 4 : cls === 'monster_gunner' ? 0 : 2;
       const o = (d['origin'] ?? '0 0 0').trim().split(/\s+/).map(Number);
       let origin: [number, number, number] = [o[0] ?? 0, o[1] ?? 0, o[2] ?? 0];
-      // id walkmonster_start_go + M_droptofloor: the lump origin is the
-      // entity origin 24 above the feet; drop the hull to the floor so a
-      // map-placed origin floating above ground rests correctly instead of
-      // hovering, and clamp startsolid Luton setups onto the floor.
-      if (this.bspTrace) {
+      // id walkmonster_start_go + M_droptofloor (game/g_monster.c): the lump
+      // origin is the entity origin 24 above the feet; drop with C's
+      // MASK_MONSTERSOLID (SV_DropTraceFor) so clip-sealed decks hold.
+      const drop = SV_DropTraceFor(map);
+      {
         const start = v3(origin[0], origin[1], origin[2] + 1);
         const end = v3(origin[0], origin[1], origin[2] - 256);
         try {
-          const tr = this.bspTrace(start, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, end);
+          const tr = drop(start, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, end);
           if (!tr.allsolid) origin = [tr.endpos[0]!, tr.endpos[1]!, tr.endpos[2]!];
         } catch {
           // Keep the lump origin on trace failure (devroom-style fallback).
