@@ -140,10 +140,12 @@ describe('host loop', () => {
     for (const x of xs) expect(x).toBeCloseTo(100, 3);
   });
 
-  it('viewmodel rides the view axis level: no pitch swing, no yaw orbit', () => {
-    // Eye-anchored gun with yaw-only orientation: pitching the view must
-    // not swing the gun, and yawing must carry it along the view axis
-    // (attached at a fixed forward push, never orbiting a world point).
+  it('viewmodel sits at the eye with full view angles (CL_AddViewWeapon)', () => {
+    // Eye-anchored gun with full view angles: the origin is the view
+    // origin at every pitch/yaw/roll (no forward push, no orbit), the
+    // angles are the live view angles, and the entity carries the
+    // RF_DEPTHHACK bias flag. Breech-behind-eye visibility is the alias
+    // backend's job (near-plane Sutherland clip, pinned in sw-renderer).
     const driver: HostDriver = {
       spawn: () => ({ origin: [0, 0, 32] }),
       step: () => {},
@@ -160,40 +162,31 @@ describe('host loop', () => {
       entities: [{ id: 1, origin: [0, 0, 32], velocity: [0, 0, 0] }],
     });
     const eye = calcViewOrigin([0, 0, 32]);
-    const gunAt = (pitch: number, yaw: number): Entity => {
-      host.lastCmd = { msec: 16, angles: [pitch, yaw, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
+    const gunAt = (pitch: number, yaw: number, roll: number): Entity => {
+      host.lastCmd = { msec: 16, angles: [pitch, yaw, roll], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
       host.renderCurrentView();
       const gun = refresh.lastEntities!.find((e) => e.model === 5);
       expect(gun).toBeDefined();
       return gun!;
     };
-    // id AngleVectors forward for [pitch, yaw, 0], pitch positive = down.
-    const fwd = (pitch: number, yaw: number): [number, number, number] => {
-      const p = (pitch * Math.PI) / 180;
-      const y = (yaw * Math.PI) / 180;
-      return [Math.cos(p) * Math.cos(y), Math.cos(p) * Math.sin(y), -Math.sin(p)];
-    };
-    for (const [pitch, yaw] of [[0, 45], [-30, 45], [-30, 135], [10, 270]] as const) {
-      const gun = gunAt(pitch, yaw);
-      // Level: no pitch/roll inheritance — the gun does not swing.
-      expect(Array.from(gun.angles)).toEqual([0, yaw, 0]);
+    for (const [pitch, yaw, roll] of [[0, 45, 0], [-30, 45, 0], [-30, 135, 0], [10, 270, 5]] as const) {
+      const gun = gunAt(pitch, yaw, roll);
+      // Full view angles inherited — the gun pitches/rolls with the view.
+      expect(Array.from(gun.angles)).toEqual([pitch, yaw, roll]);
       expect(gun.skin).toBe(2);
       expect(gun.frame).toBe(9);
-      // Attached: exactly VIEWMODEL_FORWARD out along the live view axis.
-      const f = fwd(pitch, yaw);
+      expect(gun.depthHack).toBe(true);
+      // Eye anchor: exactly at the view origin, whatever the angles.
       for (let k = 0; k < 3; k++) {
-        expect(gun.origin[k]!).toBeCloseTo(eye[k]! + f[k]! * VIEWMODEL_FORWARD, 5);
+        expect(gun.origin[k]!).toBeCloseTo(eye[k]!, 5);
       }
     }
-    // Pitch 0 vs -30 at fixed yaw: identical orientation, both on-axis —
-    // the gun stays attached instead of rotating away with the view.
-    const level = gunAt(0, 45);
-    const down = gunAt(-30, 45);
-    expect(Array.from(level.angles)).toEqual(Array.from(down.angles));
-    const dist = (g: Entity): number =>
-      Math.hypot(g.origin[0]! - eye[0]!, g.origin[1]! - eye[1]!, g.origin[2]! - eye[2]!);
-    expect(dist(level)).toBeCloseTo(VIEWMODEL_FORWARD, 5);
-    expect(dist(down)).toBeCloseTo(VIEWMODEL_FORWARD, 5);
+    // No push: distance from the eye is VIEWMODEL_FORWARD (0).
+    const gun = gunAt(-30, 45, 0);
+    const dist = Math.hypot(
+      gun.origin[0]! - eye[0]!, gun.origin[1]! - eye[1]!, gun.origin[2]! - eye[2]!,
+    );
+    expect(dist).toBeCloseTo(VIEWMODEL_FORWARD, 5);
   });
 
   it('propagates per-entity yaw and model/skin, defaults to legacy zeros', () => {

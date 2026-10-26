@@ -185,6 +185,13 @@ section in the same PR.
 
 ```ts
 // @q2/renderer-api
+export interface Entity {
+  model: ModelHandle;
+  origin: Vec3; angles: Vec3;
+  frame: number; skin: TextureHandle;
+  /** RF_DEPTHHACK: alias backend scales stored 1/z by 3 (eye-anchored viewmodel). */
+  depthHack?: boolean;
+}
 export interface Refresh {
   init(fb: Framebuffer): void;
   beginFrame(): void;
@@ -663,6 +670,24 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
   `info_player_start` (id SP `SelectSpawnPoint` rule) — base1's lump leads
   with a `targetname "base2"` start over the exit pit that used to spawn the
   player onto the exit volume and instantly "complete" the level.
+### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #3, all landed):
+- Blaster projectiles now C-faithful (`g_weapon.c`/`p_weapon.c`/`cl_fx.c`):
+- spawn = literal `G_ProjectSource` from feet (`+ fwd*24 + right*8`, `z += viewheight-8`);
+- muzzle dlight `feet + fwd*18 + right*16`, `200+(rand&31)`, pure yellow;
+- per-bolt in-flight 200-yellow dlight; trail fixed `0xe0`; SP damage 10.
+- No beam for blaster/shotgun (only railgun draws `TE_RAILTRAIL` — dead
+- `queueTracer` path stays unused for these weapons by design).
+- Viewmodel hand now C-faithful (`CL_AddViewWeapon`): eye-anchored
+- (`VIEWMODEL_FORWARD = 0`) + full view angles + hide when `fovX > 90`;
+- alias backend Sutherland-clips at `vz = near` instead of dropping whole
+- tris (no more cutoff hand); `Entity.depthHack` (RF_DEPTHHACK, `s_ziscale *= 3`)
+- keeps the gun winning vs walls. Devroom golden `8f61c755` preserved.
+- Enemies face + animate: `entityAngles` returns stored yaw (was null), corpses
+- persist with death move held on last frame, attack latched mid-move with
+- `FacingIdeal` ±45° gate, yaw clamped per-tick (`M_ChangeYaw`, speed 20).
+- Still open: sky-hit silent free (needs SURF_SKY flag in trace), ex_misc
+- explosion billboard + lasfly loop (renderer/audio hooks), LerpAngle yaw interp
+- + RF_FRAMELERP vertex lerp (needs frozen-contract Entity `oldframe/backlerp`).
 - Pickups respawn: DONE (M7.4, DM-style ~30s timers in SP).
 - `syncMixerToBrowser` per-name pak wav decode: DONE (lazy per-channel decode,
   24-entry cache, shot/synth fallback). Follow-up: several driver channel names

@@ -336,7 +336,21 @@ export interface AliasInstance {
   frameA: number; frameB: number; lerp: number;
   /** yaw-quantised light angle 0..255 */
   lightAngle: number;
+  /**
+   * Depth-bias multiplier on stored 1/z (Entity.depthHack feeds
+   * DEPTHHACK_SCALE here; default 1 = unbiased). Screen x/y projection
+   * always uses the true 1/vz — only the depth value is scaled.
+   */
+  depthScale?: number;
 }
+
+/**
+ * RF_DEPTHHACK bias (ref_soft `s_ziscale *= 3`, r_alias.c): the
+ * eye-anchored viewmodel's stored 1/z is tripled so the gun wins the
+ * depth test against walls it would otherwise sit inside. Larger stored
+ * 1/z = nearer (fillAffineTri keeps `iz > zb`).
+ */
+export const DEPTHHACK_SCALE = 3;
 
 export interface AliasSkin {
   texels: Uint8Array;
@@ -395,9 +409,16 @@ export function drawAliasInstance(
   }
   void anorms;
   const row = (inst.lightAngle & 255) * ANORM_COUNT;
+  const depthScale = inst.depthScale ?? 1;
+  // Hoisted: identical for every vert of this instance (was recomputed
+  // per vert with the same result).
+  const shadeFrame = t < 0.5 ? inst.frameA : inst.frameB;
   let pixels = 0;
   const tv: TriVert[] = aliasTri;
   for (let ti = 0; ti < mesh.numTris; ti++) {
+    // To view space first (no projection yet); u/v + shade grade ride
+    // along so the near-plane clip below can interpolate them.
+    let allIn = true;
     for (let k = 0; k < 3; k++) {
       const vi = mesh.tris[ti * 3 + k]!;
       // to view space
@@ -407,23 +428,54 @@ export function drawAliasInstance(
       const vx = px * cam.right[0]! + py * cam.right[1]! + pz * cam.right[2]!;
       const vy = px * cam.up[0]! + py * cam.up[1]! + pz * cam.up[2]!;
       const vz2 = px * cam.forward[0]! + py * cam.forward[1]! + pz * cam.forward[2]!;
-      const v = tv[k]!;
-      if (vz2 < cam.near) {
-        v.iz = -1;
-        continue;
-      }
-      const iz = 1 / vz2;
-      v.x = cam.xCenter + vx * cam.focalX * iz;
-      v.y = cam.yCenter - vy * cam.focalY * iz;
-      v.iz = iz;
-      v.u = mesh.st[vi * 2]!;
-      v.v = mesh.st[vi * 2 + 1]!;
-      const frame = t < 0.5 ? inst.frameA : inst.frameB;
-      const ni = mesh.normals[(frame * nv + vi) % mesh.normals.length]! % ANORM_COUNT;
-      v.grade = shadeDots[row + ni]!;
+      clipIX[k] = vx; clipIY[k] = vy; clipIZ[k] = vz2;
+      clipIU[k] = mesh.st[vi * 2]!;
+      clipIV[k] = mesh.st[vi * 2 + 1]!;
+      const ni = mesh.normals[(shadeFrame * nv + vi) % mesh.normals.length]! % ANORM_COUNT;
+      clipIG[k] = shadeDots[row + ni]!;
+      if (vz2 < cam.near) allIn = false;
     }
-    if (tv[0]!.iz < 0 || tv[1]!.iz < 0 || tv[2]!.iz < 0) continue;
-    pixels += fillAffineTri(idx, zb, fbW, fbH, tv[0]!, tv[1]!, tv[2]!, skin, colormap);
+    if (allIn) {
+      // Fast path (bit-identical to the old project-then-draw): no vert
+      // near the plane, so no clipping. Devroom/world geometry always
+      // lands here — the clip below only triggers for eye-anchored
+      // viewmodel tris straddling vz = near.
+      for (let k = 0; k < 3; k++) {
+        const v = tv[k]!;
+        const iz = 1 / clipIZ[k]!;
+        v.x = cam.xCenter + clipIX[k]! * cam.focalX * iz;
+        v.y = cam.yCenter - clipIY[k]! * cam.focalY * iz;
+        v.iz = iz * depthScale;
+        v.u = clipIU[k]!;
+        v.v = clipIV[k]!;
+        v.grade = clipIG[k]!;
+      }
+      pixels += fillAffineTri(idx, zb, fbW, fbH, tv[0]!, tv[1]!, tv[2]!, skin, colormap);
+      continue;
+    }
+    // Straddler: Sutherland clip the view-space polygon at vz = near
+    // (r_aclip.c R_ClipPolyPlane / ALIAS_Z_CLIP_PLANE semantics — keep the
+    // visible part, never drop the whole tri), then project the cut verts
+    // with the same focal math and emit 1-2 tris. Backface cull applies
+    // per emitted tri inside fillAffineTri.
+    const m = clipPolyNear(cam.near);
+    if (m < 3) continue;
+    for (let k = 0; k < m; k++) {
+      const c = aliasClipped[k]!;
+      const iz = 1 / clipOZ[k]!;
+      c.x = cam.xCenter + clipOX[k]! * cam.focalX * iz;
+      c.y = cam.yCenter - clipOY[k]! * cam.focalY * iz;
+      c.iz = iz * depthScale;
+      c.u = clipOU[k]!;
+      c.v = clipOV[k]!;
+      c.grade = clipOG[k]!;
+    }
+    pixels += fillAffineTri(idx, zb, fbW, fbH,
+      aliasClipped[0]!, aliasClipped[1]!, aliasClipped[2]!, skin, colormap);
+    if (m === 4) {
+      pixels += fillAffineTri(idx, zb, fbW, fbH,
+        aliasClipped[0]!, aliasClipped[2]!, aliasClipped[3]!, skin, colormap);
+    }
   }
   return pixels;
 }
@@ -445,6 +497,72 @@ const aliasTri: TriVert[] = [
   { x: 0, y: 0, iz: 0, u: 0, v: 0, grade: 0 },
   { x: 0, y: 0, iz: 0, u: 0, v: 0, grade: 0 },
 ];
+
+/**
+ * View-space near-plane clip scratch (Sutherland against the single plane
+ * vz = near, r_aclip.c R_ClipPolyPlane semantics). Input polygon = the
+ * tri (3 verts); output = up to 4 verts. Module-scope so the frame loop
+ * never allocates. Float64: the projection math consumes full float64
+ * intermediates exactly like the old direct path, so the all-inside fast
+ * path stays bit-identical (Float32 rounding here changed the golden).
+ */
+const clipIX = new Float64Array(4);
+const clipIY = new Float64Array(4);
+const clipIZ = new Float64Array(4);
+const clipIU = new Float64Array(4);
+const clipIV = new Float64Array(4);
+const clipIG = new Float64Array(4);
+const clipOX = new Float64Array(4);
+const clipOY = new Float64Array(4);
+const clipOZ = new Float64Array(4);
+const clipOU = new Float64Array(4);
+const clipOV = new Float64Array(4);
+const clipOG = new Float64Array(4);
+const aliasClipped: TriVert[] = [
+  { x: 0, y: 0, iz: 0, u: 0, v: 0, grade: 0 },
+  { x: 0, y: 0, iz: 0, u: 0, v: 0, grade: 0 },
+  { x: 0, y: 0, iz: 0, u: 0, v: 0, grade: 0 },
+  { x: 0, y: 0, iz: 0, u: 0, v: 0, grade: 0 },
+];
+
+/**
+ * Sutherland clip of the tri in (clipIX..clipIG) against vz >= near,
+ * emitting the kept polygon into (clipOX..clipOG). Returns the kept
+ * vert count (0..4). Cut verts linearly interpolate every carried
+ * channel (view coords + u/v + shade grade) at the plane crossing;
+ * vertex order is preserved so the quad fan (0,1,2)+(0,2,3) keeps the
+ * original winding.
+ */
+function clipPolyNear(near: number): number {
+  let m = 0;
+  for (let i = 0; i < 3; i++) {
+    const j = (i + 1) % 3;
+    const zin = clipIZ[i]! >= near;
+    const zjn = clipIZ[j]! >= near;
+    if (zin && zjn) {
+      clipOX[m] = clipIX[j]!; clipOY[m] = clipIY[j]!; clipOZ[m] = clipIZ[j]!;
+      clipOU[m] = clipIU[j]!; clipOV[m] = clipIV[j]!; clipOG[m] = clipIG[j]!;
+      m++;
+    } else if (zin !== zjn) {
+      // Mixed edge: exactly one endpoint inside (denominator nonzero —
+      // equal depths would put both endpoints on the same side).
+      const tt = (near - clipIZ[i]!) / (clipIZ[j]! - clipIZ[i]!);
+      clipOX[m] = clipIX[i]! + (clipIX[j]! - clipIX[i]!) * tt;
+      clipOY[m] = clipIY[i]! + (clipIY[j]! - clipIY[i]!) * tt;
+      clipOZ[m] = near;
+      clipOU[m] = clipIU[i]! + (clipIU[j]! - clipIU[i]!) * tt;
+      clipOV[m] = clipIV[i]! + (clipIV[j]! - clipIV[i]!) * tt;
+      clipOG[m] = clipIG[i]! + (clipIG[j]! - clipIG[i]!) * tt;
+      m++;
+      if (!zin && zjn) {
+        clipOX[m] = clipIX[j]!; clipOY[m] = clipIY[j]!; clipOZ[m] = clipIZ[j]!;
+        clipOU[m] = clipIU[j]!; clipOV[m] = clipIV[j]!; clipOG[m] = clipIG[j]!;
+        m++;
+      }
+    }
+  }
+  return m;
+}
 
 /** Affine triangle filler: linear u/v/grade in screen space, 1/z depth test. */
 export function fillAffineTri(

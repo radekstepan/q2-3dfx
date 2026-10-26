@@ -460,6 +460,8 @@ export class LocalDriver implements HostDriver {
   /** Muzzle flash expiry (server time) + world pos for the dlight/HUD flash. */
   private flashUntil = -10;
   private flashPos: Vec3 = v3();
+  /** Muzzle dlight radius for the pending flash (id CL_MuzzleFlash 200+(rand&31)). */
+  private flashIntensity = 200;
   /** One-shot pump gate: true only between a shot and its single drain. */
   private flashPending = false;
   /** Queued tracer beams (see TracerBeam): drained by pumpTracers(). */
@@ -560,7 +562,13 @@ export class LocalDriver implements HostDriver {
     SV_TouchTriggersAt(this.server, 'player', this.playerEdict);
     this.syncDoors();
     for (const m of this.monsters) {
-      if (m.state.dead) continue;
+      if (m.state.dead) {
+        // Corpses persist: keep advancing the death move to its last frame
+        // (monsterThink holds it there) so the snapshot keeps rendering the
+        // fallen body instead of freezing on frame 0.
+        monsterThink(m.state);
+        continue;
+      }
       // Steering (id walkmonster_start/run logic): chase the player along a
       // trivial 2-node graph (self -> player) with line-of-sight, so idle
       // stand flips to run/attack and locomotion has a nonzero dist to play.
@@ -633,7 +641,9 @@ export class LocalDriver implements HostDriver {
       },
     ];
     for (const m of this.monsters) {
-      if (m.state.dead) continue;
+      // Corpses persist in the snapshot (id keeps the dead edict rendering
+      // its last death frame); the host draws them via entityFrame, which
+      // clamps to the held final frame of the death move.
       entities.push({
         id: m.id,
         origin: [m.origin[0]!, m.origin[1]!, m.origin[2]!],
@@ -760,13 +770,20 @@ export class LocalDriver implements HostDriver {
 
   /**
    * World orientation for a snapshot entity (HostDriver pairing). Monsters
-   * keep the legacy [0,0,0] — locomotion faces them toward the player
-   * transiently without storing yaw. Bolt flight orientation rides on the
-   * extras themselves (see extraEntities). Headless-safe pure math.
+   * report the locomotion-maintained yaw (id M_ChangeYaw, shortest-arc
+   * clamped per tick) so the host renders them facing the player instead of
+   * the legacy yaw-0 snap. Bolt flight orientation rides on the extras
+   * themselves (see extraEntities). Headless-safe pure math. Unknown ids
+   * return null for the Host default.
+   * TODO(interp): LerpAngle between snapshots (client/cl_ents.c) + frame
+   * vertex lerp via oldframe/backlerp (RF_FRAMELERP) keyed off
+   * serverAcc/SERVER_DT. Needs an Entity contract change (frozen BRAIN.md
+   * §6), so yaw/frames still step at 10Hz for now.
    */
   entityAngles(id: number): [number, number, number] | null {
-    void id;
-    return null;
+    const m = this.monsters.find((m) => m.id === id);
+    if (!m) return null;
+    return [0, ((m.state.yaw % 360) + 360) % 360, 0];
   }
 
   /** Drain the one-shot muzzle-flash dlight request (dom tick pumps it). */
@@ -780,6 +797,15 @@ export class LocalDriver implements HostDriver {
     }
     this.flashPending = false;
     return this.flashPos;
+  }
+
+  /**
+   * Pending muzzle-flash radius (id CL_MuzzleFlash 200+(rand&31), rolled at
+   * fire time so the stream stays caller-seeded deterministic). Read after
+   * drainFlash() by the dlight pump; 200 before the first shot.
+   */
+  peekFlashIntensity(): number {
+    return this.flashIntensity;
   }
 
   /**
@@ -918,7 +944,15 @@ export class LocalDriver implements HostDriver {
     }
   }
 
-  /** id-style touch damage + ranged tracer fire back at the player. */
+  /** id-style touch damage + ranged tracer fire back at the player.
+   *
+   * TODO(fire-frames): key damage/sound off the move's fire-tagged frames
+   * (monsterThink action) instead of this ~1/s timer, so hits land on the
+   * muzzle flash. Left timer-based on purpose: the soldier attack tables
+   * carry no fire tags yet (all 'move'), so gating here would silence/stall
+   * soldier attacks, and re-timing kills would invalidate the Q2_PAK bot
+   * expectations (damage within the kill loop, melee-back every ~1s).
+   */
   private monsterCombat(): void {
     if (this.playerDead) return;
     const eye = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + EYE);
@@ -1179,16 +1213,21 @@ export class LocalDriver implements HostDriver {
       eye,
     );
     // Muzzle flash: HUD glow + a real dlight the renderer understands.
+    // id CL_MuzzleFlash: origin = feet + fwd*18 + right*16 (full 3D fwd/
+    // right via G_ProjectSource, no up vector), radius 200+(rand&31),
+    // pure yellow, single frame.
     this.flashUntil = t + 0.09;
     this.flashPending = true;
+    this.flashIntensity = 200 + ((this.rand() * 32) | 0);
     const fwd0 = v3();
     const right0 = v3();
     const up0 = v3();
     AngleVectors(new Float32Array(cmd.angles) as Vec3, fwd0, right0, up0);
+    const feet0 = this.pm.origin;
     this.flashPos = v3(
-      eye[0]! + fwd0[0]! * 16,
-      eye[1]! + fwd0[1]! * 16,
-      eye[2]! + fwd0[2]! * 16,
+      feet0[0]! + fwd0[0]! * 18 + right0[0]! * 16,
+      feet0[1]! + fwd0[1]! * 18 + right0[1]! * 16,
+      feet0[2]! + fwd0[2]! * 18 + right0[2]! * 16,
     );
     const fwd = v3();
     const right = v3();
@@ -1200,12 +1239,14 @@ export class LocalDriver implements HostDriver {
     // machinegun, fire_lead) are instant traces with impact sparks only;
     // only the railgun draws a beam (TE_RAILTRAIL, not in v1).
     if (this.weapon.classname === 'weapon_blaster' && res.bolt) {
-      // P_ProjectSource offset (24, 8, viewheight-8): the bolt leaves the gun
-      // muzzle, not the eye (id p_view.c / Blaster_Fire).
+      // G_ProjectSource (g_utils.c) from the feet origin: start = feet +
+      // fwd*24 + right*8 (full 3D fwd/right), then start.z += viewheight-8
+      // (22-8 = 14). No up vector. The bolt leaves the gun muzzle, not the eye.
+      const feet = this.pm.origin;
       const start = v3(
-        eye[0]! + fwd[0]! * 24 + right[0]! * 8,
-        eye[1]! + fwd[1]! * 24 + right[1]! * 8,
-        eye[2]! + fwd[2]! * -8 + 8,
+        feet[0]! + fwd[0]! * 24 + right[0]! * 8,
+        feet[1]! + fwd[1]! * 24 + right[1]! * 8,
+        feet[2]! + fwd[2]! * 24 + right[2]! * 8 + (EYE - 8),
       );
       const dir = v3(fwd[0]!, fwd[1]!, fwd[2]!);
       const dl = Math.hypot(dir[0]!, dir[1]!, dir[2]!) || 1;
@@ -1407,7 +1448,9 @@ export class LocalDriver implements HostDriver {
         bolt.pos[1]! + bolt.dir[1]! * stepLen,
         bolt.pos[2]! + bolt.dir[2]! * stepLen,
       );
-      // EF_BLASTER trail: yellow puffs every ~5 units (cl_fx.c).
+      // EF_BLASTER trail (cl_fx.c CL_BlasterTrail): yellow puffs every ~5
+      // units at the fixed palette color 0xe0 (no jitter — the impact
+      // burst below is where the 0xe0+(rand&7) spread lives).
       const trailSteps = Math.min(8, Math.max(1, Math.round(stepLen / 5)));
       for (let k = 1; k <= trailSteps; k++) {
         const f = k / (trailSteps + 1);
@@ -1417,12 +1460,15 @@ export class LocalDriver implements HostDriver {
             bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * f,
             bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * f,
           ),
-          0xe0 + ((this.rand() * 8) | 0),
+          0xe0,
         );
       }
       let dead = this.server.time - bolt.born >= bolt.life;
       if (!dead) {
         // Wall touch (blaster_touch: sky frees silently, wall explodes).
+        // TODO(sky): TraceResult exposes no SURF_SKY flag, so sky hits
+        // explode here; free the bolt silently once the trace carries the
+        // surface flag (id blaster_touch).
         const wall = this.traceShot(bolt.pos, next);
         if (wall.fraction < 1) {
           const hitPos = v3(
@@ -2009,10 +2055,31 @@ export function pumpMuzzleLight(boot: PlayBoot): boolean {
   if (!pos) return false;
   boot.refresh.testAddDynamicLight({
     origin: new Float32Array([pos[0]!, pos[1]!, pos[2]!]),
-    intensity: 200,
-    color: new Float32Array([1, 0.85, 0.5]),
+    intensity: boot.driver.peekFlashIntensity(),
+    color: new Float32Array([1, 1, 0]),
   });
   return true;
+}
+
+/**
+ * Pump one in-flight dlight per live blaster bolt (id CL_BlasterTrail /
+ * V_AddLight: 200-intensity pure yellow every frame). Same
+ * testAddDynamicLight path as the muzzle/explosion pumps; call alongside
+ * them before the frame renders. The dom tick wires muzzle + explosion;
+ * wire this next to them when the tick is next touched (dom.ts is outside
+ * this change's file lock, so headless/tests pump it explicitly).
+ */
+export function pumpBoltLights(boot: PlayBoot): number {
+  let n = 0;
+  for (const bolt of boot.driver.bolts) {
+    boot.refresh.testAddDynamicLight({
+      origin: new Float32Array([bolt.pos[0]!, bolt.pos[1]!, bolt.pos[2]!]),
+      intensity: 200,
+      color: new Float32Array([1, 1, 0]),
+    });
+    n++;
+  }
+  return n;
 }
 
 /** Pump explosion/bolt-impact dlights (TE_BLASTER yellow, 150 intensity). */

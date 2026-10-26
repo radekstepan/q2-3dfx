@@ -4,7 +4,7 @@ import type { UserCmdT } from '@q2/input';
 import { v3 } from '@q2/math';
 import type { Entity } from '@q2/renderer-api';
 import { getConcharsFont, makeConcharsFont } from '@q2/client';
-import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpExplosionLights, pumpTracers, loadConcharsFont, concharsFontFromPCX, VIEWMODEL_FIRE_FRAME, usesViewModel3D } from './play.js';
+import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpBoltLights, pumpExplosionLights, pumpTracers, loadConcharsFont, concharsFontFromPCX, VIEWMODEL_FIRE_FRAME, usesViewModel3D } from './play.js';
 import { findWeapon, spawnMonster, BOLT_LIFE } from '@q2/game';
 import type { LocalDriver } from './play.js';
 
@@ -359,8 +359,7 @@ describe('play driver (devroom, headless)', () => {
     expect(driver.events).not.toContain('explosion');
   });
 
-  it('F: TE_BLASTER impact flash is brief (~0.1s), never a stuck light', () => {
-    const boot = bootPlay({ width: 64, height: 48 });
+  it('F: TE_BLASTER impact flash is brief (~0.1s), never a stuck light', () => {    const boot = bootPlay({ width: 64, height: 48 });
     const { host, driver } = boot;
     runFrames(host, 0, 500);
     driver.pm.viewAngles = v3(0, 0, 0);
@@ -385,6 +384,70 @@ describe('play driver (devroom, headless)', () => {
     // the one-shot gate stays quiet instead of sticking a light on later.
     expect(driver.muzzleLit()).toBe(false);
     expect(pumpMuzzleLight(boot)).toBe(false);
+  });
+
+  it('G: blaster matches G_ProjectSource/CL_MuzzleFlash/CL_BlasterTrail ground truth', () => {
+    // Ground truth (g_weapon.c fire_blaster/blaster_touch, p_weapon.c
+    // Weapon_Blaster_Fire, cl_ents.c EF_BLASTER, cl_fx.c trail/impact,
+    // G_ProjectSource in g_utils.c; SP damage 10):
+    // - spawn = feet + fwd*24 + right*8, z += viewheight-8 (22-8 = 14);
+    // - muzzle = feet + fwd*18 + right*16, 200+(rand&31), pure yellow;
+    // - in-flight: 200 yellow dlight + trail step 5u at fixed 0xe0.
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    driver.pm.origin = v3(-168, 0, 24);
+    driver.pm.velocity = v3();
+    driver.pm.viewAngles = v3(0, 0, 0);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.events).toContain('bolt');
+    expect(driver.bolts.length).toBe(1);
+    // SP damage (deathmatch 15 does not apply: our game is SP-only).
+    expect(driver.bolts[0]!.damage).toBe(10);
+    // Facing +X: fwd=(1,0,0), right=(0,-1,0) — spawn off the gun muzzle,
+    // not the eye: feet + (24,-8,14).
+    const bolt = driver.bolts[0]!;
+    expect(bolt.pos[0]).toBeCloseTo(-168 + 24, 6);
+    expect(bolt.pos[1]).toBeCloseTo(0 - 8, 6);
+    expect(bolt.pos[2]).toBeCloseTo(24 + 14, 6);
+    // Muzzle dlight: feet + fwd*18 + right*16, 200+(rand&31), pure yellow.
+    const seen: Array<{ origin: Float32Array; intensity: number; color: Float32Array }> = [];
+    const origAdd = boot.refresh.testAddDynamicLight.bind(boot.refresh);
+    boot.refresh.testAddDynamicLight = (l): void => {
+      seen.push(l);
+      origAdd(l);
+    };
+    expect(pumpMuzzleLight(boot)).toBe(true);
+    expect(seen.length).toBe(1);
+    expect(seen[0]!.origin[0]).toBeCloseTo(-168 + 18, 6);
+    expect(seen[0]!.origin[1]).toBeCloseTo(0 - 16, 6);
+    expect(seen[0]!.origin[2]).toBeCloseTo(24, 6);
+    expect(seen[0]!.intensity).toBeGreaterThanOrEqual(200);
+    expect(seen[0]!.intensity).toBeLessThanOrEqual(231);
+    expect(Array.from(seen[0]!.color)).toEqual([1, 1, 0]);
+    // In-flight: one 200-intensity pure-yellow dlight per live bolt.
+    seen.length = 0;
+    expect(pumpBoltLights(boot)).toBe(1);
+    expect(seen.length).toBe(1);
+    expect(seen[0]!.intensity).toBe(200);
+    expect(Array.from(seen[0]!.color)).toEqual([1, 1, 0]);
+    expect(seen[0]!.origin[0]).toBeCloseTo(bolt.pos[0]!, 6);
+    expect(seen[0]!.origin[1]).toBeCloseTo(bolt.pos[1]!, 6);
+    expect(seen[0]!.origin[2]).toBeCloseTo(bolt.pos[2]!, 6);
+    // Trail sparks are the fixed palette color 0xe0 (impact keeps rand&7).
+    // Fire upward (pitch -90 = up, no ceiling): pure trail, no touch burst.
+    const boot2 = bootPlay({ width: 64, height: 48 });
+    const d2 = boot2.driver;
+    const staticCount = d2.mini.particles.length;
+    d2.pm.origin = v3(-168, 0, 24);
+    d2.pm.velocity = v3();
+    d2.pm.viewAngles = v3(-90, 0, 0);
+    d2.step({ ...neutralCmd([-90, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(d2.bolts.length).toBe(1);
+    stepDriver(d2, neutralCmd(), 1);
+    expect(d2.bolts.length).toBe(1); // still flying: fuse is 2s on server time
+    const fresh = d2.mini.particles.slice(staticCount) as Array<{ color: number }>;
+    expect(fresh.length).toBeGreaterThan(0);
+    for (const p of fresh) expect(p.color).toBe(0xe0);
   });
 });
 
@@ -481,8 +544,9 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     }
     expect(killed).toBe(true);
     expect(driver.events).toContain('kill');
-    // Dead monsters are removed from the snapshot (no longer rendered).
-    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === target.id)).toBe(false);
+    // Corpses persist in the snapshot, holding the last death frame.
+    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === target.id)).toBe(true);
+    expect(driver.entityFrame(target.id)).toBeGreaterThan(0);
     // 4. Exit: drop into the *27 pit volume; the brush trigger fires t37.
     driver.pm.origin = v3(-1776, 1544, -32);
     driver.pm.velocity = v3();
@@ -648,11 +712,13 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
       expect(x.skin).toBe(boot.models!.barrelSkin);
     }
     // Snapshot pairing hooks: soldier resolves to its own handles, unknown
-    // ids to null (Host default), monster facing stays legacy [0,0,0].
+    // ids to null (Host default), monster facing rides entityAngles.
     const m0 = driver.monsters[0]!;
     expect(driver.entityModel(m0.id)).toEqual({ model: boot.models!.monster, skin: boot.models!.monsterSkin });
     expect(driver.entityModel(999999)).toBeNull();
-    expect(driver.entityAngles(m0.id)).toBeNull();
+    const yaw0 = ((m0.state.yaw % 360) + 360) % 360;
+    expect(driver.entityAngles(m0.id)).toEqual([0, yaw0, 0]);
+    expect(driver.entityAngles(999999)).toBeNull();
     // No trigger_always targets a target_explosion (t148/t142/t134 fire
     // strogg-ship flybys, t91 a secret/train/button): the boot itself fires
     // no premature blast. The tick-0 showcase (trigger_once *16 -> relay

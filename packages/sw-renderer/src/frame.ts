@@ -31,7 +31,9 @@ import {
   BandedSoftwareBackend, createBandBuffers, sabAvailable, workersRequestedByCvar,
   type BandDispatcher,
 } from './bands.js';
-import { buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, createSoldierMesh, createSoldierSkin, md2ToAliasMesh, type AliasMesh } from './alias.js';
+import {
+  buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, createSoldierMesh, createSoldierSkin, md2ToAliasMesh, DEPTHHACK_SCALE, type AliasMesh,
+} from './alias.js';
 import { drawAliasInstance } from './alias.js';
 import { drawTracerBeam, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE, TRACER_CORE_COLOR } from './tracer.js';
 import { isValidSkySize, SKY_BOX_CORNERS, SKY_BOX_HALF, skyUvOnFace } from './sky.js';
@@ -885,6 +887,9 @@ export class SoftwareRenderer implements Refresh {
           mesh: m.data, origin: e.origin, angles: e.angles,
           frameA: fr, frameB: fr, lerp: 0,
           lightAngle: ((e.angles[1]! * 256) / 360) & 255,
+          // First-person viewmodel (Entity.depthHack = RF_DEPTHHACK):
+          // bias stored 1/z so the eye-anchored gun wins vs nearby walls.
+          depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
         }, skin, cam, this.anorms, this.shadeDots, this.colormap);
       } else if (m.kind === 'sp2') {
         const skin = this.skins[e.skin] ?? devSkin0(worldData);

@@ -5,7 +5,6 @@
 // snapshots into the Predictor, and render through any Refresh backend.
 // Everything heavy is injected; this file only glues.
 import { SERVER_DT, getCVarNumber } from '@q2/config';
-import { AngleVectors } from '@q2/math';
 import type { Framebuffer, Refresh, RefDef, WorldModel, FrameStats, Entity } from '@q2/renderer-api';
 import { createFramebuffer, devroomWorld } from '@q2/renderer-api';
 import { Predictor, GameConsole, Configstrings, calcViewOrigin } from '@q2/client';
@@ -83,21 +82,19 @@ export interface ExtraRenderable {
 }
 
 /**
- * View-space forward push of the first-person gun, in world units.
+ * View-model forward offset, in world units.
  *
- * id anchors the gun AT the eye with full view angles and relies on
- * near-plane *clipping* (R_AliasClipTriangle, NEAR_CLIP 0.01) + RF_DEPTHHACK.
- * Our backend instead *drops* any alias tri touching the near plane
- * (near=4): at eye anchor the breech half (real v_weap verts reach ~16u
- * behind the eye) vanishes, and pitching the view morphs or blanks the gun
- * (measured headless on real v_blast idle: full mesh at push 16–24, a
- * clipped slice at push 0–8, zero pixels at pitch −30 with no push).
- * Push 24 keeps the whole baked-composition mesh visible across ±30° pitch
- * for the idle frames and the recoil frame at level view, bottom-right
- * where the verts put it. A tri or two may still drop on the recoil frame
- * at extreme pitch — accepted (documented, transient 0.09s flash).
+ * Faithful to id `CL_AddViewWeapon` (client/cl_ents.c): the gun origin is
+ * `vieworg + gunoffset` with `gun_x/y/z` defaulting to 0 (game/g_main.c),
+ * and the gun angles are the full `viewangles + gunangles` — i.e. the gun
+ * sits AT the eye, oriented with the view (pitch included). It stays
+ * visible because the alias backend Sutherland-clips straddling tris at
+ * the near plane (r_aclip.c `R_ClipPolyPlane`, `ALIAS_Z_CLIP_PLANE`)
+ * instead of dropping them, and the gun entity carries RF_DEPTHHACK
+ * (`Entity.depthHack`, ref_soft `s_ziscale *= 3`). Kept as a named
+ * constant (0 = eye anchor, no push) so tests and drivers can pin it.
  */
-export const VIEWMODEL_FORWARD = 24;
+export const VIEWMODEL_FORWARD = 0;
 
 export class Host {
   readonly fb: Framebuffer;
@@ -304,28 +301,24 @@ export class Host {
         });
       }
     }
-    // First-person weapon view model: yaw-only orientation at a small
-    // view-space forward push from the eye (see VIEWMODEL_FORWARD). No
-    // pitch/roll inheritance, so the gun stays level instead of swinging
-    // when looking up/down; the push is recomputed from the live view
-    // angles every frame, so the gun rides the view axis at any yaw (it
-    // cannot orbit the camera — its position is a pure function of the
-    // camera). The baked bottom-right composition lives in the v_weap
-    // verts; no extra right/down offset is applied.
+    // First-person weapon view model (CL_AddViewWeapon,
+    // client/cl_ents.c:1293-1342): anchored AT the eye — origin = vieworg
+    // + gunoffset (gun_x/y/z default 0, game/g_main.c), angles = the full
+    // view angles + gunangles. No forward push (VIEWMODEL_FORWARD = 0),
+    // no yaw-only flattening: the gun rides the view exactly, bottom-right
+    // placement coming from the baked v_weap verts. The breech half behind
+    // the eye survives via view-space near-plane Sutherland clipping in
+    // the alias backend (r_aclip.c), and Entity.depthHack (RF_DEPTHHACK)
+    // keeps the gun ahead of nearby walls. Hidden when fovX > 90, like id.
     const vm = this.driver?.viewModel?.() ?? null;
-    if (vm) {
-      const fwd = new Float32Array(3);
-      AngleVectors(new Float32Array(angles), fwd);
+    if (vm && view.fovX <= 90) {
       renderables.push({
         model: vm.model,
-        origin: new Float32Array([
-          viewOrigin[0]! + fwd[0]! * VIEWMODEL_FORWARD,
-          viewOrigin[1]! + fwd[1]! * VIEWMODEL_FORWARD,
-          viewOrigin[2]! + fwd[2]! * VIEWMODEL_FORWARD,
-        ]) as Entity['origin'],
-        angles: new Float32Array([0, angles[1]!, 0]) as Entity['angles'],
+        origin: new Float32Array(viewOrigin) as Entity['origin'],
+        angles: new Float32Array(angles) as Entity['angles'],
         frame: vm.frame,
         skin: vm.skin,
+        depthHack: true,
       });
     }
     this.refresh.beginFrame();

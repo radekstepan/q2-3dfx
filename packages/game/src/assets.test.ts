@@ -110,7 +110,7 @@ describe('blaster bolt + muzzle dlight (M7.2 driver contract)', () => {
     expect(r.bolt!.speed).toBe(1000);
     expect(r.bolt!.life).toBe(2);
     expect(r.bolt!.effect).toBe(0x08);
-    expect(r.bolt!.damage).toBe(15);
+    expect(r.bolt!.damage).toBe(10);
     // exactly one dlight request
     expect(r.muzzle).not.toBe(null);
     expect(r.muzzle!.intensity).toBe(200);
@@ -121,8 +121,8 @@ describe('blaster bolt + muzzle dlight (M7.2 driver contract)', () => {
 
   it('quad scales the bolt damage like the pellet damage', () => {
     const r = fireWeapon(WEAPON_BLASTER, 0, mulberry32(4), true);
-    expect(r.bolt!.damage).toBe(60);
-    expect(r.pellets[0]!.damage).toBe(60);
+    expect(r.bolt!.damage).toBe(40);
+    expect(r.pellets[0]!.damage).toBe(40);
   });
 
   it('hitscan weapons emit a dlight but no bolt', () => {

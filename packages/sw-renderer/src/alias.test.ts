@@ -98,6 +98,68 @@ describe('drawAliasInstance', () => {
     }, flatSkin(14), cam, anorms, dots, colormap);
     expect(p).toBe(0);
   });
+
+  it('clips (not drops) a tri straddling the near plane', () => {
+    // Eye-anchored viewmodel case: two verts ahead of near=4, one at
+    // vz=2 behind it. The old drop-whole-tri path drew zero pixels; the
+    // Sutherland clip keeps the visible quad.
+    const cam = testCam();
+    const anorms = buildANorms();
+    const dots = buildShadeDots(anorms);
+    const mesh = {
+      frames: new Float32Array([20, -5, -2, 20, 5, -2, 2, 0, 2]),
+      normals: new Uint8Array([80, 80, 80]),
+      numVerts: 3,
+      numFrames: 1,
+      tris: new Uint16Array([0, 1, 2]),
+      numTris: 1,
+      st: new Float32Array([0, 0, 16, 0, 8, 16]),
+    };
+    const inst = {
+      mesh, origin: new Float32Array([0, 0, 0]), angles: new Float32Array([0, 0, 0]),
+      frameA: 0, frameB: 0, lerp: 0, lightAngle: 0,
+    };
+    const idx = new Uint8Array(64 * 64);
+    const zb = new Float32Array(64 * 64);
+    const p = drawAliasInstance(idx, zb, 64, 64, inst, flatSkin(14), cam, anorms, dots, colormap);
+    expect(p).toBeGreaterThan(0);
+    // The kept part sits ahead of the clip: every written depth is at or
+    // beyond the near plane (iz <= 1/near).
+    for (let i = 0; i < zb.length; i++) {
+      if (idx[i] !== 0) expect(zb[i]!).toBeLessThanOrEqual(1 / cam.near + 1e-6);
+    }
+  });
+
+  it('depthScale biases stored 1/z without moving pixels', () => {
+    const cam = testCam();
+    const anorms = buildANorms();
+    const dots = buildShadeDots(anorms);
+    const mesh = {
+      frames: new Float32Array([20, -5, 0, 20, 5, 0, 20, 0, 10]),
+      normals: new Uint8Array([80, 80, 80]),
+      numVerts: 3,
+      numFrames: 1,
+      tris: new Uint16Array([0, 1, 2]),
+      numTris: 1,
+      st: new Float32Array([0, 0, 16, 0, 8, 16]),
+    };
+    const base = {
+      mesh, origin: new Float32Array([0, 0, 0]), angles: new Float32Array([0, 0, 0]),
+      frameA: 0, frameB: 0, lerp: 0, lightAngle: 0,
+    };
+    const mk = () => ({ idx: new Uint8Array(64 * 64), zb: new Float32Array(64 * 64) });
+    const f1 = mk(), f3 = mk();
+    const skin = flatSkin(14);
+    const p1 = drawAliasInstance(f1.idx, f1.zb, 64, 64, { ...base }, skin, cam, anorms, dots, colormap);
+    const p3 = drawAliasInstance(f3.idx, f3.zb, 64, 64, { ...base, depthScale: 3 }, skin, cam, anorms, dots, colormap);
+    expect(p1).toBeGreaterThan(0);
+    expect(p3).toBe(p1);
+    // Same coverage, tripled depth: the RF_DEPTHHACK bias (s_ziscale *= 3).
+    expect([...f1.idx]).toEqual([...f3.idx]);
+    for (let i = 0; i < f1.zb.length; i++) {
+      if (f1.zb[i]! > 0) expect(f3.zb[i]!).toBeCloseTo(f1.zb[i]! * 3, 5);
+    }
+  });
 });
 
 describe('drawSprite', () => {

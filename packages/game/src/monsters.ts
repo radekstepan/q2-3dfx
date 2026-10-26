@@ -4,7 +4,7 @@
 // string tags the game logic switches on).
 
 import type { Vec3 } from '@q2/math';
-import { v3 } from '@q2/math';
+import { anglemod, v3 } from '@q2/math';
 import { findPath, nearestNode } from './pathfind.js';
 import type { PortalGraph } from './pathfind.js';
 
@@ -164,9 +164,56 @@ export function monsterYawTo(from: Vec3, to: Vec3): number {
   return yaw;
 }
 
+/** id's yaw_speed per kind (m_soldier.c / m_gunner.c SP_ funcs): degrees of
+ * M_ChangeYaw turn applied per 10Hz tick (the clamp is per call, not per
+ * second — M_ChangeYaw runs once per frame). */
+export const MONSTER_YAW_SPEED: Record<MonsterKind, number> = { soldier: 20, gunner: 20 };
+
+/**
+ * id m_move.c M_ChangeYaw: shortest-arc step from `current` toward `ideal`,
+ * clamped to `speed` degrees. Both inputs wrap via anglemod; the return is
+ * always in [0, 360).
+ */
+export function changeYaw(current: number, ideal: number, speed: number): number {
+  const cur = anglemod(current);
+  const tgt = anglemod(ideal);
+  if (cur === tgt) return cur;
+  let move = tgt - cur;
+  if (tgt > cur) {
+    if (move >= 180) move -= 360;
+  } else {
+    if (move <= -180) move += 360;
+  }
+  if (move > 0) {
+    if (move > speed) move = speed;
+  } else {
+    if (move < -speed) move = -speed;
+  }
+  return anglemod(cur + move);
+}
+
+/**
+ * Signed shortest-arc difference a-b in (-180, 180] degrees. Used for the
+ * FacingIdeal attack gate in monsterChaseMove.
+ */
+export function yawDiff(a: number, b: number): number {
+  let d = (a - b) % 360;
+  if (d > 180) d -= 360;
+  else if (d <= -180) d += 360;
+  return d;
+}
+
 /** Advance one server frame (0.1s). Returns the action tag of this frame. */
 export function monsterThink(ms: MonsterState): string {
-  if (ms.dead) return 'dead';
+  if (ms.dead) {
+    // Corpses persist (id holds the last death frame: the dead monster keeps
+    // rendering via the snapshot instead of being freed). Advance the death
+    // move to its last frame, then hold it — never wrap, never transition
+    // (the 'dead' end name has no move table and must never be entered).
+    const mv = monsterMoveOf(ms);
+    if (ms.frame < mv.frames.length - 1) ms.frame++;
+    return mv.frames[ms.frame]?.action ?? 'move';
+  }
   const mv = monsterMoveOf(ms);
   const idx = ms.frame;
   const fr = mv.frames[idx] ?? { dist: 0, action: 'move' };
@@ -225,11 +272,11 @@ export function monsterLocomotion(
   const dx = playerPos[0]! - origin[0]!;
   const dy = playerPos[1]! - origin[1]!;
   const len = Math.sqrt(dx * dx + dy * dy);
-  // Face the player every tick (id ai_stand/ai_run turn via M_ChangeYaw even
-  // on zero-dist frames); only translate when the frame carries a dist so
-  // stand/attack frames never moonwalk.
+  // Face the player every tick via id M_ChangeYaw (shortest-arc, clamped by
+  // yaw_speed) — never an instant snap; only translate when the frame
+  // carries a dist so stand/attack frames never moonwalk.
   if (len > 1e-9) {
-    state.yaw = monsterYawTo(origin, playerPos);
+    state.yaw = changeYaw(state.yaw, monsterYawTo(origin, playerPos), MONSTER_YAW_SPEED[state.kind]);
     if (fr.dist !== 0) {
       const nx = dx / len;
       const ny = dy / len;
@@ -333,6 +380,22 @@ function setMove(ms: MonsterState, move: string): void {
   }
 }
 
+/** True for the firing/exit attack moves (id mmove_t attack sequences). While
+ * one of these is playing, monsterChaseMove holds it to completion instead
+ * of re-rolling selectAttack (which restarted frame 0 every tick). */
+const ATTACK_MOVES: ReadonlySet<string> = new Set([
+  'attack1',
+  'attack2',
+  'attack_chain',
+  'fire_chain',
+  'endfire_chain',
+  'attack_grenade',
+]);
+
+export function isAttackMove(move: string): boolean {
+  return ATTACK_MOVES.has(move);
+}
+
 /**
  * One chase tick: attack when in range with line of sight, else navigate
  * the graph toward the player. `dist` is the 3D monster-player distance,
@@ -348,6 +411,10 @@ export function monsterChaseMove(
   rand: () => number,
 ): ChaseResult {
   if (ms.dead) return { move: ms.move, path: null, target: null };
+  // Attack latch: an attack move already playing runs to completion
+  // (monsterThink advances it). Re-rolling here picked a new random attack
+  // every tick, resetting frame to 0 — the anim strobed instead of playing.
+  if (isAttackMove(ms.move)) return { move: ms.move, path: null, target: null };
   const dx = playerPos[0]! - selfPos[0]!;
   const dy = playerPos[1]! - selfPos[1]!;
   const dz = playerPos[2]! - selfPos[2]!;
@@ -358,11 +425,17 @@ export function monsterChaseMove(
   const commit =
     r === RANGE_MELEE || ((r === RANGE_NEAR || r === RANGE_MID) && canSee && rand() < 0.7);
   if (canSee && commit) {
-    const choice = selectAttack(ms.kind, dist, rand);
-    if (choice !== 'none') {
-      const move = attackMoveFor(ms.kind, choice);
-      setMove(ms, move);
-      return { move, path: null, target: null };
+    // id FacingIdeal gate (ai_charge / ai_run_missile): only enter the
+    // attack move when already roughly facing the enemy (±45°). Otherwise
+    // keep closing/turning below so M_ChangeYaw can catch up — the anim
+    // never fires over the shoulder.
+    if (Math.abs(yawDiff(monsterYawTo(selfPos, playerPos), ms.yaw)) <= 45) {
+      const choice = selectAttack(ms.kind, dist, rand);
+      if (choice !== 'none') {
+        const move = attackMoveFor(ms.kind, choice);
+        setMove(ms, move);
+        return { move, path: null, target: null };
+      }
     }
   }
   // Close in: walk the node graph toward the player.

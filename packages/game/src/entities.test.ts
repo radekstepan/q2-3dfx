@@ -390,4 +390,34 @@ describe('monster navigation (M7.4, node graph)', () => {
     expect(res.move).toBe('runandshoot');
     expect(res.path).not.toBe(null);
   });
+
+  it('holds an attack move to completion instead of re-rolling every tick', () => {
+    const ms = spawnMonster('soldier');
+    ms.move = 'attack1';
+    ms.frame = 3;
+    // Even point-blank with sight: the latch holds, frame untouched (think
+    // advances it — no frame-0 restart strobing).
+    const res = monsterChaseMove(ms, v3(0, 0, 0), v3(10, 0, 0), nav, true, mulberry32(7));
+    expect(res.move).toBe('attack1');
+    expect(ms.move).toBe('attack1');
+    expect(ms.frame).toBe(3);
+    expect(res.path).toBe(null);
+  });
+
+  it('refuses the attack move when facing away (FacingIdeal ±45° gate)', () => {
+    const ms = spawnMonster('soldier'); // yaw 0, player due north => ideal 90
+    // rand 0 forces the commit roll; the gate still blocks: closes in on
+    // run while M_ChangeYaw turns the body.
+    const res = monsterChaseMove(ms, v3(0, 0, 0), v3(0, 200, 0), nav, true, () => 0);
+    expect(res.move).toBe('run');
+    expect(res.path).not.toBe(null);
+  });
+
+  it('enters the attack move when roughly facing (within ±45°)', () => {
+    const ms = spawnMonster('soldier');
+    ms.yaw = 10; // ideal 0, diff 10 => gate passes; rand 0 => shotgun
+    const res = monsterChaseMove(ms, v3(0, 0, 0), v3(200, 0, 0), nav, true, () => 0);
+    expect(res.move).toBe('attack1');
+    expect(res.path).toBe(null);
+  });
 });

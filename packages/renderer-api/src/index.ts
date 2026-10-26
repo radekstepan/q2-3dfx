@@ -25,6 +25,14 @@ export interface Entity {
   model: ModelHandle;
   origin: Vec3; angles: Vec3;
   frame: number; skin: TextureHandle;
+  /**
+   * RF_DEPTHHACK equivalent for the first-person viewmodel: the alias
+   * backend scales the entity's stored 1/z by 3 (ref_soft `s_ziscale *= 3`,
+   * r_alias.c) so the eye-anchored gun wins the depth test against nearby
+   * walls instead of sinking into them. Optional, defaults to false;
+   * world entities must leave it unset.
+   */
+  depthHack?: boolean;
 }
 
 export interface WorldModel {

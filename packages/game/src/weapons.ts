@@ -1,6 +1,7 @@
 // @q2/game/weapons — blaster/shotgun/machinegun (game/p_weapon.c, g_weapon.c).
 // Spread values are id's DEFAULT_* constants; damage/ammo/pellet counts match
-// the non-deathmatch player weapons. Spread sampling is caller-seeded:
+// the SP (non-deathmatch) player weapons: blaster 10 (deathmatch 15).
+// Spread sampling is caller-seeded:
 // pass a `rand()` in [0,1) so firing is fully deterministic in tests.
 //
 // Blaster visuals (no renderer contract change): the blaster is id's only
@@ -37,7 +38,7 @@ export const WEAPON_BLASTER: WeaponDef = {
   classname: 'weapon_blaster',
   ammoKind: '',
   ammoPerShot: 0,
-  damage: 15,
+  damage: 10, // SP (g_weapon.c fire_blaster: 15 only when deathmatch)
   kick: 0,
   hspread: 0,
   vspread: 0,

@@ -27,7 +27,7 @@ import {
 
 describe('weapons (M5.3)', () => {
   it('has correct damage/ammo/pellet/spread values', () => {
-    expect(WEAPON_BLASTER.damage).toBe(15);
+    expect(WEAPON_BLASTER.damage).toBe(10);
     expect(WEAPON_BLASTER.ammoKind).toBe('');
     expect(WEAPON_BLASTER.pellets).toBe(1);
     expect(WEAPON_SHOTGUN.damage).toBe(4);
@@ -121,7 +121,10 @@ describe('monsters (M5.3)', () => {
     expect(m.health).toBe(165);
     monsterPain(m, 1000, mulberry32(1));
     expect(m.dead).toBe(true);
-    expect(monsterThink(m)).toBe('dead');
+    // Corpses keep playing the death move (action of the current death
+    // frame), advancing to the last frame and holding — never 'dead'.
+    expect(monsterThink(m)).toBe('move');
+    expect(m.move).toBe('death');
   });
 
   it('every move fits inside its MD2 (soldier 475 / gunner 209 frames)', () => {

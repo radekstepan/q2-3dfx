@@ -4,11 +4,14 @@ import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import {
   MONSTER_FALL_PROBE,
+  changeYaw,
   monsterLocomotion,
   monsterMoveOf,
+  monsterPain,
   monsterThink,
   monsterYawTo,
   spawnMonster,
+  yawDiff,
 } from './monsters.js';
 
 type Trace = (start: Vec3, end: Vec3) => { fraction: number; endpos: Vec3 };
@@ -124,6 +127,44 @@ describe('monsterLocomotion (pure, headless)', () => {
   });
 });
 
+describe('M_ChangeYaw clamp (id m_move.c, yaw_speed 20°/tick)', () => {
+  // NOTE: precision 1 throughout — the repo's anglemod is id's quantized
+  // version (65536ths of a turn, ~0.0055° steps), so exact-20 never survives
+  // the wrap. The assertions below pin clamp direction + convergence, which
+  // is what the facing gate depends on.
+  it('steps toward the ideal on the shortest arc, clamped to speed', () => {
+    expect(changeYaw(0, 90, 20)).toBeCloseTo(20, 1);
+    expect(changeYaw(0, -90, 20)).toBeCloseTo(340, 1);
+    expect(changeYaw(350, 10, 20)).toBeCloseTo(10, 1); // wraps through 0
+    expect(changeYaw(0, 180, 20)).toBeCloseTo(340, 1); // id ties go negative
+    expect(changeYaw(80, 90, 20)).toBeCloseTo(90, 1); // short remainder, no overshoot
+    expect(changeYaw(45, 45, 20)).toBeCloseTo(45, 1);
+  });
+
+  it('yawDiff is the signed shortest arc in (-180, 180]', () => {
+    expect(yawDiff(90, 0)).toBe(90);
+    expect(yawDiff(0, 90)).toBe(-90);
+    expect(yawDiff(10, 350)).toBe(20);
+    expect(yawDiff(350, 10)).toBe(-20);
+    expect(yawDiff(0, 180)).toBe(180);
+  });
+});
+
+describe('corpse persistence (id holds the last death frame)', () => {
+  it('dead think advances the death move to the last frame, then holds', () => {
+    const ms = spawnMonster('soldier');
+    monsterPain(ms, 1000, () => 0);
+    expect(ms.dead).toBe(true);
+    expect(ms.move).toBe('death1');
+    expect(ms.frame).toBe(0);
+    for (let i = 0; i < 100; i++) monsterThink(ms);
+    const mv = monsterMoveOf(ms); // still a valid move (never 'dead')
+    expect(ms.move).toBe('death1');
+    expect(ms.frame).toBe(mv.frames.length - 1);
+    expect(monsterThink(ms)).toBe(mv.frames[mv.frames.length - 1]!.action);
+    expect(ms.frame).toBe(mv.frames.length - 1);
+  });
+});
 describe('monster facing (Q2 yaw: 0 = +X, 90 = +Y/left)', () => {
   it('monsterYawTo matches id vectoyaw on the cardinals', () => {
     const o = v3(0, 0, 0);
@@ -134,13 +175,18 @@ describe('monster facing (Q2 yaw: 0 = +X, 90 = +Y/left)', () => {
     expect(monsterYawTo(o, v3(100, 100, 0))).toBeCloseTo(45, 9);
   });
 
-  it('locomotion faces the player on zero-dist stand frames (no moonwalk)', () => {
+  it('locomotion faces the player via M_ChangeYaw clamp (20°/tick), no moonwalk', () => {
     const ms = spawnMonster('soldier'); // stand1, dist 0, yaw 0
     expect(ms.yaw).toBe(0);
     const origin = v3(0, 0, 0);
     monsterLocomotion(ms, origin, v3(0, 100, 0), floorTrace());
-    expect(ms.yaw).toBeCloseTo(90, 9);
+    // Ideal is 90 but yaw_speed clamps the first tick to ~20 (id M_ChangeYaw;
+    // quantized anglemod, so precision 1).
+    expect(ms.yaw).toBeCloseTo(20, 1);
     expect([...origin]).toEqual([0, 0, 0]); // stand frames never translate
+    // Four more ticks converge exactly on the ideal (no overshoot).
+    for (let i = 0; i < 4; i++) monsterLocomotion(ms, origin, v3(0, 100, 0), floorTrace());
+    expect(ms.yaw).toBeCloseTo(90, 1);
   });
 
   it('locomotion faces along travel on nonzero-dist run frames', () => {
@@ -149,7 +195,7 @@ describe('monster facing (Q2 yaw: 0 = +X, 90 = +Y/left)', () => {
     ms.frame = 0;
     const origin = v3(0, 0, 0);
     monsterLocomotion(ms, origin, v3(0, 100, 0), floorTrace());
-    expect(ms.yaw).toBeCloseTo(90, 9);
+    expect(ms.yaw).toBeCloseTo(20, 1); // clamped first step toward 90
     expect(origin[0]).toBeCloseTo(0, 6);
     expect(origin[1]).toBeCloseTo(10, 6);
   });
