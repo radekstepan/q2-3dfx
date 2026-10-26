@@ -5,7 +5,7 @@
 // - pak: real base1.bsp (BSP collision, WAL textures, PCX palette,
 //   doors/triggers/movers, static soldier/gunner placeholders you can shoot).
 import { Host } from '@q2/host';
-import type { HostDriver } from '@q2/host';
+import type { ExtraRenderable, HostDriver } from '@q2/host';
 import { BUTTON_ATTACK } from '@q2/input';
 import type { UserCmdT } from '@q2/input';
 import type { Snapshot } from '@q2/client';
@@ -39,6 +39,7 @@ import {
   findWeapon,
   fireWeapon,
   mulberry32,
+  BOLT_SPEED,
   WEAPON_BLASTER,
   spawnMonster,
   monsterChaseMove,
@@ -374,7 +375,32 @@ export interface Bolt {
   dir: Vec3; // normalized
   life: number;
   damage: number;
+  /** Server time the bolt was spawned (life expires on server time, not frame dt). */
+  born: number;
 }
+
+/**
+ * Trail/impact spark lifetime in server seconds. id's CL_BlasterParticles
+ * fade in a fraction of a second; the old path never expired them (cap-only
+ * ring), so every bolt left a permanent spark line. The sweep in step()
+ * keeps world-seeded particles (devroom torch flame, born +Infinity) forever.
+ */
+export const SPARK_TTL = 0.4;
+
+/**
+ * Impact-flash dlight window in server seconds. TE_BLASTER / TE_EXPLOSION1
+ * are brief flashes (id adds a short yellow light on touch); the old 0.3s
+ * drain window lit the whole tile noticeably longer than the authentic
+ * impact. The renderer's own light ttl still bounds each add to ~2 renders.
+ */
+export const EXPLOSION_LIGHT_WINDOW = 0.1;
+
+/** Pak lump for shootable barrels (g_misc.c SP_misc_explobox, origin at the box bottom). */
+export const BARREL_MODEL = 'models/objects/barrels/tris.md2';
+export const BARREL_SKIN = 'models/objects/barrels/skin.pcx';
+/** Authentic explobox hull (g_misc.c: mins -16,-16,0 / maxs 16,16,40). */
+export const BARREL_MINS: [number, number, number] = [-16, -16, 0];
+export const BARREL_MAXS: [number, number, number] = [16, 16, 40];
 
 /** Shootable explosive (misc_explobox / func_explosive-lite). */
 export interface Barrel {
@@ -446,6 +472,13 @@ export class LocalDriver implements HostDriver {
   private explosionTargets = new Map<string, { origin: Vec3; dmg: number }>();
   /** Recent explosion flashes (TE_EXPLOSION1/TE_BLASTER visuals). */
   readonly explosions: Explosion[] = [];
+  /**
+   * Per-particle birth (server time), parallel to `mini.particles`.
+   * World-seeded particles (devroom torch flame) start at +Infinity and
+   * never expire (`time - Infinity = -Infinity`, never past the ttl);
+   * driver-pushed sparks expire after SPARK_TTL.
+   */
+  private particleBorn: number[] = [];
   /** Player death/respawn. */
   private deadUntil = -1;
   private spawnPoints: Array<{ origin: Vec3; yaw: number }> = [];
@@ -489,6 +522,10 @@ export class LocalDriver implements HostDriver {
       this.spawnPoints = [{ origin: v3(-168, 0, 32), yaw: 0 }];
     }
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
+    // World-seeded particles predate the driver: they never expire. Prepend
+    // (not overwrite): fireTriggerAlways may already have pushed spawn
+    // sparks with real births above.
+    while (this.particleBorn.length < this.mini.particles.length) this.particleBorn.unshift(Infinity);
     this.syncAmmo();
     this.updateMixerListener();
   }
@@ -575,6 +612,7 @@ export class LocalDriver implements HostDriver {
       }
     }
     this.checkScriptedExplosions();
+    this.sweepParticles();
     this.stepBolts(dt);
     this.monsterCombat();
     this.checkPickups();
@@ -603,6 +641,41 @@ export class LocalDriver implements HostDriver {
       });
     }
     return { serverTime, entities };
+  }
+
+  /**
+   * Extra world entities the snapshot omits (HostDriver pairing: the Host
+   * appends these to its renderables with explicit model/skin/angles, so
+   * bolts and barrels render as their own MD2s the moment a pak is present
+   * — no host change needed, the hook already landed there). Null when
+   * there is nothing live (devroom at rest). Bolt flight orientation rides
+   * along as yaw/pitch (id convention pitch positive = down).
+   */
+  extraEntities(): ExtraRenderable[] | null {
+    const out: ExtraRenderable[] = [];
+    for (const b of this.barrels) {
+      if (b.dead) continue;
+      out.push({
+        origin: [b.origin[0]!, b.origin[1]!, b.origin[2]!],
+        angles: [0, 0, 0],
+        model: this.models?.barrel ?? 0,
+        skin: this.models?.barrelSkin ?? 0,
+        frame: 0,
+      });
+    }
+    for (const bolt of this.bolts) {
+      const yaw = (Math.atan2(bolt.dir[1]!, bolt.dir[0]!) * 180) / Math.PI;
+      const z = Math.max(-1, Math.min(1, bolt.dir[2]!));
+      const pitch = -(Math.asin(z) * 180) / Math.PI;
+      out.push({
+        origin: [bolt.pos[0]!, bolt.pos[1]!, bolt.pos[2]!],
+        angles: [pitch, yaw, 0],
+        model: this.models?.bolt ?? 0,
+        skin: this.models?.boltSkin ?? 0,
+        frame: 0,
+      });
+    }
+    return out.length > 0 ? out : null;
   }
 
   selectWeapon(classname: string): void {
@@ -669,6 +742,31 @@ export class LocalDriver implements HostDriver {
     } catch {
       return 0;
     }
+  }
+
+  /**
+   * Registered model/skin for a snapshot entity (HostDriver pairing:
+   * same optional-method shape as entityFrame). Soldier and gunner resolve
+   * to their own MD2 + PCX handles (registration order pins soldier skin 0
+   * / mesh 0); unknown ids return null for the Host default. Null without
+   * a pak — devroom keeps the legacy model-0 rendering.
+   */
+  entityModel(id: number): { model: number; skin: number } | null {
+    const m = this.monsters.find((m) => m.id === id);
+    if (!m || !this.models) return null;
+    if (m.state.kind === 'gunner') return { model: this.models.gunner, skin: this.models.gunnerSkin };
+    return { model: this.models.monster, skin: this.models.monsterSkin };
+  }
+
+  /**
+   * World orientation for a snapshot entity (HostDriver pairing). Monsters
+   * keep the legacy [0,0,0] — locomotion faces them toward the player
+   * transiently without storing yaw. Bolt flight orientation rides on the
+   * extras themselves (see extraEntities). Headless-safe pure math.
+   */
+  entityAngles(id: number): [number, number, number] | null {
+    void id;
+    return null;
   }
 
   /** Drain the one-shot muzzle-flash dlight request (dom tick pumps it). */
@@ -1116,6 +1214,7 @@ export class LocalDriver implements HostDriver {
         dir: v3(dir[0]! / dl, dir[1]! / dl, dir[2]! / dl),
         life: res.bolt.life,
         damage: res.bolt.damage,
+        born: this.server.time,
       });
       this.events.push('bolt');
       return;
@@ -1176,7 +1275,13 @@ export class LocalDriver implements HostDriver {
     }
   }
 
-  /** Parse shootable/scripted explosives from the entities lump (base1). */
+  /** Parse shootable/scripted explosives from the entities lump (base1).
+   *
+   * misc_explobox origins are kept as the mapper placed them (Verified
+   * against real base1.bsp: the lump origins already rest on the floor —
+   * a hull drop moves them by exactly CONTACT_EPS — matching id's
+   * M_droptofloor outcome, since the origin is the box bottom). No drop.
+   */
   private parseExplosives(map: BspMap): void {
     for (const d of parseEntities(map.entities)) {
       const cls = d['classname'];
@@ -1283,10 +1388,17 @@ export class LocalDriver implements HostDriver {
     }
   }
 
-  /** Step flying blaster bolts (1000 u/s, 2s life): trail, touch, impact. */
+  /** Step flying blaster bolts (1000 u/s, 2s life): trail, touch, impact.
+   *
+   * Life expires on SERVER time (`server.time - born >= life`, id's
+   * `G_FreeEdict at level.time + 2`): the old `life -= dt` tied the 2s fuse
+   * to whatever dt the step happened to carry, so a non-tick dt stretched
+   * or shrank the bolt's life. Movement still integrates the passed tick
+   * quantum (always SERVER_DT from Host.serverTick).
+   */
   private stepBolts(dt: number): void {
     if (this.bolts.length === 0) return;
-    const speed = 1000;
+    const speed = BOLT_SPEED;
     for (let i = this.bolts.length - 1; i >= 0; i--) {
       const bolt = this.bolts[i]!;
       const stepLen = speed * dt;
@@ -1295,7 +1407,6 @@ export class LocalDriver implements HostDriver {
         bolt.pos[1]! + bolt.dir[1]! * stepLen,
         bolt.pos[2]! + bolt.dir[2]! * stepLen,
       );
-      bolt.life -= dt;
       // EF_BLASTER trail: yellow puffs every ~5 units (cl_fx.c).
       const trailSteps = Math.min(8, Math.max(1, Math.round(stepLen / 5)));
       for (let k = 1; k <= trailSteps; k++) {
@@ -1309,7 +1420,7 @@ export class LocalDriver implements HostDriver {
           0xe0 + ((this.rand() * 8) | 0),
         );
       }
-      let dead = bolt.life <= 0;
+      let dead = this.server.time - bolt.born >= bolt.life;
       if (!dead) {
         // Wall touch (blaster_touch: sky frees silently, wall explodes).
         const wall = this.traceShot(bolt.pos, next);
@@ -1379,7 +1490,7 @@ export class LocalDriver implements HostDriver {
     }
   }
 
-  /** Live barrels whose 32-unit box the hitscan segment reaches first. */
+  /** Live barrels whose authentic hull the hitscan segment reaches first. */
   private barrelAT(eye: Vec3, seg: Vec3, bestT: number): Barrel | null {
     let best: Barrel | null = null;
     let bt = bestT;
@@ -1387,8 +1498,8 @@ export class LocalDriver implements HostDriver {
       if (b.dead) continue;
       const tHit = segmentAabb(
         eye, seg,
-        [b.origin[0]! - 20, b.origin[1]! - 20, b.origin[2]! - 20],
-        [b.origin[0]! + 20, b.origin[1]! + 20, b.origin[2]! + 20],
+        [b.origin[0]! + BARREL_MINS[0], b.origin[1]! + BARREL_MINS[1], b.origin[2]! + BARREL_MINS[2]],
+        [b.origin[0]! + BARREL_MAXS[0], b.origin[1]! + BARREL_MAXS[1], b.origin[2]! + BARREL_MAXS[2]],
       );
       if (tHit !== null && tHit < bt) {
         bt = tHit;
@@ -1413,12 +1524,12 @@ export class LocalDriver implements HostDriver {
     this.spawnExplosion(b.origin, b.dmg);
   }
 
-  /** Drain recent explosion flashes for the dlight pump (0.3s window). */
+  /** Drain recent explosion flashes for the dlight pump (brief TE_BLASTER window). */
   drainExplosions(): Vec3[] {
     const out: Vec3[] = [];
     for (let i = this.explosions.length - 1; i >= 0; i--) {
       const e = this.explosions[i]!;
-      if (this.server.time - e.born > 0.3) {
+      if (this.server.time - e.born > EXPLOSION_LIGHT_WINDOW) {
         this.explosions.splice(i, 1);
         continue;
       }
@@ -1440,7 +1551,31 @@ export class LocalDriver implements HostDriver {
   private pushColoredSpark(pos: Vec3, color: number): void {
     const parts = this.mini.particles as { origin: Vec3; color: number }[];
     parts.push({ origin: v3(pos[0], pos[1], pos[2]), color });
-    while (parts.length > 256) parts.shift();
+    this.particleBorn.push(this.server.time);
+    while (parts.length > 256) {
+      parts.shift();
+      this.particleBorn.shift();
+    }
+  }
+
+  /**
+   * Age out driver-pushed sparks older than SPARK_TTL. World-seeded
+   * particles (born +Infinity, e.g. the devroom torch flame) never match
+   * and are preserved; the length guards realign if the world ever ships
+   * more seeded particles than the driver has births for, or vice versa.
+   * Called every server tick before stepBolts so fresh impact sparks
+   * (age 0) survive.
+   */
+  private sweepParticles(): void {
+    const parts = this.mini.particles;
+    while (this.particleBorn.length < parts.length) this.particleBorn.unshift(Infinity);
+    while (this.particleBorn.length > parts.length) this.particleBorn.shift();
+    for (let i = parts.length - 1; i >= 0; i--) {
+      if (this.server.time - this.particleBorn[i]! > SPARK_TTL) {
+        parts.splice(i, 1);
+        this.particleBorn.splice(i, 1);
+      }
+    }
   }
 }
 
@@ -1680,11 +1815,21 @@ export interface PlayBoot {
 export interface PakModelHandles {
   /** Model handle 0: soldier MD2 (or box-critter fallback). */
   monster: number;
+  /** PCX skin handle for the soldier MD2 (handle 0, registered first). */
+  monsterSkin: number;
   gunner: number;
+  /** PCX skin handle for the gunner MD2. */
+  gunnerSkin: number;
   weapons: Record<string, number>;
   /** PCX skin handle per weapon classname (parallel to `weapons`). */
   weaponSkins: Record<string, number>;
   bolt: number;
+  /** PCX skin handle for the laser-bolt MD2. */
+  boltSkin: number;
+  /** Shootable explobox (g_misc.c `models/objects/barrels/tris.md2`). */
+  barrel: number;
+  /** PCX skin for the barrel MD2. */
+  barrelSkin: number;
   skins: number[];
 }
 
@@ -1720,9 +1865,9 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
     return refresh.registerModel({ name: path, kind: 'md2', data: getDevMesh(0) });
   };
   // Soldier first: skin handle 0 + model handle 0 (see contract above).
-  loadSkin(skinForMonster('soldier'));
+  const monsterSkin = loadSkin(skinForMonster('soldier'));
   const monster = loadModel(modelForMonster('soldier'));
-  loadSkin(skinForMonster('gunner'));
+  const gunnerSkin = loadSkin(skinForMonster('gunner'));
   const gunner = loadModel(modelForMonster('gunner'));
   const weapons: Record<string, number> = {};
   const weaponSkins: Record<string, number> = {};
@@ -1732,9 +1877,14 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
     weaponSkins[cls] = loadSkin(skinForWeaponModel(mdl));
     weapons[cls] = loadModel(mdl);
   }
-  loadSkin(skinForBolt());
+  const boltSkin = loadSkin(skinForBolt());
   const bolt = loadModel(modelForBolt());
-  return { monster, gunner, weapons, weaponSkins, bolt, skins };
+  // Barrel last: appending keeps every existing handle stable (soldier 0,
+  // gunner, weapons, bolt). Missing lump → box-critter fallback, never a
+  // shifted handle.
+  const barrelSkin = loadSkin(BARREL_SKIN);
+  const barrel = loadModel(BARREL_MODEL);
+  return { monster, monsterSkin, gunner, gunnerSkin, weapons, weaponSkins, bolt, boltSkin, barrel, barrelSkin, skins };
 }
 
 export function bootPlay(opts: {

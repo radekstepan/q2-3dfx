@@ -4,8 +4,8 @@ import type { UserCmdT } from '@q2/input';
 import { v3 } from '@q2/math';
 import type { Entity } from '@q2/renderer-api';
 import { getConcharsFont, makeConcharsFont } from '@q2/client';
-import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpTracers, loadConcharsFont, concharsFontFromPCX, VIEWMODEL_FIRE_FRAME, usesViewModel3D } from './play.js';
-import { findWeapon, spawnMonster } from '@q2/game';
+import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpExplosionLights, pumpTracers, loadConcharsFont, concharsFontFromPCX, VIEWMODEL_FIRE_FRAME, usesViewModel3D } from './play.js';
+import { findWeapon, spawnMonster, BOLT_LIFE } from '@q2/game';
 import type { LocalDriver } from './play.js';
 
 function runFrames(host: { frame(nowMs: number): unknown }, fromMs: number, toMs: number, step = 16): void {
@@ -331,6 +331,61 @@ describe('play driver (devroom, headless)', () => {
     expect((door!.left + door!.right) / 2).toBeLessThan(1);
     expect((door!.left + door!.right) / 2).toBeGreaterThan(0);
   });
+
+  it('E: blaster bolt life is exactly 2s on server time; trail sparks expire', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    // Devroom ships static torch-flame particles: the sweep must preserve them.
+    const staticCount = driver.mini.particles.length;
+    expect(staticCount).toBeGreaterThan(0);
+    // Aim straight up (pitch -90 = up, pitch positive is down): the analytic
+    // room has no ceiling, so the bolt never touches and can only die by fuse.
+    driver.pm.viewAngles = v3(-90, 0, 0);
+    driver.step({ ...neutralCmd([-90, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.events).toContain('bolt');
+    expect(driver.bolts.length).toBe(1);
+    expect(driver.bolts[0]!.life).toBe(BOLT_LIFE);
+    expect(driver.bolts[0]!.life).toBe(2);
+    // 1s of ticks: still flying, trail behind it.
+    stepDriver(driver, neutralCmd(), 10);
+    expect(driver.bolts.length).toBe(1);
+    expect(driver.mini.particles.length).toBeGreaterThan(staticCount);
+    // 3s total: fuse spent on server time, bolt gone; its trail (SPARK_TTL)
+    // fully aged out; only the static particles remain, no stray explosion.
+    stepDriver(driver, neutralCmd(), 20);
+    expect(driver.bolts.length).toBe(0);
+    expect(driver.mini.particles.length).toBe(staticCount);
+    expect(driver.explosions.length).toBe(0);
+    expect(driver.events).not.toContain('explosion');
+  });
+
+  it('F: TE_BLASTER impact flash is brief (~0.1s), never a stuck light', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { host, driver } = boot;
+    runFrames(host, 0, 500);
+    driver.pm.viewAngles = v3(0, 0, 0);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.bolts.length).toBe(1);
+    // Fly into the devroom pillar: bolt consumed, TE_BLASTER burst + flash.
+    for (let i = 0; i < 10 && driver.bolts.length > 0; i++) stepDriver(driver, neutralCmd(), 1);
+    expect(driver.bolts.length).toBe(0);
+    expect(driver.events).toContain('explosion');
+    // The impact flash pumps exactly one dlight...
+    expect(pumpExplosionLights(boot)).toBeGreaterThan(0);
+    // ...and is gone 0.5s later: the drain window drops it, the renderer ttl reaps it.
+    stepDriver(driver, neutralCmd(), 6);
+    expect(pumpExplosionLights(boot)).toBe(0);
+    expect(driver.drainExplosions()).toEqual([]);
+    host.frame(600);
+    host.frame(616);
+    host.frame(632);
+    const countHook = (boot.refresh as unknown as { testDynamicLightCount?: () => number }).testDynamicLightCount;
+    if (typeof countHook === 'function') expect(countHook.call(boot.refresh)).toBe(0);
+    // The un-pumped muzzle request from the shot expired with its window:
+    // the one-shot gate stays quiet instead of sticking a light on later.
+    expect(driver.muzzleLit()).toBe(false);
+    expect(pumpMuzzleLight(boot)).toBe(false);
+  });
 });
 
 const WEB_Q2_PAK = process.env.Q2_PAK;
@@ -555,5 +610,76 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     // Pak boot wires it as the active HUD font (headless-safe, no DOM/IDB).
     bootPlay({ width: 32, height: 24, pak });
     expect(getFont()).toEqual(font!);
+  });
+
+  it('G: start-room exploboxes parsed, kept, and exposed in the snapshot', { timeout: 180000 }, async () => {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const pak = ingestPak(buf);
+    const boot = bootPlay({ width: 96, height: 72, pak });
+    const { driver } = boot;
+    // base1 lump inventory (verified by dumping the entities lump): 9
+    // misc_explobox + 2 func_explosive (*20 and its twin).
+    expect(driver.barrels.length).toBe(11);
+    // True spawn is the untargeted info_player_start (128,-320,32); the two
+    // start-room exploboxes rest on the floor ~300-360 units out, origins
+    // kept exactly as the mapper placed them (id M_droptofloor outcome).
+    const near = driver.barrels.filter(
+      (b) => Math.hypot(b.origin[0]! - 128, b.origin[1]! + 320) < 400,
+    );
+    expect(near.length).toBe(2);
+    expect(near.map((b) => [...b.origin])).toContainEqual([136, 40, 0]);
+    expect(near.map((b) => [...b.origin])).toContainEqual([184, -24, 0]);
+    // Snapshot stays player + monsters; live barrels ride the Host
+    // extraEntities hook with their own barrel MD2 handles (appended after
+    // the bolt so every pre-existing handle is stable).
+    const snap = driver.snapshot(driver.server.time);
+    expect(snap.entities.every((e) => e.id === 1 || driver.monsters.some((m) => m.id === e.id))).toBe(true);
+    const extras = driver.extraEntities();
+    expect(extras).not.toBeNull();
+    expect(extras!.length).toBe(driver.barrels.length);
+    expect(extras!.map((x) => [...x.origin])).toContainEqual([136, 40, 0]);
+    expect(extras!.map((x) => [...x.origin])).toContainEqual([184, -24, 0]);
+    for (const x of extras!) {
+      expect(x.model).toBe(boot.models!.barrel);
+      expect(x.skin).toBe(boot.models!.barrelSkin);
+    }
+    // Snapshot pairing hooks: soldier resolves to its own handles, unknown
+    // ids to null (Host default), monster facing stays legacy [0,0,0].
+    const m0 = driver.monsters[0]!;
+    expect(driver.entityModel(m0.id)).toEqual({ model: boot.models!.monster, skin: boot.models!.monsterSkin });
+    expect(driver.entityModel(999999)).toBeNull();
+    expect(driver.entityAngles(m0.id)).toBeNull();
+    // No trigger_always targets a target_explosion (t148/t142/t134 fire
+    // strogg-ship flybys, t91 a secret/train/button): the boot itself fires
+    // no premature blast. The tick-0 showcase (trigger_once *16 -> relay
+    // t70 -> t151, distant flashes) is server-side map scripting, visible
+    // by design — not a consumed secret.
+    expect(driver.events).not.toContain('explosion');
+    expect(driver.explosions.length).toBe(0);
+    // Fired bolts ride the same hook with the laser MD2 + flight angles.
+    driver.pm.viewAngles = v3(0, 135, 0);
+    driver.step({ ...neutralCmd([0, 135, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.bolts.length).toBe(1);
+    const withBolt = driver.extraEntities()!;
+    expect(withBolt.length).toBe(driver.barrels.length + 1);
+    const boltX = withBolt[withBolt.length - 1]!;
+    expect(boltX.model).toBe(boot.models!.bolt);
+    expect(boltX.skin).toBe(boot.models!.boltSkin);
+    expect(boltX.angles![0]).toBeCloseTo(0, 0);
+    expect(boltX.angles![1]).toBeCloseTo(135, 0);
+    // ...and the Host actually renders them: extras flow into renderView.
+    let rendered: Entity[] = [];
+    const orig = boot.refresh.renderView.bind(boot.refresh);
+    vi.spyOn(boot.refresh, 'renderView').mockImplementation((view, world, entities) => {
+      rendered = [...entities];
+      return orig(view, world, entities);
+    });
+    boot.host.frame(100);
+    expect(rendered.some((e) => e.model === boot.models!.barrel)).toBe(true);
+    expect(rendered.some((e) => e.model === boot.models!.bolt)).toBe(true);
   });
 });
