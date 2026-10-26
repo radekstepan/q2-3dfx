@@ -696,6 +696,33 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 - Still open: sky-hit silent free (needs `SURF_SKY` trace flag), machinegun
 - per-shot kick walk, melee/grenade sound placeholders, `Entity.alpha` /
 - `oldframe/backlerp` for translucent-smooth explosions (frozen-contract PR).
+### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #5, all landed):
+- Regression locks (`@q2/game`): explosion kinds/frames/dlights/sparks/debris/
+- radius-damage, soldier/gunner frame tables + corpse-hold + gib-overkill,
+- blaster ballistics pinned; green-bolt fix: soldier attack is skin-determined
+- (skin ≤1 blaster bolt / ≤3 shotgun / else machinegun), `selectSoldierAttack` +
+- `attackFiresBolt` wired, palette 208–214 banned as bolt color (was pellet green).
+- Stop jitter #2 (`@q2/client`): replay staged stream as tick-end target +
+- blend by sub-tick debt (prefix replays legitimately overshoot one 100ms
+- friction step — proven in-test); tick renders exact, mid-interval monotonic.
+- Crouch end-to-end: KeyC→`crouch`/`BUTTON_DUCK`(8) (`@q2/input`), `PM_CheckDuck`
+- honors C `upmove<0`-on-ground + bit-8 hold with headroom-checked stand-up
+- (`@q2/game`), ducked eye +12 (`@q2/client`/`@q2/host`), driver translates
+- `isDuckHeld`→`PMF_DUCKED` (`apps/web`).
+- Base1 world (`packages/server`): all 9 `misc_explobox` lump origins are
+- floor-resting (visible float is render-side, not spawn); `SV_MonsterTick`
+- chase/locomotion/think with ambush-LOS acquire (initial runner closes +
+- fires); 3 `misc_strogg_ship` fly `path_corner` loops, `func_train` t88–t90
+- on button *13, 2 static courtyard banners; `SV_TouchDoorsAt` opens doors
+- (travel == C, no rotators in base1); zero `monster_gunner` in base1
+- (14 soldiers + 5 infantry), exit machinegun is DM-only — not a substitute;
+- `SV_SetSkill` floor+clamp default 1 with roster gating + easy-half damage.
+- Web (`apps/web`): skill dropdown Easy–Nightmare (latched at boot, calls
+- `SV_SetSkill`), crouch-C hint, `DoorSync` follows mover displacement incl.
+- func_train, ships/banners/flyers/items render from roster (no PVS cull).
+- Still open: INFANTRY lite def (`monsters.ts`) so 5 base1 infantries simulate;
+- `apps/web` spawns DM-only items in SP (no skill inhibit); barrel MD2 render
+- origin vs entity origin; sky-hit silent free; machinegun per-shot kick walk.
 ### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #3, all landed):
 - Blaster projectiles now C-faithful (`g_weapon.c`/`p_weapon.c`/`cl_fx.c`):
 - spawn = literal `G_ProjectSource` from feet (`+ fwd*24 + right*8`, `z += viewheight-8`);
