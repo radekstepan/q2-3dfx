@@ -26,8 +26,13 @@ import {
   findByClassname,
   makePmoveState,
   moverUse,
+  mulberry32,
   parseEntities,
   pmoveFull,
+  PM_CheckDuck,
+  PMF_DUCKED,
+  EXPLOBOX_MAXS,
+  EXPLOBOX_MINS,
   resetEdictNums,
   resetPmoveWorld,
   setPmoveWorld,
@@ -42,6 +47,7 @@ import { SV_Init, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, SV_UseTargetnam
 import type { ServerState } from './index.js';
 import { SV_CarryRiders } from './index.js';
 import type { RiderBody } from './index.js';
+import { SV_MonsterTick, SV_SetSkill, SV_TouchDoorsAt, droptofloor } from './index.js';
 
 const Q2_PAK = process.env.Q2_PAK;
 
@@ -1142,3 +1148,322 @@ function segmentWalkable(
   }
   return true;
 }
+
+// --- M5.2 fidelity: barrels/runner/armor/ships/doors/gunner/skill -------------
+//
+// Each test below pins one user-visible base1 behaviour against the real
+// entities lump + the C source in ../external/quake-2-source:
+// 1. barrels rest on the floor (M_droptofloor, hull origin = box bottom);
+// 2. the start-room soldier ambushes, then runs at the player (g_monster.c);
+// 3. the crouch-hole jacket sits behind a duck-only lintel (pmove duck hull);
+// 4. strogg ships fly their loops, the exit train waits for button *13;
+// 5. doors slide along G_SetMovedir axes with C travel (|movedir|.size-lip);
+// 6. no gunner lives in base1 (its machinegun is a DM-only item, not a sub);
+// 7. the skill cvar gates the roster + damage scale (g_spawn.c/g_combat.c).
+
+describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner/skill (Q2_PAK)', () => {
+  function spawnWith(
+    st: ServerState,
+    map: BspMap,
+    skill: number,
+    withDrop: boolean,
+  ): Edict[] {
+    SV_SetSkill(st, skill);
+    return SV_SpawnEntities(
+      st,
+      map.entities,
+      (model) => {
+        if (!model.startsWith('*')) return null;
+        const n = Number.parseInt(model.slice(1), 10);
+        if (!Number.isFinite(n)) return null;
+        return modelBounds(map, n);
+      },
+      withDrop ? bspTraceFor(map) : undefined,
+    );
+  }
+
+  it('barrels: 9 exploboxes at lump positions, all resting on the floor', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    const edicts = spawnWith(st, map, 1, true);
+    const barrels = findByClassname(edicts, 'misc_explobox');
+    expect(barrels).toHaveLength(9);
+    // hull origin = box bottom (SP_misc_explobox: mins -16,-16,0): the
+    // renderer-visible "floating barrel" cannot come from spawn placement —
+    // the lump origins below are verified floor-resting here.
+    expect([...EXPLOBOX_MINS]).toEqual([-16, -16, 0]);
+    expect([...EXPLOBOX_MAXS]).toEqual([16, 16, 40]);
+    const lump = parseEntities(map.entities)
+      .filter((d) => d.classname === 'misc_explobox')
+      .map((d) => d.origin)
+      .sort();
+    expect(lump).toEqual(
+      ['-1488 1712 -48', '-1456 1664 -48', '-24 864 -128', '1060 -140 -192', '136 40 0', '184 -24 0', '80 808 -128', '88 872 -128', '950 -198 -192'].sort(),
+    );
+    // M_droptofloor moves each barrel by exactly 1/32 up (C DIST_EPSILON
+    // contact offset — id does the same from these lump origins), then the
+    // placement is stable: a second drop lands back identically.
+    const byLump = new Map<string, (typeof barrels)[number]>();
+    for (const b of barrels) {
+      const lx = Math.round(b.origin[0]!);
+      const ly = Math.round(b.origin[1]!);
+      const lz = Math.round(b.origin[2]!);
+      byLump.set(`${lx} ${ly} ${lz}`, b);
+    }
+    expect([...byLump.keys()].sort()).toEqual(lump);
+    const trace = bspTraceFor(map);
+    for (const b of barrels) {
+      const again = droptofloor(b.origin, EXPLOBOX_MINS, EXPLOBOX_MAXS, trace);
+      expect(again[2]!).toBeCloseTo(b.origin[2]!, 6);
+      const t = traceBox(
+        map,
+        v3(b.origin[0], b.origin[1], b.origin[2]! + 1),
+        v3(b.origin[0], b.origin[1], b.origin[2]! - 256),
+        EXPLOBOX_MINS,
+        EXPLOBOX_MAXS,
+        1,
+      );
+      expect(t.fraction).toBeLessThan(0.05);
+      expect(t.endpos[2]!).toBeCloseTo(b.origin[2]!, 0);
+      void trace;
+    }
+  });
+
+  it('runner: start-room soldier ambushes, then closes and fires', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    const trace = bspTraceFor(map);
+    spawnWith(st, map, 1, true);
+    // nearest simulated monster to the spawn: the light soldier east of the
+    // start room (348,-348), dropped from its floating lump z (-64) to the
+    // real floor (-86) by M_droptofloor.
+    const spawn = v3(128, -320, 32);
+    const cands = st.monsters
+      .filter((m) => !m.triggered && m.kind)
+      .sort(
+        (a, b) =>
+          Math.hypot(a.edict.origin[0]! - spawn[0]!, a.edict.origin[1]! - spawn[1]!) -
+          Math.hypot(b.edict.origin[0]! - spawn[0]!, b.edict.origin[1]! - spawn[1]!),
+      );
+    const runner = cands[0]!;
+    expect(runner.edict.classname).toBe('monster_soldier_light');
+    expect(runner.ambush).toBe(true);
+    expect(runner.edict.origin[2]!).toBeLessThan(-64); // was floating
+    // 1. at spawn there is no line of sight: the ambush holds still.
+    const rand = mulberry32(7);
+    const at0: [number, number, number] = [runner.edict.origin[0]!, runner.edict.origin[1]!, runner.edict.origin[2]!];
+    for (let i = 0; i < 10; i++) SV_MonsterTick(st, spawn, trace, null, rand);
+    expect(runner.seen).toBe(false);
+    expect([...runner.edict.origin]).toEqual(at0);
+    // 2. the player rounds the corner (LOS opens at the east corridor mouth):
+    // seen latches on the first tick, then the monster closes + fires.
+    const drop = traceBox(map, v3(440, -500, 100), v3(440, -500, -300), PLAYER_MINS, PLAYER_MAXS, 1);
+    expect(drop.startsolid || drop.allsolid).toBe(false);
+    const player = v3(drop.endpos[0], drop.endpos[1], drop.endpos[2]);
+    const d0 = Math.hypot(runner.edict.origin[0]! - player[0]!, runner.edict.origin[1]! - player[1]!);
+    expect(d0).toBeGreaterThan(100);
+    SV_MonsterTick(st, player, trace, null, rand);
+    expect(runner.seen).toBe(true);
+    let fires = 0;
+    let firstAttack = '';
+    for (let i = 0; i < 60; i++) {
+      for (const ev of SV_MonsterTick(st, player, trace, null, rand)) {
+        fires++;
+        if (!firstAttack) firstAttack = ev.attack;
+        expect(ev.dmgScale).toBe(1); // skill 1: full damage
+      }
+    }
+    const d1 = Math.hypot(runner.edict.origin[0]! - player[0]!, runner.edict.origin[1]! - player[1]!);
+    expect(d1).toBeLessThan(d0 - 5); // advanced on the player, not static
+    expect(fires).toBeGreaterThan(0); // ranged attack wired (muzzle-gated)
+    expect(['shotgun', 'blaster']).toContain(firstAttack);
+    // 3. easy skill halves the reported damage scale (g_combat.c), same path.
+    SV_SetSkill(st, 0);
+    resetEdictNums();
+    const st2 = SV_Init();
+    SV_SetSkill(st2, 0);
+    spawnWith(st2, map, 0, true);
+    const r2 = st2.monsters.find((m) => m.edict.classname === 'monster_soldier_light' && !m.triggered)!;
+    const rand2 = mulberry32(7);
+    SV_MonsterTick(st2, player, trace, null, rand2);
+    let easyScale = -1;
+    for (let i = 0; i < 60 && easyScale < 0; i++) {
+      for (const ev of SV_MonsterTick(st2, player, trace, null, rand2)) {
+        easyScale = ev.dmgScale;
+        break;
+      }
+      void r2;
+    }
+    expect(easyScale).toBe(0.5);
+  });
+
+  it('armor: jacket lump behind a duck-only lintel; SP keeps the free jacket', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    const lump = parseEntities(map.entities).filter((d) => d.classname === 'item_armor_jacket');
+    expect(lump).toHaveLength(2);
+    const hole = lump.find((d) => d.origin === '360 280 -40')!;
+    expect(hole).toBeDefined();
+    // the hole jacket is deathmatch-only (1792 = NOT_EASY|MEDIUM|HARD): no SP
+    // skill ever spawns it — the crouch hole guards an empty alcove in SP.
+    expect(hole.spawnflags).toBe('1792');
+    resetEdictNums();
+    const st = SV_Init();
+    const edicts = spawnWith(st, map, 1, true);
+    const jackets = findByClassname(edicts, 'item_armor_jacket');
+    expect(jackets).toHaveLength(1);
+    // the free jacket is kept verbatim (items never drop; don't move it).
+    expect(`${jackets[0]!.origin[0]!} ${jackets[0]!.origin[1]!} ${jackets[0]!.origin[2]!}`).toBe('-384 -544 -80');
+    // geometry: C pmove duck hull is 28 tall (mins -24 / maxs +4), standing
+    // is 56 (maxs +32). The west lintel (face x~=272) passes hulls <=48 and
+    // blocks hulls >=52 — duck walks to the armor, standing stops short.
+    const duck = makePmoveState();
+    duck.pmFlags |= PMF_DUCKED;
+    PM_CheckDuck(duck, { msec: 100, angles: v3(0, 0, 0), forwardmove: 0, sidemove: 0, upmove: -1, buttons: 0 });
+    expect(duck.maxs[2]).toBe(4);
+    expect(duck.mins[2]).toBe(-24);
+    const walk = (maxs: Vec3): number =>
+      traceBox(map, v3(140, 280, -40), v3(360, 280, -40), PLAYER_MINS, maxs, 1).fraction;
+    expect(walk(PLAYER_MAXS)).toBeLessThan(1); // standing: lintel stops it
+    expect(walk(v3(16, 16, 4))).toBe(1); // ducked: reaches the alcove
+    const fits = (h: number): number =>
+      traceBox(map, v3(140, 280, -40), v3(360, 280, -40), PLAYER_MINS, v3(16, 16, h - 24), 1).fraction;
+    expect(fits(48)).toBe(1);
+    expect(fits(52)).toBeLessThan(1); // lintel clearance in (48, 52]
+  });
+
+  it('ships/train/flags: corner chains spawn, ships fly, train waits for *13', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    const edicts = spawnWith(st, map, 1, true);
+    expect(findByClassname(edicts, 'misc_strogg_ship')).toHaveLength(3);
+    expect(findByClassname(edicts, 'func_train')).toHaveLength(1);
+    expect(findByClassname(edicts, 'misc_banner')).toHaveLength(2);
+    expect(findByClassname(edicts, 'path_corner')).toHaveLength(53);
+    // the two red-eagle courtyard banners stand east of the courtyard.
+    const banners = findByClassname(edicts, 'misc_banner')
+      .map((b) => `${b.origin[0]!} ${b.origin[1]!} ${b.origin[2]!}`)
+      .sort();
+    expect(banners).toEqual(['-184 1344 108', '-376 1344 108']);
+    expect(st.trains).toHaveLength(4);
+    // trigger_always auto-started the three ships (unflagged); the exit
+    // train's own trigger_always is skill-inhibited in SP, so it waits.
+    const ships = st.trains.filter((t) => t.ship);
+    expect(ships).toHaveLength(3);
+    for (const s of ships) {
+      expect(s.started).toBe(true);
+      expect(s.corners.length).toBeGreaterThanOrEqual(3);
+    }
+    const train = st.trains.find((t) => !t.ship)!;
+    expect(train.started).toBe(false);
+    expect([...train.ent.origin]).toEqual([0, 0, 0]); // on its *12 brush
+    const starts = new Map<number, [number, number, number]>(
+      ships.map((s) => [s.ent.num, [s.ent.origin[0]!, s.ent.origin[1]!, s.ent.origin[2]!]]),
+    );
+    for (let i = 0; i < 15; i++) SV_Tick(st);
+    for (const s of ships) {
+      const p0 = starts.get(s.ent.num)!;
+      const moved = Math.hypot(s.ent.origin[0]! - p0[0], s.ent.origin[1]! - p0[1], s.ent.origin[2]! - p0[2]);
+      expect(moved).toBeGreaterThan(40); // flying the loop, not static
+    }
+    // the train still sits until button *13 (target t91) is pressed.
+    expect([...train.ent.origin]).toEqual([0, 0, 0]);
+    SV_UseTargetname(st, 't91');
+    expect(train.started).toBe(true);
+    for (let i = 0; i < 30; i++) SV_Tick(st);
+    // *12 rode t88 -> t89 (16 west) -> t90 (40 up) and stopped: no target.
+    expect(train.ent.origin[0]!).toBeCloseTo(-16, 3);
+    expect(train.ent.origin[2]!).toBeCloseTo(40, 3);
+    expect(train.arrived).toBe(true);
+  });
+
+  it('doors: touch opens *19 upward firing t69; slider axes/distances per C', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    spawnWith(st, map, 1, true);
+    const byModel = (n: number): Mover =>
+      st.movers.find((m) => m.ent.model === `*${n}`)!;
+    const d19 = byModel(19);
+    const d31 = byModel(31);
+    const d32 = byModel(32);
+    const d33 = byModel(33);
+    // G_SetMovedir axes + C travel (|movedir| . size - lip):
+    // *19 up 120, *31 down 156, *32/-y and *33/+y sliders 64 (lip 32).
+    const delta = (m: Mover): [number, number, number] => [
+      m.pos2[0]! - m.pos1[0]! + 0,
+      m.pos2[1]! - m.pos1[1]! + 0,
+      m.pos2[2]! - m.pos1[2]! + 0,
+    ];
+    const round = (xs: [number, number, number]): [number, number, number] => [
+      Math.round(xs[0]!) + 0,
+      Math.round(xs[1]!) + 0,
+      Math.round(xs[2]!) + 0,
+    ];
+    expect(round(delta(d19))).toEqual([0, 0, 120]);
+    expect(round(delta(d31))).toEqual([0, 0, -156]);
+    expect(round(delta(d32))).toEqual([0, -64, 0]);
+    expect(round(delta(d33))).toEqual([0, 64, 0]);
+    // touch the *19 trigger field (brush bounds +60 x/y): the up-door opens
+    // and fires its areaportal target at use time (door_go_up).
+    const used = SV_TouchDoorsAt(st, {
+      origin: v3(-1112, 1632, 24),
+      mins: PLAYER_MINS,
+      maxs: PLAYER_MAXS,
+    });
+    expect(used.map((m) => m.ent.model)).toContain('*19');
+    expect(d19.state).toBe('going_up');
+    expect(st.firedThisTick).toContain('t69');
+    for (let i = 0; i < 30 && d19.state !== 'waiting' && d19.state !== 'top'; i++) SV_Tick(st);
+    expect(d19.ent.origin[2]!).toBeCloseTo(120, 2); // slid +Z by travel
+    // base1 has no rotating doors (only the static *29 fan): no axis-rotation
+    // path is needed; the fan edict still spawns for the renderer.
+    expect(parseEntities(map.entities).some((d) => d.classname === 'func_door_rotating')).toBe(false);
+    expect(findByClassname(st.entities, 'func_rotating')).toHaveLength(1);
+  });
+
+  it('gunner: absent from base1; exit machinegun is DM-only, shotgun is SP', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    const dicts = parseEntities(map.entities);
+    expect(dicts.filter((d) => d.classname === 'monster_gunner')).toHaveLength(0);
+    // base1's two monster types are soldier variants (14) + infantry (5);
+    // infantry has no lite def yet (see monsterKindOf report in server.test).
+    expect(dicts.filter((d) => d.classname === 'monster_soldier' || d.classname === 'monster_soldier_light')).toHaveLength(14);
+    expect(dicts.filter((d) => d.classname === 'monster_infantry')).toHaveLength(5);
+    for (const skill of [0, 1, 2, 3]) {
+      resetEdictNums();
+      const st = SV_Init();
+      const edicts = spawnWith(st, map, skill, false);
+      // 1792 = DM-only: the exit machinegun never spawns in SP at any skill —
+      // it is not a substitute for the (nonexistent) gunner.
+      expect(findByClassname(edicts, 'weapon_machinegun')).toHaveLength(0);
+      expect(findByClassname(edicts, 'weapon_shotgun')).toHaveLength(1);
+    }
+  });
+
+  it('skill: SP roster gates per C (606 edicts / 17 monsters at skill 1)', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st1 = SV_Init();
+    const ed1 = spawnWith(st1, map, 1, true);
+    expect(ed1.length).toBe(606);
+    expect(st1.monsters).toHaveLength(17);
+    expect(st1.monsters.filter((m) => m.kind)).toHaveLength(14);
+    expect(st1.monsters.filter((m) => m.kind === null).map((m) => m.edict.classname).sort()).toEqual([
+      'monster_infantry',
+      'monster_infantry',
+      'monster_infantry',
+    ]);
+    expect(findByClassname(ed1, 'func_door')).toHaveLength(4);
+    expect(st1.triggers).toHaveLength(22);
+    expect(st1.movers).toHaveLength(6);
+    // hard+ spawns the two NOT_EASY|MEDIUM ambush infantries as well.
+    resetEdictNums();
+    const st2 = SV_Init();
+    const ed2 = spawnWith(st2, map, 2, true);
+    expect(ed2.length).toBe(607);
+    expect(st2.monsters).toHaveLength(19);
+  });
+});

@@ -8,14 +8,22 @@ import {
   SV_ConsumePickup,
   SV_Init,
   SV_LinkEdict,
+  SV_MonsterTick,
+  SV_SetSkill,
   SV_SpawnEntities,
   SV_SpawnTrigger,
   SV_Tick,
+  SV_TouchDoorsAt,
   SV_TouchTriggersAt,
   SV_UseMover,
   SV_UseTargetname,
   fireTargets,
+  inhibitedBySkill,
+  monsterKindOf,
+  skillMultiplier,
 } from './index.js';
+import { GUNNER, mulberry32, resetEdictNums } from '@q2/game';
+import type { TraceFn } from '@q2/game';
 import type { RiderBody } from './index.js';
 
 const BASE1_LOGIC = `
@@ -272,5 +280,151 @@ describe('exit-spurious-fire fix: brush volumes, relays, mover targets', () => {
     );
     SV_UseTargetname(st, 'door1');
     expect(st.firedThisTick).toContain('lit');
+  });
+});
+
+describe('skill cvar + spawn gating (g_spawn.c, g_combat.c)', () => {
+  it('SV_SetSkill floors and clamps to 0-3 (id skill cvar)', () => {
+    const st = SV_Init();
+    expect(st.skill).toBe(1); // C default: skill 1 (medium)
+    expect(SV_SetSkill(st, 2)).toBe(2);
+    expect(st.skill).toBe(2);
+    expect(SV_SetSkill(st, 2.9)).toBe(2);
+    expect(SV_SetSkill(st, -1)).toBe(0);
+    expect(SV_SetSkill(st, 9)).toBe(3);
+    expect(SV_SetSkill(st, Number.NaN)).toBe(1);
+  });
+
+  it('skillMultiplier halves damage to the player on easy (g_combat.c)', () => {
+    expect(skillMultiplier(0)).toBe(0.5);
+    expect(skillMultiplier(1)).toBe(1);
+    expect(skillMultiplier(2)).toBe(1);
+    expect(skillMultiplier(3)).toBe(1);
+  });
+
+  it('inhibitedBySkill matches the NOT_* roster rule (g_spawn.c)', () => {
+    expect(inhibitedBySkill(256, 0)).toBe(true);
+    expect(inhibitedBySkill(256, 1)).toBe(false);
+    expect(inhibitedBySkill(512, 0)).toBe(false);
+    expect(inhibitedBySkill(512, 1)).toBe(true);
+    expect(inhibitedBySkill(1024, 1)).toBe(false);
+    expect(inhibitedBySkill(1024, 2)).toBe(true);
+    expect(inhibitedBySkill(1024, 3)).toBe(true);
+    expect(inhibitedBySkill(1792, 0)).toBe(true);
+    expect(inhibitedBySkill(1792, 1)).toBe(true);
+    expect(inhibitedBySkill(1792, 2)).toBe(true);
+    expect(inhibitedBySkill(1792, 3)).toBe(true); // DM-only
+    expect(inhibitedBySkill(0, 0)).toBe(false);
+  });
+
+  it('skill gates the roster at spawn (NOT_EASY vs NOT_HARD items)', () => {
+    const lump =
+      `{ "classname" "worldspawn" }\n` +
+      `{ "classname" "ammo_shells" "origin" "0 0 0" "spawnflags" "256" }\n` +
+      `{ "classname" "ammo_bullets" "origin" "64 0 0" "spawnflags" "1024" }\n` +
+      `{ "classname" "weapon_shotgun" "origin" "-64 0 0" }\n`;
+    const easy = SV_Init();
+    SV_SetSkill(easy, 0);
+    const easyEnts = SV_SpawnEntities(easy, lump);
+    expect(easyEnts.map((e) => e.classname).sort()).toEqual(['ammo_bullets', 'weapon_shotgun', 'worldspawn']);
+    const hard = SV_Init();
+    SV_SetSkill(hard, 2);
+    const hardEnts = SV_SpawnEntities(hard, lump);
+    expect(hardEnts.map((e) => e.classname).sort()).toEqual(['ammo_shells', 'weapon_shotgun', 'worldspawn']);
+  });
+
+  it('monsterKindOf: soldiers map, gunner maps, infantry stays unmapped', () => {
+    // SP_monster_soldier_light is a soldier with a different skin; infantry
+    // has no lite def yet (needs an INFANTRY table in monsters.ts — reported).
+    expect(monsterKindOf('monster_soldier')).toBe('soldier');
+    expect(monsterKindOf('monster_soldier_light')).toBe('soldier');
+    expect(monsterKindOf('monster_gunner')).toBe('gunner');
+    expect(monsterKindOf('monster_infantry')).toBeNull();
+  });
+
+  it('gunner-lite tables match m_gunner.c move structure', () => {
+    // gcc -c ground truth: attack_chain 7f -> fire_chain, fire_chain 8f ->
+    // endfire_chain (via gunner_refire_chain), endfire_chain 7f -> run,
+    // attack_grenade 21f -> run; health 175 / gib -70 / mass 200.
+    const st = SV_Init();
+    const ents = SV_SpawnEntities(
+      st,
+      `{ "classname" "worldspawn" }\n{ "classname" "monster_gunner" "origin" "0 0 24" }\n`,
+    );
+    expect(st.monsters).toHaveLength(1);
+    const m = st.monsters[0]!;
+    expect(m.kind).toBe('gunner');
+    expect(m.state.health).toBe(175);
+    expect(ents).toHaveLength(2);
+    expect(GUNNER.moves['attack_chain']!.frames).toHaveLength(7);
+    expect(GUNNER.moves['attack_chain']!.end).toBe('fire_chain');
+    expect(GUNNER.moves['fire_chain']!.frames).toHaveLength(8);
+    expect(GUNNER.moves['endfire_chain']!.frames).toHaveLength(7);
+    expect(GUNNER.moves['endfire_chain']!.end).toBe('run');
+    expect(GUNNER.moves['attack_grenade']!.frames).toHaveLength(21);
+    expect(GUNNER.health).toBe(175);
+    expect(GUNNER.gibHealth).toBe(-70);
+    expect(GUNNER.mass).toBe(200);
+    expect(GUNNER.moves['runandshoot']!.frames.every((f) => f.action === 'fire')).toBe(true);
+  });
+
+  it('synthetic gunner chases and fires the chaingun with clear LOS', () => {
+    // No BSP needed: stub trace reports clear LOS and unclamped motion.
+    const st = SV_Init();
+    resetEdictNums();
+    SV_SpawnEntities(st, `{ "classname" "worldspawn" }\n{ "classname" "monster_gunner" "origin" "0 0 24" }\n`);
+    const gunner = st.monsters[0]!;
+    const player = v3(300, 0, 24);
+    const trace: TraceFn = (start, mins, _maxs, end) => {
+      void start;
+      void mins;
+      return { fraction: 1, endpos: v3(end[0], end[1], end[2]), planeNormal: v3(0, 0, 1), allsolid: false, startsolid: false, entityNum: -1, contents: 0 };
+    };
+    const d0 = Math.hypot(gunner.edict.origin[0]! - player[0]!, gunner.edict.origin[1]! - player[1]!);
+    const rand = mulberry32(1234);
+    let fires = 0;
+    const attacks = new Set<string>();
+    for (let i = 0; i < 40; i++) {
+      for (const ev of SV_MonsterTick(st, player, trace, null, rand)) {
+        fires++;
+        attacks.add(ev.attack);
+        expect(ev.dmgScale).toBe(1);
+      }
+    }
+    const d1 = Math.hypot(gunner.edict.origin[0]! - player[0]!, gunner.edict.origin[1]! - player[1]!);
+    expect(d1).toBeLessThan(d0); // closed in (run/runandshoot dist > 0)
+    expect(fires).toBeGreaterThan(0); // ranged attack wired, not static
+    expect([...attacks].some((a) => a === 'chaingun' || a === 'grenade')).toBe(true);
+  });
+
+  it('door touch volume opens a vertical door and fires its target (Touch_DoorTrigger)', () => {
+    // Synthetic *7-analogue: 64x64x128 brush, angle -1 (straight up, id VEC_UP).
+    const st = SV_Init();
+    SV_SpawnEntities(
+      st,
+      `{ "classname" "worldspawn" }\n` +
+        `{ "classname" "func_door" "model" "*7" "angle" "-1" "target" "lit" "wait" "-1" }\n` +
+        `{ "classname" "trigger_relay" "targetname" "lit" }\n`,
+      (model) =>
+        model === '*7'
+          ? { mins: new Float32Array([0, 0, 0]), maxs: new Float32Array([64, 64, 128]) }
+          : null,
+    );
+    const m = st.movers[0]!;
+    // travel = |up| . size - lip = 128 - 8; pos2 straight above pos1.
+    expect(m.pos2[0]! - m.pos1[0]!).toBeCloseTo(0, 6);
+    expect(m.pos2[1]! - m.pos1[1]!).toBeCloseTo(0, 6);
+    expect(m.pos2[2]! - m.pos1[2]!).toBeCloseTo(120, 6);
+    const used = SV_TouchDoorsAt(st, {
+      origin: v3(32, 32, 24),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+    });
+    expect(used).toHaveLength(1);
+    expect(m.state).toBe('going_up');
+    expect(st.firedThisTick).toContain('lit'); // door_go_up fires on opening
+    for (let i = 0; i < 30 && m.state !== 'top'; i++) SV_Tick(st);
+    expect(m.state).toBe('top');
+    expect(m.ent.origin[2]!).toBeCloseTo(120, 3); // slid along +Z by travel
   });
 });
