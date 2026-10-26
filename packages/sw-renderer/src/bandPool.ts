@@ -18,7 +18,7 @@ import { Com_Warn } from '@q2/config';
 import {
   CTL_COUNT, CTL_DONE, CTL_FBH, CTL_FBW, CTL_FRAME, CTL_HMASK, CTL_LIGHTH, CTL_LIGHTW,
   CTL_PIXELS, CTL_READY, CTL_SEQ, CTL_SPANS, CTL_TEXH, CTL_TEXW, CTL_TURBPHASE,
-  CTL_WMASK, CTL_WSHIFT, MAX_WORKERS, MIN_BAND_PIXELS,
+  CTL_WMASK, CTL_WSHIFT, LIGHT_CAP, MAX_WORKERS, MIN_BAND_PIXELS, TEX_CAP,
   attachBandShared, bandTotal, packBandSpans, processBandJob, readBandJob,
   sabAvailable, splitBands, syncWaitAllowed, writeBandJob,
   type Band,
@@ -236,6 +236,24 @@ export class BandWorkerPool implements BandDispatcher {
   }
 
   /**
+   * Staging-fit check for the SAB texture/light slots (mirrors the WASM
+   * backend's TEX_CAP/LIGHT_CAP guards in tryWasmOpaque). Oversized or
+   * short surface data can never be staged faithfully — stage() would copy
+   * a prefix (or leave a stale tail) and workers would sample zeros/stale
+   * texels as black. Unsuitable batches run inline instead, so output stays
+   * bit-identical either way. The packed sky strip (256x1536 real art) is
+   * the in-engine case: it exceeds TEX_CAP and must take the inline path.
+   */
+  private stagingFits(tex: Texture, light: LightBlock): boolean {
+    const tw = tex.width | 0, th = tex.height | 0;
+    const lw = light.width | 0, lh = light.height | 0;
+    if (!(tw > 0 && th > 0 && lw > 0 && lh > 0)) return false;
+    if (tex.texels.length < tw * th || tex.texels.length > TEX_CAP) return false;
+    if (light.values.length < lw * lh || light.values.length > LIGHT_CAP) return false;
+    return true;
+  }
+
+  /**
    * Rasterise one surface batch across the pool (blocking). Returns null
    * when the batch is unsuitable — the caller runs it inline instead.
    * Re-execution safe: all writes are depth-guarded, so a timeout fallback
@@ -252,6 +270,7 @@ export class BandWorkerPool implements BandDispatcher {
     if (!packed) return null;
     if (packed.count === 0) return { pixels: 0, spans: 0 };
     if (packed.est < MIN_BAND_PIXELS) return null;
+    if (!this.stagingFits(tex, light)) return null;
     if (!this.awaitReadySync()) {
       Com_Warn('bandPool: workers never became ready, redrawing inline');
       return null;
@@ -302,6 +321,7 @@ export class BandWorkerPool implements BandDispatcher {
     if (!packed) return null;
     if (packed.count === 0) return Promise.resolve({ pixels: 0, spans: 0 });
     if (packed.est < MIN_BAND_PIXELS) return null;
+    if (!this.stagingFits(tex, light)) return null;
     if (!(await this.awaitReadyAsync())) {
       Com_Warn('bandPool: workers never became ready, redrawing inline');
       return null;

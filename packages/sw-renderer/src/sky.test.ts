@@ -677,4 +677,92 @@ describe.runIf(!!process.env.Q2_PAK)('real unit1_ sky over base1 (Q2_PAK)', () =
     console.log(`SKY-PAK base1 spawn-north with unit1_ strip: hash=${fnv(fb.index!)} spans=${stats.spans} pixels=${stats.pixels}`);
     expect(stats.pixels).toBeGreaterThan(W * H * 0.15);
   });
+
+  it('yaw sweep at spawn: no clear-black sky frames (M7.2 sky-black pin)', { timeout: 300000 }, () => {
+    // Headless repro for the base1-play report "sky turns completely black
+    // at certain view angles": sweep yaw 0-360 at the spawn-area viewpoint
+    // with the original unit1_ 6-tile strip and require the textured box to
+    // cover every pixel where the flat path shows sky. A missing face (clear
+    // color showing through) fails; genuinely-black art texels keep depth
+    // (zb > 0) and pass. Skips cleanly without Q2_PAK via describe.runIf.
+    const pakPath = process.env.Q2_PAK as string;
+    let strip: { texels: Uint8Array; width: number; height: number } | null = null;
+    try {
+      const faces = SKY_TILE_SUFFIXES.map((suf) => parsePCX(pakReadFile(pakPath, `env/unit1_${suf}.pcx`)));
+      const w = faces[0]!.width, h = faces[0]!.height;
+      if (!faces.every((f) => f.width === w && f.height === h && f.pixels.length === w * h)) {
+        throw new Error('mismatched sky faces');
+      }
+      const texels = new Uint8Array(w * h * 6);
+      faces.forEach((f, i) => texels.set(f.pixels.subarray(0, w * h), i * w * h));
+      strip = { texels, width: w, height: h * 6 };
+    } catch {
+      console.log('SKY-PAK: env/unit1_ faces missing, skipping');
+      return;
+    }
+    const bsp = loadBsp(pakReadFile(pakPath, 'maps/base1.bsp'));
+    const walCache = new Map<string, BspTexelSource | null>();
+    const texelFor = (walName: string): BspTexelSource | null => {
+      if (walCache.has(walName)) return walCache.get(walName)!;
+      let src: BspTexelSource | null = null;
+      try {
+        const wal = parseWAL(pakReadFile(pakPath, `textures/${walName}.wal`));
+        src = { texels: wal.mips[0]!, width: wal.width, height: wal.height };
+      } catch { src = null; }
+      walCache.set(walName, src);
+      return src;
+    };
+    const world = bspToMiniWorld(bsp, { texelFor });
+    const pcx = parsePCX(pakReadFile(pakPath, 'pics/colormap.pcx'));
+    const W = 160, H = 120;
+    const eye = v3(128, -320, 54);
+    const styles = new Float32Array(256).fill(1);
+    let clearBlack = 0;
+    let skyPixels = 0;
+    // Yaw 0-360 plus look-up pitches: the spawn room shows sky through its
+    // open top at pitch <= -45, which is exactly the "certain view angles"
+    // of the report.
+    for (const pitch of [0, -30, -45, -60, -89]) {
+    for (let yaw = 0; yaw < 360; yaw += 10) {
+      const angles = v3(pitch, yaw, 0);
+      const flatFb = createFramebuffer(W, H, true);
+      const rf = new SoftwareRenderer();
+      rf.init(flatFb);
+      rf.setPalette(pcx.palette);
+      rf.beginFrame();
+      rf.renderView(
+        { origin: eye, angles, fovX: 90, time: 1.5, lightStyles: styles },
+        { name: 'base1', data: world },
+        [],
+      );
+      rf.endFrame();
+      const skyIdx = rf.testSkyIndex();
+      const flat = flatFb.index!;
+      const tFb = createFramebuffer(W, H, true);
+      const rt = new SoftwareRenderer();
+      rt.init(tFb);
+      rt.setPalette(pcx.palette);
+      rt.setSkyTexture(strip);
+      rt.beginFrame();
+      rt.renderView(
+        { origin: eye, angles, fovX: 90, time: 1.5, lightStyles: styles },
+        { name: 'base1', data: world },
+        [],
+      );
+      rt.endFrame();
+      const tex = tFb.index!, zb = tFb.depth;
+      for (let i = 0; i < flat.length; i++) {
+        if (flat[i] !== skyIdx) continue;
+        skyPixels++;
+        // Clear color showing through = the box failed to cover a pixel the
+        // world sky poly covered (wrongful face cull / missing emission).
+        // Black ART keeps depth and is not counted here.
+        if (tex[i] === 0 && zb[i] === 0) clearBlack++;
+      }
+    }
+    }
+    console.log(`SKY-PAK yaw sweep at spawn: skyPixels=${skyPixels} clearBlack=${clearBlack}`);
+    expect(skyPixels).toBeGreaterThan(0); // the sweep actually sees sky
+    expect(clearBlack).toBe(0); // ...and none of it is ever clear color
+  });
 });

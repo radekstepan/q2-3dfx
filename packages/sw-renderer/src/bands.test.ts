@@ -15,6 +15,8 @@ import {
   sabAvailable, splitBands, syncWaitAllowed, workersRequestedByCvar,
 } from './index.js';
 import { BandWorkerPool } from './index.js';
+import { SKY_SIDE_IMAGE } from './index.js';
+import type { MiniWorld } from './index.js';
 import { buildColormap, defaultPalette } from './index.js';
 import { SoftwareRenderer } from './index.js';
 import { createDevroom, DEVROOM_CAMERA } from './index.js';
@@ -488,5 +490,170 @@ describe.runIf(!!process.env.Q2_PAK)('banded vs single on real base1 (Q2_PAK)', 
     bb.drawSpans(list, tex, light);
     expect([...bIdx]).toEqual([...refIdx]);
     expect([...bZb]).toEqual([...refZb]);
+  });
+});
+
+describe('pool staging caps (M7.2 sky-black fix)', () => {
+  /** Full-width opaque spans so the pool fast path is eligible (est >> threshold). */
+  function wideBatch(W: number, H: number): SpanList {
+    const spans: Span[] = [];
+    for (let y = 0; y < H; y += 2) {
+      const s = createSpan();
+      s.y = y; s.x0 = 0; s.x1 = W; s.iz = 0.05; s.diz = 0;
+      s.uz = 0; s.duz = s.iz * 0.5; s.vz = 0; s.dvz = 0;
+      s.light = 63; s.dlight = 0; s.lv = -1;
+      spans.push(s);
+    }
+    return { spans, count: spans.length };
+  }
+
+  it('dispatch returns null for textures beyond staging instead of truncating', { timeout: 60000 }, async () => {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP pool cap test: dist not built (run yarn build first)');
+      return;
+    }
+    const W = 160, H = 120;
+    const pool = BandWorkerPool.create(2, W, H, { indexJsPath: distUrl.pathname });
+    expect(pool).not.toBeNull();
+    try {
+      const list = wideBatch(W, H);
+      const colormap = buildColormap(defaultPalette());
+      const light: LightBlock = { width: 1, height: 1, values: new Uint8Array([63]) };
+      // 65792 bytes > TEX_CAP (65536): the packed sky strip shape. Must fall
+      // back inline (null) — staging a prefix would sample zeros as black.
+      const big: Texture = { width: 256, height: 257, texels: new Uint8Array(256 * 257).fill(7) };
+      pool!.beginFrame();
+      expect(pool!.dispatch(list, big, light, colormap, 0, W, H, pool!.idx, pool!.zb)).toBeNull();
+      pool!.beginFrame();
+      expect(await pool!.dispatchAsync(list, big, light, colormap, 0, W, H, pool!.idx, pool!.zb)).toBeNull();
+      // Boundary: exactly TEX_CAP still dispatches (no behaviour change).
+      const okTex: Texture = { width: 256, height: 256, texels: new Uint8Array(65536).fill(7) };
+      pool!.beginFrame();
+      const r = pool!.dispatch(list, okTex, light, colormap, 0, W, H, pool!.idx, pool!.zb);
+      expect(r).not.toBeNull();
+      expect(r!.pixels).toBeGreaterThan(0);
+    } finally {
+      await pool!.dispose();
+    }
+  });
+
+  /** Six sky quads around the camera (same shape as the sky.test.ts room). */
+  function skyRoom(): MiniWorld {
+    const quads: number[][] = [
+      [40, -40, 0, 40, 40, 0, 40, 40, 60, 40, -40, 60],
+      [-40, 40, 0, -40, -40, 0, -40, -40, 60, -40, 40, 60],
+      [-40, 40, 0, 40, 40, 0, 40, 40, 60, -40, 40, 60],
+      [40, -40, 0, -40, -40, 0, -40, -40, 60, 40, -40, 60],
+      [-40, -40, 70, 40, -40, 70, 40, 40, 70, -40, 40, 70],
+      [-40, 40, -10, 40, 40, -10, 40, -40, -10, -40, 40, -10],
+    ];
+    const surfaces = quads.map((q, i) => ({
+      id: i,
+      verts: new Float32Array(q),
+      uvs: new Float32Array([0, 0, 64, 0, 64, 64, 0, 64]),
+      lux: new Float32Array([0, 0, 4, 0, 4, 4, 0, 4]),
+      n: 4, texId: 0, lightId: 0,
+      center: new Float32Array([0, 0, 30]), radius: 90,
+      mins: new Float32Array([-40, -40, -10]), maxs: new Float32Array([40, 40, 70]),
+      turbulent: false, sky: true,
+      fn: new Float32Array([0, 0, 1]),
+    }));
+    return {
+      brand: 'miniworld',
+      nodes: [],
+      leafs: [{ cluster: 0, firstSurf: 0, numSurfs: surfaces.length }],
+      pvs: [new Uint8Array([1])],
+      clusterCount: 1,
+      surfaces,
+      textures: [{ texels: new Uint8Array(16).fill(7), width: 4, height: 4 }],
+      lightmaps: [{ samples: new Uint8Array([128, 128, 128]), luxW: 1, luxH: 1, styles: [0] }],
+      dynamicLights: [],
+      alias: [],
+      sprites: [],
+      particles: [],
+    };
+  }
+
+  it('pooled sky with a real-size strip matches classic on all six faces', { timeout: 120000 }, async () => {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP pool sky test: dist not built (run yarn build first)');
+      return;
+    }
+    const { setCVarFromString, resetCVars } = await import('@q2/config');
+    // Real-size strip analogue: 256x1536 packed tiles (384KB > TEX_CAP).
+    const tile = 256;
+    const texels = new Uint8Array(tile * tile * 6);
+    for (let f = 0; f < 6; f++) texels.fill(10 + f * 20, f * tile * tile, (f + 1) * tile * tile);
+    const strip = { texels, width: tile, height: tile * 6 };
+    const pal = new Uint8Array(768);
+    for (let i = 0; i < 256; i++) { pal[i * 3] = i; pal[i * 3 + 1] = i; pal[i * 3 + 2] = i; }
+    const FACES: Array<[string, number[], number]> = [
+      ['+X rt', [0, 0, 0], 4],
+      ['+Y bk', [0, 90, 0], 3],
+      ['-X lf', [0, 180, 0], 1],
+      ['-Y ft', [0, 270, 0], 5],
+      ['+Z up', [-90, 0, 0], 2],
+      ['-Z dn', [90, 0, 0], 0],
+    ];
+    const W = 160, H = 120;
+    const world = skyRoom();
+    const renderClassic = (angles: number[]): Uint8Array => {
+      const fb = createFramebuffer(W, H, true);
+      const r = new SoftwareRenderer();
+      r.init(fb);
+      r.setPalette(pal);
+      r.setSkyTexture(strip);
+      r.beginFrame();
+      r.renderView(
+        {
+          origin: new Float32Array([0, 0, 30]), angles: new Float32Array(angles),
+          fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1),
+        },
+        { name: 'sky-room', data: world },
+        [],
+      );
+      r.endFrame();
+      return r.getFramebuffer().index!.slice();
+    };
+    try {
+      const pool = BandWorkerPool.create(2, W, H, { indexJsPath: distUrl.pathname });
+      expect(pool).not.toBeNull();
+      try {
+        for (const [label, angles, face] of FACES) {
+          const want = 10 + SKY_SIDE_IMAGE[face]! * 20;
+          const ref = renderClassic(angles);
+          // Sanity: the classic path covers the frame with the face tile.
+          let hit = 0;
+          for (let i = 0; i < ref.length; i++) if (ref[i] === want) hit++;
+          expect(hit / ref.length, `${label} classic coverage`).toBeGreaterThan(0.99);
+          // Pooled path (inline fallback for the oversized strip) is identical.
+          const fb = createFramebuffer(W, H, true);
+          const r = new SoftwareRenderer();
+          r.init(fb);
+          r.setPalette(pal);
+          r.setSkyTexture(strip);
+          setCVarFromString('sw_workers', '2');
+          r.syncWorkersFromCvar();
+          r.attachWorkerPool(pool);
+          r.beginFrame();
+          r.renderView(
+            {
+              origin: new Float32Array([0, 0, 30]), angles: new Float32Array(angles),
+              fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1),
+            },
+            { name: 'sky-room', data: world },
+            [],
+          );
+          r.endFrame();
+          expect(hashIdx(r.getFramebuffer().index!), `${label} pooled`).toBe(hashIdx(ref));
+        }
+      } finally {
+        await pool!.dispose();
+      }
+    } finally {
+      resetCVars();
+    }
   });
 });

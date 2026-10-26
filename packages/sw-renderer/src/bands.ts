@@ -40,8 +40,8 @@ export const F_PER_SPAN = 11;
 export const I_PER_SPAN = 5;
 
 /** Surface texel / light-block staging caps (bytes) inside shared memory. */
-const TEX_CAP = 65536; // 256x256, matches vd_maxtexsize
-const LIGHT_CAP = 65536;
+export const TEX_CAP = 65536; // 256x256, matches vd_maxtexsize
+export const LIGHT_CAP = 65536;
 const TURB_SIZE = 1024;
 
 // --- control block (Int32Array) ---
