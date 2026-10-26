@@ -217,11 +217,48 @@ export function cvarOptionLabels(name: string): readonly string[] | null {
  * vid_resolution reboots at the new framebuffer size. The browser boot
  * listens via renderCvarPanel's onChange and calls rebootPlay.
  */
-export const REBOOT_CVARS: ReadonlySet<string> = new Set(['skill', 'vid_resolution', 'map_source']);
+export const REBOOT_CVARS: ReadonlySet<string> = new Set(['skill', 'vid_resolution', 'map_source', 'vid_renderer']);
 
 /** True when changing this cvar reboots the level (skill, vid_resolution). */
 export function cvarNeedsReboot(name: string): boolean {
   return REBOOT_CVARS.has(name);
+}
+
+/** UI cvars persisted across page reloads (localStorage, DOM-guarded). */
+const PERSISTED_CVARS = ['vid_renderer', 'skill', 'vid_resolution', 'map_source', 'r_brightness'] as const;
+const PERSIST_KEY = 'q2ts.cvars.v1';
+
+/** Save menu cvars to localStorage. No-op without DOM. */
+export function savePersistedCVars(): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const obj: Record<string, string> = {};
+    for (const name of PERSISTED_CVARS) obj[name] = getCVarString(name);
+    localStorage.setItem(PERSIST_KEY, JSON.stringify(obj));
+  } catch {
+    /* storage full/blocked: session cvars still work */
+  }
+}
+
+/** Restore menu cvars from localStorage. No-op without DOM. */
+export function restorePersistedCVars(): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const raw = localStorage.getItem(PERSIST_KEY);
+    if (!raw) return;
+    const obj = JSON.parse(raw) as Record<string, string>;
+    for (const name of PERSISTED_CVARS) {
+      if (typeof obj[name] === 'string') {
+        try {
+          setCVarFromString(name, obj[name]!);
+        } catch {
+          /* stale value: keep registered default */
+        }
+      }
+    }
+  } catch {
+    /* corrupt JSON: keep defaults */
+  }
 }
 
 /** Canonical label for a skill value (clamped to 0..3, default Medium). */

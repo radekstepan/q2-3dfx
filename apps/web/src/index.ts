@@ -16,8 +16,7 @@ export { bootPlay };
 export type { PlayBoot };
 export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
-export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
-export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled, cvarOptions, cvarControlKind, cvarOptionLabels, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, MAP_SOURCE_LABELS, setMapSourceHasPak, getMapSourceHasPak, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS } from './dom.js';
+export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled, cvarOptions, cvarControlKind, cvarOptionLabels, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, MAP_SOURCE_LABELS, setMapSourceHasPak, getMapSourceHasPak, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS } from './dom.js';
 export type { PlayLoop } from './dom.js';
 export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpTracers, registerPakModels, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
 export type { PakModelHandles, TracerBeam } from './play.js';
@@ -66,6 +65,9 @@ export function bootWeb(opts: BootOptions = {}): BootResult {
 // builds working and Node imports side-effect free.
 if (typeof document !== 'undefined') {
   void import('./dom.js').then((dom) => {
+    // Restore the menu cvars (renderer/skill/resolution/map/brightness)
+    // before the first boot so a reload keeps the previous session's menu.
+    dom.restorePersistedCVars();
     const canvas = document.querySelector('#q2');
     const progress = document.querySelector('#q2-progress');
     const cvars = document.querySelector('#q2-cvars');
@@ -98,6 +100,7 @@ if (typeof document !== 'undefined') {
     // latches them; the menu applies them immediately by re-calling the
     // boot path).
     const onCvar = (cvarName: string): void => {
+      dom.savePersistedCVars();
       if (!dom.cvarNeedsReboot(cvarName)) return;
       startWithPak(lastPak, lastName);
     };

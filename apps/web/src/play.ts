@@ -3217,7 +3217,7 @@ export function bootPlay(opts: {
   const res = getResolution();
   const width = opts.width ?? res.width;
   const height = opts.height ?? res.height;
-  const renderer = opts.renderer ?? 'software';
+  const renderer = opts.renderer ?? (getCVarString('vid_renderer') === 'voodoo' ? 'voodoo' : 'software');
   const driver = new LocalDriver(opts.pak ?? null);
   const refresh = new SoftwareRenderer();
   let mainPalette: Uint8Array | null = null;
@@ -3298,7 +3298,9 @@ export function bootPlay(opts: {
  */
 export function rebootPlay(prev: PlayBoot): PlayBoot {
   const pak = getMapSource() === MAP_SOURCE_PAK ? prev.pak : null;
-  return bootPlay({ renderer: prev.renderer, pak });
+  // Renderer re-latches from the vid_renderer cvar like the other
+  // REBOOT_CVARS (resolution/skill/map): the menu owns the choice now.
+  return bootPlay({ pak });
 }
 
 /** Resolve the software framebuffer for display (voodoo post chain or direct).

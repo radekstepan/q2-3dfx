@@ -39,9 +39,25 @@ describe('menu reboot: skill + resolution (headless)', () => {
     expect(cvarNeedsReboot('skill')).toBe(true);
     expect(cvarNeedsReboot('vid_resolution')).toBe(true);
     expect(cvarNeedsReboot('map_source')).toBe(true);
-    expect(cvarNeedsReboot('vid_renderer')).toBe(false);
+    expect(cvarNeedsReboot('vid_renderer')).toBe(true);
     expect(cvarNeedsReboot('r_brightness')).toBe(false);
     expect(cvarNeedsReboot('cl_showfps')).toBe(false);
+  });
+
+  it('bootPlay honors the persisted vid_renderer cvar; rebootPlay keeps it', () => {
+    setCVar('vid_renderer', 'voodoo');
+    const b = bootPlay({});
+    expect(b.renderer).toBe('voodoo');
+    const c = rebootPlay(b);
+    expect(c.renderer).toBe('voodoo');
+    setCVar('vid_renderer', 'software');
+    expect(rebootPlay(c).renderer).toBe('software');
+  });
+
+  it('persisted cvars are a headless no-op (no DOM in tests)', async () => {
+    const dom = await import('./dom.js');
+    expect(() => dom.savePersistedCVars()).not.toThrow();
+    expect(() => dom.restorePersistedCVars()).not.toThrow();
   });
 
   it('resolution domain is the four sizes with × labels', () => {
