@@ -10,8 +10,6 @@
 import { describe, expect, it } from 'vitest';
 import { v3 } from '@q2/math';
 import {
-  GIB_DEADFLAG,
-  GIB_SOUND,
   MELEE_DISTANCE,
   MONSTER_YAW_SPEED,
   RANGE_MELEE,
@@ -19,7 +17,6 @@ import {
   changeYaw,
   corpseHittable,
   entityAngles,
-  gibModelsFor,
   isAttackMove,
   monsterChaseMove,
   monsterFrameNumber,
@@ -29,6 +26,7 @@ import {
   spawnMonster,
   yawDiff,
 } from './monsters.js';
+import { gibModelsFor, GIB_SOUND, GIB_DEADFLAG } from './explosives.js';
 import { monsterPain, monsterThink } from './monsters.js';
 import { mulberry32 } from './weapons.js';
 
@@ -181,9 +179,9 @@ describe('soldier/gunner animation + facing regressions (M7.2 batch #3)', () => 
 
 describe('shooting dead: corpses hittable, overkill gibs (M7.2 batch #4)', () => {
   it('corpses stay hittable until gibbed; gibbed bodies are gone', () => {
-    const s = spawnMonster('soldier');
+    const s = spawnMonster('soldier'); // health 30, gibHealth -30
     expect(corpseHittable(s)).toBe(false); // alive: not a corpse
-    monsterPain(s, 1000, () => 0);
+    expect(monsterPain(s, 40, () => 0)).toBe('dead'); // health -10: dead, not minced
     expect(s.dead).toBe(true);
     expect(s.gibbed).toBe(false);
     expect(corpseHittable(s)).toBe(true); // takedamage YES: re-hits can mince
@@ -195,8 +193,8 @@ describe('shooting dead: corpses hittable, overkill gibs (M7.2 batch #4)', () =>
 
   it('overkill re-hit gibs the corpse: sm_meat/chest/head + udeath + DEAD_DEAD', () => {
     const s = spawnMonster('soldier');
-    monsterPain(s, 1000, () => 0); // dead, health -970ish
-    const res = monsterPain(s, 1000, () => 0); // push under gibHealth -30
+    monsterPain(s, 40, () => 0); // dead, health -10
+    const res = monsterPain(s, 25, () => 0); // health -35 <= gibHealth -30
     expect(res).toBe('gib');
     expect(s.gibbed).toBe(true);
     expect(corpseHittable(s)).toBe(false); // DEAD_DEAD: unhittable from now on

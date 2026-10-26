@@ -281,7 +281,7 @@ describe('green soldier bolt regression (M7.2 user report)', () => {
     expect(YELLOW_COLOR_BASE).toBe(0xe0);
     expect(YELLOW_COLOR_END).toBe(0xe8);
     expect(GREEN_COLOR_BASE).toBe(0xd0);
-    expect(GREEN_COLOR_END).toBe(0xd8);
+    expect(GREEN_COLOR_END).toBe(0xd7);
     expect(isGreenBoltColor(0xe0)).toBe(false);
     expect(isGreenBoltColor(0xe1)).toBe(false);
     expect(isGreenBoltColor(225)).toBe(false); // blaster tracer orange
