@@ -9,6 +9,7 @@ import {
   EXPLOBOX_MINS,
   MONSTER_HULL_MAXS,
   MONSTER_HULL_MINS,
+  MONSTER_STEP_HEIGHT,
   MOVER_BOTTOM,
   MOVER_GOING_UP,
   MOVER_TOP,
@@ -42,8 +43,14 @@ import type {
   TraceFn,
   Trigger,
 } from '@q2/game';
+import {
+  bspContentsFor,
+  setPmoveWorld,
+} from '@q2/game';
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
+import { traceBox } from '@q2/bsp';
+import type { BspMap } from '@q2/bsp';
 
 export interface ServerState {
   /** level.time in seconds (float). Never wall-clock. */
@@ -76,10 +83,20 @@ export interface ServerState {
    * hook — firing them by proximity to 0,0,0 is always spurious.
    */
   triggerBounds: Map<number, { mins: Float32Array; maxs: Float32Array }>;
+  /**
+   * Solid brush-model clips by edict num (func_explosive / func_wall).
+   * In C these are SOLID_BSP from spawn until destroyed (SP_func_explosive,
+   * SP_func_wall): they block movement while standing. SV_SpawnEntities
+   * records their world-space bounds here when modelSizes resolves them;
+   * SV_RemoveBrushClip drops the entry when the brush is destroyed
+   * (func_explosive_explode / G_FreeEdict). Drivers feed this registry into
+   * SV_ClipTrace so walls block before detonation and open after.
+   */
+  brushClips: Map<number, { mins: Float32Array; maxs: Float32Array }>;
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map() };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map() };
 }
 
 /** Link an edict into the world (SV_LinkEdict: register + solid bookkeeping). */
@@ -142,6 +159,67 @@ export function SV_SetSkill(st: ServerState, skill: number): number {
   return s;
 }
 
+// --- C-authentic contents masks (game/q_shared.h) --------------------------
+//
+// The game-side default (MASK_PLAYERSOLID = 1 in @q2/game/collision.ts) only
+// tests CONTENTS_SOLID. The C engine collides the player against
+// MASK_PLAYERSOLID = SOLID|PLAYERCLIP|WINDOW|MONSTER and walks monsters with
+// MASK_MONSTERSOLID = SOLID|MONSTERCLIP|WINDOW|MONSTER; sight checks run eye
+// to eye against MASK_OPAQUE = SOLID|SLIME|LAVA. Base1 seals stairs and
+// ledges with PLAYERCLIP detail brushes (36 in this map) and glass with
+// WINDOW (7): a mask-1 trace falls straight through those floors, including
+// spots where the player box exits the world volume entirely (the reported
+// clip-through/void). traceBox itself is mask-correct — only the mask handed
+// in was wrong — so these server-owned helpers hand in the C masks.
+
+export const CONTENTS_SOLID = 1;
+export const CONTENTS_WINDOW = 2;
+export const CONTENTS_SLIME = 16;
+export const CONTENTS_LAVA = 8;
+export const CONTENTS_PLAYERCLIP = 0x10000;
+export const CONTENTS_MONSTERCLIP = 0x20000;
+export const CONTENTS_MONSTER = 0x2000000;
+
+/** C MASK_PLAYERSOLID (SOLID|PLAYERCLIP|WINDOW|MONSTER, q_shared.h). */
+export const MASK_PLAYERSOLID_C =
+  CONTENTS_SOLID | CONTENTS_WINDOW | CONTENTS_PLAYERCLIP | CONTENTS_MONSTER;
+/** C MASK_MONSTERSOLID (SOLID|MONSTERCLIP|WINDOW|MONSTER, q_shared.h). */
+export const MASK_MONSTERSOLID_C =
+  CONTENTS_SOLID | CONTENTS_WINDOW | CONTENTS_MONSTERCLIP | CONTENTS_MONSTER;
+/** C MASK_OPAQUE (SOLID|SLIME|LAVA: the visible() sight mask, g_ai.c). */
+export const MASK_OPAQUE_C = CONTENTS_SOLID | CONTENTS_SLIME | CONTENTS_LAVA;
+
+/** Monster eye height above origin (walkmonster_start_go, g_monster.c). */
+export const MONSTER_VIEWHEIGHT = 25;
+/** Standing player eye height (pmove_t.viewheight default, pmove.c). */
+export const PLAYER_VIEWHEIGHT = 22;
+
+/** Swept-box world trace with the C player mask (CM_BoxTrace, model 0). */
+export function SV_TraceFor(map: BspMap, mask: number = MASK_PLAYERSOLID_C): TraceFn {
+  return (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => {
+    const t = traceBox(map, start, end, mins, maxs, mask);
+    return {
+      fraction: t.fraction,
+      endpos: t.endpos,
+      planeNormal: t.planeNormal,
+      allsolid: t.allsolid,
+      startsolid: t.startsolid,
+      entityNum: t.entityNum,
+      contents: t.contents,
+    };
+  };
+}
+
+/**
+ * Install C-mask world hooks for pmove. Same shape as the game-side
+ * setPmoveWorldFromBsp but with MASK_PLAYERSOLID_C, so clip-deck floors and
+ * stairs the mapper sealed with PLAYERCLIP/WINDOW hold the player the way
+ * the C engine holds them.
+ */
+export function SV_SetPmoveWorldFromBsp(map: BspMap): void {
+  setPmoveWorld(SV_TraceFor(map), bspContentsFor(map));
+}
+
 export function SV_SpawnMover(st: ServerState, m: Mover): void {
   SV_LinkEdict(st, m.ent);
   st.movers.push(m);
@@ -151,6 +229,114 @@ export function SV_SpawnTrigger(st: ServerState, t: Trigger, bounds?: { mins: Fl
   SV_LinkEdict(st, t.ent);
   st.triggers.push(t);
   if (bounds) st.triggerBounds.set(t.ent.num, bounds);
+}
+
+/**
+ * Drop a brush clip when its brush is destroyed (func_explosive_explode with
+ * or without dmg — BecomeExplosion1 frees the edict either way; G_FreeEdict
+ * for damageless ones — and G_FreeEdict for func_wall). The opening stays
+ * open; whatever world floor the mapper left beneath catches the fall.
+ */
+export function SV_RemoveBrushClip(st: ServerState, ent: Edict): void {
+  st.brushClips.delete(ent.num);
+}
+
+/**
+ * Swept player/monster box vs one static brush AABB. Same conventions as the
+ * traversal driver's door sweep (CM_ClipBoxToBrush: starting inside only
+ * stops the move when the end is inside too; bodies resting exactly on the
+ * slab boundary keep moving).
+ */
+export function sweepBrushBox(
+  start: Vec3, end: Vec3,
+  mins: Vec3, maxs: Vec3,
+  bmins: Float32Array, bmaxs: Float32Array,
+): { fraction: number; normal: Vec3; allsolid: boolean; startsolid: boolean } {
+  const lo = [bmins[0]! - maxs[0]!, bmins[1]! - maxs[1]!, bmins[2]! - maxs[2]!];
+  const hi = [bmaxs[0]! - mins[0]!, bmaxs[1]! - mins[1]!, bmaxs[2]! - mins[2]!];
+  const inside = (p: Vec3): boolean =>
+    p[0]! >= lo[0]! && p[0]! <= hi[0]! &&
+    p[1]! >= lo[1]! && p[1]! <= hi[1]! &&
+    p[2]! >= lo[2]! && p[2]! <= hi[2]!;
+  if (inside(start)) {
+    if (inside(end)) {
+      const n = v3(0, 0, 0);
+      const pens = [
+        Math.min(start[0]! - lo[0]!, hi[0]! - start[0]!),
+        Math.min(start[1]! - lo[1]!, hi[1]! - start[1]!),
+        Math.min(start[2]! - lo[2]!, hi[2]! - start[2]!),
+      ];
+      let axis = 0;
+      if (pens[1]! < pens[axis]!) axis = 1;
+      if (pens[2]! < pens[axis]!) axis = 2;
+      const mid = (lo[axis]! + hi[axis]!) / 2;
+      n[axis] = start[axis]! < mid ? -1 : 1;
+      return { fraction: 0, normal: n, allsolid: true, startsolid: true };
+    }
+    return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: true };
+  }
+  let tmin = 0, tmax = 1, axis = -1, sign = 0;
+  for (let i = 0; i < 3; i++) {
+    const d = end[i]! - start[i]!;
+    if (Math.abs(d) < 1e-9) {
+      if (start[i]! < lo[i]! || start[i]! > hi[i]!) {
+        return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: false };
+      }
+      continue;
+    }
+    let t1 = (lo[i]! - start[i]!) / d;
+    let t2 = (hi[i]! - start[i]!) / d;
+    let s = -1;
+    if (t1 > t2) {
+      const t = t1;
+      t1 = t2;
+      t2 = t;
+      s = 1;
+    }
+    if (t1 > tmin) {
+      tmin = t1;
+      axis = i;
+      sign = s;
+    }
+    if (t2 < tmax) tmax = t2;
+    if (tmin > tmax) return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: false };
+  }
+  if (axis < 0) return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: false };
+  const n = v3(0, 0, 0);
+  n[axis] = sign;
+  return { fraction: Math.max(0, Math.min(1, tmin)), normal: n, allsolid: false, startsolid: tmin <= 0 };
+}
+
+/**
+ * World trace plus the solid brush clips (func_explosive / func_wall while
+ * standing). Drivers that move bodies (pmove, monster locomotion) should run
+ * against this instead of the bare world trace so walls block until
+ * SV_RemoveBrushClip opens them.
+ */
+export function SV_ClipTrace(st: ServerState, worldTrace: TraceFn): TraceFn {
+  return (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => {
+    let best = worldTrace(start, mins, maxs, end);
+    for (const b of st.brushClips.values()) {
+      const hit = sweepBrushBox(start, end, mins, maxs, b.mins, b.maxs);
+      if (hit.fraction < best.fraction || hit.allsolid) {
+        const f = hit.fraction;
+        best = {
+          fraction: f,
+          endpos: v3(
+            start[0]! + (end[0]! - start[0]!) * f,
+            start[1]! + (end[1]! - start[1]!) * f,
+            start[2]! + (end[2]! - start[2]!) * f,
+          ),
+          planeNormal: hit.normal,
+          allsolid: hit.allsolid,
+          startsolid: hit.startsolid,
+          entityNum: best.entityNum,
+          contents: best.contents,
+        };
+      }
+    }
+    return best;
+  };
 }
 
 // --- drop to floor (game/g_monster.c M_droptofloor) ---------------------------
@@ -451,6 +637,19 @@ export function SV_SpawnEntities(
         }
         break;
       }
+      case 'func_explosive':
+      case 'func_wall': {
+        // C SOLID_BSP while standing (SP_func_explosive / SP_func_wall):
+        // block movement until destroyed. Submodel bounds are already
+        // world-space (brush-model origins are 0 in base1), so no mover
+        // offset applies, unlike doors.
+        const model = dict['model'];
+        if (modelSizes && model) {
+          const bounds = modelSizes(model);
+          if (bounds) st.brushClips.set(e.num, { mins: bounds.mins, maxs: bounds.maxs });
+        }
+        break;
+      }
       case 'func_train':
       case 'misc_strogg_ship': {
         // Placed on the first path_corner below (needs the full edict list).
@@ -717,10 +916,69 @@ export interface MonsterEvent {
 
 const POINT_HULL: Vec3 = v3(0, 0, 0);
 
-/** Point-trace line of sight between two origins (fraction 1 = clear). */
-function losClear(trace: TraceFn, a: Vec3, b: Vec3): boolean {
-  const t = trace(a, POINT_HULL, POINT_HULL, b);
+/**
+ * C visible() (g_ai.c): eye-to-eye point trace — self origin + viewheight
+ * (25 for walkmonsters, g_monster.c) to other origin + its viewheight —
+ * against MASK_OPAQUE. Knee-to-knee origin traces stay blocked behind low
+ * rails and stair lips the eyes clear, which wedges ambush monsters in
+ * stand forever; the +25/+22 offsets are the fix. The C sight mask ignores
+ * WINDOW, so glass never blocks C sight: pass an opaque-mask trace via
+ * MonsterTickOpts when glass sits between the bodies, otherwise the shared
+ * move trace doubles (glass then blocks sight — the one known deviation).
+ */
+function losClear(
+  sightTrace: TraceFn,
+  selfPos: Vec3,
+  playerPos: Vec3,
+  playerView: number,
+): boolean {
+  const a = v3(selfPos[0], selfPos[1], selfPos[2]! + MONSTER_VIEWHEIGHT);
+  const b = v3(playerPos[0], playerPos[1], playerPos[2]! + playerView);
+  const t = sightTrace(a, POINT_HULL, POINT_HULL, b);
   return t.fraction === 1 && !t.startsolid;
+}
+
+/**
+ * C SV_movestep stair climb (m_move.c, STEPSIZE 18) wrapped around the
+ * locomotion hull trace: when the straight move clips, lift one step, move,
+ * and drop two steps, keeping the stepped landing when it lands on ground
+ * and travels farther than the direct clip. Without this any riser wedges
+ * the hull and uphill pursuit stalls at the stair base forever. Vertical
+ * probes (the gravity leg) pass through untouched — stepping applies only
+ * to horizontal moves. M_CheckBottom's dangling-corner veto is omitted;
+ * the drop must land (fraction < 1) or the step is rejected.
+ */
+function stepHullTrace(
+  trace: TraceFn,
+  start: Vec3,
+  end: Vec3,
+): { fraction: number; endpos: Vec3 } {
+  const direct = trace(start, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, end);
+  if (direct.fraction === 1 || direct.allsolid) {
+    return { fraction: direct.fraction, endpos: direct.endpos };
+  }
+  if (Math.abs(end[2]! - start[2]!) > 1e-9) {
+    return { fraction: direct.fraction, endpos: direct.endpos };
+  }
+  const sUp = v3(start[0], start[1], start[2]! + MONSTER_STEP_HEIGHT);
+  const eUp = v3(end[0], end[1], end[2]! + MONSTER_STEP_HEIGHT);
+  const up = trace(sUp, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, eUp);
+  if (up.allsolid || up.startsolid) return { fraction: direct.fraction, endpos: direct.endpos };
+  const down = trace(
+    up.endpos,
+    MONSTER_HULL_MINS,
+    MONSTER_HULL_MAXS,
+    v3(up.endpos[0], up.endpos[1], up.endpos[2]! - 2 * MONSTER_STEP_HEIGHT),
+  );
+  if (down.allsolid || down.fraction === 1) return { fraction: direct.fraction, endpos: direct.endpos };
+  const step2 =
+    (down.endpos[0]! - start[0]!) * (down.endpos[0]! - start[0]!) +
+    (down.endpos[1]! - start[1]!) * (down.endpos[1]! - start[1]!);
+  const direct2 =
+    (direct.endpos[0]! - start[0]!) * (direct.endpos[0]! - start[0]!) +
+    (direct.endpos[1]! - start[1]!) * (direct.endpos[1]! - start[1]!);
+  if (step2 <= direct2 + 1e-6) return { fraction: direct.fraction, endpos: direct.endpos };
+  return { fraction: 1, endpos: down.endpos };
 }
 
 /** Inverse of attackMoveFor for the firing event (melee resolved by range). */
@@ -749,23 +1007,39 @@ function attackOfMove(kind: MonsterKind, move: string): AttackChoice {
  * - triggered (spawnflags & 2) and unmapped (infantry: no lite def) monsters
  *   stay dormant;
  * - ambush (spawnflags & 1) monsters hold their stand pose until line of
- *   sight latches `seen` — this is the base1 opener: the start-room soldier
- *   waits until the player rounds the corner, then runs at them;
+ *   sight latches `seen` — the base1 opener: the start-room soldier waits
+ *   until the player rounds the corner, then runs at them. Sight is C
+ *   visible(): eye to eye (monster +25, player +22 standing) against an
+ *   opaque-mask trace;
  * - otherwise monsterChaseMove selects attack vs. close-in (needs a nav
  *   graph; null builds a trivial two-node graph, i.e. straight steering),
- *   monsterLocomotion steps the body with hull-trace clamp + gravity, and
- *   monsterThink advances the frame;
+ *   monsterLocomotion steps the body with a C SV_movestep stair-climbing
+ *   hull trace plus gravity, and monsterThink advances the frame;
  * - every 'fire' frame with line of sight emits a MonsterEvent carrying the
  *   skill damage scale, so drivers land shots on the muzzle flash.
  */
+export interface MonsterTickOpts {
+  /** Eye height of the player body (22 standing, 12 ducked, pmove.c). */
+  playerViewheight?: number;
+  /**
+   * Sight trace for the visible() check (C runs MASK_OPAQUE, which ignores
+   * WINDOW so glass never blocks monster sight). Defaults to the move trace;
+   * pass SV_TraceFor(map, MASK_OPAQUE_C) when glass sits between bodies.
+   */
+  sightTrace?: TraceFn;
+}
+
 export function SV_MonsterTick(
   st: ServerState,
   playerPos: Vec3,
   trace: TraceFn,
   nav: MonsterNav | null,
   rand: () => number,
+  opts?: MonsterTickOpts,
 ): MonsterEvent[] {
   const events: MonsterEvent[] = [];
+  const sightTrace = opts?.sightTrace ?? trace;
+  const playerView = opts?.playerViewheight ?? PLAYER_VIEWHEIGHT;
   for (const m of st.monsters) {
     if (m.triggered || m.kind === null) continue;
     const ms: MonsterState = m.state;
@@ -779,7 +1053,7 @@ export function SV_MonsterTick(
     const dy = playerPos[1]! - pos[1]!;
     const dz = playerPos[2]! - pos[2]!;
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    const canSee = losClear(trace, pos, playerPos);
+    const canSee = losClear(sightTrace, pos, playerPos, playerView);
     if (m.ambush && !m.seen) {
       if (!canSee) {
         const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
@@ -806,8 +1080,8 @@ export function SV_MonsterTick(
       };
     monsterChaseMove(ms, pos, playerPos, navEff, canSee, rand);
     monsterLocomotion(ms, pos, playerPos, (s, e) => {
-      const t = trace(s, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, e);
-      return { fraction: t.fraction, endpos: t.endpos };
+      const h = stepHullTrace(trace, s, e);
+      return { fraction: h.fraction, endpos: h.endpos };
     });
     const action = monsterThink(ms);
     if (action === 'fire' && canSee) {

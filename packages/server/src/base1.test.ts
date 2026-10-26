@@ -36,7 +36,6 @@ import {
   resetEdictNums,
   resetPmoveWorld,
   setPmoveWorld,
-  setPmoveWorldFromBsp,
   spawnEdict,
   triggerTouch,
 } from '@q2/game';
@@ -47,7 +46,18 @@ import { SV_Init, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, SV_UseTargetnam
 import type { ServerState } from './index.js';
 import { SV_CarryRiders } from './index.js';
 import type { RiderBody } from './index.js';
-import { SV_MonsterTick, SV_SetSkill, SV_TouchDoorsAt, droptofloor } from './index.js';
+import {
+  MASK_OPAQUE_C,
+  MASK_PLAYERSOLID_C,
+  SV_ClipTrace,
+  SV_MonsterTick,
+  SV_RemoveBrushClip,
+  SV_SetPmoveWorldFromBsp,
+  SV_SetSkill,
+  SV_TouchDoorsAt,
+  SV_TraceFor,
+  droptofloor,
+} from './index.js';
 
 const Q2_PAK = process.env.Q2_PAK;
 
@@ -260,8 +270,8 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
   it('collision hookup: spawn drop lands, wall walk is blocked', { timeout: 120000 }, () => {
     const { map } = loadBase1();
     try {
-      setPmoveWorldFromBsp(map);
-      const trace = bspTraceFor(map);
+      SV_SetPmoveWorldFromBsp(map);
+      const trace = SV_TraceFor(map);
       // wall-blocked walk: due south of spawn is a wall within 20 units.
       // NOTE: the entity origin z=32 (feet 8 above the floor); z=24 exactly
       // wedges the box into the floor (startsolid+allsolid), as in the C hull.
@@ -379,7 +389,7 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
     expect(brush).toHaveLength(22);
     for (const t of brush) expect(st.triggerBounds.has(t.ent.num)).toBe(true);
     try {
-      setPmoveWorldFromBsp(map);
+      SV_SetPmoveWorldFromBsp(map);
       // REAL spawn: info_player_start WITHOUT targetname (the targeted one
       // is the base2 entry over the exit pit).
       const starts = parseEntities(map.entities).filter(
@@ -448,7 +458,7 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       return modelBounds(map, n);
     });
     try {
-      setPmoveWorldFromBsp(map);
+      SV_SetPmoveWorldFromBsp(map);
       const exitTrigger = st.triggers.find((t) => {
         const n = modelNum(t.ent);
         return n === 27;
@@ -501,6 +511,12 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
 // touch cycles is what the test asserts.
 
 function driveBot(st: ServerState, map: BspMap): BotReport {
+  // The scripted traversal driver keeps the legacy mask-1 world hookup it
+  // was tuned against (BFS floors + walk collision): its low-trench route
+  // passes under the clip decks, and re-planning on the C-mask floors sends
+  // it over the top into the slider slabs. The C-mask world behavior itself
+  // is pinned by the dedicated clip-deck/secret tests below (SV_TraceFor),
+  // which is also what SV_SpawnEntities droptofloor and SV_MonsterTick run.
   const worldTrace = bspTraceFor(map);
   const doors: DoorSim[] = [];
   for (const m of st.movers) {
@@ -1178,7 +1194,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
         if (!Number.isFinite(n)) return null;
         return modelBounds(map, n);
       },
-      withDrop ? bspTraceFor(map) : undefined,
+      withDrop ? SV_TraceFor(map) : undefined,
     );
   }
 
@@ -1212,7 +1228,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       byLump.set(`${lx} ${ly} ${lz}`, b);
     }
     expect([...byLump.keys()].sort()).toEqual(lump);
-    const trace = bspTraceFor(map);
+    const trace = SV_TraceFor(map);
     for (const b of barrels) {
       const again = droptofloor(b.origin, EXPLOBOX_MINS, EXPLOBOX_MAXS, trace);
       expect(again[2]!).toBeCloseTo(b.origin[2]!, 6);
@@ -1222,7 +1238,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
         v3(b.origin[0], b.origin[1], b.origin[2]! - 256),
         EXPLOBOX_MINS,
         EXPLOBOX_MAXS,
-        1,
+        MASK_PLAYERSOLID_C,
       );
       expect(t.fraction).toBeLessThan(0.05);
       expect(t.endpos[2]!).toBeCloseTo(b.origin[2]!, 0);
@@ -1234,7 +1250,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     const { map } = loadBase1();
     resetEdictNums();
     const st = SV_Init();
-    const trace = bspTraceFor(map);
+    const trace = SV_TraceFor(map);
     spawnWith(st, map, 1, true);
     // nearest simulated monster to the spawn: the light soldier east of the
     // start room (348,-348), dropped from its floating lump z (-64) to the
@@ -1259,7 +1275,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect([...runner.edict.origin]).toEqual(at0);
     // 2. the player rounds the corner (LOS opens at the east corridor mouth):
     // seen latches on the first tick, then the monster closes + fires.
-    const drop = traceBox(map, v3(440, -500, 100), v3(440, -500, -300), PLAYER_MINS, PLAYER_MAXS, 1);
+    const drop = traceBox(map, v3(440, -500, 100), v3(440, -500, -300), PLAYER_MINS, PLAYER_MAXS, MASK_PLAYERSOLID_C);
     expect(drop.startsolid || drop.allsolid).toBe(false);
     const player = v3(drop.endpos[0], drop.endpos[1], drop.endpos[2]);
     const d0 = Math.hypot(runner.edict.origin[0]! - player[0]!, runner.edict.origin[1]! - player[1]!);
@@ -1279,6 +1295,68 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(d1).toBeLessThan(d0 - 5); // advanced on the player, not static
     expect(fires).toBeGreaterThan(0); // ranged attack wired (muzzle-gated)
     expect(['shotgun', 'blaster']).toContain(firstAttack);
+    // 2b. sustained pursuit uphill: the chaser starts seated at the low end
+    // of the corridor stairs (A) and the player holds the high end (B, 20
+    // units above A), strafing slowly the whole time. A deterministic RNG
+    // double that never rolls an attack isolates locomotion: every tick runs
+    // the chase path, so a closing gap here pins activation (seen latch),
+    // eye-to-eye LOS and the SV_movestep stair climb — the pre-step hull
+    // trace wedged at the first riser (~2u per 60 ticks, gap never closes).
+    const seatOnFloor = (p: Vec3): void => {
+      const d = traceBox(
+        map,
+        v3(p[0], p[1], p[2]! + 20),
+        v3(p[0], p[1], p[2]! - 400),
+        PLAYER_MINS,
+        PLAYER_MAXS,
+        MASK_PLAYERSOLID_C,
+      );
+      p[0] = d.endpos[0]!;
+      p[1] = d.endpos[1]!;
+      p[2] = d.endpos[2]!;
+    };
+    const lowA = v3(440, -500, 0);
+    seatOnFloor(lowA);
+    runner.edict.origin[0] = lowA[0]!;
+    runner.edict.origin[1] = lowA[1]!;
+    runner.edict.origin[2] = lowA[2]!;
+    const PB2 = v3(360, -430, 0);
+    seatOnFloor(PB2);
+    player[0] = PB2[0]!;
+    player[1] = PB2[1]!;
+    player[2] = PB2[2]!;
+    // Deterministic RNG double: never rolls an attack (commit needs
+    // rand() < 0.7), so every non-melee tick locomotes — movement here is
+    // pure chase-path locomotion, not attack-chance luck.
+    const chaseRand = (): number => 0.99;
+    SV_MonsterTick(st, player, trace, null, chaseRand, { sightTrace: SV_TraceFor(map, MASK_OPAQUE_C) });
+    expect(runner.seen).toBe(true); // ambush acquired through the doorway
+    const gapStart = Math.hypot(runner.edict.origin[0]! - player[0]!, runner.edict.origin[1]! - player[1]!);
+    expect(gapStart).toBeGreaterThan(60);
+    // C-exact sight for the pursuit leg (visible() runs MASK_OPAQUE).
+    const sight = SV_TraceFor(map, MASK_OPAQUE_C);
+    let cumTravel = 0;
+    let playerPath = 0;
+    let px = runner.edict.origin[0]!;
+    let py = runner.edict.origin[1]!;
+    for (let i = 0; i < 90; i++) {
+      // strafing target (2u/tick, reseated on the real floor every tick).
+      const ox = player[0]!;
+      const oy = player[1]!;
+      player[1] = player[1]! + (i % 40 < 20 ? 2 : -2);
+      seatOnFloor(player);
+      playerPath += Math.hypot(player[0]! - ox, player[1]! - oy);
+      SV_MonsterTick(st, player, trace, null, chaseRand, { sightTrace: sight });
+      cumTravel += Math.hypot(runner.edict.origin[0]! - px, runner.edict.origin[1]! - py);
+      px = runner.edict.origin[0]!;
+      py = runner.edict.origin[1]!;
+      expect(runner.seen).toBe(true); // stays engaged, never drops to ambush
+    }
+    expect(playerPath).toBeGreaterThan(100); // the target really kept moving
+    const gapEnd = Math.hypot(runner.edict.origin[0]! - player[0]!, runner.edict.origin[1]! - player[1]!);
+    expect(gapEnd).toBeLessThan(gapStart - 50); // climbed and closed on the mover
+    expect(cumTravel).toBeGreaterThan(60); // kept moving, not planted/stuck
+    // 3. easy skill halves the reported damage scale (g_combat.c), same path.
     // 3. easy skill halves the reported damage scale (g_combat.c), same path.
     SV_SetSkill(st, 0);
     resetEdictNums();
@@ -1324,11 +1402,11 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(duck.maxs[2]).toBe(4);
     expect(duck.mins[2]).toBe(-24);
     const walk = (maxs: Vec3): number =>
-      traceBox(map, v3(140, 280, -40), v3(360, 280, -40), PLAYER_MINS, maxs, 1).fraction;
+      traceBox(map, v3(140, 280, -40), v3(360, 280, -40), PLAYER_MINS, maxs, MASK_PLAYERSOLID_C).fraction;
     expect(walk(PLAYER_MAXS)).toBeLessThan(1); // standing: lintel stops it
     expect(walk(v3(16, 16, 4))).toBe(1); // ducked: reaches the alcove
     const fits = (h: number): number =>
-      traceBox(map, v3(140, 280, -40), v3(360, 280, -40), PLAYER_MINS, v3(16, 16, h - 24), 1).fraction;
+      traceBox(map, v3(140, 280, -40), v3(360, 280, -40), PLAYER_MINS, v3(16, 16, h - 24), MASK_PLAYERSOLID_C).fraction;
     expect(fits(48)).toBe(1);
     expect(fits(52)).toBeLessThan(1); // lintel clearance in (48, 52]
   });
@@ -1580,7 +1658,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     const wallBounds = (w: (typeof walls)[number]): { mins: Float32Array; maxs: Float32Array } =>
       modelBounds(map, Number.parseInt(w.model.slice(1), 10));
     const barrels = findByClassname(edicts, 'misc_explobox');
-    const trace = bspTraceFor(map);
+    const trace = SV_TraceFor(map);
     for (const [x, y] of [[136, 40], [184, -24]] as Array<[number, number]>) {
       const b = barrels.find((bb) => Math.round(bb.origin[0]!) === x && Math.round(bb.origin[1]!) === y)!;
       expect(b).toBeDefined();
@@ -1623,5 +1701,208 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     const ed2 = spawnWith(st2, map, 2, true);
     expect(ed2.length).toBe(607);
     expect(st2.monsters).toHaveLength(19);
+  });
+});
+
+// --- M5.2: secret solidity + sustained pursuit (Q2_PAK) ----------------------
+//
+// BUG 1 — secret clip-through: base1 seals stairs and ledges with
+// PLAYERCLIP detail brushes (and glass with WINDOW) that the C engine
+// collides with under MASK_PLAYERSOLID. A mask-1 trace falls straight
+// through those floors. Verified instance: the low-road clip deck by the
+// t149 stairs/explosion cluster — a player-box drop at (-500,150) lands on
+// the deck (origin z 120, feet 96) with the C mask and falls to -600 with
+// mask-1, below model0's mins z (-464): out of the world (the reported
+// see-through/void). Both func_explosives were audited too: world floor
+// sits beneath *20 (lands 40) and *30 (lands -220/-168), so blowing them
+// opens onto world geometry, never a void — id likewise leaves no clip
+// behind (BecomeExplosion1/G_FreeEdict). The server fix is the C mask
+// (SV_TraceFor/SV_SetPmoveWorldFromBsp) plus solid brush clips for
+// func_explosive/func_wall until SV_RemoveBrushClip opens them; traceBox
+// itself is mask-correct (no @q2/bsp change needed).
+//
+// BUG 2 — enemies don't follow: pinned by the runner extension above
+// (phase 2b: sustained uphill pursuit of a kiting player). The fixes are
+// eye-to-eye LOS (monster +25, player +22 per C visible()) and a C
+// SV_movestep stair climb (lift 18, move, drop 36) in the locomotion trace.
+
+describe.runIf(!!Q2_PAK)('M5.2: secret solidity + clip-deck void (Q2_PAK)', () => {
+  function spawnC(st: ServerState, map: BspMap): void {
+    SV_SpawnEntities(
+      st,
+      map.entities,
+      (model) => {
+        if (!model.startsWith('*')) return null;
+        const n = Number.parseInt(model.slice(1), 10);
+        if (!Number.isFinite(n)) return null;
+        return modelBounds(map, n);
+      },
+      SV_TraceFor(map),
+    );
+  }
+
+  function worldBounds(map: BspMap): { mins: number[]; maxs: number[] } {
+    return {
+      mins: [...map.modelsMins.slice(0, 3)],
+      maxs: [...map.modelsMaxs.slice(0, 3)],
+    };
+  }
+
+  function insideBounds(map: BspMap, p: Vec3): boolean {
+    const b = worldBounds(map);
+    return (
+      p[0]! >= b.mins[0]! - 32 && p[0]! <= b.maxs[0]! + 32 &&
+      p[1]! >= b.mins[1]! - 32 && p[1]! <= b.maxs[1]! + 32 &&
+      p[2]! >= b.mins[2]! - 32 && p[2]! <= b.maxs[2]! + 32
+    );
+  }
+
+  it('clip deck: C-mask drop lands, mask-1 falls out of the world', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    const worldC = SV_TraceFor(map);
+    const legacy = (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3): ReturnType<TraceFn> => {
+      const t = traceBox(map, start, end, mins, maxs, 1);
+      return {
+        fraction: t.fraction,
+        endpos: t.endpos,
+        planeNormal: t.planeNormal,
+        allsolid: t.allsolid,
+        startsolid: t.startsolid,
+        entityNum: t.entityNum,
+        contents: t.contents,
+      };
+    };
+    // low-road clip deck by the t149 stairs/explosion cluster.
+    const deckC = worldC(v3(-500, 150, 300), PLAYER_MINS, PLAYER_MAXS, v3(-500, 150, -600));
+    expect(deckC.startsolid || deckC.allsolid).toBe(false);
+    expect(deckC.endpos[2]!).toBeCloseTo(120, 0); // deck top: feet 96
+    expect(insideBounds(map, deckC.endpos)).toBe(true);
+    // the legacy mask-1 trace misses the PLAYERCLIP deck and exits the map.
+    const deck1 = legacy(v3(-500, 150, 300), PLAYER_MINS, PLAYER_MAXS, v3(-500, 150, -600));
+    expect(deck1.endpos[2]!).toBeLessThan(-464); // below model0 mins: left the world
+    expect(insideBounds(map, deck1.endpos)).toBe(false);
+  });
+
+  it('clip deck: pmove walks the deck without falling out', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    spawnC(st, map);
+    try {
+      SV_SetPmoveWorldFromBsp(map);
+      const bot = makePmoveState();
+      // drop onto the deck from above so the start is guaranteed clean.
+      bot.origin = v3(-600, 100, 200);
+      bot.velocity = v3(0, 0, 0);
+      let settled = false;
+      for (let i = 0; i < 60; i++) {
+        pmoveFull(bot, { msec: 100, angles: v3(0, 0, 0), forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 });
+        if (bot.onGround) {
+          settled = true;
+          break;
+        }
+      }
+      expect(settled).toBe(true);
+      expect(insideBounds(map, bot.origin)).toBe(true);
+      // walk east along the deck (stays over the clip floor toward x=-500:
+      // never falls through, never leaves the map). The deck descends
+      // eastward and ends at a wall, so six ticks land it on the low step.
+      for (let i = 0; i < 6; i++) {
+        pmoveFull(bot, { msec: 100, angles: v3(0, 0, 0), forwardmove: 300, sidemove: 0, upmove: 0, buttons: 0 });
+        expect(insideBounds(map, bot.origin)).toBe(true);
+      }
+      expect(bot.origin[0]!).toBeGreaterThan(-560);
+      expect(bot.origin[2]!).toBeGreaterThan(90); // stayed on the deck, never
+      expect(bot.onGround).toBe(true); // fell to the lower trench/void
+    } finally {
+      resetPmoveWorld();
+    }
+  });
+
+  it('secret volumes hold the player (no fall-through)', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    spawnC(st, map);
+    try {
+      SV_SetPmoveWorldFromBsp(map);
+      // BFG secret room (trigger *14 -> t77): drop inside, land on the room
+      // floor (origin -208, feet -232), never through it. Same under both
+      // masks — the room floor is world-solid, not a clip.
+      for (const mask of [MASK_PLAYERSOLID_C, 1]) {
+        const t = traceBox(
+          map, v3(1066, 888, -180), v3(1066, 888, -400),
+          PLAYER_MINS, PLAYER_MAXS, mask,
+        );
+        expect(t.startsolid || t.allsolid).toBe(false);
+        expect(t.endpos[2]!).toBeCloseTo(-208, 0);
+      }
+      const fall = makePmoveState();
+      fall.origin = v3(1066, 888, -180);
+      fall.velocity = v3(0, 0, 0);
+      let grounded = false;
+      for (let i = 0; i < 60; i++) {
+        pmoveFull(fall, { msec: 100, angles: v3(0, 0, 0), forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 });
+        if (fall.onGround) {
+          grounded = true;
+          break;
+        }
+      }
+      expect(grounded).toBe(true);
+      expect(fall.origin[2]!).toBeCloseTo(-208, 0);
+      expect(insideBounds(map, fall.origin)).toBe(true);
+      // lower corridor by the under-stairs barrels: rests on -104, in bounds.
+      const low = makePmoveState();
+      low.origin = v3(80, 808, 0);
+      low.velocity = v3(0, 0, 0);
+      let lowGrounded = false;
+      for (let i = 0; i < 60; i++) {
+        pmoveFull(low, { msec: 100, angles: v3(0, 0, 0), forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 });
+        if (low.onGround) {
+          lowGrounded = true;
+          break;
+        }
+      }
+      expect(lowGrounded).toBe(true);
+      expect(low.origin[2]!).toBeCloseTo(-104, 0);
+      expect(insideBounds(map, low.origin)).toBe(true);
+    } finally {
+      resetPmoveWorld();
+    }
+  });
+
+  it('func_explosive walls spawn solid clips; removal opens them, world floor beneath', { timeout: 120000 }, () => {
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    spawnC(st, map);
+    // both func_explosives registered solid clips from their brush bounds.
+    expect(st.brushClips.size).toBeGreaterThanOrEqual(2);
+    const exp20 = st.entities.find((e) => !e.freed && e.classname === 'func_explosive' && e.model === '*20')!;
+    const exp30 = st.entities.find((e) => !e.freed && e.classname === 'func_explosive' && e.model === '*30')!;
+    expect(exp20).toBeDefined();
+    expect(exp30).toBeDefined();
+    expect(st.brushClips.has(exp20.num)).toBe(true);
+    expect(st.brushClips.has(exp30.num)).toBe(true);
+    // the *20 wall blocks a walk at deck height through its slab (the world
+    // trace alone passes: line picked clear of world rock at z=64).
+    const worldOnly = SV_TraceFor(map);
+    expect(worldOnly(v3(28, 100, 64), PLAYER_MINS, PLAYER_MAXS, v3(28, 180, 64)).fraction).toBe(1);
+    const clipped = SV_ClipTrace(st, worldOnly);
+    const blocked = clipped(v3(28, 100, 64), PLAYER_MINS, PLAYER_MAXS, v3(28, 180, 64));
+    expect(blocked.fraction).toBeLessThan(1);
+    // detonation removes the clip (BecomeExplosion1/G_FreeEdict free the
+    // edict either way): the same walk passes, onto world geometry.
+    SV_RemoveBrushClip(st, exp20);
+    expect(st.brushClips.has(exp20.num)).toBe(false);
+    const opened = clipped(v3(28, 100, 64), PLAYER_MINS, PLAYER_MAXS, v3(28, 180, 64));
+    expect(opened.fraction).toBe(1);
+    // world floor sits beneath both slabs: removal never opens a void.
+    const under20 = worldOnly(v3(28, 140, 60), PLAYER_MINS, PLAYER_MAXS, v3(28, 140, -400));
+    expect(under20.endpos[2]!).toBeGreaterThan(-464);
+    expect(insideBounds(map, under20.endpos)).toBe(true);
+    const under30 = worldOnly(v3(1016, -184, -150), PLAYER_MINS, PLAYER_MAXS, v3(1016, -184, -600));
+    expect(under30.endpos[2]!).toBeGreaterThan(-464);
+    expect(insideBounds(map, under30.endpos)).toBe(true);
   });
 });
