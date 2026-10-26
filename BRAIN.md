@@ -723,6 +723,33 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 - Still open: INFANTRY lite def (`monsters.ts`) so 5 base1 infantries simulate;
 - `apps/web` spawns DM-only items in SP (no skill inhibit); barrel MD2 render
 - origin vs entity origin; sky-hit silent free; machinegun per-shot kick walk.
+### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #6, all landed):
+- Sky black at angles (`@q2/sw-renderer`): root cause was `BandWorkerPool`
+- staging — 64KB SAB slot truncated the 384KB unit1_ strip to the `rt` tile,
+- other faces sampled zeros → palette 0. `stagingFits()` guard returns null
+- so oversize batches run inline, bit-identical; yaw-sweep repro now 0 black.
+- Green laser, for real this time: the remaining green was view-side
+- `PELLET_TRACER_COLOR = 208` (pure green). Now `HITSCAN_TRACER_COLOR = 225`
+- single-sourced in `@q2/game` (`soldierFireEvent`, bolt⊥tracer exclusive,
+- 208–214 banned), re-exported by `apps/web`; shotgun + machinegun tracers
+- yellow on both player and monster paths.
+- Doors start closed: server rests movers at pos1, `SV_TouchDoorsAt` now honors
+- `DOOR_NOMONSTER`, autoclose cycle verified; view grafts brush-model faces
+- (`graftBrushModels`) so doors/glass actually render — zero submodel faces
+- reached the renderer before. Soldier-in-door is authentic (monsters use
+- doors); doors close behind them when clear.
+- Glass (`func_wall` *9 *10, no alpha key → opaque) renders via the graft;
+- "floating barrel" is not server-side (hull trace rests at z≈0.03, glass
+- hundreds of units away; barrel MD2 pivot = box bottom = lump origin).
+- Gunner audit: zero `monster_gunner` in base1 at every skill (Gunner is a
+- base2 enemy); the map's machine gunners are skin-4 `ss` soldiers — server
+- stashes C skins, web places all 14 soldiers with skin_lt/skin/skin_ss +
+- solatck1/2/3, ss fires 3-round fanned bursts per `m_soldier.c` hold frames.
+- Skill change now reboots the level with the new skill applied before spawn.
+- Resolution dropdown (`vid_resolution` 320×240–1024×768): reboot resizes the
+- framebuffer + canvas, CSS upscale stays ×2.
+- Still open: INFANTRY lite def; DM-only items spawning in SP; machinegun
+- per-shot kick walk; sky-hit silent free.
 ### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #3, all landed):
 - Blaster projectiles now C-faithful (`g_weapon.c`/`p_weapon.c`/`cl_fx.c`):
 - spawn = literal `G_ProjectSource` from feet (`+ fwd*24 + right*8`, `z += viewheight-8`);

@@ -70,6 +70,7 @@ import {
   MZ2_SOLDIER_MACHINEGUN_1,
   MZ2_GUNNER_MACHINEGUN_1,
   MZ2_GUNNER_GRENADE_1,
+  HITSCAN_TRACER_COLOR,
 } from '@q2/game';
 import type {
   PmoveState,
@@ -526,13 +527,13 @@ export const BLASTER_TRACER_COLOR = 225;
 /**
  * Hitscan tracer color (shotgun/machinegun pellets + monster return fire).
  *
- * Game-lane audit (@q2/game weapons.ts: GREEN 208–214 banned via
- * `isGreenBoltColor` — that range is GREEN on the engine palette, the
- * reported green-laser bug): 225 (0xe1, near-white yellow core in the
- * 0xe0–0xe8 yellow band, same as the blaster beam) is the C-correct
- * hitscan color. Never 208–214.
+ * Single source of truth in `@q2/game` (`weapons.ts`): 225 (0xe1,
+ * (255,147,0)) is the C-correct hitscan color; 208–214 is GREEN on the
+ * engine palette (the reported green-laser bug) and banned via
+ * `isGreenBoltColor`. Re-exported here so driver tests keep importing
+ * from the play module.
  */
-export const HITSCAN_TRACER_COLOR = 225;
+export { HITSCAN_TRACER_COLOR };
 /** Hot yellow pellet streak for shotgun/machinegun + monster return fire. */
 export const PELLET_TRACER_COLOR = HITSCAN_TRACER_COLOR;
 /**
