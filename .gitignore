@@ -8,5 +8,6 @@ coverage/
 __golden__/out/
 tools/bench/machine.json
 .turbo/
-*.mjs
+*.tmp.mjs
+tsup.config.bundled_*.mjs
 repomix-output.xml
