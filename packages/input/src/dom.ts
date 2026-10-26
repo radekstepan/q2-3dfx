@@ -11,14 +11,21 @@ const CODE_TO_KEY: Record<string, LogicalKey> = {
   KeyA: 'moveleft',
   KeyD: 'moveright',
   Space: 'jump',
+  KeyC: 'crouch',
   KeyE: 'use',
   ArrowLeft: 'left',
   ArrowRight: 'right',
   PageUp: 'lookup',
   PageDown: 'lookdown',
   ShiftLeft: 'up',
+  // Ctrl stays swim-down (`upmove -400`): crouch/duck lives on C so the
+  // swim fast-descend binding is not lost. Drivers needing Ctrl-duck can
+  // map ControlLeft to 'crouch' here instead.
   ControlLeft: 'down',
 };
+
+/** Browser code → logical key map (exported for tests; see note above). */
+export { CODE_TO_KEY };
 
 export interface DomBindings {
   input: InputCore;

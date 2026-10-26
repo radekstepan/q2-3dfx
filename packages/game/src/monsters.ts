@@ -186,6 +186,38 @@ export function monsterMoveOf(ms: MonsterState): MonsterMove {
 }
 
 /**
+ * Render frame for a monster (web driver entityFrame): the move's MD2
+ * `first` + the current frame offset, clamped to the move's last frame
+ * so an overrun frame (or a death move held past its end) never walks
+ * off the model. id holds the last death frame; the clamp is what keeps
+ * corpses rendering the fallen pose instead of garbage.
+ */
+export function monsterFrameNumber(ms: MonsterState): number {
+  const mv = monsterMoveOf(ms);
+  const idx = Math.max(0, Math.min(ms.frame, mv.frames.length - 1));
+  return mv.first + idx;
+}
+
+/**
+ * Render angles for a monster (host entityAngles hook): yaw-only facing
+ * from the stored yaw (was null → yaw 0 before the M7.2 facing fix).
+ * Corpses keep their last yaw (locomotion never turns the dead).
+ */
+export function entityAngles(ms: MonsterState): [number, number, number] {
+  return [0, ms.yaw, 0];
+}
+
+/**
+ * Corpses stay hittable (id takedamage YES on the dead body — soldier_die
+ * only stops at DEAD_DEAD after gibbing). Gibbed bodies are gone:
+ * unhittable, skipped by snapshots. Only direct re-hits mince; radius
+ * damage never minces (the driver skips dead bodies there by design).
+ */
+export function corpseHittable(ms: MonsterState): boolean {
+  return ms.dead && !ms.gibbed;
+}
+
+/**
  * id's vectoyaw (g_utils.c): facing yaw in degrees from `from` toward `to`
  * (Q2: +X forward, +Y left, so yaw = atan2(dy, dx)), wrapped to [0, 360).
  * Z is ignored: monsters yaw on the floor plane (M_ChangeYaw).

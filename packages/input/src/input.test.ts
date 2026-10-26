@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   BUTTON_ATTACK,
+  BUTTON_DUCK,
   BUTTON_JUMP,
   applyGamepad,
   buildUserCmd,
   cmdToInputState,
   createInput,
   emptyInput,
+  isDuckHeld,
   keyDown,
   keyUp,
   mouseMove,
@@ -81,6 +83,34 @@ describe('input -> usercmd_t mapping', () => {
     expect(input.angles).toEqual(before);
   });
 
+  it('crouch/duck hold sets BUTTON_DUCK without moving', () => {
+    const input = createInput();
+    keyDown(input, 'crouch');
+    const cmd = buildUserCmd(input, 16);
+    expect(cmd.buttons & BUTTON_DUCK).toBeTruthy();
+    expect(isDuckHeld(cmd)).toBe(true);
+    // Duck is a hold, not locomotion: no move speeds leak into the cmd.
+    expect(cmd.forwardmove).toBe(0);
+    expect(cmd.sidemove).toBe(0);
+    expect(cmd.upmove).toBe(0);
+    keyUp(input, 'crouch');
+    const released = buildUserCmd(input, 16);
+    expect(released.buttons & BUTTON_DUCK).toBe(0);
+    expect(isDuckHeld(released)).toBe(false);
+  });
+
+  it('duck is an alias for the same crouch hold', () => {
+    const input = createInput();
+    keyDown(input, 'duck');
+    expect(isDuckHeld(buildUserCmd(input, 16))).toBe(true);
+    // Releasing one alias while the other is held keeps the hold.
+    keyDown(input, 'crouch');
+    keyUp(input, 'duck');
+    expect(isDuckHeld(buildUserCmd(input, 16))).toBe(true);
+    keyUp(input, 'crouch');
+    expect(isDuckHeld(buildUserCmd(input, 16))).toBe(false);
+  });
+
   it('legacy InputState conversion keeps yaw/pitch/buttons', () => {
     expect(emptyInput()).toEqual({ forward: 0, side: 0, yaw: 0, pitch: 0, buttons: 0 });
     const input = createInput();
@@ -100,5 +130,12 @@ describe('dom bindings (headless no-op)', () => {
     const fresh = attachToCanvas({});
     expect(fresh.input).not.toBe(target);
     fresh.dispose();
+  });
+
+  it('KeyC maps to crouch, Ctrl stays swim-down', async () => {
+    const { CODE_TO_KEY } = await import('./dom.js');
+    expect(CODE_TO_KEY['KeyC']).toBe('crouch');
+    // Ctrl is kept as swim-down (upmove), not stolen by duck.
+    expect(CODE_TO_KEY['ControlLeft']).toBe('down');
   });
 });

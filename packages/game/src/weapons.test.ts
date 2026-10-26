@@ -1,9 +1,20 @@
 // M5.3: weapons + monsters + pathfinding.
 import { describe, expect, it } from 'vitest';
+import { v3 } from '@q2/math';
 import {
+  BLASTER_DAMAGE_SP,
+  BLASTER_INFLIGHT_COLOR,
+  BLASTER_INFLIGHT_LIGHT,
+  BLASTER_SPAWN_FWD,
+  BLASTER_SPAWN_RIGHT,
+  BLASTER_TRAIL_COLOR,
   DEFAULT_SHOTGUN_COUNT,
+  GREEN_COLOR_BASE,
+  GREEN_COLOR_END,
   GUNNER,
   MELEE_DISTANCE,
+  MUZZLE_LIGHT_COLOR,
+  MUZZLE_LIGHT_INTENSITY,
   RANGE_FAR,
   RANGE_MELEE,
   RANGE_MID,
@@ -12,17 +23,27 @@ import {
   WEAPON_BLASTER,
   WEAPON_MACHINEGUN,
   WEAPON_SHOTGUN,
+  YELLOW_COLOR_BASE,
+  YELLOW_COLOR_END,
+  attackFiresBolt,
+  blasterMuzzle,
+  blasterSpawn,
   findPath,
   findWeapon,
   fireWeapon,
+  isGreenBoltColor,
   isReachable,
   monsterMoveOf,
   monsterRange,
   monsterThink,
   monsterPain,
   mulberry32,
+  muzzleRadius,
   selectAttack,
+  selectSoldierAttack,
+  soldierWeaponForSkin,
   spawnMonster,
+  weaponFiresBeam,
 } from './index.js';
 
 describe('weapons (M5.3)', () => {
@@ -171,5 +192,105 @@ describe('pathfinding stub (M5.3)', () => {
     expect(p!.length).toBe(4);
     expect(isReachable(g, 4, 0)).toBe(false);
     expect(findPath(g, 0, 0)).toEqual([0]);
+  });
+});
+
+describe('blaster ballistics (M7.2 batch #3 regressions)', () => {
+  it('SP damage 10 (15 only in deathmatch), speed 1000, life 2s, 0xe0 trail', () => {
+    expect(WEAPON_BLASTER.damage).toBe(10);
+    expect(WEAPON_BLASTER.damage).toBe(BLASTER_DAMAGE_SP);
+    const r = fireWeapon(WEAPON_BLASTER, 0, mulberry32(1), false);
+    expect(r.bolt!.speed).toBe(1000);
+    expect(r.bolt!.life).toBe(2);
+    expect(r.bolt!.effect).toBe(0x08); // EF_BLASTER
+    expect(BLASTER_TRAIL_COLOR).toBe(0xe0);
+  });
+
+  it('spawn = G_ProjectSource from feet (+fwd*24 +right*8, z += viewheight-8)', () => {
+    expect(BLASTER_SPAWN_FWD).toBe(24);
+    expect(BLASTER_SPAWN_RIGHT).toBe(8);
+    const feet = v3(128, -320, 32);
+    const fwd = v3(1, 0, 0);
+    const right = v3(0, 1, 0);
+    // eye height 22 (pmove viewheight): z = 32 + 22 - 8
+    expect([...blasterSpawn(feet, fwd, right, 22)]).toEqual([152, -312, 46]);
+  });
+
+  it('muzzle dlight = feet+fwd*18+right*16, 200+(rand&31), pure yellow', () => {
+    const feet = v3(128, -320, 32);
+    expect([...blasterMuzzle(feet, v3(1, 0, 0), v3(0, 1, 0))]).toEqual([146, -304, 32]);
+    expect(muzzleRadius(() => 0)).toBe(200);
+    expect(muzzleRadius(() => 0.9999)).toBe(231);
+    expect(MUZZLE_LIGHT_INTENSITY).toBe(200);
+    expect(MUZZLE_LIGHT_COLOR).toEqual([1, 1, 0]);
+  });
+
+  it('in-flight bolts carry a 200-yellow dlight (EF_BLASTER trail look)', () => {
+    expect(BLASTER_INFLIGHT_LIGHT).toBe(200);
+    expect(BLASTER_INFLIGHT_COLOR).toEqual([1, 1, 0]);
+  });
+
+  it('no beam for blaster/shotgun/machinegun (only railgun draws TE_RAILTRAIL)', () => {
+    expect(weaponFiresBeam('weapon_blaster')).toBe(false);
+    expect(weaponFiresBeam('weapon_shotgun')).toBe(false);
+    expect(weaponFiresBeam('weapon_machinegun')).toBe(false);
+  });
+});
+
+describe('green soldier bolt regression (M7.2 user report)', () => {
+  it('soldier weapon is skin-determined (m_soldier.c soldier_fire), not random', () => {
+    expect(soldierWeaponForSkin(0)).toBe('blaster'); // monster_soldier_light
+    expect(soldierWeaponForSkin(1)).toBe('blaster');
+    expect(soldierWeaponForSkin(2)).toBe('shotgun'); // basic monster_soldier
+    expect(soldierWeaponForSkin(3)).toBe('shotgun');
+    expect(soldierWeaponForSkin(4)).toBe('machinegun'); // monster_soldier_ss
+    expect(soldierWeaponForSkin(5)).toBe('machinegun');
+  });
+
+  it('basic (shotgun-skin) soldiers never select the blaster attack', () => {
+    for (let seed = 0; seed < 50; seed++) {
+      const rand = mulberry32(seed);
+      for (const dist of [80, 100, 200, 500, 999]) {
+        const choice = selectSoldierAttack(2, dist, rand);
+        expect(choice).not.toBe('blaster');
+        expect(choice).not.toBe('none');
+      }
+      // ...and never at any range where they fight
+      expect(selectSoldierAttack('shotgun', 200, rand)).toBe('shotgun');
+    }
+    // melee still commits up close; far targets are closed in on (none)
+    expect(selectSoldierAttack(2, 10, mulberry32(1))).toBe('melee');
+    expect(selectSoldierAttack(2, 5000, mulberry32(1))).toBe('none');
+    // light soldiers keep their authentic bolt; ss soldiers keep bullets
+    expect(selectSoldierAttack(0, 200, mulberry32(1))).toBe('blaster');
+    expect(selectSoldierAttack(4, 200, mulberry32(1))).toBe('machinegun');
+  });
+
+  it('only the soldier blaster attack spawns a bolt entity — hitscan never does', () => {
+    expect(attackFiresBolt('soldier', 'blaster')).toBe(true);
+    for (const c of ['shotgun', 'machinegun', 'melee', 'none']) {
+      expect(attackFiresBolt('soldier', c)).toBe(false);
+    }
+    for (const c of ['blaster', 'chaingun', 'grenade', 'melee', 'shotgun', 'none']) {
+      expect(attackFiresBolt('gunner', c)).toBe(false);
+    }
+  });
+
+  it('no bolt or tracer color lives in the green 0xd0 range (the reported bug)', () => {
+    // yellow family (blaster trail, boom sparks) is 0xe0-0xe7
+    expect(YELLOW_COLOR_BASE).toBe(0xe0);
+    expect(YELLOW_COLOR_END).toBe(0xe8);
+    expect(GREEN_COLOR_BASE).toBe(0xd0);
+    expect(GREEN_COLOR_END).toBe(0xd8);
+    expect(isGreenBoltColor(0xe0)).toBe(false);
+    expect(isGreenBoltColor(0xe1)).toBe(false);
+    expect(isGreenBoltColor(225)).toBe(false); // blaster tracer orange
+    expect(isGreenBoltColor(215)).toBe(false); // near-white core
+    expect(isGreenBoltColor(208)).toBe(true); // the old PELLET green: banned
+    expect(isGreenBoltColor(0xd0)).toBe(true);
+    expect(isGreenBoltColor(214)).toBe(true); // last green shade (0xd6)
+    expect(isGreenBoltColor(0xd7)).toBe(false); // 215 is the near-white core
+    expect(BLASTER_TRAIL_COLOR).toBeGreaterThanOrEqual(YELLOW_COLOR_BASE);
+    expect(BLASTER_TRAIL_COLOR).toBeLessThan(YELLOW_COLOR_END);
   });
 });

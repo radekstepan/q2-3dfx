@@ -24,11 +24,24 @@ export interface UserCmdT {
 export const BUTTON_ATTACK = 1;
 export const BUTTON_USE = 2;
 export const BUTTON_JUMP = 4;
+/**
+ * Duck/crouch hold bit (input→driver convention, local extension: id's
+ * wire `usercmd_t.buttons` only defines attack/use — jump rides `upmove`).
+ *
+ * Holding `crouch`/`duck` sets this bit in the built `UserCmdT.buttons`;
+ * it flows Host→driver→`pmoveFull` untouched. `@q2/game`'s `PM_CheckDuck`
+ * does not consume it yet (takes `PMF_DUCKED` set externally), so drivers
+ * must translate via `isDuckHeld(cmd)` until the game wires it — see the
+ * note on `isDuckHeld`. `BUTTON_CROUCH` is a same-value alias.
+ */
+export const BUTTON_DUCK = 8;
+export const BUTTON_CROUCH = BUTTON_DUCK;
 
 /** Logical keys tracked by the headless core. */
 export type LogicalKey =
   | 'forward' | 'back' | 'moveleft' | 'moveright'
   | 'up' | 'down' | 'jump' | 'attack' | 'use'
+  | 'crouch' | 'duck'
   | 'left' | 'right' | 'lookup' | 'lookdown';
 
 export interface InputOptions {
@@ -57,6 +70,7 @@ export function keyDown(input: InputCore, key: LogicalKey): void {
   if (key === 'attack') input.buttons |= BUTTON_ATTACK;
   if (key === 'use') input.buttons |= BUTTON_USE;
   if (key === 'jump') input.buttons |= BUTTON_JUMP;
+  if (key === 'crouch' || key === 'duck') input.buttons |= BUTTON_DUCK;
 }
 
 export function keyUp(input: InputCore, key: LogicalKey): void {
@@ -64,6 +78,10 @@ export function keyUp(input: InputCore, key: LogicalKey): void {
   if (key === 'attack') input.buttons &= ~BUTTON_ATTACK;
   if (key === 'use') input.buttons &= ~BUTTON_USE;
   if (key === 'jump') input.buttons &= ~BUTTON_JUMP;
+  // 'crouch'/'duck' are aliases for one hold: clear only when neither is down.
+  if ((key === 'crouch' || key === 'duck') && !input.keys.has('crouch') && !input.keys.has('duck')) {
+    input.buttons &= ~BUTTON_DUCK;
+  }
 }
 
 /** Feed raw mouse motion (pixels). Applied to angles on buildUserCmd. */
@@ -126,6 +144,8 @@ const KEY_MOVE: Record<LogicalKey, [number, number, number]> = {
   jump: [0, 0, 400],
   attack: [0, 0, 0],
   use: [0, 0, 0],
+  crouch: [0, 0, 0],
+  duck: [0, 0, 0],
   left: [0, 0, 0],
   right: [0, 0, 0],
   lookup: [0, 0, 0],
@@ -172,6 +192,7 @@ export function buildUserCmd(input: InputCore, msec: number, opts: InputOptions 
   if (input.keys.has('jump')) buttons |= BUTTON_JUMP;
   if (input.keys.has('attack')) buttons |= BUTTON_ATTACK;
   if (input.keys.has('use')) buttons |= BUTTON_USE;
+  if (input.keys.has('crouch') || input.keys.has('duck')) buttons |= BUTTON_DUCK;
 
   return {
     msec,
@@ -183,9 +204,22 @@ export function buildUserCmd(input: InputCore, msec: number, opts: InputOptions 
   };
 }
 
+/**
+ * True when the crouch/duck hold bit is set on a built cmd.
+ *
+ * Driver convention until `@q2/game` wires the bit into `PM_CheckDuck`
+ * (GAME CHANGE NEEDED — reported, not edited per lock): the driver should
+ * do `if (isDuckHeld(cmd)) pm.pmFlags |= PMF_DUCKED` before `pmoveFull`,
+ * which shrinks the hull to `mins.z=-24/maxs.z=4/viewheight=12` (vs
+ * standing `-24/32/22`). The bit already reaches `pmoveFull` via
+ * `UserCmdT.buttons`; only the `PM_CheckDuck` consumption is missing.
+ */
+export function isDuckHeld(cmd: { buttons: number }): boolean {
+  return (cmd.buttons & BUTTON_DUCK) !== 0;
+}
+
 /** Legacy helper kept for the stub-era API surface. */
-export interface InputState {
-  forward: number;
+export interface InputState {  forward: number;
   side: number;
   yaw: number;
   pitch: number;

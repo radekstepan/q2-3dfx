@@ -56,6 +56,7 @@ import {
   modelForMonster,
   skinForMonster,
   viewModelForWeapon,
+  worldModelForWeapon,
   modelForBolt,
   skinForBolt,
   skinForWeaponModel,

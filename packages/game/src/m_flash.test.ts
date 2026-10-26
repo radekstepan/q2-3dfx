@@ -12,6 +12,11 @@ import {
   MZ2_SOLDIER_SHOTGUN_8,
   MZ2_GUNNER_MACHINEGUN_1,
   MZ2_GUNNER_GRENADE_1,
+  BLASTER_SPAWN_FWD,
+  BLASTER_SPAWN_RIGHT,
+  BLASTER_SPAWN_UP,
+  MUZZLE_OFFSET_FWD,
+  MUZZLE_OFFSET_RIGHT,
 } from './index.js';
 
 describe('m_flash (id monster_flash_offset soldier/gunner slices)', () => {
@@ -43,5 +48,26 @@ describe('m_flash (id monster_flash_offset soldier/gunner slices)', () => {
   it('projectSource matches G_ProjectSource (muzzle = p + f*d0 + r*d1, z += d2)', () => {
     const out = projectSource(v3(1, 2, 3), v3(10, 20, 30), v3(1, 0, 0), v3(0, 1, 0));
     expect([...out]).toEqual([11, 22, 33]);
+  });
+
+  it('monster muzzle composes via G_ProjectSource (soldier_fire / GunnerFire)', () => {
+    // G_ProjectSource offsets: blaster spawn (24 fwd + 8 right, z += viewheight-8),
+    // muzzle dlight (18 fwd + 16 right). The m_flash table rows feed d0/d1/d2.
+    expect(BLASTER_SPAWN_FWD).toBe(24);
+    expect(BLASTER_SPAWN_RIGHT).toBe(8);
+    expect(BLASTER_SPAWN_UP).toBe(-8);
+    expect(MUZZLE_OFFSET_FWD).toBe(18);
+    expect(MUZZLE_OFFSET_RIGHT).toBe(16);
+    const feet = v3(0, 0, 32);
+    const fwd = v3(1, 0, 0);
+    const right = v3(0, 1, 0);
+    const spawn = projectSource(feet, v3(BLASTER_SPAWN_FWD, BLASTER_SPAWN_RIGHT, 22 + BLASTER_SPAWN_UP), fwd, right);
+    expect([...spawn]).toEqual([24, 8, 46]); // z = 32 + 14 (viewheight 22 - 8)
+    const muzzle = projectSource(feet, v3(MUZZLE_OFFSET_FWD, MUZZLE_OFFSET_RIGHT, 0), fwd, right);
+    expect([...muzzle]).toEqual([18, 16, 32]);
+    // soldier blaster row 1 keeps the *1.2 scale (matches soldier_fire flash 0)
+    const o = monsterFlashOffset(MZ2_SOLDIER_BLASTER_1);
+    const m = projectSource(v3(100, 0, 0), o, fwd, right);
+    expect(m[0]).toBeCloseTo(100 + 10.6 * 1.2, 5);
   });
 });

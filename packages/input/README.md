@@ -17,10 +17,17 @@ for pads. Importing `dom.ts` in Node is a safe no-op.
 ## Public API (`src/index.ts`, `src/dom.ts`)
 
 - `UserCmdT { msec, angles, forwardmove, sidemove, upmove, buttons }`,
-  `BUTTON_ATTACK/BUTTON_USE/BUTTON_JUMP`, `LogicalKey` union.
+  `BUTTON_ATTACK/BUTTON_USE/BUTTON_JUMP/BUTTON_DUCK` (`BUTTON_CROUCH`
+  alias; `isDuckHeld(cmd)` reads it), `LogicalKey` union (incl.
+  `crouch`/`duck` aliases, bound to `KeyC`; `ControlLeft` stays
+  swim-down).
 - `createInput / keyDown / keyUp / mouseMove / applyGamepad / buildUserCmd`.
 - `attachToCanvas(canvas, target?): DomBindings { input, dispose }`.
 - Jump maps to `upmove +400` (what `pmove`'s `PM_CheckJump` requires).
+- Crouch/duck hold sets `BUTTON_DUCK` (flows `Host`→driver→`pmoveFull`
+  untouched); `@q2/game`'s `PM_CheckDuck` does not consume it yet, so
+  drivers translate via `isDuckHeld(cmd)` → `PMF_DUCKED` until the game
+  wires the bit (ducked hull `mins.z -24 / maxs.z 4 / viewheight 12`).
 
 ## How it is used
 

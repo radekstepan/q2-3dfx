@@ -115,10 +115,28 @@ export function CL_Interpolate(prev: Snapshot, next: Snapshot, renderTime: numbe
  * pmove step (`pmoveFull` from @q2/game — same `PM_StepSlideMove` code path
  * as the server, same injected world trace hooks). Returns the predicted
  * origin, or null for unknown ids / empty streams.
+ *
+ * `horizonMs` bounds how much of the stream is replayed (default: all of
+ * it). The caller (`CL_Predict`) passes the sub-tick render debt
+ * `(now - newest.serverTime) * 1000`, so a render exactly on a tick
+ * replays nothing and returns the snapshot origin exactly, a mid-interval
+ * render replays only the elapsed prefix, and the end-of-interval render
+ * replays exactly one 100ms server step. Replaying the whole staged stream
+ * regardless of render time (the old behaviour) runs a full frame ahead of
+ * the snapshot at tick instants and snaps back when the next snapshot
+ * lands — the stop jitter. Runs of identical inputs are still coalesced
+ * (msec is a delivery artifact), with the final run truncated to the
+ * horizon instead of overshooting it.
  */
-export function CL_PredictPmove(base: Snapshot, localId: number, cmds: PredictCmd[]): Origin3 | null {
+export function CL_PredictPmove(
+  base: Snapshot,
+  localId: number,
+  cmds: PredictCmd[],
+  horizonMs = Number.POSITIVE_INFINITY,
+): Origin3 | null {
   const ent = base.entities.find((e) => e.id === localId);
   if (!ent || cmds.length === 0) return null;
+  if (!(horizonMs > 0)) return [...ent.origin] as Origin3;
   const st = makePmoveState();
   st.origin[0] = ent.origin[0];
   st.origin[1] = ent.origin[1];
@@ -135,22 +153,43 @@ export function CL_PredictPmove(base: Snapshot, localId: number, cmds: PredictCm
   // server snapshot carries ~zero velocity, but the stale sample can hold a
   // small residual (speed<1) that constant-velocity extrapolation — or an
   // airborne gravity step in the replay — would sweep forward until the next
-  // tick snaps it back (the stop rubber-band). When every staged input is
-  // movement-zero the server's next step holds still too, so return the
-  // snapshot origin exactly instead of integrating residue. Buttons (e.g.
-  // attack) do not move the player, so only forward/side/up are checked.
+  // tick snaps it back (the stop rubber-band). When every staged input
+  // inside the horizon is movement-zero the server's next step holds still
+  // too, so return the snapshot origin exactly instead of integrating
+  // residue. Buttons (e.g. attack, duck) do not move the player, so only
+  // forward/side/up are checked.
+  //
+  // The check runs over the horizon-trimmed prefix only: inputs outside the
+  // horizon have not happened yet at this render time and must not un-snap
+  // a settled render.
+  let remaining = horizonMs;
+  const runs: Array<{ rep: PredictCmd; take: number }> = [];
+  {
+    let runStart = 0;
+    for (let i = 1; i <= cmds.length; i++) {
+      if (i < cmds.length && sameInputs(cmds[i]!, cmds[runStart]!)) continue;
+      const rep = cmds[runStart]!;
+      let total = 0;
+      for (let j = runStart; j < i; j++) total += cmds[j]!.msec;
+      if (remaining <= 0) break;
+      const take = Math.min(total, remaining);
+      remaining -= take;
+      runs.push({ rep, take });
+      runStart = i;
+    }
+  }
+  let allZeroMove = true;
+  for (const { rep } of runs) {
+    if (rep.forwardmove !== 0 || rep.sidemove !== 0 || rep.upmove !== 0) {
+      allZeroMove = false;
+      break;
+    }
+  }
   const snapSpeed = Math.sqrt(
     ent.velocity[0] * ent.velocity[0] +
     ent.velocity[1] * ent.velocity[1] +
     ent.velocity[2] * ent.velocity[2],
   );
-  let allZeroMove = true;
-  for (const c of cmds) {
-    if (c.forwardmove !== 0 || c.sidemove !== 0 || c.upmove !== 0) {
-      allZeroMove = false;
-      break;
-    }
-  }
   if (snapSpeed < 1 && allZeroMove) return [...ent.origin] as Origin3;
   // Friction-exact run coalescing: the server integrates ONE 100ms pmove
   // step per tick while the predictor replays N ~16ms frame cmds, and rAF
@@ -163,13 +202,8 @@ export function CL_PredictPmove(base: Snapshot, localId: number, cmds: PredictCm
   // Pmove does), restoring the server's chunking: a jittered run summing
   // to 100ms replays bit-identically to the server's single 100ms step,
   // and a mixed stream (held move + release frame) replays as two steps.
-  let runStart = 0;
-  for (let i = 1; i <= cmds.length; i++) {
-    if (i < cmds.length && sameInputs(cmds[i]!, cmds[runStart]!)) continue;
-    const rep = cmds[runStart]!;
-    let total = 0;
-    for (let j = runStart; j < i; j++) total += cmds[j]!.msec;
-    total = Math.max(1, Math.min(200, Math.round(total)));
+  for (const { rep, take } of runs) {
+    const total = Math.max(1, Math.min(200, Math.round(take)));
     pmoveFull(st, {
       msec: total,
       angles: new Float32Array(rep.angles),
@@ -178,7 +212,6 @@ export function CL_PredictPmove(base: Snapshot, localId: number, cmds: PredictCm
       upmove: rep.upmove,
       buttons: rep.buttons,
     });
-    runStart = i;
   }
   return [st.origin[0]!, st.origin[1]!, st.origin[2]!];
 }
@@ -186,18 +219,37 @@ export function CL_PredictPmove(base: Snapshot, localId: number, cmds: PredictCm
 /**
  * `CL_Predict`: predict the local player from the newest snapshot.
  *
- * When owned cmds are supplied AND `cl_predict` is nonzero, the cmds are
- * replayed through the real pmove step. Otherwise (no cmds, `cl_predict`
- * 0, or unknown id) it falls back to constant-velocity extrapolation
- * `origin + velocity * dt` (legacy A/B baseline). Returns null only for
- * unknown ids.
+ * When owned cmds are supplied AND `cl_predict` is nonzero, the full staged
+ * stream is replayed through the real pmove step (the tick-end target —
+ * friction-exact vs the server's 100ms step) and the render blends from the
+ * snapshot origin toward that target by the sub-tick debt
+ * `dt / stagedTotal`, clamped 0..1. `dt <= 0` returns the snapshot origin
+ * exactly, so tick-aligned renders never lead the server and never snap
+ * back; the end-of-interval render equals the tick target, so constant
+ * streams land bit-identically on the next snapshot. Blending (rather than
+ * replaying only the elapsed prefix) keeps the settle monotonic: a prefix
+ * replay overshoots the full friction step it prefixes (friction decay is
+ * front-loaded in a single pmove step — shorter dt keeps more velocity),
+ * which read as a forward pop + snap-back every tick (the stop jitter).
+ * Otherwise (no cmds, `cl_predict` 0, or unknown id) it falls back to
+ * constant-velocity extrapolation `origin + velocity * dt` (legacy A/B
+ * baseline). Returns null only for unknown ids.
  */
 export function CL_Predict(newest: Snapshot, localId: number, dt: number, cmds?: PredictCmd[]): Origin3 | null {
   const ent = newest.entities.find((e) => e.id === localId);
   if (!ent) return null;
   if (cmds && cmds.length > 0 && getCVarNumber('cl_predict') !== 0) {
-    const moved = CL_PredictPmove(newest, localId, cmds);
-    if (moved) return moved;
+    const horizonMs = Math.max(0, dt * 1000);
+    let total = 0;
+    for (const c of cmds) total += c.msec;
+    // Tick-end target: the whole staged stream (friction-exact). Horizon
+    // trimming inside still applies, with total as the budget it replays
+    // fully — including the zero-velocity snap for settled streams.
+    const end = CL_PredictPmove(newest, localId, cmds, total);
+    if (end) {
+      if (!(total > 0)) return end;
+      return lerpOrigin(ent.origin, end, clamp01(horizonMs / total));
+    }
   }
   return extrapolateOrigin(ent.origin, ent.velocity, dt);
 }
