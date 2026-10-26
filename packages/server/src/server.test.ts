@@ -342,6 +342,83 @@ describe('skill cvar + spawn gating (g_spawn.c, g_combat.c)', () => {
     expect(monsterKindOf('monster_infantry')).toBeNull();
   });
 
+  it('doors spawn closed (no START_OPEN), open on touch, auto-close when clear', () => {
+    // C SP_func_door: without START_OPEN the slab rests at pos1 in STATE_BOTTOM;
+    // door_hit_top schedules door_go_down after `wait`, door_hit_bottom ends
+    // at STATE_BOTTOM. Touch_DoorTrigger debounce is implicit: moverUse only
+    // re-fires from bottom/waiting (re-touch refreshes the wait, like C's
+    // door_go_up-on-TOP nextthink reset), so a clear area always returns to pos1.
+    const lump =
+      `{ "classname" "worldspawn" }\n` +
+      `{ "classname" "func_door" "model" "*1" "angle" "0" "distance" "128" "speed" "100" "wait" "3" }\n`;
+    const bounds = { mins: new Float32Array([-32, -32, 0]), maxs: new Float32Array([32, 32, 96]) };
+    resetEdictNums();
+    const st = SV_Init();
+    SV_SpawnEntities(st, lump, (m) => (m === '*1' ? bounds : null));
+    expect(st.movers).toHaveLength(1);
+    const door = st.movers[0]!;
+    // initial state: closed at pos1 (this is the M5.2 pin — a spawn at pos2
+    // with state bottom would render open while reading closed).
+    expect(door.state).toBe('bottom');
+    expect([...door.ent.origin]).toEqual([...door.pos1]);
+    // touch the trigger volume (brush bounds +60 x/y) as the player.
+    const used = SV_TouchDoorsAt(st, {
+      origin: v3(0, 0, 32),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+    });
+    expect(used).toHaveLength(1);
+    expect(door.state).toBe('going_up');
+    // run with the area clear (no further touches): must reach pos2 ...
+    let sawTop = false;
+    for (let i = 0; i < 40 && door.state !== 'bottom'; i++) {
+      SV_Tick(st);
+      if (door.ent.origin[0] === door.pos2[0] && door.ent.origin[2] === door.pos2[2]) sawTop = true;
+    }
+    expect(sawTop).toBe(true);
+    // ... then come back down and latch at pos1/bottom (3s wait + 1.2s legs).
+    for (let i = 0; i < 200 && door.state !== 'bottom'; i++) SV_Tick(st);
+    expect(door.state).toBe('bottom');
+    expect([...door.ent.origin]).toEqual([...door.pos1]);
+  });
+
+  it('NOMONSTER doors ignore monster touches but open for the player', () => {
+    // id Touch_DoorTrigger (g_func.c): (owner.spawnflags & DOOR_NOMONSTER) &&
+    // toucher is monster -> return. Base1 sliders *32/*33 carry flag 8.
+    const lump =
+      `{ "classname" "worldspawn" }\n` +
+      `{ "classname" "func_door" "model" "*1" "angle" "90" "distance" "72" "speed" "50" "spawnflags" "8" }\n`;
+    const bounds = { mins: new Float32Array([-8, -48, 0]), maxs: new Float32Array([8, 48, 64]) };
+    resetEdictNums();
+    const st = SV_Init();
+    SV_SpawnEntities(st, lump, (m) => (m === '*1' ? bounds : null));
+    const door = st.movers[0]!;
+    const body = { origin: v3(0, 0, 32), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) };
+    expect(SV_TouchDoorsAt(st, body, 'monster')).toHaveLength(0);
+    expect(door.state).toBe('bottom');
+    expect(SV_TouchDoorsAt(st, body, 'player')).toHaveLength(1);
+    expect(door.state).toBe('going_up');
+  });
+
+  it('soldier spawn stashes the C skinnum for the render lane', () => {
+    // m_soldier.c: SP_monster_soldier_light -> skin 0 (blaster),
+    // SP_monster_soldier -> skin 2 (shotgun), SP_monster_soldier_ss -> 4
+    // (machinegun). selectSoldierAttack keys the weapon off the same skins.
+    const lump =
+      `{ "classname" "worldspawn" }\n` +
+      `{ "classname" "monster_soldier_light" "origin" "0 0 0" }\n` +
+      `{ "classname" "monster_soldier" "origin" "64 0 0" }\n` +
+      `{ "classname" "monster_soldier_ss" "origin" "128 0 0" }\n`;
+    resetEdictNums();
+    const st = SV_Init();
+    const ents = SV_SpawnEntities(st, lump);
+    const skin = (cls: string): string =>
+      ents.find((e) => e.classname === cls)!.extra['skinnum'] as string;
+    expect(skin('monster_soldier_light')).toBe('0');
+    expect(skin('monster_soldier')).toBe('2');
+    expect(skin('monster_soldier_ss')).toBe('4');
+  });
+
   it('gunner-lite tables match m_gunner.c move structure', () => {
     // gcc -c ground truth: attack_chain 7f -> fire_chain, fire_chain 8f ->
     // endfire_chain (via gunner_refire_chain), endfire_chain 7f -> run,

@@ -105,6 +105,14 @@ export const SPAWNFLAG_NOT_HARD = 1024;
 export const SPAWNFLAG_NOT_DEATHMATCH = 2048;
 export const SPAWNFLAG_NOT_COOP = 4096;
 
+/**
+ * func_door spawnflag: monsters never trip this door (id g_func.c
+ * Touch_DoorTrigger). Local copy — @q2/game owns the mover sim and only
+ * re-exports DOOR_START_OPEN/DOOR_TOGGLE; like the SPAWNFLAG_* bits above,
+ * the server keeps its own copy for spawn/touch gating (same value, C-cited).
+ */
+export const DOOR_NOMONSTER = 8;
+
 /** True when the entity is inhibited at `skill` (g_spawn.c SpawnEntities). */
 export function inhibitedBySkill(spawnflags: number, skill: number): boolean {
   if (skill === 0 && spawnflags & SPAWNFLAG_NOT_EASY) return true;
@@ -475,6 +483,14 @@ export function SV_SpawnEntities(
         break;
     }
     if (e.classname.startsWith('monster_')) {
+      // id skin assignment (m_soldier.c SP_monster_soldier_*): light troops
+      // wear skin 0 (blaster), normals skin 2 (shotgun), supershots skin 4
+      // (machinegun). Stashed on the edict so the render lane can pick a
+      // distinct skin per kind (selectSoldierAttack keys off the same skins).
+      // Base1 fields 6× light + 8× normal, no supershots.
+      if (e.classname === 'monster_soldier_light') e.extra['skinnum'] = '0';
+      else if (e.classname === 'monster_soldier') e.extra['skinnum'] = '2';
+      else if (e.classname === 'monster_soldier_ss') e.extra['skinnum'] = '4';
       // walkmonster_start_go drops non-triggered monsters when level.time < 1
       // (spawn always qualifies: time is still 0 here).
       if (dropTrace && !(e.spawnflags & 2)) {
@@ -649,16 +665,27 @@ export function SV_TouchTriggersAt(
  * x/y (Think_SpawnDoorTrigger). A body overlapping a closed/waiting door's
  * volume uses the door (door_use), exactly like the bot driver mirrors.
  * Doors without registered brush bounds (no modelSizes hook) are skipped.
+ *
+ * C gates (Touch_DoorTrigger): monsters never trip DOOR_NOMONSTER doors
+ * (spawnflags & 8 — both base1 sliders carry it), and touches debounce at
+ * 1Hz. The debounce is implicit here: moverUse only re-fires from
+ * bottom/waiting, so a body already inside merely refreshes the wait —
+ * exactly the C door_go_up-on-TOP wait reset. Pass toucherClass 'monster'
+ * for monster bodies so the NOMONSTER gate applies.
+ *
  * Returns the doors that started moving.
  */
 export function SV_TouchDoorsAt(
   st: ServerState,
   body: { origin: Vec3; mins: Vec3; maxs: Vec3 },
+  toucherClass: 'player' | 'monster' = 'player',
 ): Mover[] {
   const used: Mover[] = [];
   for (const m of st.movers) {
     if (m.ent.classname !== 'func_door') continue;
     if (m.state !== MOVER_BOTTOM && m.state !== MOVER_WAITING) continue;
+    // id Touch_DoorTrigger: NOMONSTER doors ignore monster touches.
+    if (toucherClass === 'monster' && m.ent.spawnflags & DOOR_NOMONSTER) continue;
     const b = st.moverBounds.get(m.ent.num);
     if (!b) continue;
     const ox = m.ent.origin[0]! - m.pos1[0]!;

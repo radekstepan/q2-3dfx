@@ -1424,6 +1424,93 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(findByClassname(st.entities, 'func_rotating')).toHaveLength(1);
   });
 
+  it('doors: all four start closed at pos1; touch opens; clear + wait returns to pos1', { timeout: 120000 }, () => {
+    // M5.2 pin for the "doors render open at spawn" report: the server must
+    // spawn every mover at pos1/STATE_BOTTOM (base1 sets no START_OPEN bit —
+    // verified from the lump below), SV_TouchDoorsAt must open each door,
+    // and with the area clear the C wait cycle (door_hit_top -> door_go_down
+    // after `wait` -> door_hit_bottom) must latch back at pos1/bottom.
+    // A stuck-open door here would implicate spawn state, not the renderer.
+    const { map } = loadBase1();
+    const dicts = parseEntities(map.entities);
+    const doorDicts = dicts.filter((d) => d.classname === 'func_door');
+    expect(doorDicts).toHaveLength(4);
+    for (const d of doorDicts) expect(Number.parseInt(d.spawnflags ?? '0', 10) & 1).toBe(0);
+    resetEdictNums();
+    const st = SV_Init();
+    spawnWith(st, map, 1, true);
+    expect(st.movers.filter((m) => m.ent.classname === 'func_door')).toHaveLength(4);
+    for (const m of st.movers) {
+      if (m.ent.classname !== 'func_door') continue;
+      // closed at spawn: origin == pos1, STATE_BOTTOM.
+      expect(m.state).toBe('bottom');
+      expect([...m.ent.origin]).toEqual([...m.pos1]);
+    }
+    // door *19 (up), *31 (down), *32 (-y slider), *33 (+y slider).
+    const touchAt: Record<number, [number, number, number]> = {
+      19: [-1112, 1632, -24],
+      31: [-1774, 1536, 104],
+      32: [-1684, 1488, 120],
+      33: [-1684, 1584, 120],
+    };
+    for (const m of st.movers) {
+      if (m.ent.classname !== 'func_door') continue;
+      const n = Number.parseInt(m.ent.model.slice(1), 10);
+      const tp = touchAt[n]!;
+      expect(tp).toBeDefined();
+      const used = SV_TouchDoorsAt(
+        st,
+        { origin: v3(tp[0], tp[1], tp[2]), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+        'player',
+      );
+      expect(used.map((u) => u.ent.model)).toContain(`*${n}`);
+      expect(m.state).toBe('going_up');
+      // ride to the top with the area clear (no further touches).
+      let guard = 0;
+      while (m.state !== 'waiting' && m.state !== 'top' && guard++ < 100) SV_Tick(st);
+      expect(['waiting', 'top']).toContain(m.state);
+      for (let i = 0; i < 3; i++) {
+        expect(m.ent.origin[i]!).toBeCloseTo(m.pos2[i]!, 3);
+      }
+      // wait out the hold + the return leg: must latch at pos1/bottom.
+      guard = 0;
+      while (m.state !== 'bottom' && guard++ < 400) SV_Tick(st);
+      expect(m.state).toBe('bottom');
+      for (let i = 0; i < 3; i++) {
+        expect(m.ent.origin[i]!).toBeCloseTo(m.pos1[i]!, 3);
+      }
+    }
+  });
+
+  it('doors: NOMONSTER sliders ignore monsters, plain doors do not', { timeout: 120000 }, () => {
+    // id Touch_DoorTrigger: (spawnflags & DOOR_NOMONSTER) && monster -> return.
+    // Base1: *32/*33 carry 2056 = NOT_DM|NOMONSTER; *19/*31 carry no flags.
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    spawnWith(st, map, 1, true);
+    const byModel = (n: number): Mover =>
+      st.movers.find((mm) => mm.ent.model === `*${n}`)!;
+    expect(byModel(32).ent.spawnflags & 8).toBeGreaterThan(0);
+    expect(byModel(33).ent.spawnflags & 8).toBeGreaterThan(0);
+    expect(byModel(19).ent.spawnflags & 8).toBe(0);
+    const monsterBody = (x: number, y: number, z: number): { origin: Vec3; mins: Vec3; maxs: Vec3 } => ({
+      origin: v3(x, y, z),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+    });
+    // sliders: monster touch is a no-op (the shared trigger volume still
+    // opens *31, which carries no NOMONSTER bit), player touch opens *32.
+    const mUsed = SV_TouchDoorsAt(st, monsterBody(-1684, 1488, 120), 'monster').map((m) => m.ent.model);
+    expect(mUsed).toContain('*31');
+    expect(mUsed).not.toContain('*32');
+    expect(mUsed).not.toContain('*33');
+    expect(byModel(32).state).toBe('bottom');
+    expect(SV_TouchDoorsAt(st, monsterBody(-1684, 1488, 120), 'player').map((m) => m.ent.model)).toContain('*32');
+    // plain doors: monsters open them (authentic — the NOMONSTER bit is absent).
+    expect(SV_TouchDoorsAt(st, monsterBody(-1112, 1632, -24), 'monster').map((m) => m.ent.model)).toContain('*19');
+  });
+
   it('gunner: absent from base1; exit machinegun is DM-only, shotgun is SP', { timeout: 120000 }, () => {
     const { map } = loadBase1();
     const dicts = parseEntities(map.entities);
@@ -1432,14 +1519,85 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     // infantry has no lite def yet (see monsterKindOf report in server.test).
     expect(dicts.filter((d) => d.classname === 'monster_soldier' || d.classname === 'monster_soldier_light')).toHaveLength(14);
     expect(dicts.filter((d) => d.classname === 'monster_infantry')).toHaveLength(5);
+    // the exit machinegun is spawnflags 1792 = NOT_EASY|NOT_MEDIUM|NOT_HARD
+    // (no NOT_DEATHMATCH bit): g_spawn.c inhibits it at EVERY SP skill and
+    // spawns it in deathmatch — DM-only, not a substitute for the gunner.
+    const mg = dicts.filter((d) => d.classname === 'weapon_machinegun');
+    expect(mg).toHaveLength(1);
+    expect(mg[0]!.spawnflags).toBe('1792');
+    expect(mg[0]!.origin).toBe('-1952 1304 112');
     for (const skill of [0, 1, 2, 3]) {
       resetEdictNums();
       const st = SV_Init();
       const edicts = spawnWith(st, map, skill, false);
-      // 1792 = DM-only: the exit machinegun never spawns in SP at any skill —
-      // it is not a substitute for the (nonexistent) gunner.
       expect(findByClassname(edicts, 'weapon_machinegun')).toHaveLength(0);
       expect(findByClassname(edicts, 'weapon_shotgun')).toHaveLength(1);
+    }
+  });
+
+  it('soldiers: base1 roster carries C skins (light 0 / normal 2), no gunner at any skill', { timeout: 120000 }, () => {
+    // m_soldier.c SP_ assignment: _light -> 0 (blaster), normal -> 2
+    // (shotgun), _ss -> 4 (machinegun). Base1 fields 6 light + 8 normal, no
+    // _ss and no gunner at any skill (accounting for 256/512/1024/2048
+    // inhibition — the 1792/769-flagged edicts are checked per skill above
+    // and in the skill test). The server stashes skinnum on the edict so the
+    // web lane can render the two kinds distinctly.
+    const { map } = loadBase1();
+    for (const skill of [0, 1, 2, 3]) {
+      resetEdictNums();
+      const st = SV_Init();
+      const edicts = spawnWith(st, map, skill, true);
+      expect(findByClassname(edicts, 'monster_gunner')).toHaveLength(0);
+      expect(findByClassname(edicts, 'monster_soldier_ss')).toHaveLength(0);
+      const lights = findByClassname(edicts, 'monster_soldier_light');
+      const normals = findByClassname(edicts, 'monster_soldier');
+      for (const e of lights) expect(e.extra['skinnum']).toBe('0');
+      for (const e of normals) expect(e.extra['skinnum']).toBe('2');
+      if (skill === 1) {
+        // skill-1 roster: 6 + 8 (the two 769-flagged infantries join at 2+).
+        expect(lights).toHaveLength(6);
+        expect(normals).toHaveLength(8);
+      }
+    }
+  });
+  it('glass walls spawn in SP; z=0 barrels rest on the floor away from them', { timeout: 120000 }, () => {
+    // func_wall *9/*10 (spawnflags 2048 = NOT_DEATHMATCH): present in every
+    // SP skill, inhibited only in deathmatch (g_spawn.c DM branch checks
+    // NOT_DEATHMATCH alone). The "floating barrel where glass should be" is
+    // not a spawn error: the two z=0 barrels sit exactly on the floor
+    // (trace ends 1/32 up = C DIST_EPSILON contact) hundreds of units from
+    // either wall slab, so any visible float is render-side (web lane owns
+    // the barrel MD2 render origin vs the entity origin).
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    const edicts = spawnWith(st, map, 1, true);
+    const walls = findByClassname(edicts, 'func_wall').sort((a, b) =>
+      a.model < b.model ? -1 : 1,
+    );
+    expect(walls.map((w) => w.model)).toEqual(['*10', '*9']);
+    for (const w of walls) expect(w.spawnflags & 2048).toBe(0); // stripped, SP-kept
+    const wallBounds = (w: (typeof walls)[number]): { mins: Float32Array; maxs: Float32Array } =>
+      modelBounds(map, Number.parseInt(w.model.slice(1), 10));
+    const barrels = findByClassname(edicts, 'misc_explobox');
+    const trace = bspTraceFor(map);
+    for (const [x, y] of [[136, 40], [184, -24]] as Array<[number, number]>) {
+      const b = barrels.find((bb) => Math.round(bb.origin[0]!) === x && Math.round(bb.origin[1]!) === y)!;
+      expect(b).toBeDefined();
+      // floor directly under the barrel: hull trace ends at the origin.
+      const t = trace(
+        v3(x, y, b.origin[2]! + 1),
+        EXPLOBOX_MINS,
+        EXPLOBOX_MAXS,
+        v3(x, y, b.origin[2]! - 256),
+      );
+      expect(t.fraction).toBeLessThan(0.05);
+      expect(t.endpos[2]!).toBeCloseTo(b.origin[2]!, 0);
+      // nowhere near either glass slab (barrel hull vs wall bounds).
+      for (const w of walls) {
+        const wb = wallBounds(w);
+        expect(boxOverlap(b.origin, EXPLOBOX_MINS, EXPLOBOX_MAXS, wb.mins, wb.maxs)).toBe(false);
+      }
     }
   });
 
