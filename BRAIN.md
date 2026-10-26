@@ -980,3 +980,39 @@ after M8.1, startup ≤2.5 s from cached pak to first frame.
 `qcommon/` → `@q2/host` + `@q2/config` · `client/cl_*.c` → `@q2/client` · `server/sv_*.c` → `@q2/server`
 `game/g_*.c`, `p_*.c`, `m_*.c` → `@q2/game` · `ref_soft/*` → `@q2/sw-renderer` · `ref_gl/*` → `@q2/voodoo`
 `qcommon/cmodel.c` → `@q2/bsp` · `qcommon/files.c` → `@q2/filesystem` · `qcommon/pmove.c` → `@q2/game/pmove.ts`
+
+---
+
+## 15. Pipeline lessons (batch #8, 2026-10-26 — read before spawning lanes)
+
+Recurring user reports ("still not fixed") traced to ONE structural cause, not
+bad lanes. Evidence, all in `apps/web/src/play.ts`:
+
+1. **Two simulations.** The browser runs the server tick (`SV_Tick`, movers,
+   triggers) AND a private driver sim (`PlacedMonster[]`, `barrels`, `bolts`,
+   `monsterChaseMove`/`monsterLocomotion`, driver door touch). Rendering uses
+   the driver sim only. So `packages/server` fixes (monster pursuit/stairs/LOS,
+   `SV_SetPmoveWorldFromBsp` C-mask, spawn-drop masks) are invisible in the
+   browser — green headless server tests, zero browser change. This is the
+   recurrence engine for: enemies don't follow, secret clip (driver uses
+   game-side mask-1 `setPmoveWorldFromBsp`, not the C-mask server version),
+   doors already open, unshootable barrels.
+2. **Render-vs-hit divergence.** Hit tests (`traceShot` point mask, segmentAabb
+   boxes) run on different state/masks than what renders → visible-but-immune
+   barrels, bolts that visually connect but don't damage.
+3. **Mock-green tests.** Headless driver tests build synthetic states, never the
+   real base1 tick loop; no playtest boots base1 through the DRIVER and asserts
+   rendered-state outcomes (barrel dies when shot, monster closes distance,
+   door re-closes).
+
+**Rules from now on:**
+
+- Single-sim rule: base1 gameplay state lives in ONE place. Until the driver
+  is deleted in favor of the server sim (Phase 1 below), any `packages/server`
+  behavior fix must include the `apps/web` driver wiring in the SAME PR
+  (cross-package lanes allowed for this, reviewer checks both).
+- `done` = play-verified: every gameplay card needs a driver-level base1 bot
+  test (real lump, real tick loop, asserts on rendered/submitted state), not
+  just package unit tests.
+- No more symptom lanes on God-object `play.ts` without first checking which
+  sim owns the behavior.
