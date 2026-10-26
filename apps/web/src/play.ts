@@ -6,7 +6,7 @@
 //   doors/triggers/movers, static soldier/gunner placeholders you can shoot).
 import { Host } from '@q2/host';
 import type { ExtraRenderable, HostDriver } from '@q2/host';
-import { BUTTON_ATTACK } from '@q2/input';
+import { BUTTON_ATTACK, isDuckHeld } from '@q2/input';
 import type { UserCmdT } from '@q2/input';
 import type { Snapshot } from '@q2/client';
 import {
@@ -33,6 +33,7 @@ import {
   spawnEdict,
   makePmoveState,
   pmoveFull,
+  PMF_DUCKED,
   setPmoveWorld,
   bspTraceFor,
   setPmoveWorldFromBsp,
@@ -79,7 +80,7 @@ import type {
   TraceResult,
   PlayerState,
 } from '@q2/game';
-import { SV_Init, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, fireTargets } from '@q2/server';
+import { SV_Init, SV_SetSkill, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, fireTargets } from '@q2/server';
 import type { ServerState } from '@q2/server';
 import { ATTN_NORM, Mixer } from '@q2/sound';
 import { parseMD2, parseWAL, parsePCX } from '@q2/formats';
@@ -139,6 +140,130 @@ export function applyBrightness(dst: Uint32Array, brightness: number): void {
     dst[i] = (px & 0xff000000) | (b << 16) | (g << 8) | r;
   }
 }
+
+// --- skill (difficulty; M7.1 menu) ---
+//
+// id `skill` cvar (game/g_save.c, CVAR_LATCH, default 1 = medium): 0 easy,
+// 1 medium, 2 hard, 3 nightmare. The web menu exposes it as a labeled
+// dropdown (see SKILL_LABELS in dom.ts); the value persists via setCVar and
+// is latched at boot — changing it mid-game takes effect on the next boot,
+// exactly like id's latch. The driver hands it to `SV_SetSkill` before
+// spawning so the server applies the C SpawnEntities filter (g_spawn.c):
+// edicts carrying SPAWNFLAG_NOT_EASY (256) are inhibited on skill 0,
+// NOT_MEDIUM (512) on skill 1, NOT_HARD (1024) on skill 2/3. (Damage
+// scaling stays in @q2/server, outside this package.)
+export const SKILL_DEFAULT = 1;
+export const SKILL_MIN = 0;
+export const SKILL_MAX = 3;
+
+registerCVar('skill', SKILL_DEFAULT, 'difficulty 0 easy 1 medium 2 hard 3 nightmare (latched at boot)');
+
+/** Clamped `skill` (absent/non-finite cvar → default). Self-healing like getBrightness. */
+export function getSkill(): number {
+  let raw = getCVar('skill');
+  if (raw === undefined) {
+    registerCVar('skill', SKILL_DEFAULT, 'difficulty 0 easy 1 medium 2 hard 3 nightmare (latched at boot)');
+    raw = SKILL_DEFAULT;
+  }
+  const v = Math.floor(Number(raw));
+  if (!Number.isFinite(v)) return SKILL_DEFAULT;
+  return Math.min(SKILL_MAX, Math.max(SKILL_MIN, v));
+}
+
+/**
+ * id SpawnEntities skill test (game/g_spawn.c): does this spawnflags word
+ * inhibit the edict at the given (already clamped) skill? Worldspawn is
+ * exempt by the caller, mirroring `ent != g_edicts`.
+ */
+export function skillInhibits(spawnflags: number, skill: number): boolean {
+  const f = spawnflags | 0;
+  if (skill <= 0) return (f & 256) !== 0; // SPAWNFLAG_NOT_EASY
+  if (skill === 1) return (f & 512) !== 0; // SPAWNFLAG_NOT_MEDIUM
+  return (f & 1024) !== 0; // SPAWNFLAG_NOT_HARD (skill 2 and 3)
+}
+
+/** Parse a lump `spawnflags` key the way spawnEdict does (absent → 0). */
+export function parseSpawnflags(dict: Record<string, string>): number {
+  const v = parseInt(dict['spawnflags'] ?? '0', 10);
+  return Number.isFinite(v) ? v : 0;
+}
+
+// --- crouch (M7.1 UX) ---
+//
+// The browser binding lives in @q2/input (KeyC → 'crouch' logical key,
+// BUTTON_DUCK on the built UserCmdT; attachToCanvas wires it with zero
+// web-side code). This package only translates + advertises it: step()
+// maps the cmd duck bit onto PMF_DUCKED before pmoveFull (the documented
+// input→driver convention), so the hull shrinks (maxs 32 → 4, viewheight
+// 22 → 12). Note: the host camera stays at +22 (calcViewOrigin is
+// host-owned), so the eye does not dip — collision (fitting under low
+// ceilings) is the part that works. HUD/help advertise the binding.
+
+/** One-line controls reference drawn in the HUD and mirrored in index.html. */
+export const CONTROLS_HINT = 'move WASD - crouch C - jump Space - use E - attack click - guns 1/2/3';
+
+// --- pickup / scenery world models (M7.1 view) ---
+//
+// C world-model lumps for base1 pickups (game/g_items.c, verified against
+// pak0.pak): items render as their spinning world models (EF_ROTATE), never
+// as boxes. Weapon world models come from the game table
+// (worldModelForWeapon); item/ammo models live in this table. Skins sit next
+// to their model as skin.pcx (all verified present).
+const ITEM_WORLD_MODELS: Record<string, string> = {
+  item_armor_shard: 'models/items/armor/shard/tris.md2',
+  item_armor_jacket: 'models/items/armor/jacket/tris.md2',
+  item_armor_combat: 'models/items/armor/combat/tris.md2',
+  item_armor_body: 'models/items/armor/body/tris.md2',
+  item_health_small: 'models/items/healing/stimpack/tris.md2',
+  item_health: 'models/items/healing/medium/tris.md2',
+  item_health_large: 'models/items/healing/large/tris.md2',
+  item_health_mega: 'models/items/mega_h/tris.md2',
+  ammo_shells: 'models/items/ammo/shells/medium/tris.md2',
+  ammo_bullets: 'models/items/ammo/bullets/medium/tris.md2',
+  ammo_grenades: 'models/items/ammo/grenades/medium/tris.md2',
+  ammo_cells: 'models/items/ammo/cells/medium/tris.md2',
+  ammo_rockets: 'models/items/ammo/rockets/medium/tris.md2',
+  ammo_slugs: 'models/items/ammo/slugs/medium/tris.md2',
+  item_quad: 'models/items/quaddama/tris.md2',
+  item_invulnerability: 'models/items/invulner/tris.md2',
+  item_silencer: 'models/items/silencer/tris.md2',
+  item_breather: 'models/items/breather/tris.md2',
+  item_enviro: 'models/items/enviro/tris.md2',
+  item_adrenaline: 'models/items/adrenal/tris.md2',
+  item_band: 'models/items/band/tris.md2',
+  item_pack: 'models/items/pack/tris.md2',
+};
+
+const WEAPON_WORLD_CLASSES = [
+  'weapon_blaster',
+  'weapon_shotgun',
+  'weapon_supershotgun',
+  'weapon_machinegun',
+  'weapon_chaingun',
+  'weapon_grenadelauncher',
+  'weapon_rocketlauncher',
+  'weapon_hyperblaster',
+  'weapon_railgun',
+  'weapon_bfg',
+];
+
+/** World-model lump for a pickup classname (weapons via the game table). */
+export function worldModelForPickup(classname: string): string | null {
+  return worldModelForWeapon(classname) ?? ITEM_WORLD_MODELS[classname] ?? null;
+}
+
+/** Skin lump next to an item/weapon world model (sibling skin.pcx). */
+export function skinForItemModel(modelPath: string): string {
+  const slash = modelPath.lastIndexOf('/');
+  const dir = slash >= 0 ? modelPath.slice(0, slash) : '';
+  return dir ? `${dir}/skin.pcx` : 'skin.pcx';
+}
+
+/** C model lumps for the courtyard dressing (game/g_misc.c, verified vs pak). */
+export const SHIP_MODEL = 'models/ships/strogg1/tris.md2';
+export const SHIP_SKIN = 'models/ships/strogg1/skin.pcx';
+export const BANNER_MODEL = 'models/objects/banner/tris.md2';
+export const BANNER_SKIN = 'models/objects/banner/skin.pcx';
 
 const PLAYER_ID = 1;
 /** Eye height above the pm origin (matches PmoveState.viewheight). */
@@ -504,7 +629,14 @@ const SPARK_GRAVITY = 40;
 const TOSS_GRAVITY = 800;
 
 interface DoorSync {
-  mover: Mover;
+  ent: Edict;
+  /**
+   * Rest origin the baked verts correspond to: mover pos1 for doors/buttons,
+   * the lump origin (usually 0,0,0 for brush models) for func_trains. The
+   * rendered offset is always `ent.origin - rest`, matching the C brush-model
+   * convention (faces baked at mapper coords, shifted by the entity origin).
+   */
+  rest: Vec3;
   model: number;
   faces: MiniSurf[];
   baseVerts: Float32Array[];
@@ -624,6 +756,9 @@ export class LocalDriver implements HostDriver {
       this.mini = built.mini;
       setPmoveWorldFromBsp(built.map);
       this.bspTrace = bspTraceFor(built.map);
+      // Skill latch (id CVAR_LATCH, g_spawn.c): the server filters spawns,
+      // damage scale, and the roster from st.skill — set it before spawning.
+      SV_SetSkill(this.server, getSkill());
       SV_SpawnEntities(this.server, built.map.entities, (model) => modelBounds(built.map, model));
       this.playerEdict = spawnEdict({ classname: 'player' });
       this.spawnFromLump(built.map);
@@ -690,6 +825,11 @@ export class LocalDriver implements HostDriver {
       this.pm.velocity = v3();
     } else {
       this.pm.viewAngles = new Float32Array(cmd.angles) as Vec3;
+      // Duck translation (@q2/input convention): the KeyC 'crouch' key sets
+      // BUTTON_DUCK on the built cmd (Host → driver untouched); the driver
+      // owns PMF_DUCKED until @q2/game wires it into PM_CheckDuck.
+      if (isDuckHeld(gcmd)) this.pm.pmFlags |= PMF_DUCKED;
+      else this.pm.pmFlags &= ~PMF_DUCKED;
       pmoveFull(this.pm, gcmd);
     }
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
@@ -874,8 +1014,78 @@ export class LocalDriver implements HostDriver {
           frame: 0,
         });
       }
+      // Pickups: live (unpicked, skill-kept) item/weapon/ammo edicts render
+      // as their C world models with the EF_ROTATE spin; picked-up (freed)
+      // or skill-inhibited ones stay hidden, exactly matching the pickup
+      // logic in checkPickups. This is what makes the low-hole armor
+      // shards visible: entity submits have no PVS/frustum cull in the
+      // renderer (z-test only), so a shard at z=-216 renders like any other.
+      for (const e of this.server.entities) {
+        if (e.freed) continue;
+        const h = this.models.items[e.classname];
+        if (!h) continue;
+        out.push({
+          origin: [e.origin[0]!, e.origin[1]!, e.origin[2]!],
+          angles: [0, (this.server.time * 90) % 360, 0],
+          model: h.model,
+          skin: h.skin,
+          frame: 0,
+        });
+      }
+      // Banners wave through MD2 frames 0..15 at 10Hz (misc_banner_think);
+      // the C start frame is random, ours walks from 0 (deterministic).
+      // Read from the server roster (plain edicts) so skill filtering applies.
+      if (this.models.banner >= 0) {
+        const bf = Math.floor(this.server.time / 0.1) % 16;
+        for (const e of this.server.entities) {
+          if (e.freed || e.classname !== 'misc_banner') continue;
+          out.push({
+            origin: [e.origin[0]!, e.origin[1]!, e.origin[2]!],
+            angles: [0, parseFloat(e.extra['angle'] ?? '0', 0), 0],
+            model: this.models.banner,
+            skin: this.models.bannerSkin,
+            frame: bf,
+          });
+        }
+      }
+      // Ships ride the server trains (func_train_find + train_next): the
+      // position is authoritative and moves every tick, so a parked lump
+      // origin would desync within a second. `started` is the SVF_NOCLIENT
+      // gate (trigger_spawned until a use — trigger_always at boot for all
+      // three base1 flybys); unstarted trains stay hidden like in C.
+      if (this.models.ship >= 0) {
+        for (const tr of this.server.trains) {
+          if (!tr.ship || !tr.started) continue;
+          out.push({
+            origin: [tr.ent.origin[0]!, tr.ent.origin[1]!, tr.ent.origin[2]!],
+            angles: [0, parseFloat(tr.ent.extra['angle'] ?? '0', 0), 0],
+            model: this.models.ship,
+            skin: this.models.shipSkin,
+            frame: 0,
+          });
+        }
+      }
     }
     return out.length > 0 ? out : null;
+  }
+
+  /** Test hook: live pickup extras (unpicked, skill-kept item/weapon/ammo). */
+  livePickupCount(): number {
+    if (!this.models) return 0;
+    let n = 0;
+    for (const e of this.server.entities) {
+      if (!e.freed && this.models.items[e.classname]) n++;
+    }
+    return n;
+  }
+
+  /** Test hook: started ship trains (trigger_spawned visibility gate). */
+  startedShips(): number {
+    let n = 0;
+    for (const tr of this.server.trains) {
+      if (tr.ship && tr.started) n++;
+    }
+    return n;
   }
 
   selectWeapon(classname: string): void {
@@ -1469,7 +1679,9 @@ export class LocalDriver implements HostDriver {
 
   private placeMonsters(map: BspMap): void {
     let id = 2;
+    const skill = getSkill();
     for (const d of parseEntities(map.entities)) {
+      if (skillInhibits(parseSpawnflags(d), skill)) continue;
       const cls = d['classname'];
       if (cls !== 'monster_soldier' && cls !== 'monster_gunner') continue;
       if (this.monsters.length >= 12) break;
@@ -1500,15 +1712,15 @@ export class LocalDriver implements HostDriver {
 
   private snapshotDoorBases(): void {
     if (!this.map) return;
-    for (const m of this.server.movers) {
-      const model = m.ent.model;
-      if (!model || !model.startsWith('*')) continue;
+    const snap = (ent: Edict, rest: Vec3): void => {
+      const model = ent.model;
+      if (!model || !model.startsWith('*')) return;
       const n = Number.parseInt(model.slice(1), 10);
-      if (!Number.isFinite(n)) continue;
-      const count = this.map.modelsExtra.length / MODEL_EXTRA_STRIDE;
-      if (n < 0 || n >= count) continue;
-      const first = this.map.modelsExtra[n * MODEL_EXTRA_STRIDE + 1]!;
-      const num = this.map.modelsExtra[n * MODEL_EXTRA_STRIDE + 2]!;
+      if (!Number.isFinite(n)) return;
+      const count = this.map!.modelsExtra.length / MODEL_EXTRA_STRIDE;
+      if (n < 0 || n >= count) return;
+      const first = this.map!.modelsExtra[n * MODEL_EXTRA_STRIDE + 1]!;
+      const num = this.map!.modelsExtra[n * MODEL_EXTRA_STRIDE + 2]!;
       const faces: MiniSurf[] = [];
       const baseVerts: Float32Array[] = [];
       const baseCenter: Float32Array[] = [];
@@ -1524,16 +1736,30 @@ export class LocalDriver implements HostDriver {
         baseMaxs.push(new Float32Array(s.maxs));
       }
       if (faces.length > 0) {
-        this.doors.push({ mover: m, model: n, faces, baseVerts, baseCenter, baseMins, baseMaxs });
+        this.doors.push({ ent, rest, model: n, faces, baseVerts, baseCenter, baseMins, baseMaxs });
       }
+    };
+    for (const m of this.server.movers) snap(m.ent, m.pos1);
+    // func_train brushes ride the server trains (train_next): snapshot them
+    // the same way so the exit-train brush follows the authoritative origin.
+    // Point ships (misc_strogg_ship) render as MD2 entities, not brush faces.
+    for (const tr of this.server.trains) {
+      if (tr.ship) continue;
+      const o = (tr.ent.extra['origin'] ?? '0 0 0').trim().split(/\s+/).map(Number);
+      snap(tr.ent, v3(o[0] ?? 0, o[1] ?? 0, o[2] ?? 0));
     }
+  }
+
+  /** Test hook: how many brush models the DoorSync covers (doors + trains). */
+  doorSyncCount(): number {
+    return this.doors.length;
   }
 
   private syncDoors(): void {
     for (const d of this.doors) {
-      const ox = d.mover.ent.origin[0]! - d.mover.pos1[0]!;
-      const oy = d.mover.ent.origin[1]! - d.mover.pos1[1]!;
-      const oz = d.mover.ent.origin[2]! - d.mover.pos1[2]!;
+      const ox = d.ent.origin[0]! - d.rest[0]!;
+      const oy = d.ent.origin[1]! - d.rest[1]!;
+      const oz = d.ent.origin[2]! - d.rest[2]!;
       if (ox === 0 && oy === 0 && oz === 0) continue;
       for (let i = 0; i < d.faces.length; i++) {
         const s = d.faces[i]!;
@@ -1723,7 +1949,9 @@ export class LocalDriver implements HostDriver {
    * M_droptofloor outcome, since the origin is the box bottom). No drop.
    */
   private parseExplosives(map: BspMap): void {
+    const skill = getSkill();
     for (const d of parseEntities(map.entities)) {
+      if (skillInhibits(parseSpawnflags(d), skill)) continue;
       const ex = spawnExplosive(d);
       if (!ex) continue;
       if (ex.kind === 'misc_explobox') {
@@ -1763,8 +1991,12 @@ export class LocalDriver implements HostDriver {
 
   /** id SP_trigger_always: fire at spawn (base1 level-start relays). */
   private fireTriggerAlways(map: BspMap): void {
+    const skill = getSkill();
     for (const d of parseEntities(map.entities)) {
       if (d['classname'] !== 'trigger_always' || !d['target']) continue;
+      if (skillInhibits(parseSpawnflags(d), skill)) continue;
+      // Explosion targets only: ships/trains/relays already fired server-side
+      // (SV_SpawnEntities runs its own trigger_always pass and starts them).
       for (const t of d['target']!.trim().split(/\s+/)) this.fireExplosionTarget(t);
     }
   }
@@ -2555,6 +2787,14 @@ export interface PakModelHandles {
   gibBoneSkin: number;
   gibHead: number;
   gibHeadSkin: number;
+  /** Pickup world models (spinning EF_ROTATE items/weapons/ammo) by classname. */
+  items: Record<string, { model: number; skin: number }>;
+  /** Strogg flyby ship (misc_strogg_ship, trigger_spawned). */
+  ship: number;
+  shipSkin: number;
+  /** Waving courtyard banner (misc_banner, frames 0..15). */
+  banner: number;
+  bannerSkin: number;
   skins: number[];
 }
 
@@ -2631,11 +2871,33 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
   const gibBone = loadModel('models/objects/gibs/bone/tris.md2');
   const gibHeadSkin = loadSkin('models/objects/gibs/head2/skin.pcx');
   const gibHead = loadModel('models/objects/gibs/head2/tris.md2');
+  // Pickup world models (g_items.c EF_ROTATE items/weapons/ammo, appended
+  // after everything above, same stability rule): keyed by classname so the
+  // driver maps live edicts to handles without hardcoding paths. Missing
+  // lump → box-critter/checker fallback, never a shifted handle.
+  const items: Record<string, { model: number; skin: number }> = {};
+  for (const cls of Object.keys(ITEM_WORLD_MODELS)) {
+    const mdl = ITEM_WORLD_MODELS[cls]!;
+    items[cls] = { model: loadModel(mdl), skin: loadSkin(skinForItemModel(mdl)) };
+  }
+  for (const cls of WEAPON_WORLD_CLASSES) {
+    if (items[cls] !== undefined) continue;
+    const mdl = worldModelForWeapon(cls);
+    if (!mdl) continue;
+    items[cls] = { model: loadModel(mdl), skin: loadSkin(skinForWeaponModel(mdl)) };
+  }
+  // Courtyard dressing (g_misc.c): strogg flyby ship + waving banner.
+  // The banner skin is the red eagle art (models/objects/banner/skin.pcx).
+  const shipSkin = loadSkin(SHIP_SKIN);
+  const ship = loadModel(SHIP_MODEL);
+  const bannerSkin = loadSkin(BANNER_SKIN);
+  const banner = loadModel(BANNER_MODEL);
   return {
     monster, monsterSkin, gunner, gunnerSkin, weapons, weaponSkins, bolt, boltSkin, barrel, barrelSkin,
     explode, explodeSkin, blast, blastSkin,
     debris1, debris1Skin, debris2, debris2Skin, debris3, debris3Skin,
     gibMeat, gibMeatSkin, gibChest, gibChestSkin, gibBone, gibBoneSkin, gibHead, gibHeadSkin,
+    items, ship, shipSkin, banner, bannerSkin,
     skins,
   };
 }
@@ -2907,6 +3169,10 @@ export function drawPlayHud(
   if (boot.source === 'devroom') {
     drawString(target, 8, 28, 'devroom - drop pak0.pak for base1', dim);
   }
+  // Controls reference (M7.1 crouch UX): dim single line above the hp row
+  // (h-48), clear of the weapon (h-18) and message (h-30) rows. Clipped away
+  // on tiny buffers; the same text lives in index.html #q2-help.
+  drawString(target, 8, target.height - 62, CONTROLS_HINT, dim);
 }
 
 /**

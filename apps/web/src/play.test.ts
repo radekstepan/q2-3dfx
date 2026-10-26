@@ -902,11 +902,13 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     expect(snap.entities.every((e) => e.id === 1 || driver.monsters.some((m) => m.id === e.id))).toBe(true);
     const extras = driver.extraEntities();
     expect(extras).not.toBeNull();
-    expect(extras!.length).toBe(driver.barrels.length);
-    expect(extras!.map((x) => [...x.origin])).toContainEqual([136, 40, 0]);
-    expect(extras!.map((x) => [...x.origin])).toContainEqual([184, -24, 0]);
-    for (const x of extras!) {
-      expect(x.model).toBe(boot.models!.barrel);
+    // Barrels ride 1:1 (plus pickups/ships/banners on the same hook since
+    // M7.1: filter by the barrel handle for the barrel assertions).
+    const barrelX = extras!.filter((x) => x.model === boot.models!.barrel);
+    expect(barrelX.length).toBe(driver.barrels.length);
+    expect(barrelX.map((x) => [...x.origin])).toContainEqual([136, 40, 0]);
+    expect(barrelX.map((x) => [...x.origin])).toContainEqual([184, -24, 0]);
+    for (const x of barrelX) {
       expect(x.skin).toBe(boot.models!.barrelSkin);
     }
     // Snapshot pairing hooks: soldier resolves to its own handles, unknown
@@ -929,8 +931,9 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     driver.step({ ...neutralCmd([0, 135, 0]), buttons: BUTTON_ATTACK }, 0.1);
     expect(driver.bolts.length).toBe(1);
     const withBolt = driver.extraEntities()!;
-    expect(withBolt.length).toBe(driver.barrels.length + 1);
-    const boltX = withBolt[withBolt.length - 1]!;
+    expect(withBolt.filter((x) => x.model === boot.models!.barrel).length).toBe(driver.barrels.length);
+    const boltX = withBolt.find((x) => x.model === boot.models!.bolt)!;
+    expect(boltX).toBeDefined();
     expect(boltX.model).toBe(boot.models!.bolt);
     expect(boltX.skin).toBe(boot.models!.boltSkin);
     expect(boltX.angles![0]).toBeCloseTo(0, 0);

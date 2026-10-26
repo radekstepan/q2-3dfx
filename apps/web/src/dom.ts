@@ -133,6 +133,7 @@ export function attachDropZone(
  */
 export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   vid_renderer: ['software', 'voodoo'],
+  skill: ['0', '1', '2', '3'],
   sw_workers: ['0', '2', '4'],
   cl_showfps: ['0', '1'],
   r_brightness: ['0.75', '1.0', '1.25', '1.5', '2.0'],
@@ -153,6 +154,34 @@ export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
 /** Option list for a cvar, or null when it takes free-text input. */
 export function cvarOptions(name: string): readonly string[] | null {
   return CVAR_OPTIONS[name] ?? null;
+}
+
+/**
+ * Difficulty labels for the skill dropdown (M7.1 menu): skill 0-3 maps to
+ * Easy/Medium/Hard/Nightmare, Q2 default Medium(1). Persisted as numbers
+ * via setCVar; the labels are display-only.
+ */
+export const SKILL_LABELS = ['Easy', 'Medium', 'Hard', 'Nightmare'] as const;
+
+/** Display labels for a cvar's options (currently only skill is labeled). */
+export function cvarOptionLabels(name: string): readonly string[] | null {
+  if (name === 'skill') return SKILL_LABELS;
+  return null;
+}
+
+/** Canonical label for a skill value (clamped to 0..3, default Medium). */
+export function skillLabel(value: number | string): string {
+  const n = typeof value === 'string' ? Number.parseInt(value, 10) : Math.floor(value);
+  const i = Number.isFinite(n) ? Math.min(3, Math.max(0, n)) : 1;
+  return SKILL_LABELS[i]!;
+}
+
+/** Parse a difficulty label (or bare number) back to its skill value. */
+export function skillValueForLabel(label: string): number {
+  const i = SKILL_LABELS.findIndex((l) => l.toLowerCase() === label.trim().toLowerCase());
+  if (i >= 0) return i;
+  const n = Number.parseInt(label, 10);
+  return n >= 0 && n <= 3 ? n : 1;
 }
 
 /** Control kind for a cvar row: 'select' for known domains, else 'text'. */
@@ -179,10 +208,14 @@ export function renderCvarPanel(container: unknown, filter = ''): string[] {  co
       // Reflect out-of-list values (e.g. sw_workers=8, r_brightness=1.1)
       // instead of silently showing the wrong preset.
       const choices = options.includes(current) ? options : [current, ...options];
+      // Labeled domains (skill 0-3 → Easy/Medium/Hard/Nightmare) persist
+      // the bare value; the label is display-only.
+      const labels = cvarOptionLabels(name);
       for (const opt of choices) {
         const el = document.createElement('option');
         el.value = opt;
-        el.textContent = opt;
+        const li = labels ? options.indexOf(opt) : -1;
+        el.textContent = li >= 0 ? labels![li]! : opt;
         select.appendChild(el);
       }
       select.value = current;

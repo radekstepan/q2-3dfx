@@ -17,9 +17,9 @@ export type { PlayBoot };
 export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
 export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
-export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled, cvarOptions, cvarControlKind, CVAR_OPTIONS } from './dom.js';
+export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled, cvarOptions, cvarControlKind, cvarOptionLabels, skillLabel, skillValueForLabel, SKILL_LABELS, CVAR_OPTIONS } from './dom.js';
 export type { PlayLoop } from './dom.js';
-export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpTracers, registerPakModels, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, getBrightness, applyBrightness, FPS_GREEN, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, PELLET_TRACER_COLOR } from './play.js';
+export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpTracers, registerPakModels, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, getBrightness, applyBrightness, getSkill, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, PELLET_TRACER_COLOR } from './play.js';
 export type { PakModelHandles, TracerBeam } from './play.js';
 
 export interface BootOptions {
