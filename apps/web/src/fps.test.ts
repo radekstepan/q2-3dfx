@@ -45,17 +45,16 @@ describe('fps counter', () => {
     resetCVars();
   });
 
-  it('drawPlayHud writes the in-canvas fps text top-right in green', () => {
+  it('drawPlayHud leaves the canvas fps-free (DOM overlay owns the counter)', () => {
     resetCVars();
     const boot = bootPlay({ width: 160, height: 120 });
     const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
     drawPlayHud(target, boot, { fps: 60, frame: 1 });
+    // Old behaviour painted `fps 60` green top-right in-canvas; the HUD
+    // cleanup removed position readout, controls hint, and that overlay
+    // (fps already shows in the DOM #q2-fps overlay via updateFpsOverlay).
     const text = 'fps 60';
     const { x, y } = fpsHudAnchor(target.width, text);
-    // Top-right: right edge lands on the margin, left edge past mid-screen.
-    expect(y).toBe(8);
-    expect(x + stringWidth(text)).toBeLessThanOrEqual(target.width - 8);
-    expect(x).toBeGreaterThan(target.width / 2);
     let lit = 0;
     let green = 0;
     for (let py = y; py < y + 8; py++) {
@@ -65,14 +64,10 @@ describe('fps counter', () => {
         if (c === FPS_GREEN) green++;
       }
     }
-    expect(lit).toBeGreaterThan(0);
-    expect(green).toBeGreaterThan(0);
-    // The old top-left slot stays empty (no rect, no text).
-    for (let py = 8; py < 16; py++) {
-      for (let px = 8; px < 24; px++) {
-        expect(target.color[py * target.width + px]).toBe(0);
-      }
-    }
+    expect(green).toBe(0);
+    void lit;
+    // Crosshair still draws (the HUD keeps world/crosshair/weapon/hp).
+    expect(target.color[60 * 160 + 80]).toBe(0xffffffff);
     resetCVars();
   });
 });

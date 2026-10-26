@@ -2,7 +2,8 @@ import { describe, expect, it, afterEach } from 'vitest';
 import { resetCVars } from '@q2/config';
 import { isGreenBoltColor, soldierWeaponForSkin, spawnMonster } from '@q2/game';
 import type { UserCmdT } from '@q2/input';
-import { bootPlay, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR } from './play.js';
+import { v3 } from '@q2/math';
+import { bootPlay, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
 
 function neutralCmd(angles: [number, number, number] = [0, 0, 0]): UserCmdT {
   return { msec: 100, angles, forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
@@ -63,6 +64,69 @@ describe('hitscan tracer color (no green lasers)', () => {
     }
     expect(driver.events).toContain('monshot');
     expect(sawBolt).toBe(true);
+  });
+
+  it('enemy hitscan is a short muzzle streak, never a beam ending at the eye', () => {
+    // Face-flame fix (M7.1): C draws NO beam for monster hitscan (only the
+    // railgun draws TE_RAILTRAIL) — the old full muzzle→eye beam filled the
+    // screen at close range. Every enemy hitscan round is now a short
+    // muzzle-origin streak (ENEMY_TRACER_LENGTH, same 225 yellow) whose
+    // endpoint stays far from the eye, plus the small muzzle dlight.
+    for (const skin of [2, 4]) {
+      const boot = bootPlay({ width: 64, height: 48 });
+      const { driver } = boot;
+      driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), skin, lastAttack: -10 });
+      let beams = 0;
+      for (let i = 0; i < 200 && beams === 0; i++) {
+        driver.step(neutralCmd(), 0.1);
+        const got = driver.drainTracers();
+        if (got.length === 0) continue;
+        const eye = v3(driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + 22);
+        const eyeDist0 = Math.hypot(eye[0]! - got[0]!.origin[0]!, eye[1]! - got[0]!.origin[1]!, eye[2]! - got[0]!.origin[2]!);
+        // Engagement is mid-range: a full muzzle→eye beam would reach the eye.
+        expect(eyeDist0).toBeGreaterThan(100);
+        for (const t of got) {
+          beams++;
+          expect(t.color).toBe(HITSCAN_TRACER_COLOR);
+          expect(isGreenBoltColor(t.color)).toBe(false);
+          // Short muzzle streak, never a beam to the eye.
+          expect(t.length).toBe(ENEMY_TRACER_LENGTH);
+          expect(t.length).toBeLessThanOrEqual(64);
+          const dl = Math.hypot(t.dir[0]!, t.dir[1]!, t.dir[2]!) || 1;
+          const end = v3(
+            t.origin[0]! + (t.dir[0]! / dl) * t.length,
+            t.origin[1]! + (t.dir[1]! / dl) * t.length,
+            t.origin[2]! + (t.dir[2]! / dl) * t.length,
+          );
+          const endDist = Math.hypot(end[0]! - eye[0]!, end[1]! - eye[1]!, end[2]! - eye[2]!);
+          // The closing monster drifts while aiming, so pin the invariant
+          // relatively: the endpoint stays well clear of the eye and the
+          // beam shortened the muzzle→eye gap by ~its own length (a full
+          // muzzle→eye beam would end AT the eye, gap ≈ 0).
+          expect(endDist).toBeGreaterThan(30);
+          expect(eyeDist0 - endDist).toBeGreaterThan(20);
+          expect(eyeDist0 - endDist).toBeLessThan(60);
+        }
+      }
+      expect(driver.events).toContain('monshot');
+      expect(beams).toBeGreaterThan(0);
+    }
+    // Gunner chain fire obeys the same cap.
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('gunner'), skin: 0, lastAttack: -10 });
+    let gbeams = 0;
+    for (let i = 0; i < 200 && gbeams === 0; i++) {
+      driver.step(neutralCmd(), 0.1);
+      const got = driver.drainTracers();
+      for (const t of got) {
+        gbeams++;
+        expect(t.color).toBe(HITSCAN_TRACER_COLOR);
+        expect(t.length).toBe(ENEMY_TRACER_LENGTH);
+      }
+    }
+    expect(driver.events).toContain('monshot');
+    expect(gbeams).toBeGreaterThan(0);
   });
 
   it('machinegun-skin soldiers burst yellow tracers with the ss attack sound', () => {

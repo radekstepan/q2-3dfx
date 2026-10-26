@@ -4,7 +4,7 @@
 // auto-boot below additionally wires canvas, drop zone, loop + HUD.
 import { setCVarFromString } from '@q2/config';
 import { bootToFirstFrame } from './devroom.js';
-import { bootPlay } from './play.js';
+import { bootPlay, getMapSource } from './play.js';
 import type { PlayBoot, RendererKind } from './play.js';
 import { pakHasMaps } from './pak.js';
 import type { WebPak } from './pak.js';
@@ -17,9 +17,9 @@ export type { PlayBoot };
 export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
 export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
-export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled, cvarOptions, cvarControlKind, cvarOptionLabels, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS } from './dom.js';
+export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled, cvarOptions, cvarControlKind, cvarOptionLabels, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, MAP_SOURCE_LABELS, setMapSourceHasPak, getMapSourceHasPak, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS } from './dom.js';
 export type { PlayLoop } from './dom.js';
-export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpTracers, registerPakModels, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, getBrightness, applyBrightness, getSkill, getResolution, parseResolution, rebootPlay, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR } from './play.js';
+export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpTracers, registerPakModels, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
 export type { PakModelHandles, TracerBeam } from './play.js';
 
 export interface BootOptions {
@@ -76,22 +76,33 @@ if (typeof document !== 'undefined') {
       current?.stop();
       lastPak = pak;
       lastName = name;
+      // Map-source dropdown: the pak appears in the list from now on, and
+      // the selection latches here (drop/cache = pak, clear = devroom).
+      // A reboot honors getMapSource(): 'pak' boots the cached game map,
+      // 'devroom' boots the asset-free demomap even with a pak cached.
+      dom.setMapSourceHasPak(pak !== null);
+      renderCvars();
+      const effective = getMapSource() === 'pak' ? pak : null;
       // bootPlay latches the menu skill + resolution cvars (same path as
       // fresh boot: SV_SetSkill before spawning, framebuffer at the menu
       // size), so the panel below needs no explicit size arguments.
-      const boot = bootPlay({ pak });
-      current = dom.startPlayLoop(canvas, boot, { pak });
+      const boot = bootPlay({ pak: effective });
+      current = dom.startPlayLoop(canvas, boot, { pak: effective });
       dom.setProgress(
         progress,
         1,
         name ? `loaded ${name}: ${pak?.entries.length} entries` : `devroom ready — drop pak0.pak for base1`,
       );
     };
-    // Skill/resolution changes reboot the level at once (id latches them;
-    // the menu applies them immediately by re-calling the boot path).
+    // Skill/resolution/map-source changes reboot the level at once (id
+    // latches them; the menu applies them immediately by re-calling the
+    // boot path).
     const onCvar = (cvarName: string): void => {
       if (!dom.cvarNeedsReboot(cvarName)) return;
       startWithPak(lastPak, lastName);
+    };
+    const renderCvars = (): void => {
+      if (cvars) dom.renderCvarPanel(cvars, '', onCvar);
     };
     // Cached-first boot: a previous drop persists in IndexedDB, so one
     // drop survives reloads. Empty/corrupt cache → devroom, no error spam.
@@ -100,12 +111,18 @@ if (typeof document !== 'undefined') {
       try {
         const cached = await loadCachedPak();
         if (cached) {
+          // Persist the map selection for the cached game map (the
+          // map_source default is already 'pak'; this keeps an explicit
+          // earlier choice intact while guaranteeing the cached boot).
+          if (getMapSource() !== 'devroom') setCVarFromString('map_source', 'pak');
           startWithPak(cached.pak, cached.name);
           return;
         }
       } catch {
         /* corrupt IDB → fall through to devroom */
       }
+      // No pak cached: devroom only, so latch the menu there.
+      setCVarFromString('map_source', 'devroom');
       startWithPak(null);
     };
     void bootFromCache();
@@ -113,10 +130,13 @@ if (typeof document !== 'undefined') {
       dom.attachDropZone(document.body, (pak, name) => {
         // Persist the raw drop, then boot as today.
         void storeCachedPak(name, pak.data).catch(() => undefined);
+        // The drop IS a map selection: the pak appears in the dropdown and
+        // boots at once (fresh reboot, same as the boot path).
+        setCVarFromString('map_source', 'pak');
         startWithPak(pak, name);
       });
     }
-    if (cvars) dom.renderCvarPanel(cvars, '', onCvar);
+    renderCvars();
     // Minimal "clear cached pak" affordance next to the cvar panel.
     const ui = document.querySelector('#q2-ui');
     if (ui && !document.querySelector('#q2-clear-pak')) {
@@ -125,6 +145,10 @@ if (typeof document !== 'undefined') {
       btn.textContent = 'clear cached pak';
       btn.addEventListener('click', () => {
         void clearCachedPak().then(() => {
+          lastPak = null;
+          // Clearing drops the pak from the dropdown and latches devroom.
+          setCVarFromString('map_source', 'devroom');
+          startWithPak(null);
           dom.setProgress(progress, 1, 'cached pak cleared — drop pak0.pak for base1');
         });
       });

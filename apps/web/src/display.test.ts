@@ -45,15 +45,20 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
     expect(FPS_GREEN).toBe(0xff00ff00);
   });
 
-  it('cl_showfps=0 hides the in-canvas fps readout', () => {
+  it('canvas never draws fps text (the DOM overlay is the fps counter)', () => {
     const boot = bootPlay({ width: 160, height: 120 });
-    setCVar('cl_showfps', 0);
-    try {
-      const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
-      drawPlayHud(target, boot, { fps: 60, frame: 1 });
-      expect(target.color.some((c) => c === FPS_GREEN)).toBe(false);
-    } finally {
-      setCVar('cl_showfps', 1);
+    // Old behaviour drew `fps N` green top-right in-canvas; the clutter fix
+    // removed it (fps already shows in the DOM #q2-fps overlay). Both
+    // cl_showfps states must leave the canvas fps-free.
+    for (const v of [0, 1]) {
+      setCVar('cl_showfps', v);
+      try {
+        const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
+        drawPlayHud(target, boot, { fps: 60, frame: 1 });
+        expect(target.color.some((c) => c === FPS_GREEN)).toBe(false);
+      } finally {
+        setCVar('cl_showfps', 1);
+      }
     }
   });
 
@@ -115,9 +120,9 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
     try {
       const target = resolveDisplay(boot);
       drawPlayHud({ width: 160, height: 120, color: target }, boot, { fps: 60, frame: 1 });
-      // fps glyphs keep their exact authored green (drawn post-lift).
-      expect(target.some((c) => c === FPS_GREEN)).toBe(true);
-      // Crosshair centre pixel keeps full white.
+      // HUD text is drawn post-lift: the hp row keeps its authored colour…
+      expect(target.some((c) => c === 0xffffffff)).toBe(true);
+      // …and the crosshair centre pixel keeps full white.
       expect(target[60 * 160 + 80]).toBe(0xffffffff);
     } finally {
       setCVar('r_brightness', BRIGHTNESS_DEFAULT);

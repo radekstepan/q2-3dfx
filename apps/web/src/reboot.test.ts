@@ -6,13 +6,22 @@ import {
   rebootPlay,
   getResolution,
   parseResolution,
+  getMapSource,
+  availableMapSources,
+  MAP_SOURCE_DEFAULT,
+  MAP_SOURCE_DEVROOM,
+  MAP_SOURCE_PAK,
   RESOLUTION_OPTIONS,
   RESOLUTION_DEFAULT,
 } from './play.js';
 import {
   cvarNeedsReboot,
   cvarOptions,
+  cvarControlKind,
   cvarOptionLabels,
+  setMapSourceHasPak,
+  getMapSourceHasPak,
+  MAP_SOURCE_LABELS,
   RESOLUTION_LABELS,
 } from './dom.js';
 
@@ -22,12 +31,14 @@ function neutralCmd(angles: [number, number, number] = [0, 0, 0]): UserCmdT {
 
 afterEach(() => {
   resetCVars();
+  setMapSourceHasPak(false);
 });
 
 describe('menu reboot: skill + resolution (headless)', () => {
-  it('skill and vid_resolution reboot; nothing else does', () => {
+  it('skill, vid_resolution, and map_source reboot; nothing else does', () => {
     expect(cvarNeedsReboot('skill')).toBe(true);
     expect(cvarNeedsReboot('vid_resolution')).toBe(true);
+    expect(cvarNeedsReboot('map_source')).toBe(true);
     expect(cvarNeedsReboot('vid_renderer')).toBe(false);
     expect(cvarNeedsReboot('r_brightness')).toBe(false);
     expect(cvarNeedsReboot('cl_showfps')).toBe(false);
@@ -100,6 +111,56 @@ describe('menu reboot: skill + resolution (headless)', () => {
     const frames = b.host.frame(100);
     expect(frames.pixels).toBeGreaterThan(0);
   });
+
+  it('map_source defaults to pak, clamps, and persists via setCVar', () => {
+    expect(MAP_SOURCE_DEFAULT).toBe('pak');
+    expect(MAP_SOURCE_DEVROOM).toBe('devroom');
+    expect(MAP_SOURCE_PAK).toBe('pak');
+    expect(getMapSource()).toBe('pak');
+    setCVar('map_source', 'devroom');
+    expect(getMapSource()).toBe('devroom');
+    setCVar('map_source', 'pak');
+    expect(getMapSource()).toBe('pak');
+    // Garbage latches back to the pak default (graceful: no pak → devroom).
+    setCVar('map_source', 'bogus');
+    expect(getMapSource()).toBe('pak');
+  });
+
+  it('availableMapSources lists devroom always, pak only after a drop', () => {
+    expect(availableMapSources(false)).toEqual(['devroom']);
+    expect(availableMapSources(true)).toEqual(['devroom', 'pak']);
+  });
+
+  it('map_source dropdown is a labeled select gated on pak availability', () => {
+    expect(cvarControlKind('map_source')).toBe('select');
+    expect(getMapSourceHasPak()).toBe(false);
+    // No pak cached: only devroom is listed.
+    expect(cvarOptions('map_source')).toEqual(['devroom']);
+    expect(cvarOptionLabels('map_source')).toEqual([...MAP_SOURCE_LABELS]);
+    expect(MAP_SOURCE_LABELS).toEqual(['Built-in devroom (demomap)', 'Cached pak0.pak (game)']);
+    // After a drop the pak appears; clearing hides it again.
+    setMapSourceHasPak(true);
+    expect(getMapSourceHasPak()).toBe(true);
+    expect(cvarOptions('map_source')).toEqual(['devroom', 'pak']);
+    expect(cvarOptionLabels('map_source')).toEqual([...MAP_SOURCE_LABELS]);
+    setMapSourceHasPak(false);
+    expect(cvarOptions('map_source')).toEqual(['devroom']);
+  });
+
+  it('rebootPlay honors map_source: devroom selection drops the pak', () => {
+    // Headless, no pak: both selections boot devroom (pak request with no
+    // pak degrades gracefully instead of throwing).
+    const a = bootPlay({ pak: null });
+    expect(a.source).toBe('devroom');
+    setCVar('map_source', 'devroom');
+    const b = rebootPlay(a);
+    expect(b.source).toBe('devroom');
+    expect(b.pak).toBeNull();
+    setCVar('map_source', 'pak');
+    const c = rebootPlay(b);
+    expect(c.source).toBe('devroom');
+    expect(c.pak).toBeNull();
+  });
 });
 
 const WEB_Q2_PAK = process.env.Q2_PAK;
@@ -136,5 +197,25 @@ describe.runIf(!!WEB_Q2_PAK)('menu reboot on base1 (real pak, Q2_PAK)', () => {
     const med = rebootPlay(hard);
     expect(med.driver.server.skill).toBe(1);
     expect(infantryCount(med)).toBe(3);
+  });
+
+  it('map_source dropdown reboots between game and devroom (fresh reboot)', { timeout: 180000 }, async () => {
+    const game = await bootPak();
+    expect(game.source).toBe('pak');
+    expect(game.pak).not.toBeNull();
+    // Default selection is the pak: a plain reboot keeps the game map.
+    expect(getMapSource()).toBe('pak');
+    const kept = rebootPlay(game);
+    expect(kept.source).toBe('pak');
+    expect(kept.pak).not.toBeNull();
+    // "Change the dropdown" to devroom: fresh reboot of the demomap even
+    // with the pak cached (prev.pak is dropped, like the boot path).
+    setCVar('map_source', 'devroom');
+    const demo = rebootPlay(game);
+    expect(demo.source).toBe('devroom');
+    expect(demo.pak).toBeNull();
+    expect(demo.driver.monsters.length).toBe(0);
+    const stats = demo.host.frame(100);
+    expect(stats.pixels).toBeGreaterThan(0);
   });
 });

@@ -625,8 +625,7 @@ describe('play driver (devroom, headless)', () => {
     expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === 99)).toBe(false);
   });
 
-  it('K: monster fire frames spawn tracers (hitscan) and foe bolts (blaster)', () => {
-    const boot = bootPlay({ width: 64, height: 48 });
+  it('K: monster fire frames spawn tracers (hitscan) and foe bolts (blaster)', () => {    const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
     // Soldier off to the side (open LOS past the pillar) at ~224u: NEAR
     // range, so chase commits attack1/attack2 once it faces the player.
@@ -646,6 +645,48 @@ describe('play driver (devroom, headless)', () => {
     expect(sawTracer || sawBolt).toBe(true);
     // Every monster shot carries its 200+(rand&31) yellow muzzle dlight.
     expect(sawFlash).toBe(true);
+  });
+
+  it('L: rendered monster closes on a live player (driver + renderView)', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { host, driver } = boot;
+    // Soldier east with the pillar between it and the spawn: no LOS, so the
+    // chase holds `run` every tick (never an attack plant) and locomotion
+    // walks it at the player until the pillar hull stops it.
+    driver.monsters.push({ id: 99, origin: [200, 0, 32], state: spawnMonster('soldier'), skin: 2, lastAttack: -10 });
+    const m = driver.monsters[0]!;
+    const distToPlayer = (): number =>
+      Math.hypot(m.origin[0]! - driver.pm.origin[0]!, m.origin[1]! - driver.pm.origin[1]!, m.origin[2]! - driver.pm.origin[2]!);
+    const d0 = distToPlayer();
+    expect(d0).toBeGreaterThan(300);
+    stepDriver(driver, neutralCmd(), 30);
+    // monsterThink stepped the state machine and locomotion advanced the
+    // RENDERED origin (the snapshot below) toward the player.
+    expect(m.state.move).toBe('run');
+    const d1 = distToPlayer();
+    expect(d1).toBeLessThan(d0 - 50);
+    // The authoritative snapshot carries the closed-in origin…
+    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === 99)).toBe(true);
+    // …and the Host actually submits it to renderView (not PVS/frustum-
+    // culled away): captured entity rides within 5u of the driver origin and
+    // is strictly closer to the player than at spawn.
+    runFrames(host, 0, 500);
+    let rendered: Entity[] = [];
+    const orig = boot.refresh.renderView.bind(boot.refresh);
+    vi.spyOn(boot.refresh, 'renderView').mockImplementation((view, world, entities) => {
+      rendered = [...entities];
+      return orig(view, world, entities);
+    });
+    host.frame(600);
+    const near = rendered.filter((e) => Math.hypot(e.origin[0]! - m.origin[0]!, e.origin[1]! - m.origin[1]!, e.origin[2]! - m.origin[2]!) < 5);
+    expect(near.length).toBe(1);
+    expect(near[0]!.frame).toBe(driver.entityFrame(99));
+    const rd = Math.hypot(
+      near[0]!.origin[0]! - host.playerOrigin[0]!,
+      near[0]!.origin[1]! - host.playerOrigin[1]!,
+      near[0]!.origin[2]! - host.playerOrigin[2]!,
+    );
+    expect(rd).toBeLessThan(d0 - 50);
   });
 });
 
@@ -953,5 +994,163 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     boot.host.frame(100);
     expect(rendered.some((e) => e.model === boot.models!.barrel)).toBe(true);
     expect(rendered.some((e) => e.model === boot.models!.bolt)).toBe(true);
+  });
+
+  it('M7.1 ships: flybys submit live train positions every frame, models registered', { timeout: 180000 }, async () => {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const pak = ingestPak(buf);
+    const boot = bootPlay({ width: 96, height: 72, pak });
+    const { driver } = boot;
+    // Ship MD2 + skin registered (never -1/unregistered).
+    expect(boot.models!.ship).toBeGreaterThanOrEqual(0);
+    expect(boot.models!.shipSkin).toBeGreaterThanOrEqual(0);
+    const ships = driver.server.trains.filter((t) => t.ship);
+    expect(ships.length).toBe(3);
+    // All three flybys trigger_always-started server-side (C behaviour).
+    expect(ships.every((t) => t.started)).toBe(true);
+    const shipOrigins = (): Array<[number, number, number]> =>
+      driver.extraEntities()!.filter((x) => x.model === boot.models!.ship).map((x) => [...x.origin!] as [number, number, number]);
+    // 1:1 with the server roster — no missing ship, no double-submit.
+    expect(shipOrigins().length).toBe(ships.length);
+    // Advance ticks: origins move along the path_corner loops.
+    const before = shipOrigins();
+    for (let i = 0; i < 5; i++) driver.step(neutralCmd(), 0.1);
+    const after = shipOrigins();
+    expect(after.length).toBe(ships.length);
+    let moved = 0;
+    for (let i = 0; i < before.length; i++) {
+      moved += Math.hypot(after[i]![0] - before[i]![0], after[i]![1] - before[i]![1], after[i]![2] - before[i]![2]);
+    }
+    expect(moved).toBeGreaterThan(10);
+    // View-side robustness: submits come from live train positions
+    // regardless of started-gating mistakes — even a missed trigger_always
+    // can never hide the flybys.
+    for (const t of ships) t.started = false;
+    try {
+      expect(driver.extraEntities()!.filter((x) => x.model === boot.models!.ship).length).toBe(ships.length);
+    } finally {
+      for (const t of ships) t.started = true;
+    }
+    // …and the Host actually renders them: ship submits reach renderView.
+    let rendered: Entity[] = [];
+    const orig = boot.refresh.renderView.bind(boot.refresh);
+    vi.spyOn(boot.refresh, 'renderView').mockImplementation((view, world, entities) => {
+      rendered = [...entities];
+      return orig(view, world, entities);
+    });
+    boot.host.frame(100);
+    expect(rendered.some((e) => e.model === boot.models!.ship)).toBe(true);
+  });
+
+  it('M7.1 barrels: bases sit on the floor, exactly two near spawn, no doubles', { timeout: 180000 }, async () => {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const { readPakEntry } = await import('./pak.js');
+    const { parseMD2 } = await import('@q2/formats');
+    const pak = ingestPak(buf);
+    const boot = bootPlay({ width: 96, height: 72, pak });
+    const { driver } = boot;
+    // Pivot audit: the barrel MD2 pivot really is the box bottom — every
+    // frame's min-z ≈ 0, so rendering at the lump origin plants the base on
+    // the floor with no view-side offset to apply.
+    const md2 = parseMD2(readPakEntry(pak, 'models/objects/barrels/tris.md2'));
+    expect(md2.numFrames).toBeGreaterThan(0);
+    for (let f = 0; f < md2.numFrames; f++) {
+      let minZ = Infinity;
+      let maxZ = -Infinity;
+      for (let v = 0; v < md2.numVerts; v++) {
+        const z = md2.frames[(f * md2.numVerts + v) * 3 + 2]!;
+        minZ = Math.min(minZ, z);
+        maxZ = Math.max(maxZ, z);
+      }
+      console.log(`barrel frame ${f}: min-z ${minZ.toFixed(3)} max-z ${maxZ.toFixed(3)}`);
+      expect(minZ).toBeCloseTo(0, 0);
+    }
+    // Exactly two live barrels near spawn at the lump origins.
+    const near = driver.barrels.filter(
+      (b) => !b.dead && Math.hypot(b.origin[0]! - 128, b.origin[1]! + 320) < 400,
+    );
+    expect(near.length).toBe(2);
+    expect(near.every((b) => !b.isFunc)).toBe(true);
+    // Rendered extras mirror the roster 1:1 (no double-submit) at bottom
+    // bases: misc origins ARE the floor (z=0), funcs render at bbox bottom.
+    const extras = driver.extraEntities()!;
+    const barrelX = extras.filter((x) => x.model === boot.models!.barrel);
+    expect(barrelX.length).toBe(driver.barrels.filter((b) => !b.dead).length);
+    const keys = barrelX.map((x) => [...x.origin!].join(','));
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(keys).toContain('136,40,0');
+    expect(keys).toContain('184,-24,0');
+    for (const b of driver.barrels) {
+      if (b.dead) continue;
+      const wantZ = b.isFunc ? b.origin[2]! - b.size[2]! / 2 : b.origin[2]!;
+      const found = barrelX.find((x) => x.origin![0] === b.origin[0]! && x.origin![1] === b.origin[1]!);
+      expect(found).toBeDefined();
+      expect(found!.origin![2]).toBeCloseTo(wantZ, 6);
+      expect(found!.skin).toBe(boot.models!.barrelSkin);
+    }
+    // Spawn pair bases sit exactly at the floor.
+    for (const key of ['136,40,0', '184,-24,0']) {
+      const found = barrelX.find((x) => [...x.origin!].join(',') === key)!;
+      expect(found).toBeDefined();
+      expect(found.origin![2]).toBe(0);
+    }
+  });
+
+  it('M7.1 follow: rendered base1 monster closes on a live player', { timeout: 180000 }, async () => {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const pak = ingestPak(buf);
+    const boot = bootPlay({ width: 96, height: 72, pak });
+    const { driver } = boot;
+    // Same-floor pair (verified coplanar, z=-168): stand the player where
+    // monster 8 rests (known-free floor) and watch monster 9 close in.
+    const A = driver.monsters[9]!;
+    const B = driver.monsters[8]!;
+    expect(A.origin[2]).toBe(B.origin[2]);
+    driver.pm.origin = v3(B.origin[0], B.origin[1], B.origin[2]);
+    driver.pm.velocity = v3();
+    const distNow = (): number =>
+      Math.hypot(A.origin[0]! - driver.pm.origin[0]!, A.origin[1]! - driver.pm.origin[1]!, A.origin[2]! - driver.pm.origin[2]!);
+    const d0 = distNow();
+    expect(d0).toBeGreaterThan(200);
+    for (let i = 0; i < 40; i++) driver.step(neutralCmd(), 0.1);
+    // monsterThink activated (left stand) and locomotion advanced the
+    // rendered origin toward the player — not just the server edict.
+    expect(A.state.move).not.toBe('stand1');
+    const d1 = distNow();
+    expect(d1).toBeLessThan(d0 - 100);
+    // The authoritative snapshot carries the closed-in origin…
+    const snap = driver.snapshot(driver.server.time);
+    const sent = snap.entities.find((e) => e.id === A.id)!;
+    expect(sent).toBeDefined();
+    expect(Math.hypot(sent.origin[0]! - A.origin[0]!, sent.origin[1]! - A.origin[1]!)).toBeLessThan(1);
+    // …and the Host submits it to renderView with the live MD2 frame.
+    // Warm the snapshot stream first (snapshots ingest on host ticks).
+    runFrames(boot.host, 0, 2000);
+    let rendered: Entity[] = [];
+    const orig = boot.refresh.renderView.bind(boot.refresh);
+    vi.spyOn(boot.refresh, 'renderView').mockImplementation((view, world, entities) => {
+      rendered = [...entities];
+      return orig(view, world, entities);
+    });
+    boot.host.frame(2100);
+    const near = rendered.filter((e) => Math.hypot(e.origin[0]! - A.origin[0]!, e.origin[1]! - A.origin[1]!) < 8);
+    expect(near.length).toBeGreaterThan(0);
+    const rd = Math.hypot(
+      near[0]!.origin[0]! - boot.host.playerOrigin[0]!,
+      near[0]!.origin[1]! - boot.host.playerOrigin[1]!,
+    );
+    expect(rd).toBeLessThan(d0 - 50);
   });
 });

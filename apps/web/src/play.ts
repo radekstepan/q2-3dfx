@@ -91,7 +91,7 @@ import type { Pcx } from '@q2/formats';
 import { resolveFrame } from '@q2/voodoo';
 import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
-import { getCVar, getCVarNumber, getCVarString, registerCVar } from '@q2/config';
+import { getCVar, getCVarString, registerCVar } from '@q2/config';
 import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 
@@ -190,6 +190,46 @@ export function skillInhibits(spawnflags: number, skill: number): boolean {
 export function parseSpawnflags(dict: Record<string, string>): number {
   const v = parseInt(dict['spawnflags'] ?? '0', 10);
   return Number.isFinite(v) ? v : 0;
+}
+
+// --- map source (M7.1 config menu) ---
+//
+// Which world to boot: the built-in procedural devroom (demomap, asset-free)
+// or the cached pak0.pak game map (base1). The menu exposes it as a dropdown
+// (see MAP_SOURCE_LABELS in dom.ts); the value persists via setCVar and is
+// latched at boot — changing it reboots the level (see REBOOT_CVARS), the
+// same fresh-reboot path as skill/vid_resolution (rebootPlay).
+//
+// Default is the pak: a cached drop boots straight into base1 (the M7.3
+// cached-first behaviour); with no pak cached the boot degrades gracefully
+// to devroom (bootPlay maps a null pak to devroom, and rebootPlay maps a
+// pak request with no pak the same way). The no-pak boot path resets the
+// cvar to devroom so the menu never shows a stale pak selection.
+export const MAP_SOURCE_DEVROOM = 'devroom';
+export const MAP_SOURCE_PAK = 'pak';
+export type MapSource = typeof MAP_SOURCE_DEVROOM | typeof MAP_SOURCE_PAK;
+export const MAP_SOURCE_DEFAULT: MapSource = MAP_SOURCE_PAK;
+export const MAP_SOURCE_OPTIONS = [MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK] as const;
+
+registerCVar('map_source', MAP_SOURCE_DEFAULT, 'map source: cached pak0.pak game (pak) or built-in devroom (devroom); changing it reboots the level');
+
+/** Clamped `map_source` (absent/garbage cvar → default). Self-healing like getSkill. */
+export function getMapSource(): MapSource {
+  const raw = getCVar('map_source');
+  if (raw === undefined) {
+    registerCVar('map_source', MAP_SOURCE_DEFAULT, 'map source: cached pak0.pak game (pak) or built-in devroom (devroom); changing it reboots the level');
+    return MAP_SOURCE_DEFAULT;
+  }
+  return raw === MAP_SOURCE_DEVROOM ? MAP_SOURCE_DEVROOM : MAP_SOURCE_PAK;
+}
+
+/**
+ * Dropdown sources for the menu: devroom is always listed; the cached pak
+ * appears only after a drop (hasPak). Pure/headless-safe — the DOM panel
+ * filters through this (see setMapSourceHasPak in dom.ts).
+ */
+export function availableMapSources(hasPak: boolean): MapSource[] {
+  return hasPak ? [MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK] : [MAP_SOURCE_DEVROOM];
 }
 
 // --- resolution (M7.1 menu) ---
@@ -522,6 +562,18 @@ export interface TracerBeam {
   length: number;
 }
 
+/**
+ * Enemy hitscan tracer length in world units (M7.1 face-flame fix).
+ *
+ * Monster return fire is hitscan (m_soldier.c soldier_fire): C draws NO beam
+ * for it (only the railgun draws TE_RAILTRAIL) — just the muzzle flash, the
+ * damage roll, and impact sparks. The old driver queued a full
+ * muzzle→eye beam (up to ~1000u); at close range that beam ends in the
+ * player's face and fills the screen. Now every enemy hitscan round draws
+ * only a short muzzle-origin streak (muzzle + shot-dir × this length, same
+ * 225 yellow) that NEVER reaches the eye, plus the small muzzle dlight.
+ */
+export const ENEMY_TRACER_LENGTH = 48;
 /** Full-bright palette index for the blaster bolt beam (matches id's EF_BLASTER look). */
 export const BLASTER_TRACER_COLOR = 225;
 /**
@@ -1018,8 +1070,17 @@ export class LocalDriver implements HostDriver {
     const out: ExtraRenderable[] = [];
     for (const b of this.barrels) {
       if (b.dead) continue;
+      // Render base sits at the hull bottom: misc_explobox origins already
+      // are the box bottom (the barrel MD2 pivot is the box bottom too —
+      // frame min-z ≈ 0 on every frame — so origin renders flush on the
+      // floor, no view-side lift). func_explosive origins are the brush bbox
+      // CENTER (a wall/slab middle, e.g. *20 at z=64): rendering the barrel
+      // MD2 there floats it mid-air, so funcs render at the bbox bottom
+      // (origin − size/2) instead. Damage math keeps using the center
+      // (damageRadius/barrelAT read Barrel.origin untouched).
+      const baseZ = b.isFunc ? b.origin[2]! - b.size[2]! / 2 : b.origin[2]!;
       out.push({
-        origin: [b.origin[0]!, b.origin[1]!, b.origin[2]!],
+        origin: [b.origin[0]!, b.origin[1]!, baseZ],
         angles: [0, 0, 0],
         model: this.models?.barrel ?? 0,
         skin: this.models?.barrelSkin ?? 0,
@@ -1113,12 +1174,16 @@ export class LocalDriver implements HostDriver {
       }
       // Ships ride the server trains (func_train_find + train_next): the
       // position is authoritative and moves every tick, so a parked lump
-      // origin would desync within a second. `started` is the SVF_NOCLIENT
-      // gate (trigger_spawned until a use — trigger_always at boot for all
-      // three base1 flybys); unstarted trains stay hidden like in C.
+      // origin would desync within a second. Submitted from the LIVE train
+      // origin every frame, unconditionally (C hides unstarted ships behind
+      // SVF_NOCLIENT, but the flybys are ambient scenery — a missed
+      // trigger_always must never hide them view-side; all three base1
+      // flybys are trigger_always-started anyway). Entity submits bypass
+      // PVS/frustum culling in the renderer (z-test only), so a flyby
+      // renders wherever its loop takes it.
       if (this.models.ship >= 0) {
         for (const tr of this.server.trains) {
-          if (!tr.ship || !tr.started) continue;
+          if (!tr.ship) continue;
           out.push({
             origin: [tr.ent.origin[0]!, tr.ent.origin[1]!, tr.ent.origin[2]!],
             angles: [0, parseFloat(tr.ent.extra['angle'] ?? '0', 0), 0],
@@ -1598,12 +1663,13 @@ export class LocalDriver implements HostDriver {
     const pHit = dist < 500 ? 0.6 : 0.25;
     // Soldier machinegun skin: 3-round burst (id monster_fire_bullet dmg 2
     // × the HOLD_FRAME repeat), fanned ±40u at 8192 like the pellet spread
-    // basis; each round rolls pHit independently and draws its own tracer.
+    // basis; each round rolls pHit independently and draws its own SHORT
+    // muzzle streak (ENEMY_TRACER_LENGTH, never a muzzle→eye beam — the old
+    // full-length beam filled the screen at close range).
     if (skinWeapon === 'machinegun') {
       for (let b = -1; b <= 1; b++) {
         const fan = v3(dirToEye[0]! + b * 40, dirToEye[1]! - b * 40, dirToEye[2]!);
-        const fanLen = Math.hypot(fan[0]!, fan[1]!, fan[2]!) || 1;
-        this.queueTracer(muzzle, fan, PELLET_TRACER_COLOR, fanLen);
+        this.queueTracer(muzzle, fan, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH);
         if (this.rand() < pHit) {
           this.damagePlayer(2, m.origin);
           this.pushSpark(eye);
@@ -1619,7 +1685,7 @@ export class LocalDriver implements HostDriver {
       dmg = move === 'attack_grenade' ? 12 : 6;
       sound = move === 'attack_grenade' ? 'gunner/gunatck3.wav' : 'gunner/gunatck2.wav';
     }
-    this.queueTracer(muzzle, dirToEye, PELLET_TRACER_COLOR, dirLen);
+    this.queueTracer(muzzle, dirToEye, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH);
     this.emitSound(sound, v3(m.origin[0]!, m.origin[1]!, m.origin[2]! + 32));
     this.events.push('monshot');
     if (this.rand() < pHit) {
@@ -3222,13 +3288,17 @@ export function bootPlay(opts: {
 }
 
 /**
- * Reboot a boot at the CURRENT cvar values (skill + vid_resolution): the
- * menu path for "changing the dropdown reboots the level". Same pak and
- * renderer as the previous boot, fresh driver/server/mini (DoorSync bases
- * re-baked, skill filter re-applied before spawning). Headless-safe.
+ * Reboot a boot at the CURRENT cvar values (skill + vid_resolution +
+ * map_source): the menu path for "changing the dropdown reboots the level".
+ * Same pak and renderer as the previous boot, fresh driver/server/mini
+ * (DoorSync bases re-baked, skill filter re-applied before spawning).
+ * map_source decides which world: 'pak' keeps the previous pak (null when
+ * the previous boot had none → devroom fallback), anything else boots the
+ * asset-free devroom even when a pak is cached.
  */
 export function rebootPlay(prev: PlayBoot): PlayBoot {
-  return bootPlay({ renderer: prev.renderer, pak: prev.pak });
+  const pak = getMapSource() === MAP_SOURCE_PAK ? prev.pak : null;
+  return bootPlay({ renderer: prev.renderer, pak });
 }
 
 /** Resolve the software framebuffer for display (voodoo post chain or direct).
@@ -3367,50 +3437,47 @@ export interface HudState {
   frame: number;
 }
 
-/** In-canvas fps readout colour: readable green, 0xAABBGGRR like all HUD. */
+/** In-canvas fps readout colour (legacy: the canvas no longer draws fps —
+ * the DOM overlay from updateFpsOverlay is the fps counter now; kept
+ * exported for the pure-helper tests and index re-exports). */
 export const FPS_GREEN = 0xff00ff00;
 
 /**
- * Pure anchor for the in-canvas fps readout: top-right, 8px margins, using
- * the active conchars font metrics (real pak glyphs when present, procedural
- * fallback otherwise — both are 8px-advance via `stringWidth`). No
- * background rect is ever drawn behind the text.
+ * Pure anchor for the legacy in-canvas fps slot: top-right, 8px margins.
+ * Kept exported (pure, tested); the canvas no longer draws fps text.
  */
 export function fpsHudAnchor(width: number, text: string): { x: number; y: number } {
   return { x: Math.max(0, width - stringWidth(text) - 8), y: 8 };
 }
 
-/** `cl_showfps` gates the in-canvas fps readout too (default 1 when absent). */
-function showInCanvasFps(): boolean {
-  if (getCVar('cl_showfps') === undefined) return true;
-  return getCVarNumber('cl_showfps') !== 0;
-}
-
-/** Draw crosshair + status lines onto a 0xAABBGGRR buffer (runs post-resolve). */
+/** Draw crosshair + status lines onto a 0xAABBGGRR buffer (runs post-resolve).
+ *
+ * The play canvas shows ONLY world + crosshair + weapon/ammo + hp + message
+ * (+ the devroom hint and death bars). Position readout, the controls hint,
+ * and the green in-canvas fps text are deliberately NOT drawn here: the
+ * controls live in the menu panel (index.html #q2-help), the fps counter
+ * lives in the DOM overlay (updateFpsOverlay, gated by cl_showfps), and a
+ * position readout has no place in the game view. The real in-game fps
+ * counter (DOM overlay) is untouched.
+ */
 export function drawPlayHud(
   target: { width: number; height: number; color: Uint32Array },
   boot: PlayBoot,
   hud: HudState,
 ): void {
+  void hud;
   const white = 0xffffffff;
-  const dim = 0xff888888;
   const cx = (target.width / 2) | 0;
   const cy = (target.height / 2) | 0;
+  const dim = 0xff888888;
   fillRect(target, cx - 4, cy, 9, 1, dim);
   fillRect(target, cx, cy - 4, 1, 9, dim);
   fillRect(target, cx, cy, 1, 1, white);
   // 3D view model (pak) replaces the 2D silhouette — never double-draw.
   if (usesViewModel3D(boot)) drawDeathBars(target, boot);
   else drawViewModel(target, boot);
-  const o = boot.driver.pm.origin;
   const hp = boot.driver.playerHealth;
   const hpColor = boot.driver.playerDead ? 0xffff3333 : hp <= 25 ? 0xffff9933 : white;
-  if (showInCanvasFps()) {
-    const fpsText = `fps ${hud.fps.toFixed(0)}`;
-    const anchor = fpsHudAnchor(target.width, fpsText);
-    drawString(target, anchor.x, anchor.y, fpsText, FPS_GREEN);
-  }
-  drawString(target, 8, 18, `${o[0]!.toFixed(0)} ${o[1]!.toFixed(0)} ${o[2]!.toFixed(0)}`, dim);
   drawString(target, 8, target.height - 18, `${boot.driver.weapon.classname} ${boot.driver.hudAmmo()}`, white);
   drawString(target, 8, target.height - 48, `hp ${hp}`, hpColor);
   if (boot.driver.message) {
@@ -3420,10 +3487,6 @@ export function drawPlayHud(
   if (boot.source === 'devroom') {
     drawString(target, 8, 28, 'devroom - drop pak0.pak for base1', dim);
   }
-  // Controls reference (M7.1 crouch UX): dim single line above the hp row
-  // (h-48), clear of the weapon (h-18) and message (h-30) rows. Clipped away
-  // on tiny buffers; the same text lives in index.html #q2-help.
-  drawString(target, 8, target.height - 62, CONTROLS_HINT, dim);
 }
 
 /**

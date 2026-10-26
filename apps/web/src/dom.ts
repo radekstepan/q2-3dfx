@@ -4,6 +4,7 @@
 // tests can import this module safely. Canvas code is isolated here —
 // `index.ts` and `devroom.ts` never touch `document`.
 import { getCVar, getCVarNumber, getCVarString, listCVars, registerCVar, setCVarFromString } from '@q2/config';
+import { availableMapSources } from './play.js';
 import type { Framebuffer } from '@q2/renderer-api';
 import { ingestPak } from './pak.js';
 import type { WebPak } from './pak.js';
@@ -135,6 +136,7 @@ export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   vid_renderer: ['software', 'voodoo'],
   vid_resolution: ['320x240', '640x480', '800x600', '1024x768'],
   skill: ['0', '1', '2', '3'],
+  map_source: ['devroom', 'pak'],
   sw_workers: ['0', '2', '4'],
   cl_showfps: ['0', '1'],
   r_brightness: ['0.75', '1.0', '1.25', '1.5', '2.0'],
@@ -152,8 +154,13 @@ export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   cl_interp: ['0', '1'],
 };
 
-/** Option list for a cvar, or null when it takes free-text input. */
+/**
+ * Option list for a cvar, or null when it takes free-text input.
+ * map_source is pak-aware: the cached pak appears in the dropdown only after
+ * a drop (see setMapSourceHasPak); with no pak only devroom is listed.
+ */
 export function cvarOptions(name: string): readonly string[] | null {
+  if (name === 'map_source') return availableMapSources(mapSourceHasPak);
   return CVAR_OPTIONS[name] ?? null;
 }
 
@@ -169,10 +176,38 @@ export const SKILL_LABELS = ['Easy', 'Medium', 'Hard', 'Nightmare'] as const;
  */
 export const RESOLUTION_LABELS = ['320×240', '640×480', '800×600', '1024×768'] as const;
 
-/** Display labels for a cvar's options (currently skill + resolution). */
+/**
+ * Display labels for the map_source dropdown (M7.1 config menu): the cached
+ * pak boots the game map (base1), the built-in devroom is the asset-free
+ * demomap. Persisted as bare values via setCVar; labels are display-only.
+ */
+export const MAP_SOURCE_LABELS = ['Built-in devroom (demomap)', 'Cached pak0.pak (game)'] as const;
+
+/**
+ * Whether a pak is available for the map_source dropdown. Set by the boot
+ * layer (index.ts) on cache load / drop / clear; the dropdown lists the pak
+ * only afterwards. Defaults to false (devroom only) so headless/Node boots
+ * stay deterministic.
+ */
+let mapSourceHasPak = false;
+
+/** Record pak availability for the map_source dropdown (test hook too). */
+export function setMapSourceHasPak(v: boolean): void {
+  mapSourceHasPak = v;
+}
+
+/** Current pak availability behind the map_source dropdown. */
+export function getMapSourceHasPak(): boolean {
+  return mapSourceHasPak;
+}
+
+/**
+ * Display labels for a cvar's options (currently skill + resolution).
+ */
 export function cvarOptionLabels(name: string): readonly string[] | null {
   if (name === 'skill') return SKILL_LABELS;
   if (name === 'vid_resolution') return RESOLUTION_LABELS;
+  if (name === 'map_source') return MAP_SOURCE_LABELS;
   return null;
 }
 
@@ -182,7 +217,7 @@ export function cvarOptionLabels(name: string): readonly string[] | null {
  * vid_resolution reboots at the new framebuffer size. The browser boot
  * listens via renderCvarPanel's onChange and calls rebootPlay.
  */
-export const REBOOT_CVARS: ReadonlySet<string> = new Set(['skill', 'vid_resolution']);
+export const REBOOT_CVARS: ReadonlySet<string> = new Set(['skill', 'vid_resolution', 'map_source']);
 
 /** True when changing this cvar reboots the level (skill, vid_resolution). */
 export function cvarNeedsReboot(name: string): boolean {
