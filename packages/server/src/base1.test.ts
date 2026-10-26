@@ -33,6 +33,8 @@ import {
   PMF_DUCKED,
   EXPLOBOX_MAXS,
   EXPLOBOX_MINS,
+  MONSTER_HULL_MAXS,
+  MONSTER_HULL_MINS,
   resetEdictNums,
   resetPmoveWorld,
   setPmoveWorld,
@@ -50,6 +52,7 @@ import {
   MASK_OPAQUE_C,
   MASK_PLAYERSOLID_C,
   SV_ClipTrace,
+  SV_DropTraceFor,
   SV_MonsterTick,
   SV_RemoveBrushClip,
   SV_SetPmoveWorldFromBsp,
@@ -1194,7 +1197,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
         if (!Number.isFinite(n)) return null;
         return modelBounds(map, n);
       },
-      withDrop ? SV_TraceFor(map) : undefined,
+      withDrop ? SV_DropTraceFor(map) : undefined,
     );
   }
 
@@ -1254,7 +1257,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     spawnWith(st, map, 1, true);
     // nearest simulated monster to the spawn: the light soldier east of the
     // start room (348,-348), dropped from its floating lump z (-64) to the
-    // real floor (-86) by M_droptofloor.
+    // real floor (-84) by M_droptofloor (C MASK_MONSTERSOLID semantics).
     const spawn = v3(128, -320, 32);
     const cands = st.monsters
       .filter((m) => !m.triggered && m.kind)
@@ -1455,6 +1458,77 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(train.ent.origin[0]!).toBeCloseTo(-16, 3);
     expect(train.ent.origin[2]!).toBeCloseTo(40, 3);
     expect(train.arrived).toBe(true);
+  });
+
+  it('ships: teleport-closed loops wrap forever, never stall after one pass', { timeout: 120000 }, () => {
+    // All three base1 ship loops close through a TELEPORT path_corner
+    // (t147->t143, t141->t137, t130->t131). C train_next chains via
+    // self->target = ent->target, so the teleport snaps and travel resumes
+    // at the loop head forever; a linear seg++ array instead ends the chain
+    // at the teleport and the ships freeze after ~one circuit.
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    spawnWith(st, map, 1, true);
+    const ships = st.trains.filter((t) => t.ship);
+    expect(ships).toHaveLength(3);
+    for (const s of ships) {
+      expect(s.started).toBe(true);
+      const tail = s.corners[s.corners.length - 1]!;
+      expect(tail.teleport).toBe(true);
+      expect(s.corners[0]!.name).toBe(tail.target); // loop closes
+    }
+    // 700 ticks = 70s: every loop period (14-30s incl. corner waits) is
+    // covered at least twice. Single-pass travel is 1032/2640/2720 units, so
+    // 3000 cumulative proves multi-loop motion on every ship (pre-fix each
+    // stops after exactly one pass with arrived=true).
+    const dist = new Map<number, number>(ships.map((s) => [s.ent.num, 0]));
+    for (let i = 0; i < 700; i++) {
+      const before = new Map<number, [number, number, number]>(
+        ships.map((s) => [s.ent.num, [s.ent.origin[0]!, s.ent.origin[1]!, s.ent.origin[2]!]]),
+      );
+      SV_Tick(st);
+      for (const s of ships) {
+        const p0 = before.get(s.ent.num)!;
+        dist.set(
+          s.ent.num,
+          dist.get(s.ent.num)! +
+            Math.hypot(s.ent.origin[0]! - p0[0], s.ent.origin[1]! - p0[1], s.ent.origin[2]! - p0[2]),
+        );
+      }
+    }
+    for (const s of ships) {
+      expect(s.arrived).toBe(false); // still flying, never stalled
+      expect(dist.get(s.ent.num)!).toBeGreaterThan(3000); // multi-loop travel
+    }
+  });
+
+  it('spawn drop: monster0 rests on the C floor, not below grade', { timeout: 120000 }, () => {
+    // soldier_light lump (348,-348,-64) floats above a clip-sealed deck. C
+    // M_droptofloor traces MASK_MONSTERSOLID and rests it at -84; a mask-1
+    // world trace misses the deck and overshoots to -86.27 (below grade).
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    spawnWith(st, map, 1, true);
+    const m0 = st.monsters.find(
+      (m) =>
+        m.edict.classname === 'monster_soldier_light' &&
+        Math.round(m.edict.origin[0]!) === 348 &&
+        Math.round(m.edict.origin[1]!) === -348,
+    )!;
+    expect(m0).toBeDefined();
+    expect(m0.edict.origin[2]!).toBeCloseTo(-84, 0); // true floor, like C
+    // the failure mode, pinned: mask 1 falls through to the lower level.
+    const legacy = traceBox(
+      map,
+      v3(348, -348, -63),
+      v3(348, -348, -320),
+      MONSTER_HULL_MINS,
+      MONSTER_HULL_MAXS,
+      1,
+    );
+    expect(legacy.endpos[2]!).toBeCloseTo(-86.27, 1);
   });
 
   it('doors: touch opens *19 upward firing t69; slider axes/distances per C', { timeout: 120000 }, () => {

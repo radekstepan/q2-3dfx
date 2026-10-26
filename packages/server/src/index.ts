@@ -211,6 +211,18 @@ export function SV_TraceFor(map: BspMap, mask: number = MASK_PLAYERSOLID_C): Tra
 }
 
 /**
+ * C M_droptofloor grounding trace (game/g_monster.c): id drops walkmonsters
+ * AND exploboxes with `gi.trace(..., MASK_MONSTERSOLID)` — never the player
+ * mask and never mask 1. A mask-1 trace misses clip-sealed decks (base1's
+ * start-room soldier at (348,-348,-64) falls to -86.27, below the true
+ * -83.97 floor both C masks hit) so spawn grounding must run through this,
+ * not through a generic world trace. Pass it as SV_SpawnEntities' dropTrace.
+ */
+export function SV_DropTraceFor(map: BspMap): TraceFn {
+  return SV_TraceFor(map, MASK_MONSTERSOLID_C);
+}
+
+/**
  * Install C-mask world hooks for pmove. Same shape as the game-side
  * setPmoveWorldFromBsp but with MASK_PLAYERSOLID_C, so clip-deck floors and
  * stairs the mapper sealed with PLAYERCLIP/WINDOW hold the player the way
@@ -343,9 +355,11 @@ export function SV_ClipTrace(st: ServerState, worldTrace: TraceFn): TraceFn {
 //
 // Barrels (SP_misc_explobox think) and walkmonsters (walkmonster_start_go,
 // when not triggered and level.time < 1) snap to the floor at spawn: origin
-// nudged +1 up, traced 256 down with the entity hull; a clean miss or an
-// allsolid start keeps the mapper origin. The trace hook is supplied by the
-// caller (BSP-backed in tests); without it origins are kept as mapped.
+// nudged +1 up, traced 256 down with the entity hull under MASK_MONSTERSOLID
+// (see SV_DropTraceFor — a narrower mask falls through clip decks to a lower
+// level); a clean miss or an allsolid start keeps the mapper origin. The
+// trace hook is supplied by the caller (SV_DropTraceFor in tests); without
+// it origins are kept as mapped.
 
 export function droptofloor(origin: Vec3, mins: Vec3, maxs: Vec3, trace: TraceFn): Vec3 {
   const start = v3(origin[0], origin[1], origin[2]! + 1);
@@ -399,6 +413,15 @@ export interface TrainCorner {
   wait: number;
   teleport: boolean;
   pathtarget: string;
+  /**
+   * Targetname of this corner (the key other corners / the train link by).
+   * Needed for C-faithful chaining: id train_next advances via
+   * self->target = ent->target (G_PickTarget), so a corner whose target
+   * names an earlier corner wraps the loop forever instead of ending it.
+   */
+  name: string;
+  /** Target link this corner hands off to on arrival (ent->target). */
+  target: string;
 }
 
 export interface Train {
@@ -436,6 +459,8 @@ function resolveCorners(edicts: Edict[], target: string): TrainCorner[] {
       wait: c.wait,
       teleport: (c.spawnflags & 1) !== 0,
       pathtarget: c.extra['pathtarget'] ?? '',
+      name: t,
+      target: c.target,
     });
     t = c.target;
   }
@@ -461,12 +486,14 @@ function trainNext(tr: Train, now: number): void {
       return;
     }
     if (dest.teleport) {
-      // connected-teleport guard: C errors when two teleports chain without
-      // a travel leg; here the second one simply ends the chain.
+      // Teleport corner (id `goto again`): snap without a travel leg, then
+      // keep chaining from the teleport's own target link. A cycle made only
+      // of teleports exhausts the guard and stops, like C's connected-
+      // teleport error return.
       tr.ent.origin[0] = dest.pos[0]! - tr.base[0]!;
       tr.ent.origin[1] = dest.pos[1]! - tr.base[1]!;
       tr.ent.origin[2] = dest.pos[2]! - tr.base[2]!;
-      tr.seg++;
+      if (!advanceTrainSeg(tr)) return;
       continue;
     }
     tr.from = v3(tr.ent.origin[0], tr.ent.origin[1], tr.ent.origin[2]);
@@ -475,6 +502,33 @@ function trainNext(tr: Train, now: number): void {
     return;
   }
   tr.arrived = true;
+}
+
+/**
+ * Advance seg past the just-arrived corner the id way (train_next):
+ * self->target was set to ent->target when the corner was picked, so the
+ * next leg goes to the corner NAMED by the arrived corner's target link —
+ * not to the next array slot. A link back into the chain (base1's ship
+ * loops close t147->t143, t141->t137, t130->t131, each a TELEPORT corner)
+ * wraps seg and the train runs forever; an empty or dangling link ends the
+ * chain (C prints "bad target" and returns).
+ */
+function advanceTrainSeg(tr: Train): boolean {
+  const cur = tr.corners[tr.seg];
+  const next = cur ? cur.target : '';
+  if (!next) {
+    tr.arrived = true;
+    tr.waitUntil = -1;
+    return false;
+  }
+  const idx = tr.corners.findIndex((c) => c.name === next);
+  if (idx < 0) {
+    tr.arrived = true;
+    tr.waitUntil = -1;
+    return false;
+  }
+  tr.seg = idx;
+  return true;
 }
 
 /** Use a train/ship the id way (train_use / misc_strogg_ship_use). */
@@ -507,7 +561,7 @@ export function trainThink(tr: Train, now: number, dt: number, fire: (targetname
   if (!tr.started || tr.arrived) return v3(0, 0, 0);
   if (tr.waitUntil >= 0) {
     if (now < tr.waitUntil) return v3(0, 0, 0);
-    tr.seg++;
+    if (!advanceTrainSeg(tr)) return v3(0, 0, 0);
     trainNext(tr, now);
     if (tr.arrived) return v3(0, 0, 0);
   }
@@ -526,8 +580,7 @@ export function trainThink(tr: Train, now: number, dt: number, fire: (targetname
     if (dest && dest.wait > 0) {
       tr.waitUntil = now + dest.wait;
     } else {
-      tr.seg++;
-      trainNext(tr, now);
+      if (advanceTrainSeg(tr)) trainNext(tr, now);
     }
   } else {
     const k = step / len;
@@ -551,9 +604,9 @@ export function trainThink(tr: Train, now: number, dt: number, fire: (targetname
  * which only the BSP side knows. When a model resolves, its size-based travel
  * is used; otherwise the legacy `distance`-key default (128) applies.
  *
- * `dropTrace` is the M_droptofloor hook (BSP-backed in tests): barrels and
- * non-triggered monsters snap to the floor at spawn; without it mapper
- * origins are kept verbatim.
+ * `dropTrace` is the M_droptofloor hook (SV_DropTraceFor: MASK_MONSTERSOLID
+ *   per C, for both barrels and monsters): barrels and non-triggered monsters
+ *   snap to the floor at spawn; without it mapper origins are kept verbatim.
  */
 export function SV_SpawnEntities(
   st: ServerState,
