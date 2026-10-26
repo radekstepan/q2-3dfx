@@ -670,6 +670,32 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
   `info_player_start` (id SP `SelectSpawnPoint` rule) — base1's lump leads
   with a `targetname "base2"` start over the exit pit that used to spawn the
   player onto the exit volume and instantly "complete" the level.
+### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #4, all landed):
+- Viewmodel glued + recoil (MATCH THE GAME): alias entity basis rewritten
+- to C `R_AliasSetUpTransform` (`world = origin + lx*F − ly*R + lz*U`, roll
+- supported; pitch-0 bit-identical, devroom `8f61c755` preserved) — fixes
+- limb-above when looking down; `HostDriver.viewKick()` (blaster `-2*fwd`,
+- pitch `-1°`, one 10Hz tick) + `gunAnglesDelta()` (`SV_CalcGunOffset`-lite
+- turn-lag + speed sway, zeros when still) consumed in `renderCurrentView`;
+- `Weapon_Generic`-lite gunframe walks fire→idle (v_blast `pow01..pow04`).
+- Barrels (MATCH THE GAME): 0.2s fuse + `target_explosion` delay, `r_explode`
+- 15f / grounded 19f-base30 / `ex_misc` 4f kinds with 350-orange / 150-yellow
+- alpha-decayed dlights, 256-count ballistic boom sparks, 14 bouncing debris
+- chunks (5–10s life, `SV_Physics_Toss`-lite) + `damageRadius` from bbox-center
+- (`dmg−0.5*len`, attacker-half, LOS). No scorch (Q2 has none). Sampler fix:
+- `textureMasks` `hmask` is next-POT-minus-1 (6-tile sky strip 64×384 /
+- 256×1536 aliased `lf`/`ft` faces before).
+- Enemies (MATCH THE GAME): `m_flash` soldier/gunner muzzle table + visible
+- return fire (orange tracers, foe blaster bolts, enemy muzzle dlights, eye
+- impact sparks, `solatck`/`gunatck` sounds, fire-gated damage); corpses
+- hittable → overkill gibs (`sm_meat`/chest/head, `udeath.wav`, `DEAD_DEAD`).
+- Sky locked: all-6-face `SKY_SIDE_IMAGE` room test + asset-free textured-sky
+- golden `9a87c5c5` + no-scroll/fallback pins; Q2_PAK `unit1_` render logged.
+- Stop jitter: predictor run-coalescing (msec-ignored, exact vs 100ms server
+- tick) + zero-velocity snap (`speed<1` + zero inputs → snapshot origin).
+- Still open: sky-hit silent free (needs `SURF_SKY` trace flag), machinegun
+- per-shot kick walk, melee/grenade sound placeholders, `Entity.alpha` /
+- `oldframe/backlerp` for translucent-smooth explosions (frozen-contract PR).
 ### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #3, all landed):
 - Blaster projectiles now C-faithful (`g_weapon.c`/`p_weapon.c`/`cl_fx.c`):
 - spawn = literal `G_ProjectSource` from feet (`+ fwd*24 + right*8`, `z += viewheight-8`);

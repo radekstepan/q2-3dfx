@@ -381,11 +381,30 @@ export function drawAliasInstance(
   const mesh = inst.mesh;
   const nv = mesh.numVerts;
   ensureAliasScratch(nv);
-  // entity basis
-  const pitch = (inst.angles[0]! * Math.PI) / 180;
-  const yaw = (inst.angles[1]! * Math.PI) / 180;
-  const cp = Math.cos(pitch), sp2 = Math.sin(pitch);
-  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  // Entity basis (R_AliasSetUpTransform in ref_soft/r_alias.c): the model
+  // frame maps +X to the entity forward vector, so
+  //   world = origin + lx*F - ly*R + lz*U
+  // (the -R column is id's, not a typo: aliasworldtransform[][1] holds
+  // -s_alias_right). The old code did yaw-then-pitch-about-X instead, so at
+  // pitch != 0 the hand swung toward the near plane ("cutoff limb above").
+  // Formula mirrors @q2/math AngleVectors (q_shared.c: pitch positive =
+  // down, +X fwd +Y left +Z up), inlined in float64: AngleVectors writes
+  // Float32Array outs, whose rounding would move the pitch-0 path off the
+  // old yaw-about-Z bits. At pitch=roll=0 this reduces to it bit-for-bit.
+  const pitchR = (inst.angles[0]! * Math.PI) / 180;
+  const yawR = (inst.angles[1]! * Math.PI) / 180;
+  const rollR = (inst.angles[2]! * Math.PI) / 180;
+  const sp = Math.sin(pitchR), cp = Math.cos(pitchR);
+  const sy = Math.sin(yawR), cy = Math.cos(yawR);
+  const sr = Math.sin(rollR), cr = Math.cos(rollR);
+  const fxx = cp * cy, fxy = cp * sy, fxz = -sp;
+  const rxx = -sr * sp * cy + cr * sy;
+  const rxy = -sr * sp * sy - cr * cy;
+  const rxz = -sr * cp;
+  const uxx = cr * sp * cy + sr * sy;
+  const uxy = cr * sp * sy - sr * cy;
+  const uxz = cr * cp;
+  const eox = inst.origin[0]!, eoy = inst.origin[1]!, eoz = inst.origin[2]!;
   // lerp frames
   const fA = mesh.frames.subarray(inst.frameA * nv * 3, (inst.frameA + 1) * nv * 3);
   const fB = mesh.frames.subarray(inst.frameB * nv * 3, (inst.frameB + 1) * nv * 3);
@@ -396,16 +415,12 @@ export function drawAliasInstance(
     const lx = fA[i * 3]! + (fB[i * 3]! - fA[i * 3]!) * t;
     const ly = fA[i * 3 + 1]! + (fB[i * 3 + 1]! - fA[i * 3 + 1]!) * t;
     const lz = fA[i * 3 + 2]! + (fB[i * 3 + 2]! - fA[i * 3 + 2]!) * t;
-    // yaw then pitch (Quake entity rotation), then translate
-    const x1 = cy * lx - sy * ly;
-    const y1 = sy * lx + cy * ly;
-    const z1 = lz;
-    const x2 = x1;
-    const y2 = cp * y1 - sp2 * z1;
-    const z2 = sp2 * y1 + cp * z1;
-    wx[i] = x2 + inst.origin[0]!;
-    wy[i] = y2 + inst.origin[1]!;
-    wz[i] = z2 + inst.origin[2]!;
+    // R_AliasSetUpTransform columns (F, -R, U), then translate. Operation
+    // order ((lx*F - ly*R) + lz*U) + origin keeps pitch-0/roll-0 bit-identical
+    // to the old yaw-about-Z path (mult commutes exactly; +0 is exact).
+    wx[i] = lx * fxx - ly * rxx + lz * uxx + eox;
+    wy[i] = lx * fxy - ly * rxy + lz * uxy + eoy;
+    wz[i] = lx * fxz - ly * rxz + lz * uxz + eoz;
   }
   void anorms;
   const row = (inst.lightAngle & 255) * ANORM_COUNT;

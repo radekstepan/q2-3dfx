@@ -73,6 +73,35 @@ export interface MonsterDef {
 // NOT name suffixes. Dists are the per-frame ai_move/ai_run/ai_walk/ai_charge
 // values from m_soldier.c / m_gunner.c (origin is 24 above the feet:
 // mins -24, maxs +32 — see MONSTER_HULL_* below).
+//
+// Soldier attack fire tags (m_soldier.c): attack1 (FRAME_attak101-112) fires
+// at its 3rd frame (soldier_fire1 -> shotgun/blaster by skin), attack2
+// (FRAME_attak201-218) fires at its 5th frame (soldier_fire2). The lite
+// driver gates return-fire damage on monsterThink's 'fire' return, so these
+// tags are what make soldier shots land on the muzzle flash instead of on a
+// wall-clock timer.
+function soldierAttackFrames(count: number, fireIdx: number): MonsterFrame[] {
+  const frames: MonsterFrame[] = [];
+  for (let f = 0; f < count; f++) frames.push({ dist: 0, action: f === fireIdx ? 'fire' : 'move' });
+  return frames;
+}
+
+const soldierAttack1: MonsterMove = {
+  name: 'attack1',
+  first: 0,
+  last: 11,
+  frames: soldierAttackFrames(12, 2),
+  end: 'run',
+};
+
+const soldierAttack2: MonsterMove = {
+  name: 'attack2',
+  first: 12,
+  last: 29,
+  frames: soldierAttackFrames(18, 4),
+  end: 'run',
+};
+
 export const SOLDIER: MonsterDef = {
   classname: 'monster_soldier',
   health: 30,
@@ -87,8 +116,8 @@ export const SOLDIER: MonsterDef = {
     pain1: mv('pain1', 50, [-3, 4, 1, 1, 0], 'run'),
     pain2: mv('pain2', 55, [-13, -1, 2, 4, 2, 3, 2], 'run'),
     pain3: mv('pain3', 62, [-8, 10, -4, -1, -3, 0, 3, 0, 0, 0, 0, 1, 0, 1, 2, 4, 3, 2], 'run'),
-    attack1: mv('attack1', 0, new Array(12).fill(0), 'run'), // shotgun
-    attack2: mv('attack2', 12, new Array(18).fill(0), 'run'), // blaster
+    attack1: soldierAttack1,
+    attack2: soldierAttack2,
     duck: mv('duck', 45, [5, -1, 1, 0, 5], 'run'),
     death1: mv('death1', 272, [0, -10, -10, -10, -5, ...new Array(31).fill(0)], 'dead'),
   },
@@ -133,13 +162,20 @@ export interface MonsterState {
   move: string;
   frame: number; // absolute frame number within current move
   dead: boolean;
+  /**
+   * Gibbed (id DEAD_DEAD after ThrowGib: soldier_die/gunner_die gib branch).
+   * Gibbed bodies are gone — unhittable, skipped by snapshots. Plain corpses
+   * (dead, !gibbed) stay hittable (takedamage YES) so re-hitting them can
+   * still mince them via the gib-health check below.
+   */
+  gibbed: boolean;
   /** Facing yaw in degrees (Q2 convention: 0 = +X, 90 = +Y/left). */
   yaw: number;
 }
 
 export function spawnMonster(kind: MonsterKind): MonsterState {
   const def = monsterDef(kind);
-  return { kind, health: def.health, move: kind === 'soldier' ? 'stand1' : 'stand', frame: 0, dead: false, yaw: 0 };
+  return { kind, health: def.health, move: kind === 'soldier' ? 'stand1' : 'stand', frame: 0, dead: false, gibbed: false, yaw: 0 };
 }
 
 export function monsterMoveOf(ms: MonsterState): MonsterMove {
@@ -300,19 +336,39 @@ export function monsterLocomotion(
   }
 }
 
-export function monsterPain(ms: MonsterState, damage: number, rand: () => number): void {
+/**
+ * id T_Damage gib-first ordering (g_combat.c): the gib-health check runs
+ * before the dead re-entry gate (soldier_die checks `health <= gib_health`
+ * first, then `deadflag == DEAD_DEAD`). Returns what happened so drivers can
+ * spawn gib extras + udeath on 'gib':
+ * - 'gib': health at/below gibHealth — mince (DEAD_DEAD, unhittable).
+ * - 'dead': killed (or a corpse re-hit short of gibbing — stays a corpse).
+ * - 'pain': survived, maybe entered a pain move.
+ * - 'none': already gibbed (unhittable — no further damage).
+ */
+export function monsterPain(ms: MonsterState, damage: number, rand: () => number): 'gib' | 'dead' | 'pain' | 'none' {
+  if (ms.gibbed) return 'none';
   ms.health -= damage;
-  if (ms.health <= monsterDef(ms.kind).gibHealth || ms.health <= 0) {
+  if (ms.health <= monsterDef(ms.kind).gibHealth) {
+    ms.dead = true;
+    ms.gibbed = true;
+    ms.move = ms.kind === 'soldier' ? 'death1' : 'death';
+    ms.frame = 0;
+    return 'gib';
+  }
+  if (ms.dead) return 'dead';
+  if (ms.health <= 0) {
     ms.dead = true;
     ms.move = ms.kind === 'soldier' ? 'death1' : 'death';
     ms.frame = 0;
-    return;
+    return 'dead';
   }
   // id skips pain anims probabilistically; keep deterministic via caller rng
   if (rand() < 0.4) {
     ms.move = ms.kind === 'soldier' ? (rand() < 0.5 ? 'pain1' : 'pain2') : 'pain1';
     ms.frame = 0;
   }
+  return 'pain';
 }
 
 export type AttackChoice = 'melee' | 'shotgun' | 'blaster' | 'chaingun' | 'grenade' | 'none';

@@ -5,7 +5,7 @@ import { v3 } from '@q2/math';
 import type { Entity } from '@q2/renderer-api';
 import { getConcharsFont, makeConcharsFont } from '@q2/client';
 import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpBoltLights, pumpExplosionLights, pumpTracers, loadConcharsFont, concharsFontFromPCX, VIEWMODEL_FIRE_FRAME, usesViewModel3D } from './play.js';
-import { findWeapon, spawnMonster, BOLT_LIFE } from '@q2/game';
+import { findWeapon, spawnMonster, monsterPain, BOLT_LIFE } from '@q2/game';
 import type { LocalDriver } from './play.js';
 
 function runFrames(host: { frame(nowMs: number): unknown }, fromMs: number, toMs: number, step = 16): void {
@@ -386,8 +386,7 @@ describe('play driver (devroom, headless)', () => {
     expect(pumpMuzzleLight(boot)).toBe(false);
   });
 
-  it('G: blaster matches G_ProjectSource/CL_MuzzleFlash/CL_BlasterTrail ground truth', () => {
-    // Ground truth (g_weapon.c fire_blaster/blaster_touch, p_weapon.c
+  it('G: blaster matches G_ProjectSource/CL_MuzzleFlash/CL_BlasterTrail ground truth', () => {    // Ground truth (g_weapon.c fire_blaster/blaster_touch, p_weapon.c
     // Weapon_Blaster_Fire, cl_ents.c EF_BLASTER, cl_fx.c trail/impact,
     // G_ProjectSource in g_utils.c; SP damage 10):
     // - spawn = feet + fwd*24 + right*8, z += viewheight-8 (22-8 = 14);
@@ -448,6 +447,205 @@ describe('play driver (devroom, headless)', () => {
     const fresh = d2.mini.particles.slice(staticCount) as Array<{ color: number }>;
     expect(fresh.length).toBeGreaterThan(0);
     for (const p of fresh) expect(p.color).toBe(0xe0);
+  });
+
+  it('H: gunframe walks fire-first to idle-first (blaster 5→9, p_weapon.c)', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    // READY holds the idle-first frame (Weapon_Blaster 9..52).
+    expect(driver.gunFrame).toBe(9);
+    driver.pm.viewAngles = v3(0, 0, 0);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.events).toContain('shot');
+    // Firing starts at FIRE_FIRST (activate 4 + 1); the per-tick stepper
+    // walks it to IDLE_FIRST+1 (fire 8 + 2) — never a frozen fire frame.
+    expect(driver.gunFrame).toBe(5);
+    stepDriver(driver, neutralCmd(), 1);
+    expect(driver.gunFrame).toBe(6);
+    stepDriver(driver, neutralCmd(), 3);
+    expect(driver.gunFrame).toBe(9);
+    // READY holds idle-first (does not stick at 10 or wrap to 0).
+    stepDriver(driver, neutralCmd(), 3);
+    expect(driver.gunFrame).toBe(9);
+  });
+
+  it('H: firing kick is visible for exactly one tick (blaster -2/-1)', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    expect(driver.viewKick()).toBeNull();
+    driver.pm.viewAngles = v3(0, 0, 0);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    // Facing +X: kickOrigin = -2*fwd, pitch kick -1 (Blaster_Fire).
+    const kick = driver.viewKick();
+    expect(kick).not.toBeNull();
+    expect(kick!.angles).toEqual([-1, 0, 0]);
+    expect(kick!.origin[0]).toBeCloseTo(-2, 6);
+    expect(kick!.origin[1]).toBeCloseTo(0, 6);
+    expect(kick!.origin[2]).toBeCloseTo(0, 6);
+    // Exactly one 10Hz tick: the next step clears it (compute-then-clear).
+    stepDriver(driver, neutralCmd(), 1);
+    expect(driver.viewKick()).toBeNull();
+  });
+
+  it('H: shotgun kick is -2/-2 (weapon_shotgun_fire)', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    driver.ps.weapons.push('weapon_shotgun');
+    driver.selectWeapon('weapon_shotgun');
+    driver.shells = 5;
+    driver.pm.viewAngles = v3(0, 0, 0);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.events).toContain('shot');
+    const kick = driver.viewKick();
+    expect(kick).not.toBeNull();
+    expect(kick!.angles).toEqual([-2, 0, 0]);
+    expect(kick!.origin[0]).toBeCloseTo(-2, 6);
+    stepDriver(driver, neutralCmd(), 1);
+    expect(driver.viewKick()).toBeNull();
+  });
+
+  it('H: sway is zeros when still, turn-lag + bob when moving (p_view.c)', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    stepDriver(driver, neutralCmd(), 3);
+    // Static (xyspeed < 5): gunoffset stays 0, sway zeros.
+    expect(driver.gunAnglesDelta()).toEqual([0, 0, 0]);
+    // Run facing +Y (open room, no pillar): bob sway builds (xyspeed-scaled,
+    // sign flips per bobcycle).
+    const run: UserCmdT = { msec: 100, angles: [0, 90, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 };
+    let peak = 0;
+    for (let i = 0; i < 8; i++) {
+      driver.step(run, 0.1);
+      const g = driver.gunAnglesDelta()!;
+      peak = Math.max(peak, Math.abs(g[0]!) + Math.abs(g[1]!) + Math.abs(g[2]!));
+    }
+    expect(peak).toBeGreaterThan(0.01);
+    // Snap-turn 60° while moving: turn lag 0.2*clamped(-45) dominates yaw.
+    driver.step({ ...run, angles: [0, 150, 0] }, 0.1);
+    const turned = driver.gunAnglesDelta()!;
+    expect(turned[1]!).toBeLessThan(-4);
+  });
+
+  it('I: lethal barrel hit schedules a 0.2s fuse, then explosion + 14 debris', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    driver.pm.origin = v3(-144, -16, 24);
+    driver.pm.velocity = v3();
+    driver.pm.viewAngles = v3(-90, 0, 0);
+    driver.barrels.push({
+      origin: v3(-144, -16, 100), health: 10, dmg: 150, mass: 400,
+      size: v3(32, 32, 40), isFunc: false, dead: false,
+    });
+    driver.step({ ...neutralCmd([-90, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    expect(driver.bolts.length).toBe(1);
+    // Bolt climbs 100u/tick into the barrel hull: lethal hit, fuse set, and
+    // the TE_BLASTER touch flash (no big boom yet — barrel_delay fuse).
+    stepDriver(driver, neutralCmd(), 1);
+    expect(driver.bolts.length).toBe(0);
+    const barrel = driver.barrels[0]!;
+    expect(barrel.dead).toBe(true);
+    expect(driver.pendingFuses).toBe(1);
+    expect(driver.explosions.some((e) => e.kind === 'explosion1')).toBe(false);
+    expect(driver.debris.length).toBe(0);
+    // One more tick (0.1s) is still inside the 0.2s fuse.
+    stepDriver(driver, neutralCmd(), 1);
+    expect(driver.pendingFuses).toBe(1);
+    expect(driver.explosions.some((e) => e.kind === 'explosion1')).toBe(false);
+    // Fuse blows: 256-spark boom + T_RadiusDamage (attacker-half hurts us).
+    const hpBefore = driver.playerHealth;
+    stepDriver(driver, neutralCmd(), 2);
+    expect(driver.pendingFuses).toBe(0);
+    expect(driver.events).toContain('barrel');
+    expect(driver.events).toContain('explosion');
+    const big = driver.explosions.find((e) => e.kind === 'explosion1');
+    expect(big).toBeDefined();
+    expect(driver.debris.length).toBe(14);
+    expect(driver.debris.filter((d) => d.kind === 'debris1').length).toBe(2);
+    expect(driver.debris.filter((d) => d.kind === 'debris2').length).toBe(8);
+    expect(driver.debris.filter((d) => d.kind === 'debris3').length).toBe(4);
+    expect(driver.mini.particles.length).toBeGreaterThan(256);
+    expect(driver.playerHealth).toBeLessThan(hpBefore);
+  });
+
+  it('I: func_explosive debris follows the mass formula (mass/100 cap 8 + mass/25 cap 16)', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    driver.ps.health = 1000;
+    driver.pm.origin = v3(-144, -16, 24);
+    driver.pm.velocity = v3();
+    driver.pm.viewAngles = v3(-90, 0, 0);
+    driver.barrels.push({
+      origin: v3(-144, -16, 100), health: 100, dmg: 0, mass: 400,
+      size: v3(32, 32, 40), isFunc: true, dead: false,
+    });
+    // Bolt damage 10 × 10 hits to burn through 100hp: refire-limited, so
+    // step attack until the fuse is lit (bolt hits every ~3 ticks).
+    for (let i = 0; i < 40 && driver.pendingFuses === 0; i++) {
+      driver.step({ ...neutralCmd([-90, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    }
+    expect(driver.pendingFuses).toBe(1);
+    for (let i = 0; i < 5 && driver.pendingFuses === 1; i++) stepDriver(driver, neutralCmd(), 1);
+    expect(driver.pendingFuses).toBe(0);
+    expect(driver.debris.filter((d) => d.kind === 'debris1').length).toBe(4);
+    expect(driver.debris.filter((d) => d.kind === 'debris2').length).toBe(16);
+    expect(driver.debris.filter((d) => d.kind === 'debris3').length).toBe(0);
+  });
+
+  it('J: re-hitting a corpse minces it (gibs + udeath, then unhittable)', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    driver.pm.origin = v3(-168, 100, 24);
+    driver.pm.velocity = v3();
+    driver.pm.viewAngles = v3(0, 0, 0);
+    driver.monsters.push({ id: 99, origin: [100, 92, 24], state: spawnMonster('soldier'), lastAttack: -10 });
+    const m = driver.monsters[0]!;
+    // Kill cleanly (30hp exactly: dead, not gibbed since 0 > gibHealth -30).
+    expect(monsterPain(m.state, 30, () => 0.5)).toBe('dead');
+    expect(m.state.dead).toBe(true);
+    expect(m.state.gibbed).toBe(false);
+    // Fire blaster bolts downrange: each bolt impact re-hits the corpse
+    // (no dead-skip) until the gib-health check minces it (3×10dmg: 0→-30).
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    stepDriver(driver, neutralCmd(), 5);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    stepDriver(driver, neutralCmd(), 5);
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    stepDriver(driver, neutralCmd(), 8);
+    expect(m.state.gibbed).toBe(true);
+    expect(driver.events).toContain('gib');
+    expect(driver.gibs.length).toBe(5);
+    expect(driver.gibs.filter((g) => g.kind === 'meat').length).toBe(3);
+    // Gibbed is DEAD_DEAD unhittable: further fire changes nothing, and the
+    // snapshot drops the minced body (normal corpses persist instead).
+    const gibEvents = driver.events.filter((e) => e === 'gib').length;
+    driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
+    stepDriver(driver, neutralCmd(), 6);
+    expect(driver.events.filter((e) => e === 'gib').length).toBe(gibEvents);
+    expect(driver.gibs.length).toBe(5);
+    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === 99)).toBe(false);
+  });
+
+  it('K: monster fire frames spawn tracers (hitscan) and foe bolts (blaster)', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    // Soldier off to the side (open LOS past the pillar) at ~224u: NEAR
+    // range, so chase commits attack1/attack2 once it faces the player.
+    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), lastAttack: -10 });
+    let sawTracer = false;
+    let sawBolt = false;
+    let sawFlash = false;
+    for (let i = 0; i < 90; i++) {
+      stepDriver(driver, neutralCmd(), 1);
+      if (driver.pendingTracers > 0) sawTracer = true;
+      if (driver.bolts.length > 0) sawBolt = true;
+      if (driver.drainEnemyMuzzle().length > 0) sawFlash = true;
+      if (driver.events.includes('monshot') && (sawTracer || sawBolt) && sawFlash) break;
+    }
+    // Fire-gated return fire happened on a 'fire' frame (not the old timer).
+    expect(driver.events).toContain('monshot');
+    expect(sawTracer || sawBolt).toBe(true);
+    // Every monster shot carries its 200+(rand&31) yellow muzzle dlight.
+    expect(sawFlash).toBe(true);
   });
 });
 

@@ -62,6 +62,21 @@ export interface HostDriver {
    */
   entityModel?(id: number): { model: number; skin: number } | null | undefined;
   /**
+   * One-tick camera kick offset (RF/gunoffset-lite: id applies the weapon
+   * kick in game/p_weapon.c and the gun offset in game/p_view.c
+   * `SV_CalcGunOffset` — pitch/yaw/roll delta plus eye-offset delta).
+   * Added to the RefDef angles/origin in renderCurrentView; the driver
+   * clears it next tick (returns null) so it lands on exactly one frame.
+   */
+  viewKick?(): { angles: [number, number, number]; origin: [number, number, number] } | null;
+  /**
+   * Sway/turn-lag added to the viewmodel entity angles (RF/gunoffset-lite:
+   * the driver computes the SV_CalcGunOffset-lite term — 0.2*delta
+   * turn-lag ±45 clamp + speed-scaled bob sway; static when still).
+   * Added to the full view angles on the eye-anchored gun entity.
+   */
+  gunAnglesDelta?(): [number, number, number] | null;
+  /**
    * Extra world entities the snapshot omits (flying bolts, live barrels,
    * explosion flashes). Absent/null → none. Plain data, no web imports.
    */
@@ -259,12 +274,19 @@ export class Host {
       const local = entities.find((e) => e.id === this.localPlayerId);
       if (local) base = local.origin;
     }
-    const viewOrigin = calcViewOrigin(base);
-    const angles: [number, number, number] = this.lastCmd
+    const viewBase: [number, number, number] = this.lastCmd
       ? [this.lastCmd.angles[0], this.lastCmd.angles[1], this.lastCmd.angles[2]]
       : [0, 0, 0];
+    // One-tick camera kick (p_weapon.c kick via p_view.c SV_CalcGunOffset):
+    // added to the RefDef angles/origin; the driver returns null next tick.
+    const kick = this.driver?.viewKick?.() ?? null;
+    const angles: [number, number, number] = kick
+      ? [viewBase[0] + kick.angles[0], viewBase[1] + kick.angles[1], viewBase[2] + kick.angles[2]]
+      : viewBase;
+    let eye = calcViewOrigin(base);
+    if (kick) eye = [eye[0] + kick.origin[0], eye[1] + kick.origin[1], eye[2] + kick.origin[2]];
     const view: RefDef = {
-      origin: new Float32Array(viewOrigin) as RefDef['origin'],
+      origin: new Float32Array(eye) as RefDef['origin'],
       angles: new Float32Array(angles) as RefDef['angles'],
       fovX: 90,
       time: this.serverTime,
@@ -306,16 +328,23 @@ export class Host {
     // + gunoffset (gun_x/y/z default 0, game/g_main.c), angles = the full
     // view angles + gunangles. No forward push (VIEWMODEL_FORWARD = 0),
     // no yaw-only flattening: the gun rides the view exactly, bottom-right
-    // placement coming from the baked v_weap verts. The breech half behind
-    // the eye survives via view-space near-plane Sutherland clipping in
-    // the alias backend (r_aclip.c), and Entity.depthHack (RF_DEPTHHACK)
-    // keeps the gun ahead of nearby walls. Hidden when fovX > 90, like id.
+    // placement coming from the baked v_weap verts. The gunangles term is
+    // the RF/gunoffset-lite driver hook (p_view.c SV_CalcGunOffset-lite:
+    // 0.2*delta turn-lag ±45 clamp + speed-scaled bob sway; static when
+    // still). The breech half behind the eye survives via view-space
+    // near-plane Sutherland clipping in the alias backend (r_aclip.c), and
+    // Entity.depthHack (RF_DEPTHHACK) keeps the gun ahead of nearby walls.
+    // Hidden when fovX > 90, like id.
     const vm = this.driver?.viewModel?.() ?? null;
     if (vm && view.fovX <= 90) {
+      const gunDelta = this.driver?.gunAnglesDelta?.() ?? null;
+      const gunAngles: [number, number, number] = gunDelta
+        ? [angles[0] + gunDelta[0], angles[1] + gunDelta[1], angles[2] + gunDelta[2]]
+        : angles;
       renderables.push({
         model: vm.model,
-        origin: new Float32Array(viewOrigin) as Entity['origin'],
-        angles: new Float32Array(angles) as Entity['angles'],
+        origin: new Float32Array(eye) as Entity['origin'],
+        angles: new Float32Array(gunAngles) as Entity['angles'],
         frame: vm.frame,
         skin: vm.skin,
         depthHack: true,

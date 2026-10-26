@@ -25,6 +25,11 @@ import {
 import { SoftwareBackend } from './spans.js';
 import { WasmSpanBackend } from './wasmSpans.js';
 import { buildColormap, defaultPalette } from './colormap.js';
+import { readFileSync } from 'fs';
+import { loadBsp } from '@q2/bsp';
+import { parsePCX, parseWAL } from '@q2/formats';
+import { bspToMiniWorld, type BspTexelSource } from './index.js';
+import { v3 } from '@q2/math';
 
 /** Blue-forward palette: index 200 is the unambiguous sky pick. */
 function skyPalette(): Uint8Array {
@@ -346,8 +351,7 @@ describe('textured skybox (setSkyTexture, ref_soft R_EmitSkyBox/D_SkySurf)', () 
     expect([...a.idx]).toEqual([...b.idx]);
   });
 
-  it('rejects bad strips and clears back to the flat fill', () => {
-    const W = 160, H = 120;
+  it('rejects bad strips and clears back to the flat fill', () => {    const W = 160, H = 120;
     const mk = (tex: { texels: Uint8Array; width: number; height: number } | null) => {
       const fb = createFramebuffer(W, H, true);
       const r = new SoftwareRenderer();
@@ -374,6 +378,127 @@ describe('textured skybox (setSkyTexture, ref_soft R_EmitSkyBox/D_SkySurf)', () 
     expect(mk(null)).toBe(fnv(flat.idx));
     // And a valid strip takes effect again afterwards (sticky-null check).
     expect(mk(stripTexture())).toBe(fnv(renderSky(-1, { tex: stripTexture() }).idx));
+  });
+
+  it('pins the textured-sky golden hash (asset-free)', () => {
+    const textured = renderSky(-1, { tex: stripTexture() });
+    expect(fnv(textured.idx)).toBe('9a87c5c5');
+  });
+});
+
+/** Six sky quads forming a room around the camera (all SURF_SKY). */
+function skyRoomWorld(): MiniWorld {
+  const quads: number[][] = [
+    [40, -40, 0, 40, 40, 0, 40, 40, 60, 40, -40, 60], // +X
+    [-40, 40, 0, -40, -40, 0, -40, -40, 60, -40, 40, 60], // -X
+    [-40, 40, 0, 40, 40, 0, 40, 40, 60, -40, 40, 60], // +Y
+    [40, -40, 0, -40, -40, 0, -40, -40, 60, 40, -40, 60], // -Y
+    [-40, -40, 70, 40, -40, 70, 40, 40, 70, -40, 40, 70], // +Z
+    [-40, 40, -10, 40, 40, -10, 40, -40, -10, -40, -40, -10], // -Z
+  ];
+  const surfaces = quads.map((q, i) => {
+    const verts = new Float32Array(q);
+    const mins = new Float32Array([Infinity, Infinity, Infinity]);
+    const maxs = new Float32Array([-Infinity, -Infinity, -Infinity]);
+    const center = new Float32Array(3);
+    for (let k = 0; k < 4; k++) {
+      for (let a = 0; a < 3; a++) {
+        const v = verts[k * 3 + a]!;
+        if (v < mins[a]!) mins[a] = v;
+        if (v > maxs[a]!) maxs[a] = v;
+        center[a]! += v / 4;
+      }
+    }
+    const dx = maxs[0]! - center[0]!, dy = maxs[1]! - center[1]!, dz = maxs[2]! - center[2]!;
+    return {
+      id: i, verts,
+      uvs: new Float32Array([0, 0, 64, 0, 64, 64, 0, 64]),
+      lux: new Float32Array([0, 0, 4, 0, 4, 4, 0, 4]),
+      n: 4, texId: 0, lightId: 0,
+      center, radius: Math.hypot(dx, dy, dz), mins, maxs,
+      turbulent: false, sky: true,
+      fn: new Float32Array([0, 0, 1]),
+    };
+  });
+  return {
+    brand: 'miniworld',
+    nodes: [],
+    leafs: [{ cluster: 0, firstSurf: 0, numSurfs: surfaces.length }],
+    pvs: [new Uint8Array([1])],
+    clusterCount: 1,
+    surfaces,
+    textures: [{ texels: new Uint8Array(16).fill(7), width: 4, height: 4 }],
+    lightmaps: [{ samples: new Uint8Array([128, 128, 128]), luxW: 1, luxH: 1, styles: [0] }],
+    dynamicLights: [],
+    alias: [],
+    sprites: [],
+    particles: [],
+  };
+}
+
+describe('textured skybox all-6-faces (SKY_SIDE_IMAGE)', () => {
+  /** Axis view per box face: [label, angles, face]. */
+  const FACES: Array<[string, number[], number]> = [
+    ['+X rt', [0, 0, 0], 4],
+    ['+Y bk', [0, 90, 0], 3],
+    ['-X lf', [0, 180, 0], 1],
+    ['-Y ft', [0, 270, 0], 5],
+    ['+Z up', [-90, 0, 0], 2],
+    ['-Z dn', [90, 0, 0], 0],
+  ];
+  it('each axis view is covered by its SKY_SIDE_IMAGE tile', () => {
+    const tex = stripTexture();
+    const W = 160, H = 120;
+    for (const [, angles, face] of FACES) {
+      const fb = createFramebuffer(W, H, true);
+      const r = new SoftwareRenderer();
+      r.init(fb);
+      r.setPalette(skyPalette());
+      r.setSkyTexture(tex);
+      r.beginFrame();
+      r.renderView(
+        {
+          origin: new Float32Array([0, 0, 30]), angles: new Float32Array(angles),
+          fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1),
+        },
+        { name: 'sky-room', data: skyRoomWorld() },
+        [],
+      );
+      r.endFrame();
+      const want = 10 + SKY_SIDE_IMAGE[face]! * 20;
+      const idx = fb.index!;
+      // Center ray is exactly the face normal: exact tile, no tolerance.
+      expect(idx[(H >> 1) * W + (W >> 1)]).toBe(want);
+      let hit = 0, flat = 0;
+      for (let i = 0; i < idx.length; i++) {
+        if (idx[i] === want) hit++;
+        if (idx[i] === 200) flat++;
+      }
+      // The facing box face fills the whole 90-degree frustum (corner rays
+      // stay dominant-axis); only edge rasterisation may wobble.
+      expect(hit / idx.length).toBeGreaterThan(0.99);
+      expect(flat).toBe(0);
+    }
+  });
+
+  it('pins the all-faces room hash at the +X view (asset-free)', () => {
+    const W = 160, H = 120;
+    const fb = createFramebuffer(W, H, true);
+    const r = new SoftwareRenderer();
+    r.init(fb);
+    r.setPalette(skyPalette());
+    r.setSkyTexture(stripTexture());
+    r.beginFrame();
+    r.renderView(
+      {
+        origin: new Float32Array([0, 0, 30]), angles: new Float32Array([0, 0, 0]),
+        fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1),
+      },
+      { name: 'sky-room', data: skyRoomWorld() },
+      [],
+    );
+    r.endFrame();
+    expect(fnv(fb.index!)).toBe('9a87c5c5');
   });
 });
 
@@ -475,5 +600,81 @@ describe('skybox mapping units (id r_rast.c box faces)', () => {
     expect(SKY_BOX_CORNERS.length).toBe(6);
     expect(SKY_BOX_HALF).toBe(16384);
     for (let f = 0; f < 6; f++) expect(SKY_BOX_CORNERS[f]!.length).toBe(12);
+  });
+});
+
+/** Minimal PAK reader (test-only; avoids a @q2/filesystem dependency). */
+function pakReadFile(pakPath: string, name: string): ArrayBuffer {
+  const data = readFileSync(pakPath);
+  if (data.subarray(0, 4).toString() !== 'PACK') throw new Error('not a pak');
+  const dirofs = data.readUInt32LE(4);
+  const dirlen = data.readUInt32LE(8);
+  for (let o = dirofs; o < dirofs + dirlen; o += 64) {
+    const entry = data.subarray(o, o + 56).toString().replace(/\0.*$/, '');
+    if (entry === name) {
+      const off = data.readUInt32LE(o + 56);
+      const len = data.readUInt32LE(o + 60);
+      return data.buffer.slice(data.byteOffset + off, data.byteOffset + off + len);
+    }
+  }
+  throw new Error(`pak entry missing: ${name}`);
+}
+
+describe.runIf(!!process.env.Q2_PAK)('real unit1_ sky over base1 (Q2_PAK)', () => {
+  it('logs the real-art sky hash (unpinned first-run record)', { timeout: 300000 }, () => {
+    const pakPath = process.env.Q2_PAK as string;
+    // env/unit1_{rt,bk,lf,ft,up,dn}.pcx packed in suffix order with raw
+    // indices (no palette remap — deterministic either way). Skips (logs)
+    // when the faces are absent instead of failing.
+    let strip: { texels: Uint8Array; width: number; height: number } | null = null;
+    try {
+      const faces = SKY_TILE_SUFFIXES.map((suf) => parsePCX(pakReadFile(pakPath, `env/unit1_${suf}.pcx`)));
+      const w = faces[0]!.width, h = faces[0]!.height;
+      if (!faces.every((f) => f.width === w && f.height === h && f.pixels.length === w * h)) {
+        throw new Error('mismatched sky faces');
+      }
+      const texels = new Uint8Array(w * h * 6);
+      faces.forEach((f, i) => texels.set(f.pixels.subarray(0, w * h), i * w * h));
+      strip = { texels, width: w, height: h * 6 };
+    } catch {
+      strip = null;
+    }
+    if (!strip) {
+      console.log('SKY-PAK: env/unit1_ faces missing, skipping');
+      return;
+    }
+    const bsp = loadBsp(pakReadFile(pakPath, 'maps/base1.bsp'));
+    const walCache = new Map<string, BspTexelSource | null>();
+    const texelFor = (walName: string): BspTexelSource | null => {
+      if (walCache.has(walName)) return walCache.get(walName)!;
+      let src: BspTexelSource | null = null;
+      try {
+        const wal = parseWAL(pakReadFile(pakPath, `textures/${walName}.wal`));
+        src = { texels: wal.mips[0]!, width: wal.width, height: wal.height };
+      } catch { src = null; }
+      walCache.set(walName, src);
+      return src;
+    };
+    const world = bspToMiniWorld(bsp, { texelFor });
+    const pcx = parsePCX(pakReadFile(pakPath, 'pics/colormap.pcx'));
+    const W = 320, H = 240;
+    const fb = createFramebuffer(W, H, true);
+    const r = new SoftwareRenderer();
+    r.init(fb);
+    r.setPalette(pcx.palette);
+    r.setSkyTexture(strip);
+    r.beginFrame();
+    const stats = r.renderView(
+      {
+        origin: v3(128, -320, 54), angles: v3(0, 90, 0), fovX: 90, time: 1.5,
+        lightStyles: new Float32Array(256).fill(1),
+      },
+      { name: 'base1', data: world },
+      [],
+    );
+    r.endFrame();
+    // Unpinned by design: first run records the hash, later runs eyeball it.
+    console.log(`SKY-PAK base1 spawn-north with unit1_ strip: hash=${fnv(fb.index!)} spans=${stats.spans} pixels=${stats.pixels}`);
+    expect(stats.pixels).toBeGreaterThan(W * H * 0.15);
   });
 });

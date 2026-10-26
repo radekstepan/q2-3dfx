@@ -44,6 +44,14 @@ export interface PredictCmd {
   buttons: number;
 }
 
+/** Inputs-equal ignoring per-cmd msec (chunking is a delivery artifact). */
+function sameInputs(a: PredictCmd, b: PredictCmd): boolean {
+  return (
+    a.forwardmove === b.forwardmove && a.sidemove === b.sidemove &&
+    a.upmove === b.upmove && a.buttons === b.buttons &&
+    a.angles[0] === b.angles[0] && a.angles[1] === b.angles[1] && a.angles[2] === b.angles[2]
+  );
+}
 /** Constant-velocity extrapolation: origin + velocity * dt. */
 export function extrapolateOrigin(origin: Origin3, velocity: Origin3, dt: number): Origin3 {
   return [origin[0] + velocity[0] * dt, origin[1] + velocity[1] * dt, origin[2] + velocity[2] * dt];
@@ -123,50 +131,54 @@ export function CL_PredictPmove(base: Snapshot, localId: number, cmds: PredictCm
     st.viewAngles[1] = ent.angles[1];
     st.viewAngles[2] = ent.angles[2];
   }
-  // Friction-exact coalescing: the server integrates ONE 100ms pmove step
-  // per tick while the predictor replays N ~16ms frame cmds. PM_Friction is
-  // nonlinear in frametime ((1-k*dt)^N != 1-k*N*dt), so per-cmd replay
-  // diverges from the tick it predicts — after stopping, the replayed
-  // origin overshoots then snaps back each tick (the stop jitter). When all
-  // staged inputs are identical (the common settle case: all zeros), merge
-  // them into one step with the summed msec so the replay uses the same
-  // chunking as the server. Mixed inputs keep the per-cmd path.
-  const first = cmds[0]!;
-  let identical = true;
-  for (let i = 1; i < cmds.length; i++) {
-    const c = cmds[i]!;
-    if (
-      c.forwardmove !== first.forwardmove || c.sidemove !== first.sidemove ||
-      c.upmove !== first.upmove || c.buttons !== first.buttons ||
-      c.angles[0] !== first.angles[0] || c.angles[1] !== first.angles[1] || c.angles[2] !== first.angles[2]
-    ) {
-      identical = false;
+  // Zero-velocity snap: mirrors PM_Friction's speed<1 zeroing. A settled
+  // server snapshot carries ~zero velocity, but the stale sample can hold a
+  // small residual (speed<1) that constant-velocity extrapolation — or an
+  // airborne gravity step in the replay — would sweep forward until the next
+  // tick snaps it back (the stop rubber-band). When every staged input is
+  // movement-zero the server's next step holds still too, so return the
+  // snapshot origin exactly instead of integrating residue. Buttons (e.g.
+  // attack) do not move the player, so only forward/side/up are checked.
+  const snapSpeed = Math.sqrt(
+    ent.velocity[0] * ent.velocity[0] +
+    ent.velocity[1] * ent.velocity[1] +
+    ent.velocity[2] * ent.velocity[2],
+  );
+  let allZeroMove = true;
+  for (const c of cmds) {
+    if (c.forwardmove !== 0 || c.sidemove !== 0 || c.upmove !== 0) {
+      allZeroMove = false;
       break;
     }
   }
-  if (identical) {
+  if (snapSpeed < 1 && allZeroMove) return [...ent.origin] as Origin3;
+  // Friction-exact run coalescing: the server integrates ONE 100ms pmove
+  // step per tick while the predictor replays N ~16ms frame cmds, and rAF
+  // delivers those slices with 16/17ms jitter. PM_Friction is nonlinear in
+  // frametime ((1-k*dt)^N != 1-k*N*dt), so per-cmd replay diverges from the
+  // tick it predicts — after stopping, the replayed origin overshoots then
+  // snaps back each tick (the stop jitter). Group consecutive runs of
+  // identical inputs (msec is a delivery artifact, not input) and replay
+  // each run as ONE step with the summed msec (clamped 1..200, exactly as
+  // Pmove does), restoring the server's chunking: a jittered run summing
+  // to 100ms replays bit-identically to the server's single 100ms step,
+  // and a mixed stream (held move + release frame) replays as two steps.
+  let runStart = 0;
+  for (let i = 1; i <= cmds.length; i++) {
+    if (i < cmds.length && sameInputs(cmds[i]!, cmds[runStart]!)) continue;
+    const rep = cmds[runStart]!;
     let total = 0;
-    for (const c of cmds) total += c.msec;
+    for (let j = runStart; j < i; j++) total += cmds[j]!.msec;
     total = Math.max(1, Math.min(200, Math.round(total)));
     pmoveFull(st, {
       msec: total,
-      angles: new Float32Array(first.angles),
-      forwardmove: first.forwardmove,
-      sidemove: first.sidemove,
-      upmove: first.upmove,
-      buttons: first.buttons,
+      angles: new Float32Array(rep.angles),
+      forwardmove: rep.forwardmove,
+      sidemove: rep.sidemove,
+      upmove: rep.upmove,
+      buttons: rep.buttons,
     });
-    return [st.origin[0]!, st.origin[1]!, st.origin[2]!];
-  }
-  for (const c of cmds) {
-    pmoveFull(st, {
-      msec: c.msec,
-      angles: new Float32Array(c.angles),
-      forwardmove: c.forwardmove,
-      sidemove: c.sidemove,
-      upmove: c.upmove,
-      buttons: c.buttons,
-    });
+    runStart = i;
   }
   return [st.origin[0]!, st.origin[1]!, st.origin[2]!];
 }

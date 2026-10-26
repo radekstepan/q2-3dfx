@@ -202,7 +202,14 @@ export function sampleLightBlock(lb: LightBlock, lu: number, lv: number): number
 export function textureMasks(tex: Texture): { wshift: number; wmask: number; hmask: number } {
   let wshift = 0;
   while ((1 << wshift) < tex.width) wshift++;
-  return { wshift, wmask: tex.width - 1, hmask: tex.height - 1 };
+  // Height need not be POT: the packed sky strip is 6*tileH (e.g. 64x384,
+  // 256x1536 for real art). height-1 would strip bit 7 for v in [128,256)
+  // (136&383=8), aliasing sky tiles 2..3 onto tiles 0..1. Mask up to the next
+  // POT instead so every in-range v passes through untouched; POT heights are
+  // exactly what height-1 gave. Widths stay POT (enforced at registration).
+  let hbits = 0;
+  while ((1 << hbits) < tex.height) hbits++;
+  return { wshift, wmask: tex.width - 1, hmask: (1 << hbits) - 1 };
 }
 
 /**

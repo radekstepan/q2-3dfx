@@ -184,6 +184,112 @@ describe('pmove prediction (TODO(M6.1) hookup)', () => {
     }
   });
 
+  it('msec-tolerant run coalescing matches the server tick exactly (rAF jitter + release)', () => {
+    resetPmoveWorld();
+    setCVar('cl_predict', 1);
+    try {
+      const base: Snapshot = {
+        serverTime: 1.0,
+        entities: [{ id: 1, origin: [0, 0, 0], velocity: [0, 0, 0] }],
+      };
+      const fwd = (msec: number): PredictCmd => ({
+        msec,
+        angles: [0, 90, 0],
+        forwardmove: 400,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 0,
+      });
+      // Six jittered rAF slices summing to exactly 100ms predict exactly the
+      // server's single 100ms step (msec split is a delivery artifact).
+      const jittered = [16, 17, 16, 17, 17, 17].map(fwd);
+      const predicted = CL_PredictPmove(base, 1, jittered);
+      const server = makePmoveState();
+      pmove(server, {
+        msec: 100,
+        angles: new Float32Array([0, 90, 0]),
+        forwardmove: 400,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 0,
+      });
+      expect(predicted).toEqual([server.origin[0], server.origin[1], server.origin[2]]);
+      // Held move + release frame replays as two summed runs, exactly the
+      // chunked reference (per-cmd friction would diverge instead).
+      const zero = (msec: number): PredictCmd => ({
+        msec,
+        angles: [0, 90, 0],
+        forwardmove: 0,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 0,
+      });
+      const mixed = [...[16, 17, 16, 17, 16].map(fwd), zero(18)];
+      const mixedPred = CL_PredictPmove(base, 1, mixed);
+      const ref = makePmoveState();
+      pmove(ref, {
+        msec: 82,
+        angles: new Float32Array([0, 90, 0]),
+        forwardmove: 400,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 0,
+      });
+      pmove(ref, {
+        msec: 18,
+        angles: new Float32Array([0, 90, 0]),
+        forwardmove: 0,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 0,
+      });
+      expect(mixedPred).toEqual([ref.origin[0], ref.origin[1], ref.origin[2]]);
+      // And the two-step run replay genuinely differs from naive per-cmd
+      // replay (friction is nonlinear in frametime), so the merge matters.
+      const naive = makePmoveState();
+      for (const c of mixed) {
+        pmove(naive, {
+          msec: c.msec,
+          angles: new Float32Array(c.angles),
+          forwardmove: c.forwardmove,
+          sidemove: c.sidemove,
+          upmove: c.upmove,
+          buttons: c.buttons,
+        });
+      }
+      expect([naive.origin[0], naive.origin[1], naive.origin[2]]).not.toEqual(mixedPred);
+    } finally {
+      setCVar('cl_predict', 1);
+      resetPmoveWorld();
+    }
+  });
+
+  it('zero-velocity snap holds the snapshot origin on all-zero inputs', () => {
+    resetPmoveWorld();
+    setCVar('cl_predict', 1);
+    try {
+      // Residual velocity below PM_Friction's speed<1 zeroing threshold with
+      // released inputs: the replay must not sweep forward (or sink via an
+      // airborne gravity step) — it holds the snapshot origin exactly.
+      const base: Snapshot = {
+        serverTime: 1.0,
+        entities: [{ id: 1, origin: [100, 5, -24], velocity: [0.5, 0, 0] }],
+      };
+      const zeros: PredictCmd[] = [16, 17, 16, 17].map((msec) => ({
+        msec,
+        angles: [0, 0, 0] as [number, number, number],
+        forwardmove: 0,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 0,
+      }));
+      expect(CL_PredictPmove(base, 1, zeros)).toEqual([100, 5, -24]);
+    } finally {
+      setCVar('cl_predict', 1);
+      resetPmoveWorld();
+    }
+  });
+
   it('CL_PredictPmove returns null for unknown ids / empty streams', () => {
     expect(CL_PredictPmove(snap(1.0, 0), 999, recordedCmds())).toBeNull();
     expect(CL_PredictPmove(snap(1.0, 0), 1, [])).toBeNull();

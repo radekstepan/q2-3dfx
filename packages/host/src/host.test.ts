@@ -8,11 +8,13 @@ import type { Entity, Framebuffer, FrameStats, Refresh, RefDef, WorldModel } fro
 /** Minimal Refresh that captures the camera origin of each rendered view. */
 class CaptureRefresh implements Refresh {
   lastOrigin: [number, number, number] | null = null;
+  lastAngles: [number, number, number] | null = null;
   lastEntities: Entity[] | null = null;
   init(_fb: Framebuffer): void {}
   beginFrame(): void {}
   renderView(view: RefDef, _world: WorldModel, entities: Entity[]): FrameStats {
     this.lastOrigin = [view.origin[0]!, view.origin[1]!, view.origin[2]!];
+    this.lastAngles = [view.angles[0]!, view.angles[1]!, view.angles[2]!];
     this.lastEntities = entities;
     return { spans: 0, pixels: 0, overdraw: 1, ms: 0 };
   }
@@ -138,6 +140,29 @@ describe('host loop', () => {
       xs.push(refresh.lastOrigin![0]);
     }
     for (const x of xs) expect(x).toBeCloseTo(100, 3);
+
+    // Residual velocity below PM_Friction's speed<1 zeroing threshold with
+    // released inputs: the zero-velocity snap in CL_PredictPmove holds the
+    // snapshot origin exactly instead of sweeping forward on stale residue.
+    const driftDriver: HostDriver = {
+      spawn: () => ({ origin: [100, 0, 0] }),
+      step: () => {},
+      snapshot: (t: number) => ({
+        serverTime: t,
+        entities: [{ id: 1, origin: [100, 0, 0] as [number, number, number], velocity: [0.5, 0, 0] as [number, number, number] }],
+      }),
+    };
+    const driftRefresh = new CaptureRefresh();
+    const driftHost = new Host({ refresh: driftRefresh, width: 64, height: 48, driver: driftDriver });
+    let dnow = 0;
+    driftHost.frame(dnow);
+    const dxs: number[] = [];
+    for (let i = 1; i <= 30; i++) {
+      dnow += 16;
+      driftHost.frame(dnow);
+      dxs.push(driftRefresh.lastOrigin![0]);
+    }
+    for (const x of dxs) expect(x).toBeCloseTo(100, 3);
   });
 
   it('viewmodel sits at the eye with full view angles (CL_AddViewWeapon)', () => {
@@ -187,6 +212,57 @@ describe('host loop', () => {
       gun.origin[0]! - eye[0]!, gun.origin[1]! - eye[1]!, gun.origin[2]! - eye[2]!,
     );
     expect(dist).toBeCloseTo(VIEWMODEL_FORWARD, 5);
+  });
+
+  it('viewKick offsets the camera for one tick, gun rides the kicked view + sway', () => {
+    // RF/gunoffset-lite: viewKick adds a one-tick camera offset (p_weapon.c
+    // kick via p_view.c SV_CalcGunOffset) to the RefDef angles/origin; the
+    // driver clears it next tick. gunAnglesDelta adds sway/turn-lag to the
+    // eye-anchored viewmodel entity angles. Absent hooks render as before.
+    let kicks = 0;
+    const driver: HostDriver = {
+      spawn: () => ({ origin: [0, 0, 0] }),
+      step: () => {},
+      snapshot: (t: number) => ({
+        serverTime: t,
+        entities: [{ id: 1, origin: [0, 0, 0] as [number, number, number], velocity: [0, 0, 0] as [number, number, number] }],
+      }),
+      viewModel: () => ({ model: 5, skin: 2, frame: 9 }),
+      viewKick: () => {
+        kicks += 1;
+        return kicks === 1 ? { angles: [-2, 1, 0], origin: [0, 0, 1] } : null;
+      },
+      gunAnglesDelta: () => [1, 2, 3],
+    };
+    const refresh = new CaptureRefresh();
+    const host = new Host({ refresh, width: 64, height: 48, driver });
+    host.lastCmd = { msec: 16, angles: [10, 20, 30], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
+    const eye = calcViewOrigin([0, 0, 0]);
+
+    host.renderCurrentView();
+    // RefDef = base view + kick.
+    expect(refresh.lastAngles!).toEqual([8, 21, 30]);
+    expect(refresh.lastOrigin![0]).toBeCloseTo(eye[0]!, 5);
+    expect(refresh.lastOrigin![1]).toBeCloseTo(eye[1]!, 5);
+    expect(refresh.lastOrigin![2]).toBeCloseTo(eye[2]! + 1, 5);
+    // Gun rides the kicked view: eye anchor + kicked origin, full kicked
+    // view angles + sway delta, depthHack set.
+    const gun = refresh.lastEntities!.find((e) => e.model === 5);
+    expect(gun).toBeDefined();
+    expect(Array.from(gun!.angles)).toEqual([9, 23, 33]);
+    expect(gun!.depthHack).toBe(true);
+    for (let k = 0; k < 3; k++) {
+      expect(gun!.origin[k]!).toBeCloseTo(refresh.lastOrigin![k]!, 5);
+    }
+
+    // Driver cleared the kick: next frame is the unkicked base view, but the
+    // sway delta still applies to the gun.
+    host.renderCurrentView();
+    expect(refresh.lastAngles!).toEqual([10, 20, 30]);
+    expect(refresh.lastOrigin![2]).toBeCloseTo(eye[2]!, 5);
+    const gun2 = refresh.lastEntities!.find((e) => e.model === 5);
+    expect(Array.from(gun2!.angles)).toEqual([11, 22, 33]);
+    expect(gun2!.depthHack).toBe(true);
   });
 
   it('propagates per-entity yaw and model/skin, defaults to legacy zeros', () => {
