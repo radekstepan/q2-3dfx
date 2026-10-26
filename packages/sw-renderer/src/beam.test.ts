@@ -100,4 +100,46 @@ describe('blaster beam look (yellow core + orange surround)', () => {
     // Longer beams land strictly more core pixels (no truncation).
     expect(countCore(120)).toBeGreaterThan(countCore(30) + 40);
   });
+
+  it('a spawned beam expires after its ttl frames (no lingering bolts)', () => {
+    const W = 320, H = 240;
+    const fb = createFramebuffer(W, H, true);
+    const r = new SoftwareRenderer();
+    r.init(fb);
+    r.setPalette(defaultPalette());
+    const view = {
+      origin: new Float32Array([0, 0, 0]), angles: new Float32Array([0, 0, 0]),
+      fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1),
+    };
+    const world = { name: 'beam', data: emptyWorld() };
+    const frame = (): void => {
+      r.beginFrame();
+      r.renderView(view, world, []);
+      r.endFrame();
+    };
+    const beamPixels = (): number => {
+      let n = 0;
+      const idx = fb.index!;
+      for (let i = 0; i < idx.length; i++) {
+        if (idx[i] === TRACER_CORE_COLOR || idx[i] === BEAM_GLOW) n++;
+      }
+      return n;
+    };
+    // ttl 6 (TRACER_TTL_FRAMES): drawn for 6 renders, gone by the 7th.
+    expect(r.spawnTracer(new Float32Array([100, -60, 0]), new Float32Array([0, 1, 0]), BEAM_GLOW, 120, 6)).toBe(true);
+    for (let i = 0; i < 5; i++) {
+      frame();
+      expect(r.testTracerCount()).toBe(1);
+      expect(beamPixels()).toBeGreaterThan(100);
+    }
+    frame(); // 6th render: still drawn (ttl 1 -> 0), pool empty afterwards
+    expect(beamPixels()).toBeGreaterThan(100);
+    expect(r.testTracerCount()).toBe(0);
+    frame(); // 7th render: fully expired, nothing lands
+    expect(r.testTracerCount()).toBe(0);
+    expect(beamPixels()).toBe(0);
+    frame();
+    expect(r.testTracerCount()).toBe(0);
+    expect(beamPixels()).toBe(0);
+  });
 });

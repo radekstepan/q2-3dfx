@@ -17,9 +17,10 @@ import {
   processBandJob,
   splitBands,
 } from './bands.js';
+import { setupCamera } from './camera.js';
 import {
-  SKY_SIDE_IMAGE, SKY_TILE_SUFFIXES,
-  isValidSkySize, skyFaceForDir, skyUvForDir,
+  SKY_BOX_CORNERS, SKY_BOX_HALF, SKY_SIDE_IMAGE, SKY_TILE_SUFFIXES,
+  isValidSkySize, skyFaceForDir, skyUvForDir, skyUvOnFace,
 } from './sky.js';
 import { SoftwareBackend } from './spans.js';
 import { WasmSpanBackend } from './wasmSpans.js';
@@ -248,16 +249,19 @@ describe('textured skybox (setSkyTexture, ref_soft R_EmitSkyBox/D_SkySurf)', () 
     expect(textured.stats.hits).toBe(0);
   });
 
-  it('corner-spanning polys never smear across uninvolved tiles (lava regression)', () => {
-    // A world sky quad straddling the +X/+Z edge has verts in two box-face
-    // pyramids (face 4/rt -> strip tile 0, face 2/up -> strip tile 4).
-    // Old per-vertex UV + perspective interpolation swept v continuously
-    // across the packed strip, dragging tiles 1..3 (incl. the bk black
-    // bands) over orange faces = black lava streaks. Fan-triangulated
-    // single-face sampling (skyUvOnFace per tri centroid) can only ever
-    // emit the fragment's own tile.
+  it('corner-spanning polys sample the geometrically correct face per pixel', () => {
+    // A world sky quad straddling the +X/+Z box edge. With flat tiles the
+    // correct output is fully determined: every rendered pixel must carry
+    // the tile of the box face its camera ray actually pierces (id
+    // R_EmitSkyBox rasterises the 6 faces separately, so span interpolation
+    // can never sweep across tile boundaries). Single-face centroid
+    // fan-triangulation smears whole triangles with the wrong tile instead.
     const tex = stripTexture();
-    const verts = new Float32Array([60, 10, 30, 60, 10, 90, 10, 10, 90, 10, 10, 30]);
+    // Wall at x=40 spanning y in [-120,30]: its on-screen part is pierced
+    // only by +X (face 4/rt) rays, but the fan triangle (v0,v2,v3) has its
+    // centroid deep in -Y (face 5/ft) land, so centroid sampling paints the
+    // whole on-screen fragment with the wrong tile.
+    const verts = new Float32Array([40, -120, 0, 40, 30, 0, 40, 30, 60, 40, -120, 60]);
     const world: MiniWorld = {
       brand: 'miniworld',
       nodes: [],
@@ -269,8 +273,8 @@ describe('textured skybox (setSkyTexture, ref_soft R_EmitSkyBox/D_SkySurf)', () 
         uvs: new Float32Array([0, 0, 64, 0, 64, 64, 0, 64]),
         lux: new Float32Array([0, 0, 4, 0, 4, 4, 0, 4]),
         n: 4, texId: 0, lightId: 0,
-        center: new Float32Array([35, 10, 60]), radius: 90,
-        mins: new Float32Array([10, 10, 30]), maxs: new Float32Array([60, 10, 90]),
+        center: new Float32Array([40, -45, 30]), radius: 120,
+        mins: new Float32Array([40, -120, 0]), maxs: new Float32Array([40, 30, 60]),
         turbulent: false, sky: true,
         fn: new Float32Array([0, 1, 0]),
       }],
@@ -287,21 +291,51 @@ describe('textured skybox (setSkyTexture, ref_soft R_EmitSkyBox/D_SkySurf)', () 
     r.init(fb);
     r.setPalette(skyPalette());
     r.setSkyTexture(tex);
+    const origin = new Float32Array([0, 0, 30]);
+    const angles = new Float32Array([0, 0, 0]);
     r.beginFrame();
     r.renderView(
-      {
-        origin: new Float32Array([0, 0, 30]), angles: new Float32Array([0, 0, 0]),
-        fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1),
-      },
+      { origin, angles, fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1) },
       { name: 'sky-corner', data: world },
       [],
     );
     r.endFrame();
-    const seen = new Set<number>(fb.index!);
-    // Only background 0 + the fragment tiles may appear: never the
-    // in-between strip tiles (30/50/70) nor the far tiles (90/110).
-    for (const px of seen) expect([0, 10, 90]).toContain(px);
-    expect(seen.has(10)).toBe(true);
+    // Expected tile per pixel from the camera ray. Pixels whose center ray
+    // lands within half a pixel of a box edge may rasterise from the
+    // neighbour face, so the 4-neighbour rays are accepted too — but a
+    // wrong-face triangle is dozens of pixels wide and matches neither.
+    const cam = setupCamera(origin, angles, 90, W, H);
+    const rayTile = (px: number, py: number): number => {
+      const vx = (px - cam.xCenter) / cam.focalX;
+      const vy = -(py - cam.yCenter) / cam.focalY;
+      const dx = cam.right[0]! * vx + cam.up[0]! * vy + cam.forward[0]!;
+      const dy = cam.right[1]! * vx + cam.up[1]! * vy + cam.forward[1]!;
+      const dz = cam.right[2]! * vx + cam.up[2]! * vy + cam.forward[2]!;
+      return SKY_SIDE_IMAGE[skyFaceForDir(dx, dy, dz)]!;
+    };
+    let checked = 0, strict = 0;
+    const bad: number[] = [];
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const got = fb.index![y * W + x]!;
+        if (got === 0) continue; // occluded background (none in this world)
+        checked++;
+        const want = 10 + rayTile(x + 0.5, y + 0.5) * 20;
+        if (got === want) {
+          strict++;
+          continue;
+        }
+        const near: number[] = [want];
+        if (x > 0) near.push(10 + rayTile(x - 0.5, y + 0.5) * 20);
+        if (x + 1 < W) near.push(10 + rayTile(x + 1.5, y + 0.5) * 20);
+        if (y > 0) near.push(10 + rayTile(x + 0.5, y - 0.5) * 20);
+        if (y + 1 < H) near.push(10 + rayTile(x + 0.5, y + 1.5) * 20);
+        if (!near.includes(got) && bad.length < 8) bad.push((y * W + x) | 0);
+      }
+    }
+    expect(checked).toBeGreaterThan(160 * 120 * 0.2);
+    expect(bad).toEqual([]);
+    expect(strict / checked).toBeGreaterThan(0.99);
   });
 
   it('is stable across frames and view time (ref_soft has no sky scroll)', () => {
@@ -378,5 +412,68 @@ describe('skybox mapping units (id r_rast.c box faces)', () => {
     expect(isValidSkySize(100, 600)).toBe(false); // non-POT width
     expect(isValidSkySize(64, 385)).toBe(false); // not a multiple of 6
     expect(isValidSkySize(0, 0)).toBe(false);
+  });
+
+  it('adjacent faces meet at shared edges (continuity, no tile bleed)', () => {
+    // Inverts the box mapping back to 3D: tile texel (u,v) on face f is the
+    // box point 128*N + S*a + T*b with a/b from the normalized texel. Both
+    // faces sharing an edge must invert to the SAME 3D point (up to the
+    // 1/256-texel clamp epsilon) — a flipped axis/sign would land on the
+    // wrong edge and open a visible seam under real art. UVs must also stay
+    // inside their own tile for every direction (clamped, never bleeding).
+    const sAxis = [
+      [0, -1, 0], [0, 1, 0], [0, -1, 0], [1, 0, 0], [0, -1, 0], [-1, 0, 0],
+    ];
+    const tAxis = [
+      [-1, 0, 0], [0, 0, -1], [1, 0, 0], [0, 0, -1], [0, 0, -1], [0, 0, -1],
+    ];
+    const normal = [
+      [0, 0, -1], [-1, 0, 0], [0, 0, 1], [0, 1, 0], [1, 0, 0], [0, -1, 0],
+    ];
+    const invert = (face: number, u: number, v: number, tile: number): number[] => {
+      const S = sAxis[face]!, T = tAxis[face]!, N = normal[face]!;
+      const strip = SKY_SIDE_IMAGE[face]!;
+      const a = ((u / tile) * 2 - 1) * 128;
+      const b = (((v - strip * tile) / tile) * 2 - 1) * 128;
+      return [
+        N[0]! * 128 + S[0]! * a + T[0]! * b,
+        N[1]! * 128 + S[1]! * a + T[1]! * b,
+        N[2]! * 128 + S[2]! * a + T[2]! * b,
+      ];
+    };
+    const edges: Array<[number, number, number[]]> = [
+      [4, 2, [1, 0, 1]], [4, 0, [1, 0, -1]], [4, 3, [1, 1, 0]], [4, 5, [1, -1, 0]],
+      [1, 2, [-1, 0, 1]], [1, 0, [-1, 0, -1]], [1, 3, [-1, 1, 0]], [1, 5, [-1, -1, 0]],
+      [2, 3, [0, 1, 1]], [2, 5, [0, -1, 1]], [0, 3, [0, 1, -1]], [0, 5, [0, -1, -1]],
+    ];
+    const out = { u: 0, v: 0 };
+    const tile = 64;
+    for (const [fa, fb, d] of edges) {
+      skyUvOnFace(d[0]!, d[1]!, d[2]!, fa, tile, tile, out);
+      const A = invert(fa, out.u, out.v, tile);
+      skyUvOnFace(d[0]!, d[1]!, d[2]!, fb, tile, tile, out);
+      const B = invert(fb, out.u, out.v, tile);
+      const err = Math.hypot(A[0]! - B[0]!, A[1]! - B[1]!, A[2]! - B[2]!);
+      expect(err).toBeLessThan(0.1); // clamp epsilon is ~0.02 box units
+    }
+    // No bleed: a dense direction grid stays inside its selected tile.
+    for (let ix = -8; ix <= 8; ix++) {
+      for (let iy = -8; iy <= 8; iy++) {
+        for (let iz = -8; iz <= 8; iz++) {
+          if (ix === 0 && iy === 0 && iz === 0) continue;
+          const face = skyFaceForDir(ix, iy, iz);
+          skyUvOnFace(ix, iy, iz, face, tile, tile, out);
+          const strip = SKY_SIDE_IMAGE[face]!;
+          expect(out.u).toBeGreaterThanOrEqual(0);
+          expect(out.u).toBeLessThan(tile);
+          expect(out.v).toBeGreaterThanOrEqual(strip * tile);
+          expect(out.v).toBeLessThan((strip + 1) * tile);
+        }
+      }
+    }
+    // Box corners regroup to the same 6 faces (emission table sanity).
+    expect(SKY_BOX_CORNERS.length).toBe(6);
+    expect(SKY_BOX_HALF).toBe(16384);
+    for (let f = 0; f < 6; f++) expect(SKY_BOX_CORNERS[f]!.length).toBe(12);
   });
 });

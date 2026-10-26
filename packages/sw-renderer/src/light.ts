@@ -37,7 +37,13 @@ export const LIGHT_OVERBRIGHT = 1;
  * samples: RGB luxels (w*h*3, 0..255). styleScales: per-style 0..2 multipliers
  * (from RefDef.lightStyles at the surface's style indices, 255 slots already
  * filtered by the caller). Empty scales fall back to 1 (unlit default).
- * dlights: dynamic lights with world-space surfCenter for falloff.
+ * dlights: dynamic lights; dlightBits selects the affecting ones (bit d for
+ * dlights[d], as set by DLightState.markLights).
+ * surfCenter: legacy single-point falloff reference (whole-surface boost).
+ * luxelPos: optional per-luxel world-space centers (w*h*3, row-major) for
+ * per-luxel falloff (id R_AddDynamicLights computes per-luxel: a point light
+ * only affects nearby luxels). When absent, every luxel uses surfCenter
+ * (legacy uniform boost; keeps the no-geometry unit-test path stable).
  * overbright: pre-clamp modulate (default LIGHT_OVERBRIGHT = 1).
  */
 export function buildLightMap(
@@ -50,6 +56,7 @@ export function buildLightMap(
   surfCenter: Float32Array,
   dlightBits: number,
   overbright = LIGHT_OVERBRIGHT,
+  luxelPos?: Float32Array | null,
 ): void {
   // id R_BuildLightMap sums one scaled block per valid style; the samples
   // here carry a single baked block, so the per-style scales add up. The sum
@@ -58,6 +65,7 @@ export function buildLightMap(
   for (let k = 0; k < styleScales.length; k++) styleScale += styleScales[k]!;
   if (styleScales.length === 0) styleScale = 1;
   const n = w * h;
+  const perLuxel = luxelPos && luxelPos.length >= n * 3 ? luxelPos : null;
   for (let i = 0; i < n; i++) {
     const r = samples[i * 3]! / 255;
     const g = samples[i * 3 + 1]! / 255;
@@ -65,13 +73,18 @@ export function buildLightMap(
     // luma of the static sample, scaled by the summed lightstyles
     // (overbright-style modulate happens here, before the grade clamp)
     let l = (0.299 * r + 0.587 * g + 0.114 * b) * styleScale * overbright;
-    // dynamic lights: linear falloff from the surface center (R_AddDynamicLights)
+    // dynamic lights: linear falloff from the luxel position
+    // (R_AddDynamicLights). Per-luxel world pos when the caller supplies
+    // the fitted grid, else the legacy single surfCenter for all luxels.
     for (let d = 0; d < dlights.length; d++) {
       if (((dlightBits >> d) & 1) === 0) continue;
       const dl = dlights[d]!;
-      const dx = dl.origin[0]! - surfCenter[0]!;
-      const dy = dl.origin[1]! - surfCenter[1]!;
-      const dz = dl.origin[2]! - surfCenter[2]!;
+      const px = perLuxel ? perLuxel[i * 3]! : surfCenter[0]!;
+      const py = perLuxel ? perLuxel[i * 3 + 1]! : surfCenter[1]!;
+      const pz = perLuxel ? perLuxel[i * 3 + 2]! : surfCenter[2]!;
+      const dx = dl.origin[0]! - px;
+      const dy = dl.origin[1]! - py;
+      const dz = dl.origin[2]! - pz;
       const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
       const rad = dl.intensity;
       if (dist < rad) {
@@ -83,6 +96,107 @@ export function buildLightMap(
     if (l < 0) l = 0;
     if (l > 1) l = 1;
     out[i] = Math.round(l * 63);
+  }
+}
+
+/**
+ * Fit world-space positions for every luxel of a surface lightmap grid.
+ * The surface is planar, so world xyz is an exact affine function of the
+ * per-vertex luxel coords (lux = (uv - base)/16, see bspWorld): solve the
+ * map from the first non-collinear vertex triple, then evaluate at luxel
+ * centers (s+0.5, t+0.5). Degenerate input (n < 3, all verts sharing one
+ * luxel, NaN) falls back to `center` for every luxel — never NaN, never
+ * throws. `out` must hold at least w*h*3 floats. No allocation.
+ */
+export function luxelWorldPositions(
+  verts: Float32Array,
+  lux: Float32Array,
+  n: number,
+  w: number,
+  h: number,
+  center: Float32Array,
+  out: Float32Array,
+): void {
+  const need = w * h * 3;
+  const fillCenter = (): void => {
+    const cx = center[0] ?? 0, cy = center[1] ?? 0, cz = center[2] ?? 0;
+    for (let i = 0; i < need; i += 3) {
+      out[i] = cx;
+      out[i + 1] = cy;
+      out[i + 2] = cz;
+    }
+  };
+  if (!(n >= 3) || !(w >= 1) || !(h >= 1) || out.length < need) {
+    if (out.length >= need) fillCenter();
+    return;
+  }
+  // First non-collinear triple in luxel space defines the exact affine map.
+  const s0 = lux[0]!, t0 = lux[1]!;
+  let i1 = -1, i2 = -1;
+  let ds1 = 0, dt1 = 0, ds2 = 0, dt2 = 0;
+  if (!Number.isFinite(s0) || !Number.isFinite(t0)) {
+    fillCenter();
+    return;
+  }
+  outer: for (let a = 1; a < n; a++) {
+    const sa = lux[a * 2]!, ta = lux[a * 2 + 1]!;
+    if (!Number.isFinite(sa) || !Number.isFinite(ta)) continue;
+    for (let b = a + 1; b < n; b++) {
+      const sb = lux[b * 2]!, tb = lux[b * 2 + 1]!;
+      if (!Number.isFinite(sb) || !Number.isFinite(tb)) continue;
+      const e1s = sa - s0, e1t = ta - t0;
+      const e2s = sb - s0, e2t = tb - t0;
+      const area2 = e1s * e2t - e2s * e1t;
+      // Scale-relative collinearity reject (luxel units can be large).
+      const m1 = e1s * e1s + e1t * e1t;
+      const m2 = e2s * e2s + e2t * e2t;
+      if (area2 * area2 > 1e-12 * m1 * m2) {
+        i1 = a;
+        i2 = b;
+        ds1 = e1s;
+        dt1 = e1t;
+        ds2 = e2s;
+        dt2 = e2t;
+        break outer;
+      }
+    }
+  }
+  if (i1 < 0) {
+    fillCenter();
+    return;
+  }
+  const det = ds1 * dt2 - ds2 * dt1;
+  if (!(Math.abs(det) > 0)) {
+    fillCenter();
+    return;
+  }
+  const inv = 1 / det;
+  const p0x = verts[0]!, p0y = verts[1]!, p0z = verts[2]!;
+  const a1x = verts[i1 * 3]! - p0x, a1y = verts[i1 * 3 + 1]! - p0y, a1z = verts[i1 * 3 + 2]! - p0z;
+  const a2x = verts[i2 * 3]! - p0x, a2y = verts[i2 * 3 + 1]! - p0y, a2z = verts[i2 * 3 + 2]! - p0z;
+  if (!Number.isFinite(a1x + a1y + a1z + a2x + a2y + a2z + p0x + p0y + p0z)) {
+    fillCenter();
+    return;
+  }
+  // A = [P1-P0, P2-P0] * M^-1, c = P0 - A*[s0, t0]; eval at centers.
+  const m00 = dt2 * inv, m01 = -ds2 * inv;
+  const m10 = -dt1 * inv, m11 = ds1 * inv;
+  const axx = a1x * m00 + a2x * m10, axy = a1x * m01 + a2x * m11;
+  const ayx = a1y * m00 + a2y * m10, ayy = a1y * m01 + a2y * m11;
+  const azx = a1z * m00 + a2z * m10, azy = a1z * m01 + a2z * m11;
+  const cx = p0x - (axx * s0 + axy * t0);
+  const cy = p0y - (ayx * s0 + ayy * t0);
+  const cz = p0z - (azx * s0 + azy * t0);
+  let o = 0;
+  for (let t = 0; t < h; t++) {
+    const lt = t + 0.5;
+    for (let s = 0; s < w; s++) {
+      const ls = s + 0.5;
+      out[o] = axx * ls + axy * lt + cx;
+      out[o + 1] = ayx * ls + ayy * lt + cy;
+      out[o + 2] = azx * ls + azy * lt + cz;
+      o += 3;
+    }
   }
 }
 
@@ -134,6 +248,7 @@ export class DLightState {
   frame = 0;
 
   clear(): void {
+    if (this.lights.length === 0) return;
     this.lights.length = 0;
     this.ttl.length = 0;
     this.serial++;

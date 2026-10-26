@@ -1,8 +1,11 @@
 // M3.2 tests: R_BuildLightMap equivalent + LRU surface cache.
 import { describe, expect, it } from 'vitest';
-import { buildLightMap, combineStyleScales, DLightState, bboxDistance } from './light.js';
+import { createFramebuffer } from '@q2/renderer-api';
+import { buildLightMap, combineStyleScales, DLightState, bboxDistance, luxelWorldPositions } from './light.js';
 import { DEFAULT_DLIGHT_TTL_FRAMES, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED } from './light.js';
 import { SurfaceCache, hashLightStyles, surfaceCacheKey } from './surfaceCache.js';
+import { SoftwareRenderer } from './frame.js';
+import type { MiniWorld } from './worldNodes.js';
 
 function flatSamples(w: number, h: number, v: number): Uint8Array {
   const s = new Uint8Array(w * h * 3);
@@ -92,6 +95,61 @@ describe('buildLightMap', () => {
     buildLightMap(out, flatSamples(1, 1, 64), 1, 1, [1], [dl], new Float32Array([0, 0, 0]), 1);
     // dist 1000 > 10 -> no contribution; 64/255=0.251 -> 16
     expect(out[0]).toBe(16);
+  });
+});
+
+describe('luxelWorldPositions (per-luxel dlight falloff grid)', () => {
+  // Quad in the z=0 plane, x in [0,64], y in [0,16]; lux = (uv-base)/16.
+  const verts = new Float32Array([0, 0, 0, 64, 0, 0, 64, 16, 0, 0, 16, 0]);
+  const lux = new Float32Array([0, 0, 4, 0, 4, 1, 0, 1]);
+  const center = new Float32Array([32, 8, 0]);
+
+  it('fits exact world pos at luxel centers for a planar quad', () => {
+    const out = new Float32Array(4 * 1 * 3);
+    luxelWorldPositions(verts, lux, 4, 4, 1, center, out);
+    expect([...out]).toEqual([
+      8, 8, 0,
+      24, 8, 0,
+      40, 8, 0,
+      56, 8, 0,
+    ]);
+  });
+
+  it('a point light only affects nearby luxels, not the whole surface', () => {
+    const w = 4, h = 1;
+    const samples = new Uint8Array(w * h * 3); // black static: base grade 0
+    const pos = new Float32Array(w * h * 3);
+    luxelWorldPositions(verts, lux, 4, w, h, center, pos);
+    const out = new Uint8Array(w * h);
+    // light at luxel-0 center, radius 32: covers luxels 0 (fully) and 1 (half)
+    const dl = { origin: new Float32Array([8, 8, 0]), intensity: 32, color: new Float32Array([1, 1, 1]) };
+    buildLightMap(out, samples, w, h, [1], [dl], center, 1, 1, pos);
+    // dists 0/16/32/48 -> f 1/0.5/0/0 -> grades 63/31/0/0 (31: fp luma sum)
+    expect([...out]).toEqual([63, 31, 0, 0]);
+  });
+
+  it('legacy center path stays uniform when no luxel grid is supplied', () => {
+    const w = 4, h = 1;
+    const samples = new Uint8Array(w * h * 3);
+    const out = new Uint8Array(w * h);
+    const dl = { origin: new Float32Array([8, 8, 0]), intensity: 32, color: new Float32Array([1, 1, 1]) };
+    buildLightMap(out, samples, w, h, [1], [dl], center, 1);
+    // dist(center, light) = 24 -> f = 0.25 -> every luxel 16
+    expect([...out]).toEqual([16, 16, 16, 16]);
+  });
+
+  it('degenerate lux mapping falls back to center, never NaN', () => {
+    const out = new Float32Array(2 * 2 * 3);
+    const dv = new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]);
+    const dl = new Float32Array([5, 5, 5, 5, 5, 5]); // all verts one luxel
+    luxelWorldPositions(dv, dl, 3, 2, 2, center, out);
+    for (const v of out) expect(Number.isFinite(v)).toBe(true);
+    expect([...out]).toEqual([32, 8, 0, 32, 8, 0, 32, 8, 0, 32, 8, 0]);
+    const grades = new Uint8Array(4);
+    buildLightMap(grades, new Uint8Array(12), 2, 2, [1],
+      [{ origin: new Float32Array([32, 8, 0]), intensity: 10, color: new Float32Array([1, 1, 1]) }],
+      center, 1, 1, out);
+    expect([...grades]).toEqual([63, 63, 63, 63]);
   });
 });
 
@@ -197,6 +255,18 @@ describe('DLightState expiry (muzzle-leak fix, renderer side)', () => {
     expect(st.count).toBe(0);
     expect(st.expireStaleLights()).toBe(0);
   });
+
+  it('clear() on an idle list bumps no serial (stays cache-hot)', () => {
+    const st = new DLightState();
+    const s0 = st.serial;
+    st.clear();
+    expect(st.serial).toBe(s0);
+    st.addLight(mk(200));
+    st.clear();
+    expect(st.serial).toBe(s0 + 2); // one add bump + one drop bump
+    st.clear();
+    expect(st.serial).toBe(s0 + 2);
+  });
 });
 
 describe('SurfaceCache', () => {
@@ -249,5 +319,91 @@ describe('SurfaceCache', () => {
   it('hashLightStyles is deterministic and sensitive', () => {
     expect(hashLightStyles([1, 1])).toBe(hashLightStyles([1, 1]));
     expect(hashLightStyles([1, 0.5])).not.toBe(hashLightStyles([1, 1]));
+  });
+});
+
+describe('per-luxel dynamic light (full render path)', () => {
+  it('a blaster impact lights nearby luxels, not the whole surface', () => {
+    // Quad at x=100 facing the camera (-X normal). y in [-32,32] maps to
+    // screen columns (screen-left = +Y), z in [-8,8]. Static lightmap is
+    // black, texture flat mid-grey: every lit pixel comes from the dlight.
+    const verts = new Float32Array([
+      100, -32, -8, 100, 32, -8, 100, 32, 8, 100, -32, 8,
+    ]);
+    const world: MiniWorld = {
+      brand: 'miniworld',
+      nodes: [],
+      leafs: [{ cluster: 0, firstSurf: 0, numSurfs: 1 }],
+      pvs: [new Uint8Array([1])],
+      clusterCount: 1,
+      surfaces: [{
+        id: 0, verts,
+        uvs: new Float32Array([0, 0, 32, 0, 32, 16, 0, 16]),
+        lux: new Float32Array([0, 0, 4, 0, 4, 1, 0, 1]),
+        n: 4, texId: 0, lightId: 0,
+        center: new Float32Array([100, 0, 0]), radius: 40,
+        mins: new Float32Array([100, -32, -8]), maxs: new Float32Array([100, 32, 8]),
+        turbulent: false, sky: false,
+        fn: new Float32Array([-1, 0, 0]),
+      }],
+      textures: [{ texels: new Uint8Array(32 * 16).fill(200), width: 32, height: 16 }],
+      lightmaps: [{ samples: new Uint8Array(4 * 1 * 3), luxW: 4, luxH: 1, styles: [0] }],
+      dynamicLights: [],
+      alias: [],
+      sprites: [],
+      particles: [],
+    };
+    const W = 160, H = 120;
+    const fb = createFramebuffer(W, H, true);
+    const r = new SoftwareRenderer();
+    r.init(fb);
+    const pal = new Uint8Array(768);
+    for (let i = 0; i < 256; i++) {
+      pal[i * 3] = i;
+      pal[i * 3 + 1] = i;
+      pal[i * 3 + 2] = i;
+    }
+    r.setPalette(pal);
+    const view = {
+      origin: new Float32Array([0, 0, 0]), angles: new Float32Array([0, 0, 0]),
+      fovX: 90, time: 0, lightStyles: new Float32Array(256).fill(1),
+    };
+    const w = { name: 'quad', data: world };
+    r.beginFrame();
+    r.renderView(view, w, []);
+    r.endFrame();
+    const base = fb.index!.slice();
+    // Impact near the screen-left edge of the quad (light radius 40 covers
+    // ~2 of the 4 luxels; the far half must stay near baseline).
+    r.testAddDynamicLight({
+      origin: new Float32Array([100, 28, 0]), intensity: 40,
+      color: new Float32Array([1, 1, 1]),
+    });
+    r.beginFrame();
+    r.renderView(view, w, []);
+    r.endFrame();
+    const lit = fb.index!;
+    let nearSum = 0, nearN = 0, farSum = 0, farN = 0;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const d = lit[y * W + x]! - base[y * W + x]!;
+        if (d === 0) continue;
+        if (x < W / 2) {
+          nearSum += d;
+          nearN++;
+        } else {
+          farSum += d;
+          farN++;
+        }
+      }
+    }
+    expect(nearN).toBeGreaterThan(50);
+    expect(farN).toBeGreaterThan(50);
+    const nearMean = nearSum / nearN;
+    const farMean = farSum / farN;
+    // Localised falloff: the lit half averages far brighter than the far
+    // half (legacy surfCenter falloff lit both halves uniformly).
+    expect(nearMean).toBeGreaterThan(farMean + 40);
+    expect(farMean).toBeLessThan(60);
   });
 });

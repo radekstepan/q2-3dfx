@@ -49,7 +49,7 @@ export {
 } from './surfaceCache.js';
 
 export {
-  buildLightMap, combineStyleScales, bboxDistance,
+  buildLightMap, combineStyleScales, bboxDistance, luxelWorldPositions,
   LIGHT_STYLE_UNUSED, LIGHT_OVERBRIGHT, DEFAULT_DLIGHT_TTL_FRAMES,
   DLightState,
   type DynamicLight, type SurfaceBounds,
@@ -102,8 +102,8 @@ export {
 export { SoftwareRenderer, sortBatchByRow, nextPot, MAX_SPANS } from './frame.js';
 
 export {
-  SKY_TILE_SUFFIXES, SKY_SIDE_IMAGE,
-  skyFaceForDir, skyUvForDir, computeSkyUvs, isValidSkySize,
+  SKY_TILE_SUFFIXES, SKY_SIDE_IMAGE, SKY_BOX_HALF, SKY_BOX_CORNERS,
+  skyFaceForDir, skyUvForDir, skyUvOnFace, computeSkyUvs, isValidSkySize,
 } from './sky.js';
 
 export {

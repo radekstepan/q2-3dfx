@@ -13,13 +13,13 @@
 //   sky). The Q2 software sky is static relative to the view direction.
 //   (Quake 1's scrolling r_sky.c clouds do not exist in Q2.)
 //
-// Our pipeline rasterises the world sky polys directly (no separate box
-// emission), so faithfulness = sampling the same 6 faces with the same
-// per-face texture axes (box_vecs) from the same view-locked mapping:
-// for each sky vertex, direction d = vert - camOrigin selects the box face
-// pierced by the ray, and (u,v) is the box-face coordinate of that point.
-// Perspective-correct span interpolation of those UVs is exactly what id's
-// D_CalcGradients computes from the texinfo vecs.
+// Our pipeline mirrors that structure (frame.ts emitSkyBox): when a SURF_SKY
+// surface is visible, the 6 box faces at SKY_BOX_HALF around the camera
+// origin are rasterised instead of the world poly — one single-face quad per
+// box face, so span interpolation of (u,v) can never sweep across tile
+// boundaries. Each face carries its own tile's UVs from the same
+// view-locked box mapping; the box sits far beyond any real geometry, so
+// it depth-tests as background with exact perspective math.
 //
 // PACKING CONTRACT for setSkyTexture (the renderer never touches the pak;
 // a parallel agent wires the web side — do not deviate):
@@ -132,6 +132,30 @@ export function skyUvOnFace(
   out.v = SKY_SIDE_IMAGE[face]! * tileH + lv;
   return out;
 }
+
+/**
+ * View-centered skybox half-size (id R_EmitSkyBox uses +/-128 around the
+ * view origin; ours sits far enough that every real surface depth-tests in
+ * front of it, so the box reads as infinity without an explicit depth
+ * override — the perspective span math stays exact, no fixed-point hazard).
+ * Quake II maps span a few thousand units; 16384 keeps 1/z well above the
+ * cleared depth plane while staying float-precise through projection.
+ */
+export const SKY_BOX_HALF = 16384;
+
+/**
+ * Camera-relative box corners per face (cyclic quads), id `box_verts`
+ * regrouped by face. Any cyclic order works (no culling on sky polys).
+ * Face order: 0 dn(-Z), 1 lf(-X), 2 up(+Z), 3 bk(+Y), 4 rt(+X), 5 ft(-Y).
+ */
+export const SKY_BOX_CORNERS: ReadonlyArray<readonly [number, number, number, number, number, number, number, number, number, number, number, number]> = [
+  [-1, -1, -1, 1, -1, -1, 1, 1, -1, -1, 1, -1], // 0 dn
+  [-1, 1, -1, -1, -1, -1, -1, -1, 1, -1, 1, 1], // 1 lf
+  [-1, -1, 1, -1, 1, 1, 1, 1, 1, 1, -1, 1], // 2 up
+  [1, 1, -1, -1, 1, -1, -1, 1, 1, 1, 1, 1], // 3 bk
+  [1, -1, -1, 1, 1, -1, 1, 1, 1, 1, -1, 1], // 4 rt
+  [-1, -1, -1, 1, -1, -1, 1, -1, 1, -1, -1, 1], // 5 ft
+];
 
 /**
  * Fill `out` (2*n floats) with packed-strip UVs for n world vertices
