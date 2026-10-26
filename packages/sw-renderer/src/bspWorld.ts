@@ -146,11 +146,19 @@ export function bspToMiniWorld(map: BspMap, opts: BspWorldOptions = {}): MiniWor
       if (v < minT) minT = v;
       if (v > maxT) maxT = v;
     }
-    // luxel grid (r_surf.c extents): floor to 16, +1 luxel per side
-    const luxW = Math.min(256, Math.max(1, Math.floor((maxS - minS) / LUXEL) + 1));
-    const luxH = Math.min(256, Math.max(1, Math.floor((maxT - minT) / LUXEL) + 1));
-    const baseS = Math.floor(minS / LUXEL) * LUXEL;
-    const baseT = Math.floor(minT / LUXEL) * LUXEL;
+    // luxel grid (id CalcSurfaceExtents, r_model.c): bmins = floor(min/16),
+    // bmaxs = ceil(max/16) per axis, extents forced to >= 16 texels so every
+    // face owns at least 2x2 luxels. texturemins/extents drive BOTH the
+    // lighting-lump row layout and the luxel coordinate frame, so any
+    // deviation (e.g. floor(span/16)+1) row-shifts every static luxel after
+    // the first row and truncates the dynamic per-luxel falloff grid —
+    // on real maps this lit whole tile-rows while neighbors stayed dark.
+    const bminsS = Math.floor(minS / LUXEL), bmaxsS = Math.ceil(maxS / LUXEL);
+    const bminsT = Math.floor(minT / LUXEL), bmaxsT = Math.ceil(maxT / LUXEL);
+    const luxW = Math.min(256, Math.max(2, bmaxsS - bminsS + 1));
+    const luxH = Math.min(256, Math.max(2, bmaxsT - bminsT + 1));
+    const baseS = bminsS * LUXEL;
+    const baseT = bminsT * LUXEL;
     const lux = new Float32Array(numedges * 2);
     for (let k = 0; k < numedges; k++) {
       lux[k * 2] = (uvs[k * 2]! - baseS) / LUXEL;
