@@ -470,8 +470,23 @@ export function PM_CategorizePosition(st: PmoveState): void {
   }
 }
 
+export const BUTTON_DUCK_BIT = 8;
+
 export function PM_CheckDuck(st: PmoveState, cmd: UserCmd): void {
-  void cmd;
+  // C qcommon/pmove.c PM_CheckDuck: duck when cmd.upmove < 0 on ground.
+  // Local extension: holding crouch/duck (BUTTON_DUCK bit 8, set by @q2/input
+  // for KeyC) also ducks — the web driver never sends negative upmove.
+  const wantDuck =
+    (cmd.upmove < 0 || (cmd.buttons & BUTTON_DUCK_BIT) !== 0) &&
+    (st.pmFlags & PMF_ON_GROUND || (st.pmFlags & PMF_DUCKED) !== 0 || st.groundEntity !== -1);
+  if (wantDuck) {
+    st.pmFlags |= PMF_DUCKED;
+  } else if (st.pmFlags & PMF_DUCKED) {
+    // Try to stand up: only clear if headroom allows (id traces maxs 32).
+    const standing = v3(st.maxs[0]!, st.maxs[1]!, 32);
+    const trace = activeTrace(st.origin, st.mins, standing, st.origin);
+    if (!trace.allsolid && trace.fraction === 1) st.pmFlags &= ~PMF_DUCKED;
+  }
   if (st.pmFlags & PMF_DUCKED) {
     st.mins[2] = -24;
     st.maxs[2] = 4;

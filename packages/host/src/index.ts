@@ -283,7 +283,7 @@ export class Host {
     const angles: [number, number, number] = kick
       ? [viewBase[0] + kick.angles[0], viewBase[1] + kick.angles[1], viewBase[2] + kick.angles[2]]
       : viewBase;
-    let eye = calcViewOrigin(base);
+    let eye = calcViewOrigin(base, this.lastCmd ? (this.lastCmd.buttons & 8) !== 0 || this.lastCmd.upmove < 0 : false);
     if (kick) eye = [eye[0] + kick.origin[0], eye[1] + kick.origin[1], eye[2] + kick.origin[2]];
     const view: RefDef = {
       origin: new Float32Array(eye) as RefDef['origin'],

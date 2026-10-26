@@ -12,6 +12,7 @@ import {
   CONTENTS_LADDER,
   CONTENTS_WATER,
   PMF_DUCKED,
+  PMF_ON_GROUND,
 } from './index.js';
 import type { TraceResult, UserCmd } from './index.js';
 
@@ -265,11 +266,18 @@ describe('pmove determinism (M5.1)', () => {
 
   it('crouch shrinks hull and clamps speed', () => {
     resetPmoveWorld();
+    // C PM_CheckDuck: duck hold = upmove<0 on ground (or BUTTON_DUCK bit 8
+    // local extension for KeyC). Sticky PMF_DUCKED alone stands back up.
     const st = makePmoveState();
-    st.pmFlags |= PMF_DUCKED;
-    pmove(st, { msec: 50, angles: v3(), forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 });
+    st.pmFlags |= PMF_ON_GROUND;
+    pmove(st, { msec: 50, angles: v3(), forwardmove: 0, sidemove: 0, upmove: -400, buttons: 0 });
     expect(st.maxs[2]).toBe(4);
     expect(st.viewheight).toBe(12);
+    const st2 = makePmoveState();
+    st2.pmFlags |= PMF_ON_GROUND;
+    pmove(st2, { msec: 50, angles: v3(), forwardmove: 0, sidemove: 0, upmove: 0, buttons: 8 });
+    expect(st2.maxs[2]).toBe(4);
+    expect(st2.viewheight).toBe(12);
   });
 
   it('detects water levels and ladders', () => {
