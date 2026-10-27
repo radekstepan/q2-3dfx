@@ -286,6 +286,8 @@ export class SoftwareRenderer implements Refresh {
     base: -1, cap: 0, kind: 0, ord: 0,
     light: null, dlight: null, lv: null, written: -1,
   };
+  private alphaDeferredSi: Int32Array = new Int32Array(0);
+  private alphaDeferredOrd: Int32Array = new Int32Array(0);
   private frame = 0;
   private fallbackMesh = createBoxMesh(20);
   /** Procedural gun fallback (registerModel md2 without real data). Lazy. */
@@ -922,24 +924,26 @@ export class SoftwareRenderer implements Refresh {
     const pixelsBase = this.backend.pixelsDrawn;
     // Translucency (SURF_TRANS33/66): C draws alpha surfaces AFTER all
     // opaque geometry (R_DrawAlphaSurfaces, depth-tested, never
-    // depth-writing, back-to-front). Pass 0 is today's opaque loop verbatim
-    // with translucent surfaces deferred; pass 1 re-walks the visible set
-    // in reverse traversal order through the same cache/emit/sort pipeline
-    // and draws via drawSpansTranslucent. r_translucency = 0 collapses to
-    // one pass with translucent surfaces drawn opaque (pre-port behaviour).
+    // depth-writing, back-to-front). SINGLE WALK: the main loop below admits
+    // each visible surface once (frustum/backface cull runs a single time)
+    // and records translucent surfaces into the deferred alpha list; the
+    // alpha loop after it draws them in reverse traversal order through the
+    // same cache/emit/sort pipeline via drawSpansTranslucent.
+    // r_translucency = 0 collapses to one loop with translucent surfaces
+    // drawn opaque (pre-port behaviour).
     const tMode = translucencyModeFromCvars();
-    const passes = tMode === 0 ? 1 : 2;
-    for (let pass = 0; pass < passes; pass++) {
+    if (this.alphaDeferredSi.length < nvis) {
+      this.alphaDeferredSi = new Int32Array(Math.max(16, nvis));
+      this.alphaDeferredOrd = new Int32Array(Math.max(16, nvis));
+    }
+    let nAlpha = 0;
     for (let i = 0; i < nvis; i++) {
-      const vi = pass === 1 ? nvis - 1 - i : i;
-      const si = this.visSurfs[vi]!;
-      const order = this.visOrder[vi]!;
+      const si = this.visSurfs[i]!;
+      const order = this.visOrder[i]!;
       const surf = worldData.surfaces[si]!;
       // degenerate (NODRAW) placeholders from BSP conversion carry no geometry.
-      // Diag buckets accumulate on pass 0 only: pass 1 re-walks the set for
-      // the deferred alpha draw and must not recount admitted surfaces.
-      if (surf.n < 3) { if (d && pass === 0) d.degenerate++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
-      if (culledByFlatFrustum(this.frustumFlat, surf.mins, surf.maxs)) { if (d && pass === 0) d.frustumCulled++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
+      if (surf.n < 3) { if (d) d.degenerate++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
+      if (culledByFlatFrustum(this.frustumFlat, surf.mins, surf.maxs)) { if (d) d.frustumCulled++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
       // backface cull for single-sided world polys (id draws these too and
       // lets the z-buffer reject them; skipping is output-identical and
       // saves the span work). Turbulent (water) and sky stay double-sided:
@@ -949,26 +953,26 @@ export class SoftwareRenderer implements Refresh {
         const dy = cam.origin[1]! - surf.center[1]!;
         const dz = cam.origin[2]! - surf.center[2]!;
         if (surf.fn[0]! * dx + surf.fn[1]! * dy + surf.fn[2]! * dz < 0) {
-          if (d && pass === 0) d.backfaceCulled++;
+          if (d) d.backfaceCulled++;
           if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
           continue;
         }
       }
       // Translucent deferral (R_RenderFace queues SURF_TRANS33/66 into
-      // r_alpha_surfaces): pass 0 counts the surface as emitted and skips
-      // it, so the M3.3 diag buckets still sum to PVS-visible; pass 1
-      // draws only translucent surfaces. Sky+translucent (never in
-      // practice) follows the alpha path, matching C's TRANS-first check.
+      // r_alpha_surfaces): count the surface as emitted (so the M3.3 diag
+      // buckets still sum to PVS-visible) and record it for the alpha loop.
+      // Sky+translucent (never in practice) follows the alpha path, matching
+      // C's TRANS-first check.
       const trRaw = surf.translucent ?? 0;
       const tr = trRaw === 2 ? 2 : trRaw === 1 ? 1 : 0;
-      if (tMode !== 0) {
-        if (pass === 0) {
-          if (tr !== 0) { if (d) d.emitted++; continue; }
-        } else if (tr === 0) {
-          continue;
-        }
+      if (tMode !== 0 && tr !== 0) {
+        if (d) d.emitted++;
+        this.alphaDeferredSi[nAlpha] = si;
+        this.alphaDeferredOrd[nAlpha] = order;
+        nAlpha++;
+        continue;
       }
-      if (surf.sky && !(pass === 1 && tr !== 0)) {
+      if (surf.sky) {
         const sky = this.skyTex;
         if (sky) {
           // Textured skybox (faithful R_EmitSkyBox/D_SkySurf): world SURF_SKY
@@ -1006,14 +1010,14 @@ export class SoftwareRenderer implements Refresh {
         if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
         const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
         if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
-        if (nproj < 3) { if (d && pass === 0) d.clipRejected++; continue; }
+        if (nproj < 3) { if (d) d.clipRejected++; continue; }
         const start = this.spanList.count;
         const flat = this.flatForEmit(SPAN_FLAT, order, this.skyIndex, 0, null);
         const endCount = emitSpansForPoly(
           this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
           flat,
         );
-        if (endCount <= start) { if (d && pass === 0) d.clipRejected++; continue; }
+        if (endCount <= start) { if (d) d.clipRejected++; continue; }
         if (!this.commitFlat(flat, endCount - start)) {
           for (let i = start; i < endCount; i++) {
             const sp = this.pool[i]!;
@@ -1032,7 +1036,7 @@ export class SoftwareRenderer implements Refresh {
         this.spanList.count = 0;
         spansEmitted += endCount - start;
         if (d) {
-          if (pass === 0) d.emitted++;
+          d.emitted++;
           const batchSpans = endCount - start;
           if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
         }
@@ -1093,26 +1097,17 @@ export class SoftwareRenderer implements Refresh {
       this.polyInput.n = surf.n;
       const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
       if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
-      if (nproj < 3) { if (d && pass === 0) d.clipRejected++; continue; }
+      if (nproj < 3) { if (d) d.clipRejected++; continue; }
       const start = this.spanList.count;
-      // The alpha pass bypasses fused emission (flat undefined): the fused
-      // copy would sit unstaged in the SAB (the pool kick already ran), so
-      // pass 1 always tags objects and draws through the classic backend.
-      const flat = pass === 1 ? undefined : this.flatForEmit(
+      const flat = this.flatForEmit(
         surf.turbulent ? SPAN_TURBULENT : SPAN_OPAQUE, order, null, null, null,
       );
       const endCount = emitSpansForPoly(
         this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
         flat,
       );
-      if (endCount <= start) { if (d && pass === 0) d.clipRejected++; continue; }
-      if (pass === 1) {
-        for (let i = start; i < endCount; i++) {
-          const sp = this.pool[i]!;
-          sp.kind = tr === 2 ? SPAN_TRANS66 : SPAN_TRANS33;
-          sp.ord = order;
-        }
-      } else if (!this.commitFlat(flat, endCount - start)) {
+      if (endCount <= start) { if (d) d.clipRejected++; continue; }
+      if (!this.commitFlat(flat, endCount - start)) {
         for (let i = start; i < endCount; i++) {
           const sp = this.pool[i]!;
           sp.kind = surf.turbulent ? SPAN_TURBULENT : SPAN_OPAQUE;
@@ -1123,41 +1118,114 @@ export class SoftwareRenderer implements Refresh {
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
-      if (pass === 1) {
-        // Deferred alpha draw (R_DrawAlphaSurfaces): blend through the
-        // classic TS backend into the live planes, so the pooled/wasm
-        // paths need no TRANS plumbing. Counters merge into the active
-        // backend, keeping frameStats and the M3.3 attribution exact.
-        // Tables build lazily here (first translucent frame only), so
-        // translucent-free worlds (devroom golden) never pay for them.
-        this.ensureAlphamap();
-        const tb = this.tsBackend;
-        if (this.backend !== tb) tb.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
-        const t = drawSpansTranslucent(this.idx, this.zb, this.fbW, this.fbH, this.spanList,
-          tex, lb, this.colormap, this.alpha33, this.alpha66,
-          surf.turbulent ? tb.turbTable : null, view.time, tMode === 2);
-        this.transSpans += t.spans;
-        if (this.backend === tb) {
-          tb.spansDrawn += t.spans;
-          tb.pixelsDrawn += t.pixels;
-        } else {
-          this.backend.spansDrawn += t.spans;
-          this.backend.pixelsDrawn += t.pixels;
-        }
+      this.backend.drawSpans(this.spanList, tex, lb);
+      if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
+      this.spanList.count = 0;
+      spansEmitted += endCount - start;
+      if (d) {
+        d.emitted++;
+        const batchSpans = endCount - start;
+        if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
+      }
+    }
+    // Deferred alpha draw (R_DrawAlphaSurfaces): the recorded translucent
+    // surfaces draw here in reverse traversal order (back-to-front), blended
+    // through the classic TS backend into the live planes, so the
+    // pooled/wasm paths need no TRANS plumbing. Counters merge into the
+    // active backend, keeping frameStats and the M3.3 attribution exact
+    // (buckets were counted at deferral time; only maxBatchSpans updates
+    // here). Tables build lazily on the first translucent frame, so
+    // translucent-free worlds (devroom golden) never pay for them. The alpha
+    // loop bypasses fused emission (flat undefined): the fused copy would sit
+    // unstaged in the SAB (the pool kick runs after this loop), so alpha
+    // batches always tag objects and draw classic.
+    for (let a = nAlpha - 1; a >= 0; a--) {
+      const si = this.alphaDeferredSi[a]!;
+      const order = this.alphaDeferredOrd[a]!;
+      const surf = worldData.surfaces[si]!;
+      const trRaw = surf.translucent ?? 0;
+      const tr = trRaw === 2 ? 2 : trRaw === 1 ? 1 : 0;
+      const dist = Math.sqrt(
+        (surf.center[0]! - view.origin[0]!) ** 2 +
+        (surf.center[1]! - view.origin[1]!) ** 2 +
+        (surf.center[2]! - view.origin[2]!) ** 2,
+      );
+      const mip = dist < 320 ? 0 : dist < 640 ? 1 : dist < 1280 ? 2 : 3;
+      const lightId = surf.lightId % worldData.lightmaps.length;
+      const lm = worldData.lightmaps[lightId]!;
+      let stylesHash: number;
+      let nValid = -1;
+      if (this.styleHashStamp[lightId] === this.frame && this.styleHashStyles === view.lightStyles) {
+        stylesHash = this.styleHashMemo[lightId]!;
       } else {
-        this.backend.drawSpans(this.spanList, tex, lb);
+        nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
+        stylesHash = hashLightStyles(this.styleScratch, nValid);
+        this.styleHashMemo[lightId] = stylesHash;
+        this.styleHashStamp[lightId] = this.frame;
+        this.styleHashStyles = view.lightStyles;
+      }
+      if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
+      let block = this.cache.get(surf.id, stylesHash, mip);
+      if (!block) {
+        if (nValid < 0) nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
+        const scalesCopy: number[] = [];
+        for (let k = 0; k < nValid; k++) scalesCopy.push(this.styleScratch[k]!);
+        if (scalesCopy.length === 0) scalesCopy.push(1);
+        block = this.buildSurfaceBlock(worldData, surf, mip, scalesCopy, dyn, dlightFrameBits(surf.id));
+        this.cache.put(surf.id, stylesHash, mip, block);
+      }
+      const tex = texView;
+      tex.width = block.bw;
+      tex.height = block.bh;
+      tex.texels = block.texels;
+      const lb = lightView;
+      lb.width = block.luxW;
+      lb.height = block.luxH;
+      lb.values = block.light;
+      if (ph) { ph.cache += phaseNow() - pt; pt = phaseNow(); }
+      this.polyInput.verts = surf.verts;
+      this.polyInput.uvs = surf.uvs;
+      this.polyInput.lux = surf.lux;
+      this.polyInput.n = surf.n;
+      const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
+      if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
+      if (nproj < 3) continue;
+      const start = this.spanList.count;
+      const endCount = emitSpansForPoly(
+        this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
+        undefined,
+      );
+      if (endCount <= start) continue;
+      for (let i = start; i < endCount; i++) {
+        const sp = this.pool[i]!;
+        sp.kind = tr === 2 ? SPAN_TRANS66 : SPAN_TRANS33;
+        sp.ord = order;
+      }
+      if (ph) { ph.emit += phaseNow() - pt; pt = phaseNow(); }
+      sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+      if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
+      this.spanList.count = endCount;
+      this.ensureAlphamap();
+      const tb = this.tsBackend;
+      if (this.backend !== tb) tb.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
+      const t = drawSpansTranslucent(this.idx, this.zb, this.fbW, this.fbH, this.spanList,
+        tex, lb, this.colormap, this.alpha33, this.alpha66,
+        surf.turbulent ? tb.turbTable : null, view.time, tMode === 2);
+      this.transSpans += t.spans;
+      if (this.backend === tb) {
+        tb.spansDrawn += t.spans;
+        tb.pixelsDrawn += t.pixels;
+      } else {
+        this.backend.spansDrawn += t.spans;
+        this.backend.pixelsDrawn += t.pixels;
       }
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
       spansEmitted += endCount - start;
       if (d) {
-        // Pass 0 counted the deferred surface as emitted at deferral time;
-        // pass 1 must not recount, but still tracks the max batch.
-        if (pass === 0) d.emitted++;
         const batchSpans = endCount - start;
         if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
       }
-    }
     }
 
     // Frame accumulation (M8.1 async-render step 1): geometry captured every

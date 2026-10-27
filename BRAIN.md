@@ -553,7 +553,7 @@ done-when:
 > scripted frames). `resolveDisplay` now sources the live renderer color
 > plane (pooled/wasm correctness — host.fb.color is stale with a pool).
 > Browser projection at 640×480 (ledger play split): GEO serial ~8–19ms
-> (view-dependent; two-pass translucency loop included) + DRAW parallel
+> (view-dependent; single-walk translucency since 2026-10-27) + DRAW parallel
 > (~3–5ms main share, spanfill ~3× pooled) + resolve parallel + HUD 0.15
 > + blit-copy ~2.4–3.5 + sim ~0.5–1.5 amortised → ~15–18ms typical views,
 > ~27–30ms spawn-north worst. Left for the web lane: the dom.ts rAF tick
@@ -617,6 +617,13 @@ done-when:
 > Translucent+pooled ordering follows the pooled sync path (translucency
 > lane's open item; the two-pass loop roughly doubles the serial cull walk:
 > spawn-north cull ~8.8ms with both passes in this tree).
+> Single-walk fusion 2026-10-27 (translucency lane): the walk admits each
+> surface once (frustum/backface cull single) and records translucent
+> surfaces into a reused alpha list drawn back-to-front after opaque —
+> interleaved OLDx3/NEWx3 spawn-north 640x480 serial classic: cull lower
+> in all 3 pairs (median -4.0ms; quiet-window 12.8-20.1 -> 4.1-5.1ms),
+> spans/px/overdraw identical (59506/729735/2.38), all goldens
+> byte-identical (devroom `8f61c755`, base1 x4, TRANS66 `06456518`/`1dc00e44`).
 
 ### M7.2 — Playable base1 (NEXT STEP — pick this card first)
 owns: `apps/web` (+ `packages/game` data tables only, no contract changes)
@@ -790,6 +797,7 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-26 | perf-lane (interleaved OLD×3/NEW×3) | software base1 spawn-north, serial classic + cull hot-path opts (flat frustum, style-hash memo, affected bsearch) | 640×480 | ~34 (29) | — | 2.38 | GEO 15.2→13.4ms (cull −0.5, emit −0.5, trav −0.2), frame ~35→~29ms; index+color hashes ≡ on all 4 views, devroom `8f61c755`; box: Ryzen 5 PRO 2400G×8, node 22, concurrent-lane load (ranges, same direction all 3 pairs) |
 | 2026-10-26 | perf-lane | software base1 spawn combat, play-level split (10Hz tick / pumps / host render / HUD / blit-copy est) | 640×480 | ~19 | — | 2.38 | step(tick)=3.41 pumps=0.08 render=45.82 resolve=1.09 hud=0.15 blitCopy~=2.38 (excludes createImageData+putImageData); cache 50.8% under combat fire (quiescent hot-cache in the frame section); sim is per-tick — amortised ÷6 at 60fps |
 | 2026-10-26 | 2d42770 | software base1 pool TRANS66 blend, real colormap.pcx alphamap | 320×240 | 41 | ~3 | 3.00 | warp+blend water through the deferred alpha pass, 480 trans spans, mode-1 hash `06456518` (mode-0 `1dc00e44`); devroom `8f61c755` byte-exact |
+| 2026-10-27 | uncommitted | software base1 spawn-north, single-walk translucency (classic serial) | 640×480 | — | — | 2.38 | interleaved OLDx3/NEWx3: cull NEW<OLD all pairs (median -4.0ms), GEO down in quiet window; opaque-then-alpha, back-to-front, stipple/blend identical: devroom `8f61c755`, base1 x4 idx+color, TRANS66 `06456518`/`1dc00e44` |
 | 2026-10-26 | 2d42770 | software base1 sweep flythrough, steady-state surface cache | 640×480 | 18 | ~6 | 1.92 | 8-view yaw sweeps: round-2 9107 hits / 0 misses / 0 evictions (100%); 4-teleport union exceeds the 4MB budget and re-thrashes (~6% — expected, not a regression) |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
