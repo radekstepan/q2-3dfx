@@ -94,6 +94,7 @@ describe('infantry sim (m_infantry.c lite def)', () => {
     const trace = openTrace();
     let fired = false;
     for (let i = 0; i < 40 && !fired; i++) {
+      st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
       for (const ev of SV_MonsterTick(st, playerAt(300).pos, trace, null, mulberry32(i + 1))) {
         if (ev.attack === 'machinegun' && ev.move === 'attack1') fired = true;
       }
@@ -121,7 +122,10 @@ describe('infantry sim (m_infantry.c lite def)', () => {
     m.seen = false;
     const blocked = blockedTrace();
     const at0 = [...m.edict.origin];
-    for (let i = 0; i < 5; i++) SV_MonsterTick(st, playerAt(300).pos, blocked, null, mulberry32(i));
+    for (let i = 0; i < 5; i++) {
+      st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
+      SV_MonsterTick(st, playerAt(300).pos, blocked, null, mulberry32(i));
+    }
     expect(m.seen).toBe(false);
     expect([...m.edict.origin]).toEqual(at0);
     expect(m.state.move).toBe('stand');
@@ -130,7 +134,10 @@ describe('infantry sim (m_infantry.c lite def)', () => {
     SV_MonsterTick(st, playerAt(300).pos, open, null, mulberry32(99));
     expect(m.seen).toBe(true);
     const d0 = Math.hypot(m.edict.origin[0]! - 300, m.edict.origin[1]!);
-    for (let i = 0; i < 30; i++) SV_MonsterTick(st, playerAt(300).pos, open, null, () => 0.99);
+    for (let i = 0; i < 30; i++) {
+      st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
+      SV_MonsterTick(st, playerAt(300).pos, open, null, () => 0.99);
+    }
     const d1 = Math.hypot(m.edict.origin[0]! - 300, m.edict.origin[1]!);
     expect(d1).toBeLessThan(d0 - 5);
   });
@@ -166,7 +173,10 @@ describe('infantry sim (m_infantry.c lite def)', () => {
     const player = playerAt(120, 0, 42);
     // 0.99 never commits to an attack, so every tick is pure chase
     // locomotion up the same stair wrapper soldiers use.
-    for (let i = 0; i < 40; i++) SV_MonsterTick(st, player.pos, trace, null, () => 0.99);
+    for (let i = 0; i < 40; i++) {
+      st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
+      SV_MonsterTick(st, player.pos, trace, null, () => 0.99);
+    }
     // Crossed the riser and settled onto the deck (rest 42), not wedged.
     expect(m.edict.origin[0]!).toBeGreaterThan(0);
     expect(m.edict.origin[2]!).toBeCloseTo(42, 6);

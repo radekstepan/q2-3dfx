@@ -90,6 +90,42 @@ function openTrace(): TraceFn {
 const PMINS: Vec3 = v3(-16, -16, -24);
 const PMAXS: Vec3 = v3(16, 16, 32);
 
+/**
+ * Floor-aware open room for locomotion tests: horizontal probes free,
+ * downward probes rest at the monster hull rest height (z=24, floor z=0).
+ * The bare openTrace has no floor, so gravity sinks bodies 50u/tick and
+ * the 3D range runs to FAR — the C M_CheckAttack FAR reject then holsters
+ * every attack. No real map behaves that way; pin the floor here.
+ */
+function floorRestTrace(): TraceFn {
+  return (start: Vec3, _m: Vec3, _x: Vec3, end: Vec3): TraceResult => {
+    // Genuine ground penetration (end below the rest height) rests on the
+    // floor; anything else is free. Keyed on absolute height, not probe
+    // direction — eye-to-eye sight traces slope slightly downward and must
+    // stay clear.
+    if (end[2]! < 24) {
+      return {
+        fraction: 0,
+        endpos: v3(start[0], start[1], 24),
+        planeNormal: v3(0, 0, 1),
+        allsolid: false,
+        startsolid: false,
+        entityNum: -1,
+        contents: 0,
+      };
+    }
+    return {
+      fraction: 1,
+      endpos: v3(end[0], end[1], end[2]),
+      planeNormal: v3(0, 0, 1),
+      allsolid: false,
+      startsolid: false,
+      entityNum: -1,
+      contents: 0,
+    };
+  };
+}
+
 describe('bolt nearest-wins (wall in the same step)', () => {
   function boltState(wallX: number) {
     const st = SV_Init();
@@ -184,9 +220,11 @@ describe('triggered wake/use chains (g_monster.c, g_items.c)', () => {
     m.triggered = true;
     m.woken = false;
     m.ambush = false;
-    const trace = openTrace();
+    // Floor-aware: the bare openTrace sinks bodies out of range (see above).
+    const trace = floorRestTrace();
     const playerPos = v3(200, 0, 24);
     for (let t = 0; t < 20; t++) {
+      st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
       const evs = SV_MonsterTick(st, playerPos, trace, null, Math.random, { sightTrace: trace });
       expect(evs).toEqual([]);
     }
@@ -196,6 +234,7 @@ describe('triggered wake/use chains (g_monster.c, g_items.c)', () => {
     SV_UseMonster(m, true);
     let events = 0;
     for (let t = 0; t < 100; t++) {
+      st.time += 0.1;
       events += SV_MonsterTick(st, playerPos, trace, null, Math.random, { sightTrace: trace }).length;
     }
     expect(Math.hypot(playerPos[0]! - m.edict.origin[0]!, playerPos[1]! - m.edict.origin[1]!)).toBeLessThan(200);
@@ -316,6 +355,7 @@ describe.runIf(!!Q2_PAK)('base1 touch regressions (Q2_PAK)', () => {
     const d0 = Math.hypot(playerPos[0]! - m.edict.origin[0]!, playerPos[1]! - m.edict.origin[1]!);
     let events = 0;
     for (let t = 0; t < 100; t++) {
+      st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
       events += SV_MonsterTick(st, playerPos, trace, null, rand, { sightTrace: sight }).length;
     }
     const d1 = Math.hypot(playerPos[0]! - m.edict.origin[0]!, playerPos[1]! - m.edict.origin[1]!);

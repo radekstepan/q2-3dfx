@@ -1277,7 +1277,10 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     // 1. at spawn there is no line of sight: the ambush holds still.
     const rand = mulberry32(7);
     const at0: [number, number, number] = [runner.edict.origin[0]!, runner.edict.origin[1]!, runner.edict.origin[2]!];
-    for (let i = 0; i < 10; i++) SV_MonsterTick(st, spawn, trace, null, rand);
+    for (let i = 0; i < 10; i++) {
+      st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
+      SV_MonsterTick(st, spawn, trace, null, rand);
+    }
     expect(runner.seen).toBe(false);
     expect([...runner.edict.origin]).toEqual(at0);
     // 2. the player rounds the corner (LOS opens at the east corridor mouth):
@@ -1292,6 +1295,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     let fires = 0;
     let firstAttack = '';
     for (let i = 0; i < 60; i++) {
+      st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
       for (const ev of SV_MonsterTick(st, player, trace, null, rand)) {
         fires++;
         if (!firstAttack) firstAttack = ev.attack;
@@ -1327,6 +1331,12 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     runner.edict.origin[0] = lowA[0]!;
     runner.edict.origin[1] = lowA[1]!;
     runner.edict.origin[2] = lowA[2]!;
+    // Harness hygiene: the teleport above is a test artifact (real bodies
+    // never teleport), but the move/frame still describe the pre-teleport
+    // animation — a stale attack latch would freeze the first ticks and
+    // measure latch luck instead of pursuit. Restart the chase anim.
+    runner.state.move = 'run';
+    runner.state.frame = 0;
     const PB2 = v3(360, -430, 0);
     seatOnFloor(PB2);
     player[0] = PB2[0]!;
@@ -1353,6 +1363,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       player[1] = player[1]! + (i % 40 < 20 ? 2 : -2);
       seatOnFloor(player);
       playerPath += Math.hypot(player[0]! - ox, player[1]! - oy);
+      st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
       SV_MonsterTick(st, player, trace, null, chaseRand, { sightTrace: sight });
       cumTravel += Math.hypot(runner.edict.origin[0]! - px, runner.edict.origin[1]! - py);
       px = runner.edict.origin[0]!;
@@ -1374,7 +1385,9 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     const rand2 = mulberry32(7);
     SV_MonsterTick(st2, player, trace, null, rand2);
     let easyScale = -1;
-    for (let i = 0; i < 60 && easyScale < 0; i++) {
+    for (let i = 0; i < 120 && easyScale < 0; i++) {
+      st2.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live);
+      // 120 ticks: easy gates most attacks (0.05/tick), same verdict.
       for (const ev of SV_MonsterTick(st2, player, trace, null, rand2)) {
         easyScale = ev.dmgScale;
         break;

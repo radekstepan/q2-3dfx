@@ -152,6 +152,14 @@ export const GUNNER: MonsterDef = {
 
 export type MonsterKind = 'soldier' | 'gunner' | 'infantry';
 
+/**
+ * C attack_state (g_local.h monsterinfo_t: AS_STRAIGHT/AS_MISSILE/AS_MELEE/
+ * AS_SLIDING/AS_BLIND). Our kinds never fly, so SLIDING never occurs and
+ * BLIND (predator/orbital-strike monsters only in C) is unrepresentable —
+ * the lite sim runs the STRAIGHT/MISSILE/MELEE subset M_CheckAttack emits.
+ */
+export type AttackState = 'straight' | 'missile' | 'melee';
+
 export function monsterDef(kind: MonsterKind): MonsterDef {
   if (kind === 'soldier') return SOLDIER;
   if (kind === 'gunner') return GUNNER;
@@ -173,11 +181,53 @@ export interface MonsterState {
   gibbed: boolean;
   /** Facing yaw in degrees (Q2 convention: 0 = +X, 90 = +Y/left). */
   yaw: number;
+  // --- C monsterinfo pursuit/attack fields (M5.3 depth; g_ai.c/g_local.h) ----
+  // The lite sim used to beeline at the player and roll a flat 0.7 attack
+  // commit. These fields carry the C ai_run/ai_checkattack state so monsters
+  // follow the player trail around corners and gate attacks the C way.
+  /** C monsterinfo.attack_state (what the last check decided). */
+  attackState: AttackState;
+  /** C monsterinfo.attack_finished: no new attack may start before this. */
+  attackFinished: number;
+  /** C monsterinfo.trail_time: timestamp of the trail marker being pursued. */
+  trailTime: number;
+  /** C monsterinfo.last_sighting: enemy spot at the last visible tick. */
+  lastSighting: Vec3;
+  /** C monsterinfo.search_time: pursuit gives up past search_time + 20. */
+  searchTime: number;
+  /** C AI_LOST_SIGHT: set on the tick sight breaks, cleared on regain. */
+  lostSight: boolean;
+  /** C AI_PURSUE_NEXT: reached the current goal, pick the next marker. */
+  pursueNext: boolean;
+  /** C AI_PURSUE_TEMP: last_sighting is a sidestep probe, retry after. */
+  pursueTemp: boolean;
+  /** C AI_PURSUIT_LAST_SEEN: next pick is the first-trail-marker branch. */
+  pursuitLastSeen: boolean;
+  /** C monsterinfo.saved_goal: probe origin saved across a sidestep. */
+  savedGoal: Vec3;
 }
 
 export function spawnMonster(kind: MonsterKind): MonsterState {
   const def = monsterDef(kind);
-  return { kind, health: def.health, move: kind === 'soldier' ? 'stand1' : 'stand', frame: 0, dead: false, gibbed: false, yaw: 0 };
+  return {
+    kind,
+    health: def.health,
+    move: kind === 'soldier' ? 'stand1' : 'stand',
+    frame: 0,
+    dead: false,
+    gibbed: false,
+    yaw: 0,
+    attackState: 'straight',
+    attackFinished: 0,
+    trailTime: 0,
+    lastSighting: v3(),
+    searchTime: 0,
+    lostSight: false,
+    pursueNext: false,
+    pursueTemp: false,
+    pursuitLastSeen: false,
+    savedGoal: v3(),
+  };
 }
 
 export function monsterMoveOf(ms: MonsterState): MonsterMove {
@@ -434,6 +484,13 @@ export const MONSTER_FALL_PROBE = 50;
  * drop to the ground via a downward trace (sticks to floors and step-downs
  * within MONSTER_STEP_HEIGHT, falls bounded by MONSTER_FALL_PROBE).
  *
+ * `moveTarget` (default: the player) overrides the steering target while
+ * facing/closing still key off the enemy: the trail-pursuit tick steers at
+ * lastSighting/trail markers so the body rounds corners instead of
+ * beelining the (possibly hidden) player. Facing follows the steering
+ * target (C turns toward ideal_yaw, which ai_run points at the goal while
+ * pursuing blind, and at the enemy while visible).
+ *
  * `trace` works in monster-origin space: the caller expands obstacles by the
  * monster hull (MONSTER_HULL_MINS/MAXS) and traces the origin as a point
  * segment; only `fraction`/`endpos` are used. Mutates `origin` in place and
@@ -450,18 +507,20 @@ export function monsterLocomotion(
   origin: Vec3,
   playerPos: Vec3,
   trace: (start: Vec3, end: Vec3) => { fraction: number; endpos: Vec3 },
+  moveTarget?: Vec3,
 ): void {
   if (state.dead) return;
   const mv = monsterMoveOf(state);
   const fr = mv.frames[state.frame] ?? { dist: 0, action: 'move' };
-  const dx = playerPos[0]! - origin[0]!;
-  const dy = playerPos[1]! - origin[1]!;
+  const goal = moveTarget ?? playerPos;
+  const dx = goal[0]! - origin[0]!;
+  const dy = goal[1]! - origin[1]!;
   const len = Math.sqrt(dx * dx + dy * dy);
-  // Face the player every tick via id M_ChangeYaw (shortest-arc, clamped by
-  // yaw_speed) — never an instant snap; only translate when the frame
-  // carries a dist so stand/attack frames never moonwalk.
+  // Face the steering target every tick via id M_ChangeYaw (shortest-arc,
+  // clamped by yaw_speed) — never an instant snap; only translate when the
+  // frame carries a dist so stand/attack frames never moonwalk.
   if (len > 1e-9) {
-    state.yaw = changeYaw(state.yaw, monsterYawTo(origin, playerPos), MONSTER_YAW_SPEED[state.kind]);
+    state.yaw = changeYaw(state.yaw, monsterYawTo(origin, goal), MONSTER_YAW_SPEED[state.kind]);
     if (fr.dist !== 0) {
       const nx = dx / len;
       const ny = dy / len;
@@ -536,6 +595,152 @@ export function monsterPain(ms: MonsterState, damage: number, rand: () => number
 
 export type AttackChoice = 'melee' | 'shotgun' | 'blaster' | 'machinegun' | 'chaingun' | 'grenade' | 'none';
 
+/**
+ * Which kinds have a real melee callback (C monsterinfo.melee != NULL).
+ * Soldier/gunner melee is NULL in C (m_soldier.c/m_gunner.c never assign
+ * it — point-blank events resolve as gunfire, see resolveMonsterFire); only
+ * infantry has the smack (m_infantry.c infantry_attack -> attack2). The
+ * melee branch of checkAttack keys the attack_state off this, exactly like
+ * C's `if (self->monsterinfo.melee)` test.
+ */
+export function monsterHasMelee(kind: MonsterKind): boolean {
+  return kind === 'infantry';
+}
+
+// --- M_CheckAttack (g_ai.c) + skill-scaled aggression (M5.3 depth) ----------
+//
+// Port of C M_CheckAttack with our naming. The caller supplies the eye-to-
+// eye clear-shot result as `canSee` (C runs the trace inline against
+// SOLID|MONSTER|SLIME|LAVA|WINDOW); everything else is the C decision
+// tree verbatim: melee gate (easy mode fails it 3/4 via rand()&3), the
+// attack-callback + attack_finished + FAR rejects, and the range/stand-
+// ground chance table scaled x0.5 on easy / x2 on hard+ (skill->value).
+//
+// On success the result carries AS_MISSILE/AS_MELEE plus the refreshed
+// attack_finished (level.time + 2*random); on failure the attack_state
+// falls back to AS_STRAIGHT (C leaves flying monsters sliding — no flyers
+// exist in the lite sim, documented).
+
+export interface CheckAttackOpts {
+  /** C enemy_range: monsterRange(dist) to the enemy. */
+  range: number;
+  /** Eye-to-eye clear shot (C inline trace passed). */
+  canSee: boolean;
+  /** C AI_STAND_GROUND (combat-point hold / ambush stand). */
+  standGround: boolean;
+  /** C monsterinfo.attack_finished. */
+  attackFinished: number;
+  /** C level.time. */
+  time: number;
+  /** C skill->value 0-3. */
+  skill: number;
+  /** C monsterinfo.attack != NULL (always true for our kinds). */
+  hasAttack: boolean;
+  /** C monsterinfo.melee != NULL (infantry only — see monsterHasMelee). */
+  hasMelee: boolean;
+  rand: () => number;
+}
+
+export interface CheckAttackResult {
+  attack: boolean;
+  attackState: AttackState;
+  attackFinished: number;
+}
+
+export function checkAttack(opts: CheckAttackOpts): CheckAttackResult {
+  const { range, canSee, standGround, attackFinished, time, skill, hasAttack, hasMelee, rand } = opts;
+  if (!canSee) return { attack: false, attackState: 'straight', attackFinished };
+  // Melee attack (C: enemy in melee range — easy mode usually declines).
+  if (range === RANGE_MELEE) {
+    // C: `if (skill->value == 0 && (rand()&3)) return false` — the float-rand
+    // equivalent of the low two bits being nonzero (3/4 of the time).
+    if (skill === 0 && Math.floor(rand() * 4) !== 0) {
+      return { attack: false, attackState: 'straight', attackFinished };
+    }
+    return {
+      attack: true,
+      attackState: hasMelee ? 'melee' : 'missile',
+      attackFinished,
+    };
+  }
+  // Missile attack gates.
+  if (!hasAttack) return { attack: false, attackState: 'straight', attackFinished };
+  if (time < attackFinished) return { attack: false, attackState: 'straight', attackFinished };
+  if (range === RANGE_FAR) return { attack: false, attackState: 'straight', attackFinished };
+  let chance: number;
+  if (standGround) chance = 0.4;
+  else if (range === RANGE_MELEE) chance = 0.2;
+  else if (range === RANGE_NEAR) chance = 0.1;
+  else if (range === RANGE_MID) chance = 0.02;
+  else return { attack: false, attackState: 'straight', attackFinished };
+  if (skill === 0) chance *= 0.5;
+  else if (skill >= 2) chance *= 2;
+  if (rand() < chance) {
+    return {
+      attack: true,
+      attackState: 'missile',
+      attackFinished: time + 2 * rand(),
+    };
+  }
+  return { attack: false, attackState: 'straight', attackFinished };
+}
+
+/**
+ * Sight-delay before the first attack after acquiring the enemy (C
+ * HuntTarget AttackFinished(self, 1): a flat 1s hold). Skill-scaled
+ * extension the job asks for: easy reacts slower, nightmare near-
+ * instantly; medium keeps the C 1s. No jitter (C has none).
+ */
+export function sightReactionDelay(skill: number): number {
+  if (skill <= 0) return 1.2;
+  if (skill === 1) return 1.0;
+  if (skill === 2) return 0.6;
+  return 0.3;
+}
+
+/** Soldier dodge outcome (C soldier_dodge branches). */
+export type DodgeChoice = 'none' | 'duck' | 'duckShoot';
+
+/**
+ * C check_dodge easy-mode pre-gate (g_weapon.c): on easy the whole dodge
+ * check only runs a quarter of the time. Skill 1+ always checks.
+ */
+export function checkDodgeGate(skill: number, rand: () => number): boolean {
+  if (skill === 0 && rand() > 0.25) return false;
+  return true;
+}
+
+/**
+ * C soldier_dodge (m_soldier.c): 25% of incoming projectile shots make the
+ * soldier react; easy always ducks, medium ducks 1/3 else duck-and-shoots
+ * (attack3), hard+ ducks 2/3 else duck-and-shoots.
+ */
+export function soldierDodgeChoice(skill: number, rand: () => number): DodgeChoice {
+  if (rand() > 0.25) return 'none';
+  if (skill === 0) return 'duck';
+  if (skill === 1) return rand() > 0.33 ? 'duck' : 'duckShoot';
+  if (skill >= 2) return rand() > 0.66 ? 'duck' : 'duckShoot';
+  return 'duckShoot';
+}
+
+/**
+ * C soldier_duck_down hull (m_soldier.c): maxs[2] -= 32, so the 16x16x56
+ * standing hull becomes 16x16x24 while ducked (mins unchanged). Bolt and
+ * pellet sweeps test this hull while the duck move plays.
+ */
+export const MONSTER_HULL_MAXS_DUCKED: Vec3 = v3(16, 16, 0);
+
+/**
+ * Skill-3 burst refire (m_soldier.c attack4/attack6 nextframe: skill 3
+ * re-fires the machinegun move half the time instead of exiting). The tick
+ * calls this when an attack move runs to completion; true re-enters the
+ * same move immediately, bypassing checkAttack like C's nextframe does.
+ * Only the machinegun-class guns burst (soldier ss skin, gunner chain).
+ */
+export function burstRefire(skill: number, machinegunClass: boolean, rand: () => number): boolean {
+  if (skill < 3 || !machinegunClass) return false;
+  return rand() < 0.5;
+}
 /**
  * Melee/ranged selection by range. Soldier picks its skin weapon at
  * near/mid (see selectSoldierAttack); gunner sprays or lobs (the lite
@@ -642,8 +847,26 @@ export function isAttackMove(move: string): boolean {
 }
 
 /**
- * One chase tick: attack when in range with line of sight, else navigate
- * the graph toward the player. `dist` is the 3D monster-player distance,
+ * Optional per-tick context for monsterChaseMove. All optional so existing
+ * callers (and the C-default behaviour) keep working with no changes:
+ * - time/skill feed M_CheckAttack (defaults: 0/1 — the pre-depth path ran
+ *   with no clock and medium odds);
+ * - standGround mirrors AI_STAND_GROUND (combat-point hold);
+ * - goal overrides the steering target while range/commit still key off the
+ *   enemy (playerPos): the trail-pursuit tick steers at lastSighting/trail
+ *   markers instead of beelining the (possibly hidden) player.
+ */
+export interface ChaseOpts {
+  time?: number;
+  skill?: number;
+  standGround?: boolean;
+  goal?: Vec3 | null;
+}
+
+/**
+ * One chase tick: attack when in range with line of sight (gated by the
+ * C M_CheckAttack chance table, not the old flat 0.7 roll), else navigate
+ * the graph toward the goal. `dist` is the 3D monster-player distance,
  * `canSee` the caller's line-of-sight result. Returns the chosen move plus
  * the node path (null while attacking/standing).
  */
@@ -654,38 +877,68 @@ export function monsterChaseMove(
   nav: MonsterNav,
   canSee: boolean,
   rand: () => number,
+  opts?: ChaseOpts,
 ): ChaseResult {
   if (ms.dead) return { move: ms.move, path: null, target: null };
   // Attack latch: an attack move already playing runs to completion
   // (monsterThink advances it). Re-rolling here picked a new random attack
   // every tick, resetting frame to 0 — the anim strobed instead of playing.
   if (isAttackMove(ms.move)) return { move: ms.move, path: null, target: null };
+  const time = opts?.time ?? 0;
+  const skill = opts?.skill ?? 1;
+  const goal = opts?.goal ?? playerPos;
   const dx = playerPos[0]! - selfPos[0]!;
   const dy = playerPos[1]! - selfPos[1]!;
   const dz = playerPos[2]! - selfPos[2]!;
   const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
   const r = monsterRange(dist);
-  // Melee always commits; at near/mid with sight the monster usually
-  // plants and fires (id attack chance), otherwise it closes in.
-  const commit =
-    r === RANGE_MELEE || ((r === RANGE_NEAR || r === RANGE_MID) && canSee && rand() < 0.7);
-  if (canSee && commit) {
-    // id FacingIdeal gate (ai_charge / ai_run_missile): only enter the
-    // attack move when already roughly facing the enemy (±45°). Otherwise
-    // keep closing/turning below so M_ChangeYaw can catch up — the anim
-    // never fires over the shoulder.
-    if (Math.abs(yawDiff(monsterYawTo(selfPos, playerPos), ms.yaw)) <= 45) {
-      const choice = selectAttack(ms.kind, dist, rand);
-      if (choice !== 'none') {
-        const move = attackMoveFor(ms.kind, choice);
-        setMove(ms, move);
-        return { move, path: null, target: null };
+  // M_CheckAttack (g_ai.c): chance/as-state gating, skill-scaled. The old
+  // flat `rand() < 0.7` commit fired far too eagerly (and never cooled
+  // down); the C table + attack_finished is what paces real engagements.
+  if (canSee) {
+    const chk = checkAttack({
+      range: r,
+      canSee: true,
+      standGround: opts?.standGround ?? false,
+      attackFinished: ms.attackFinished,
+      time,
+      skill,
+      hasAttack: true,
+      hasMelee: monsterHasMelee(ms.kind),
+      rand,
+    });
+    ms.attackState = chk.attackState;
+    ms.attackFinished = chk.attackFinished;
+    if (chk.attack) {
+      // id FacingIdeal gate (ai_charge / ai_run_missile): only enter the
+      // attack move when already roughly facing the enemy (±45°). Otherwise
+      // keep closing/turning below so M_ChangeYaw can catch up — the anim
+      // never fires over the shoulder.
+      if (Math.abs(yawDiff(monsterYawTo(selfPos, playerPos), ms.yaw)) <= 45) {
+        const choice = selectAttack(ms.kind, dist, rand);
+        if (choice !== 'none') {
+          const move = attackMoveFor(ms.kind, choice);
+          setMove(ms, move);
+          return { move, path: null, target: null };
+        }
       }
     }
+  } else {
+    ms.attackState = 'straight';
   }
-  // Close in: walk the node graph toward the player.
+  // AI_STAND_GROUND (combat-point hold / ambush stand): plant and shoot,
+  // never walk the graph. C ai_stand still runs the attack check above, so
+  // a holder with sight and a passed roll enters the attack move; reaching
+  // here means hold position.
+  if (opts?.standGround ?? false) {
+    const stand = ms.kind === 'soldier' ? 'stand1' : 'stand';
+    setMove(ms, stand);
+    return { move: ms.move, path: null, target: null };
+  }
+  // Close in: walk the node graph toward the goal (the enemy when visible,
+  // the last sighting / trail marker while pursuing blind).
   const from = nearestNode(nav.positions, selfPos);
-  const to = nearestNode(nav.positions, playerPos);
+  const to = nearestNode(nav.positions, goal);
   if (from !== null && to !== null) {
     const path = from === to ? [from] : findPath(nav.graph, from, to);
     if (path && path.length > 0) {

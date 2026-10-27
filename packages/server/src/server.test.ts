@@ -463,6 +463,7 @@ describe('skill cvar + spawn gating (g_spawn.c, g_combat.c)', () => {
     let fires = 0;
     const attacks = new Set<string>();
     for (let i = 0; i < 40; i++) {
+      st.time += 0.1; // each direct tick is a 10Hz clock tick (SV_Tick owns it live)
       for (const ev of SV_MonsterTick(st, player, trace, null, rand)) {
         fires++;
         attacks.add(ev.attack);

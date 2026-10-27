@@ -28,6 +28,7 @@ import {
   monsterChaseMove,
   monsterFlashOffset,
   monsterLocomotion,
+  monsterMoveOf,
   monsterPain,
   monsterThink,
   moverThink,
@@ -52,6 +53,7 @@ import {
   spawnPlat,
   spawnTrigger,
   targetExplosionFuseAt,
+  trailInit,
   triggerTouch,
   BOLT_LIFE,
   BOLT_SPEED,
@@ -80,9 +82,25 @@ import type {
   MonsterNav,
   MonsterState,
   Mover,
+  PlayerTrail,
   TraceFn,
   Trigger,
 } from '@q2/game';
+import {
+  arriveCombatPoint,
+  checkDodges,
+  duckHoldFrozen,
+  duckShootEvent,
+  maybeBurstRefire,
+  monsterHullMaxs,
+  pursueGoal,
+  reactionAt,
+  resolveCombatPoint,
+  separationOffset,
+  skinOf,
+  trailUpkeep,
+} from './monster-ai.js';
+import type { CombatPoint } from './monster-ai.js';
 import {
   bspContentsFor,
   setPmoveWorld,
@@ -185,10 +203,14 @@ export interface ServerState {
   /** Authoritative player health (the driver mirrors it into HUD state). */
   playerHealth: number;
   playerMaxHealth: number;
+  /** Player-trail ring (p_trail.c): pursuit memory when LOS breaks. */
+  trail: PlayerTrail;
+  /** point_combat firing positions (g_misc.c SP_point_combat). */
+  combatPoints: CombatPoint[];
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100 };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100, trail: trailInit(false), combatPoints: [] };
 }
 
 /** Link an edict into the world (SV_LinkEdict: register + solid bookkeeping). */
@@ -503,6 +525,23 @@ export interface ServerMonster {
   woken: boolean;
   /** latched the first tick with line of sight (ambush acquire). */
   seen: boolean;
+  // --- M5.3 depth: per-monster pursuit/duck/combat-point state ---------------
+  // (C monsterinfo fields the lite sim never carried). reactionAt is the
+  // sight-delay gate (HuntTarget AttackFinished, skill-scaled): no attack
+  // may start before it. 0 = already alert (synthetics); -1 = stamp on the
+  // next tick (woken bodies whose use carried no clock).
+  /** Earliest attack start after acquiring the enemy (0 ready, -1 stamp). */
+  reactionAt: number;
+  /** Duck-hold expiry (m_soldier.c pausetime; 0 = not ducking). */
+  duckUntil: number;
+  /** attack3: fire once mid-duck (m_soldier.c duck-and-shoot). */
+  duckShoot: boolean;
+  /** Combat-point destination (AI_COMBAT_POINT en route; null = hunting). */
+  combatGoal: Vec3 | null;
+  /** point_combat hold flag: stand ground after arrival. */
+  combatHold: boolean;
+  /** FoundTarget combattarget hookup already ran (one-shot). */
+  combatDone: boolean;
 }
 
 /**
@@ -780,6 +819,10 @@ export function SV_SpawnEntities(
   resetEdictNums();
   const out: Edict[] = [];
   const dicts = parseEntities(text);
+  // C PlayerTrail_Init (g_spawn.c SpawnEntities): fresh pursuit memory every
+  // spawn (always active in SP; deathmatch never inits — our sim is SP-only).
+  st.trail = trailInit(true);
+  st.combatPoints = [];
   dicts.forEach((dict, index) => {
     const spawnflags = parseFloat(dict['spawnflags'], 0);
     // Skill inhibit (g_spawn.c); worldspawn (first block) is exempt.
@@ -971,6 +1014,19 @@ export function SV_SpawnEntities(
         });
         break;
       }
+      case 'point_combat': {
+        // C SP_point_combat (g_misc.c): firing-position marker, linked by
+        // targetname from a monster's combattarget. Recorded by targetname
+        // so FoundTarget can install it as the monster's combat goal.
+        st.combatPoints.push({
+          targetname: e.targetname,
+          pos: v3(e.origin[0], e.origin[1], e.origin[2]),
+          hold: (e.spawnflags & 1) !== 0,
+          target: e.target,
+          pathtarget: dict['pathtarget'] ?? '',
+        });
+        break;
+      }
       default:
         break;
     }
@@ -1013,6 +1069,12 @@ export function SV_SpawnEntities(
         triggered: (e.spawnflags & 2) !== 0,
         woken: false,
         seen: false,
+        reactionAt: 0,
+        duckUntil: 0,
+        duckShoot: false,
+        combatGoal: null,
+        combatHold: false,
+        combatDone: false,
       };
       st.monsters.push(monster);
       // C spawn HP per skin (m_soldier.c SP_ funcs): light 20, normal 30,
@@ -1081,9 +1143,15 @@ export function SV_UseMonster(m: ServerMonster, byPlayer: boolean): void {
     // monster_triggered_spawn: non-ambush FoundTarget (acquire now), ambush
     // keeps enemy NULL and waits for line of sight.
     if (byPlayer && !m.ambush) m.seen = true;
+    // The use carries no clock; stamp the sight-delay on the next tick
+    // (reactionAt -1 = pending, resolved against level.time there).
+    if (m.seen) m.reactionAt = -1;
     return;
   }
-  if (!m.triggered && byPlayer) m.seen = true;
+  if (!m.triggered && byPlayer && !m.seen) {
+    m.seen = true;
+    m.reactionAt = -1;
+  }
 }
 
 /** Fire a "use" on every entity with the given targetname (button/trigger path). */
@@ -1428,13 +1496,21 @@ function attackOfMove(kind: MonsterKind, move: string): AttackChoice {
  *   until the player rounds the corner, then runs at them. Sight is C
  *   visible(): eye to eye (monster +25, player +22 standing) against an
  *   opaque-mask trace;
- * - otherwise monsterChaseMove selects attack vs. close-in (needs a nav
- *   graph; null builds a trivial two-node graph, i.e. straight steering),
- *   monsterLocomotion steps the body with a C SV_movestep stair-climbing
- *   hull trace plus gravity, and monsterThink advances the frame;
+ * - first sight latches seen plus the skill-scaled sight delay
+ *   (HuntTarget AttackFinished): no attack may start before reactionAt;
+ * - a monster carrying combattarget heads for its point_combat instead
+ *   (one-shot hookup, chain/hold on arrival — no firing while en route);
+ * - otherwise monsterChaseMove selects attack vs. close-in (C M_CheckAttack
+ *   chance/as-state table, not the old flat roll), steering at the
+ *   trail-pursuit goal when sight is lost (needs a nav graph; null builds
+ *   a trivial two-node graph, i.e. straight steering). monsterLocomotion
+ *   steps the body with a C SV_movestep stair-climbing hull trace plus
+ *   gravity, and monsterThink advances the frame;
  * - every 'fire'/'melee' frame with line of sight emits a MonsterEvent
  *   carrying the skill damage scale, so drivers land shots on the muzzle
  *   flash (infantry's smack tags 'melee', everything ballistic tags 'fire').
+ *   Duck-and-shoot (attack3) emits one skin-gun event mid-duck; skill-3
+ *   machinegun-class bursts may refire immediately (attack4/6 nextframe).
  */
 export interface MonsterTickOpts {
   /** Eye height of the player body (22 standing, 12 ducked, pmove.c). */
@@ -1458,6 +1534,20 @@ export function SV_MonsterTick(
   const events: MonsterEvent[] = [];
   const sightTrace = opts?.sightTrace ?? trace;
   const playerView = opts?.playerViewheight ?? PLAYER_VIEWHEIGHT;
+  const now = st.time;
+  // Player-trail upkeep (p_client.c): record the spot when it leaves sight
+  // of the last marker, so blind pursuit follows the path, not a beeline.
+  // Lives here (not just SV_GameTick) so direct-tick callers get the same
+  // populated trail the production tick thinks with — pursuit keys off it,
+  // and an empty trail degenerates to the world origin. Idempotent: a fresh
+  // marker is already visible, so a second call per tick adds nothing.
+  trailUpkeep(
+    st,
+    playerPos,
+    v3(playerPos[0], playerPos[1], playerPos[2]! + playerView),
+    sightTrace,
+    st.playerHealth > 0,
+  );
   for (const m of st.monsters) {
     if (m.kind === null || (m.triggered && !m.woken)) continue;
     const ms: MonsterState = m.state;
@@ -1466,12 +1556,21 @@ export function SV_MonsterTick(
       monsterThink(ms); // corpses hold their last death frame
       continue;
     }
+    // Woken bodies stamp their sight delay against the clock (SV_UseMonster
+    // carries no time, so the use only parks -1).
+    if (m.reactionAt < 0) m.reactionAt = reactionAt(st.skill, now);
     const pos = m.edict.origin;
     const dx = playerPos[0]! - pos[0]!;
     const dy = playerPos[1]! - pos[1]!;
     const dz = playerPos[2]! - pos[2]!;
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
     const canSee = losClear(sightTrace, pos, playerPos, playerView);
+    // FoundTarget (g_ai.c): first sight acquires the enemy plus the
+    // sight-delay hold (HuntTarget AttackFinished) before any attack.
+    if (!m.seen && canSee) {
+      m.seen = true;
+      m.reactionAt = reactionAt(st.skill, now);
+    }
     if (m.ambush && !m.seen) {
       if (!canSee) {
         const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
@@ -1483,6 +1582,35 @@ export function SV_MonsterTick(
         continue;
       }
       m.seen = true;
+      m.reactionAt = reactionAt(st.skill, now);
+    }
+    // Combat-point hookup (one-shot): a carried combattarget installs the
+    // point_combat goal instead of hunting the enemy directly.
+    if (m.seen) resolveCombatPoint(st, m);
+    // Steering goal: combat points run blind (M_MoveToGoal, no attack);
+    // seen monsters pursue via the trail when sight breaks; unseen
+    // non-ambush bodies keep the legacy beeline (no sound-alert path yet).
+    let standGround = false;
+    let goal: Vec3;
+    if (m.combatGoal) {
+      if (dist3(pos, m.combatGoal) <= 24) {
+        const pathtarget = arriveCombatPoint(st, m);
+        if (pathtarget) fireTargets(st, { ...m.edict, target: pathtarget });
+      }
+      if (m.combatGoal) {
+        goal = m.combatGoal;
+      } else if (m.combatHold) {
+        standGround = true;
+        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms)) : playerPos;
+      } else {
+        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms)) : playerPos;
+      }
+    } else {
+      if (m.combatHold) standGround = true;
+      goal = m.seen
+        ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms))
+        : playerPos;
+      goal = separationOffset(st, m, goal);
     }
     const navEff: MonsterNav =
       nav ??
@@ -1493,16 +1621,42 @@ export function SV_MonsterTick(
         ]),
         positions: new Map<number, Vec3>([
           [0, v3(pos[0], pos[1], pos[2])],
-          [1, v3(playerPos[0], playerPos[1], playerPos[2])],
+          [1, v3(goal[0], goal[1], goal[2])],
         ]),
       };
-    monsterChaseMove(ms, pos, playerPos, navEff, canSee, rand);
+    // Sight delay (HuntTarget AttackFinished): attacks stay holstered until
+    // reactionAt, but the body still closes — folded into the sight bit so
+    // monsterChaseMove's M_CheckAttack path never sees an early attack.
+    const gated = canSee && now >= m.reactionAt;
+    // A playing duck is never interrupted (C runs the current move's
+    // frames): chase decisions would re-roll it into run/attack, so the
+    // duck steers with the goal but takes no chase decisions until it
+    // finishes. Think + locomotion below still advance it.
+    if (ms.move !== 'duck') {
+      monsterChaseMove(ms, pos, playerPos, navEff, m.combatGoal ? false : gated, rand, {
+        time: now,
+        skill: st.skill,
+        // Hold plants (see the stand-ground branch); combat runs steer blind
+        // and never consider attacks, so they keep walking the point chain.
+        standGround: standGround && m.combatGoal === null,
+        goal,
+      });
+    }
     monsterLocomotion(ms, pos, playerPos, (s, e) => {
       const h = stepHullTrace(trace, s, e);
       return { fraction: h.fraction, endpos: h.endpos };
-    });
+    }, goal);
+    const prevMove = ms.move;
     const playedIdx = ms.frame;
-    const action = monsterThink(ms);
+    // Duck hold (AI_HOLD_FRAME): freeze the hold frame while the pausetime
+    // runs instead of advancing through it.
+    const action = duckHoldFrozen(m, now) ? 'move' : monsterThink(ms);
+    // Skill-3 machinegun-class burst (attack4/attack6 nextframe): re-enter
+    // the finished attack move immediately, bypassing the cooldown.
+    maybeBurstRefire(m, prevMove, canSee, st.skill, rand);
+    // Duck-and-shoot (attack3): one skin-gun event on the duck fire frame.
+    const duckEv = duckShootEvent(m, canSee, skillMultiplier(st.skill));
+    if (duckEv) events.push(duckEv);
     if ((action === 'fire' || action === 'melee') && canSee) {
       events.push({
         num: m.edict.num,
@@ -1515,6 +1669,20 @@ export function SV_MonsterTick(
     }
   }
   return events;
+}
+
+/** 3D distance between two points (arrival tests). */
+function dist3(a: Vec3, b: Vec3): number {
+  const dx = a[0]! - b[0]!;
+  const dy = a[1]! - b[1]!;
+  const dz = a[2]! - b[2]!;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/** Current frame's travel (for the pursuit arrival latch). */
+function frameDistOf(ms: MonsterState): number {
+  const mv = monsterMoveOf(ms);
+  return mv.frames[ms.frame]?.dist ?? 0;
 }
 
 /**
@@ -1874,13 +2042,6 @@ function segmentAabbSeg(
   return tEnter;
 }
 
-/** Skinnum stashed on a monster edict (m_soldier.c SP_ funcs). */
-function skinOf(m: ServerMonster): number {
-  const raw = m.edict.extra['skinnum'] ?? '2';
-  const v = Number.parseInt(raw, 10);
-  return Number.isFinite(v) ? v : 2;
-}
-
 /**
  * Spawn a synthetic monster (test hook + devroom synthetics): creates and
  * links the edict, maps the classname onto the lite defs (soldier/gunner/
@@ -1913,6 +2074,12 @@ export function SV_SpawnMonster(
     triggered: false,
     woken: true,
     seen: true,
+    reactionAt: 0,
+    duckUntil: 0,
+    duckShoot: false,
+    combatGoal: null,
+    combatHold: false,
+    combatDone: false,
   };
   if (kind === 'soldier') {
     const skin = Number.parseInt((e.extra['skinnum'] as string) ?? '2', 10);
@@ -2392,10 +2559,11 @@ function sweepBoltEntities(st: ServerState, bolt: ServerBolt, player: SVPlayerBo
   if (!bolt.foe) {
     for (const m of st.monsters) {
       if (m.state.gibbed || (m.triggered && !m.woken)) continue;
+      const maxs = monsterHullMaxs(m);
       const tHit = segmentAabbSeg(
         bolt.pos, seg,
         v3(m.edict.origin[0]! + MONSTER_HULL_MINS[0]!, m.edict.origin[1]! + MONSTER_HULL_MINS[1]!, m.edict.origin[2]! + MONSTER_HULL_MINS[2]!),
-        v3(m.edict.origin[0]! + MONSTER_HULL_MAXS[0]!, m.edict.origin[1]! + MONSTER_HULL_MAXS[1]!, m.edict.origin[2]! + MONSTER_HULL_MAXS[2]!),
+        v3(m.edict.origin[0]! + maxs[0]!, m.edict.origin[1]! + maxs[1]!, m.edict.origin[2]! + maxs[2]!),
       );
       if (tHit !== null && (tMonster === null || tHit < tMonster)) {
         tMonster = tHit;
@@ -2587,13 +2755,13 @@ function stepChunks(
  */
 function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
   const rand = game.rand ?? Math.random;
+  const sightTrace = game.sightTrace ?? game.trace;
   // Monsters use doors (Touch_DoorTrigger; NOMONSTER sliders ignore them).
   for (const m of st.monsters) {
     if (m.state.dead || m.state.gibbed || (m.triggered && !m.woken) || m.kind === null) continue;
     SV_TouchDoorsAt(st, { origin: m.edict.origin, mins: MONSTER_HULL_MINS, maxs: MONSTER_HULL_MAXS }, 'monster');
   }
   // Think + C-cadence return fire (damage, bolts, tracers, muzzles, sounds).
-  const sightTrace = game.sightTrace ?? game.trace;
   for (const ev of SV_MonsterTick(st, game.player.pos, game.trace, game.nav ?? null, rand, { sightTrace, playerViewheight: game.player.view })) {
     const m = st.monsters.find((mm) => mm.edict.num === ev.num);
     if (!m) continue;
@@ -2775,6 +2943,10 @@ export function SV_PlayerFire(
     const start = blasterSpawn(opts.feet, fwd, right, opts.viewheight);
     const dl = Math.hypot(fwd[0]!, fwd[1]!, fwd[2]!) || 1;
     const dir = v3(fwd[0]! / dl, fwd[1]! / dl, fwd[2]! / dl);
+    // C check_dodge (g_weapon.c): projectile weapons only — the soldier in
+    // the shot line may duck or duck-and-shoot (skill odds) with eta from
+    // the bolt speed. Hitscan (shotgun/machinegun) never triggers this.
+    checkDodges(st, opts.eye, dir, st.skill, opts.trace, opts.rand, BOLT_SPEED);
     const spawn = resolveBoltSpawn(opts.trace, dir, start);
     if (spawn.embedded) {
       SV_BlasterImpact(st, start, res.bolt.damage, null, opts.rand);
@@ -2811,11 +2983,13 @@ export function SV_PlayerFire(
       if (m.state.gibbed || (m.triggered && !m.woken)) continue;
       // No dead-skip: corpses stay hittable (takedamage YES) so re-hitting
       // them minces (g_combat.c T_Damage gib-first ordering). Dormant
-      // TRIGGER_SPAWN bodies skip (SOLID_NOT until woken).
+      // TRIGGER_SPAWN bodies skip (SOLID_NOT until woken). Ducking soldiers
+      // present the C duck hull (maxs z 0 — chest-aimed shots pass over).
+      const maxs = monsterHullMaxs(m);
       const tHit = segmentAabbSeg(
         opts.eye, seg,
         v3(m.edict.origin[0]! + MONSTER_HULL_MINS[0]!, m.edict.origin[1]! + MONSTER_HULL_MINS[1]!, m.edict.origin[2]! + MONSTER_HULL_MINS[2]!),
-        v3(m.edict.origin[0]! + MONSTER_HULL_MAXS[0]!, m.edict.origin[1]! + MONSTER_HULL_MAXS[1]!, m.edict.origin[2]! + MONSTER_HULL_MAXS[2]!),
+        v3(m.edict.origin[0]! + maxs[0]!, m.edict.origin[1]! + maxs[1]!, m.edict.origin[2]! + maxs[2]!),
       );
       if (tHit !== null && tHit < bestT) {
         bestT = tHit;

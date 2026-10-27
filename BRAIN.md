@@ -513,6 +513,15 @@ done-when:
 - [x] blaster/shotgun/machinegun with correct spread, damage, ammo
 - [x] `soldier` + `gunner`-lite state machines, pathfinding on the node graph
 
+### TODO(M5.3-depth) — full monster AI depth (landed 2026-10-26, card stays done)
+- [x] player-trail pursuit around corners (C `PlayerTrail_*` ring + ai_run lost-sight block: last sighting first, then PickFirst/PickNext; upkeep owned idempotently by SV_MonsterTick so direct-tick callers match production)
+- [x] `M_CheckAttack` chance/as-state table (C range/stand-ground table, skill x0.5/x2, melee easy gate, FAR reject, attack_finished cooldown; replaces the old flat 0.7 commit, keeps the FacingIdeal gate)
+- [x] soldier duck on incoming fire (g_weapon.c check_dodge + m_soldier.c soldier_dodge odds, duck move + C hull shrink + AI_HOLD_FRAME + duck-and-shoot attack3; bolt/pellet sweeps test the duck hull)
+- [x] combat points (point_combat spawn + FoundTarget hookup + touch chain + hold-stand; base1 links zero combattargets, so a small documented anti-stack separation keeps firing lines from stacking instead)
+- [x] skill-scaled aggression (sight delay 1.2/1.0/0.6/0.3s, skill-3 machinegun-burst refire, dodge chance by skill; damage still half-only on easy; SV_SetSkill floor+clamp unchanged)
+- [x] gate: base1-gate (i) blind pursuit to the last sighting, (j) skill 0 < skill 3 fire counts, (k) rendered duck frames on incoming fire; (b) gains a planted strafe-battle phase (C ~1/s cadence), (e) aims at the live hull center to track the duck. New tests fail on pre-depth code.
+- [ ] M_MoveToGoal sidestep probes (sharp-corner legs hug instead of sidestepping — accepted deviation, tracked in §15 still-open).
+
 ### M6.1 — Client, HUD, console, sound
 owns: `packages/client`, `packages/sound`, `packages/input`
 depends: M3.3, M5.1
@@ -841,9 +850,15 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - M7.2 viewmodel placeholder note (real `v_weap` MD2s render with a pak);
 - batch #3 real-pak play-test note (box-critters, 2D gun, HUD noise,
 - muzzle leak — all resolved).
-- OPEN (next push): full monster AI depth — player-trail pursuit around
-- corners, M_CheckAttack chance/as-state table, soldier duck, combat points,
-- skill-scaled aggression, lasfly loop (the bigger M5.3 job);
+- CLOSED 2026-10-26 (M5.3-depth): full monster AI depth — player-trail
+- pursuit around corners (ring + lost-sight last-sighting/trail pursuit),
+- M_CheckAttack chance/as-state table, soldier duck (dodge odds, duck hull +
+- hold + duck-and-shoot), combat points (spawn/hookup/chain/hold + anti-stack
+- separation; base1 links zero combattargets), skill-scaled aggression
+- (sight delay, burst refire, dodge chance; damage still half-only on easy).
+- Gate (i/j/k) green, (b)/(e) adapted to the authentic cadence/duck; narrowed
+- remainder: M_MoveToGoal sidestep probes (sharp-corner legs hug instead of
+- sidestepping) and the lasfly loop.
 - 60fps @640×480 (M8.1 async-render +
 - M9.1 SIMD v128); saves, menus beyond the cvar panel, multiplayer
 - (explicit non-goal).
