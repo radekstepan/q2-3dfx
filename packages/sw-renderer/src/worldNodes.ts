@@ -56,6 +56,15 @@ export interface MiniSurf {
   maxs: Float32Array;
   turbulent: boolean;
   /**
+   * Translucency class (ref_soft texinfo flags): 0/undefined = opaque,
+   * 1 = SURF_TRANS33 (alpha ~0.30, e.g. base1 glass), 2 = SURF_TRANS66
+   * (alpha ~0.60, e.g. translucent water). Translucent surfaces skip the
+   * edge/span path and draw in a deferred alpha pass after all opaque
+   * geometry (R_DrawAlphaSurfaces): depth-tested, never depth-writing.
+   * Optional so procedural worlds stay opaque without touching builders.
+   */
+  translucent?: number;
+  /**
    * Sky surface (SURF_SKY): drawn as a flat-shaded fill with no texture,
    * lightmap, or surface-cache entry, and exempt from backface culling
    * (sky hulls face outward). ref_soft drew scrolling sky layers here;

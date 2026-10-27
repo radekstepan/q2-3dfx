@@ -362,7 +362,7 @@ done-when:
 - [x] `turbo.json` with `build`, `typecheck`, `lint`, `test`, `bench`, `golden` tasks (see §10.1)
 - [x] `.changeset/config.json`, all packages `"license": "GPL-2.0-only"`, `"version": "0.0.0"`
 - [x] `yarn verify` = `turbo run typecheck lint test build`
-- [ ] CI: node 20 + 22 matrix, `yarn verify`, changeset check on PRs
+- [x] CI: node 20 + 22 matrix, `yarn verify`, changeset check on PRs (+ `yarn deps:check` step after verify)
 
 ### M0.2 — Package skeletons + contracts
 owns: `packages/*`
@@ -371,7 +371,7 @@ status: done
 done-when:
 - [x] every package from §4 exists with `src/index.ts`, `tsconfig.json` extending base, `tsup` build
 - [x] all interfaces from §6 compile with stub implementations that `Com_Error('not implemented')`
-- [ ] `yarn deps:check` enforces the graph in §4
+- [x] `yarn deps:check` enforces the graph in §4 (`tools/asset-cooker` `check-deps.ts`: §5 config-everywhere + documented exceptions — sw-renderer→renderer-api implements Refresh, game→formats asset data, server→{filesystem,math}, host→{input,sound,renderer-api} wiring, testkit harness-only)
 
 ### M1.1 — Math + fixed point
 owns: `packages/math`
@@ -736,6 +736,8 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-25 | overdraw | software base1 4-view attribution, ceiling proof | 640×480 | — | — | 1.81–2.36 | north 2.362 / west 1.810 / lowroad 2.186 / trench 1.936; written+zRejected≡candidate, 44.8–57.7% depth-rejected; budget recalibrated 1.15× → 2.5× |
 | 2026-10-26 | async+simd | software base1 spawn-north, frame-attribution (classic) | 640×480 | ~36 | — | 2.38 | renderView 28.3 = GEO 13.4 (setup 0.05 mark 0.0 trav 1.0 cull 4.3 cache 0.9 proj 1.8 emit 3.8 sort 1.0) + DRAW 11.5 + resolve 1.2; 1806 batches, 30337 spans; committed `tools/bench` frame bench |
 | 2026-10-26 | async+simd | software base1 spawn-north, pooled frame-accum + parallel resolve | 640×480 | 66 | — | 2.38 | classic 19.1 → 15.1 ms/frame @7 workers (1.25x; spanfill ~3x, fused pack saves ~1ms, resolve kick ~0.7ms); index + color hashes ≡ classic on all 4 views; devroom `8f61c755`; closes the 16ms budget headless |
+| 2026-10-26 | 2d42770 | software base1 pool TRANS66 blend, real colormap.pcx alphamap | 320×240 | 41 | ~3 | 3.00 | warp+blend water through the deferred alpha pass, 480 trans spans, mode-1 hash `06456518` (mode-0 `1dc00e44`); devroom `8f61c755` byte-exact |
+| 2026-10-26 | 2d42770 | software base1 sweep flythrough, steady-state surface cache | 640×480 | 18 | ~6 | 1.92 | 8-view yaw sweeps: round-2 9107 hits / 0 misses / 0 evictions (100%); 4-teleport union exceeds the 4MB budget and re-thrashes (~6% — expected, not a regression) |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.
@@ -898,9 +900,7 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - the wall plane, closes 291u to engagement). Root cause was the missing
 - probe, not the movestep (C SV_movestep has no slide — corners come from
 - the probe + NewChaseDir sweep, both now ported).
-- 60fps @640×480 (M8.1 async-render +
-- M9.1 SIMD v128); saves, menus beyond the cvar panel, multiplayer
-- (explicit non-goal).
+- OPEN (perf/scope remainder): 60fps @640×480 software needs the browser async-render follow-up (M8.1 note); saves/menus/multiplayer stay out of scope (multiplayer explicit non-goal).
 - CLOSED 2026-10-26 (doors/paths C-parity): func_door_secret / rotating
 - doors, Think_CalcMoveSpeed, func_train_find path corners (synthetic unit
 - tests in `packages/server`; base1 ships none — C-parity for other maps).
@@ -1066,16 +1066,11 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - move-switch clear). Headless pins (game/server): ss 9-event pass at
 - 10Hz + 5-round/10dmg skill-1 damage pin, infantry 19-event pass with
 - cock preceding; gate (e)/(i/j/k) and full base1-gate 20/20 green.
-- OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
-- (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
-- `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`
-- playback still needs retail assets (Q2_PAK-gated, future work).
-- OPEN (M4.1 review): harness LANDED (`testkit` side-by-side + `decodePng`
-- slot, devtools review doc, `CAPTURE-M4.1.md`, voodoo `captureCVarTable()`)
-- but NO real Voodoo3 capture yet — human review pending; the M4.1
-- done-when box stays unchecked until sign-off is recorded here.
-- OPEN (surface-cache ledger): hit-rate number on a base1/demo1 flythrough
-- (`testCacheStats` exposed, devroom 100% measured).
+- OPEN (demo1 fallback): procedural devroom + fixed cameras wired; real `demo1.dm2` playback needs retail assets (Q2_PAK-gated, future work).
+- OPEN (M4.1 review): harness landed but no real Voodoo3 capture yet — human review pending (done-when box stays unchecked).
+- CLOSED 2026-10-26 (surface-cache ledger, render/process sweep): base1 sweep flythrough steady state 100% (9107 hits / 0 misses / 0 evictions, §11 row) — closes the M3.2 done-when; the raw 4-teleport union exceeds the 4MB budget and re-thrashes (~6%, expected by construction).
+- CLOSED 2026-10-26 (glass translucency, render/process sweep): SURF_TRANS33/66 ported (deferred alpha pass, blend + stipple, `r_translucency`/`sw_stipplealpha` cvars; devroom `8f61c755` byte-exact; base1 pool-water golden `06456518` with the real alphamap; the 17 *20 TRANS33 faces live in brush-model *20, unreachable from the worldspawn tree, so they ride the same SPAN_TRANS33 code once the web mover graft submits them).
+- CLOSED 2026-10-26 (process boxes, render/process sweep): CI runs node 20+22 `yarn verify` + `yarn deps:check` + PR changeset check; `yarn deps:check` enforces §4 (checker + documented exceptions) — closes the M0.1/M0.2 boxes.
 - CLOSED 2026-10-26 (sweep gameplay lane, this card): (1) driver channel
 - names are the real pak lumps (doors/dr1_strt.wav, switches/butn2.wav,
 - items/pkup.wav, banded player/male/painN_M.wav + deathN.wav with the

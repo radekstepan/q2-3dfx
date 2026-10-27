@@ -4,12 +4,14 @@
 
 export {
   SUBDIV,
-  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SPAN_TRANS33, SPAN_TRANS66,
+  TRANSLUCENCY_CVAR, STIPPLE_ALPHA_CVAR, translucencyModeFromCvars,
   createSpan,
   runSubdiv16, runSubdivTurbulent, runSpanFlat,
+  runSubdivTranslucent, runSubdivTranslucentWarp, runSubdivStipple33, runSubdivStipple66,
   drawSpansFlatPerSpan,
   sampleLightBlock, textureMasks,
-  drawSpansSoftware, drawSpansTurbulent, drawSpansFlat,
+  drawSpansSoftware, drawSpansTurbulent, drawSpansFlat, drawSpansTranslucent,
   drawSpans16, SoftwareBackend,
   buildTurbTable, spanListView,
   type Span, type SpanList, type Texture, type LightBlock, type RasterBackend,
@@ -47,7 +49,9 @@ export { BandWorkerPool, type PoolOptions } from './bandPool.js';
 
 export {
   COLORMAP_GRADES, COLORMAP_SIZE,
-  buildColormap, defaultPalette,
+  ALPHAMAP_HEAD, ALPHAMAP_SIZE, COLORMAP_PCX_PIXELS,
+  buildColormap, buildAlphamapPair, defaultPalette,
+  extractAlphamap33, extractAlphamap66,
 } from './colormap.js';
 
 export {
@@ -63,7 +67,7 @@ export {
   type DynamicLight, type SurfaceBounds,
 } from './light.js';
 
-export { setupCamera, setupCameraInto, buildFrustum, boxOnFrustumSide, culledByFrustum, type Camera } from './camera.js';
+export { setupCamera, setupCameraInto, buildFrustum, boxOnFrustumSide, culledByFrustum, culledByFlatFrustum, type Camera } from './camera.js';
 
 export {
   createEdgeScratch, projectClippedPoly,
@@ -104,7 +108,8 @@ export { createDevroom, createDevSkins, getDevMesh, DEVROOM_CAMERA } from './dev
 export {
   bspToMiniWorld,
   bspModelBounds,
-  SURF_SKY, SURF_WARP, SURF_NODRAW,
+  SURF_SKY, SURF_WARP, SURF_TRANS33, SURF_TRANS66, SURF_NODRAW,
+  translucencyOfFlags,
   type BspTexelSource, type BspWorldOptions,
 } from './bspWorld.js';
 

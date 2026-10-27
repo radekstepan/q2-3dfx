@@ -6,7 +6,7 @@
 import type {
   Entity, Framebuffer, FrameStats, Model, ModelHandle, RefDef, Refresh, TextureHandle, WorldModel,
 } from '@q2/renderer-api';
-import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
+import type { MiniLightmap } from './worldNodes.js';import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
 import { SurfaceCache, hashLightStyles, type SurfaceBlock } from './surfaceCache.js';
 import { setupCamera, setupCameraInto, type Camera } from './camera.js';
 import {
@@ -22,8 +22,8 @@ import {
   type EdgeScratch, type EmitFlat, type PolyInput,
 } from './edges.js';
 import {
-  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, buildTurbTable, createSpan,
-  drawSpansTurbulent, SoftwareBackend,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SPAN_TRANS33, SPAN_TRANS66, buildTurbTable, createSpan,
+  drawSpansTranslucent, drawSpansTurbulent, SoftwareBackend, translucencyModeFromCvars,
   type LightBlock, type RasterBackend, type Span, type SpanList, type Texture,
 } from './spans.js';
 import { WasmSpanBackend, wasmRequestedByCvar } from './wasmSpans.js';
@@ -41,7 +41,7 @@ import { isValidSkySize, SKY_BOX_CORNERS, SKY_BOX_HALF, skyUvOnFace } from './sk
 import { AngleVectors } from '@q2/math';
 import { drawSprite } from './sprites.js';
 import { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
-import { buildColormap, defaultPalette } from './colormap.js';
+import { buildColormap, buildAlphamapPair, defaultPalette, extractAlphamap33, extractAlphamap66, COLORMAP_PCX_PIXELS } from './colormap.js';
 import { createDevroom, getDevMesh } from './devroom.js';
 
 export const MAX_SPANS = 16384;
@@ -182,6 +182,24 @@ export function nextPot(n: number): number {
   return p;
 }
 
+/**
+ * Resolve a lightmap's valid style scales into `out` (id faces carry up to
+ * 4 slots, 255 = "no more styles"). Returns the valid count. Module scope
+ * (not a per-surface closure) so the frame loop stays allocation-free.
+ */
+export function countValidStyles(
+  lm: MiniLightmap, lightStyles: Float32Array, out: Float32Array,
+): number {
+  let nValid = 0;
+  const maxStyles = Math.min(lm.styles.length, out.length);
+  for (let k = 0; k < maxStyles; k++) {
+    const idx = lm.styles[k]!;
+    if (idx === LIGHT_STYLE_UNUSED) continue;
+    out[nValid++] = lightStyles[idx] ?? 0;
+  }
+  return nValid;
+}
+
 export class SoftwareRenderer implements Refresh {
   private fbW = 0;
   private fbH = 0;
@@ -190,6 +208,19 @@ export class SoftwareRenderer implements Refresh {
   private color: Uint32Array = new Uint32Array(0);
   private palette: Uint8Array = defaultPalette();
   private colormap: Uint8Array = buildColormap(this.palette);
+  /**
+   * Translucency blend tables (ref_soft vid.alphamap, one per ratio, both
+   * indexed [(dst << 8) + src] — see colormap.ts). Rebuilt lazily from the
+   * palette on the first translucent frame, or installed exactly from a
+   * real colormap.pcx via setAlphamapFromColormapPcx (C-exact). Shared by
+   * reference with nothing (renderer-owned); devroom never builds them
+   * (no translucent surfaces), so the golden path pays nothing.
+   */
+  private alpha33: Uint8Array = new Uint8Array(0);
+  private alpha66: Uint8Array = new Uint8Array(0);
+  private alphaReady = false;
+  /** Deferred alpha-pass spans drawn this frame (testTranslucentSpans). */
+  private transSpans = 0;
   private readonly tsBackend = new SoftwareBackend();
   private backend: SoftwareBackend = this.tsBackend;
   private wasmBackend: WasmSpanBackend | null = null;
@@ -212,6 +243,28 @@ export class SoftwareRenderer implements Refresh {
   private visOrder: number[] = [];
   private surfBounds: SurfaceBounds[] = [];
   /** World the surfBounds mirror (identity + length checked per frame). */
+  /**
+   * Hoisted frustum planes (M8.1 hot path): 5× [nx,ny,nz,dist], refilled
+   * once per renderView so the per-surface cull avoids the Camera record +
+   * Float32Array property chasing (see culledByFlatFrustum). Zero alloc.
+   */
+  private frustumFlat = new Float64Array(20);
+  /**
+   * Per-lightmap style-hash memo (M8.1 hot path): the style hash depends
+   * only on (lightId, lightStyles-for-this-frame), so surfaces sharing a
+   * lightmap skip the style loop + FNV. Stamped by render frame; grown on
+   * demand, never reallocated in steady state. A memo hit leaves
+   * styleScratch holding another surface's scales, so a cache miss after a
+   * hit refills it (scalesRefilled flag) before building the block.
+   */
+  private styleHashMemo = new Int32Array(0);
+  private styleHashStamp = new Int32Array(0);
+  /**
+   * lightStyles array the memo was computed against (identity + frame must
+   * both match for a hit: two views in one frame must not share hashes when
+   * their style values differ).
+   */
+  private styleHashStyles: Float32Array | null = null;
   private boundsWorld: MiniWorld | null = null;
   private polyInput: PolyInput = {
     verts: new Float32Array(0), uvs: new Float32Array(0), lux: new Float32Array(0), n: 0,
@@ -276,6 +329,13 @@ export class SoftwareRenderer implements Refresh {
   private dluxScratch: Float32Array = new Float32Array(0);
   private styleScratch = new Float32Array(8);
   private frameStats: FrameStats = { spans: 0, pixels: 0, overdraw: 0, ms: 0 };
+  /**
+   * Stats partials stashed by renderView for finishStats() (see above).
+   * Instance scratch — zero allocation, never read across frames.
+   */
+  private stSpansEmitted = 0;
+  private stPixelsBase = 0;
+  private stT0 = 0;
   /**
    * Overdraw-attribution counters (M3.3 option b). Null unless a diagnostic
    * measurement is armed via testMeasureOverdraw(); the per-surface loop only
@@ -474,6 +534,45 @@ export class SoftwareRenderer implements Refresh {
     this.backend.colormap = this.colormap;
     if (this.wasmBackend) this.wasmBackend.colormap = this.colormap;
     this.bandBackend.colormap = this.colormap;
+    // Blend tables follow the palette (lazily rebuilt on the next
+    // translucent frame; a real colormap.pcx install is dropped too).
+    this.alphaReady = false;
+    this.alpha33 = new Uint8Array(0);
+    this.alpha66 = new Uint8Array(0);
+  }
+
+  /**
+   * Install the C-exact blend tables from parsed `pics/colormap.pcx`
+   * pixels (shade rows + 256x256 alphamap, 81920 pixels for the 256x320
+   * file). Internal extension like setSkyTexture (the frozen Refresh keeps
+   * setPalette only). Returns false (keeping the procedural fallback) when
+   * the pixels are too short — never throws, so headless/pak-less paths
+   * stay green.
+   */
+  setAlphamapFromColormapPcx(pixels: Uint8Array): boolean {
+    if (pixels.length < COLORMAP_PCX_PIXELS) return false;
+    try {
+      this.alpha33 = extractAlphamap33(pixels);
+      this.alpha66 = extractAlphamap66(pixels);
+      this.alphaReady = true;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** True once blend tables are installed or lazily built (test hook). */
+  testAlphamapReady(): boolean {
+    return this.alphaReady;
+  }
+
+  /** Lazily build the procedural blend pair (once per palette). */
+  private ensureAlphamap(): void {
+    if (this.alphaReady) return;
+    const pair = buildAlphamapPair(this.palette);
+    this.alpha33 = pair.a33;
+    this.alpha66 = pair.a66;
+    this.alphaReady = true;
   }
 
   registerModel(m: Model): ModelHandle {
@@ -699,6 +798,7 @@ export class SoftwareRenderer implements Refresh {
     this.backend.spansDrawn = 0;
     this.backend.pixelsDrawn = 0;
     this.backend.time = 0;
+    this.transSpans = 0;
   }
 
   renderView(view: RefDef, world: WorldModel, entities: Entity[]): FrameStats {
@@ -750,6 +850,25 @@ export class SoftwareRenderer implements Refresh {
       ? this.dlights.lights
       : worldData.dynamicLights;
     if (ph) { ph.setup += phaseNow() - pt; pt = phaseNow(); }
+    // Hoist the frustum once per frame into the flat scratch (the
+    // per-surface cull below reads these locals, not the Camera record).
+    {
+      const fp = this.frustumFlat;
+      const fr = cam.frustum;
+      for (let i = 0; i < 5; i++) {
+        const p = fr[i]!;
+        fp[i * 4] = p.normal[0]!;
+        fp[i * 4 + 1] = p.normal[1]!;
+        fp[i * 4 + 2] = p.normal[2]!;
+        fp[i * 4 + 3] = p.dist;
+      }
+    }
+    // Style-hash memo: sized to the world's lightmap count (grown on
+    // demand). Stamps use the render frame, so no per-frame clearing.
+    if (this.styleHashMemo.length < worldData.lightmaps.length) {
+      this.styleHashMemo = new Int32Array(worldData.lightmaps.length);
+      this.styleHashStamp = new Int32Array(worldData.lightmaps.length);
+    }
     const dlState = this.dlights;
     const savedLights = dlState.lights;
     dlState.lights = dyn;
@@ -759,8 +878,17 @@ export class SoftwareRenderer implements Refresh {
     const hasRendererLights = savedLights.length > 0;
     const dlightFrameBits = (id: number): number => {
       if (hasRendererLights) return dlState.bitsFor(id);
-      // world-embedded lights always affect bit 0 when marked this frame
-      return affected.includes(id) ? 1 : 0;
+      // world-embedded lights always affect bit 0 when marked this frame.
+      // `affected` is sorted ascending (markLights), so binary search.
+      let lo = 0, hi = affected.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        const v = affected[mid]!;
+        if (v === id) return 1;
+        if (v < id) lo = mid + 1;
+        else hi = mid;
+      }
+      return 0;
     };
     if (ph) { ph.mark += phaseNow() - pt; pt = phaseNow(); }
 
@@ -792,13 +920,26 @@ export class SoftwareRenderer implements Refresh {
     }
     // per-surface batches: cache -> emit -> row z-sort -> draw
     const pixelsBase = this.backend.pixelsDrawn;
-    for (let vi = 0; vi < nvis; vi++) {
+    // Translucency (SURF_TRANS33/66): C draws alpha surfaces AFTER all
+    // opaque geometry (R_DrawAlphaSurfaces, depth-tested, never
+    // depth-writing, back-to-front). Pass 0 is today's opaque loop verbatim
+    // with translucent surfaces deferred; pass 1 re-walks the visible set
+    // in reverse traversal order through the same cache/emit/sort pipeline
+    // and draws via drawSpansTranslucent. r_translucency = 0 collapses to
+    // one pass with translucent surfaces drawn opaque (pre-port behaviour).
+    const tMode = translucencyModeFromCvars();
+    const passes = tMode === 0 ? 1 : 2;
+    for (let pass = 0; pass < passes; pass++) {
+    for (let i = 0; i < nvis; i++) {
+      const vi = pass === 1 ? nvis - 1 - i : i;
       const si = this.visSurfs[vi]!;
       const order = this.visOrder[vi]!;
       const surf = worldData.surfaces[si]!;
-      // degenerate (NODRAW) placeholders from BSP conversion carry no geometry
-      if (surf.n < 3) { if (d) d.degenerate++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
-      if (surfFrustumCulled(cam, surf)) { if (d) d.frustumCulled++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
+      // degenerate (NODRAW) placeholders from BSP conversion carry no geometry.
+      // Diag buckets accumulate on pass 0 only: pass 1 re-walks the set for
+      // the deferred alpha draw and must not recount admitted surfaces.
+      if (surf.n < 3) { if (d && pass === 0) d.degenerate++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
+      if (surfFrustumCulled(cam, surf)) { if (d && pass === 0) d.frustumCulled++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
       // backface cull for single-sided world polys (id draws these too and
       // lets the z-buffer reject them; skipping is output-identical and
       // saves the span work). Turbulent (water) and sky stay double-sided:
@@ -808,12 +949,26 @@ export class SoftwareRenderer implements Refresh {
         const dy = cam.origin[1]! - surf.center[1]!;
         const dz = cam.origin[2]! - surf.center[2]!;
         if (surf.fn[0]! * dx + surf.fn[1]! * dy + surf.fn[2]! * dz < 0) {
-          if (d) d.backfaceCulled++;
+          if (d && pass === 0) d.backfaceCulled++;
           if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
           continue;
         }
       }
-      if (surf.sky) {
+      // Translucent deferral (R_RenderFace queues SURF_TRANS33/66 into
+      // r_alpha_surfaces): pass 0 counts the surface as emitted and skips
+      // it, so the M3.3 diag buckets still sum to PVS-visible; pass 1
+      // draws only translucent surfaces. Sky+translucent (never in
+      // practice) follows the alpha path, matching C's TRANS-first check.
+      const trRaw = surf.translucent ?? 0;
+      const tr = trRaw === 2 ? 2 : trRaw === 1 ? 1 : 0;
+      if (tMode !== 0) {
+        if (pass === 0) {
+          if (tr !== 0) { if (d) d.emitted++; continue; }
+        } else if (tr === 0) {
+          continue;
+        }
+      }
+      if (surf.sky && !(pass === 1 && tr !== 0)) {
         const sky = this.skyTex;
         if (sky) {
           // Textured skybox (faithful R_EmitSkyBox/D_SkySurf): world SURF_SKY
@@ -851,14 +1006,14 @@ export class SoftwareRenderer implements Refresh {
         if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
         const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
         if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
-        if (nproj < 3) { if (d) d.clipRejected++; continue; }
+        if (nproj < 3) { if (d && pass === 0) d.clipRejected++; continue; }
         const start = this.spanList.count;
         const flat = this.flatForEmit(SPAN_FLAT, order, this.skyIndex, 0, null);
         const endCount = emitSpansForPoly(
           this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
           flat,
         );
-        if (endCount <= start) { if (d) d.clipRejected++; continue; }
+        if (endCount <= start) { if (d && pass === 0) d.clipRejected++; continue; }
         if (!this.commitFlat(flat, endCount - start)) {
           for (let i = start; i < endCount; i++) {
             const sp = this.pool[i]!;
@@ -877,7 +1032,7 @@ export class SoftwareRenderer implements Refresh {
         this.spanList.count = 0;
         spansEmitted += endCount - start;
         if (d) {
-          d.emitted++;
+          if (pass === 0) d.emitted++;
           const batchSpans = endCount - start;
           if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
         }
@@ -889,23 +1044,33 @@ export class SoftwareRenderer implements Refresh {
         (surf.center[2]! - view.origin[2]!) ** 2,
       );
       const mip = dist < 320 ? 0 : dist < 640 ? 1 : dist < 1280 ? 2 : 3;
-      const lm = worldData.lightmaps[surf.lightId % worldData.lightmaps.length]!;
-      // id faces carry up to 4 style slots with 255 = "no more styles":
-      // resolve only the valid ones (test and devroom paths have none).
-      // Single-style surfaces resolve to exactly one scale, so the static
-      // baseline (devroom golden) is bit-identical to the old [0]-only path.
-      let nValid = 0;
-      const maxStyles = Math.min(lm.styles.length, this.styleScratch.length);
-      for (let k = 0; k < maxStyles; k++) {
-        const idx = lm.styles[k]!;
-        if (idx === LIGHT_STYLE_UNUSED) continue;
-        this.styleScratch[nValid++] = view.lightStyles[idx] ?? 0;
+      const lightId = surf.lightId % worldData.lightmaps.length;
+      const lm = worldData.lightmaps[lightId]!;
+      // Style-hash memo: the hash depends only on (lightId, this frame's
+      // lightStyles), so lightmap-sharing surfaces skip the style loop +
+      // FNV. nValid is recomputed on the miss path (misses are rare), so a
+      // memo hit never pays the style loop at all. Bit-identical: the memo
+      // stores the exact hash the direct path computes.
+      let stylesHash: number;
+      let nValid = -1;
+      if (this.styleHashStamp[lightId] === this.frame && this.styleHashStyles === view.lightStyles) {
+        stylesHash = this.styleHashMemo[lightId]!;
+      } else {
+        // id faces carry up to 4 style slots with 255 = "no more styles":
+        // resolve only the valid ones (test and devroom paths have none).
+        // Single-style surfaces resolve to exactly one scale, so the static
+        // baseline (devroom golden) is bit-identical to the old [0]-only path.
+        nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
+        stylesHash = hashLightStyles(this.styleScratch, nValid);
+        this.styleHashMemo[lightId] = stylesHash;
+        this.styleHashStamp[lightId] = this.frame;
+        this.styleHashStyles = view.lightStyles;
       }
-      const stylesHash = hashLightStyles(this.styleScratch, nValid);
       if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
       let block = this.cache.get(surf.id, stylesHash, mip);
       if (!block) {
         // copy the style scales out of scratch (build is a miss-only path)
+        if (nValid < 0) nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
         const scalesCopy: number[] = [];
         for (let k = 0; k < nValid; k++) scalesCopy.push(this.styleScratch[k]!);
         if (scalesCopy.length === 0) scalesCopy.push(1);
@@ -928,17 +1093,26 @@ export class SoftwareRenderer implements Refresh {
       this.polyInput.n = surf.n;
       const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
       if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
-      if (nproj < 3) { if (d) d.clipRejected++; continue; }
+      if (nproj < 3) { if (d && pass === 0) d.clipRejected++; continue; }
       const start = this.spanList.count;
-      const flat = this.flatForEmit(
+      // The alpha pass bypasses fused emission (flat undefined): the fused
+      // copy would sit unstaged in the SAB (the pool kick already ran), so
+      // pass 1 always tags objects and draws through the classic backend.
+      const flat = pass === 1 ? undefined : this.flatForEmit(
         surf.turbulent ? SPAN_TURBULENT : SPAN_OPAQUE, order, null, null, null,
       );
       const endCount = emitSpansForPoly(
         this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
         flat,
       );
-      if (endCount <= start) { if (d) d.clipRejected++; continue; }
-      if (!this.commitFlat(flat, endCount - start)) {
+      if (endCount <= start) { if (d && pass === 0) d.clipRejected++; continue; }
+      if (pass === 1) {
+        for (let i = start; i < endCount; i++) {
+          const sp = this.pool[i]!;
+          sp.kind = tr === 2 ? SPAN_TRANS66 : SPAN_TRANS33;
+          sp.ord = order;
+        }
+      } else if (!this.commitFlat(flat, endCount - start)) {
         for (let i = start; i < endCount; i++) {
           const sp = this.pool[i]!;
           sp.kind = surf.turbulent ? SPAN_TURBULENT : SPAN_OPAQUE;
@@ -949,15 +1123,41 @@ export class SoftwareRenderer implements Refresh {
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
-      this.backend.drawSpans(this.spanList, tex, lb);
+      if (pass === 1) {
+        // Deferred alpha draw (R_DrawAlphaSurfaces): blend through the
+        // classic TS backend into the live planes, so the pooled/wasm
+        // paths need no TRANS plumbing. Counters merge into the active
+        // backend, keeping frameStats and the M3.3 attribution exact.
+        // Tables build lazily here (first translucent frame only), so
+        // translucent-free worlds (devroom golden) never pay for them.
+        this.ensureAlphamap();
+        const tb = this.tsBackend;
+        if (this.backend !== tb) tb.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
+        const t = drawSpansTranslucent(this.idx, this.zb, this.fbW, this.fbH, this.spanList,
+          tex, lb, this.colormap, this.alpha33, this.alpha66,
+          surf.turbulent ? tb.turbTable : null, view.time, tMode === 2);
+        this.transSpans += t.spans;
+        if (this.backend === tb) {
+          tb.spansDrawn += t.spans;
+          tb.pixelsDrawn += t.pixels;
+        } else {
+          this.backend.spansDrawn += t.spans;
+          this.backend.pixelsDrawn += t.pixels;
+        }
+      } else {
+        this.backend.drawSpans(this.spanList, tex, lb);
+      }
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
       spansEmitted += endCount - start;
       if (d) {
-        d.emitted++;
+        // Pass 0 counted the deferred surface as emitted at deferral time;
+        // pass 1 must not recount, but still tracks the max batch.
+        if (pass === 0) d.emitted++;
         const batchSpans = endCount - start;
         if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
       }
+    }
     }
 
     // Frame accumulation (M8.1 async-render step 1): geometry captured every
@@ -967,7 +1167,7 @@ export class SoftwareRenderer implements Refresh {
     // candidatePixels finalises from the backend counters either way (the
     // per-batch deltas telescoped to the same total).
     if (this.backend === this.bandBackend && this.bandBackend.dispatcher &&
-      this.bandBackend.accumEnabled) {
+      this.bandBackend.accumEnabled && !this.bandBackend.flushDeferred) {
       if (ph) pt = phaseNow();
       this.bandBackend.flushAccum();
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
@@ -1095,16 +1295,65 @@ export class SoftwareRenderer implements Refresh {
     // re-added expires after DEFAULT_DLIGHT_TTL_FRAMES renders (swept at the
     // top of the next renderView, with one serial bump / one cache rebuild).
     this.dlights.ageFrame();
-    const ms = Date.now() - t0;
-    const area = this.fbW * this.fbH;
     if (d) d.candidatePixels = candidatePixels;
+    // Stash the stats partials: finishStats() reads the backend counters,
+    // which are only complete after the (possibly async) frame kick.
+    // The sync path's counters are already complete, so its stats are
+    // unchanged; the async path re-runs finishStats() after the kick.
+    this.stSpansEmitted = spansEmitted;
+    this.stPixelsBase = pixelsBase;
+    this.stT0 = t0;
+    return this.finishStats();
+  }
+
+  /**
+   * Finalise frame stats from the stashed partials + live backend
+   * counters. Called once at the end of renderView (sync path, counters
+   * complete) and again at the end of renderViewAsync (after the async
+   * frame kick completes the counters). Pure recompute: identical values
+   * either way. Zero allocation.
+   */
+  finishStats(): FrameStats {
+    const area = this.fbW * this.fbH;
+    const candidatePixels = this.backend.pixelsDrawn - this.stPixelsBase;
+    const ms = Date.now() - this.stT0;
     this.frameStats = {
-      spans: spansEmitted + this.backend.spansDrawn,
+      spans: this.stSpansEmitted + this.backend.spansDrawn,
       pixels: this.backend.pixelsDrawn,
       overdraw: area > 0 ? candidatePixels / area : 0,
       ms,
     };
     return this.frameStats;
+  }
+
+  /**
+   * Async render (M8.1 browser lane): geometry + entity foreground run
+   * synchronously exactly like renderView (deferring only the pooled frame
+   * kick), then the single frame kick completes without blocking the
+   * calling thread (message-driven worker completion). Output is
+   * bit-identical to renderView on opaque worlds: every plane write stays
+   * depth-guarded, so the deferred world kick converges to the same planes
+   * regardless of the foreground having drawn first, and the stats
+   * recompute from the same counters. (Translucent + pooled/deferred
+   * ordering follows the pooled sync path — the translucency lane's open
+   * item, identical in both.) Non-reentrant (uses the stats stash); await
+   * the result before starting the next frame. Falls back to the sync path
+   * with no pool.
+   */
+  async renderViewAsync(view: RefDef, world: WorldModel, entities: Entity[]): Promise<FrameStats> {
+    const banded = this.backend === this.bandBackend ? this.bandBackend : null;
+    const prevDefer = banded ? banded.flushDeferred : false;
+    if (banded) banded.flushDeferred = true;
+    try {
+      // Premature stats discarded; partials stashed for finishStats().
+      this.renderView(view, world, entities);
+    } finally {
+      if (banded) banded.flushDeferred = prevDefer;
+    }
+    if (banded && banded.dispatcher && banded.accumEnabled) {
+      await banded.flushAccumAsync();
+    }
+    return this.finishStats();
   }
 
   endFrame(): void {
@@ -1129,6 +1378,30 @@ export class SoftwareRenderer implements Refresh {
         this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
       }
     }
+    this.mirrorIndexPlane();
+  }
+
+  /**
+   * Async end-of-frame (M8.1 browser lane): the pooled resolve kick
+   * completes without blocking the calling thread; every other path runs
+   * the identical serial expand. Bit-identical to endFrame.
+   */
+  async endFrameAsync(): Promise<void> {
+    if (this.backend === this.bandBackend && this.bandBackend.dispatcher) {
+      if (this.bandBackend.batchesDrawn === 0) {
+        this.idx.fill(0);
+        this.zb.fill(0);
+      }
+      await this.bandBackend.resolveAccumAsync(this.palette, this.color);
+    } else {
+      this.endFrame();
+      return;
+    }
+    this.mirrorIndexPlane();
+  }
+
+  /** Mirror the wasm index plane back to the host framebuffer (see endFrame). */
+  private mirrorIndexPlane(): void {
     // wasm mode draws into wasm-memory views: mirror the index plane back so
     // host code reading fb.index directly stays correct (testkit's harness
     // uses getFramebuffer(), which already returns the live views).
@@ -1171,6 +1444,12 @@ export class SoftwareRenderer implements Refresh {
   testCacheStats(): { hits: number; misses: number; evictions: number; used: number; size: number; hitRate: number } {
     const c = this.cache;
     return { hits: c.hits, misses: c.misses, evictions: c.evictions, used: c.used, size: c.size, hitRate: c.hitRate() };
+  }
+
+  /** Deferred alpha-pass spans drawn by the last renderView (0 when the
+   * view sees no TRANS33/66 glass; observability for the glass golden). */
+  testTranslucentSpans(): number {
+    return this.transSpans;
   }
 
   /** WASM backend batch stats (M9.1): null unless initWasm() succeeded. */

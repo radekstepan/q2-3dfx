@@ -14,10 +14,19 @@ import { clusterPVS, FACE_STRIDE } from '@q2/bsp';
 import type { BspMap } from '@q2/bsp';
 import type { MiniLeaf, MiniLightmap, MiniNode, MiniSurf, MiniTexture, MiniWorld } from './worldNodes.js';
 
-/** Q2 surface flags (qfiles.h texinfo_t): only warp + nodraw matter here. */
+/** Q2 surface flags (qfiles.h texinfo_t): translucency + warp + nodraw matter here. */
 export const SURF_SKY = 0x4;
 export const SURF_WARP = 0x8;
+export const SURF_TRANS33 = 0x10;
+export const SURF_TRANS66 = 0x20;
 export const SURF_NODRAW = 0x80;
+
+/** Translucency class for a texinfo flags word (TRANS66 wins, like C). */
+export function translucencyOfFlags(flags: number): number {
+  if ((flags & SURF_TRANS66) !== 0) return 2;
+  if ((flags & SURF_TRANS33) !== 0) return 1;
+  return 0;
+}
 
 /** Mip-0 texel source for a WAL texture, or null for the checker fallback. */
 export interface BspTexelSource {
@@ -112,7 +121,7 @@ export function bspToMiniWorld(map: BspMap, opts: BspWorldOptions = {}): MiniWor
         id: f, verts: empty, uvs: new Float32Array(0), lux: new Float32Array(0), n: 0,
         texId: 0, lightId: f, center: new Float32Array(3), radius: 0,
         mins: new Float32Array(3), maxs: new Float32Array(3), turbulent: false,
-        sky: false,
+        sky: false, translucent: 0,
         fn: new Float32Array([0, 0, 1]),
       };
       lightmaps[f] = { samples: new Uint8Array([128, 128, 128]), luxW: 1, luxH: 1, styles: [0, 0, 0, 0] };
@@ -197,6 +206,7 @@ export function bspToMiniWorld(map: BspMap, opts: BspWorldOptions = {}): MiniWor
       maxs: bb.maxs,
       turbulent: (flags & SURF_WARP) !== 0,
       sky: (flags & SURF_SKY) !== 0,
+      translucent: translucencyOfFlags(flags),
       fn: new Float32Array([
         map.planes[pn * 4]! * sgn,
         map.planes[pn * 4 + 1]! * sgn,

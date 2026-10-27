@@ -17,7 +17,7 @@
     "golden": "turbo run golden",
     "bench": "turbo run bench",
     "verify": "turbo run typecheck lint test build",
-    "deps:check": "node tools/asset-cooker/dist/check-deps.js || echo deps-check-pending",
+    "deps:check": "yarn workspace asset-cooker build && node tools/asset-cooker/dist/check-deps.js",
     "changeset": "changeset",
     "cook": "q2-cook"
   },

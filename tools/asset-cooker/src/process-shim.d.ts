@@ -3,5 +3,6 @@
 declare const process: {
   argv: string[];
   version: string;
+  cwd(): string;
   exit(code?: number): never;
 };

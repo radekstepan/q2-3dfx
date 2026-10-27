@@ -4,9 +4,11 @@
 // - Uint8Array/Float32Array only in the inner loop. No objects, no closures.
 // - 16.16 fixed point texture coords, ONE division per 16-pixel subdivision.
 // - Separate monomorphic entry points per span kind (opaque / turbulent /
-//   flat). The kind branches once per SPAN, never inside the pixel loop.
+//   flat / translucent33 / translucent66). The kind branches once per SPAN,
+//   never inside the pixel loop.
 
 import type { Framebuffer } from '@q2/renderer-api';
+import { getCVarNumber, registerCVar } from '@q2/config';
 
 /** Pixels per perspective-correct subdivision step. */
 export const SUBDIV = 16;
@@ -15,6 +17,37 @@ export const SUBDIV = 16;
 export const SPAN_OPAQUE = 0;
 export const SPAN_TURBULENT = 1;
 export const SPAN_FLAT = 2;
+/**
+ * Translucent span kinds (ref_soft SURF_TRANS33/SURF_TRANS66, r_poly.c
+ * R_DrawAlphaSurfaces). Drawn after all opaque geometry, depth-tested but
+ * never depth-writing, blended through the 256x256 alphamap (or
+ * screen-door stipple when sw_stipplealpha is set). Texel 255 stays
+ * transparent, exactly like C's `if (btemp != 255)` guard.
+ */
+export const SPAN_TRANS33 = 3;
+export const SPAN_TRANS66 = 4;
+
+/** Master switch for the translucent-surface path (default 1 = blend like C). */
+export const TRANSLUCENCY_CVAR = 'r_translucency';
+/** Screen-door stipple instead of alphamap blend (ref_soft sw_stipplealpha). */
+export const STIPPLE_ALPHA_CVAR = 'sw_stipplealpha';
+
+/**
+ * Resolve the translucency mode from cvars (same lazy-register pattern as
+ * workersRequestedByCvar): 0 = draw translucent surfaces opaque (safety
+ * fallback, matches the pre-port behaviour), 1 = alphamap blend (C
+ * default), 2 = screen-door stipple (C sw_stipplealpha = 1).
+ */
+export function translucencyModeFromCvars(): 0 | 1 | 2 {
+  try {
+    registerCVar(TRANSLUCENCY_CVAR, 1, 'translucent surfaces: 0 = opaque fallback, 1 = alphamap blend (ref_soft default)');
+    if (getCVarNumber(TRANSLUCENCY_CVAR) === 0) return 0;
+    registerCVar(STIPPLE_ALPHA_CVAR, 0, 'screen-door stipple for translucency (ref_soft sw_stipplealpha, default 0 = blend)');
+    return getCVarNumber(STIPPLE_ALPHA_CVAR) !== 0 ? 2 : 1;
+  } catch {
+    return 1;
+  }
+}
 
 /** Doubles packed per span: iz diz uz duz vz dvz light dlight lu lv dlu. */
 export const F_PER_SPAN = 11;
@@ -44,15 +77,30 @@ export interface Span {
 }
 
 export interface SpanList {
-  /** Preallocated pool; only [0, count) is active. Never truncate. */
+  /** Preallocated pool; only [start, count) is active. Never truncate. */
   spans: Span[];
   count: number;
+  /**
+   * Active window base (M8.1 batch-range draw): readers process
+   * [start, count), so a per-surface batch draws only its own tail instead
+   * of rescanning the whole cumulative list. Undefined = 0 (legacy full
+   * lists behave exactly as before). Set per batch by the frame loop;
+   * producers that fill from 0 leave it unset.
+   */
+  start?: number;
+}
+
+/** Active window base (undefined = 0). Read once per batch, never per pixel. */
+function listStart(list: SpanList): number {
+  const s = list.start ?? 0;
+  return s < 0 ? 0 : s;
 }
 
 /** Wrap a pool array as a list view (no allocation if reused by caller). */
 export function spanListView(pool: Span[], count: number, out: SpanList): SpanList {
   out.spans = pool;
   out.count = count;
+  out.start = 0;
   return out;
 }
 
@@ -235,9 +283,10 @@ export function drawSpansSoftware(
   const { wshift, wmask, hmask } = textureMasks(tex);
   const spans = list.spans;
   const n = list.count < spans.length ? list.count : spans.length;
+  const s0 = listStart(list);
   let pixels = 0;
   let drawn = 0;
-  for (let si = 0; si < n; si++) {
+  for (let si = s0 < n ? s0 : n; si < n; si++) {
     const s = spans[si]!;
     if (s.kind !== SPAN_OPAQUE) continue;
     if (s.y < 0 || s.y >= fbH) continue;
@@ -294,9 +343,10 @@ export function drawSpansTurbulent(
   const spans = list.spans;
   const phase = ((time * 64) | 0) & (turbTable.length - 1);
   const tn = list.count < spans.length ? list.count : spans.length;
+  const s0 = listStart(list);
   let pixels = 0;
   let drawn = 0;
-  for (let si = 0; si < tn; si++) {
+  for (let si = s0 < tn ? s0 : tn; si < tn; si++) {
     const s = spans[si]!;
     if (s.kind !== SPAN_TURBULENT) continue;
     if (s.y < 0 || s.y >= fbH) continue;
@@ -340,9 +390,10 @@ export function drawSpansFlatPerSpan(
 ): { pixels: number; spans: number } {
   const spans = list.spans;
   const n = list.count < spans.length ? list.count : spans.length;
+  const s0 = listStart(list);
   let pixels = 0;
   let drawn = 0;
-  for (let si = 0; si < n; si++) {
+  for (let si = s0 < n ? s0 : n; si < n; si++) {
     const s = spans[si]!;
     if (s.kind !== SPAN_FLAT) continue;
     if (s.y < 0 || s.y >= fbH) continue;
@@ -369,9 +420,10 @@ export function drawSpansFlat(
 ): { pixels: number; spans: number } {
   const spans = list.spans;
   const n = list.count < spans.length ? list.count : spans.length;
+  const s0 = listStart(list);
   let pixels = 0;
   let drawn = 0;
-  for (let si = 0; si < n; si++) {
+  for (let si = s0 < n ? s0 : n; si < n; si++) {
     const s = spans[si]!;
     if (s.kind !== SPAN_FLAT) continue;
     if (s.y < 0 || s.y >= fbH) continue;
@@ -453,4 +505,280 @@ export function buildTurbTable(): Uint8Array {
     t[i] = Math.round(16 + 15 * Math.sin((i / 1024) * Math.PI * 2)) & 255;
   }
   return t;
+}
+
+// --- Translucent spans (SURF_TRANS33/TRANS66, r_poly.c R_DrawAlphaSurfaces) ---
+//
+// C draws alpha surfaces AFTER all opaque geometry through R_ClipAndDrawPoly
+// with alpha 0.30 (TRANS33) or 0.60 (TRANS66). The blended spanlets
+// (R_DrawSpanlet33/66) depth-test (`*pz <= izi`, i.e. strict-greater wins,
+// like the opaque loop here) but never write depth, skip texel 255, and
+// blend the LIT source index with the destination through vid.alphamap:
+// 33 uses alphamap[src + dst*256], 66 uses alphamap[src*256 + dst].
+//
+// Both tables below are stored in ONE index order, [(dst << 8) + src], so a
+// single monomorphic loop serves both ratios (the ratio lives in the table,
+// selected per span). extractAlphamap33/66 in colormap.ts perform the
+// matching slice/transpose from a real colormap.pcx.
+
+/** One blended subdivision (TRANS33/66, non-warped). Chains like runSubdiv16. */
+export function runSubdivTranslucent(
+  idx: Uint8Array,
+  zb: Float32Array,
+  o0: number,
+  n: number,
+  iz: number,
+  diz: number,
+  uz: number,
+  duz: number,
+  vz: number,
+  dvz: number,
+  u0: number,
+  v0: number,
+  light: number,
+  dlight: number,
+  texels: Uint8Array,
+  wshift: number,
+  wmask: number,
+  hmask: number,
+  colormap: Uint8Array,
+  alpha: Uint8Array,
+): { iz: number; light: number; u1: number; v1: number } {
+  const z1 = 1 / (iz + diz * n);
+  const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
+  let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
+  const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
+  for (let i = 0, o = o0; i < n; i++, o++) {
+    const texel = texels[(((tv >> 16) & hmask) << wshift) + ((tu >> 16) & wmask)]!;
+    if (texel !== 255 && iz > zb[o]) {
+      const lit = colormap[(light << 8) + texel]!;
+      idx[o] = alpha[(idx[o]! << 8) + lit]!;
+    }
+    tu += dtu; tv += dtv; iz += diz; light += dlight;
+  }
+  return { iz, light, u1, v1 };
+}
+
+/** Blended subdivision with water warp (R_DrawSpanletTurbulentBlended33/66). */
+export function runSubdivTranslucentWarp(
+  idx: Uint8Array,
+  zb: Float32Array,
+  o0: number,
+  n: number,
+  iz: number,
+  diz: number,
+  uz: number,
+  duz: number,
+  vz: number,
+  dvz: number,
+  u0: number,
+  v0: number,
+  light: number,
+  dlight: number,
+  texels: Uint8Array,
+  wshift: number,
+  wmask: number,
+  hmask: number,
+  colormap: Uint8Array,
+  alpha: Uint8Array,
+  turbTable: Uint8Array,
+  turbPhase: number,
+): { iz: number; light: number; u1: number; v1: number } {
+  const z1 = 1 / (iz + diz * n);
+  const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
+  let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
+  const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
+  const tmask = turbTable.length - 1;
+  for (let i = 0, o = o0; i < n; i++, o++) {
+    const wu = (tu + (turbTable[((tv >> 16) + turbPhase) & tmask]! << 16)) >> 16;
+    const wv = (tv + (turbTable[((tu >> 16) + turbPhase) & tmask]! << 16)) >> 16;
+    const texel = texels[((wv & hmask) << wshift) + (wu & wmask)]!;
+    if (texel !== 255 && iz > zb[o]) {
+      const lit = colormap[(light << 8) + texel]!;
+      idx[o] = alpha[(idx[o]! << 8) + lit]!;
+    }
+    tu += dtu; tv += dtv; iz += diz; light += dlight;
+  }
+  return { iz, light, u1, v1 };
+}
+
+/**
+ * Screen-door stipple subdivisions (R_DrawSpanlet33Stipple/66Stipple with
+ * the world path's stipple_parity = 0): opaque lit texels on a fixed
+ * parity lattice, no depth write. 33 draws even columns of odd rows (1/4);
+ * 66 draws all of even rows + even columns of odd rows (3/4). xAbs is the
+ * absolute screen x of the subdivision start, y the absolute scanline.
+ */
+export function runSubdivStipple33(
+  idx: Uint8Array,
+  zb: Float32Array,
+  o0: number,
+  n: number,
+  xAbs: number,
+  y: number,
+  iz: number,
+  diz: number,
+  uz: number,
+  duz: number,
+  vz: number,
+  dvz: number,
+  u0: number,
+  v0: number,
+  light: number,
+  dlight: number,
+  texels: Uint8Array,
+  wshift: number,
+  wmask: number,
+  hmask: number,
+  colormap: Uint8Array,
+): { iz: number; light: number; u1: number; v1: number } {
+  const oddRow = (y & 1) === 1;
+  const z1 = 1 / (iz + diz * n);
+  const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
+  let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
+  const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
+  for (let i = 0, o = o0; i < n; i++, o++) {
+    if (oddRow && (((xAbs + i) & 1) === 0)) {
+      const texel = texels[(((tv >> 16) & hmask) << wshift) + ((tu >> 16) & wmask)]!;
+      if (texel !== 255 && iz > zb[o]) {
+        idx[o] = colormap[(light << 8) + texel]!;
+      }
+    }
+    tu += dtu; tv += dtv; iz += diz; light += dlight;
+  }
+  return { iz, light, u1, v1 };
+}
+
+export function runSubdivStipple66(
+  idx: Uint8Array,
+  zb: Float32Array,
+  o0: number,
+  n: number,
+  xAbs: number,
+  y: number,
+  iz: number,
+  diz: number,
+  uz: number,
+  duz: number,
+  vz: number,
+  dvz: number,
+  u0: number,
+  v0: number,
+  light: number,
+  dlight: number,
+  texels: Uint8Array,
+  wshift: number,
+  wmask: number,
+  hmask: number,
+  colormap: Uint8Array,
+): { iz: number; light: number; u1: number; v1: number } {
+  const evenRow = (y & 1) === 0;
+  const z1 = 1 / (iz + diz * n);
+  const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
+  let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
+  const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
+  for (let i = 0, o = o0; i < n; i++, o++) {
+    if (evenRow || (((xAbs + i) & 1) === 0)) {
+      const texel = texels[(((tv >> 16) & hmask) << wshift) + ((tu >> 16) & wmask)]!;
+      if (texel !== 255 && iz > zb[o]) {
+        idx[o] = colormap[(light << 8) + texel]!;
+      }
+    }
+    tu += dtu; tv += dtv; iz += diz; light += dlight;
+  }
+  return { iz, light, u1, v1 };
+}
+
+/**
+ * Translucent span pass (R_DrawAlphaSurfaces equivalent): per-span kind
+ * selects the blend table (TRANS33 vs TRANS66); the warp/stipple variants
+ * are chosen once per span, never per pixel. Honors the [start, count)
+ * batch window like the other passes.
+ */
+export function drawSpansTranslucent(
+  idx: Uint8Array,
+  zb: Float32Array,
+  fbW: number,
+  fbH: number,
+  list: SpanList,
+  tex: Texture,
+  light: LightBlock,
+  colormap: Uint8Array,
+  alpha33: Uint8Array,
+  alpha66: Uint8Array,
+  turbTable: Uint8Array | null,
+  time: number,
+  stipple: boolean,
+): { pixels: number; spans: number } {
+  const texels = tex.texels;
+  const { wshift, wmask, hmask } = textureMasks(tex);
+  const spans = list.spans;
+  const n = list.count < spans.length ? list.count : spans.length;
+  const s0 = listStart(list);
+  const tmask = turbTable ? turbTable.length - 1 : 0;
+  const timePhase = turbTable ? (((time * 64) | 0) & tmask) : 0;
+  let pixels = 0;
+  let drawn = 0;
+  for (let si = s0 < n ? s0 : n; si < n; si++) {
+    const s = spans[si]!;
+    if (s.kind !== SPAN_TRANS33 && s.kind !== SPAN_TRANS66) continue;
+    if (s.y < 0 || s.y >= fbH) continue;
+    let x0 = s.x0, x1 = s.x1;
+    if (x0 < 0) x0 = 0;
+    if (x1 > fbW) x1 = fbW;
+    const count = x1 - x0;
+    if (count <= 0) continue;
+    let lz = s.light, dlz = s.dlight;
+    if (s.lv >= 0) {
+      const l0 = sampleLightBlock(light, s.lu, s.lv);
+      const l1 = sampleLightBlock(light, s.lu + s.dlu * count, s.lv);
+      lz = l0;
+      dlz = (l1 - l0) / count;
+    }
+    const skip = x0 - s.x0;
+    let iz = s.iz + s.diz * skip;
+    let uz = s.uz + s.duz * skip;
+    let vz = s.vz + s.dvz * skip;
+    let u0 = uz / iz, v0 = vz / iz;
+    let o = s.y * fbW + x0;
+    let remaining = count;
+    const alpha = s.kind === SPAN_TRANS66 ? alpha66 : alpha33;
+    const phase = turbTable ? (timePhase + s.turb) & tmask : 0;
+    while (remaining > 0) {
+      const m = remaining >= SUBDIV ? SUBDIV : remaining;
+      if (stipple && s.kind === SPAN_TRANS66) {
+        const r = runSubdivStipple66(idx, zb, o, m, x0 + (count - remaining), s.y,
+          iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lz, dlz,
+          texels, wshift, wmask, hmask, colormap);
+        iz = r.iz; lz = r.light;
+        uz += s.duz * m; vz += s.dvz * m;
+        u0 = r.u1; v0 = r.v1;
+      } else if (stipple) {
+        const r = runSubdivStipple33(idx, zb, o, m, x0 + (count - remaining), s.y,
+          iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lz, dlz,
+          texels, wshift, wmask, hmask, colormap);
+        iz = r.iz; lz = r.light;
+        uz += s.duz * m; vz += s.dvz * m;
+        u0 = r.u1; v0 = r.v1;
+      } else if (turbTable) {
+        const r = runSubdivTranslucentWarp(idx, zb, o, m,
+          iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lz, dlz,
+          texels, wshift, wmask, hmask, colormap, alpha, turbTable, phase);
+        iz = r.iz; lz = r.light;
+        uz += s.duz * m; vz += s.dvz * m;
+        u0 = r.u1; v0 = r.v1;
+      } else {
+        const r = runSubdivTranslucent(idx, zb, o, m,
+          iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lz, dlz,
+          texels, wshift, wmask, hmask, colormap, alpha);
+        iz = r.iz; lz = r.light;
+        uz += s.duz * m; vz += s.dvz * m;
+        u0 = r.u1; v0 = r.v1;
+      }
+      o += m; remaining -= m;
+    }
+    pixels += count;
+    drawn++;
+  }
+  return { pixels, spans: drawn };
 }
