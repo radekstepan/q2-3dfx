@@ -4,6 +4,8 @@
 // so spans reuse built blocks across frames. Dynamic lights invalidate via
 // invalidateSurfaces() driven by DLightState.markLights().
 
+import type { RGBMaterial } from './spans.js';
+
 export const SURFACE_CACHE_BUDGET = 4 * 1024 * 1024;
 
 export interface SurfaceBlock {
@@ -15,6 +17,14 @@ export interface SurfaceBlock {
   light: Uint8Array;
   luxW: number;
   luxH: number;
+  /**
+   * Optional parallel RGB light block (astra V2a): luxW*luxH*3 bytes
+   * 0..255 in luxel space, built by buildRGBLightMap. Present only on
+   * RGB-cache entries; the scalar `light` grades are always kept
+   * alongside so the software path never changes. Never read by the
+   * software span loop.
+   */
+  rgb?: Uint8Array;
 }
 
 interface Entry {
@@ -148,6 +158,136 @@ export class SurfaceCache {
       const surface = Math.floor(k / 16384);
       if (set.has(surface)) {
         const e = this.map.get(k)!;
+        this.map.delete(k);
+        this.used -= e.bytes;
+      }
+    }
+  }
+
+  invalidateAll(): void {
+    this.map.clear();
+    this.used = 0;
+  }
+
+  resetStats(): void {
+    this.hits = 0;
+    this.misses = 0;
+    this.evictions = 0;
+  }
+}
+
+/**
+ * Cached RGB binding: the scalar-shaped block (`rgb` luxels set, texels +
+ * grades shared by reference with the scalar entry built the same batch)
+ * plus the built material (mip chain + light view sharing block.rgb).
+ */
+export interface RGBCachedBlock {
+  block: SurfaceBlock;
+  material: RGBMaterial;
+}
+
+/**
+ * Key for the parallel RGB block cache. Carries the dlight serial in
+ * addition to (surface, stylesHash, mip): RGB lighting depends on the
+ * dynamic-light generation, and the scalar key alone could serve a block
+ * whose colored lights predate the latest add/remove. A serial change
+ * therefore misses (never serves stale color); the frame loop also drops
+ * the whole RGB cache whenever it drops the scalar one. String keys keep
+ * the 32-bit serial exact (a packed-number key would lose precision).
+ */
+export function rgbCacheKey(
+  surface: number,
+  stylesHash: number,
+  mip: number,
+  dlightSerial: number,
+): string {
+  return `${surface}:${stylesHash >>> 0}:${mip & 3}:${dlightSerial >>> 0}`;
+}
+
+/**
+ * Parallel RGB block cache (astra V2a), beside SurfaceCache. Same
+ * frame-stamp LRU policy and budget discipline, separate map and counters
+ * so the software path stays bit-identical whether or not the RGB path is
+ * armed. Entries are RGBCachedBlocks (block + built material); byte
+ * accounting covers the owned RGB luxels + mip chain only (texels/grades
+ * are shared with the scalar cache entry). Callers mirror every scalar
+ * invalidation (invalidateSurfaces / invalidateAll / nextFrame) on this
+ * cache; palette changes must invalidateAll since the mip-chain expansion
+ * bakes palette colors in.
+ */
+export class RGBLightCache {
+  readonly budget: number;
+  used = 0;
+  hits = 0;
+  misses = 0;
+  evictions = 0;
+  private frame = 0;
+  private map = new Map<string, { surface: number; entry: RGBCachedBlock; bytes: number; used: number }>();
+
+  constructor(budget: number = SURFACE_CACHE_BUDGET) {
+    this.budget = budget;
+  }
+
+  get size(): number {
+    return this.map.size;
+  }
+
+  hitRate(): number {
+    const t = this.hits + this.misses;
+    return t === 0 ? 1 : this.hits / t;
+  }
+
+  nextFrame(): void {
+    this.frame = (this.frame + 1) >>> 0;
+  }
+
+  get(surface: number, stylesHash: number, mip: number, dlightSerial: number): RGBCachedBlock | null {
+    const e = this.map.get(rgbCacheKey(surface, stylesHash, mip, dlightSerial));
+    if (!e) {
+      this.misses++;
+      return null;
+    }
+    e.used = this.frame;
+    this.hits++;
+    return e.entry;
+  }
+
+  put(surface: number, stylesHash: number, mip: number, dlightSerial: number, entry: RGBCachedBlock): void {
+    const key = rgbCacheKey(surface, stylesHash, mip, dlightSerial);
+    let chainBytes = 0;
+    for (const lvl of entry.material.levels) chainBytes += lvl.data.length;
+    const bytes = chainBytes + (entry.block.rgb ? entry.block.rgb.length : 0) + 64;
+    const old = this.map.get(key);
+    if (old) {
+      this.used -= old.bytes;
+      this.map.delete(key);
+    }
+    while (this.used + bytes > this.budget && this.map.size > 0) {
+      let victim: string | undefined;
+      let victimAge = -1;
+      for (const [k, e] of this.map) {
+        const age = (this.frame - e.used) >>> 0;
+        if (age > victimAge) {
+          victimAge = age;
+          victim = k;
+          if (age > 0) break;
+        }
+      }
+      if (victim === undefined) break;
+      const e = this.map.get(victim)!;
+      this.map.delete(victim);
+      this.used -= e.bytes;
+      this.evictions++;
+    }
+    this.map.set(key, { surface, entry, bytes, used: this.frame });
+    this.used += bytes;
+  }
+
+  /** Dynamic-light invalidation path: drop every mip/style of surf ids. */
+  invalidateSurfaces(ids: number[] | Set<number>): void {
+    const set = ids instanceof Set ? ids : new Set(ids);
+    for (const [k, e] of [...this.map.keys()].map((k) => [k, this.map.get(k)!] as const)) {
+      if (set.has(e.surface)) {
         this.map.delete(k);
         this.used -= e.bytes;
       }

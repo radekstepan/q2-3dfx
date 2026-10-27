@@ -100,6 +100,80 @@ export function buildLightMap(
 }
 
 /**
+ * Per-channel RGB lightmap build (astra V2a — ref_gl gl_light.c
+ * R_BuildLightMap / R_AddDynamicLights port). Unlike buildLightMap, which
+ * reduces static samples to a scalar luma grade for the 8-bit colormap
+ * path, this keeps all three channels separate end to end:
+ * - static RGB luxels scaled by the summed style scales, with the same
+ *   pre-clamp overbright modulate stage as the scalar path,
+ * - colored dynamic lights added per channel with linear falloff
+ *   (R_AddDynamicLights), per-luxel when luxelPos is supplied,
+ * - hue-preserving over-range (ref_gl bound step): when any channel
+ *   exceeds 1 the whole luxel is scaled by 1/max instead of clipping
+ *   channels independently, so red/blue patches keep distinct hues
+ *   under style/dlight changes instead of collapsing to white.
+ * Output is 0..255 bytes per channel (w*h*3). buildLightMap is untouched.
+ */
+export function buildRGBLightMap(
+  out: Uint8Array,
+  samples: Uint8Array,
+  w: number,
+  h: number,
+  styleScales: Float32Array | number[],
+  dlights: DynamicLight[],
+  surfCenter: Float32Array,
+  dlightBits: number,
+  overbright = LIGHT_OVERBRIGHT,
+  luxelPos?: Float32Array | null,
+): void {
+  // Same style-sum hoist as buildLightMap (single baked block per surface).
+  let styleScale = 0;
+  for (let k = 0; k < styleScales.length; k++) styleScale += styleScales[k]!;
+  if (styleScales.length === 0) styleScale = 1;
+  const n = w * h;
+  const perLuxel = luxelPos && luxelPos.length >= n * 3 ? luxelPos : null;
+  for (let i = 0; i < n; i++) {
+    let r = (samples[i * 3]! / 255) * styleScale * overbright;
+    let g = (samples[i * 3 + 1]! / 255) * styleScale * overbright;
+    let b = (samples[i * 3 + 2]! / 255) * styleScale * overbright;
+    for (let d = 0; d < dlights.length; d++) {
+      if (((dlightBits >> d) & 1) === 0) continue;
+      const dl = dlights[d]!;
+      const px = perLuxel ? perLuxel[i * 3]! : surfCenter[0]!;
+      const py = perLuxel ? perLuxel[i * 3 + 1]! : surfCenter[1]!;
+      const pz = perLuxel ? perLuxel[i * 3 + 2]! : surfCenter[2]!;
+      const dx = dl.origin[0]! - px;
+      const dy = dl.origin[1]! - py;
+      const dz = dl.origin[2]! - pz;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      const rad = dl.intensity;
+      if (dist < rad) {
+        const f = (rad - dist) / rad;
+        r += f * dl.color[0]!;
+        g += f * dl.color[1]!;
+        b += f * dl.color[2]!;
+      }
+    }
+    // Hue-preserving over-range: normalize the whole luxel by the max
+    // channel instead of clipping per channel (which would push saturated
+    // red/blue patches toward white and erase their hue difference).
+    const m = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    if (m > 1) {
+      const s = 1 / m;
+      r *= s;
+      g *= s;
+      b *= s;
+    }
+    if (r < 0) r = 0;
+    if (g < 0) g = 0;
+    if (b < 0) b = 0;
+    out[i * 3] = Math.round(r * 255);
+    out[i * 3 + 1] = Math.round(g * 255);
+    out[i * 3 + 2] = Math.round(b * 255);
+  }
+}
+
+/**
  * Fit world-space positions for every luxel of a surface lightmap grid.
  * The surface is planar, so world xyz is an exact affine function of the
  * per-vertex luxel coords (lux = (uv - base)/16, see bspWorld): solve the

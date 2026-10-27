@@ -14,7 +14,12 @@ export {
   drawSpansSoftware, drawSpansTurbulent, drawSpansFlat, drawSpansTranslucent,
   drawSpans16, SoftwareBackend,
   buildTurbTable, spanListView,
+  rgbMipLevel, rgbPickMipLevel, rgbSampleTexture, rgbSampleLightmap,
+  rgbModulate, expandPaletteRGB, buildRGBMaterial,
+  runSubdivRGBRepeat, runSubdivRGBClamp,
+  drawSpansRGB, RGBWorldBackend,
   type Span, type SpanList, type Texture, type LightBlock, type RasterBackend,
+  type RGBAddressMode, type RGBBlend, type RGBMipLevel, type RGBLightmap, type RGBMaterial,
 } from './spans.js';
 
 export {
@@ -57,11 +62,12 @@ export {
 export {
   SURFACE_CACHE_BUDGET,
   SurfaceCache, surfaceCacheKey, hashLightStyles,
-  type SurfaceBlock,
+  RGBLightCache, rgbCacheKey,
+  type SurfaceBlock, type RGBCachedBlock,
 } from './surfaceCache.js';
 
 export {
-  buildLightMap, combineStyleScales, bboxDistance, luxelWorldPositions,
+  buildLightMap, buildRGBLightMap, combineStyleScales, bboxDistance, luxelWorldPositions,
   LIGHT_STYLE_UNUSED, LIGHT_OVERBRIGHT, DEFAULT_DLIGHT_TTL_FRAMES,
   DLightState,
   type DynamicLight, type SurfaceBounds,
@@ -113,7 +119,10 @@ export {
   type BspTexelSource, type BspWorldOptions,
 } from './bspWorld.js';
 
-export { SoftwareRenderer, sortBatchByRow, nextPot, MAX_SPANS } from './frame.js';
+export {
+  SoftwareRenderer, sortBatchByRow, nextPot, MAX_SPANS,
+  setRGBWorldEnabled, isRGBWorldEnabled,
+} from './frame.js';
 export {
   createFramePhases, phaseNow,
   type FramePhases,

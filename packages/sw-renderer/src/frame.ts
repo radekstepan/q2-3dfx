@@ -6,8 +6,8 @@
 import type {
   Entity, Framebuffer, FrameStats, Model, ModelHandle, RefDef, Refresh, TextureHandle, WorldModel,
 } from '@q2/renderer-api';
-import type { MiniLightmap } from './worldNodes.js';import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
-import { SurfaceCache, hashLightStyles, type SurfaceBlock } from './surfaceCache.js';
+import type { MiniLightmap } from './worldNodes.js';import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, buildRGBLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
+import { SurfaceCache, hashLightStyles, RGBLightCache, type RGBCachedBlock, type SurfaceBlock } from './surfaceCache.js';
 import { setupCamera, setupCameraInto, culledByFlatFrustum, type Camera } from './camera.js';
 import {
   collectVisibleSurfaces, findLeaf, isMiniWorld,
@@ -24,7 +24,8 @@ import {
 import {
   SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SPAN_TRANS33, SPAN_TRANS66, buildTurbTable, createSpan,
   drawSpansTranslucent, drawSpansTurbulent, SoftwareBackend, translucencyModeFromCvars,
-  type LightBlock, type RasterBackend, type Span, type SpanList, type Texture,
+  buildRGBMaterial, RGBWorldBackend,
+  type LightBlock, type RasterBackend, type RGBMaterial, type Span, type SpanList, type Texture,
 } from './spans.js';
 import { WasmSpanBackend, wasmRequestedByCvar } from './wasmSpans.js';
 import {
@@ -46,6 +47,34 @@ import { createDevroom, getDevMesh } from './devroom.js';
 
 export const MAX_SPANS = 16384;
 const MAX_ROW = 4096;
+
+/**
+ * Serial RGB (voodoo-policy) world pass selector (astra V2a/V2c). Default
+ * OFF: software output is bit-identical whether the RGB code exists or not
+ * (the classic path pays one flag check per opaque surface when off, and
+ * nothing else). ON routes opaque world batches through drawSpansRGB into
+ * an RGB888 plane + coverage mask composited in endFrame; turbulent, sky,
+ * translucent, alias, sprite and particle draws keep the classic indexed
+ * planes either way. Serial classic backend only: pooled (banded) and wasm
+ * backends ignore the flag and keep software output.
+ */
+let rgbWorldEnabled = false;
+
+/**
+ * Select the serial RGB world pass. For the apps/web agent: call with true
+ * when `vid_renderer` selects the voodoo path (and the renderer runs the
+ * serial classic backend), false when switching back to software. No stale
+ * color survives a switch: the coverage mask is cleared every enabled
+ * frame and the composite is skipped entirely while disabled.
+ */
+export function setRGBWorldEnabled(on: boolean): void {
+  rgbWorldEnabled = on === true;
+}
+
+/** Observability hook for the RGB world flag (default false). */
+export function isRGBWorldEnabled(): boolean {
+  return rgbWorldEnabled;
+}
 
 function isAliasMesh(data: unknown): data is AliasMesh {
   if (!data || typeof data !== 'object') return false;
@@ -230,7 +259,17 @@ export class SoftwareRenderer implements Refresh {
   private cache = new SurfaceCache();
   private dlights = new DLightState();
   private lastDynSerial = 0;
-  private models: RegisteredModel[] = [];
+  /**
+   * Serial RGB world pass state (astra V2a/V2c). Planes are sized in init()
+   * and re-attached every enabled frame so backend switches (wasm/banded)
+   * can never leave a stale depth view behind. All no-ops while the module
+   * flag is off.
+   */
+  private readonly rgbBackend = new RGBWorldBackend();
+  private rgbColor: Uint32Array = new Uint32Array(0);
+  private rgbCover: Uint8Array = new Uint8Array(0);
+  private rgbCache = new RGBLightCache();
+  private rgbUsedThisFrame = false;  private models: RegisteredModel[] = [];
   private skins: Texture[] = [];
   private skinNames: string[] = [];
   private scratch: EdgeScratch = createEdgeScratch(64);
@@ -329,6 +368,8 @@ export class SoftwareRenderer implements Refresh {
   private tracerRight = new Float32Array(3);
   private tracerUp = new Float32Array(3);
   private lightBlockScratch: Uint8Array = new Uint8Array(0);
+  /** Reusable RGB luxel block for the RGB miss path (grown on demand). */
+  private rgbLightScratch: Uint8Array = new Uint8Array(0);
   /** Reusable per-luxel world-pos grid for dlight falloff (grown on demand). */
   private dluxScratch: Float32Array = new Float32Array(0);
   private styleScratch = new Float32Array(8);
@@ -387,6 +428,9 @@ export class SoftwareRenderer implements Refresh {
     this.idx = fb.index;
     this.zb = fb.depth;
     this.color = fb.color;
+    this.rgbColor = new Uint32Array(fb.width * fb.height);
+    this.rgbCover = new Uint8Array(fb.width * fb.height);
+    this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.zb, this.fbW, this.fbH);
     this.pickSkyIndex();
     for (let i = 0; i < MAX_SPANS; i++) this.pool.push(createSpan());
     for (let i = 0; i < MAX_SPANS; i++) this.tmpSort.push(this.pool[i]!);
@@ -557,9 +601,13 @@ export class SoftwareRenderer implements Refresh {
     this.bandBackend.colormap = this.colormap;
     // Blend tables follow the palette (lazily rebuilt on the next
     // translucent frame; a real colormap.pcx install is dropped too).
+    // The RGB world pass bakes palette colors into its mip chain at upload,
+    // so a palette change drops the whole RGB cache (serial-keyed entries
+    // would otherwise serve stale color).
     this.alphaReady = false;
     this.alpha33 = new Uint8Array(0);
     this.alpha66 = new Uint8Array(0);
+    this.rgbCache.invalidateAll();
   }
 
   /**
@@ -823,6 +871,18 @@ export class SoftwareRenderer implements Refresh {
     this.backend.pixelsDrawn = 0;
     this.backend.time = 0;
     this.transSpans = 0;
+    // RGB plane binding follows the live depth plane (backend switches swap
+    // this.zb; re-attaching here keeps the RGB backend on the active one).
+    // Cover clears only while enabled — disabled frames skip the composite
+    // so the extra fill costs nothing and output is untouched.
+    this.rgbBackend.spansDrawn = 0;
+    this.rgbBackend.pixelsDrawn = 0;
+    this.rgbUsedThisFrame = false;
+    if (rgbWorldEnabled) {
+      this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.zb, this.fbW, this.fbH);
+      this.rgbCover.fill(0);
+    }
+    this.rgbCache.nextFrame();
   }
 
   renderView(view: RefDef, world: WorldModel, entities: Entity[]): FrameStats {
@@ -848,6 +908,7 @@ export class SoftwareRenderer implements Refresh {
     // dynamic lights -> cache invalidation (serial change = add/remove)
     if (this.dlights.serial !== this.lastDynSerial) {
       this.cache.invalidateAll();
+      this.rgbCache.invalidateAll();
       this.lastDynSerial = this.dlights.serial;
     }
     const nSurfs = worldData.surfaces.length;
@@ -898,7 +959,10 @@ export class SoftwareRenderer implements Refresh {
     dlState.lights = dyn;
     const affected = dlState.markLights(bounds, nSurfs);
     dlState.lights = savedLights;
-    if (affected.length > 0) this.cache.invalidateSurfaces(affected);
+    if (affected.length > 0) {
+      this.cache.invalidateSurfaces(affected);
+      this.rgbCache.invalidateSurfaces(affected);
+    }
     const hasRendererLights = savedLights.length > 0;
     const dlightFrameBits = (id: number): number => {
       if (hasRendererLights) return dlState.bitsFor(id);
@@ -1116,6 +1180,23 @@ export class SoftwareRenderer implements Refresh {
       lb.height = block.luxH;
       lb.values = block.light;
       if (ph) { ph.cache += phaseNow() - pt; pt = phaseNow(); }
+      // RGB (voodoo-policy) binding for the opaque world pass. Resolved
+      // from the parallel RGB cache (keyed by surface/style/mip + dlight
+      // serial); a miss builds it from the scalar block's texels plus a
+      // fresh RGB luxel block and caches both. Null (non-classic backend,
+      // turbulent/sky surface, unusable lightmap) falls back to the scalar
+      // block/backend drawn below — output shape never changes, only the
+      // plane opaque pixels land in.
+      let rgbMat: RGBMaterial | null = null;
+      if (rgbWorldEnabled && this.backend === this.tsBackend && !surf.turbulent && !surf.sky) {
+        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, this.dlights.serial);
+        rgbMat = rgbHit
+          ? rgbHit.material
+          : this.buildRGBEntry(
+            worldData, surf, block, stylesHash, mip,
+            view.lightStyles, dyn, dlightFrameBits(surf.id),
+          );
+      }
       // emit
       this.polyInput.verts = surf.verts;
       this.polyInput.uvs = surf.uvs;
@@ -1144,7 +1225,14 @@ export class SoftwareRenderer implements Refresh {
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
-      this.backend.drawSpans(this.spanList, tex, lb);
+      if (rgbMat) {
+        const rr = this.rgbBackend.drawSpansRGB(this.spanList, rgbMat);
+        this.backend.spansDrawn += rr.spans;
+        this.backend.pixelsDrawn += rr.pixels;
+        this.rgbUsedThisFrame = true;
+      } else {
+        this.backend.drawSpans(this.spanList, tex, lb);
+      }
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
       spansEmitted += endCount - start;
@@ -1516,6 +1604,16 @@ export class SoftwareRenderer implements Refresh {
         const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
         this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
       }
+      // RGB world composite: pixels the RGB backend wrote this frame come
+      // from the RGB888 plane; everything else keeps the indexed resolve
+      // (entities, sky, turbulent water, translucent alpha). Skipped while
+      // disabled, so classic output is untouched.
+      if (this.rgbUsedThisFrame) {
+        const rgb = this.rgbColor, cover = this.rgbCover;
+        for (let i = 0; i < n; i++) {
+          if (cover[i]) this.color[i] = rgb[i]!;
+        }
+      }
     }
     this.mirrorIndexPlane();
   }
@@ -1589,6 +1687,39 @@ export class SoftwareRenderer implements Refresh {
    * view sees no TRANS33/66 glass; observability for the glass golden). */
   testTranslucentSpans(): number {
     return this.transSpans;
+  }
+
+  /**
+   * Observability for the RGB world pass (astra V2a/V2c test hook):
+   * whether the module flag is on, whether any opaque batch took the RGB
+   * backend this frame, RGB cache hit/miss/size, and how many framebuffer
+   * pixels the coverage mask marks for the RGB888 composite. Zero unless
+   * the flag was enabled for the last renderView.
+   */
+  testRGBStats(): {
+    enabled: boolean; used: boolean;
+    hits: number; misses: number; size: number; coverPixels: number;
+  } {
+    let coverPixels = 0;
+    if (this.rgbUsedThisFrame) {
+      const c = this.rgbCover;
+      for (let i = 0; i < c.length; i++) coverPixels += c[i]!;
+    }
+    const cc = this.rgbCache;
+    return {
+      enabled: rgbWorldEnabled,
+      used: this.rgbUsedThisFrame,
+      hits: cc.hits,
+      misses: cc.misses,
+      size: cc.size,
+      coverPixels,
+    };
+  }
+
+  /** Live RGB cache hit rate (bench/ledger observability). */
+  testRGBCacheStats(): { hits: number; misses: number; size: number; hitRate: number } {
+    const c = this.rgbCache;
+    return { hits: c.hits, misses: c.misses, size: c.size, hitRate: c.hitRate() };
   }
 
   /** WASM backend batch stats (M9.1): null unless initWasm() succeeded. */
@@ -1795,6 +1926,60 @@ export class SoftwareRenderer implements Refresh {
       light: this.lightBlockScratch.slice(0, n),
       luxW: lm.luxW, luxH: lm.luxH,
     };
+  }
+
+  /**
+   * RGB miss path: build the cached binding for one opaque surface from
+   * the scalar block's texels (shared by reference — no second mip pass)
+   * plus a fresh per-channel luxel block (buildRGBLightMap). Returns null
+   * when the lightmap is unusable; the caller then draws the scalar
+   * block/backend instead, so output shape never changes. The entry shares
+   * texels/grades with the scalar block and owns only the RGB luxels +
+   * mip chain (palette-baked: setPalette drops the whole RGB cache).
+   */
+  private buildRGBEntry(
+    world: MiniWorld, surf: MiniSurf, block: SurfaceBlock,
+    stylesHash: number, mip: number,
+    lightStyles: Float32Array, dyn: DynamicLight[], dlightBits: number,
+  ): RGBMaterial | null {
+    const lm = world.lightmaps[surf.lightId % world.lightmaps.length]!;
+    if (!lm || lm.luxW < 1 || lm.luxH < 1) return null;
+    if (lm.samples.length < lm.luxW * lm.luxH * 3) return null;
+    if (block.texels.length < block.bw * block.bh || block.bw < 1 || block.bh < 1) return null;
+    const n = lm.luxW * lm.luxH;
+    const need = n * 3;
+    if (this.rgbLightScratch.length < need) this.rgbLightScratch = new Uint8Array(need);
+    // Per-luxel dlight falloff (same grid fit as the scalar miss path).
+    let luxelPos: Float32Array | null = null;
+    if (dyn.length > 0 && dlightBits !== 0) {
+      const need3 = n * 3;
+      if (this.dluxScratch.length < need3) this.dluxScratch = new Float32Array(need3);
+      luxelWorldPositions(surf.verts, surf.lux, surf.n, lm.luxW, lm.luxH, surf.center, this.dluxScratch);
+      luxelPos = this.dluxScratch;
+    }
+    const nValid = countValidStyles(lm, lightStyles, this.styleScratch);
+    const scales: number[] = [];
+    for (let k = 0; k < nValid; k++) scales.push(this.styleScratch[k]!);
+    if (scales.length === 0) scales.push(1);
+    buildRGBLightMap(
+      this.rgbLightScratch, lm.samples, lm.luxW, lm.luxH,
+      scales, dyn, surf.center, dlightBits, LIGHT_OVERBRIGHT, luxelPos,
+    );
+    const rgb = this.rgbLightScratch.slice(0, need);
+    const material = buildRGBMaterial(
+      block.texels, block.bw, block.bh, this.palette,
+      { samples: rgb, luxW: lm.luxW, luxH: lm.luxH },
+      { addressS: 'repeat', addressT: 'repeat', overbright: true, lodBias: -0.35, mipDither: true },
+    );
+    const entry: RGBCachedBlock = {
+      block: {
+        texels: block.texels, bw: block.bw, bh: block.bh,
+        light: block.light, luxW: block.luxW, luxH: block.luxH, rgb,
+      },
+      material,
+    };
+    this.rgbCache.put(surf.id, stylesHash, mip, this.dlights.serial, entry);
+    return material;
   }
 }
 

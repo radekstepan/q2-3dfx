@@ -8,7 +8,7 @@
 //   never inside the pixel loop.
 
 import type { Framebuffer } from '@q2/renderer-api';
-import { getCVarNumber, registerCVar } from '@q2/config';
+import { Com_Error, getCVarNumber, registerCVar } from '@q2/config';
 
 /** Pixels per perspective-correct subdivision step. */
 export const SUBDIV = 16;
@@ -761,4 +761,563 @@ export function drawSpansTranslucent(
     drawn++;
   }
   return { pixels, spans: drawn };
+}
+
+// --- RGB world backend (astra V2a/V2c, serial voodoo-policy path) ---------
+//
+// Internal to @q2/sw-renderer: NOT part of the frozen RasterBackend
+// contract (BRAIN.md §5). drawSpansRGB takes an RGBMaterial binding, which
+// carries the mip chain + RGB lightmap + blend/depth state the scalar
+// drawSpans signature cannot express. The software path above is untouched;
+// when the RGB flag is off this code never runs and software pixels are
+// bit-identical.
+//
+// Sampler math (bilinear RGB taps, LOD + bias, Bayer mip-dither pick,
+// lightmap modulate) is ported from @q2/voodoo sampler.ts (pure functions,
+// identical integer behavior). A direct @q2/voodoo import is deliberately
+// NOT used: the enforced dependency rules (tools/asset-cooker dep check)
+// allow sw-renderer only bsp/config/formats/math/renderer-api, and widening
+// that allowlist is outside this change — so the helpers live here until a
+// follow-up moves them somewhere both packages may depend on. Deviations
+// from the voodoo originals are marked PORT-DIFF below.
+
+/** Texture addressing per axis (world textures repeat, lightmaps clamp). */
+export type RGBAddressMode = 'repeat' | 'clamp';
+
+/**
+ * RGB blend mode. V2 wires opaque world only; alpha/additive (sprites,
+ * water, explosions) arrive with step-3 material coverage. Kept as a
+ * field so call sites read like the final policy.
+ */
+export type RGBBlend = 'opaque';
+
+/** One expanded-RGB mip level (w*h triplets, 8:8:8). */
+export interface RGBMipLevel {
+  data: Uint8Array;
+  width: number;
+  height: number;
+}
+
+/** RGB light samples in luxel space (bilinear sampling like LightBlock). */
+export interface RGBLightmap {
+  /** w*h*3 bytes 0..255, row-major */
+  samples: Uint8Array;
+  luxW: number;
+  luxH: number;
+}
+
+/**
+ * Internal RGB material binding (kept inside sw-renderer, NOT renderer-api).
+ * Built per surface from the MiniWorld texture (indices expanded through
+ * the palette at upload) + the bspWorld RGB luxels + style/dlight state.
+ */
+export interface RGBMaterial {
+  /** Mip chain, [0] full res (box-filtered halves until 1x1). */
+  levels: RGBMipLevel[];
+  addressS: RGBAddressMode;
+  addressT: RGBAddressMode;
+  /** RGB luxel block + luxel dims; null = unlit (textured sky): texel as-is. */
+  light: RGBLightmap | null;
+  /** x2 modulate + clamp (vd_overbright policy). */
+  overbright: boolean;
+  /** Added to log2(rho); negative favours finer levels (voodoo tLOD sign). */
+  lodBias: number;
+  /** Per-pixel Bayer choice between level n / n+1 (single-TMU trilinear). */
+  mipDither: boolean;
+  /** V2: opaque world only (step 3 adds alpha/additive materials). */
+  blend: RGBBlend;
+  /** V2: null (masked/alpha-test surfaces arrive with step 3). */
+  alphaTest: number | null;
+  /** V2: always true for the wired world pass (flag honored, not ignored). */
+  depthWrite: boolean;
+}
+
+/** Row-major 4x4 Bayer matrix, values 0..15 (voodoo bayer.ts port). */
+const RGB_BAYER4 = new Uint8Array([
+  0, 8, 2, 10,
+  12, 4, 14, 6,
+  3, 11, 1, 9,
+  15, 7, 13, 5,
+]);
+
+/**
+ * Mipmap LOD: lod = log2(rho) + bias, clamped to [0, maxLevel] (voodoo
+ * mipLevel port). PORT-DIFF: total (never throws — the hot loop must not
+ * trap): non-positive/NaN rho clamps to epsilon, non-finite bias to 0.
+ */
+export function rgbMipLevel(rho: number, bias: number, maxLevel: number): number {
+  const r = rho > 0 ? rho : 1e-6;
+  const b = Number.isFinite(bias) ? bias : 0;
+  const lod = Math.log2(r) + b;
+  if (!(lod > 0)) return 0;
+  const cap = maxLevel < 0 ? 0 : maxLevel;
+  return lod > cap ? cap : lod;
+}
+
+/**
+ * Single-TMU "trilinear": per-pixel pick of LOD n or n+1 by comparing the
+ * fractional LOD against the Bayer threshold (voodoo pickMipLevel port).
+ */
+export function rgbPickMipLevel(
+  lod: number,
+  x: number,
+  y: number,
+  mipDither: boolean,
+  maxLevel: number,
+): number {
+  const clamped = lod < 0 ? 0 : lod;
+  const n = clamped | 0;
+  const f = clamped - n;
+  let level: number;
+  if (!mipDither) {
+    level = f < 0.5 ? n : n + 1;
+  } else {
+    const bx = (x | 0) & 3, by = (y | 0) & 3;
+    level = f * 16 <= RGB_BAYER4[(by << 2) | bx]! ? n : n + 1;
+  }
+  return level > maxLevel ? maxLevel : level;
+}
+
+/**
+ * Bilinear sample of an expanded-RGB texture level into out[off..off+2]
+ * (voodoo sampleRGBTexture port: 8-bit fixed-point weights, integer
+ * channel math — no floats per channel in the inner loop). Integer u/v =
+ * texel centre, matching the software floor(u) convention at integers.
+ * PORT-DIFF: per-axis repeat/clamp addressing (voodoo clamps; world
+ * textures repeat — each tap wraps so bilinear seams stay sealed).
+ */
+export function rgbSampleTexture(
+  tex: Uint8Array,
+  w: number,
+  h: number,
+  u: number,
+  v: number,
+  out: Uint8Array,
+  off: number,
+  wrapS: boolean,
+  wrapT: boolean,
+): void {
+  let x0: number, y0: number, x1: number, y1: number, fu: number, fv: number;
+  if (wrapS || wrapT) {
+    const uw = wrapS ? (((u % w) + w) % w) : (u < 0 ? 0 : u > w - 1 ? w - 1 : u);
+    const vw = wrapT ? (((v % h) + h) % h) : (v < 0 ? 0 : v > h - 1 ? h - 1 : v);
+    x0 = uw | 0;
+    y0 = vw | 0;
+    x1 = wrapS ? (x0 + 1) % w : (x0 + 1 < w ? x0 + 1 : x0);
+    y1 = wrapT ? (y0 + 1) % h : (y0 + 1 < h ? y0 + 1 : y0);
+    fu = Math.round((uw - x0) * 256);
+    fv = Math.round((vw - y0) * 256);
+  } else {
+    const uc = u < 0 ? 0 : u > w - 1 ? w - 1 : u;
+    const vc = v < 0 ? 0 : v > h - 1 ? h - 1 : v;
+    x0 = uc | 0;
+    y0 = vc | 0;
+    x1 = x0 + 1 < w ? x0 + 1 : x0;
+    y1 = y0 + 1 < h ? y0 + 1 : y0;
+    fu = Math.round((uc - x0) * 256);
+    fv = Math.round((vc - y0) * 256);
+  }
+  const pa = (y0 * w + x0) * 3;
+  const pb = (y0 * w + x1) * 3;
+  const pc = (y1 * w + x0) * 3;
+  const pd = (y1 * w + x1) * 3;
+  const w00 = (256 - fu) * (256 - fv);
+  const w10 = fu * (256 - fv);
+  const w01 = (256 - fu) * fv;
+  const w11 = fu * fv;
+  out[off] = (w00 * tex[pa]! + w10 * tex[pb]! + w01 * tex[pc]! + w11 * tex[pd]! + 32768) >> 16;
+  out[off + 1] =
+    (w00 * tex[pa + 1]! + w10 * tex[pb + 1]! + w01 * tex[pc + 1]! + w11 * tex[pd + 1]! + 32768) >> 16;
+  out[off + 2] =
+    (w00 * tex[pa + 2]! + w10 * tex[pb + 2]! + w01 * tex[pc + 2]! + w11 * tex[pd + 2]! + 32768) >> 16;
+}
+
+/**
+ * Bilinear sample of an RGB luxel block in luxel space (light is always
+ * clamp-addressed). Integer channel math like the texture sampler.
+ */
+export function rgbSampleLightmap(
+  lb: RGBLightmap,
+  lu: number,
+  lv: number,
+  out: Uint8Array,
+  off: number,
+): void {
+  const w = lb.luxW, h = lb.luxH, v = lb.samples;
+  const uc = lu < 0 ? 0 : lu > w - 1 ? w - 1 : lu;
+  const vc = lv < 0 ? 0 : lv > h - 1 ? h - 1 : lv;
+  const x0 = uc | 0, y0 = vc | 0;
+  const x1 = x0 + 1 < w ? x0 + 1 : x0;
+  const y1 = y0 + 1 < h ? y0 + 1 : y0;
+  const fu = Math.round((uc - x0) * 256);
+  const fv = Math.round((vc - y0) * 256);
+  const w00 = (256 - fu) * (256 - fv);
+  const w10 = fu * (256 - fv);
+  const w01 = (256 - fu) * fv;
+  const w11 = fu * fv;
+  const pa = (y0 * w + x0) * 3;
+  const pb = (y0 * w + x1) * 3;
+  const pc = (y1 * w + x0) * 3;
+  const pd = (y1 * w + x1) * 3;
+  for (let c = 0; c < 3; c++) {
+    out[off + c] =
+      ((w00 * v[pa + c]! + w10 * v[pb + c]! + w01 * v[pc + c]! + w11 * v[pd + c]! + 32768) >> 16);
+  }
+}
+
+/**
+ * Diffuse x lightmap x (overbright ? 2 : 1), clamped (voodoo
+ * modulateLightmap port). Inputs/outputs 0..255, integer math.
+ * PORT-DIFF: channels out via out[off..off+2] instead of a packed pixel
+ * (the span loop packs once, in target 0xAABBGGRR order).
+ */
+export function rgbModulate(
+  tr: number,
+  tg: number,
+  tb: number,
+  lr: number,
+  lg: number,
+  lb: number,
+  overbright: boolean,
+  out: Uint8Array,
+  off: number,
+): void {
+  const m = overbright ? 2 : 1;
+  let r = (((tr * lr * m + 127) / 255) | 0);
+  let g = (((tg * lg * m + 127) / 255) | 0);
+  let b = (((tb * lb * m + 127) / 255) | 0);
+  r = r > 255 ? 255 : r;
+  g = g > 255 ? 255 : g;
+  b = b > 255 ? 255 : b;
+  out[off] = r;
+  out[off + 1] = g;
+  out[off + 2] = b;
+}
+
+/** Expand palette indices to 8:8:8 triplets (upload-time expansion). */
+export function expandPaletteRGB(
+  texels: Uint8Array,
+  w: number,
+  h: number,
+  palette: Uint8Array,
+): Uint8Array {
+  const out = new Uint8Array(w * h * 3);
+  const n = w * h;
+  for (let i = 0; i < n; i++) {
+    const p = (texels[i]! & 255) * 3;
+    out[i * 3] = palette[p] ?? 0;
+    out[i * 3 + 1] = palette[p + 1] ?? 0;
+    out[i * 3 + 2] = palette[p + 2] ?? 0;
+  }
+  return out;
+}
+
+/** One box-filtered (2x2 average) halve step for the mip chain. */
+function halveRGBLevel(src: Uint8Array, sw: number, sh: number): RGBMipLevel {
+  const w = Math.max(1, sw >> 1), h = Math.max(1, sh >> 1);
+  const data = new Uint8Array(w * h * 3);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const sx = Math.min(x * 2, sw - 1), sy = Math.min(y * 2, sh - 1);
+      const x1 = Math.min(sx + 1, sw - 1), y1 = Math.min(sy + 1, sh - 1);
+      for (let c = 0; c < 3; c++) {
+        const a = src[(sy * sw + sx) * 3 + c]!;
+        const b = src[(sy * sw + x1) * 3 + c]!;
+        const d = src[(y1 * sw + sx) * 3 + c]!;
+        const e = src[(y1 * sw + x1) * 3 + c]!;
+        data[(y * w + x) * 3 + c] = (a + b + d + e + 2) >> 2;
+      }
+    }
+  }
+  return { data, width: w, height: h };
+}
+
+/**
+ * Build an RGBMaterial from indexed texels + an optional RGB luxel block.
+ * The mip chain is expanded once here (upload-time cost); the span loop
+ * only reads. levels is never empty (invalid dims fall back to 1x1 black).
+ */
+export function buildRGBMaterial(
+  texels: Uint8Array,
+  w: number,
+  h: number,
+  palette: Uint8Array,
+  light: RGBLightmap | null,
+  opts?: {
+    addressS?: RGBAddressMode; addressT?: RGBAddressMode;
+    overbright?: boolean; lodBias?: number; mipDither?: boolean;
+    blend?: RGBBlend; alphaTest?: number | null; depthWrite?: boolean;
+  },
+): RGBMaterial {
+  const levels: RGBMipLevel[] = [];
+  if (w >= 1 && h >= 1 && texels.length >= w * h) {
+    const base = expandPaletteRGB(texels.subarray(0, w * h), w, h, palette);
+    levels.push({ data: base, width: w, height: h });
+    let cw = w, ch = h, cur = base;
+    while (cw > 1 || ch > 1) {
+      const next = halveRGBLevel(cur, cw, ch);
+      levels.push(next);
+      cur = next.data;
+      cw = next.width;
+      ch = next.height;
+    }
+  } else {
+    levels.push({ data: new Uint8Array(3), width: 1, height: 1 });
+  }
+  return {
+    levels,
+    addressS: opts?.addressS ?? 'repeat',
+    addressT: opts?.addressT ?? 'repeat',
+    light,
+    overbright: opts?.overbright ?? true,
+    lodBias: opts?.lodBias ?? -0.35,
+    mipDither: opts?.mipDither ?? true,
+    blend: opts?.blend ?? 'opaque',
+    alphaTest: opts?.alphaTest ?? null,
+    depthWrite: opts?.depthWrite ?? true,
+  };
+}
+
+// Module scratch for the RGB pixel loop (serial path only, no allocation).
+const _rgbTex = new Uint8Array(3);
+const _rgbLit = new Uint8Array(3);
+
+/**
+ * One 16-pixel RGB subdivision (repeat-addressed texture). Mirrors
+ * runSubdiv16: ONE division, fixed-point u/v stepping, float luxel stepping;
+ * samples the per-pixel mip level, bilinear RGB texel x bilinear RGB
+ * luxel, integer modulate, 1/z depth test + write. Returns the chaining
+ * tuple (iz, lux, u1, v1) so the caller chains subdivisions exactly.
+ */
+export function runSubdivRGBRepeat(
+  color: Uint32Array,
+  cover: Uint8Array,
+  zb: Float32Array,
+  o0: number,
+  n: number,
+  xAbs: number,
+  yAbs: number,
+  iz: number,
+  diz: number,
+  uz: number,
+  duz: number,
+  vz: number,
+  dvz: number,
+  u0: number,
+  v0: number,
+  lux0: number,
+  dlux: number,
+  lv: number,
+  mat: RGBMaterial,
+  spanLod: number,
+  maxLevel: number,
+): { iz: number; lux: number; u1: number; v1: number } {
+  const levels = mat.levels;
+  const lb = mat.light;
+  const overbright = mat.overbright;
+  const mipDither = mat.mipDither;
+  const z1 = 1 / (iz + diz * n);
+  const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
+  let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
+  const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
+  let lux = lux0;
+  for (let i = 0, o = o0; i < n; i++, o++) {
+    if (iz > zb[o]!) {
+      const lvl = rgbPickMipLevel(spanLod, xAbs + i, yAbs, mipDither, maxLevel);
+      const t = levels[lvl]!;
+      rgbSampleTexture(t.data, t.width, t.height, tu / 65536, tv / 65536, _rgbTex, 0, true, true);
+      let r = _rgbTex[0]!, g = _rgbTex[1]!, b = _rgbTex[2]!;
+      if (lb) {
+        rgbSampleLightmap(lb, lux, lv, _rgbLit, 0);
+        rgbModulate(r, g, b, _rgbLit[0]!, _rgbLit[1]!, _rgbLit[2]!, overbright, _rgbLit, 0);
+        r = _rgbLit[0]!;
+        g = _rgbLit[1]!;
+        b = _rgbLit[2]!;
+      }
+      zb[o] = iz;
+      color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      cover[o] = 1;
+    }
+    tu += dtu; tv += dtv; iz += diz; lux += dlux;
+  }
+  return { iz, lux, u1, v1 };
+}
+
+/**
+ * Clamp-addressed twin of runSubdivRGBRepeat (reserved for clamp materials
+ * such as sky tiles; the wired world pass uses repeat). Separate
+ * monomorphic loop so the address mode branches per span, never per pixel.
+ */
+export function runSubdivRGBClamp(
+  color: Uint32Array,
+  cover: Uint8Array,
+  zb: Float32Array,
+  o0: number,
+  n: number,
+  xAbs: number,
+  yAbs: number,
+  iz: number,
+  diz: number,
+  uz: number,
+  duz: number,
+  vz: number,
+  dvz: number,
+  u0: number,
+  v0: number,
+  lux0: number,
+  dlux: number,
+  lv: number,
+  mat: RGBMaterial,
+  spanLod: number,
+  maxLevel: number,
+): { iz: number; lux: number; u1: number; v1: number } {
+  const levels = mat.levels;
+  const lb = mat.light;
+  const overbright = mat.overbright;
+  const mipDither = mat.mipDither;
+  const z1 = 1 / (iz + diz * n);
+  const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
+  let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
+  const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
+  let lux = lux0;
+  for (let i = 0, o = o0; i < n; i++, o++) {
+    if (iz > zb[o]!) {
+      const lvl = rgbPickMipLevel(spanLod, xAbs + i, yAbs, mipDither, maxLevel);
+      const t = levels[lvl]!;
+      rgbSampleTexture(t.data, t.width, t.height, tu / 65536, tv / 65536, _rgbTex, 0, false, false);
+      let r = _rgbTex[0]!, g = _rgbTex[1]!, b = _rgbTex[2]!;
+      if (lb) {
+        rgbSampleLightmap(lb, lux, lv, _rgbLit, 0);
+        rgbModulate(r, g, b, _rgbLit[0]!, _rgbLit[1]!, _rgbLit[2]!, overbright, _rgbLit, 0);
+        r = _rgbLit[0]!;
+        g = _rgbLit[1]!;
+        b = _rgbLit[2]!;
+      }
+      zb[o] = iz;
+      color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      cover[o] = 1;
+    }
+    tu += dtu; tv += dtv; iz += diz; lux += dlux;
+  }
+  return { iz, lux, u1, v1 };
+}
+
+/**
+ * RGB span rasteriser for the opaque world pass (drawSpansSoftware twin).
+ * Reuses traversal/clipping: perspective-correct UVs (uz/vz/iz), lightmap
+ * bilinear in luxel space (lu + dlu*x at constant lv, exactly the software
+ * gradient convention). Writes 0xAABBGGRR into `color`, 1/z into `zb`
+ * (Framebuffer.depth semantics untouched), and marks `cover` per written
+ * pixel so endFrame can composite over the indexed resolve. Zero
+ * allocation; non-opaque span kinds are skipped (step-3 material coverage
+ * draws those through the classic path for now).
+ */
+export function drawSpansRGB(
+  color: Uint32Array,
+  cover: Uint8Array,
+  zb: Float32Array,
+  fbW: number,
+  fbH: number,
+  list: SpanList,
+  mat: RGBMaterial,
+): { pixels: number; spans: number } {
+  if (mat.blend !== 'opaque' || mat.alphaTest !== null || !mat.depthWrite) {
+    Com_Error('error', 'drawSpansRGB: unsupported material (step-3 coverage pending)');
+  }
+  const repeat = mat.addressS === 'repeat' && mat.addressT === 'repeat';
+  const levels = mat.levels;
+  const maxLevel = levels.length - 1;
+  const spans = list.spans;
+  const n = list.count < spans.length ? list.count : spans.length;
+  let pixels = 0;
+  let drawn = 0;
+  for (let si = 0; si < n; si++) {
+    const s = spans[si]!;
+    if (s.kind !== SPAN_OPAQUE) continue;
+    if (s.y < 0 || s.y >= fbH) continue;
+    let x0 = s.x0, x1 = s.x1;
+    if (x0 < 0) x0 = 0;
+    if (x1 > fbW) x1 = fbW;
+    const count = x1 - x0;
+    if (count <= 0) continue;
+    // Clip-adjusted perspective start (same as the software path).
+    const skip = x0 - s.x0;
+    let iz = s.iz + s.diz * skip;
+    let uz = s.uz + s.duz * skip;
+    let vz = s.vz + s.dvz * skip;
+    let lux = s.lu + s.dlu * skip;
+    let u0 = uz / iz, v0 = vz / iz;
+    // Per-span LOD from the screen-space texture footprint (x-gradients;
+    // y-derivatives are ignored — serial-milestone approximation, the
+    // per-pixel Bayer dither still varies the chosen level within the row).
+    const dudx = (s.duz - u0 * s.diz) / iz;
+    const dvdx = (s.dvz - v0 * s.diz) / iz;
+    const aud = dudx < 0 ? -dudx : dudx;
+    const avd = dvdx < 0 ? -dvdx : dvdx;
+    const spanLod = rgbMipLevel(aud > avd ? aud : avd, mat.lodBias, maxLevel);
+    let o = s.y * fbW + x0;
+    let remaining = count;
+    while (remaining > 0) {
+      const m = remaining >= SUBDIV ? SUBDIV : remaining;
+      let r: { iz: number; lux: number; u1: number; v1: number };
+      if (repeat) {
+        r = runSubdivRGBRepeat(
+          color, cover, zb, o, m, x0 + (count - remaining), s.y,
+          iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
+          mat, spanLod, maxLevel);
+      } else {
+        r = runSubdivRGBClamp(
+          color, cover, zb, o, m, x0 + (count - remaining), s.y,
+          iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
+          mat, spanLod, maxLevel);
+      }
+      iz = r.iz;
+      lux = r.lux;
+      uz += s.duz * m;
+      vz += s.dvz * m;
+      u0 = r.u1;
+      v0 = r.v1;
+      o += m;
+      remaining -= m;
+    }
+    pixels += count;
+    drawn++;
+  }
+  return { pixels, spans: drawn };
+}
+
+/**
+ * Monomorphic RGB backend: owns the RGB888 work plane + coverage mask,
+ * dispatches the opaque world pass. Framebuffer.depth keeps 1/z semantics
+ * (same strict-greater test as the software loop); 16-bit depth
+ * quantization at test/write is deferred to step 4 (target/depth).
+ */
+export class RGBWorldBackend {
+  color: Uint32Array = new Uint32Array(0);
+  cover: Uint8Array = new Uint8Array(0);
+  zb: Float32Array = new Float32Array(0);
+  fbW = 0;
+  fbH = 0;
+  spansDrawn = 0;
+  pixelsDrawn = 0;
+
+  attach(
+    color: Uint32Array, cover: Uint8Array, zb: Float32Array, w: number, h: number,
+  ): void {
+    this.color = color;
+    this.cover = cover;
+    this.zb = zb;
+    this.fbW = w;
+    this.fbH = h;
+  }
+
+  /** Opaque RGB world pass (counts mirror SoftwareBackend accounting). */
+  drawSpansRGB(list: SpanList, mat: RGBMaterial): { pixels: number; spans: number } {
+    const r = drawSpansRGB(
+      this.color, this.cover, this.zb, this.fbW, this.fbH, list, mat,
+    );
+    this.spansDrawn += r.spans;
+    this.pixelsDrawn += r.pixels;
+    return r;
+  }
 }
