@@ -540,7 +540,9 @@ describe('play driver (devroom, headless)', () => {
     stepDriver(driver, neutralCmd(), 1);
     expect(driver.bolts.length).toBe(0);
     const barrel = driver.barrels[0]!;
-    expect(barrel.edict.freed).toBe(true);
+    // C barrel_delay: the brush stays live + solid during the 0.2s fuse —
+    // freed + clip-drop happen atomically at the blow, never at damage time.
+    expect(barrel.edict.freed).toBe(false);
     expect(driver.pendingFuses).toBe(1);
     expect(driver.explosions.some((e) => e.kind === 'explosion1')).toBe(false);
     expect(driver.debris.length).toBe(0);
@@ -552,6 +554,8 @@ describe('play driver (devroom, headless)', () => {
     const hpBefore = driver.playerHealth;
     stepDriver(driver, neutralCmd(), 2);
     expect(driver.pendingFuses).toBe(0);
+    // Fuse blew: freed + clip-drop on the same tick (no freed-but-solid window).
+    expect(driver.barrels[0]!.edict.freed).toBe(true);
     expect(driver.events).toContain('barrel');
     expect(driver.events).toContain('explosion');
     const big = driver.explosions.find((e) => e.kind === 'explosion1');

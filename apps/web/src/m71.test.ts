@@ -112,7 +112,7 @@ describe('M7.1 crouch UX (headless)', () => {
     driver.step({ ...neutralCmd(), buttons: BUTTON_DUCK }, 0.1);
     expect(driver.pm.maxs[2]).toBe(4);
     expect(driver.pm.mins[2]).toBe(-24);
-    expect(driver.pm.viewheight).toBe(12);
+    expect(driver.pm.viewheight).toBe(-2);
     // Release clears the flag on the next step (no stuck crouch).
     driver.step(neutralCmd(), 0.1);
     expect(driver.pm.maxs[2]).toBe(32);

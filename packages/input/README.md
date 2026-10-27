@@ -27,7 +27,7 @@ for pads. Importing `dom.ts` in Node is a safe no-op.
 - Crouch/duck hold sets `BUTTON_DUCK` (flows `Host`→driver→`pmoveFull`
   untouched); `@q2/game`'s `PM_CheckDuck` does not consume it yet, so
   drivers translate via `isDuckHeld(cmd)` → `PMF_DUCKED` until the game
-  wires the bit (ducked hull `mins.z -24 / maxs.z 4 / viewheight 12`).
+  wires the bit (ducked hull `mins.z -24 / maxs.z 4 / viewheight -2`).
 
 ## How it is used
 

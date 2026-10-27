@@ -296,7 +296,7 @@ export function getResolution(): { width: number; height: number } {
 // PM_CheckDuck own it: step() asserts the flag while the hold bit is down
 // (immediate engage, including the first tick when ground is not yet
 // categorized) and never clears it, so release flows through the
-// headroom-checked stand-up (hull maxs 32 → 4, viewheight 22 → 12). The host
+// headroom-checked stand-up (hull maxs 32 → 4, viewheight 22 → -2). The host
 // eye follows the authoritative pm.viewheight (host-owned calcViewOrigin
 // call) and the mixer listener rides the same height — one transition per
 // edge, no per-tick flip-flop while held.

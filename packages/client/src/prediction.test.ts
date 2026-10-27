@@ -472,7 +472,7 @@ describe('stop settle (10Hz server, sub-tick renders)', () => {
     setCVar('cl_predict', 1);
     try {
       // C PM_CheckDuck: hold (BUTTON_DUCK bit 8 / upmove<0) + ON_GROUND ducks
-      // the hull to maxs.z=4 / viewheight=12 (standing: 32/22).
+      // the hull to maxs.z=4 / viewheight=-2 (feet+22; standing: 32/22).
       const st = makePmoveState();
       st.pmFlags |= PMF_ON_GROUND;
       st.groundEntity = 0;
@@ -485,7 +485,7 @@ describe('stop settle (10Hz server, sub-tick renders)', () => {
         buttons: 8, // BUTTON_DUCK hold; hull comes from PM_CheckDuck
       });
       expect(st.maxs[2]).toBe(4);
-      expect(st.viewheight).toBe(12);
+      expect(st.viewheight).toBe(-2);
       expect(PMF_DUCKED).toBe(1);
       // Airborne hold stands (C: the else branch tries to stand) — no
       // self-sustaining DUCKED while falling.

@@ -210,7 +210,7 @@ export function buildUserCmd(input: InputCore, msec: number, opts: InputOptions 
  * Driver convention until `@q2/game` wires the bit into `PM_CheckDuck`
  * (GAME CHANGE NEEDED — reported, not edited per lock): the driver should
  * do `if (isDuckHeld(cmd)) pm.pmFlags |= PMF_DUCKED` before `pmoveFull`,
- * which shrinks the hull to `mins.z=-24/maxs.z=4/viewheight=12` (vs
+ * which shrinks the hull to `mins.z=-24/maxs.z=4/viewheight=-2` (vs
  * standing `-24/32/22`). The bit already reaches `pmoveFull` via
  * `UserCmdT.buttons`; only the `PM_CheckDuck` consumption is missing.
  */

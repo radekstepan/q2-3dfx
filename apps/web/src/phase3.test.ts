@@ -254,7 +254,7 @@ describe('Phase 3: player muzzle flash audit (CL_MuzzleFlash ground truth)', () 
 });
 
 describe('Phase 3: single duck state (input → pmove → hull → host eye)', () => {
-  it('hold crouch 60 ticks: hull maxs 4 / viewheight 12 / eye +12 every tick', () => {
+  it('hold crouch 60 ticks: hull maxs 4 / viewheight -2 / eye feet+22 every tick', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { host, driver } = boot;
     // Settle onto the devroom floor first (ground categorized, steady z).
@@ -274,13 +274,13 @@ describe('Phase 3: single duck state (input → pmove → hull → host eye)', (
       expect(driver.pm.pmFlags & PMF_DUCKED).toBe(PMF_DUCKED);
       expect(driver.pm.maxs[2]).toBe(4);
       expect(driver.pm.mins[2]).toBe(-24);
-      expect(driver.pm.viewheight).toBe(12);
+      expect(driver.pm.viewheight).toBe(-2);
     }
     expect(eyes.length).toBe(60);
     for (const z of eyes) {
-      // Eye rides the authoritative hull: feet z=24 + 12 every frame.
+      // Eye rides the authoritative hull: feet z=24 - 2 every frame.
       // (Standing eye would read 46 — cleanly separated.)
-      expect(z).toBeCloseTo(36, 0);
+      expect(z).toBeCloseTo(22, 0);
     }
     // Release: stands on the next ticks (open room ⇒ headroom free).
     keyUp(host.input, 'crouch');
@@ -318,7 +318,7 @@ describe('Phase 3: single duck state (input → pmove → hull → host eye)', (
     const st = makePmoveState();
     st.pmFlags |= PMF_DUCKED;
     st.maxs = v3(16, 16, 4);
-    st.viewheight = 12;
+    st.viewheight = -2;
     pmoveFull(st, {
       msec: 100,
       angles: v3(),
@@ -329,7 +329,7 @@ describe('Phase 3: single duck state (input → pmove → hull → host eye)', (
     });
     expect(st.pmFlags & PMF_DUCKED).toBe(PMF_DUCKED);
     expect(st.maxs[2]).toBe(4);
-    expect(st.viewheight).toBe(12);
+    expect(st.viewheight).toBe(-2);
     // Same release with headroom: stands.
     setPmoveWorld(() => standing());
     pmoveFull(st, {

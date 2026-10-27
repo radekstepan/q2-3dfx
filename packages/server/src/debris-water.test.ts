@@ -26,7 +26,8 @@ import {
   SV_Tick,
   SV_TraceFor,
 } from './index.js';
-import type { TraceFn, SVGameTick } from './index.js';
+import type { TraceFn } from '@q2/game';
+import type { SVGameTick } from './index.js';
 
 const Q2_PAK = process.env.Q2_PAK;
 
