@@ -94,6 +94,29 @@ import type { WebPak } from './pak.js';
 
 export type RendererKind = 'software' | 'voodoo';
 
+/**
+ * Rotate a baked brush-model vertex about a pivot by Quake delta angles
+ * (degrees [pitch, yaw, roll]). Render-side twin of the server's angular
+ * movers (func_door_rotating): v' = pivot + dx*F - dy*R + dz*U, the
+ * R_AliasSetUpTransform basis the alias backend already uses — an identity
+ * delta is the identity, so closed rotators render bit-identical to the
+ * baked verts. Pure (no sim state); covered by door-rotation.test.ts.
+ */
+export function rotateDoorVert(base: Vec3, pivot: Vec3, delta: Vec3, out?: Vec3): Vec3 {
+  const fwd = v3();
+  const right = v3();
+  const up = v3();
+  AngleVectors(delta, fwd, right, up);
+  const dx = base[0]! - pivot[0]!;
+  const dy = base[1]! - pivot[1]!;
+  const dz = base[2]! - pivot[2]!;
+  const o = out ?? v3();
+  o[0] = pivot[0]! + dx * fwd[0]! - dy * right[0]! + dz * up[0]!;
+  o[1] = pivot[1]! + dx * fwd[1]! - dy * right[1]! + dz * up[1]!;
+  o[2] = pivot[2]! + dx * fwd[2]! - dy * right[2]! + dz * up[2]!;
+  return o;
+}
+
 // --- display-only brightness (M7.1 feedback) ---
 //
 // `r_brightness` is a pure presentation lift applied post-resolve in
@@ -652,6 +675,13 @@ interface DoorSync {
    * convention (faces baked at mapper coords, shifted by the entity origin).
    */
   rest: Vec3;
+  /**
+   * Rest angles the baked verts correspond to (rotating doors only). The
+   * rendered verts rotate about `rest` by `ent.angles - restAngles`.
+   */
+  restAngles: Vec3;
+  /** True for func_door_rotating: sync rotates instead of translating. */
+  rotates: boolean;
   model: number;
   faces: MiniSurf[];
   baseVerts: Float32Array[];
@@ -1715,7 +1745,7 @@ export class LocalDriver implements HostDriver {
 
   private snapshotDoorBases(): void {
     if (!this.map) return;
-    const snap = (ent: Edict, rest: Vec3): void => {
+    const snap = (ent: Edict, rest: Vec3, restAngles: Vec3, rotates: boolean): void => {
       const model = ent.model;
       if (!model || !model.startsWith('*')) return;
       const n = Number.parseInt(model.slice(1), 10);
@@ -1739,17 +1769,22 @@ export class LocalDriver implements HostDriver {
         baseMaxs.push(new Float32Array(s.maxs));
       }
       if (faces.length > 0) {
-        this.doors.push({ ent, rest, model: n, faces, baseVerts, baseCenter, baseMins, baseMaxs });
+        this.doors.push({ ent, rest, restAngles, rotates, model: n, faces, baseVerts, baseCenter, baseMins, baseMaxs });
       }
     };
-    for (const m of this.server.movers) snap(m.ent, m.pos1);
+    for (const m of this.server.movers) snap(m.ent, m.pos1, m.ent.angles, false);
+    // Secret doors translate like sliders (rest = spawn origin).
+    for (const s of this.server.secretDoors) snap(s.ent, s.origin0, s.ent.angles, false);
+    // Rotating doors never translate; their faces rotate about the entity
+    // origin by ent.angles - restAngles (see syncDoors).
+    for (const r of this.server.rotDoors) snap(r.ent, r.ent.origin, r.ent.angles, true);
     // func_train brushes ride the server trains (train_next): snapshot them
     // the same way so the exit-train brush follows the authoritative origin.
     // Point ships (misc_strogg_ship) render as MD2 entities, not brush faces.
     for (const tr of this.server.trains) {
       if (tr.ship) continue;
       const o = (tr.ent.extra['origin'] ?? '0 0 0').trim().split(/\s+/).map(Number);
-      snap(tr.ent, v3(o[0] ?? 0, o[1] ?? 0, o[2] ?? 0));
+      snap(tr.ent, v3(o[0] ?? 0, o[1] ?? 0, o[2] ?? 0), tr.ent.angles, false);
     }
   }
 
@@ -1802,6 +1837,30 @@ export class LocalDriver implements HostDriver {
       if (n === null) continue;
       include(n, 0, 0, 0);
       include(n, m.pos2[0]! - m.pos1[0]!, m.pos2[1]! - m.pos1[1]!, m.pos2[2]! - m.pos1[2]!);
+    }
+    // Secret doors translate origin0 -> pos1 -> pos2 (same union pattern).
+    for (const s of this.server.secretDoors) {
+      const n = brushModelNum(s.ent.model);
+      if (n === null) continue;
+      include(n, 0, 0, 0);
+      include(n, s.pos1[0]! - s.origin0[0]!, s.pos1[1]! - s.origin0[1]!, s.pos1[2]! - s.origin0[2]!);
+      include(n, s.pos2[0]! - s.origin0[0]!, s.pos2[1]! - s.origin0[1]!, s.pos2[2]! - s.origin0[2]!);
+    }
+    // Rotating doors swing about their entity origin: union the rest bounds
+    // expanded by the brush diagonal, which contains every swing pose.
+    for (const r of this.server.rotDoors) {
+      const n = brushModelNum(r.ent.model);
+      if (n === null) continue;
+      const b = modelBounds(map, `*${n}`);
+      if (!b) continue;
+      const diag = Math.hypot(
+        b.maxs[0]! - b.mins[0]!,
+        b.maxs[1]! - b.mins[1]!,
+        b.maxs[2]! - b.mins[2]!,
+      );
+      include(n, 0, 0, 0);
+      include(n, diag, diag, diag);
+      include(n, -diag, -diag, -diag);
     }
     // Brush trains ride corner - base - rest over every path corner.
     for (const tr of this.server.trains) {
@@ -1887,6 +1946,10 @@ export class LocalDriver implements HostDriver {
 
   private syncDoors(): void {
     for (const d of this.doors) {
+      if (d.rotates) {
+        this.syncRotDoor(d);
+        continue;
+      }
       const ox = d.ent.origin[0]! - d.rest[0]!;
       const oy = d.ent.origin[1]! - d.rest[1]!;
       const oz = d.ent.origin[2]! - d.rest[2]!;
@@ -1915,6 +1978,69 @@ export class LocalDriver implements HostDriver {
         s.maxs[1] = bx[1]! + oy;
         s.maxs[2] = bx[2]! + oz;
       }
+    }
+  }
+
+  /**
+   * Render-side twin of func_door_rotating: re-pose the baked faces about
+   * the door pivot (`rest`, the static entity origin) by the live angular
+   * displacement. An identity delta copies the baked verts exactly, so
+   * closed rotators render bit-identical to the mapper geometry. Per-face
+   * bounds are rebuilt from the rotated verts (a rotated AABB is not the
+   * translated AABB), keeping frustum/backface culling correct mid-swing.
+   */
+  private syncRotDoor(d: DoorSync): void {
+    const delta = v3(
+      d.ent.angles[0]! - d.restAngles[0]!,
+      d.ent.angles[1]! - d.restAngles[1]!,
+      d.ent.angles[2]! - d.restAngles[2]!,
+    );
+    if (Math.abs(delta[0]!) < 1e-9 && Math.abs(delta[1]!) < 1e-9 && Math.abs(delta[2]!) < 1e-9) {
+      for (let i = 0; i < d.faces.length; i++) {
+        const s = d.faces[i]!;
+        const bv = d.baseVerts[i]!;
+        s.verts.set(bv);
+        s.center.set(d.baseCenter[i]!);
+        s.mins.set(d.baseMins[i]!);
+        s.maxs.set(d.baseMaxs[i]!);
+      }
+      return;
+    }
+    const tmp = v3();
+    for (let i = 0; i < d.faces.length; i++) {
+      const s = d.faces[i]!;
+      const bv = d.baseVerts[i]!;
+      let mnx = Infinity, mny = Infinity, mnz = Infinity;
+      let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
+      let cx = 0, cy = 0, cz = 0;
+      const n = bv.length / 3;
+      for (let k = 0; k < bv.length; k += 3) {
+        tmp[0] = bv[k]!;
+        tmp[1] = bv[k + 1]!;
+        tmp[2] = bv[k + 2]!;
+        rotateDoorVert(tmp, d.rest, delta, tmp);
+        s.verts[k] = tmp[0]!;
+        s.verts[k + 1] = tmp[1]!;
+        s.verts[k + 2] = tmp[2]!;
+        if (tmp[0]! < mnx) mnx = tmp[0]!;
+        if (tmp[1]! < mny) mny = tmp[1]!;
+        if (tmp[2]! < mnz) mnz = tmp[2]!;
+        if (tmp[0]! > mxx) mxx = tmp[0]!;
+        if (tmp[1]! > mxy) mxy = tmp[1]!;
+        if (tmp[2]! > mxz) mxz = tmp[2]!;
+        cx += tmp[0]!;
+        cy += tmp[1]!;
+        cz += tmp[2]!;
+      }
+      s.center[0] = cx / n;
+      s.center[1] = cy / n;
+      s.center[2] = cz / n;
+      s.mins[0] = mnx;
+      s.mins[1] = mny;
+      s.mins[2] = mnz;
+      s.maxs[0] = mxx;
+      s.maxs[1] = mxy;
+      s.maxs[2] = mxz;
     }
   }
 

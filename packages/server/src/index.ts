@@ -92,6 +92,19 @@ import type { Vec3 } from '@q2/math';
 import { AngleVectors } from '@q2/math';
 import { traceBox } from '@q2/bsp';
 import type { BspMap } from '@q2/bsp';
+import {
+  CRUSH_DAMAGE,
+  DOOR_SOUND_START,
+  MOVER_TOUCH_DEBOUNCE,
+  applyTeamMoveSpeeds,
+  rotThink,
+  rotUse,
+  secretThink,
+  secretUse,
+  spawnRotDoor,
+  spawnSecretDoor,
+} from './doors.js';
+import type { RotMover, SecretMover } from './doors.js';
 
 export interface ServerState {
   /** level.time in seconds (float). Never wall-clock. */
@@ -108,6 +121,10 @@ export interface ServerState {
   triggers: Trigger[];
   /** scripted movers: func_train + misc_strogg_ship (path_corner chains) */
   trains: Train[];
+  /** C-parity secret doors (func_door_secret: back/pause/slide/hold/return). */
+  secretDoors: SecretMover[];
+  /** C-parity rotating doors (func_door_rotating: angular travel). */
+  rotDoors: RotMover[];
   /** monster bodies: every spawned monster_* edict (g_monster.c) */
   monsters: ServerMonster[];
   /** fired targetnames this tick (test/diagnostics hook) */
@@ -171,7 +188,7 @@ export interface ServerState {
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100 };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100 };
 }
 
 /** Link an edict into the world (SV_LinkEdict: register + solid bookkeeping). */
@@ -544,6 +561,14 @@ export interface Train {
   started: boolean;
   arrived: boolean;
   speed: number;
+  /** spawnflags TRAIN_TOGGLE (game/g_func.c): use pauses mid-leg / resumes. */
+  toggle: boolean;
+  /** TOGGLE halt (mid-leg stop or wait<0 corner hold); use resumes. */
+  halted: boolean;
+  /** blocked damage (SP_func_train: 100, or 0 with BLOCK_STOPS). */
+  dmg: number;
+  /** debounce for train_blocked damage. */
+  touchDebounce: number;
 }
 
 /** Ship hull from SP_misc_strogg_ship (VectorSet mins -16,-16,0). */
@@ -639,6 +664,12 @@ function advanceTrainSeg(tr: Train): boolean {
 export function startTrain(tr: Train, now: number): void {
   void now;
   if (tr.arrived) return;
+  if (tr.halted) {
+    // TOGGLE resume (train_resume): re-run the leg to the current corner.
+    tr.halted = false;
+    if (tr.seg < tr.corners.length) trainNext(tr, now);
+    return;
+  }
   if (!tr.started) {
     tr.started = true;
     if (tr.seg >= tr.corners.length) {
@@ -648,7 +679,26 @@ export function startTrain(tr: Train, now: number): void {
     trainNext(tr, now);
     return;
   }
-  // non-TOGGLE trains ignore use while running (C train_use returns).
+  // C train_use: START_ON without TOGGLE ignores use while running; with
+  // TOGGLE it stops mid-leg (START_ON cleared, velocity zeroed).
+  if (tr.toggle) tr.halted = true;
+}
+
+/**
+ * C train_blocked damage rules (game/g_func.c): debris/gibs take 100000
+ * (+ the BecomeExplosion1 nuke — `crush` tells the caller to free them);
+ * players/monsters take dmg debounced at 0.5s (BLOCK_STOPS doors deal 0
+ * but still consume the debounce). Null while debounced.
+ */
+export function trainBlocked(
+  tr: Train,
+  victimKind: 'player' | 'monster' | 'other',
+  now: number,
+): { dmg: number; crush: boolean } | null {
+  if (victimKind === 'other') return { dmg: CRUSH_DAMAGE, crush: true };
+  if (now < tr.touchDebounce) return null;
+  tr.touchDebounce = now + MOVER_TOUCH_DEBOUNCE;
+  return { dmg: tr.dmg, crush: false };
 }
 
 /**
@@ -662,7 +712,7 @@ export function trainThink(tr: Train, now: number, dt: number, fire: (targetname
   const ox = tr.ent.origin[0]!;
   const oy = tr.ent.origin[1]!;
   const oz = tr.ent.origin[2]!;
-  if (!tr.started || tr.arrived) return v3(0, 0, 0);
+  if (!tr.started || tr.arrived || tr.halted) return v3(0, 0, 0);
   if (tr.waitUntil >= 0) {
     if (now < tr.waitUntil) return v3(0, 0, 0);
     if (!advanceTrainSeg(tr)) return v3(0, 0, 0);
@@ -681,10 +731,19 @@ export function trainThink(tr: Train, now: number, dt: number, fire: (targetname
     // train_wait: fire pathtarget, then wait or continue.
     const dest = tr.corners[tr.seg];
     if (dest && dest.pathtarget) fire(dest.pathtarget);
-    if (dest && dest.wait > 0) {
-      tr.waitUntil = now + dest.wait;
-    } else {
+    if (!dest || dest.wait === 0) {
       if (advanceTrainSeg(tr)) trainNext(tr, now);
+    } else if (dest.wait > 0) {
+      tr.waitUntil = now + dest.wait;
+    } else if (tr.toggle) {
+      // C train_wait: wait < 0 with TRAIN_TOGGLE stops (START_ON cleared,
+      // nextthink 0); a later use resumes via train_resume.
+      tr.halted = true;
+      tr.waitUntil = -1;
+    } else {
+      // C train_wait: wait < 0 without TOGGLE halts with nextthink 0.
+      tr.arrived = true;
+      tr.waitUntil = -1;
     }
   } else {
     const k = step / len;
@@ -758,6 +817,34 @@ export function SV_SpawnEntities(
           }
         }
         SV_SpawnMover(st, spawnDoor(e, angle, distance));
+        break;
+      }
+      case 'func_door_secret': {
+        // C sizes the back-out/slide from the brush bounds; without the
+        // BSP hook the door is degenerate (zero travel, like C's empty size).
+        let size: Vec3 | null = null;
+        const model = dict['model'];
+        if (modelSizes && model) {
+          const bounds = modelSizes(model);
+          if (bounds) {
+            size = v3(
+              bounds.maxs[0]! - bounds.mins[0]!,
+              bounds.maxs[1]! - bounds.mins[1]!,
+              bounds.maxs[2]! - bounds.mins[2]!,
+            );
+          }
+        }
+        st.secretDoors.push(spawnSecretDoor(e, size));
+        break;
+      }
+      case 'func_door_rotating': {
+        const rm = spawnRotDoor(e);
+        st.rotDoors.push(rm);
+        const model = dict['model'];
+        if (modelSizes && model) {
+          const bounds = modelSizes(model);
+          if (bounds) st.moverBounds.set(e.num, { mins: bounds.mins, maxs: bounds.maxs });
+        }
         break;
       }
       case 'func_plat':
@@ -876,6 +963,11 @@ export function SV_SpawnEntities(
           started: false,
           arrived: false,
           speed: e.speed || (ship ? 300 : 100),
+          toggle: (e.spawnflags & 2) !== 0, // TRAIN_TOGGLE
+          halted: false,
+          // SP_func_train: BLOCK_STOPS deals 0, otherwise dmg defaults 100.
+          dmg: (e.spawnflags & 4) !== 0 ? 0 : e.dmg || 100,
+          touchDebounce: 0,
         });
         break;
       }
@@ -957,6 +1049,9 @@ export function SV_SpawnEntities(
   // own trigger_always is skill-inhibited in SP, so the train waits for *13).
   // Explosion targets fire for real too (none in base1, but the path is the
   // same use_target_explosion fuse the tick runs for relay chains).
+  // Team doors share one travel time (Think_CalcMoveSpeed: the shortest move
+  // governs so multi-part doors arrive together).
+  applyTeamMoveSpeeds(st.movers);
   for (const e of out) {
     if (!e.freed && e.classname === 'trigger_always' && e.target) {
       const pseudo: Edict = { ...e };
@@ -996,6 +1091,13 @@ export function SV_UseTargetname(st: ServerState, targetname: string): void {
   for (const m of st.movers) {
     if (m.ent.targetname === targetname) SV_UseMover(st, m);
   }
+  for (const sm of st.secretDoors) {
+    // Secret doors fire nothing on use (C door_secret_use skips G_UseTargets).
+    if (sm.ent.targetname === targetname) secretUse(sm, st.time);
+  }
+  for (const rm of st.rotDoors) {
+    if (rm.ent.targetname === targetname) SV_UseRotDoor(st, rm);
+  }
   for (const tr of st.trains) {
     if (tr.ent.targetname === targetname) startTrain(tr, st.time);
   }
@@ -1033,6 +1135,26 @@ export function SV_UseMover(st: ServerState, m: Mover, depth = 0): void {
 /** Maximum G_UseTargets cascade depth (cycle guard; id would recurse). */
 export const MAX_USETARGETS_DEPTH = 16;
 
+/**
+ * Use a rotating door the id way (door_use / door_go_up, angular branch):
+ * an opening leg plays sound_start and fires the door's target right away
+ * (C door_go_up runs G_UseTargets); TOGGLE close legs fire nothing.
+ */
+export function SV_UseRotDoor(st: ServerState, rm: RotMover): void {
+  const res = rotUse(rm, st.time);
+  if (res === null) return;
+  if (res === 'opened') {
+    if (!rm.silent) {
+      st.sounds.push({
+        name: DOOR_SOUND_START,
+        pos: v3(rm.ent.origin[0], rm.ent.origin[1], rm.ent.origin[2]),
+        born: st.time,
+      });
+    }
+    fireTargets(st, rm.ent);
+  }
+}
+
 /** G_UseTargets equivalent: use every entity targeted by `user`. */
 export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
   if (!user.target || depth > MAX_USETARGETS_DEPTH) return;
@@ -1048,7 +1170,20 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     const m = st.movers.find((mm) => mm.ent === e);
     if (m) {
       SV_UseMover(st, m, depth);
-    } else if (e.classname === 'trigger_relay') {
+      continue;
+    }
+    const sm = st.secretDoors.find((s) => s.ent === e);
+    if (sm) {
+      // Secret use fires no targets (C door_secret_use skips G_UseTargets).
+      secretUse(sm, st.time);
+      continue;
+    }
+    const rm = st.rotDoors.find((r) => r.ent === e);
+    if (rm) {
+      SV_UseRotDoor(st, rm);
+      continue;
+    }
+    if (e.classname === 'trigger_relay') {
       // id G_UseTargets uses the relay, which fires the relay's own target.
       fireTargets(st, e, depth + 1);
     } else {
@@ -1118,10 +1253,12 @@ export function SV_TouchTriggersAt(
 
 /**
  * Touch door trigger fields (id Touch_DoorTrigger, g_func.c): every func_door
+ * (and func_door_rotating — SP_func_door_rotating installs the same think)
  * spawns an invisible trigger volume from its brush bounds expanded 60 in
  * x/y (Think_SpawnDoorTrigger). A body overlapping a closed/waiting door's
  * volume uses the door (door_use), exactly like the bot driver mirrors.
  * Doors without registered brush bounds (no modelSizes hook) are skipped.
+ * func_door_secret spawns NO trigger in C, so secrets never open on touch.
  *
  * C gates (Touch_DoorTrigger): monsters never trip DOOR_NOMONSTER doors
  * (spawnflags & 8 — both base1 sliders carry it), and touches debounce at
@@ -1130,14 +1267,14 @@ export function SV_TouchTriggersAt(
  * exactly the C door_go_up-on-TOP wait reset. Pass toucherClass 'monster'
  * for monster bodies so the NOMONSTER gate applies.
  *
- * Returns the doors that started moving.
+ * Returns the doors that started moving (sliders and rotators).
  */
 export function SV_TouchDoorsAt(
   st: ServerState,
   body: { origin: Vec3; mins: Vec3; maxs: Vec3 },
   toucherClass: 'player' | 'monster' = 'player',
-): Mover[] {
-  const used: Mover[] = [];
+): Array<Mover | RotMover> {
+  const used: Array<Mover | RotMover> = [];
   for (const m of st.movers) {
     if (m.ent.classname !== 'func_door') continue;
     if (m.state !== MOVER_BOTTOM && m.state !== MOVER_WAITING) continue;
@@ -1154,6 +1291,21 @@ export function SV_TouchDoorsAt(
     // door_use → door_go_up: fires the door's own target as it starts moving.
     SV_UseMover(st, m);
     used.push(m);
+  }
+  for (const rm of st.rotDoors) {
+    if (rm.state !== MOVER_BOTTOM && rm.state !== MOVER_WAITING) continue;
+    if (toucherClass === 'monster' && rm.ent.spawnflags & DOOR_NOMONSTER) continue;
+    const b = st.moverBounds.get(rm.ent.num);
+    if (!b) continue;
+    // Rotating doors never translate, so the rest bounds apply unoffset
+    // (the swing itself is ignored — bounds-exact rotation needs the brush
+    // planes; the 60-unit touch slop covers ordinary swings).
+    const tmins = new Float32Array([b.mins[0]! - 60, b.mins[1]! - 60, b.mins[2]!]);
+    const tmaxs = new Float32Array([b.maxs[0]! + 60, b.maxs[1]! + 60, b.maxs[2]!]);
+    if (!bodyOverlapsBounds(body.origin, body.mins, body.maxs, tmins, tmaxs)) continue;
+    // door_use → door_go_up (angular): fires the target as it starts moving.
+    SV_UseRotDoor(st, rm);
+    used.push(rm);
   }
   return used;
 }
@@ -1390,6 +1542,10 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
     if (tr.ent.freed) continue;
     before.set(tr.ent.num, v3(tr.ent.origin[0], tr.ent.origin[1], tr.ent.origin[2]));
   }
+  for (const sm of st.secretDoors) {
+    if (sm.ent.freed) continue;
+    before.set(sm.ent.num, v3(sm.ent.origin[0], sm.ent.origin[1], sm.ent.origin[2]));
+  }
   for (const m of st.movers) {
     if (m.ent.freed) continue;
     const completed = moverThink(m, now);
@@ -1408,6 +1564,23 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
       const pseudo: Edict = { ...tr.ent, target: targetname };
       fireTargets(st, pseudo);
     });
+  }
+  // Secret doors run their 5-move think chain (silent in C — the move funcs
+  // carry no sound calls); rotating doors emit start/end sounds like sliders.
+  for (const sm of st.secretDoors) {
+    if (sm.ent.freed) continue;
+    secretThink(sm, now, dt);
+  }
+  for (const rm of st.rotDoors) {
+    if (rm.ent.freed) continue;
+    const sounds = rotThink(rm, now, dt);
+    for (const name of sounds) {
+      st.sounds.push({
+        name,
+        pos: v3(rm.ent.origin[0], rm.ent.origin[1], rm.ent.origin[2]),
+        born: now,
+      });
+    }
   }
   st.moverDeltas.clear();
   for (const m of st.movers) {
@@ -1431,6 +1604,19 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
     const dz = tr.ent.origin[2]! - b[2]!;
     if (dx !== 0 || dy !== 0 || dz !== 0) {
       st.moverDeltas.set(tr.ent.num, v3(dx, dy, dz));
+    }
+  }
+  // Secret doors translate riders too (rotating doors only change angles,
+  // so they record no origin delta — riders keep their world position).
+  for (const sm of st.secretDoors) {
+    if (sm.ent.freed) continue;
+    const b = before.get(sm.ent.num);
+    if (!b) continue;
+    const dx = sm.ent.origin[0]! - b[0]!;
+    const dy = sm.ent.origin[1]! - b[1]!;
+    const dz = sm.ent.origin[2]! - b[2]!;
+    if (dx !== 0 || dy !== 0 || dz !== 0) {
+      st.moverDeltas.set(sm.ent.num, v3(dx, dy, dz));
     }
   }
   // Pickup respawn (DoRespawn): re-materialize hidden items whose timer

@@ -488,6 +488,23 @@ status: done (WIRE qualified — see TODO(WIRE-EXIT) in `packages/server/src/bas
 done-when:
 - [x] `base1` is traversable start → exit complex with doors/lifts/buttons working (scripted bot: spawn → low road → trench, all doors per C `G_SetMovedir`/travel semantics; exit trigger chain proven by pit-floor overlap firing t37 → `base2$base1`). Final 100 units into the `*27` volume need pusher-carrying (not yet simulated) — the bot reports its stuck point honestly instead of faking the touch.
 
+### TODO(doors-cparity) — update 2026-10-26 (doors/paths C-parity lane, done):
+- [x] `func_door_secret`: 5-move sequence (back, pause, slide, hold, return)
+  at C-forced 50 u/s, shoot-to-open, blocked damage w/ 0.5s debounce —
+  `packages/server/src/doors.ts` + `doors.test.ts` (25 synthetic tests).
+- [x] Rotating doors (`func_door_rotating` + `G_SetMovedir` axes): angular
+  travel/pos1/pos2, `START_OPEN`/`REVERSE`/`TOGGLE`, blocked damage +
+  reverse, touch open — same module/tests; render graft in `apps/web`
+  (`rotateDoorVert` + `syncRotDoor`, `door-rotation.test.ts` 5/5).
+- [x] `Think_CalcMoveSpeed`: team-keyed movers share one travel time
+  (shortest move governs), applied at spawn; singles are the identity.
+- [x] `func_train_find` generalization: `TRAIN_TOGGLE` pause/resume,
+  `wait<0` halt semantics, `train_blocked` damage; teleport-corner
+  link-following verified for `func_train` too (`trains.test.ts`: 11).
+- Still open (needs physics-push victim plumbing — no mover-vs-body
+  collision exists for any mover yet): per-tick blocked-damage application
+  against live bodies; per-team trigger-volume union.
+
 ### M5.3 — Weapons + two monsters
 owns: `packages/game`
 depends: M5.2
@@ -578,6 +595,14 @@ done-when:
 > door each tick so the plug can't rise with a rider (real Q2 behaviour).
 > Exit-*chain* proof stays green; accepting slot-hold as delivery. Revisit
 > only if the map assumption changes.
+
+### TODO(doors-cparity) — update 2026-10-26 (doors/paths C-parity lane, done):
+- [x] Secret/rotating doors, `Think_CalcMoveSpeed`, `func_train_find`
+  generalization — see the M5.2 TODO above; server owns the sim, web owns
+  only the `DoorSync` render graft (rotation + secret/rot snapshots).
+  Play-verified: `base1-gate` (c)/(g) + `m71` DoorSync/train-brush green;
+  (b)/(e) failures are the concurrent monster lane's, identical with and
+  without this change (proven by stash experiment).
 
 ### M9.1 — WASM span backend
 owns: `packages/sw-renderer`
@@ -819,10 +844,12 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - OPEN (next push): full monster AI depth — player-trail pursuit around
 - corners, M_CheckAttack chance/as-state table, soldier duck, combat points,
 - skill-scaled aggression, lasfly loop (the bigger M5.3 job);
-- func_door_secret / rotating doors, Think_CalcMoveSpeed,
-- func_train_find path corners; 60fps @640×480 (M8.1 async-render +
+- 60fps @640×480 (M8.1 async-render +
 - M9.1 SIMD v128); saves, menus beyond the cvar panel, multiplayer
 - (explicit non-goal).
+- CLOSED 2026-10-26 (doors/paths C-parity): func_door_secret / rotating
+- doors, Think_CalcMoveSpeed, func_train_find path corners (synthetic unit
+- tests in `packages/server`; base1 ships none — C-parity for other maps).
 - OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
 - (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
 - `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`
