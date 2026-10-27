@@ -3361,9 +3361,12 @@ export function createAsyncLoopState(): AsyncLoopState {
  * for the web lane). Honors `sw_workers` like the sync path: 0 (default)
  * or unavailable (headless, no SAB, no isolation) leaves the
  * single-threaded planes active and returns null. Call once after bootPlay
- * (and after any rebootPlay, which rebuilds the renderer).
+ * (and after any rebootPlay, which rebuilds the renderer). When `workers`
+ * is omitted the pool is sized from the cvar (bands − 1: the calling thread
+ * owns the last band); an explicit count overrides it. Never throws and
+ * never allocates per frame — the pool (SAB + workers) lives until dispose.
  */
-export function attachBrowserPool(boot: PlayBoot, workers = 3): BrowserBandPool | null {
+export function attachBrowserPool(boot: PlayBoot, workers?: number): BrowserBandPool | null {
   const { refresh, host } = boot;
   try {
     refresh.syncWorkersFromCvar();
@@ -3372,7 +3375,10 @@ export function attachBrowserPool(boot: PlayBoot, workers = 3): BrowserBandPool 
   }
   if (!refresh.isWorkersActive()) return null;
   if (!browserPoolAvailable()) return null;
-  const n = Math.max(1, Math.min(7, Math.floor(workers)));
+  const bands = Math.floor(getCVarNumber('sw_workers'));
+  const want = workers === undefined ? bands - 1 : workers;
+  const n = Math.max(1, Math.min(7, Math.floor(want)));
+  if (!Number.isFinite(n)) return null;
   const pool = BrowserBandPool.create(n, host.fb.width, host.fb.height);
   if (!pool) return null;
   refresh.attachWorkerPool(pool);

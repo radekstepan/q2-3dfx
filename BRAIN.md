@@ -560,6 +560,28 @@ done-when:
 > one-liner (`await frameAsync`), `sw_workers` pool tuning in-browser, and
 > the `blitToCanvas` per-byte copy loop (~2.4–3.5ms measured headless;
 > dom.ts is outside the perf lane's lock, as is the tick).
+> M7.1 follow-up DONE 2026-10-27 (browser async tick + blit, box stays
+> open): `startPlayLoop` (dom.ts) pre-spawns ONE `BrowserBandPool` per loop
+> (never per frame, disposed on stop) and the rAF tick awaits `frameAsync`
+> when pooled, classic `host.frame` otherwise (in-flight guard: no overlap,
+> no double-pump — `frameAsync` owns the pumps; one bad frame falls back to
+> sync). `sw_workers` left at default 0 latches `defaultBrowserWorkers()`
+> (hardwareConcurrency−1, clamped 1..7) in-session; explicit nonzero cvar
+> honored, `attachBrowserPool` sizes the pool from the cvar (bands−1).
+> `blitToCanvas` caches the ImageData per canvas (no per-frame
+> createImageData) + bulk u32 copy on LE (pure `blitCopyRGBA`, pinned in
+> display.test.ts): 1.81ms → 0.074ms at 640×480 headless (~26×,
+> byte-identical), eliminating the whole ~2.4–3.5ms blit-copy line. No
+> renderer/config contract touched (cvar default stays 0; browser auto is a
+> session latch). Golden-identical: devroom `8f61c755`, base1 ×4 views
+> pooled sync≡async, `frameAsync` ≡ `host.frame` differential green,
+> base1-gate 23/23 + full web 194/194 (Q2_PAK) green. NOT 60fps yet: no
+> real-browser measurement (pool tuning + fps meter need a live COOP/COEP
+> page); headless pooled A/B @7 workers this run classic 22.98 → accum
+> 19.41ms spawn-north (hashes identical; absolute slower than the §11
+> 15.1ms row under this concurrent-lane tree + load — same direction).
+> Left for real-browser sign-off: in-browser fps at 640×480, worker-count
+> sweep on real hardware, first-kick warm-up cost.
 
 ### M8.1 — Workers + SharedArrayBuffer banding
 owns: `packages/sw-renderer`, `apps/web`
@@ -799,6 +821,7 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-26 | 2d42770 | software base1 pool TRANS66 blend, real colormap.pcx alphamap | 320×240 | 41 | ~3 | 3.00 | warp+blend water through the deferred alpha pass, 480 trans spans, mode-1 hash `06456518` (mode-0 `1dc00e44`); devroom `8f61c755` byte-exact |
 | 2026-10-27 | uncommitted | software base1 spawn-north, single-walk translucency (classic serial) | 640×480 | — | — | 2.38 | interleaved OLDx3/NEWx3: cull NEW<OLD all pairs (median -4.0ms), GEO down in quiet window; opaque-then-alpha, back-to-front, stipple/blend identical: devroom `8f61c755`, base1 x4 idx+color, TRANS66 `06456518`/`1dc00e44` |
 | 2026-10-26 | 2d42770 | software base1 sweep flythrough, steady-state surface cache | 640×480 | 18 | ~6 | 1.92 | 8-view yaw sweeps: round-2 9107 hits / 0 misses / 0 evictions (100%); 4-teleport union exceeds the 4MB budget and re-thrashes (~6% — expected, not a regression) |
+| 2026-10-27 | 3c09006 | browser async tick + blit (M7.1 follow-up, apps/web only) | 640×480 | — | — | 2.38 | rAF tick awaits `frameAsync` when pooled (in-flight guard, sync fallback), pool pre-spawned once/loop, `sw_workers` auto-latch hwConcurrency−1 (1..7); `blitToCanvas` cached ImageData + bulk u32: copy 1.81→0.074ms (~26×, byte-identical, per-frame createImageData gone); pooled A/B @7 workers spawn-north classic 22.98→accum 19.41ms (idx `d5edf6cb` color `8a34205b` identical all modes); devroom `8f61c755`, base1 ×4 sync≡async, web 194/194 incl. gate. Box unchecked: no real-browser fps yet (concurrent-lane tree; absolute render slower than the 15.1ms row under load). |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.

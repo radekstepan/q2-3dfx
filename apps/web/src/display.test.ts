@@ -15,7 +15,8 @@ import {
   POS_GREY,
   resolveDisplay,
 } from './play.js';
-import { cvarControlKind, cvarOptions, renderCvarPanel } from './dom.js';
+import { cvarControlKind, cvarOptions, renderCvarPanel, blitCopyRGBA, blitIsLittleEndian } from './dom.js';
+import { defaultBrowserWorkers } from './render-workers.js';
 
 function runFrames(host: { frame(nowMs: number): unknown }, fromMs: number, toMs: number, step = 16): void {
   for (let t = fromMs; t <= toMs; t += step) host.frame(t);
@@ -190,5 +191,45 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
     expect(names).toContain('r_brightness');
     expect(names).toContain('vid_renderer');
     expect(names).toContain('cl_showfps');
+  });
+
+  it('blitCopyRGBA bulk path equals explicit LE byte expansion (alpha kept)', () => {
+    const src = new Uint32Array(257);
+    for (let i = 0; i < src.length; i++) src[i] = (Math.imul(i + 1, 2654435761) >>> 0);
+    src[0] = 0x00000000;
+    src[1] = 0xffffffff;
+    src[2] = 0x80112233;
+    const dst = new Uint8Array(src.length * 4);
+    blitCopyRGBA(dst, src);
+    for (let i = 0; i < src.length; i++) {
+      const px = src[i]!;
+      expect(dst[i * 4]).toBe(px & 255);
+      expect(dst[i * 4 + 1]).toBe((px >> 8) & 255);
+      expect(dst[i * 4 + 2]).toBe((px >> 16) & 255);
+      expect(dst[i * 4 + 3]).toBe(px >>> 24);
+    }
+    // The bulk path is only valid where it matters: every real browser is LE.
+    expect(blitIsLittleEndian()).toBe(true);
+  });
+
+  it('blitCopyRGBA handles empty + oversized destinations without throwing', () => {
+    const src = new Uint32Array([0xff112233, 0x00445566]);
+    const empty = new Uint8Array(0);
+    expect(() => blitCopyRGBA(empty, src)).not.toThrow();
+    // Oversized destination: prefix filled, tail untouched (loop fallback).
+    const big = new Uint8Array(src.length * 4 + 8).fill(0xaa);
+    blitCopyRGBA(big, src);
+    expect(big[0]).toBe(0x33);
+    expect(big[3]).toBe(0xff);
+    expect(big[4]).toBe(0x66);
+    expect(big[7]).toBe(0x00);
+    expect(big.slice(8).every((b) => b === 0xaa)).toBe(true);
+  });
+
+  it('defaultBrowserWorkers stays in the pool range (navigator-capped, sane fallback)', () => {
+    const n = defaultBrowserWorkers();
+    expect(Number.isInteger(n)).toBe(true);
+    expect(n).toBeGreaterThanOrEqual(1);
+    expect(n).toBeLessThanOrEqual(7);
   });
 });

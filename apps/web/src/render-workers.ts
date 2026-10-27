@@ -66,6 +66,27 @@ import {
 /** Per-batch wait budget in ms (mirrors the Node pool default). */
 export const BROWSER_POOL_TIMEOUT_MS = 30000;
 
+/**
+ * Browser-default worker count (M7.1 perf lane): one worker per core minus
+ * the main thread, clamped to the pool's valid range. Used by startPlayLoop
+ * to latch `sw_workers` when the operator left it at the default 0, so a
+ * real browser runs pooled without manual tuning while headless/CI stays
+ * single-threaded (browserPoolAvailable() is false there). Pure; falls back
+ * to 3 (the historic attach default) without `navigator`.
+ */
+export function defaultBrowserWorkers(): number {
+  try {
+    const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+    const hc = nav?.hardwareConcurrency;
+    if (typeof hc === 'number' && Number.isFinite(hc) && hc > 0) {
+      return Math.max(1, Math.min(7, Math.floor(hc) - 1));
+    }
+  } catch {
+    /* no navigator: historic default below */
+  }
+  return 3;
+}
+
 /** True when the browser can run the worker pool (DOM + SAB + isolation). */
 export function browserPoolAvailable(): boolean {
   try {

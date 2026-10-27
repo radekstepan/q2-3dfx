@@ -50,7 +50,16 @@ export function showPosEnabled(): boolean {
   return getCVarNumber('cl_showpos') !== 0;
 }
 
-/** Blit a 0xAABBGGRR framebuffer into a <canvas> via putImageData. */
+/** Blit a 0xAABBGGRR framebuffer into a <canvas> via putImageData.
+ *
+ * Fast path: one bulk u32 copy into a cached ImageData (no per-frame
+ * createImageData, no per-pixel loop). On little-endian runtimes
+ * (x86/ARM/wasm32 — every real browser) 0xAABBGGRR bytes already sit in
+ * R,G,B,A order, exactly ImageData's RGBA layout, so the copy is a memcpy.
+ * Big-endian falls back to the legacy per-byte loop. The ImageData (and its
+ * u32 view) is cached per canvas in a WeakMap and only recreated on canvas
+ * or size change — zero allocation on the steady-state frame.
+ */
 export function blitToCanvas(canvas: unknown, fb: Framebuffer): boolean {
   if (typeof document === 'undefined') return false;
   const el = canvas as HTMLCanvasElement;
@@ -59,20 +68,81 @@ export function blitToCanvas(canvas: unknown, fb: Framebuffer): boolean {
     el.width = fb.width;
     el.height = fb.height;
   }
-  const ctx = el.getContext('2d');
-  if (!ctx) return false;
-  const img = ctx.createImageData(fb.width, fb.height);
-  const dst = img.data;
-  const src = new Uint8Array(fb.color.buffer, fb.color.byteOffset, fb.color.length * 4);
-  // 0xAABBGGRR -> RGBA bytes.
-  for (let i = 0, j = 0; i < src.length; i += 4, j += 4) {
-    dst[j] = src[i]!;
-    dst[j + 1] = src[i + 1]!;
-    dst[j + 2] = src[i + 2]!;
-    dst[j + 3] = src[i + 3]!;
+  let cached = blitCaches.get(el);
+  if (!cached || cached.w !== fb.width || cached.h !== fb.height) {
+    const ctx = el.getContext('2d');
+    if (!ctx) return false;
+    let img: ImageData;
+    try {
+      img = ctx.createImageData(fb.width, fb.height);
+    } catch {
+      return false;
+    }
+    // u32 view over the RGBA bytes (ImageData buffers are fresh +
+    // 4-aligned): the steady-state copy below allocates nothing.
+    const u32 = img.data.byteOffset % 4 === 0 && img.data.length === fb.width * fb.height * 4
+      ? new Uint32Array(img.data.buffer, img.data.byteOffset, fb.width * fb.height)
+      : null;
+    cached = { ctx: ctx as CanvasRenderingContext2D, img, w: fb.width, h: fb.height, u32 };
+    blitCaches.set(el, cached);
   }
-  ctx.putImageData(img, 0, 0);
+  // Steady state: one bulk u32 copy into the cached ImageData (the bytes
+  // already sit in RGBA order on little-endian — see blitCopyRGBA). Length
+  // drift (never happens at a fixed resolution) falls back to the loop.
+  if (cached.u32 && cached.u32.length === fb.color.length) {
+    cached.u32.set(fb.color);
+  } else {
+    blitCopyRGBA(cached.img.data, fb.color);
+  }
+  cached.ctx.putImageData(cached.img, 0, 0);
   return true;
+}
+
+/** Per-canvas blit scratch (cached ImageData + u32 view, see blitToCanvas). */
+interface BlitCache {
+  ctx: CanvasRenderingContext2D;
+  img: ImageData;
+  w: number;
+  h: number;
+  /** u32 view over img.data, built lazily (byteOffset must be 4-aligned). */
+  u32: Uint32Array | null;
+}
+
+const blitCaches = new WeakMap<object, BlitCache>();
+
+/** True on little-endian runtimes (x86/ARM/wasm32): 0xAABBGGRR bytes ARE RGBA order. */
+let blitLE: boolean | null = null;
+
+/** Runtime endianness probe (memoized, no DOM needed — unit-testable). */
+export function blitIsLittleEndian(): boolean {
+  if (blitLE === null) {
+    const u32 = new Uint32Array([0x0a0b0c0d]);
+    blitLE = new Uint8Array(u32.buffer)[0] === 0x0d;
+  }
+  return blitLE;
+}
+
+/**
+ * Copy a 0xAABBGGRR buffer into an RGBA byte buffer (the blitToCanvas core,
+ * extracted pure + headless-testable). Little-endian with an exactly-sized,
+ * 4-aligned destination: one bulk u32 copy. Anything else (big-endian,
+ * odd-sized scratch): the legacy per-pixel loop over the source pixels.
+ * Never throws on length mismatch — fills the min prefix.
+ */
+export function blitCopyRGBA(dst: Uint8Array | Uint8ClampedArray, src: Uint32Array): void {
+  const n = Math.min(src.length, Math.floor(dst.length / 4));
+  if (n <= 0) return;
+  if (blitIsLittleEndian() && dst.length === src.length * 4 && dst.byteOffset % 4 === 0) {
+    new Uint32Array(dst.buffer, dst.byteOffset, src.length).set(src);
+    return;
+  }
+  for (let i = 0, j = 0; i < n; i++, j += 4) {
+    const px = src[i]!;
+    dst[j] = px & 255;
+    dst[j + 1] = (px >> 8) & 255;
+    dst[j + 2] = (px >> 16) & 255;
+    dst[j + 3] = (px >>> 24);
+  }
 }
 
 /** Attach pak drop + file-picker ingest to an element. No-op without DOM. */
@@ -447,7 +517,19 @@ export function setRendererChoice(kind: string): void {
 
 import type { Host } from '@q2/host';
 import type { LocalDriver, PlayBoot } from './play.js';
-import { drawPlayHud, pumpExplosionLights, pumpMuzzleLight, pumpTracers, resolveDisplay } from './play.js';
+import {
+  attachBrowserPool,
+  createAsyncLoopState,
+  drawPlayHud,
+  frameAsync,
+  pumpExplosionLights,
+  pumpMuzzleLight,
+  pumpTracers,
+  resolveDisplay,
+} from './play.js';
+import type { AsyncLoopState } from './play.js';
+import { browserPoolAvailable, defaultBrowserWorkers } from './render-workers.js';
+import type { BrowserBandPool } from './render-workers.js';
 import { attachToCanvas } from '@q2/input/dom';
 import { readPakEntry, findPakSoundEntry } from './pak.js';
 import type { Mixer, MixedChannel } from '@q2/sound';
@@ -636,25 +718,47 @@ export function startPlayLoop(
   let lastT = -1;
   let fps = 60;
   let frame = 0;
-  const tick = (nowMs: number): void => {
-    if (stopped) return;
-    if (lastT >= 0) {
-      const dt = nowMs - lastT;
-      if (dt > 0) fps += (1000 / dt - fps) * 0.05;
+
+  // Worker pool warm-up (M7.1 perf lane): pre-spawn ONCE per loop, never per
+  // frame. When the browser can run workers and the operator left sw_workers
+  // at its default 0, latch a hardwareConcurrency-capped count so the live
+  // loop runs pooled with no manual tuning; an explicit nonzero sw_workers
+  // is honored as-is. Headless/Node (no DOM/SAB/isolation) skips all of this
+  // and stays on the classic single-threaded path.
+  let pool: BrowserBandPool | null = null;
+  try {
+    if (browserPoolAvailable() && !(getCVarNumber('sw_workers') > 0)) {
+      setCVarFromString('sw_workers', String(defaultBrowserWorkers()));
     }
-    lastT = nowMs;
-    // Muzzle dlight + tracer beams must be registered before the renderer draws the frame.
-    pumpMuzzleLight(boot);
-    pumpExplosionLights(boot);
-    pumpTracers(boot);
-    host.frame(nowMs);
-    const target = resolveDisplay(boot);
+    pool = attachBrowserPool(boot);
+  } catch {
+    pool = null;
+  }
+  // Async-loop state (frameAsync's mirror of Host privates). Null pool →
+  // classic sync path below, pixel-identical (frameAsync ≡ host.frame).
+  const asyncSt: AsyncLoopState = createAsyncLoopState();
+  let useAsync = pool !== null;
+  let busy = false;
+
+  // Reused blit wrapper: points at the resolved display buffer every frame
+  // (avoids the old per-frame `{...host.fb, color: target}` spread garbage).
+  const blitFb: Framebuffer = {
+    width: host.fb.width,
+    height: host.fb.height,
+    color: host.fb.color,
+    index: host.fb.index,
+    depth: host.fb.depth,
+  };
+
+  /** Shared post-render tail (HUD + blit + sound/event cues), both paths. */
+  const finishFrame = (target: Uint32Array): void => {
     drawPlayHud(
       { width: host.fb.width, height: host.fb.height, color: target },
       boot,
       { fps, frame: frame++ },
     );
-    blitToCanvas(el, { ...host.fb, color: target });
+    blitFb.color = target;
+    blitToCanvas(el, blitFb);
     // The fps (`cl_showfps`) and position (`cl_showpos`, default ON)
     // readouts are in-canvas conchars glyphs painted by drawPlayHud above
     // (top-right / top-left of the framebuffer itself) — no DOM overlay.
@@ -670,6 +774,64 @@ export function startPlayLoop(
         blip(sound.ctx, sound.master, 784, 0.25, 0.15);
       }
     }
+  };
+
+  const tickSync = (nowMs: number): void => {
+    if (lastT >= 0) {
+      const dt = nowMs - lastT;
+      if (dt > 0) fps += (1000 / dt - fps) * 0.05;
+    }
+    lastT = nowMs;
+    // Muzzle dlight + tracer beams must be registered before the renderer draws the frame.
+    pumpMuzzleLight(boot);
+    pumpExplosionLights(boot);
+    pumpTracers(boot);
+    host.frame(nowMs);
+    const target = resolveDisplay(boot);
+    finishFrame(target);
+  };
+
+  const tick = (nowMs: number): void => {
+    if (stopped) return;
+    if (useAsync) {
+      // Pooled async render (frameAsync owns pumps + sim + async kick +
+      // resolve — do NOT pre-pump here: a second drain would clear the
+      // just-added muzzle flash). Never block the main thread and never
+      // overlap frames (the renderer stash is non-reentrant and the sim must
+      // not double-pump): a still-running frame drops this rAF tick, and the
+      // next tick's dt covers the gap via AsyncLoopState (dt clamps at 0.25).
+      if (busy) {
+        raf = requestAnimationFrame(tick);
+        return;
+      }
+      busy = true;
+      void (async (): Promise<void> => {
+        try {
+          if (lastT >= 0) {
+            const dt = nowMs - lastT;
+            if (dt > 0) fps += (1000 / dt - fps) * 0.05;
+          }
+          lastT = nowMs;
+          const target = await frameAsync(boot, asyncSt, nowMs);
+          finishFrame(target);
+        } catch {
+          // One bad frame (worker timeout, torn-down pool) falls back to the
+          // classic sync path from the next tick — inline replay converges to
+          // identical pixels, so the loop never wedges and never tears.
+          useAsync = false;
+          try {
+            boot.refresh.syncWorkersFromCvar();
+          } catch {
+            /* classic single-threaded path stays active */
+          }
+        } finally {
+          busy = false;
+          if (!stopped) raf = requestAnimationFrame(tick);
+        }
+      })();
+      return;
+    }
+    tickSync(nowMs);
     raf = requestAnimationFrame(tick);
   };
   raf = requestAnimationFrame(tick);
@@ -684,6 +846,10 @@ export function startPlayLoop(
       document.removeEventListener('pointerdown', unlock);
       document.removeEventListener('keydown', unlock);
       document.removeEventListener('keydown', onWeaponKeys);
+      const p = pool;
+      pool = null;
+      useAsync = false;
+      if (p) void p.dispose().catch(() => undefined);
       if (sound) {
         for (const ch of sound.channels.values()) {
           try {
