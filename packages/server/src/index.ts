@@ -71,6 +71,7 @@ import {
   traceHitSky,
   INFANTRY_C,
   INFANTRY_GUN_SOUND,
+  INFANTRY_COCK_SOUND,
   INFANTRY_MELEE_SOUND,
   GUNNER_GRENADE_SOUND,
   MZ2_INFANTRY_MACHINEGUN_1,
@@ -78,6 +79,7 @@ import {
   MZ2_GUNNER_MACHINEGUN_1,
   MZ2_SOLDIER_BLASTER_1,
   MZ2_SOLDIER_MACHINEGUN_1,
+  MZ2_SOLDIER_MACHINEGUN_4,
   MZ2_SOLDIER_SHOTGUN_1,
   SOLID_BBOX,
   MOVETYPE_NONE,
@@ -97,6 +99,9 @@ import type {
 } from '@q2/game';
 import {
   arriveCombatPoint,
+  armInfantryCock,
+  armSoldierBurst,
+  burstHoldFrozen,
   checkDodges,
   deathFireEvent,
   duckHoldFrozen,
@@ -108,6 +113,7 @@ import {
   resolveCombatPoint,
   separationOffset,
   skinOf,
+  sustainedFireFrame,
   trailUpkeep,
 } from './monster-ai.js';
 import type { CombatPoint } from './monster-ai.js';
@@ -601,6 +607,17 @@ export interface ServerMonster {
   duckUntil: number;
   /** attack3: fire once mid-duck (m_soldier.c duck-and-shoot). */
   duckShoot: boolean;
+  /** Sustained-fire hold expiry (C monsterinfo.pausetime for the gun:
+   * m_soldier.c soldier_fire4 / m_infantry.c infantry_cock_gun; 0 = no
+   * hold). While now < burstUntil the fire frame freezes and re-fires
+   * every 10Hz tick (C AI_HOLD_FRAME in M_MoveFrame). */
+  burstUntil: number;
+  /** Sustained-fire hold flag (C AI_HOLD_FRAME itself): set while the
+   * fire frame is frozen, cleared by the thinkfunc once the pausetime
+   * lapses (firing once more that tick — the C expiry bullet). Exists
+   * because the pausetime alone cannot tell a fresh arrival (arm) from
+   * the expiry replay (advance without re-arming). */
+  burstHeld: boolean;
   /** Combat-point destination (AI_COMBAT_POINT en route; null = hunting). */
   combatGoal: Vec3 | null;
   /** point_combat hold flag: stand ground after arrival. */
@@ -1159,6 +1176,8 @@ export function SV_SpawnEntities(
         reactionAt: 0,
         duckUntil: 0,
         duckShoot: false,
+        burstUntil: 0,
+        burstHeld: false,
         combatGoal: null,
         combatHold: false,
         combatDone: false,
@@ -1585,6 +1604,10 @@ function attackOfMove(kind: MonsterKind, move: string): AttackChoice {
       // Soldier attack2 is the blaster/shotgun volley; infantry attack2 is
       // the melee smack (m_infantry.c attack2 = infantry_smack).
       return kind === 'infantry' ? 'melee' : 'blaster';
+    case 'attack4':
+      // ss soldier machinegun strafe (m_soldier.c soldier_move_attack4:
+      // soldier_fire4, one 2dmg bullet per hold tick).
+      return 'machinegun';
     case 'attack_chain':
     case 'fire_chain':
     case 'endfire_chain':
@@ -1621,8 +1644,11 @@ function attackOfMove(kind: MonsterKind, move: string): AttackChoice {
  * - every 'fire'/'melee' frame with line of sight emits a MonsterEvent
  *   carrying the skill damage scale, so drivers land shots on the muzzle
  *   flash (infantry's smack tags 'melee', everything ballistic tags 'fire').
- *   Duck-and-shoot (attack3) emits one skin-gun event mid-duck; skill-3
- *   machinegun-class bursts may refire immediately (attack4/6 nextframe).
+ *   Duck-and-shoot (attack3) emits one skin-gun event mid-duck; the
+ *   sustained-fire holds (ss attack4 0.3-1.0s, infantry attack1 1.0-2.5s
+ *   with the infatck3 cock) freeze their fire frame and re-emit every
+ *   10Hz tick until the pausetime runs out; skill-3 re-attacks may
+ *   refire a finished attack1/attack2 immediately (attack1/2 nextframe).
  */
 export interface MonsterTickOpts {
   /** Eye height of the player body (22 standing, 12 ducked, pmove.c). */
@@ -1758,6 +1784,9 @@ export function SV_MonsterTick(
         // and never consider attacks, so they keep walking the point chain.
         standGround: standGround && m.combatGoal === null,
         goal,
+        // Skin-keyed attack pick (C soldier_attack): ss skins commit to
+        // the attack4 machinegun strafe.
+        skin: skinOf(m),
       });
     }
     const loco = monsterLocomotion(ms, pos, playerPos, (s, e) => {
@@ -1773,16 +1802,65 @@ export function SV_MonsterTick(
     if (loco.slide !== 0) m.slideDir = loco.slide;
     const prevMove = ms.move;
     const playedIdx = ms.frame;
-    // Duck hold (AI_HOLD_FRAME): freeze the hold frame while the pausetime
-    // runs instead of advancing through it.
-    const action = duckHoldFrozen(m, now) ? 'move' : monsterThink(ms);
-    // Skill-3 machinegun-class burst (attack4/attack6 nextframe): re-enter
+    // C AI_HOLD_FRAME careers on the monster as two fields: the gun
+    // pausetime (burstUntil) and the flag itself (burstHeld). A set flag
+    // freezes the fire frame and re-runs its thinkfunc every tick
+    // (M_MoveFrame skips the frame++); the thinkfunc clears the flag once
+    // the pausetime lapses, firing once more that tick (the C expiry
+    // bullet) before the frame advances. wasHeld is the tick-start flag
+    // on the hold frame: it tells a fresh arrival (arm) from the expiry
+    // replay (advance without re-arming) — the pausetime alone cannot.
+    // C M_MoveFrame range check: leaving the move (duck dodge, pain,
+    // death) clears AI_HOLD_FRAME — a stranded flag must never eat a
+    // fresh burst, and only a set flag on its fire frame may freeze.
+    if (m.burstHeld && !sustainedFireFrame(m.kind, ms.move, ms.frame)) m.burstHeld = false;
+    const wasHeld = m.burstHeld && sustainedFireFrame(m.kind, prevMove, playedIdx);
+    let action: string;
+    let advanced = false;
+    if (duckHoldFrozen(m, now)) action = 'move';
+    else if (burstHoldFrozen(m, now)) action = 'fire'; // live hold: frozen replay
+    else {
+      if (wasHeld) m.burstHeld = false; // lapsed hold: the flag clears
+      action = monsterThink(ms); // fresh arrival AND expiry replay advance
+      advanced = true;
+    }
+    // Skill-3 burst refire (attack1/attack2 nextframe): re-enter
     // the finished attack move immediately, bypassing the cooldown.
+    // (attack4 has no nextframe in C — the hold IS the burst.)
     maybeBurstRefire(m, prevMove, canSee, st.skill, rand);
     // Duck-and-shoot (attack3): one skin-gun event on the duck fire frame.
     const duckEv = duckShootEvent(m, canSee, skillMultiplier(st.skill));
     if (duckEv) events.push(duckEv);
+    // Infantry chaingun spin (m_infantry.c infantry_cock_gun, attak104):
+    // the cock frame plays infatck3 and arms the 1.0-2.5s burst pausetime
+    // (no bullet — the fire frame does that). Anim-committed like C: the
+    // move was entered with LOS, so the cock always plays.
+    if (action === 'cock') {
+      armInfantryCock(m, now, rand);
+      st.sounds.push({
+        name: INFANTRY_COCK_SOUND,
+        pos: v3(pos[0], pos[1], pos[2]! + 32),
+        born: st.time,
+      });
+    }
     if ((action === 'fire' || action === 'melee') && canSee) {
+      // Fresh arrival on the ss fire frame (a live hold's frozen replay
+      // never reaches think; the expiry replay carries wasHeld): arm the C
+      // pausetime (m_soldier.c soldier_fire sets it when AI_HOLD_FRAME is
+      // clear). A fresh arrival overwrites any stale pausetime, like C.
+      if (advanced && !wasHeld && m.kind === 'soldier' && ms.move === 'attack4') {
+        armSoldierBurst(m, now, rand);
+      }
+      // Engaging a live hold latches the flag (infantry: the cock armed
+      // the pausetime; the flag engages on the first fire — the hold then
+      // freezes until the pausetime lapses).
+      if (advanced && !wasHeld && sustainedFireFrame(m.kind, ms.move, playedIdx) && m.burstUntil > now) {
+        m.burstHeld = true;
+      }
+      // Live hold: rewind the lite post-increment so M_MoveFrame re-fires
+      // the frozen frame next tick. The expiry replay does not rewind:
+      // the flag cleared, so the frame advances.
+      if (m.burstHeld && m.burstUntil > now && sustainedFireFrame(m.kind, ms.move, playedIdx)) ms.frame = playedIdx;
       events.push({
         num: m.edict.num,
         classname: m.edict.classname,
@@ -2208,6 +2286,8 @@ export function SV_SpawnMonster(
     reactionAt: 0,
     duckUntil: 0,
     duckShoot: false,
+    burstUntil: 0,
+    burstHeld: false,
     combatGoal: null,
     combatHold: false,
     combatDone: false,
@@ -2598,7 +2678,11 @@ function resolveMonsterFire(
   let flashId = MZ2_SOLDIER_SHOTGUN_1;
   if (m.kind === 'soldier') {
     if (skinWeapon === 'blaster') flashId = MZ2_SOLDIER_BLASTER_1;
-    else if (skinWeapon === 'machinegun') flashId = MZ2_SOLDIER_MACHINEGUN_1 + (ev.frame % 2);
+    // C soldier_fire4 fires with flash_number 3 (machinegun_flash[3] =
+    // MZ2_SOLDIER_MACHINEGUN_4); duck/death mg one-shots keep the legacy
+    // parity slot.
+    else if (skinWeapon === 'machinegun')
+      flashId = move === 'attack4' ? MZ2_SOLDIER_MACHINEGUN_4 : MZ2_SOLDIER_MACHINEGUN_1 + (ev.frame % 2);
     else flashId = MZ2_SOLDIER_SHOTGUN_1;
   } else if (move === 'attack_grenade') flashId = MZ2_GUNNER_GRENADE_1 + (ev.frame % 4);
   else if (m.kind === 'gunner') flashId = MZ2_GUNNER_MACHINEGUN_1 + (ev.frame % 8);
@@ -2649,8 +2733,9 @@ function resolveMonsterFire(
   const pHit = dist < 500 ? 0.6 : 0.25;
   // Infantry machinegun: single bullet per trigger (m_infantry.c
   // InfantryMachineGun -> monster_fire_bullet dmg 3 kick 4 spread 300/500,
-  // infatck1.wav). The C AI_HOLD_FRAME re-fire across pausetime collapses
-  // to the one lite fire frame, so no 3-round fan like the soldier ss.
+  // infatck1.wav). The C AI_HOLD_FRAME hold re-fires this frame across
+  // ticks for the remainder of the cock pausetime (3-18 rounds); the tick
+  // owns the freeze (burstHoldFrozen), so each event resolves one bullet.
   if (m.kind === 'infantry') {
     st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
     st.sounds.push({ name: INFANTRY_GUN_SOUND, pos: chest, born: st.time });
@@ -2660,20 +2745,18 @@ function resolveMonsterFire(
     }
     return;
   }
-  // Soldier machinegun skin: 3-round burst (id monster_fire_bullet dmg 2 ×
-  // the HOLD_FRAME repeat), fanned ±40u at 8192 like the pellet spread
-  // basis; each round rolls pHit independently and draws its own SHORT
-  // muzzle streak (never a muzzle→eye beam).
+  // Soldier machinegun skin: ONE bullet per trigger (m_soldier.c
+  // soldier_fire4 -> monster_fire_bullet dmg 2 kick 4). The sustained
+  // burst is the AI_HOLD_FRAME re-fire across 10Hz ticks (3-10 shots),
+  // never a same-tick fan: each tick draws its own SHORT muzzle streak
+  // (never a muzzle→eye beam) and rolls pHit once.
   if (skinWeapon === 'machinegun') {
-    for (let bb = -1; bb <= 1; bb++) {
-      const fan = v3(dirToEye[0]! + bb * 40, dirToEye[1]! - bb * 40, dirToEye[2]!);
-      st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: fan, color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
-      if (rand() < pHit) {
-        SV_DamagePlayer(st, SOLDIER_WEAPON_STATS.machinegun.damage);
-        st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
-      }
-    }
+    st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
     st.sounds.push({ name: SOLDIER_WEAPON_STATS.machinegun.sound, pos: chest, born: st.time });
+    if (rand() < pHit) {
+      SV_DamagePlayer(st, SOLDIER_WEAPON_STATS.machinegun.damage);
+      st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
+    }
     return;
   }
   let dmg = SOLDIER_WEAPON_STATS.shotgun.damage;

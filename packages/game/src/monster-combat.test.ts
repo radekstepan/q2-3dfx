@@ -170,6 +170,20 @@ describe('soldier/gunner animation + facing regressions (M7.2 batch #3)', () => 
     expect(r.move).toBe(attackMoveFor('soldier', 'shotgun'));
   });
 
+  it('ss skins chase into attack4 (C soldier_attack picks attack4)', () => {
+    // skinnum 4+ (ss) always plays the attack4 machinegun strafe
+    // (m_soldier.c soldier_attack); lighter skins keep the attack1/2 roll.
+    const nav = { graph: new Map([[0, [1]]]), positions: new Map([[0, v3(0, 0, 0)], [1, v3(0, 200, 0)]]) };
+    const ss = spawnMonster('soldier');
+    ss.yaw = 80; // facing: FacingIdeal gate passes
+    monsterChaseMove(ss, v3(0, 0, 0), v3(0, 200, 0), nav, true, () => 0, { skin: 4 });
+    expect(ss.move).toBe('attack4');
+    const plain = spawnMonster('soldier');
+    plain.yaw = 80;
+    monsterChaseMove(plain, v3(0, 0, 0), v3(0, 200, 0), nav, true, () => 0);
+    expect(plain.move).toBe('attack1'); // default skin 2: shotgun roll
+  });
+
   it('yaw clamps per-tick via M_ChangeYaw (speed 20), entityAngles returns stored yaw', () => {
     expect(MONSTER_YAW_SPEED['soldier']).toBe(20);
     expect(MONSTER_YAW_SPEED['gunner']).toBe(20);

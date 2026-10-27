@@ -16,6 +16,7 @@ import type { Vec3 } from '@q2/math';
 import {
   SV_DamagePlayer,
   SV_Init,
+  SV_MonsterTick,
   SV_PlayerFire,
   SV_SetSkill,
   SV_SpawnEntities,
@@ -316,6 +317,81 @@ describe('Phase 2: TTK proof (skill 1 = medium)', () => {
       expect(m.state.dead).toBe(true);
     }
     expect(total).toBeLessThanOrEqual(30);
+  });
+});
+
+describe('sustained fire: ss burst is C-true (attack4 + hold, not a fan)', () => {
+  it('attack4 pass: 3-10 single-bullet events at 10Hz on the C fire frame', () => {
+    // m_soldier.c: soldier_attack always picks soldier_move_attack4 for
+    // skinnum 4+ (6 frames, soldier_fire4 at index 2 = attak403, flash
+    // machinegun_flash[3]); soldier_fire arms pausetime = level.time +
+    // (3 + rand()%8) * FRAMETIME on the first fire frame, and M_MoveFrame
+    // (g_monster.c) freezes + re-fires the frame every 0.1s — 3-10 single
+    // 2dmg bullets, no wind-up, no spin, no same-tick fan.
+    resetEdictNums();
+    const st = SV_Init();
+    expect(st.skill).toBe(1);
+    const m = SV_SpawnMonster(st, 'monster_soldier_ss', v3(0, 0, 24));
+    expect(m.edict.extra['skinnum']).toBe('4');
+    m.state.yaw = 0;
+    m.state.move = 'attack4';
+    m.state.frame = 0;
+    const trace = floorTrace();
+    const fired: number[] = [];
+    const tickOf: number[] = [];
+    for (let i = 0; i < 20; i++) {
+      st.time += 0.1;
+      for (const ev of SV_MonsterTick(st, v3(300, 0, 24), trace, null, () => 0.5)) {
+        if (ev.move === 'attack4') {
+          expect(ev.attack).toBe('machinegun');
+          fired.push(ev.frame);
+          tickOf.push(i);
+        }
+      }
+    }
+    // rand 0.5: hold k = 3 + floor(0.5*8) = 7 frames (0.7s). The arming
+    // tick, every frozen tick, and the expiry tick all fire (C: the
+    // thinkfunc runs on the expiry tick too, then clears AI_HOLD_FRAME):
+    // k+1 = 8 single rounds, all on the C fire frame (attak403, index 2),
+    // one per consecutive tick — plus the float-boundary tick the 0.1s
+    // accumulation buys (deterministic: 9). No same-tick fan, no spin-up.
+    expect(fired).toHaveLength(9);
+    expect(fired.every((f) => f === 2)).toBe(true);
+    for (let k = 1; k < tickOf.length; k++) expect(tickOf[k]! - tickOf[k - 1]!).toBe(1);
+    expect(tickOf[0]).toBe(2); // first shot on the attak403 pass
+    // The move plays out after the hold (no infinite freeze).
+    expect(m.state.move).toBe('run');
+  });
+
+  it('each burst round is one 2dmg bullet (solatck3): skill-1 TTK matches C numbers', () => {
+    // C soldier_fire4 -> monster_fire_bullet dmg 2 kick 4, one bullet per
+    // 10Hz tick, sound solatck3.wav per shot (cl_fx.c muzzleflash). At
+    // skill 1 the 100hp player takes exactly 2 per connecting round.
+    resetEdictNums();
+    const st = SV_Init();
+    const m = SV_SpawnMonster(st, 'monster_soldier_ss', v3(0, 0, 24));
+    m.state.yaw = 0;
+    m.state.move = 'attack4';
+    m.state.frame = 0;
+    const trace = floorTrace();
+    const player = {
+      pos: v3(300, 0, 24),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+      view: 22,
+    };
+    const hp0 = st.playerHealth;
+    // rand 0: hold k = 3 frames (0.3s); every round connects (pHit 0.6 at
+    // 300u, rand 0 always beats it). The arming tick, the frozen ticks,
+    // and the expiry tick all fire (C thinkfunc tail): k+1 = 4 rounds plus
+    // the float-boundary tick (deterministic: 5). 8 ticks cover the pass
+    // without tripping the next M_CheckAttack roll.
+    for (let i = 0; i < 8; i++) SV_Tick(st, 0.1, { player, trace, rand: () => 0 });
+    expect(st.playerHealth).toBe(hp0 - 5 * 2);
+    // One tracer + muzzle + solatck3 per round — single bullets, no fan.
+    expect(st.tracers).toHaveLength(5);
+    expect(st.muzzles.filter((z) => z.foe)).toHaveLength(5);
+    expect(st.sounds.filter((s) => s.name === 'soldier/solatck3.wav')).toHaveLength(5);
   });
 });
 

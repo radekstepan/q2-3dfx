@@ -181,6 +181,7 @@ export {
   soldierHealthForSkin,
   SOLDIER_HP,
   SOLDIER_GIB_HEALTH,
+  infantryCockBurstFrames,
   INFANTRY_C,
   INFANTRY,
   INFANTRY_HP,

@@ -16,6 +16,7 @@ import {
   MONSTER_HULL_MINS,
   MELEE_DISTANCE,
   attackMoveFor,
+  infantryCockBurstFrames,
   infantryMeleeDamage,
   machinegunKick,
   monsterChaseMove,
@@ -218,6 +219,20 @@ describe('INFANTRY lite def (m_infantry.c)', () => {
     }
     // C infantry_die: n = rand() % 3 across the three death moves.
     expect([...seen].sort()).toEqual(['death1', 'death2', 'death3']);
+  });
+
+  it('cock burst window is C AI_HOLD_FRAME: ((rand&15)+3+7) frames', () => {
+    // m_infantry.c infantry_cock_gun: n = (rand() & 15) + 3 + 7 -> 10-25
+    // frames of 0.1s. The fire frame plays 7 frames after the cock, so the
+    // hold re-fires 3-18 single bullets.
+    for (let seed = 0; seed < 200; seed++) {
+      const n = infantryCockBurstFrames(mulberry32(seed));
+      expect(Number.isInteger(n)).toBe(true);
+      expect(n).toBeGreaterThanOrEqual(10);
+      expect(n).toBeLessThanOrEqual(25);
+    }
+    expect(infantryCockBurstFrames(() => 0)).toBe(10);
+    expect(infantryCockBurstFrames(() => 0.99999)).toBe(25);
   });
 
   it('chase closes in run, plants the machinegun strafe at range, smacks in melee', () => {

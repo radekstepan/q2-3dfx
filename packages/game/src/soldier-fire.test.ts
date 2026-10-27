@@ -53,6 +53,7 @@ import {
   isAttackMove,
   isGreenBoltColor,
   monsterMoveOf,
+  selectAttack,
   selectSoldierAttack,
   soldierFireEvent,
   soldierMachinegunBurstFrames,
@@ -207,16 +208,39 @@ describe('machinegun soldier fire pattern (m_soldier.c soldier_fire)', () => {
     expect(soldierFireEvent(4, 10, mulberry32(1)).sound).toBe(null); // melee: no gun sound
   });
 
-  it('machinegun choice routes to a known hitscan-safe lite move (never attack2)', () => {
-    // attack2 is the bolt move in both lanes (web monsterFire spawns the foe
-    // bolt on attack2; server attackOfMove maps attack2 -> blaster). Until
-    // M5.3 full AI adds the C attack4/attack6 moves, machinegun soldiers
-    // play the generic gunfire anim — which every lane treats as hitscan.
+  it('machinegun choice routes to the C attack4 strafe (never attack2)', () => {
+    // C soldier_attack picks soldier_move_attack4 for skinnum 4+
+    // (m_soldier.c: attack4, 6 frames, soldier_fire4 at index 2 = attak403,
+    // flash machinegun_flash[3]). attack2 is the bolt move in both lanes
+    // (web monsterFire spawns the foe bolt on attack2; server attackOfMove
+    // maps attack2 -> blaster) — the mg strafe must never route there.
     const move = attackMoveFor('soldier', 'machinegun');
-    expect(move).toBe('attack1');
+    expect(move).toBe('attack4');
     expect(move).not.toBe('attack2');
     expect(isAttackMove(move)).toBe(true);
-    expect(() => monsterMoveOf({ ...spawnMonster('soldier'), move })).not.toThrow();
-    expect(monsterMoveOf({ ...spawnMonster('soldier'), move }).frames.filter((f) => f.action === 'fire').length).toBeGreaterThan(0);
+    const mv = monsterMoveOf({ ...spawnMonster('soldier'), move });
+    expect(mv.first).toBe(39); // id FRAME_attak401
+    expect(mv.frames).toHaveLength(6); // FRAME_attak401-406
+    expect(mv.frames.map((f) => f.action)).toEqual([
+      'move', 'move', 'fire', 'move', 'move', 'move',
+    ]); // soldier_fire4 at index 2 = attak403
+    expect(mv.end).toBe('run');
+  });
+
+  it('ss skins commit to the machinegun; lighter skins keep the 1/2 roll', () => {
+    // C soldier_attack (m_soldier.c): skinnum 4+ always attack4; lighter
+    // skins roll attack1/attack2 (same skin gun, different anim).
+    expect(selectAttack('soldier', 200, mulberry32(1), 4)).toBe('machinegun');
+    expect(selectAttack('soldier', 200, mulberry32(1), 5)).toBe('machinegun');
+    expect(selectAttack('soldier', 200, mulberry32(1), 99)).toBe('machinegun');
+    for (const skin of [0, 1, 2, 3]) {
+      const c = selectAttack('soldier', 200, mulberry32(7), skin);
+      expect(c === 'shotgun' || c === 'blaster').toBe(true);
+    }
+    // default (no skin) is the normal shotgun-skin class
+    const c = selectAttack('soldier', 200, mulberry32(7));
+    expect(c === 'shotgun' || c === 'blaster').toBe(true);
+    // melee still wins in range for every skin
+    expect(selectAttack('soldier', 10, mulberry32(7), 4)).toBe('melee');
   });
 });

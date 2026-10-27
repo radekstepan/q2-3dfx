@@ -1047,9 +1047,23 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - damage, unconditional like C); the old "infantry deaths never fire"
 - comment corrected (death1/death3 stay silent). Headless pins: attack1
 - pass fires exactly once on frame 10, cock frame emits nothing (no
-- fabricated bullet). Honest gap for the server owner: cock sound +
-- hold-repeat burst need a tick call-site in `packages/server/src/index.ts`
-- (out of this lane's lock) — proposed, not implemented.
+- fabricated bullet).
+- CLOSED 2026-10-27 (sustained-fire lane): the deferred cock/hold gap is
+- implemented — cock emits infatck3 at frame 3 + arms the C pausetime in
+- the tick (`armInfantryCock` + `burstHoldFrozen` freeze on attack1 frame
+- 10, `packages/server/src/index.ts` think hunk), firing one 3dmg bullet
+- per 10Hz tick through the expiry tick (n-6 = 4-19 rounds at skill 1,
+- same canSee gate as live fire). Same lane ports the C ss burst:
+- skin-aware attack pick → attack4 strafe (6 frames, fire idx 2 =
+- attak403, flash MZ2_SOLDIER_MACHINEGUN_4) with the
+- (3+rand%8)*FRAMETIME hold (k+1 = 4-11 single 2dmg bullets, solatck3 per
+- shot) replacing the fabricated same-tick 3-round fan — the user-visible
+- "spinning gun for seconds" is the infantry chaingun (cock + 1.0–2.5s),
+- the ss has no wind-up (C soldier_attack goes straight to attack4).
+- New `burstHeld` mirrors C AI_HOLD_FRAME exactly (freeze, expiry bullet,
+- move-switch clear). Headless pins (game/server): ss 9-event pass at
+- 10Hz + 5-round/10dmg skill-1 damage pin, infantry 19-event pass with
+- cock preceding; gate (e)/(i/j/k) and full base1-gate 20/20 green.
 - OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
 - (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
 - `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`

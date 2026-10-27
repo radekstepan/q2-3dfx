@@ -7,6 +7,7 @@ import type { Vec3 } from '@q2/math';
 import { anglemod, v3 } from '@q2/math';
 import { findPath, nearestNode } from './pathfind.js';
 import type { PortalGraph } from './pathfind.js';
+import { soldierWeaponForSkin } from './weapons.js';
 
 export const RANGE_MELEE = 0;
 export const RANGE_NEAR = 1;
@@ -112,6 +113,23 @@ const soldierAttack2: MonsterMove = {
   end: 'run',
 };
 
+// Soldier ATTACK4 (machinegun, m_soldier.c soldier_move_attack4,
+// FRAME_attak401-406 = 39-44): one aimed bullet at the 3rd frame
+// (soldier_fire4 -> soldier_fire(self, 3), flash machinegun_flash[3]) plus
+// the AI_HOLD_FRAME hold (g_monster.c M_MoveFrame freezes the frame and
+// re-runs the thinkfunc): pausetime = level.time + (3 + rand()%8) *
+// FRAMETIME = 0.3-1.0s. The arming tick, every frozen tick, and the expiry
+// tick all fire (k+1 = 4-11 single rounds). C soldier_attack always picks
+// attack4 for skinnum 4+ (no wind-up, no spin: the "spinning gun" is the
+// infantry chaingun's cock, not this move).
+const soldierAttack4: MonsterMove = {
+  name: 'attack4',
+  first: 39,
+  last: 44,
+  frames: soldierAttackFrames(6, 2),
+  end: 'run',
+};
+
 export const SOLDIER: MonsterDef = {
   classname: 'monster_soldier',
   health: 30,
@@ -128,6 +146,11 @@ export const SOLDIER: MonsterDef = {
     pain3: mv('pain3', 62, [-8, 10, -4, -1, -3, 0, 3, 0, 0, 0, 0, 1, 0, 1, 2, 4, 3, 2], 'run'),
     attack1: soldierAttack1,
     attack2: soldierAttack2,
+    // Machinegun strafe (see the attack4 note above): skinnum 4+ (ss)
+    // soldiers always play this (C soldier_attack), firing one 2dmg bullet
+    // per 0.1s tick for the AI_HOLD_FRAME hold (arming + frozen + expiry
+    // ticks: k+1 = 4-11 rounds).
+    attack4: soldierAttack4,
     duck: mv('duck', 45, [5, -1, 1, 0, 5], 'run'),
     // Last-ditch shot (see the fire-tags note above): death1 indices 21/24
     // are 'fire' exactly like the C soldier_fire6/soldier_fire7 frames.
@@ -378,6 +401,16 @@ export const INFANTRY_C: InfantryCStats = {
   meleeKick: 50,
 };
 
+/**
+ * C infantry_cock_gun burst window (m_infantry.c: pausetime = level.time +
+ * ((rand() & 15) + 3 + 7) * FRAMETIME): 10-25 frames of 0.1s. The fire
+ * frame (attak111, index 10) plays 7 frames after the cock (attak104,
+ * index 3), so the AI_HOLD_FRAME hold re-fires 3-18 single bullets.
+ */
+export function infantryCockBurstFrames(rand: () => number): number {
+  return 10 + Math.floor(rand() * 16);
+}
+
 /** C spawn HP (m_infantry.c SP_monster_infantry: no skin classes, all 100). */
 export const INFANTRY_HP = 100;
 /** C gib health shared by all infantry (m_infantry.c). */
@@ -417,10 +450,8 @@ function taggedMove(
 //   (monster_fire_bullet dmg 3 kick 4 spread 300/500, infatck1.wav) plus
 //   AI_HOLD_FRAME, which re-fires the frame every 0.1s until the cock
 //   pausetime expires (a 3-18 round burst). The lite table tags both frames
-//   ('cock' + 'fire') but the live event gate only routes 'fire'/'melee',
-//   so each pass resolves one bullet — the hold-repeat needs a tick hook
-//   (carry the cock pausetime, freeze the fire frame); documented
-//   deviation, not silence.
+//   ('cock' + 'fire'); the tick owns the C loop (armInfantryCock on the
+//   cock frame, burstHoldFrozen re-emitting the fire frame).
 // - attack2 (FRAME_attak201-208 = md2 199-206, the melee): infantry_swing
 //   at the 3rd frame (attak203 = md2 201, infatck2.wav, no damage) and
 //   infantry_smack at the 6th (attak206 = md2 204: fire_hit 5+(rand%5)
@@ -868,11 +899,13 @@ export function soldierDodgeChoice(skill: number, rand: () => number): DodgeChoi
 export const MONSTER_HULL_MAXS_DUCKED: Vec3 = v3(16, 16, 0);
 
 /**
- * Skill-3 burst refire (m_soldier.c attack4/attack6 nextframe: skill 3
+ * Skill-3 burst refire (m_soldier.c attack1/attack2 nextframe: skill 3
  * re-fires the machinegun move half the time instead of exiting). The tick
- * calls this when an attack move runs to completion; true re-enters the
- * same move immediately, bypassing checkAttack like C's nextframe does.
- * Only the machinegun-class guns burst (soldier ss skin, gunner chain).
+ * calls this when an attack1/attack2 move runs to completion; true
+ * re-enters the same move immediately, bypassing checkAttack like C's
+ * nextframe does. Only the machinegun-class guns burst (ss soldier,
+ * gunner chain). (The attack4 machinegun move itself has NO nextframe —
+ * its refire lines are commented out in C; the hold IS the burst.)
  */
 export function burstRefire(skill: number, machinegunClass: boolean, rand: () => number): boolean {
   if (skill < 3 || !machinegunClass) return false;
@@ -880,14 +913,19 @@ export function burstRefire(skill: number, machinegunClass: boolean, rand: () =>
 }
 /**
  * Melee/ranged selection by range. Soldier picks its skin weapon at
- * near/mid (see selectSoldierAttack); gunner sprays or lobs (the lite
- * caller handles LOS for grenades); infantry (m_infantry.c infantry_attack)
- * commits to the melee move in melee range, else the machinegun strafe.
+ * near/mid (see selectSoldierAttack): skinnum 4+ (ss) always commits to
+ * the machinegun (C soldier_attack picks attack4), lighter skins roll
+ * attack1/attack2 (same skin gun, different anim); gunner sprays or lobs
+ * (the lite caller handles LOS for grenades); infantry (m_infantry.c
+ * infantry_attack) commits to the melee move in melee range, else the
+ * machinegun strafe. `skin` is the soldier skinnum (defaults to the
+ * normal shotgun-skin class, preserving the pre-skin callers).
  */
-export function selectAttack(kind: MonsterKind, dist: number, rand: () => number): AttackChoice {
+export function selectAttack(kind: MonsterKind, dist: number, rand: () => number, skin = 2): AttackChoice {
   const r = monsterRange(dist);
   if (r === RANGE_MELEE) return 'melee';
   if (kind === 'soldier') {
+    if (soldierWeaponForSkin(skin) === 'machinegun') return 'machinegun';
     if (r === RANGE_NEAR || r === RANGE_MID) return rand() < 0.5 ? 'shotgun' : 'blaster';
     return 'none';
   }
@@ -923,11 +961,10 @@ export interface ChaseResult {
 }
 
 /** Map an attack choice onto the kind's data-table move names. The soldier
- * 'machinegun' choice (ss skins, m_soldier.c attack4/attack6 — full moves
- * arrive with M5.3 full AI) plays the generic gunfire anim: it is a KNOWN
- * move every lane already treats as hitscan (web monsterFire only spawns
- * the foe bolt on attack2; server attackOfMove maps attack1 -> shotgun).
- * It must never be attack2 — the bolt move. */
+ * 'machinegun' choice (ss skins) plays attack4 (m_soldier.c
+ * soldier_move_attack4: 6 frames, fire at index 2 = attak403, then the
+ * 3-10 frame AI_HOLD_FRAME hold re-fires it). It must never be attack2 —
+ * the bolt move. */
 export function attackMoveFor(kind: MonsterKind, choice: AttackChoice): string {
   // Infantry attack mapping (m_infantry.c infantry_attack): melee commits
   // to attack2 (the smack), everything ballistic plays the attack1
@@ -946,7 +983,7 @@ export function attackMoveFor(kind: MonsterKind, choice: AttackChoice): string {
     case 'shotgun':
       return 'attack1';
     case 'machinegun':
-      return kind === 'soldier' ? 'attack1' : 'attack_chain';
+      return kind === 'soldier' ? 'attack4' : 'attack_chain';
     case 'blaster':
       return 'attack2';
     case 'chaingun':
@@ -973,6 +1010,7 @@ function setMove(ms: MonsterState, move: string): void {
 const ATTACK_MOVES: ReadonlySet<string> = new Set([
   'attack1',
   'attack2',
+  'attack4',
   'attack_chain',
   'fire_chain',
   'endfire_chain',
@@ -998,6 +1036,10 @@ export interface ChaseOpts {
   skill?: number;
   standGround?: boolean;
   goal?: Vec3 | null;
+  /** Soldier skinnum for the skin-keyed attack pick (C soldier_attack):
+   * ss skins (4+) commit to the attack4 machinegun strafe. Defaults to the
+   * normal shotgun-skin class, preserving the pre-skin callers. */
+  skin?: number;
 }
 
 /**
@@ -1052,7 +1094,7 @@ export function monsterChaseMove(
       // keep closing/turning below so M_ChangeYaw can catch up — the anim
       // never fires over the shoulder.
       if (Math.abs(yawDiff(monsterYawTo(selfPos, playerPos), ms.yaw)) <= 45) {
-        const choice = selectAttack(ms.kind, dist, rand);
+        const choice = selectAttack(ms.kind, dist, rand, opts?.skin ?? 2);
         if (choice !== 'none') {
           const move = attackMoveFor(ms.kind, choice);
           setMove(ms, move);

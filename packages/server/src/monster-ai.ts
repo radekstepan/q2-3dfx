@@ -30,11 +30,13 @@ import {
   MONSTER_HULL_MINS,
   burstRefire,
   checkDodgeGate,
+  infantryCockBurstFrames,
   monsterRange,
   monsterYawTo,
   projectSource,
   sightReactionDelay,
   soldierDodgeChoice,
+  soldierMachinegunBurstFrames,
   soldierWeaponForSkin,
   trailAdd,
   trailLastSpot,
@@ -48,6 +50,7 @@ import type {
 } from '@q2/game';
 import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
+import { SERVER_DT } from '@q2/config';
 import type { MonsterEvent, ServerMonster, ServerState } from './index.js';
 
 /** C point_combat entity (g_misc.c SP_point_combat). */
@@ -468,6 +471,68 @@ export function duckHoldFrozen(m: ServerMonster, now: number): boolean {
   return m.state.move === 'duck' && m.state.frame === 1 && now < m.duckUntil;
 }
 
+// --- sustained-fire hold (C AI_HOLD_FRAME: M_MoveFrame, g_monster.c) --------
+//
+// While the gun pausetime runs, the fire frame freezes and its thinkfunc
+// re-fires every 0.1s tick: one single bullet per tick, never a same-tick
+// fan. The flag (burstHeld) is C AI_HOLD_FRAME itself; the pausetime
+// (burstUntil) alone cannot tell a fresh arrival (arm) from the expiry
+// replay (advance without re-arming). Two C owners:
+// - ss soldier attack4 (m_soldier.c soldier_fire4): pausetime armed on a
+//   fresh arrival at the fire frame only (3 + rand()%8 FRAMETIME =
+//   0.3-1.0s), no wind-up, no spin. The arming tick, every frozen tick,
+//   and the expiry tick all fire: k+1 = 4-11 single rounds per burst.
+// - infantry attack1 (m_infantry.c infantry_cock_gun + infantry_fire):
+//   the cock frame (attak104) plays infatck3 and arms 10-25 frames
+//   (1.0-2.5s); the fire frame (attak111, 7 frames later) then holds,
+//   firing through the expiry tick: n-6 = 4-19 single rounds per burst.
+
+/**
+ * Freeze predicate for the sustained-fire hold: the flag is set, the
+ * body is on the C fire frame, and the pausetime still runs. The tick
+ * skips monsterThink (the frame stays) and re-emits the fire event,
+ * exactly like M_MoveFrame skipping the frame++ and re-running the
+ * thinkfunc.
+ */
+export function burstHoldFrozen(m: ServerMonster, now: number): boolean {
+  if (!m.burstHeld || m.burstUntil <= 0 || now >= m.burstUntil) return false;
+  return sustainedFireFrame(m.kind, m.state.move, m.state.frame);
+}
+
+/**
+ * The C fire frames a hold freezes on: ss attack4 index 2 (attak403 =
+ * soldier_fire4) and infantry attack1 index 10 (attak111 = infantry_fire).
+ */
+export function sustainedFireFrame(kind: ServerMonster['kind'], move: string, frame: number): boolean {
+  if (kind === 'soldier' && move === 'attack4' && frame === 2) return true;
+  if (kind === 'infantry' && move === 'attack1' && frame === 10) return true;
+  return false;
+}
+
+/**
+ * Arm the ss burst on a fresh arrival at the fire frame (m_soldier.c
+ * soldier_fire: `if (!(aiflags & AI_HOLD_FRAME)) pausetime = ...`). Sets
+ * the pausetime only — the tick latches the flag when it engages the
+ * live hold. Called solely for fresh arrivals (frozen replays skip think,
+ * expiry replays carry wasHeld), so a fresh arrival overwrites any stale
+ * pausetime, exactly like C re-arming when the flag is clear.
+ */
+export function armSoldierBurst(m: ServerMonster, now: number, rand: () => number): void {
+  if (m.kind !== 'soldier' || m.state.move !== 'attack4') return;
+  m.burstUntil = now + soldierMachinegunBurstFrames(rand) * SERVER_DT;
+}
+
+/**
+ * Arm the infantry burst on the cock frame (m_infantry.c
+ * infantry_cock_gun: pausetime = level.time + ((rand&15)+3+7) *
+ * FRAMETIME). Unconditional like C — the anim commits the gun the moment
+ * the frame plays. The caller owns the infatck3 sound.
+ */
+export function armInfantryCock(m: ServerMonster, now: number, rand: () => number): void {
+  if (m.kind !== 'infantry' || m.state.move !== 'attack1') return;
+  m.burstUntil = now + infantryCockBurstFrames(rand) * SERVER_DT;
+}
+
 /**
  * Duck-and-shoot (m_soldier.c attack3): skill 1+ dodge losers fire once,
  * mid-duck, with the skin gun. Synthesized as an attack2-resolution event
@@ -550,10 +615,13 @@ export function deathFireEvent(
 }
 
 /**
- * Skill-3 burst refire (attack4/attack6 nextframe): when an attack move
- * runs to completion with the enemy still visible, half the time re-enter
- * it immediately instead of cooling down. Soldier ss skin only (the
- * machinegun class); gunner chains loop by table already.
+ * Skill-3 burst refire (attack1/attack2 mid-move nextframe in C: skill 3
+ * re-fires the volley half the time instead of exiting; the attack4
+ * machinegun move has NO nextframe — its refire lines are commented out in
+ * m_soldier.c, the hold IS the burst). When an attack1/attack2 move runs
+ * to completion with the enemy still visible, half the time re-enter it
+ * immediately, bypassing the cooldown. Only the machinegun-class guns
+ * burst (ss soldier, gunner chain).
  */
 export function maybeBurstRefire(
   m: ServerMonster,

@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   GUNNER_GRENADE_SOUND,
   INFANTRY_C,
+  INFANTRY_COCK_SOUND,
   INFANTRY_GUN_SOUND,
   INFANTRY_MELEE_SOUND,
   MONSTER_HULL_MAXS,
@@ -361,11 +362,14 @@ describe('machinegun kick walk in SV_PlayerFire (p_weapon.c)', () => {
 });
 
 describe('infantry spin/cock combat loop (m_infantry.c cock_gun + fire + death2)', () => {
-  it('attack1 pass: one machinegun event on the C fire frame (attak111), none on the cock frame', () => {
-    // C order: infantry_cock_gun at attak104 (spin/crank, infatck3.wav,
-    // arms the burst) then infantry_fire at attak111 (single aimed bullet).
-    // The lite sim resolves the fire frame; the cock frame emits nothing
-    // (no fabricated bullet — the sound/hold-repeat needs a tick hook).
+  it('attack1 pass: cock sound arms the burst, then N>1 fire events at 10Hz cadence', () => {
+    // C order (m_infantry.c): infantry_cock_gun at attak104 (spin/crank,
+    // infatck3.wav, pausetime = level.time + ((rand&15)+3+7) * FRAMETIME =
+    // 1.0-2.5s), then infantry_fire at attak111 (single aimed bullet) with
+    // AI_HOLD_FRAME (g_monster.c M_MoveFrame) re-firing the frozen frame
+    // every 0.1s until the pausetime expires. The tick owns the C loop:
+    // the cock frame emits the sound + arms, the fire frame freezes and
+    // re-emits (gated by the same canSee rule as live fire).
     resetEdictNums();
     const st = SV_Init();
     const m = SV_SpawnMonster(st, 'monster_infantry', v3(0, 0, 24));
@@ -374,16 +378,38 @@ describe('infantry spin/cock combat loop (m_infantry.c cock_gun + fire + death2)
     m.state.frame = 0;
     const trace = openTrace();
     const fired: number[] = [];
-    for (let i = 0; i < 15; i++) {
+    const tickOf: number[] = [];
+    let firstFireTime = -1;
+    for (let i = 0; i < 40; i++) {
       st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
       for (const ev of SV_MonsterTick(st, playerAt(300).pos, trace, null, () => 0.99)) {
         if (ev.move === 'attack1') {
           expect(ev.attack).toBe('machinegun');
           fired.push(ev.frame);
+          tickOf.push(i);
+          if (firstFireTime < 0) firstFireTime = st.time;
         }
       }
     }
-    expect(fired).toEqual([10]); // exactly FRAME_attak111 (md2 194)
+    // rand 0.99: cock n = 10 + floor(0.99*16) = 25 frames (2.5s); the fire
+    // frame (7 frames after the cock) holds for the remainder, firing
+    // through the expiry tick like C (thinkfunc tail): n-6 = 19
+    // single-bullet rounds, all on the C fire frame (attak111, md2 194).
+    expect(fired).toHaveLength(19);
+    expect(fired.every((f) => f === 10)).toBe(true);
+    // 10Hz cadence: one round per consecutive tick.
+    for (let k = 1; k < tickOf.length; k++) expect(tickOf[k]! - tickOf[k - 1]!).toBe(1);
+    expect(tickOf[0]).toBe(10); // first shot on the attak111 pass
+    // The cock armed the hold (pausetime in the future at the fire frame).
+    expect(m.burstUntil).toBeGreaterThan(0);
+    // ... and the cock sound preceded the first shot (anim-committed C:
+    // the move was entered with LOS, so the cock always plays).
+    const cocks = st.sounds.filter((s) => s.name === INFANTRY_COCK_SOUND);
+    expect(cocks).toHaveLength(1);
+    expect(cocks[0]!.born).toBeLessThan(firstFireTime);
+  });
+
+  it('attack1 fire frame resolves one C bullet (muzzle + tracer + infatck1)', () => {
     // The resolved volley carries the C ballistics: muzzle + tracer +
     // infatck1.wav through the skin-gun pipeline.
     resetEdictNums();
@@ -392,6 +418,7 @@ describe('infantry spin/cock combat loop (m_infantry.c cock_gun + fire + death2)
     m2.state.yaw = 0;
     m2.state.move = 'attack1';
     m2.state.frame = 10;
+    const trace = openTrace();
     SV_Tick(st2, 0.1, { player: playerAt(300), trace, rand: () => 0.99 });
     expect(st2.muzzles.filter((z) => z.foe)).toHaveLength(1);
     expect(st2.tracers).toHaveLength(1);
