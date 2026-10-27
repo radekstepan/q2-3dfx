@@ -13,6 +13,10 @@ import {
   MELEE_DISTANCE,
   MONSTER_YAW_SPEED,
   RANGE_MELEE,
+  INFANTRY_C,
+  SOLDIER,
+  SOLDIER_GIB_HEALTH,
+  SOLDIER_HP,
   attackMoveFor,
   changeYaw,
   corpseHittable,
@@ -23,6 +27,7 @@ import {
   monsterMoveOf,
   monsterRange,
   selectAttack,
+  soldierHealthForSkin,
   spawnMonster,
   yawDiff,
 } from './monsters.js';
@@ -208,5 +213,50 @@ describe('shooting dead: corpses hittable, overkill gibs (M7.2 batch #4)', () =>
     const g = spawnMonster('gunner'); // health 175, gibHealth -70
     expect(monsterPain(g, 1000, () => 0)).toBe('gib');
     expect(g.gibbed).toBe(true);
+  });
+});
+
+describe('Phase 2 C HP/damage tables (m_soldier.c, m_infantry.c)', () => {
+  it('soldier spawn HP is skin-determined: 20 / 30 / 40 (gib -30 throughout)', () => {
+    // m_soldier.c SP_ funcs: light (skin 0) 20hp, normal (skin 2) 30hp,
+    // super-shot (skin 4) 40hp; every skin gibs at -30.
+    expect(soldierHealthForSkin(0)).toBe(20);
+    expect(soldierHealthForSkin(1)).toBe(20);
+    expect(soldierHealthForSkin(2)).toBe(30);
+    expect(soldierHealthForSkin(3)).toBe(30);
+    expect(soldierHealthForSkin(4)).toBe(40);
+    expect(soldierHealthForSkin(5)).toBe(40);
+    expect(soldierHealthForSkin(99)).toBe(40);
+    expect(SOLDIER_HP).toEqual({ blaster: 20, shotgun: 30, machinegun: 40 });
+    expect(SOLDIER_GIB_HEALTH).toBe(-30);
+    // the shared lite def stays the normal (shotgun-skin) class
+    expect(SOLDIER.health).toBe(30);
+    expect(SOLDIER.gibHealth).toBe(-30);
+  });
+
+  it('soldier skin damage matches the m_soldier.c monster_fire_* args', () => {
+    // soldier_fire: blaster 5dmg@600 (skin<=1), shotgun 2dmg x12 kick 1
+    // (skin<=3), machinegun bullet 2dmg kick 4 (else). Damage lives in
+    // SOLDIER_WEAPON_STATS (pinned in soldier-fire.test.ts); the HP table
+    // keys off the same skin families.
+    expect(SOLDIER_HP.blaster).toBe(20);
+    expect(SOLDIER_HP.shotgun).toBe(30);
+    expect(SOLDIER_HP.machinegun).toBe(40);
+  });
+
+  it('infantry C numbers are pinned (m_infantry.c, no lite sim def yet)', () => {
+    // SP_monster_infantry: 100hp, gib -40, mass 200. InfantryMachineGun ->
+    // monster_fire_bullet dmg 3 kick 4 spread 300/500; infantry_smack ->
+    // fire_hit dmg 5+(rand%5) kick 50.
+    expect(INFANTRY_C.health).toBe(100);
+    expect(INFANTRY_C.gibHealth).toBe(-40);
+    expect(INFANTRY_C.mass).toBe(200);
+    expect(INFANTRY_C.bulletDamage).toBe(3);
+    expect(INFANTRY_C.bulletKick).toBe(4);
+    expect(INFANTRY_C.bulletHspread).toBe(300);
+    expect(INFANTRY_C.bulletVspread).toBe(500);
+    expect(INFANTRY_C.meleeDamageMin).toBe(5);
+    expect(INFANTRY_C.meleeDamageMax).toBe(9);
+    expect(INFANTRY_C.meleeKick).toBe(50);
   });
 });

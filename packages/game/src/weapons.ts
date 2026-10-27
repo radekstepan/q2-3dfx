@@ -16,6 +16,7 @@
 
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
+import type { TraceFn } from './pmove.js';
 import { BOLT_LIFE, BOLT_MODEL, BOLT_SKIN, BOLT_SPEED, EF_BLASTER } from './assets.js';
 
 export interface WeaponDef {
@@ -54,7 +55,11 @@ export const WEAPON_SHOTGUN: WeaponDef = {
   ammoPerShot: 1,
   damage: 4,
   kick: 8,
-  hspread: DEFAULT_SHOTGUN_HSPREAD,
+  // C weapon_shotgun_fire (p_weapon.c) passes literal 500, 500 in BOTH SP
+  // and deathmatch — NOT DEFAULT_SHOTGUN_HSPREAD (1000). The 1000 default
+  // belongs to the MONSTER shotgun (m_soldier.c soldier_fire) and to the
+  // SOLDIER_WEAPON_STATS table below; the player gun is twice as tight.
+  hspread: 500,
   vspread: DEFAULT_SHOTGUN_VSPREAD,
   pellets: DEFAULT_SHOTGUN_COUNT,
   mod: 'MOD_SHOTGUN',
@@ -154,6 +159,61 @@ export function blasterSpawn(feet: Vec3, fwd: Vec3, right: Vec3, viewheight: num
     feet[1]! + fwd[1]! * BLASTER_SPAWN_FWD + right[1]! * BLASTER_SPAWN_RIGHT,
     feet[2]! + fwd[2]! * BLASTER_SPAWN_FWD + right[2]! * BLASTER_SPAWN_RIGHT + (viewheight + BLASTER_SPAWN_UP),
   );
+}
+
+/** Eject step for the muzzle probe (1u position tests along the shot dir). */
+export const BOLT_EJECT_STEP = 1;
+/**
+ * Maximum forward ejection for an embedded muzzle (id has no equivalent —
+ * C fire_blaster pulls the bolt BACK 10 and detonates via blaster_touch, so
+ * a seam-embedded muzzle is always a wasted shot + face flash; the eject
+ * keeps a legal shot in flight instead). Covers doorframes/seams (brush
+ * slivers are units thick); anything still solid past this is a real wall
+ * and detonates C-style at the muzzle.
+ */
+export const BOLT_EJECT_MAX = 64;
+
+const ZERO_HULL: Vec3 = v3(0, 0, 0);
+
+/** Resolved bolt spawn: a free point, or still embedded past the eject cap. */
+export interface BoltSpawnResolution {
+  /** First free point along dir at/after spawn (== spawn when already free). */
+  pos: Vec3;
+  /** True when solid past BOLT_EJECT_MAX — caller detonates C-style, no bolt. */
+  embedded: boolean;
+}
+
+/**
+ * Hull-swept bolt spawn (Phase 2): when G_ProjectSource plants the muzzle
+ * inside solid (point-blank at a wall seam/doorframe: the muzzle is 24u
+ * ahead of the feet, easily inside a brush sliver), eject the spawn point
+ * FORWARD along `dir` to the first free point instead of detonating at the
+ * muzzle. Probes are C position tests (zero-length zero-hull traces, the
+ * same primitive CM_TestBoxInBrush answers), so monster boxes — which never
+ * live in the world trace — never eject: point-blank flesh still hits.
+ * `dir` is normalized defensively; pure, headless-testable.
+ */
+export function resolveBoltSpawn(
+  trace: TraceFn,
+  dir: Vec3,
+  spawn: Vec3,
+  maxDist: number = BOLT_EJECT_MAX,
+): BoltSpawnResolution {
+  const len = Math.hypot(dir[0]!, dir[1]!, dir[2]!) || 1;
+  const dx = dir[0]! / len;
+  const dy = dir[1]! / len;
+  const dz = dir[2]! / len;
+  const p = v3(spawn[0], spawn[1], spawn[2]);
+  let d = 0;
+  for (;;) {
+    const t = trace(p, ZERO_HULL, ZERO_HULL, p);
+    if (!t.startsolid && !t.allsolid) return { pos: p, embedded: false };
+    if (d >= maxDist) return { pos: p, embedded: true };
+    d += BOLT_EJECT_STEP;
+    p[0] = p[0]! + dx * BOLT_EJECT_STEP;
+    p[1] = p[1]! + dy * BOLT_EJECT_STEP;
+    p[2] = p[2]! + dz * BOLT_EJECT_STEP;
+  }
 }
 
 /**

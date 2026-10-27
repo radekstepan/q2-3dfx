@@ -40,6 +40,8 @@ import {
   radiusDamagePoints,
   radiusDamageRadius,
   respawnDelayFor,
+  soldierHealthForSkin,
+  resolveBoltSpawn,
   resetEdictNums,
   soldierWeaponForSkin,
   spawnButton,
@@ -206,6 +208,12 @@ export function inhibitedBySkill(spawnflags: number, skill: number): boolean {
 /**
  * Damage dealt TO the player scales by this (g_combat.c: easy halves it).
  * Health is not skill-scaled in id (only damage, pain, aim and the roster).
+ *
+ * Nightmare note (verified, not assumed): NOTHING in C scales damage at
+ * skill 3 — g_combat.c halves only at skill 0, and the skill-3 branches
+ * (pain debounce in T_Damage, duck/dodge/re-attack odds in m_soldier.c,
+ * m_gunner.c, m_infantry.c) are all behavioral. The old "nightmare x2"
+ * guess was wrong; the shape stays {0: 0.5, else 1}.
  */
 export function skillMultiplier(skill: number): number {
   return skill <= 0 ? 0.5 : 1;
@@ -875,14 +883,21 @@ export function SV_SpawnEntities(
         e.origin[2] = g[2]!;
       }
       const kind = monsterKindOf(e.classname);
-      st.monsters.push({
+      const monster: ServerMonster = {
         edict: e,
         state: kind ? spawnMonster(kind) : spawnMonster('soldier'),
         kind,
         ambush: (e.spawnflags & 1) !== 0,
         triggered: (e.spawnflags & 2) !== 0,
         seen: false,
-      });
+      };
+      st.monsters.push(monster);
+      // C spawn HP per skin (m_soldier.c SP_ funcs): light 20, normal 30,
+      // ss 40 — the shared lite def defaults to the normal class.
+      if (kind === 'soldier') {
+        const skin = Number.parseInt((e.extra['skinnum'] as string) ?? '2', 10);
+        monster.state.health = soldierHealthForSkin(Number.isFinite(skin) ? skin : 2);
+      }
       if (kind) {
         // face the mapper angle until the first tick re-yaws (M_ChangeYaw).
         const yaw = parseFloat(dict['angle'], 0);
@@ -1621,7 +1636,8 @@ export function SV_SpawnMonster(
   // id skin assignment parity with the lump path (m_soldier.c SP_ funcs):
   // light troops wear skin 0 (blaster), normals skin 2 (shotgun),
   // supershots skin 4 (machinegun). selectSoldierAttack keys the weapon off
-  // the same skins, so synthetics must carry them too.
+  // the same skins, so synthetics must carry them too. Spawn HP follows the
+  // same skins (20/30/40 — the shared lite def defaults to the normal class).
   if (classname === 'monster_soldier_light') e.extra['skinnum'] = '0';
   else if (classname === 'monster_soldier') e.extra['skinnum'] = '2';
   else if (classname === 'monster_soldier_ss') e.extra['skinnum'] = '4';
@@ -1633,6 +1649,10 @@ export function SV_SpawnMonster(
     triggered: false,
     seen: true,
   };
+  if (kind === 'soldier') {
+    const skin = Number.parseInt((e.extra['skinnum'] as string) ?? '2', 10);
+    m.state.health = soldierHealthForSkin(Number.isFinite(skin) ? skin : 2);
+  }
   m.state.yaw = ((yaw % 360) + 360) % 360;
   st.monsters.push(m);
   return m;
@@ -2370,12 +2390,23 @@ export function SV_PlayerFire(
   });
   // Authentic blaster: G_ProjectSource from the feet (start = feet +
   // fwd*24 + right*8, z += viewheight-8). The bolt leaves the gun muzzle.
+  // Hull-swept spawn (Phase 2): when the muzzle plants inside solid
+  // (point-blank at a wall seam/doorframe), C fire_blaster would pull the
+  // bolt back 10 and touch-detonate — a wasted shot + face flash. Eject the
+  // spawn forward to the first free point instead so a legal shot leaves the
+  // gun; only a muzzle buried past the eject cap detonates C-style.
   if (weaponKind === 'weapon_blaster' && res.bolt) {
     const start = blasterSpawn(opts.feet, fwd, right, opts.viewheight);
     const dl = Math.hypot(fwd[0]!, fwd[1]!, fwd[2]!) || 1;
+    const dir = v3(fwd[0]! / dl, fwd[1]! / dl, fwd[2]! / dl);
+    const spawn = resolveBoltSpawn(opts.trace, dir, start);
+    if (spawn.embedded) {
+      SV_BlasterImpact(st, start, res.bolt.damage, null, opts.rand);
+      return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: false };
+    }
     st.bolts.push({
-      pos: start,
-      dir: v3(fwd[0]! / dl, fwd[1]! / dl, fwd[2]! / dl),
+      pos: spawn.pos,
+      dir,
       life: res.bolt.life,
       damage: res.bolt.damage,
       speed: BOLT_SPEED,

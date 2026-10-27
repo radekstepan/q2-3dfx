@@ -112,6 +112,9 @@ export {
   BLASTER_SPAWN_FWD,
   BLASTER_SPAWN_RIGHT,
   BLASTER_SPAWN_UP,
+  BOLT_EJECT_MAX,
+  BOLT_EJECT_STEP,
+  resolveBoltSpawn,
   blasterSpawn,
   MUZZLE_OFFSET_FWD,
   MUZZLE_OFFSET_RIGHT,
@@ -139,6 +142,7 @@ export {
   isGreenBoltColor,
 } from './weapons.js';
 export type { WeaponDef, Pellet, FireResult, BoltSpec, MuzzleSpec, SoldierSkin } from './weapons.js';
+export type { BoltSpawnResolution } from './weapons.js';
 export type { SoldierWeaponStats, SoldierFireEvent, SoldierFireWeapon } from './weapons.js';
 export {
   MUZZLE_LIGHT_COLOR,
@@ -163,6 +167,10 @@ export {
   monsterChaseMove,
   attackMoveFor,
   monsterLocomotion,
+  soldierHealthForSkin,
+  SOLDIER_HP,
+  SOLDIER_GIB_HEALTH,
+  INFANTRY_C,
   MONSTER_HULL_MINS,
   MONSTER_HULL_MAXS,
   MONSTER_STEP_HEIGHT,
@@ -176,6 +184,7 @@ export {
   MELEE_DISTANCE,
 } from './monsters.js';
 export type { MonsterDef, MonsterMove, MonsterFrame, MonsterState, MonsterKind, AttackChoice } from './monsters.js';
+export type { InfantryCStats } from './monsters.js';
 export type { MonsterNav, ChaseResult } from './monsters.js';
 export {
   monsterFlashOffset,

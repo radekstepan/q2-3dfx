@@ -1,6 +1,8 @@
 // M5.3: weapons + monsters + pathfinding.
 import { describe, expect, it } from 'vitest';
 import { v3 } from '@q2/math';
+import type { Vec3 } from '@q2/math';
+import type { TraceFn } from './pmove.js';
 import {
   BLASTER_DAMAGE_SP,
   BLASTER_INFLIGHT_COLOR,
@@ -8,7 +10,12 @@ import {
   BLASTER_SPAWN_FWD,
   BLASTER_SPAWN_RIGHT,
   BLASTER_TRAIL_COLOR,
+  BOLT_EJECT_MAX,
   DEFAULT_SHOTGUN_COUNT,
+  DEFAULT_SHOTGUN_HSPREAD,
+  DEFAULT_SHOTGUN_VSPREAD,
+  DEFAULT_BULLET_HSPREAD,
+  DEFAULT_BULLET_VSPREAD,
   GREEN_COLOR_BASE,
   GREEN_COLOR_END,
   GUNNER,
@@ -20,6 +27,7 @@ import {
   RANGE_MID,
   RANGE_NEAR,
   SOLDIER,
+  SOLDIER_WEAPON_STATS,
   WEAPON_BLASTER,
   WEAPON_MACHINEGUN,
   WEAPON_SHOTGUN,
@@ -39,6 +47,7 @@ import {
   monsterPain,
   mulberry32,
   muzzleRadius,
+  resolveBoltSpawn,
   selectAttack,
   selectSoldierAttack,
   soldierWeaponForSkin,
@@ -54,7 +63,9 @@ describe('weapons (M5.3)', () => {
     expect(WEAPON_SHOTGUN.damage).toBe(4);
     expect(WEAPON_SHOTGUN.pellets).toBe(DEFAULT_SHOTGUN_COUNT);
     expect(WEAPON_SHOTGUN.pellets).toBe(12);
-    expect(WEAPON_SHOTGUN.hspread).toBe(1000);
+    // C weapon_shotgun_fire passes literal 500, 500 (SP and DM) — NOT the
+    // 1000 DEFAULT_SHOTGUN_HSPREAD (monster shotgun only).
+    expect(WEAPON_SHOTGUN.hspread).toBe(500);
     expect(WEAPON_SHOTGUN.vspread).toBe(500);
     expect(WEAPON_SHOTGUN.ammoKind).toBe('shells');
     expect(WEAPON_MACHINEGUN.damage).toBe(8);
@@ -71,7 +82,7 @@ describe('weapons (M5.3)', () => {
     expect(r.ammoLeft).toBe(9);
     for (const p of r.pellets) {
       expect(p.damage).toBe(4);
-      expect(Math.abs(p.r)).toBeLessThanOrEqual(1000);
+      expect(Math.abs(p.r)).toBeLessThanOrEqual(500);
       expect(Math.abs(p.u)).toBeLessThanOrEqual(500);
     }
   });
@@ -292,5 +303,109 @@ describe('green soldier bolt regression (M7.2 user report)', () => {
     expect(isGreenBoltColor(0xd7)).toBe(false); // 215 is the near-white core
     expect(BLASTER_TRAIL_COLOR).toBeGreaterThanOrEqual(YELLOW_COLOR_BASE);
     expect(BLASTER_TRAIL_COLOR).toBeLessThan(YELLOW_COLOR_END);
+  });
+});
+
+describe('Phase 2 combat numbers (C audit)', () => {
+  it('player SP shotgun is the tight 500/500 gun, not the monster 1000 spread', () => {
+    // p_weapon.c weapon_shotgun_fire: fire_shotgun(..., 500, 500,
+    // DEFAULT_SHOTGUN_COUNT, ...) in SP and DM alike. The 1000-wide
+    // DEFAULT_SHOTGUN_HSPREAD is the MONSTER shotgun arg (m_soldier.c
+    // soldier_fire) — SOLDIER_WEAPON_STATS.shotgun keeps it; the player
+    // table must not.
+    expect(WEAPON_SHOTGUN.hspread).toBe(500);
+    expect(WEAPON_SHOTGUN.vspread).toBe(DEFAULT_SHOTGUN_VSPREAD);
+    expect(WEAPON_SHOTGUN.damage).toBe(4);
+    expect(WEAPON_SHOTGUN.pellets).toBe(12);
+    // monster table for contrast (m_soldier.c: dmg 2, kick 1, 12 pellets)
+    expect(SOLDIER_WEAPON_STATS['shotgun']).toMatchObject({
+      damage: 2,
+      kick: 1,
+      pellets: 12,
+      hspread: DEFAULT_SHOTGUN_HSPREAD,
+    });
+    expect(DEFAULT_SHOTGUN_HSPREAD).toBe(1000);
+  });
+
+  it('player machinegun is flat 8dmg/2kick (p_weapon.c Machinegun_Fire)', () => {
+    expect(WEAPON_MACHINEGUN.damage).toBe(8);
+    expect(WEAPON_MACHINEGUN.kick).toBe(2);
+    expect(WEAPON_MACHINEGUN.hspread).toBe(DEFAULT_BULLET_HSPREAD);
+    expect(WEAPON_MACHINEGUN.vspread).toBe(DEFAULT_BULLET_VSPREAD);
+  });
+
+  it('resolveBoltSpawn leaves a free muzzle exactly where it is', () => {
+    const clear: TraceFn = (start, _mins, _maxs, end) => ({
+      fraction: 1,
+      endpos: v3(end[0], end[1], end[2]),
+      planeNormal: v3(0, 0, 1),
+      allsolid: false,
+      startsolid: false,
+      entityNum: -1,
+      contents: 0,
+    });
+    const spawn = v3(4, -8, 14);
+    const r = resolveBoltSpawn(clear, v3(1, 0, 0), spawn);
+    expect(r.embedded).toBe(false);
+    expect([...r.pos]).toEqual([...spawn]);
+  });
+
+  it('resolveBoltSpawn ejects an embedded muzzle forward to free space', () => {
+    // Abutting-slab seam (traceBox semantics): slab A x in [0,8], slab B x
+    // in [8,16]. A position test is startsolid inside either; a segment
+    // takes the minimum slab-entry fraction, so a step starting inside A
+    // and crossing B reports fraction < 1 (the pre-fix muzzle detonation).
+    const solid = (p: Vec3): boolean => p[0]! >= 0 && p[0]! <= 16;
+    const slabFrac = (s: number, e: number, lo: number, hi: number): number => {
+      const d = e - s;
+      if (Math.abs(d) < 1e-9) return s >= lo && s <= hi ? 0 : 1;
+      let t0 = (lo - s) / d;
+      let t1 = (hi - s) / d;
+      if (t0 > t1) [t0, t1] = [t1, t0];
+      if (t1 < 0 || t0 > 1) return 1;
+      return Math.max(0, t0);
+    };
+    const seam: TraceFn = (start, _mins, _maxs, end) => {
+      const f = Math.min(
+        slabFrac(start[0]!, end[0]!, 0, 8),
+        slabFrac(start[0]!, end[0]!, 8, 16),
+      );
+      return {
+        fraction: f,
+        endpos: v3(start[0]! + (end[0]! - start[0]!) * f, end[1], end[2]),
+        planeNormal: v3(-1, 0, 0),
+        allsolid: false,
+        startsolid: solid(start),
+        entityNum: -1,
+        contents: 0,
+      };
+    };
+    // Muzzle 4u inside the seam: a raw first step detonates at the abutment.
+    const raw = seam(v3(4, 0, 0), v3(0, 0, 0), v3(0, 0, 0), v3(104, 0, 0));
+    expect(raw.startsolid).toBe(true);
+    expect(raw.fraction).toBeLessThan(1);
+    // Ejection walks forward out of both slabs; the flight then runs clean.
+    const r = resolveBoltSpawn(seam, v3(1, 0, 0), v3(4, 0, 0));
+    expect(r.embedded).toBe(false);
+    expect(r.pos[0]!).toBeGreaterThan(16);
+    expect(r.pos[0]!).toBeLessThanOrEqual(17);
+    const flight = seam(r.pos, v3(0, 0, 0), v3(0, 0, 0), v3(r.pos[0]! + 100, 0, 0));
+    expect(flight.fraction).toBe(1);
+    expect(flight.startsolid).toBe(false);
+  });
+
+  it('resolveBoltSpawn reports embedded past the cap (thick wall: C detonates)', () => {
+    const deep: TraceFn = (start, _mins, _maxs, end) => ({
+      fraction: 1,
+      endpos: v3(end[0], end[1], end[2]),
+      planeNormal: v3(0, 0, 1),
+      allsolid: false,
+      // solid everywhere within the cap: a whole wall, not a seam sliver
+      startsolid: start[0]! < BOLT_EJECT_MAX + 10,
+      entityNum: -1,
+      contents: 0,
+    });
+    const r = resolveBoltSpawn(deep, v3(1, 0, 0), v3(0, 0, 0));
+    expect(r.embedded).toBe(true);
   });
 });

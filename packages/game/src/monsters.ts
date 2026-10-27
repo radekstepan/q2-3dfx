@@ -237,6 +237,69 @@ export function monsterYawTo(from: Vec3, to: Vec3): number {
  * second — M_ChangeYaw runs once per frame). */
 export const MONSTER_YAW_SPEED: Record<MonsterKind, number> = { soldier: 20, gunner: 20 };
 
+// --- C damage/HP tables (Phase 2 audit: m_soldier.c SP_ funcs, m_infantry.c) --
+//
+// The lite soldier sim carries one shared SOLDIER def (30hp: the normal), but
+// C spawns three HP classes by skin: light troops (skin 0/1, blaster) 20hp,
+// normals (skin 2/3, shotgun) 30hp, supershots (skin 4+, machinegun) 40hp —
+// all gib at -30. Spawn paths must stamp the skin HP (see
+// soldierHealthForSkin), or TTK lies by a full blaster bolt per skin.
+
+/** C spawn HP per soldier skin family (m_soldier.c SP_monster_soldier_*). */
+export const SOLDIER_HP: Record<'blaster' | 'shotgun' | 'machinegun', number> = {
+  blaster: 20,
+  shotgun: 30,
+  machinegun: 40,
+};
+
+/** C gib health shared by all three soldier skins (m_soldier.c). */
+export const SOLDIER_GIB_HEALTH = -30;
+
+/**
+ * Skin-aware soldier spawn HP (thresholds mirror soldierWeaponForSkin in
+ * weapons.ts: skins 0-1 light, 2-3 normal, 4+ super-shot).
+ */
+export function soldierHealthForSkin(skin: number): number {
+  if (skin <= 1) return SOLDIER_HP.blaster;
+  if (skin <= 3) return SOLDIER_HP.shotgun;
+  return SOLDIER_HP.machinegun;
+}
+
+/**
+ * C infantry tables (m_infantry.c SP_monster_infantry) as pure data. There
+ * is no INFANTRY lite def yet (still open: infantry stays present-but-
+ * dormant in the sim), so both lanes pin the C numbers here and converge on
+ * them when the sim lands: 100hp / gib -40 / mass 200, ranged
+ * monster_fire_bullet dmg 3 kick 4 spread 300/500 (m_infantry.c
+ * InfantryMachineGun), melee fire_hit dmg 5+(rand%5) kick 50
+ * (m_infantry.c infantry_smack).
+ */
+export interface InfantryCStats {
+  health: number;
+  gibHealth: number;
+  mass: number;
+  bulletDamage: number;
+  bulletKick: number;
+  bulletHspread: number;
+  bulletVspread: number;
+  meleeDamageMin: number;
+  meleeDamageMax: number;
+  meleeKick: number;
+}
+
+export const INFANTRY_C: InfantryCStats = {
+  health: 100,
+  gibHealth: -40,
+  mass: 200,
+  bulletDamage: 3,
+  bulletKick: 4,
+  bulletHspread: 300,
+  bulletVspread: 500,
+  meleeDamageMin: 5,
+  meleeDamageMax: 9,
+  meleeKick: 50,
+};
+
 /**
  * id m_move.c M_ChangeYaw: shortest-arc step from `current` toward `ideal`,
  * clamped to `speed` degrees. Both inputs wrap via anglemod; the return is
