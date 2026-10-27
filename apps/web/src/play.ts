@@ -726,6 +726,8 @@ export class LocalDriver implements HostDriver {
   private doors: DoorSync[] = [];
   /** Live submodel face indices the graft appended (unique, for the test hook). */
   private graftedFaces: number[] = [];
+  /** Brush models already stripped from the leaf facelists after blowing. */
+  private freedBrushHidden = new Set<number>();
   /**
    * World trace for gameplay queries (pmove, shots, drops): the server
    * C-mask helper (SV_TraceFor, MASK_PLAYERSOLID_C) wrapped with the solid
@@ -932,6 +934,7 @@ export class LocalDriver implements HostDriver {
       maxs: v3(this.pm.maxs[0], this.pm.maxs[1], this.pm.maxs[2]),
     }, 'player');
     this.syncDoors();
+    this.hideFreedBrushes();
     this.updateBob();
     this.stepGunframe();
     this.emitDoorSounds();
@@ -1104,11 +1107,14 @@ export class LocalDriver implements HostDriver {
     const out: ExtraRenderable[] = [];
     // Server-owned barrels (live only): render base sits at the hull
     // bottom — misc_explobox origins already are the box bottom (the barrel
-    // MD2 pivot is the box bottom too), func_explosive origins are the brush
-    // bbox CENTER, so funcs render at the bbox bottom (origin − size/2).
+    // MD2 pivot is the box bottom too). func_explosive NEVER renders here:
+    // it is brush geometry (the *20 glass window, the *30 slab), grafted
+    // into the world leaves like doors/func_walls so it renders CLOSED at
+    // spawn and disappears when blown — a barrel MD2 proxy would
+    // triple-render the spawn room (the reported "3 barrels" bug).
     for (const b of this.server.barrels) {
-      if (b.edict.freed) continue;
-      const baseZ = b.isFunc ? b.origin[2]! - b.size[2]! / 2 : b.origin[2]!;
+      if (b.edict.freed || b.isFunc) continue;
+      const baseZ = b.origin[2]!;
       out.push({
         origin: [b.origin[0]!, b.origin[1]!, baseZ],
         angles: [0, 0, 0],
@@ -1221,6 +1227,23 @@ export class LocalDriver implements HostDriver {
             model: this.models.banner,
             skin: this.models.bannerSkin,
             frame: bf,
+          });
+        }
+      }
+      // Dead soldiers (misc_deadsoldier, g_misc.c SP_misc_deadsoldier): the
+      // lump pose (spawnflags bits -> deadbod dude MD2 frame, first match
+      // wins) at the lump origin + lump yaw. Read from the server roster
+      // (plain edicts) so skill filtering applies; corpses persist (never
+      // freed — the server spawn case keeps them as permanent scenery).
+      if (this.models.corpse >= 0) {
+        for (const e of this.server.entities) {
+          if (e.freed || e.classname !== 'misc_deadsoldier') continue;
+          out.push({
+            origin: [e.origin[0]!, e.origin[1]!, e.origin[2]!],
+            angles: [0, parseFloat(e.extra['angle'] ?? '0', 0), 0],
+            model: this.models.corpse,
+            skin: this.models.corpseSkin,
+            frame: deadsoldierFrameForSpawnflags(parseSpawnflags(e.extra ?? {})),
           });
         }
       }
@@ -1791,28 +1814,40 @@ export class LocalDriver implements HostDriver {
       const o = (tr.ent.extra['origin'] ?? '0 0 0').trim().split(/\s+/).map(Number);
       snap(tr.ent, v3(o[0] ?? 0, o[1] ?? 0, o[2] ?? 0), tr.ent.angles, false);
     }
+    // func_explosive walls render as brush geometry (the *20 glass window,
+    // the *30 slab — never as a barrel MD2 proxy). Snapshot them like
+    // static brush models (rest = the lump origin, 0,0,0 for brush models)
+    // so DoorSync tracks them and doorRenderOffset can pin the closed pose;
+    // hideFreedBrushes strips the graft when one blows.
+    for (const e of this.server.entities) {
+      if (e.freed || e.classname !== 'func_explosive' || !e.model) continue;
+      snap(e, v3(0, 0, 0), e.angles, false);
+    }
   }
 
-  /** Test hook: how many brush models the DoorSync covers (doors + trains). */
+  /** Test hook: how many brush models the DoorSync covers (doors + trains + func_explosive). */
   doorSyncCount(): number {
     return this.doors.length;
   }
 
   /**
    * Brush-model graft (view-side): QBSP submodel faces (*1..*N — doors,
-   * buttons, trains, func_walls) are referenced by NEITHER the world node
-   * face ranges NOR any leaf facelist, so the stock world traversal never
-   * collects them and every brush entity renders invisible. The fix owns
-   * only this MiniWorld instance (fresh per boot): append each rendered
-   * brush model's live faces to the facelists of the leaves its mapper
-   * bounds intersect (movers/trainds unioned over their full travel so an
-   * open door or a running train never leaves its leaves). Frustum,
+   * buttons, trains, func_walls, func_explosive) are referenced by NEITHER
+   * the world node face ranges NOR any leaf facelist, so the stock world
+   * traversal never collects them and every brush entity renders invisible.
+   * The fix owns only this MiniWorld instance (fresh per boot): append each
+   * rendered brush model's live faces to the facelists of the leaves its
+   * mapper bounds intersect (movers/trainds unioned over their full travel
+   * so an open door or a running train never leaves its leaves). Frustum,
    * backface, and z culling still apply per surface; PVS is bypassed for
    * these faces (a few hundred extra stamp checks per frame).
    *
-   * Excluded on purpose: func_explosive brushes (rendered as the barrel
-   * MD2 through extraEntities — grafting would double-draw) and trigger
-   * volumes (SURF_NODRAW, degenerate n=0, invisible in C too).
+   * func_explosive renders here as brush geometry (the *20 TRANS33 glass
+   * window, the *30 slab) — the old barrel-MD2 proxy is retired (it
+   * double-drew the spawn room). hideFreedBrushes strips a blown brush
+   * from the leaf lists so the wall visibly disappears. Excluded on
+   * purpose: trigger volumes (SURF_NODRAW, degenerate n=0, invisible
+   * in C too).
    */
   private graftBrushModels(): void {
     if (!this.map) return;
@@ -1882,6 +1917,16 @@ export class LocalDriver implements HostDriver {
     // func_wall statics never move: mapper bounds only.
     for (const e of this.server.entities) {
       if (e.freed || e.classname !== 'func_wall' || !e.model) continue;
+      const n = brushModelNum(e.model);
+      if (n === null) continue;
+      include(n, 0, 0, 0);
+    }
+    // func_explosive statics render as brush geometry too (the *20 glass
+    // window, the *30 slab — C SOLID_BSP until destroyed, never an MD2).
+    // Mapper bounds only: explosive brushes never move. Blown on free via
+    // hideFreedBrushes (graft runs once at boot, when all are standing).
+    for (const e of this.server.entities) {
+      if (e.freed || e.classname !== 'func_explosive' || !e.model) continue;
       const n = brushModelNum(e.model);
       if (n === null) continue;
       include(n, 0, 0, 0);
@@ -1982,6 +2027,28 @@ export class LocalDriver implements HostDriver {
         s.maxs[0] = bx[0]! + ox;
         s.maxs[1] = bx[1]! + oy;
         s.maxs[2] = bx[2]! + oz;
+      }
+    }
+  }
+
+  /**
+   * Strip blown brush models (func_explosive G_FreeEdict) from the leaf
+   * facelists the graft appended them to, so a destroyed wall visibly
+   * disappears. Runs every tick after syncDoors; each model is stripped
+   * once (freedBrushHidden). Only func_explosive edicts ever free — movers
+   * and trains never leave the DoorSync — but the loop is generic.
+   */
+  private hideFreedBrushes(): void {
+    if (!this.map) return;
+    for (const d of this.doors) {
+      if (!d.ent.freed || this.freedBrushHidden.has(d.model)) continue;
+      this.freedBrushHidden.add(d.model);
+      const first = this.map.modelsExtra[d.model * MODEL_EXTRA_STRIDE + 1]!;
+      const num = this.map.modelsExtra[d.model * MODEL_EXTRA_STRIDE + 2]!;
+      for (const leaf of this.mini.leafs) {
+        const list = leaf.faceList;
+        if (!list || list.length === 0) continue;
+        leaf.faceList = list.filter((f) => f < first || f >= first + num);
       }
     }
   }
@@ -2562,12 +2629,16 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
   const ship = loadModel(SHIP_MODEL);
   const bannerSkin = loadSkin(BANNER_SKIN);
   const banner = loadModel(BANNER_MODEL);
+  // Dead-soldier corpse (misc_deadsoldier, appended last like the banner so
+  // every earlier handle stays stable; missing lump → box-critter fallback).
+  const corpseSkin = loadSkin(CORPSE_SKIN);
+  const corpse = loadModel(CORPSE_MODEL);
   return {
     monster, monsterSkin, soldierLightSkin, soldierSsSkin, gunner, gunnerSkin, infantry, infantrySkin, weapons, weaponSkins, bolt, boltSkin, barrel, barrelSkin,
     explode, explodeSkin, blast, blastSkin,
     debris1, debris1Skin, debris2, debris2Skin, debris3, debris3Skin,
     gibMeat, gibMeatSkin, gibChest, gibChestSkin, gibBone, gibBoneSkin, gibHead, gibHeadSkin,
-    items, ship, shipSkin, banner, bannerSkin,
+    items, ship, shipSkin, banner, bannerSkin, corpse, corpseSkin,
     skins,
   };
 }

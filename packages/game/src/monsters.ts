@@ -80,6 +80,15 @@ export interface MonsterDef {
 // driver gates return-fire damage on monsterThink's 'fire' return, so these
 // tags are what make soldier shots land on the muzzle flash instead of on a
 // wall-clock timer.
+//
+// Soldier LAST-DITCH fire (m_soldier.c soldier_move_death1,
+// FRAME_death101-136 = first 272): the only death move in the game with
+// fire callbacks — soldier_fire6 (flash 5) at 0-based frame index 21 and
+// soldier_fire7 (flash 6) at index 24, both aimed straight along the facing
+// (no enemy tracking) and skin-gunned by soldier_fire (blaster/shotgun/
+// machinegun). Gunner (m_gunner.c gunner_frames_death, all NULL) and
+// infantry (m_infantry.c death1-3, all NULL) deaths never fire, so their
+// tables stay all-'move'.
 function soldierAttackFrames(count: number, fireIdx: number): MonsterFrame[] {
   const frames: MonsterFrame[] = [];
   for (let f = 0; f < count; f++) frames.push({ dist: 0, action: f === fireIdx ? 'fire' : 'move' });
@@ -119,7 +128,12 @@ export const SOLDIER: MonsterDef = {
     attack1: soldierAttack1,
     attack2: soldierAttack2,
     duck: mv('duck', 45, [5, -1, 1, 0, 5], 'run'),
-    death1: mv('death1', 272, [0, -10, -10, -10, -5, ...new Array(31).fill(0)], 'dead'),
+    // Last-ditch shot (see the fire-tags note above): death1 indices 21/24
+    // are 'fire' exactly like the C soldier_fire6/soldier_fire7 frames.
+    // (C picks death1-6 at random with only death1 armed; the lite soldier
+    // holds death1, so every lite death plays the armed move — the trace
+    // agrees with the animation it actually renders.)
+    death1: taggedMove('death1', 272, [0, -10, -10, -10, -5, ...new Array(31).fill(0)], 'dead', { 21: 'fire', 24: 'fire' }),
   },
 };
 
@@ -287,6 +301,20 @@ export function monsterYawTo(from: Vec3, to: Vec3): number {
 /** id's yaw_speed per kind (m_soldier.c / m_gunner.c SP_ funcs; infantry
  * inherits walkmonster_start's default 20 — m_infantry.c sets none). */
 export const MONSTER_YAW_SPEED: Record<MonsterKind, number> = { soldier: 20, gunner: 20, infantry: 20 };
+
+/** C SP_misc_deadsoldier pose (g_misc.c): the deadbod dude MD2 frame from
+ * the spawnflags pose bits — first match wins, default frame 0 (ON_BACK).
+ * QUAKED poses: ON_BACK 0, ON_STOMACH 2, BACK_DECAP 4, FETAL_POS 8,
+ * SIT_DECAP 16, IMPALED 32. base1 fields 12 (frames 0/1/2/4). */
+export function deadsoldierFrameForSpawnflags(spawnflags: number): number {
+  const f = spawnflags | 0;
+  if (f & 2) return 1;
+  if (f & 4) return 2;
+  if (f & 8) return 3;
+  if (f & 16) return 4;
+  if (f & 32) return 5;
+  return 0;
+}
 
 // --- C damage/HP tables (Phase 2 audit: m_soldier.c SP_ funcs, m_infantry.c) --
 //

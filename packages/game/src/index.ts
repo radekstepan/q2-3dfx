@@ -166,6 +166,7 @@ export {
   monsterFrameNumber,
   entityAngles,
   corpseHittable,
+  deadsoldierFrameForSpawnflags,
   monsterThink,
   monsterPain,
   monsterYawTo,

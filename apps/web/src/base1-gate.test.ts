@@ -32,7 +32,15 @@
 //       fire (rendered barrels gone, clips open).
 //   (n) all 9 misc_exploboxes rest on the hull-trace floor (server origin
 //       and rendered mesh bottom within epsilon — the (a) pin for every
-//       barrel, not just the spawn pair).
+//       barrel, not just the spawn pair; func_explosives render as brush
+//       geometry, never as barrel proxies, so the roster is 9, not 11).
+//   (o) the spawn-room "third barrel" is brush glass: lump holds 2
+//       misc_explobox + 1 func_explosive (*20, TRANS33 window); it renders
+//       via the mover graft at the closed pose (never a barrel MD2), and
+//       still dies to direct fire (clip removed, faces ungrafted).
+//   (p) dead soldiers render: the lump holds 12 misc_deadsoldier and every
+//       one submits the deadbod dude MD2 at its lump origin + C pose frame
+//       (spawnflags bits, first match wins), persisting (never freed).
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { resetCVars, setCVar } from '@q2/config';
 import { BUTTON_DUCK } from '@q2/input';
@@ -40,9 +48,9 @@ import type { UserCmdT } from '@q2/input';
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import type { Entity } from '@q2/renderer-api';
-import { MODEL_EXTRA_STRIDE, traceBox } from '@q2/bsp';
+import { MODEL_EXTRA_STRIDE, traceBox, FACE_STRIDE } from '@q2/bsp';
 import type { BspMap } from '@q2/bsp';
-import { EXPLOBOX_MAXS, EXPLOBOX_MINS, PMF_DUCKED, parseEntities } from '@q2/game';
+import { EXPLOBOX_MAXS, EXPLOBOX_MINS, PMF_DUCKED, SOLID_BBOX, deadsoldierFrameForSpawnflags, parseEntities, parseFloat } from '@q2/game';
 import { SV_ClipTrace, SV_SetPlayerHealth, SV_TraceFor, MASK_OPAQUE_C, MASK_PLAYERSOLID_C } from '@q2/server';
 import { bootPlay, rebootPlay, pumpExplosionLights } from './play.js';
 
@@ -357,8 +365,9 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
       expect(mag3(off)).toBeLessThan(0.01);
     }
     expect(synced).toBeGreaterThan(0);
-    // The graft covers every live submodel face (movers/trains/func_walls).
-    expect(driver.graftedFaceCount()).toBe(232);
+    // The graft covers every live submodel face (movers/trains/func_walls +
+    // the *20 glass window + the *30 slab): 232 + 17 + 83 = 332.
+    expect(driver.graftedFaceCount()).toBe(332);
     // Q2 glass reads `alpha` on the func_wall (translucent when present);
     // base1 carries none, so the correct render is opaque, never invisible.
     const dicts = parseEntities(driver.map!.entities);
@@ -685,8 +694,9 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     const { driver } = boot;
     const map = driver.map!;
     // The two exploboxes by the shotgun secret, plus the *30 slab between
-    // them (112x120x19 brush rendered as a barrel proxy). All three take
-    // direct blaster fire through the clip-attributed touch.
+    // them (112x120x19 brush rendered as grafted geometry, never a barrel
+    // proxy). All three take direct blaster fire through the clip-attributed
+    // touch.
     const at = (x: number, y: number): NonNullable<ReturnType<typeof driver.server.barrels.find>> =>
       driver.server.barrels.find((b) => !b.isFunc && Math.abs(b.origin[0]! - x) < 2 && Math.abs(b.origin[1]! - y) < 2)!;
     const b1 = at(950, -198);
@@ -763,9 +773,11 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     const boxes = driver.server.barrels.filter((b) => !b.isFunc);
     expect(boxes).toHaveLength(9);
     // Rendered roster mirrors the live roster 1:1 (no doubles): 9 explobox
-    // meshes at their hull bottoms plus the 2 func bbox-bottom proxies.
+    // meshes at their hull bottoms. func_explosive walls render as grafted
+    // brush geometry (DoorSync), NEVER as barrel proxies — the spawn room
+    // shows 2 barrel MD2s, not 3.
     const rendered = driver.extraEntities()!.filter((x) => x.model === boot.models!.barrel);
-    expect(rendered).toHaveLength(11);
+    expect(rendered).toHaveLength(9);
     for (const b of boxes) {
       // Server hull rests on the floor: a 256-down hull drop ends at the
       // origin (C M_droptofloor contact rides the 1/32 epsilon, never a
@@ -786,5 +798,147 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
       expect(got!.origin![2]!).toBeCloseTo(b.origin[2]!, 1);
       expect(got!.origin![2]!).toBeCloseTo(drop.endpos[2]!, 1);
     }
+  });
+
+  it('(o) the spawn "third barrel" is brush glass: lump 2 explobox + *20, renders closed, dies to fire', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    const map = driver.map!;
+    // Lump evidence: the start room holds exactly 2 misc_explobox near
+    // spawn plus the func_explosive *20 wall (the "third" is a window, not
+    // a barrel). *20 carries no spawnflags (always solid, C SP_ default).
+    const dicts = parseEntities(map.entities);
+    const nearSpawn = dicts.filter((d) => {
+      if (d['classname'] !== 'misc_explobox' || !d['origin']) return false;
+      const o = d['origin']!.split(' ').map(Number);
+      return Math.hypot(o[0]! - 128, o[1]! + 320) < 400;
+    });
+    expect(nearSpawn).toHaveLength(2);
+    const w20dict = dicts.find((d) => d['classname'] === 'func_explosive' && d['model'] === '*20')!;
+    expect(w20dict).toBeDefined();
+    expect(w20dict['spawnflags']).toBeUndefined();
+    expect(w20dict['target']).toBe('t78');
+    const spawnBoxes = driver.server.barrels.filter(
+      (b) => !b.isFunc && Math.hypot(b.origin[0]! - 128, b.origin[1]! + 320) < 400,
+    );
+    expect(spawnBoxes).toHaveLength(2);
+    // Glass evidence: every *20 face is the TRANS33 window texture
+    // (e1u1/wndow0_3, SURF_TRANS33 0x10 — qfiles.h) across the corridor.
+    const first = map.modelsExtra[20 * MODEL_EXTRA_STRIDE + 1]!;
+    const num = map.modelsExtra[20 * MODEL_EXTRA_STRIDE + 2]!;
+    expect(num).toBe(17);
+    for (let f = first; f < first + num; f++) {
+      const ti = map.faces[f * FACE_STRIDE + 4]!;
+      expect(map.texinfoFlags[ti]! & 16).toBe(16);
+      expect(map.texinfoNames[ti]).toContain('wndow');
+    }
+    // Server: one isFunc barrel record for the brush, clip standing.
+    const w20 = driver.server.barrels.find((b) => b.isFunc && b.edict.model === '*20')!;
+    expect(w20).toBeDefined();
+    expect(driver.server.brushClips.has(w20.edict.num)).toBe(true);
+    // Rendered CLOSED at spawn via the DoorSync (zero displacement) with
+    // all 17 live faces grafted into the leaf lists ...
+    const off20 = driver.doorRenderOffset('*20');
+    expect(off20).not.toBeNull();
+    expect(mag3(off20!)).toBeLessThan(0.01);
+    const inLists = new Set<number>();
+    for (const leaf of driver.mini.leafs) {
+      for (const f of leaf.faceList ?? []) inLists.add(f);
+    }
+    for (let f = first; f < first + num; f++) {
+      if (!driver.mini.surfaces[f]?.n) continue;
+      expect(inLists.has(f)).toBe(true);
+    }
+    // ... and NEVER as a barrel MD2: no barrel proxy anywhere near the
+    // window bbox (x -72..128, y 136..144).
+    const extras = driver.extraEntities()!;
+    expect(
+      extras.filter(
+        (x) =>
+          x.model === boot.models!.barrel &&
+          x.origin![0]! > -80 && x.origin![0]! < 136 && x.origin![1]! > 128 && x.origin![1]! < 152,
+      ),
+    ).toHaveLength(0);
+    // Still killable: dead-on blaster from the south stand latches the
+    // barrel_delay fuse on the brush itself (commit e2227bb kept).
+    driver.pm.origin = v3(28, 60, 30);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    let ticks = 0;
+    while (!w20.edict.freed && ticks++ < 40) driver.step(attackCmd([0, 90, 0]), 0.1);
+    expect(w20.edict.freed).toBe(true);
+    stepDriver(driver, neutralCmd(), 5);
+    // RENDERED verdict: the fuse blew (explosion + debris submitted), the
+    // brush clip opened, the graft stripped all 17 faces (the *30 control
+    // stays grafted), and no barrel MD2 renders at the wall.
+    expect(driver.server.brushClips.has(w20.edict.num)).toBe(false);
+    expect(driver.events).toContain('barrel');
+    expect(driver.events).toContain('explosion');
+    const inListsAfter = new Set<number>();
+    for (const leaf of driver.mini.leafs) {
+      for (const f of leaf.faceList ?? []) inListsAfter.add(f);
+    }
+    for (let f = first; f < first + num; f++) expect(inListsAfter.has(f)).toBe(false);
+    const s30 = map.modelsExtra[30 * MODEL_EXTRA_STRIDE + 1]!;
+    const n30 = map.modelsExtra[30 * MODEL_EXTRA_STRIDE + 2]!;
+    expect(driver.mini.surfaces[s30]?.n).toBeGreaterThan(0);
+    expect(inListsAfter.has(s30!)).toBe(true);
+    expect(n30).toBe(83);
+    const extrasAfter = driver.extraEntities()!;
+    expect(
+      extrasAfter.filter(
+        (x) =>
+          x.model === boot.models!.barrel &&
+          x.origin![0]! > -80 && x.origin![0]! < 136 && x.origin![1]! > 128 && x.origin![1]! < 152,
+      ),
+    ).toHaveLength(0);
+    expectInWorld(driver.pm.origin, map);
+  });
+
+  it('(p) all 12 dead soldiers render at their lump origins in the C pose', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    // Lump evidence: base1 fields 12 misc_deadsoldier (g_misc.c
+    // SP_misc_deadsoldier — corpse in a fixed pose, non-triggered).
+    const dicts = parseEntities(driver.map!.entities);
+    const corpses = dicts.filter((d) => d['classname'] === 'misc_deadsoldier');
+    expect(corpses).toHaveLength(12);
+    // Server: every one spawns (SP-only sim keeps them all — C removes
+    // them only in deathmatch) as a permanent SOLID_BBOX edict.
+    const spawned = driver.server.entities.filter((e) => !e.freed && e.classname === 'misc_deadsoldier');
+    expect(spawned).toHaveLength(12);
+    for (const e of spawned) {
+      expect(e.solid).toBe(SOLID_BBOX);
+      expect([...e.mins]).toEqual([-16, -16, 0]);
+      expect([...e.maxs]).toEqual([16, 16, 16]);
+    }
+    // Rendered: the deadbod dude MD2 + skin are registered, and every
+    // corpse submits at its lump origin + lump yaw in the C pose frame
+    // (spawnflags bits, first match wins — deadsoldierFrameForSpawnflags).
+    expect(boot.models!.corpse).toBeGreaterThanOrEqual(0);
+    expect(boot.models!.corpseSkin).toBeGreaterThanOrEqual(0);
+    const extras = driver.extraEntities()!;
+    const rendered = extras.filter((x) => x.model === boot.models!.corpse);
+    expect(rendered).toHaveLength(12);
+    for (const d of corpses) {
+      const o = d['origin']!.split(' ').map(Number);
+      const got = rendered.find((x) => Math.hypot(x.origin![0]! - o[0]!, x.origin![1]! - o[1]!) < 1);
+      expect(got).toBeDefined();
+      expect(got!.origin![2]).toBe(o[2]);
+      expect(got!.skin).toBe(boot.models!.corpseSkin);
+      const wantFrame = deadsoldierFrameForSpawnflags(parseInt(d['spawnflags'] ?? '0', 10));
+      expect(got!.frame).toBe(wantFrame);
+      const wantYaw = parseFloat(d['angle'] ?? '0', 0);
+      expect(got!.angles![1]).toBe(wantYaw);
+    }
+    // The door-debris corpse by the start lines (40,272,-64, frame 1)
+    // renders with the rest of the roster.
+    const doorCorpse = rendered.find((x) => Math.hypot(x.origin![0]! - 40, x.origin![1]! - 272) < 1)!;
+    expect(doorCorpse).toBeDefined();
+    expect(doorCorpse.frame).toBe(1);
+    // Corpses persist: they ride extraEntities (never freed, never in the
+    // snapshot corpse path) after ticks advance.
+    stepDriver(driver, neutralCmd(), 10);
+    expect(driver.extraEntities()!.filter((x) => x.model === boot.models!.corpse)).toHaveLength(12);
   });
 });

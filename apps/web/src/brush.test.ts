@@ -48,8 +48,9 @@ describe.runIf(!!WEB_Q2_PAK)('brush models render (doors closed, glass visible)'
     const map = driver.map!;
     const modelCount = map.modelsExtra.length / MODEL_EXTRA_STRIDE;
     // Expected: union of live faces over mover models + brush-train models
-    // + func_wall models (func_explosive excluded: MD2-rendered, triggers
-    // excluded: NODRAW).
+    // + func_wall + func_explosive models (func_explosive renders as brush
+    // geometry — the *20 glass window, the *30 slab — never as an MD2 proxy;
+    // triggers excluded: NODRAW).
     const wanted = new Set<number>();
     for (const m of driver.server.movers) {
       const n = Number.parseInt(m.ent.model.slice(1), 10);
@@ -61,7 +62,7 @@ describe.runIf(!!WEB_Q2_PAK)('brush models render (doors closed, glass visible)'
       if (Number.isFinite(n)) wanted.add(n);
     }
     for (const e of driver.server.entities) {
-      if (!e.freed && e.classname === 'func_wall' && e.model) {
+      if (!e.freed && (e.classname === 'func_wall' || e.classname === 'func_explosive') && e.model) {
         const n = Number.parseInt(e.model.slice(1), 10);
         if (Number.isFinite(n)) wanted.add(n);
       }

@@ -956,10 +956,12 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     expect(snap.entities.every((e) => e.id === 1 || driver.server.monsters.some((m) => m.edict.num === e.id))).toBe(true);
     const extras = driver.extraEntities();
     expect(extras).not.toBeNull();
-    // Barrels ride 1:1 (plus pickups/ships/banners on the same hook since
-    // M7.1: filter by the barrel handle for the barrel assertions).
+    // Barrels ride 1:1 for genuine exploboxes (plus pickups/ships/banners/
+    // corpses on the same hook since M7.1 — filter by the barrel handle for
+    // the barrel assertions). func_explosive NEVER rides the barrel MD2
+    // (brush geometry via the graft), so the count is exploboxes only.
     const barrelX = extras!.filter((x) => x.model === boot.models!.barrel);
-    expect(barrelX.length).toBe(driver.barrels.length);
+    expect(barrelX.length).toBe(driver.barrels.filter((b) => !b.isFunc).length);
     const roundedX = barrelX.map((x) => [Math.round(x.origin![0]!), Math.round(x.origin![1]!), Math.round(x.origin![2]!)]);
     expect(roundedX).toContainEqual([136, 40, 0]);
     expect(roundedX).toContainEqual([184, -24, 0]);
@@ -988,7 +990,9 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     driver.step({ ...neutralCmd([0, 135, 0]), buttons: BUTTON_ATTACK }, 0.1);
     expect(driver.bolts.length).toBe(1);
     const withBolt = driver.extraEntities()!;
-    expect(withBolt.filter((x) => x.model === boot.models!.barrel).length).toBe(driver.barrels.length);
+    expect(withBolt.filter((x) => x.model === boot.models!.barrel).length).toBe(
+      driver.barrels.filter((b) => !b.edict.freed && !b.isFunc).length,
+    );
     const boltX = withBolt.find((x) => x.model === boot.models!.bolt)!;
     expect(boltX).toBeDefined();
     expect(boltX.model).toBe(boot.models!.bolt);
@@ -1091,22 +1095,31 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     expect(near.length).toBe(2);
     expect(near.every((b) => !b.isFunc)).toBe(true);
     // Rendered extras mirror the roster 1:1 (no double-submit) at bottom
-    // bases: misc origins ARE the floor (z=0), funcs render at bbox bottom.
+    // bases: misc origins ARE the floor (z=0). func_explosive NEVER rides
+    // the barrel MD2 — the *20 glass window / *30 slab render as grafted
+    // brush geometry (DoorSync), so the barrel roster here is explobox-only.
     const extras = driver.extraEntities()!;
     const barrelX = extras.filter((x) => x.model === boot.models!.barrel);
-    expect(barrelX.length).toBe(driver.barrels.filter((b) => !b.edict.freed).length);
+    expect(barrelX.length).toBe(driver.barrels.filter((b) => !b.edict.freed && !b.isFunc).length);
     const keys = barrelX.map((x) => [Math.round(x.origin![0]!), Math.round(x.origin![1]!), Math.round(x.origin![2]!)].join(','));
     expect(new Set(keys).size).toBe(keys.length);
     expect(keys).toContain('136,40,0');
     expect(keys).toContain('184,-24,0');
     for (const b of driver.barrels) {
-      if (b.edict.freed) continue;
-      const wantZ = b.isFunc ? b.origin[2]! - b.size[2]! / 2 : b.origin[2]!;
+      if (b.edict.freed || b.isFunc) continue;
       const found = barrelX.find((x) => Math.round(x.origin![0]!) === Math.round(b.origin[0]!) && Math.round(x.origin![1]!) === Math.round(b.origin[1]!));
       expect(found).toBeDefined();
-      expect(found!.origin![2]).toBeCloseTo(wantZ, 1);
+      expect(found!.origin![2]).toBeCloseTo(b.origin[2]!, 1);
       expect(found!.skin).toBe(boot.models!.barrelSkin);
     }
+    // func_explosive brushes are DoorSync'd, not MD2-proxied: *20/*30 rest
+    // at the closed pose and their faces are in the graft (332 = 232 +
+    // 17 + 83), with no barrel MD2 at either brush.
+    for (const model of ['*20', '*30']) {
+      expect(driver.doorRenderOffset(model)).not.toBeNull();
+      expect(driver.graftedFacesSorted().length).toBeGreaterThan(232);
+    }
+    expect(driver.graftedFaceCount()).toBe(332);
     // Spawn pair bases sit exactly at the floor.
     for (const key of ['136,40,0', '184,-24,0']) {
       const found = barrelX.find((x) => [Math.round(x.origin![0]!), Math.round(x.origin![1]!), Math.round(x.origin![2]!)].join(',') === key)!;

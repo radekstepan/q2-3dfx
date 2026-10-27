@@ -282,7 +282,9 @@ describe.runIf(!!WEB_Q2_PAK)('M7.1 base1 view (real pak, Q2_PAK)', () => {
     expect(rounded).toContainEqual([184, -24, 0]);
     const extras = driver.extraEntities()!;
     const barrelX = extras.filter((x) => x.model === boot.models!.barrel);
-    expect(barrelX.length).toBe(driver.barrels.length);
+    // Live exploboxes only: the two func_explosive walls render as grafted
+    // brush geometry (DoorSync), never as barrel MD2 proxies.
+    expect(barrelX.length).toBe(driver.barrels.filter((b) => !b.edict.freed && !b.isFunc).length);
     const origins = barrelX.map((x) => [Math.round(x.origin![0]!), Math.round(x.origin![1]!), Math.round(x.origin![2]!)].join(','));
     expect(new Set(origins).size).toBe(origins.length);
     expect(origins).toContain('136,40,0');
@@ -290,7 +292,8 @@ describe.runIf(!!WEB_Q2_PAK)('M7.1 base1 view (real pak, Q2_PAK)', () => {
     // The func_train brush (*12) rides the DoorSync like the doors: baked at
     // the mapper position, shifted by the authoritative server origin every
     // tick (dormant at its first corner until the *13 button fires it).
-    expect(driver.doorSyncCount()).toBe(7); // 4 doors + 2 buttons + *12 train
+    // 9 total: 4 doors + 2 buttons + *12 train + *20/*30 func_explosive.
+    expect(driver.doorSyncCount()).toBe(9); // 4 doors + 2 buttons + *12 train + *20 + *30
     const train = driver.server.trains.find((t) => !t.ship)!;
     expect(train).toBeDefined();
     expect(train.ent.model).toBe('*12');
@@ -312,7 +315,11 @@ describe.runIf(!!WEB_Q2_PAK)('M7.1 base1 view (real pak, Q2_PAK)', () => {
     });
     const stats = host.frame(100);
     expect(stats.pixels).toBeGreaterThan(0);
-    expect(rendered.filter((e) => e.model === boot.models!.barrel).length).toBe(driver.barrels.length);
+    // Spawn view submits the live exploboxes (func_explosive walls ride the
+    // brush graft, never the barrel MD2).
+    expect(rendered.filter((e) => e.model === boot.models!.barrel).length).toBe(
+      driver.barrels.filter((b) => !b.edict.freed && !b.isFunc).length,
+    );
   });
 
   it('func_train brush follows the server train once started (*13 path)', { timeout: 180000 }, async () => {

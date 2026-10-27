@@ -944,6 +944,20 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - up — real falls rest at +1/32 and stand fine. Gate (l) settles from above
 - to play it the way the engine does.
 - CLOSED 2026-10-26 (HUD lane): fps is a top-right DOM overlay (`#q2-fps`, `cl_showfps`; in-canvas fps deleted so the counter never touches renderer output) and player coords are a top-left DOM overlay (`#q2-pos`, `pos x y z yaw <yaw>` 1-decimal per frame, `cl_showpos` default ON with a menu checkbox; menu clicks stay input-free under canvas pointer-lock).
+- CLOSED 2026-10-26 (window/corpse content lane): the spawn-room "third
+- barrel" is func_explosive *20 (lump: 2 misc_explobox at (136,40,0) +
+- (184,-24,0), 1 func_explosive *20; *30 is the second brush). Barrel MD2
+- proxies render ONLY for genuine misc_explobox (9 live); both func
+- explosives render their brush models via the mover graft (DoorSync +
+- leaf facelists, closed pose at spawn) and ungraft on free
+- (hideFreedBrushes). Damage path untouched (e2227bb kept — all 3 still
+- chain the opener). *20 is all-TRANS33 e1u1/wndow0_3 glass (flags 0x10,
+- 17 faces), rendered through the same world path as all base1 glass; no C
+- spawnflags on either brush (TRIGGER_SPAWN/EF_ANIM inapplicable). 12
+- misc_deadsoldier spawn per C (SOLID_BBOX 32x32x16, MOVETYPE_NONE,
+- SP-only) and render the deadbod dude MD2 at lump origin + yaw with the C
+- pose frame (spawnflags bits first-match-wins → 1..5, else 0), persisting.
+- Gate (o)/(p) pin it (16/16 green); (g) 232 → 332, (n) 11 → 9.
 - OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
 - (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
 - `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`

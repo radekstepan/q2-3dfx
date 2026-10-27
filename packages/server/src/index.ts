@@ -74,6 +74,8 @@ import {
   MZ2_SOLDIER_BLASTER_1,
   MZ2_SOLDIER_MACHINEGUN_1,
   MZ2_SOLDIER_SHOTGUN_1,
+  SOLID_BBOX,
+  MOVETYPE_NONE,
 } from '@q2/game';
 import type {
   AttackChoice,
@@ -1044,6 +1046,20 @@ export function SV_SpawnEntities(
           target: e.target,
           pathtarget: dict['pathtarget'] ?? '',
         });
+        break;
+      }
+      case 'misc_deadsoldier': {
+        // C SP_misc_deadsoldier (g_misc.c): a corpse in a fixed pose
+        // (spawnflags bits -> deadbod dude MD2 frame, resolved view-side),
+        // SOLID_BBOX 32x32x16 + MOVETYPE_NONE, DAMAGE_YES at DEAD_DEAD
+        // (gibbed past -80hp). Deathmatch removes them; this sim is SP-only
+        // so they always spawn. Takedamage/deadflag have no Edict fields and
+        // no clip entry consumes the bbox, so corpses persist as scenery:
+        // never freed, never blocking, rendered from the roster every frame.
+        e.solid = SOLID_BBOX;
+        e.movetype = MOVETYPE_NONE;
+        e.mins = v3(-16, -16, 0);
+        e.maxs = v3(16, 16, 16);
         break;
       }
       default:
