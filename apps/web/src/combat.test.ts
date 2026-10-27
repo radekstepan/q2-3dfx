@@ -1,9 +1,16 @@
 import { describe, expect, it, afterEach } from 'vitest';
 import { resetCVars } from '@q2/config';
-import { isGreenBoltColor, soldierWeaponForSkin } from '@q2/game';
+import {
+  INFANTRY_GUN_SOUND,
+  MZ2_INFANTRY_MACHINEGUN_1,
+  isGreenBoltColor,
+  monsterFlashOffset,
+  projectSource,
+  soldierWeaponForSkin,
+} from '@q2/game';
 import { SV_SpawnMonster } from '@q2/server';
 import type { UserCmdT } from '@q2/input';
-import { v3 } from '@q2/math';
+import { AngleVectors, v3 } from '@q2/math';
 import { bootPlay, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
 
 function neutralCmd(angles: [number, number, number] = [0, 0, 0]): UserCmdT {
@@ -240,6 +247,82 @@ describe('hitscan tracer color (no green lasers)', () => {
     const names = driver.mixer.mix().map((c) => c.name);
     expect(names).toContain('soldier/solatck3.wav');
     expect(driver.soldierSkinFor(4)).toBe(0); // no pak: Host default
+  });
+
+  it('infantry chaingun bursts yellow muzzle streaks from the gun muzzle', () => {
+    // C-true sustained fire (m_infantry.c attack1: cock at attak104 arms
+    // 1.0-2.5s, infantry_fire at attak111 re-fires every 0.1s tick): one
+    // single round per tick (4-19 rounds), each tracer leaving the LIVE gun
+    // muzzle (flash MZ2_INFANTRY_MACHINEGUN_1, m_flash.c [26.6, 7.1, 13.1])
+    // — never a stale first-tick origin, never the hold-frame index as a
+    // flash row, never eye-ending.
+    //
+    // The move is entered directly (the M_CheckAttack approach roll is the
+    // server lane's pin; devroom closes 200u→melee before the roll commits
+    // a ranged attack, so a natural opener would smack instead). Attack
+    // moves latch to completion, so the burst plays out through the REAL
+    // driver tick (SV_Tick + drainServerEvents + tracer queue) exactly like
+    // a committed opener.
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    const m = SV_SpawnMonster(driver.server, 'monster_infantry', v3(32, 100, 24));
+    m.state.move = 'attack1';
+    m.state.frame = 0;
+    let burstRounds = 0;
+    let burstTicks = 0;
+    let inBurst = false;
+    for (let i = 0; i < 60 && burstTicks < 30 && driver.playerHealth > 0; i++) {
+      driver.step(neutralCmd(), 0.1);
+      const got = driver.drainTracers();
+      for (const t of got) {
+        expect(t.color).toBe(HITSCAN_TRACER_COLOR);
+        expect(isGreenBoltColor(t.color)).toBe(false);
+        expect(t.length).toBe(ENEMY_TRACER_LENGTH);
+      }
+      if (!inBurst) {
+        if (got.length > 0) inBurst = true;
+        continue;
+      }
+      // Inside the burst: at most one round per tick (sustained, not fan).
+      expect(got.length).toBeLessThanOrEqual(1);
+      burstTicks++;
+      for (const t of got) {
+        burstRounds++;
+        // Live muzzle for this tick's body pose (the hold freezes the fire
+        // frame but locomotion keeps stepping/yawing the body).
+        const live = driver.server.monsters.find((x) => x.edict.num === m.edict.num)!;
+        const fwd = v3();
+        const right = v3();
+        AngleVectors(v3(0, live.state.yaw, 0), fwd, right);
+        const want = projectSource(
+          v3(live.edict.origin[0], live.edict.origin[1], live.edict.origin[2]),
+          monsterFlashOffset(MZ2_INFANTRY_MACHINEGUN_1),
+          fwd,
+          right,
+        );
+        expect(t.origin[0]!).toBeCloseTo(want[0]!, 9);
+        expect(t.origin[1]!).toBeCloseTo(want[1]!, 9);
+        expect(t.origin[2]!).toBeCloseTo(want[2]!, 9);
+        // Short streak, never eye-ending: stops well short of the hull.
+        const eye = v3(driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + 22);
+        const gap = Math.hypot(eye[0]! - t.origin[0]!, eye[1]! - t.origin[1]!, eye[2]! - t.origin[2]!);
+        expect(t.length).toBeLessThan(gap);
+        const dl = Math.hypot(t.dir[0]!, t.dir[1]!, t.dir[2]!) || 1;
+        const end = v3(
+          t.origin[0]! + (t.dir[0]! / dl) * t.length,
+          t.origin[1]! + (t.dir[1]! / dl) * t.length,
+          t.origin[2]! + (t.dir[2]! / dl) * t.length,
+        );
+        const endDist = Math.hypot(end[0]! - eye[0]!, end[1]! - eye[1]!, end[2]! - eye[2]!);
+        expect(endDist).toBeGreaterThan(10);
+      }
+    }
+    expect(inBurst).toBe(true);
+    expect(burstRounds).toBeGreaterThanOrEqual(3);
+    expect(driver.events).toContain('monshot');
+    // The chaingun sound fires with the burst (was missing from monshot).
+    const names = driver.mixer.mix().map((c) => c.name);
+    expect(names).toContain(INFANTRY_GUN_SOUND);
   });
 });
 

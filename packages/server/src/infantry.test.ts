@@ -11,16 +11,22 @@ import {
   MONSTER_HULL_MAXS,
   MONSTER_HULL_MINS,
   MONSTER_MELEE_SOUND_ALIAS,
+  MZ2_INFANTRY_MACHINEGUN_1,
+  MZ2_INFANTRY_MACHINEGUN_2,
   SURF_SKY,
+  infantryDeathSprayAngles,
+  monsterFlashOffset,
   monsterPain,
   mulberry32,
+  projectSource,
   resetEdictNums,
 } from '@q2/game';
 import type { TraceFn } from '@q2/game';
-import { v3 } from '@q2/math';
+import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import {
   MASK_OPAQUE_C,
+  SERVER_ENEMY_TRACER_LENGTH,
   SV_DamageMonster,
   SV_Init,
   SV_MonsterTick,
@@ -65,6 +71,52 @@ function blockedTrace(surfaceFlags = 0): TraceFn {
     contents: 1,
     surfaceFlags,
   });
+}
+
+/** Open room with a floor at z = -mins.z (hull-aware: monsters rest at z=24). */
+function floorTrace(): TraceFn {
+  return (start: Vec3, mins: Vec3, _maxs: Vec3, end: Vec3) => {
+    const plane = -mins[2]!;
+    if (start[2]! >= plane && end[2]! >= plane) {
+      return {
+        fraction: 1,
+        endpos: v3(end[0], end[1], end[2]),
+        planeNormal: v3(0, 0, 1),
+        allsolid: false,
+        startsolid: false,
+        entityNum: -1,
+        contents: 0,
+        surfaceFlags: 0,
+      };
+    }
+    if (start[2]! >= plane) {
+      const f = (start[2]! - plane) / (start[2]! - end[2]!);
+      return {
+        fraction: Math.max(0, Math.min(1, f)),
+        endpos: v3(
+          start[0]! + (end[0]! - start[0]!) * f,
+          start[1]! + (end[1]! - start[1]!) * f,
+          plane,
+        ),
+        planeNormal: v3(0, 0, 1),
+        allsolid: false,
+        startsolid: false,
+        entityNum: -1,
+        contents: 0,
+        surfaceFlags: 0,
+      };
+    }
+    return {
+      fraction: 1,
+      endpos: v3(end[0], end[1], end[2]),
+      planeNormal: v3(0, 0, 1),
+      allsolid: false,
+      startsolid: true,
+      entityNum: -1,
+      contents: 0,
+      surfaceFlags: 0,
+    };
+  };
 }
 
 function playerAt(x: number, y = 0, z = 24): SVGameTick['player'] {
@@ -424,6 +476,98 @@ describe('infantry spin/cock combat loop (m_infantry.c cock_gun + fire + death2)
     expect(st2.tracers).toHaveLength(1);
     expect(st2.sounds.map((s) => s.name)).toContain(INFANTRY_GUN_SOUND);
     expect(st2.playerHealth).toBe(100); // 0.99 never beats pHit: no damage
+    // C muzzle: attak111 always fires flash MZ2_INFANTRY_MACHINEGUN_1
+    // (m_flash.c [26.6, 7.1, 13.1]) off the live body yaw — never the
+    // frozen hold-frame index as a flash row (that parked the muzzle ~16u
+    // forward / ~8u sideways / ~12u up at flash 36).
+    const fwd = v3();
+    const right = v3();
+    AngleVectors(v3(0, m2.state.yaw, 0), fwd, right);
+    // Post-tick body pose: locomotion steps the attack frame's dist before
+    // the resolver runs, so the muzzle keys off the live origin.
+    const wantMuzzle = projectSource(
+      v3(m2.edict.origin[0], m2.edict.origin[1], m2.edict.origin[2]),
+      monsterFlashOffset(MZ2_INFANTRY_MACHINEGUN_1),
+      fwd,
+      right,
+    );
+    const mz = st2.muzzles.find((z) => z.foe)!;
+    expect(mz.pos[0]!).toBeCloseTo(wantMuzzle[0]!, 9);
+    expect(mz.pos[1]!).toBeCloseTo(wantMuzzle[1]!, 9);
+    expect(mz.pos[2]!).toBeCloseTo(wantMuzzle[2]!, 9);
+    // The tracer is a short muzzle-origin streak toward the player hull:
+    // same origin, aimed (not eye-ending — length 48 << the ~300u gap).
+    const t = st2.tracers[0]!;
+    expect(t.origin[0]!).toBeCloseTo(wantMuzzle[0]!, 9);
+    expect(t.origin[1]!).toBeCloseTo(wantMuzzle[1]!, 9);
+    expect(t.origin[2]!).toBeCloseTo(wantMuzzle[2]!, 9);
+    expect(t.length).toBe(SERVER_ENEMY_TRACER_LENGTH);
+    expect(t.color).toBe(225);
+    const eye = v3(300, 0, 24 + 22);
+    const wantDir = v3(eye[0]! - wantMuzzle[0]!, eye[1]! - wantMuzzle[1]!, eye[2]! - wantMuzzle[2]!);
+    const wl = Math.hypot(wantDir[0]!, wantDir[1]!, wantDir[2]!) || 1;
+    const tl = Math.hypot(t.dir[0]!, t.dir[1]!, t.dir[2]!) || 1;
+    expect(t.dir[0]! / tl).toBeCloseTo(wantDir[0]! / wl, 9);
+    expect(t.dir[1]! / tl).toBeCloseTo(wantDir[1]! / wl, 9);
+    expect(t.dir[2]! / tl).toBeCloseTo(wantDir[2]! / wl, 9);
+    const gap = Math.hypot(eye[0]! - t.origin[0]!, eye[1]! - t.origin[1]!, eye[2]! - t.origin[2]!);
+    expect(t.length).toBeLessThan(gap);
+  });
+
+  it('burst tracers originate at the live muzzle every 10Hz tick', () => {
+    // Sustained-fire hold (AI_HOLD_FRAME): one bullet per tick through the
+    // expiry tick. Every round's tracer must leave the CURRENT gun muzzle
+    // (the body keeps stepping through locomotion while frozen on the fire
+    // frame) — never a stale first-tick origin, never more than one round
+    // per tick, never the cock frame (no fabricated bullet). Floored trace
+    // (combat.test.ts pattern): the stub floor holds the body at z=24 so
+    // the C dist>1000 resolver cutoff never trips mid-burst.
+    resetEdictNums();
+    const st = SV_Init();
+    const m = SV_SpawnMonster(st, 'monster_infantry', v3(0, 0, 24));
+    m.state.yaw = 0;
+    m.state.move = 'attack1';
+    m.state.frame = 0;
+    const game = { player: playerAt(300), trace: floorTrace(), rand: () => 0.99 };
+    // Run the full attack1 pass + hold (40 ticks cover the 2.5s max hold).
+    const origins: Vec3[] = [];
+    let rounds = 0;
+    for (let i = 0; i < 40; i++) {
+      SV_Tick(st, 0.1, game);
+      // At most one bullet per tick — the hold never fans.
+      expect(st.tracers.length).toBeLessThanOrEqual(1);
+      if (st.tracers.length === 1) {
+        rounds++;
+        const t = st.tracers[0]!;
+        // Live muzzle for THIS tick's body pose (yaw may have turned,
+        // origin stepped — recompute, don't reuse tick 0).
+        const fwd = v3();
+        const right = v3();
+        AngleVectors(v3(0, m.state.yaw, 0), fwd, right);
+        const want = projectSource(
+          v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]),
+          monsterFlashOffset(MZ2_INFANTRY_MACHINEGUN_1),
+          fwd,
+          right,
+        );
+        expect(t.origin[0]!).toBeCloseTo(want[0]!, 9);
+        expect(t.origin[1]!).toBeCloseTo(want[1]!, 9);
+        expect(t.origin[2]!).toBeCloseTo(want[2]!, 9);
+        expect(t.length).toBe(SERVER_ENEMY_TRACER_LENGTH);
+        origins.push(v3(t.origin[0], t.origin[1], t.origin[2]));
+        st.tracers.length = 0; // drain per tick: the queue never accumulates
+      } else {
+        st.tracers.length = 0;
+      }
+    }
+    // rand 0.99 → 19 single-bullet rounds (n-6, see the pass test above).
+    expect(rounds).toBe(19);
+    // The streak never ends at the eye: length 48 << muzzle→eye gap.
+    const eye = v3(300, 0, 24 + 22);
+    for (const o of origins) {
+      const gap = Math.hypot(eye[0]! - o[0]!, eye[1]! - o[1]!, eye[2]! - o[2]!);
+      expect(SERVER_ENEMY_TRACER_LENGTH).toBeLessThan(gap);
+    }
   });
 
   it('death2 spray: InfantryMachineGun on death211-222 (md2 155-166)', () => {
@@ -468,6 +612,43 @@ describe('infantry spin/cock combat loop (m_infantry.c cock_gun + fire + death2)
     // rand 0 always beats pHit: 12 hits x INFANTRY_C.bulletDamage (3).
     expect(st.playerHealth).toBe(before - 12 * INFANTRY_C.bulletDamage);
     expect(st.playerHealth).toBe(before - 36);
+    // C flash walk (m_infantry.c death211-222): round i leaves flash
+    // MZ2_INFANTRY_MACHINEGUN_2+i — the corpse's own MD2 rows, never the
+    // attack1 gun flash and never a wraparound.
+    const fwd = v3();
+    const right = v3();
+    AngleVectors(v3(0, m.state.yaw, 0), fwd, right);
+    expect(m.state.yaw).toBe(0); // corpses never turn: the yaw basis is fixed
+    const foes = st.muzzles.filter((z) => z.foe);
+    for (let i = 0; i < 12; i++) {
+      const want = projectSource(v3(200, 0, 24), monsterFlashOffset(MZ2_INFANTRY_MACHINEGUN_2 + i), fwd, right);
+      expect(foes[i]!.pos[0]!).toBeCloseTo(want[0]!, 9);
+      expect(foes[i]!.pos[1]!).toBeCloseTo(want[1]!, 9);
+      expect(foes[i]!.pos[2]!).toBeCloseTo(want[2]!, 9);
+      // The tracer shares the round's muzzle and flies the blind spray
+      // (angles - aimangles[]), not at the player hull.
+      const t = st.tracers[i]!;
+      expect(t.origin[0]!).toBeCloseTo(want[0]!, 9);
+      expect(t.origin[1]!).toBeCloseTo(want[1]!, 9);
+      expect(t.origin[2]!).toBeCloseTo(want[2]!, 9);
+      const sprayFwd = v3();
+      AngleVectors(infantryDeathSprayAngles(0, 10 + i), sprayFwd);
+      const sl = Math.hypot(sprayFwd[0]!, sprayFwd[1]!, sprayFwd[2]!) || 1;
+      const tl = Math.hypot(t.dir[0]!, t.dir[1]!, t.dir[2]!) || 1;
+      expect(t.dir[0]! / tl).toBeCloseTo(sprayFwd[0]! / sl, 9);
+      expect(t.dir[1]! / tl).toBeCloseTo(sprayFwd[1]! / sl, 9);
+      expect(t.dir[2]! / tl).toBeCloseTo(sprayFwd[2]! / sl, 9);
+      expect(t.length).toBe(SERVER_ENEMY_TRACER_LENGTH);
+    }
+    // Blind, not aimed: the opening round sprays downrange (+X, away from
+    // the player at the origin) instead of tracking the hull.
+    const eye = v3(0, 0, 24 + 22);
+    const t0 = st.tracers[0]!;
+    const eyeDir = v3(eye[0]! - t0.origin[0]!, eye[1]! - t0.origin[1]!, eye[2]! - t0.origin[2]!);
+    const el = Math.hypot(eyeDir[0]!, eyeDir[1]!, eyeDir[2]!) || 1;
+    const tl0 = Math.hypot(t0.dir[0]!, t0.dir[1]!, t0.dir[2]!) || 1;
+    const dot = (t0.dir[0]! / tl0) * (eyeDir[0]! / el) + (t0.dir[1]! / tl0) * (eyeDir[1]! / el) + (t0.dir[2]! / tl0) * (eyeDir[2]! / el);
+    expect(dot).toBeLessThan(0.5);
   });
 });
 

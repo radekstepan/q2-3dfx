@@ -79,6 +79,7 @@ import {
   SOLDIER_WEAPON_STATS,
   machinegunKick,
   infantryMeleeDamage,
+  infantryDeathSprayAngles,
   traceHitSky,
   INFANTRY_C,
   INFANTRY_GUN_SOUND,
@@ -86,6 +87,8 @@ import {
   INFANTRY_MELEE_SOUND,
   GUNNER_GRENADE_SOUND,
   MZ2_INFANTRY_MACHINEGUN_1,
+  MZ2_INFANTRY_MACHINEGUN_2,
+  INFANTRY_DEATH_SPRAY_FIRST_FRAME,
   MZ2_GUNNER_GRENADE_1,
   MZ2_GUNNER_MACHINEGUN_1,
   MZ2_SOLDIER_BLASTER_1,
@@ -2986,7 +2989,18 @@ function resolveMonsterFire(
     else flashId = MZ2_SOLDIER_SHOTGUN_1;
   } else if (move === 'attack_grenade') flashId = MZ2_GUNNER_GRENADE_1 + (ev.frame % 4);
   else if (m.kind === 'gunner') flashId = MZ2_GUNNER_MACHINEGUN_1 + (ev.frame % 8);
-  else if (m.kind === 'infantry') flashId = MZ2_INFANTRY_MACHINEGUN_1 + (ev.frame % 13);
+  else if (m.kind === 'infantry') {
+    // m_infantry.c InfantryMachineGun: the attack1 fire frame (attak111)
+    // always uses flash MZ2_INFANTRY_MACHINEGUN_1 and aims at the enemy;
+    // the death2 spray (death211-222) walks flashes 2..13 with the blind
+    // aimangles[] spray. The old `+ (frame % 13)` read the hold's frozen
+    // frame index as a flash row, parking the live muzzle ~16u off the gun.
+    flashId =
+      ev.move === 'death2'
+        ? MZ2_INFANTRY_MACHINEGUN_2 +
+          Math.max(0, Math.min(11, ev.frame - INFANTRY_DEATH_SPRAY_FIRST_FRAME))
+        : MZ2_INFANTRY_MACHINEGUN_1;
+  }
   const muzzle = projectSource(
     v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]),
     monsterFlashOffset(flashId),
@@ -3036,8 +3050,18 @@ function resolveMonsterFire(
   // infatck1.wav). The C AI_HOLD_FRAME hold re-fires this frame across
   // ticks for the remainder of the cock pausetime (3-18 rounds); the tick
   // owns the freeze (burstHoldFrozen), so each event resolves one bullet.
+  // Attack1 aims at the enemy (with the -0.2 velocity lead folded into
+  // the resolver's eye target); the death2 spray is blind — each round
+  // leaves along angles - aimangles[] (see infantryDeathSprayAngles), so
+  // the corpse's 12 streaks fan out instead of tracking the player.
   if (m.kind === 'infantry') {
-    st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
+    let shotDir = dirToEye;
+    if (ev.move === 'death2') {
+      const spray = v3();
+      AngleVectors(infantryDeathSprayAngles(m.state.yaw, ev.frame), spray);
+      shotDir = spray;
+    }
+    st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(shotDir[0], shotDir[1], shotDir[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
     st.sounds.push({ name: INFANTRY_GUN_SOUND, pos: chest, born: st.time });
     if (rand() < pHit) {
       SV_DamagePlayer(st, INFANTRY_C.bulletDamage);

@@ -17,6 +17,9 @@ import {
   MELEE_DISTANCE,
   attackMoveFor,
   infantryCockBurstFrames,
+  infantryDeathSprayAngles,
+  INFANTRY_DEATH_AIMANGLES,
+  INFANTRY_DEATH_SPRAY_FIRST_FRAME,
   infantryMeleeDamage,
   machinegunKick,
   monsterChaseMove,
@@ -176,6 +179,26 @@ describe('INFANTRY lite def (m_infantry.c)', () => {
       expect(mv.last).toBeLessThanOrEqual(206);
       expect(mv.last - mv.first + 1).toBe(mv.frames.length);
     }
+  });
+
+  it('death-spray aim table is the C aimangles[] (blind fan, not enemy aim)', () => {
+    // m_infantry.c `aimangles[]`: 12 (pitch, yaw, roll) rows subtracted from
+    // the corpse angles for death211-222 (flashes 27-38). Verbatim values —
+    // any drift fans the corpse spray the wrong way.
+    expect(INFANTRY_DEATH_AIMANGLES).toHaveLength(12);
+    expect(INFANTRY_DEATH_AIMANGLES[0]).toEqual([0.0, 5.0, 0.0]);
+    expect(INFANTRY_DEATH_AIMANGLES[2]).toEqual([20.0, 25.0, 0.0]);
+    expect(INFANTRY_DEATH_AIMANGLES[11]).toEqual([90.0, 35.0, 0.0]);
+    expect(INFANTRY_DEATH_SPRAY_FIRST_FRAME).toBe(10);
+    // Lite death2 fire frames 10-21 map onto rows 0-11: angles minus row.
+    // (-0: the negation of the +0.0 table row — Object.is-strict.)
+    expect([...infantryDeathSprayAngles(0, 10)]).toEqual([-0.0, -5.0, -0.0]);
+    expect([...infantryDeathSprayAngles(90, 12)]).toEqual([-20.0, 65.0, -0.0]);
+    expect([...infantryDeathSprayAngles(0, 21)]).toEqual([-90.0, -35.0, -0.0]);
+    // Clamped at the table ends (the C flash arithmetic never leaves 27-38
+    // on a real corpse; the clamp only guards synthetic frames).
+    expect([...infantryDeathSprayAngles(0, 9)]).toEqual([...infantryDeathSprayAngles(0, 10)]);
+    expect([...infantryDeathSprayAngles(0, 22)]).toEqual([...infantryDeathSprayAngles(0, 21)]);
   });
 
   it('spawns at full HP on stand, def/move/frame wiring resolves', () => {

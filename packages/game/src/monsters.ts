@@ -411,6 +411,44 @@ export function infantryCockBurstFrames(rand: () => number): number {
   return 10 + Math.floor(rand() * 16);
 }
 
+/**
+ * C death-spray aim table (m_infantry.c `aimangles[]`, 12 entries): the
+ * beheaded infantry (death211-222) does NOT aim at the enemy — each round
+ * fires along `self->s.angles - aimangles[flash - MZ2_INFANTRY_MACHINEGUN_2]`
+ * (pitch, yaw, roll degrees). Lite death2 fire frames 10-21 map onto
+ * entries 0-11 in order (flash MZ2_INFANTRY_MACHINEGUN_2..13).
+ */
+export const INFANTRY_DEATH_AIMANGLES: ReadonlyArray<readonly [number, number, number]> = [
+  [0.0, 5.0, 0.0],
+  [10.0, 15.0, 0.0],
+  [20.0, 25.0, 0.0],
+  [25.0, 35.0, 0.0],
+  [30.0, 40.0, 0.0],
+  [30.0, 45.0, 0.0],
+  [25.0, 50.0, 0.0],
+  [20.0, 40.0, 0.0],
+  [15.0, 35.0, 0.0],
+  [40.0, 35.0, 0.0],
+  [70.0, 35.0, 0.0],
+  [90.0, 35.0, 0.0],
+];
+
+/** First lite death2 fire frame (death211, flash MZ2_INFANTRY_MACHINEGUN_2). */
+export const INFANTRY_DEATH_SPRAY_FIRST_FRAME = 10;
+
+/**
+ * Spray angles for one death2 round (m_infantry.c InfantryMachineGun else
+ * branch): monster angles minus the aim table entry. `yawDeg` is the live
+ * body yaw (pitch/roll are 0 on the ground); `frame` is the lite death2
+ * frame index (10-21). Out-of-range frames clamp to the table ends, like
+ * the C flash arithmetic would over/under-shoot by one row at most.
+ */
+export function infantryDeathSprayAngles(yawDeg: number, frame: number): Vec3 {
+  const i = Math.max(0, Math.min(INFANTRY_DEATH_AIMANGLES.length - 1, frame - INFANTRY_DEATH_SPRAY_FIRST_FRAME));
+  const a = INFANTRY_DEATH_AIMANGLES[i]!;
+  return v3(-a[0]!, yawDeg - a[1]!, -a[2]!);
+}
+
 /** C spawn HP (m_infantry.c SP_monster_infantry: no skin classes, all 100). */
 export const INFANTRY_HP = 100;
 /** C gib health shared by all infantry (m_infantry.c). */

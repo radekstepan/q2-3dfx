@@ -1170,6 +1170,7 @@ export class LocalDriver implements HostDriver {
         s.name === 'soldier/solatck3.wav' ||
         s.name === 'gunner/gunatck2.wav' ||
         s.name === 'gunner/gunatck3.wav' ||
+        s.name === 'infantry/infatck1.wav' ||
         s.name === 'monster/melee.wav'
       ) {
         monshot = true;
