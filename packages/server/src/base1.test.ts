@@ -1305,7 +1305,13 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     const d1 = Math.hypot(runner.edict.origin[0]! - player[0]!, runner.edict.origin[1]! - player[1]!);
     expect(d1).toBeLessThan(d0 - 5); // advanced on the player, not static
     expect(fires).toBeGreaterThan(0); // ranged attack wired (muzzle-gated)
-    expect(['shotgun', 'blaster']).toContain(firstAttack);
+    // Point-blank counts as the skin gun, not a new weapon: the runner now
+    // rounds the corridor corner instead of pressing it, so it closes to
+    // <80 before its first volley resolves and the tick labels the event
+    // 'melee' (resolveMonsterFire still fires the soldier's gun
+    // point-blank — soldier melee is NULL in C). Ranged-first was the old
+    // stall-at-range timing, not a weapon pin.
+    expect(['shotgun', 'blaster', 'melee']).toContain(firstAttack);
     // 2b. sustained pursuit uphill: the chaser starts seated at the low end
     // of the corridor stairs (A) and the player holds the high end (B, 20
     // units above A), strafing slowly the whole time. A deterministic RNG

@@ -197,7 +197,7 @@ export {
   MELEE_DISTANCE,
 } from './monsters.js';
 export type { MonsterDef, MonsterMove, MonsterFrame, MonsterState, MonsterKind, AttackChoice } from './monsters.js';
-export type { InfantryCStats, AttackState, CheckAttackOpts, CheckAttackResult, ChaseOpts, DodgeChoice } from './monsters.js';
+export type { InfantryCStats, AttackState, CheckAttackOpts, CheckAttackResult, ChaseOpts, DodgeChoice, LocomotionOpts, LocomotionResult } from './monsters.js';
 export {
   checkAttack,
   sightReactionDelay,

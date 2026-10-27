@@ -127,6 +127,101 @@ describe('monsterLocomotion (pure, headless)', () => {
   });
 });
 
+describe('monsterLocomotion SV_NewChaseDir-lite sweep (opt-in)', () => {
+  // Blocks only the due-east leg (fraction 0.5), clears everything else.
+  const eastBlocked: Trace = (s, e) => {
+    const dx = e[0]! - s[0]!;
+    const dy = e[1]! - s[1]!;
+    if (dx > 0 && Math.abs(dy) < 1e-9) {
+      const f = 0.5;
+      return hit(f, v3(s[0]! + dx * f, s[1]!, s[2]!));
+    }
+    return hit(1, v3(e[0], e[1], e[2]));
+  };
+
+  it('default off: keeps the press-and-clamp contract (no slide)', () => {
+    const ms = spawnMonster('soldier');
+    ms.move = 'run'; // frame 0 dist 10
+    ms.frame = 0;
+    const origin = v3(0, 0, 0);
+    const res = monsterLocomotion(ms, origin, v3(100, 0, 0), wallTrace(5, floorTrace()));
+    expect(origin[0]).toBeCloseTo(5, 6); // clamped at the wall face
+    expect(res).toEqual({ slide: 0, blocked: false });
+  });
+
+  it('opt-in: a blocked direct leg takes the first clear side heading', () => {
+    const ms = spawnMonster('soldier');
+    ms.move = 'run';
+    ms.frame = 0;
+    const origin = v3(0, 0, 0);
+    const res = monsterLocomotion(ms, origin, v3(100, 0, 0), eastBlocked, undefined, {
+      newChaseDir: true,
+    });
+    // +45 off due east clears: 10u at 45 deg.
+    expect(origin[0]).toBeCloseTo(10 * Math.cos(Math.PI / 4), 6);
+    expect(origin[1]).toBeCloseTo(10 * Math.sin(Math.PI / 4), 6);
+    expect(res).toEqual({ slide: 1, blocked: false });
+  });
+
+  it('slideSign prefers the committed hand when both sides clear', () => {
+    const left = spawnMonster('soldier');
+    left.move = 'run';
+    left.frame = 0;
+    const lo = v3(0, 0, 0);
+    const rl = monsterLocomotion(left, lo, v3(100, 0, 0), eastBlocked, undefined, {
+      newChaseDir: true,
+      slideSign: 1,
+    });
+    expect(lo[1]).toBeGreaterThan(0);
+    expect(rl.slide).toBe(1);
+    const right = spawnMonster('soldier');
+    right.move = 'run';
+    right.frame = 0;
+    const ro = v3(0, 0, 0);
+    const rr = monsterLocomotion(right, ro, v3(100, 0, 0), eastBlocked, undefined, {
+      newChaseDir: true,
+      slideSign: -1,
+    });
+    expect(ro[1]).toBeLessThan(0);
+    expect(rr.slide).toBe(-1);
+  });
+
+  it('total block keeps the direct partial and reports blocked', () => {
+    const boxed: Trace = (s) => hit(0, v3(s[0], s[1], s[2]));
+    const ms = spawnMonster('soldier');
+    ms.move = 'run';
+    ms.frame = 0;
+    const origin = v3(0, 0, 0);
+    const res = monsterLocomotion(ms, origin, v3(100, 0, 0), boxed, undefined, {
+      newChaseDir: true,
+    });
+    // horizontal leg stands (the stub blocks everything); gravity still
+    // applies its probe, which the same stub answers with the start point.
+    expect(origin[0]).toBeCloseTo(0, 6);
+    expect(origin[1]).toBeCloseTo(0, 6);
+    expect(res).toEqual({ slide: 0, blocked: true });
+  });
+
+  it('stand frames and corpses report keep-commitment (blocked, no slide)', () => {
+    const stand = spawnMonster('soldier'); // stand1, dist 0
+    const so = v3(10, 20, 0);
+    expect(monsterLocomotion(stand, so, v3(100, 100, 0), floorTrace())).toEqual({
+      slide: 0,
+      blocked: true,
+    });
+    expect([...so]).toEqual([10, 20, 0]);
+    const dead = spawnMonster('soldier');
+    dead.dead = true;
+    dead.move = 'run';
+    const do_ = v3(0, 0, 50);
+    expect(monsterLocomotion(dead, do_, v3(100, 0, 0), openTrace)).toEqual({
+      slide: 0,
+      blocked: true,
+    });
+    expect([...do_]).toEqual([0, 0, 50]);
+  });
+});
+
 describe('M_ChangeYaw clamp (id m_move.c, yaw_speed 20°/tick)', () => {
   // NOTE: precision 1 throughout — the repo's anglemod is id's quantized
   // version (65536ths of a turn, ~0.0055° steps), so exact-20 never survives

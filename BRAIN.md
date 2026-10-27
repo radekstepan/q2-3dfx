@@ -888,8 +888,16 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - separation; base1 links zero combattargets), skill-scaled aggression
 - (sight delay, burst refire, dodge chance; damage still half-only on easy).
 - Gate (i/j/k) green, (b)/(e) adapted to the authentic cadence/duck; narrowed
-- remainder: M_MoveToGoal sidestep probes (sharp-corner legs hug instead of
-- sidestepping) and the lasfly loop.
+- remainder: the lasfly loop only — the M_MoveToGoal sidestep probes LANDED
+- 2026-10-26 (corner-stuck fix): the ai_run `new` course correction (TEMP
+- sidestep on freshly adopted legs, dust-winner rejection) plus the
+- SV_NewChaseDir-lite heading sweep with committed chirality in locomotion
+- (opt-in; duck-aware step hull). Blind pursuit now rounds wall faces
+- around their ends instead of hugging/pressing them; pinned by
+- `monster-corner.test.ts` (L-wall: reaches last sighting blind, crosses
+- the wall plane, closes 291u to engagement). Root cause was the missing
+- probe, not the movestep (C SV_movestep has no slide — corners come from
+- the probe + NewChaseDir sweep, both now ported).
 - 60fps @640×480 (M8.1 async-render +
 - M9.1 SIMD v128); saves, menus beyond the cvar panel, multiplayer
 - (explicit non-goal).

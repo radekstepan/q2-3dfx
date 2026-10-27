@@ -478,6 +478,36 @@ export const MONSTER_STEP_HEIGHT = 18;
 export const MONSTER_FALL_PROBE = 50;
 
 /**
+ * Optional per-tick context for monsterLocomotion. All optional so existing
+ * callers keep working with no changes:
+ * - newChaseDir: C M_MoveToGoal/SV_NewChaseDir-lite (m_move.c). When the
+ *   straight step is blocked, sweep alternate headings and take the first
+ *   fully clear one instead of pressing into the wall. Off by default: the
+ *   pure helper keeps the press-and-clamp contract its tests pin; the server
+ *   tick opts in so blind pursuit flows around corners instead of stalling.
+ * - slideSign: committed wall-following chirality (+1 tries the
+ *   goal-relative left offsets first, -1 the right ones, 0/unset the
+ *   default +45-first order). The tick feeds back the side the sweep took
+ *   (see LocomotionResult), so once the body starts sliding along a face it
+ *   keeps the same hand instead of dithering back — the deterministic
+ *   counterpart of C's randomized sweep order, which breaks the same
+ *   symmetry stochastically. A fresh 0 means undecided.
+ */
+export interface LocomotionOpts {
+  newChaseDir?: boolean;
+  slideSign?: number;
+}
+
+/** What the locomotion step did (drives the tick's slide commitment). */
+export interface LocomotionResult {
+  /** +1/-1 when a sweep candidate on that goal-relative side was taken,
+   *  0 when the direct (possibly partial) step ran. */
+  slide: number;
+  /** True when even the sweep found nothing: the direct partial stands. */
+  blocked: boolean;
+}
+
+/**
  * One locomotion tick (10Hz): yaw the monster toward `playerPos`, advance
  * `origin` along the facing by the CURRENT frame's `dist` (MonsterFrame.dist,
  * the same units monsterThink plays), collision-clamped via `trace`, then
@@ -496,7 +526,8 @@ export const MONSTER_FALL_PROBE = 50;
  * segment; only `fraction`/`endpos` are used. Mutates `origin` in place and
  * `state.yaw` (facing only), and touches nothing else (no I/O, no globals),
  * so it is headless-testable with a stub trace. Corpses (`state.dead`)
- * never move and keep their last yaw.
+ * never move and keep their last yaw. Returns what the horizontal step did
+ * so the caller can commit wall-following chirality (see LocomotionResult).
  *
  * Reads `state.frame` without advancing it: call BEFORE monsterThink each
  * tick so the move plays the frame think is about to advance (id ai_move
@@ -508,27 +539,81 @@ export function monsterLocomotion(
   playerPos: Vec3,
   trace: (start: Vec3, end: Vec3) => { fraction: number; endpos: Vec3 },
   moveTarget?: Vec3,
-): void {
-  if (state.dead) return;
+  opts?: LocomotionOpts,
+): LocomotionResult {
+  if (state.dead) return { slide: 0, blocked: true };
   const mv = monsterMoveOf(state);
   const fr = mv.frames[state.frame] ?? { dist: 0, action: 'move' };
   const goal = moveTarget ?? playerPos;
   const dx = goal[0]! - origin[0]!;
   const dy = goal[1]! - origin[1]!;
   const len = Math.sqrt(dx * dx + dy * dy);
+  // No horizontal attempt (coincident goal, stand/attack frame): keep any
+  // wall-following commitment the tick holds.
+  let result: LocomotionResult = { slide: 0, blocked: true };
   // Face the steering target every tick via id M_ChangeYaw (shortest-arc,
   // clamped by yaw_speed) — never an instant snap; only translate when the
   // frame carries a dist so stand/attack frames never moonwalk.
   if (len > 1e-9) {
     state.yaw = changeYaw(state.yaw, monsterYawTo(origin, goal), MONSTER_YAW_SPEED[state.kind]);
     if (fr.dist !== 0) {
-      const nx = dx / len;
-      const ny = dy / len;
-      const end = v3(origin[0]! + nx * fr.dist, origin[1]! + ny * fr.dist, origin[2]!);
-      const h = trace(v3(origin[0], origin[1], origin[2]), end);
-      origin[0] = h.endpos[0]!;
-      origin[1] = h.endpos[1]!;
-      origin[2] = h.endpos[2]!;
+      const step = (
+        yawDeg: number,
+      ): { fraction: number; endpos: Vec3 } => {
+        const a = (yawDeg * Math.PI) / 180;
+        const end = v3(
+          origin[0]! + Math.cos(a) * fr.dist,
+          origin[1]! + Math.sin(a) * fr.dist,
+          origin[2]!,
+        );
+        return trace(v3(origin[0], origin[1], origin[2]), end);
+      };
+      const goalYaw = monsterYawTo(origin, goal);
+      const direct = step(goalYaw);
+      if (direct.fraction === 1) {
+        origin[0] = direct.endpos[0]!;
+        origin[1] = direct.endpos[1]!;
+        origin[2] = direct.endpos[2]!;
+        result = { slide: 0, blocked: false };
+      } else if (opts?.newChaseDir ?? false) {
+        // SV_NewChaseDir-lite: the direct step is blocked, so sweep
+        // goal-relative alternate headings and take the first fully clear
+        // one instead of pressing into the wall. The committed side goes
+        // first (the tick feeds back the side taken, so wall-following keeps
+        // its hand instead of dithering back — the deterministic counterpart
+        // of C's randomized sweep order); undecided sweeps try +45 first.
+        // 180 (backing out of a dead end) drops the commitment. Nothing
+        // clear keeps the direct partial — the body still presses toward the
+        // goal instead of freezing, which is what the pursuit arrival latch
+        // keys off.
+        const committed = opts?.slideSign ?? 0;
+        const s = committed >= 0 ? 1 : -1;
+        const order =
+          committed === 0
+            ? [45, -45, 90, -90, 135, -135, 180]
+            : [s * 45, s * 90, s * 135, -s * 45, -s * 90, -s * 135, 180];
+        result = { slide: 0, blocked: true };
+        for (const off of order) {
+          const alt = step(goalYaw + off);
+          if (alt.fraction === 1) {
+            origin[0] = alt.endpos[0]!;
+            origin[1] = alt.endpos[1]!;
+            origin[2] = alt.endpos[2]!;
+            result = { slide: off === 180 ? 0 : off > 0 ? 1 : -1, blocked: false };
+            break;
+          }
+        }
+        if (result.blocked) {
+          origin[0] = direct.endpos[0]!;
+          origin[1] = direct.endpos[1]!;
+          origin[2] = direct.endpos[2]!;
+        }
+      } else {
+        origin[0] = direct.endpos[0]!;
+        origin[1] = direct.endpos[1]!;
+        origin[2] = direct.endpos[2]!;
+        result = { slide: 0, blocked: false };
+      }
     }
   }
   // Gravity: probe down from 1 unit above the feet so resting contact is a
@@ -542,6 +627,7 @@ export function monsterLocomotion(
   } else {
     origin[2] = gend[2]!;
   }
+  return result;
 }
 
 /**

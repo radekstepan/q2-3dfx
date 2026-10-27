@@ -17,9 +17,9 @@
 // - anti-stack separation: base1 links zero combattargets, so mapper points
 //   alone never separate the roster; crowded packmates get a small lateral
 //   goal nudge so firing lines don't stack (pure steering, no teleports).
-// - trail steering has no M_MoveToGoal sidestep probes; each pursuit leg is
-//   steered straight and collision-clamped (the step/stair wrapper still
-//   applies). Sharp-corner legs hug the corner instead of sidestepping it.
+// - trail steering runs the C ai_run sidestep probe on freshly adopted legs
+//   and the SV_NewChaseDir-lite heading sweep in locomotion (opt-in); long
+//   wall faces are followed around their ends instead of pressed forever.
 // - unseen non-ambush monsters keep the legacy beeline (C would stand until
 //   FindTarget; we have no sound-alert path yet, and standing the whole map
 //   down would read as dead).
@@ -32,6 +32,7 @@ import {
   checkDodgeGate,
   monsterRange,
   monsterYawTo,
+  projectSource,
   sightReactionDelay,
   soldierDodgeChoice,
   soldierWeaponForSkin,
@@ -45,7 +46,7 @@ import type {
   AttackChoice,
   TraceFn,
 } from '@q2/game';
-import { v3 } from '@q2/math';
+import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import type { MonsterEvent, ServerMonster, ServerState } from './index.js';
 
@@ -182,8 +183,17 @@ export function arriveCombatPoint(st: ServerState, m: ServerMonster): string | n
  *
  * Arrival (within the frame's own travel + a step slack) latches
  * AI_PURSUE_NEXT so the next tick advances down the trail instead of
- * orbiting the reached spot. The 20s search timeout and the M_MoveToGoal
- * sidestep probes are omitted (documented above).
+ * orbiting the reached spot. The 20s search timeout is omitted (the tick
+ * re-arms search_time on every advance instead).
+ *
+ * When a fresh goal is adopted this tick (sight just lost, a TEMP restore,
+ * or a trail-marker pick) the C `new` course correction runs when the
+ * caller supplies `moveTrace`: the hull leg to the goal is traced, and
+ * when blocked the ±16u lateral sidesteps are probed. The clearer side
+ * (strictly better than the center leg, strictly better than the other
+ * side) becomes the steering goal with the original stashed as the TEMP
+ * goal, restored on arrival. That is what rounds corners; without it the
+ * body presses into the wall between it and the marker forever.
  */
 export function pursueGoal(
   st: ServerState,
@@ -192,6 +202,7 @@ export function pursueGoal(
   canSee: boolean,
   sightTrace: TraceFn,
   frameDist: number,
+  moveTrace?: TraceFn,
 ): Vec3 {
   const ms = m.state;
   const pos = m.edict.origin;
@@ -205,13 +216,19 @@ export function pursueGoal(
     ms.pursueNext = false;
     ms.pursueTemp = false;
     ms.pursuitLastSeen = false;
+    // Visible again: pursuit (and any wall-following hand) is over.
+    m.slideDir = 0;
     return playerPos;
   }
+  // C `new`: a fresh leg adopted this tick earns a course correction
+  // below (the sidestep probe), exactly like the C block.
+  let adopted = false;
   if (!ms.lostSight) {
     ms.lostSight = true;
     ms.pursuitLastSeen = true;
     ms.pursueNext = false;
     ms.pursueTemp = false;
+    adopted = true;
   }
   if (ms.pursueNext) {
     ms.pursueNext = false;
@@ -221,6 +238,7 @@ export function pursueGoal(
       ms.lastSighting[0] = ms.savedGoal[0]!;
       ms.lastSighting[1] = ms.savedGoal[1]!;
       ms.lastSighting[2] = ms.savedGoal[2]!;
+      adopted = true;
     } else if (ms.pursuitLastSeen) {
       ms.pursuitLastSeen = false;
       const marker = trailPickFirst(st.trail, ms.trailTime, (spot) =>
@@ -232,6 +250,7 @@ export function pursueGoal(
         ms.lastSighting[2] = marker.origin[2]!;
         ms.trailTime = marker.timestamp;
         ms.yaw = ((marker.yaw % 360) + 360) % 360;
+        adopted = true;
       }
     } else {
       const marker = trailPickNext(st.trail, ms.trailTime);
@@ -241,6 +260,7 @@ export function pursueGoal(
         ms.lastSighting[2] = marker.origin[2]!;
         ms.trailTime = marker.timestamp;
         ms.yaw = ((marker.yaw % 360) + 360) % 360;
+        adopted = true;
       }
     }
   }
@@ -250,7 +270,73 @@ export function pursueGoal(
   if (Math.sqrt(dx * dx + dy * dy + dz * dz) <= Math.max(frameDist, 4)) {
     ms.pursueNext = true;
   }
+  if (adopted && moveTrace) sidestepProbe(m, moveTrace);
   return ms.lastSighting;
+}
+
+/**
+ * C ai_run lost-sight course correction (the `new` block, g_ai.c): the
+ * hull leg from the body to the freshly adopted goal is traced, and when
+ * blocked the ±16u lateral sidesteps at `d1 * ((center + 1) / 2)` down the
+ * leg are probed. A side strictly better than the normalized center leg
+ * (and strictly better than the other side) becomes the steering goal;
+ * the original is stashed in savedGoal with AI_PURSUE_TEMP so arrival on
+ * the probe restores it. Partial legs go partway
+ * (`d2 * side * 0.5`), exactly like C. Facing is left to locomotion (C
+ * sets ideal_yaw here; our tick yaws toward the returned goal each step).
+ */
+function sidestepProbe(m: ServerMonster, moveTrace: TraceFn): void {
+  const ms = m.state;
+  const pos = m.edict.origin;
+  const gx = ms.lastSighting[0]! - pos[0]!;
+  const gy = ms.lastSighting[1]! - pos[1]!;
+  const gz = ms.lastSighting[2]! - pos[2]!;
+  const d1 = Math.sqrt(gx * gx + gy * gy + gz * gz);
+  if (d1 <= 1e-6) return;
+  const maxs = monsterHullMaxs(m);
+  const center = moveTrace(pos, MONSTER_HULL_MINS, maxs, ms.lastSighting).fraction;
+  if (center >= 1) return;
+  const d2 = d1 * ((center + 1) / 2);
+  const yaw = monsterYawTo(pos, ms.lastSighting);
+  const fwd = v3();
+  const right = v3();
+  AngleVectors(v3(0, yaw, 0), fwd, right);
+  const leftTarget = projectSource(pos, v3(d2, -16, 0), fwd, right);
+  const rightTarget = projectSource(pos, v3(d2, 16, 0), fwd, right);
+  const left = moveTrace(pos, MONSTER_HULL_MINS, maxs, leftTarget).fraction;
+  const rightF = moveTrace(pos, MONSTER_HULL_MINS, maxs, rightTarget).fraction;
+  const need = (d1 * center) / d2;
+  // Adopt only a MATERIAL improvement over the center leg. C adopts on a
+  // strict >; with our deterministic tick the dust-winner flips every
+  // restore/re-probe cycle and the body dithers ±16u in place instead of
+  // ratcheting (C breaks the same symmetry stochastically inside
+  // SV_NewChaseDir's randomized sweep). A useless sidestep falls through
+  // to the locomotion heading sweep, which is what makes progress along
+  // long faces; real posts still read ~1.0 vs ~0.4 and adopt.
+  const MARGIN = 0.05;
+  if (left >= need + MARGIN && left > rightF) {
+    stashGoal(ms);
+    const t =
+      left < 1 ? projectSource(pos, v3(d2 * left * 0.5, -16, 0), fwd, right) : leftTarget;
+    ms.lastSighting[0] = t[0]!;
+    ms.lastSighting[1] = t[1]!;
+    ms.lastSighting[2] = t[2]!;
+  } else if (rightF >= need + MARGIN && rightF > left) {
+    stashGoal(ms);
+    const t =
+      rightF < 1 ? projectSource(pos, v3(d2 * rightF * 0.5, 16, 0), fwd, right) : rightTarget;
+    ms.lastSighting[0] = t[0]!;
+    ms.lastSighting[1] = t[1]!;
+    ms.lastSighting[2] = t[2]!;
+  }
+}
+
+/** Stash the current goal across a sidestep (C saved_goal + AI_PURSUE_TEMP). */
+function stashGoal(ms: ServerMonster['state']): void {
+  ms.savedGoal[0] = ms.lastSighting[0]!;
+  ms.savedGoal[1] = ms.lastSighting[1]!;
+  ms.savedGoal[2] = ms.lastSighting[2]!;
+  ms.pursueTemp = true;
 }
 
 // --- anti-stack separation (M5.3 depth; no direct C ancestor) -----------------

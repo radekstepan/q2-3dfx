@@ -542,6 +542,14 @@ export interface ServerMonster {
   combatHold: boolean;
   /** FoundTarget combattarget hookup already ran (one-shot). */
   combatDone: boolean;
+  /**
+   * Wall-following chirality for the SV_NewChaseDir-lite heading sweep
+   * (+1 = try goal-left first, -1 = goal-right first, 0 = undecided).
+   * Committed from the sweep's feedback each tick and dropped when the
+   * direct leg clears or sight is regained, so a body sliding along a face
+   * keeps its hand instead of dithering back.
+   */
+  slideDir: number;
 }
 
 /**
@@ -1075,6 +1083,7 @@ export function SV_SpawnEntities(
         combatGoal: null,
         combatHold: false,
         combatDone: false,
+        slideDir: 0,
       };
       st.monsters.push(monster);
       // C spawn HP per skin (m_soldier.c SP_ funcs): light 20, normal 30,
@@ -1433,8 +1442,9 @@ function stepHullTrace(
   trace: TraceFn,
   start: Vec3,
   end: Vec3,
+  maxs: Vec3 = MONSTER_HULL_MAXS,
 ): { fraction: number; endpos: Vec3 } {
-  const direct = trace(start, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, end);
+  const direct = trace(start, MONSTER_HULL_MINS, maxs, end);
   if (direct.fraction === 1 || direct.allsolid) {
     return { fraction: direct.fraction, endpos: direct.endpos };
   }
@@ -1443,12 +1453,12 @@ function stepHullTrace(
   }
   const sUp = v3(start[0], start[1], start[2]! + MONSTER_STEP_HEIGHT);
   const eUp = v3(end[0], end[1], end[2]! + MONSTER_STEP_HEIGHT);
-  const up = trace(sUp, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, eUp);
+  const up = trace(sUp, MONSTER_HULL_MINS, maxs, eUp);
   if (up.allsolid || up.startsolid) return { fraction: direct.fraction, endpos: direct.endpos };
   const down = trace(
     up.endpos,
     MONSTER_HULL_MINS,
-    MONSTER_HULL_MAXS,
+    maxs,
     v3(up.endpos[0], up.endpos[1], up.endpos[2]! - 2 * MONSTER_STEP_HEIGHT),
   );
   if (down.allsolid || down.fraction === 1) return { fraction: direct.fraction, endpos: direct.endpos };
@@ -1601,14 +1611,14 @@ export function SV_MonsterTick(
         goal = m.combatGoal;
       } else if (m.combatHold) {
         standGround = true;
-        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms)) : playerPos;
+        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), trace) : playerPos;
       } else {
-        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms)) : playerPos;
+        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), trace) : playerPos;
       }
     } else {
       if (m.combatHold) standGround = true;
       goal = m.seen
-        ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms))
+        ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), trace)
         : playerPos;
       goal = separationOffset(st, m, goal);
     }
@@ -1642,10 +1652,17 @@ export function SV_MonsterTick(
         goal,
       });
     }
-    monsterLocomotion(ms, pos, playerPos, (s, e) => {
-      const h = stepHullTrace(trace, s, e);
+    const loco = monsterLocomotion(ms, pos, playerPos, (s, e) => {
+      const h = stepHullTrace(trace, s, e, monsterHullMaxs(m));
       return { fraction: h.fraction, endpos: h.endpos };
-    }, goal);
+    }, goal, { newChaseDir: true, slideSign: m.slideDir });
+    // Commit the sweep's hand: a sliding body keeps sliding the same way
+    // (deterministic wall-following). Cleared direct legs do NOT drop it —
+    // near a face a full step can fit without touching, and resetting there
+    // re-decides with the default order every other tick (the dither the
+    // hand exists to prevent). Sight regained drops it (see pursueGoal);
+    // a wrong hand on a new wall self-corrects within one sweep.
+    if (loco.slide !== 0) m.slideDir = loco.slide;
     const prevMove = ms.move;
     const playedIdx = ms.frame;
     // Duck hold (AI_HOLD_FRAME): freeze the hold frame while the pausetime
@@ -2080,6 +2097,7 @@ export function SV_SpawnMonster(
     combatGoal: null,
     combatHold: false,
     combatDone: false,
+    slideDir: 0,
   };
   if (kind === 'soldier') {
     const skin = Number.parseInt((e.extra['skinnum'] as string) ?? '2', 10);
