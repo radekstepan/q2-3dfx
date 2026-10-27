@@ -1030,11 +1030,15 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - fire events), barrels (damage/delay/`damageRadius`), bolts (edicts + touch),
 - explosions + muzzle events; driver renders from server state, fires via
 - server `SV_PlayerFire`. (Folds Phase 1: driver uses `SV_*` trace helpers.)
-- [ ] Phase 2 — combat numbers: hull-swept bolt spawn (no muzzle detonations),
+- [x] Phase 2 — combat numbers: hull-swept bolt spawn (no muzzle detonations),
 - C damage/skill tables, crosshair-vs-view audit, TTK bot (≤4 point-blank
 - blaster hits, soldier 30hp, medium skill).
-- [ ] Phase 3 — feedback correctness: `m_flash` muzzle offsets only, no
+- [x] Phase 3 — feedback correctness: `m_flash` muzzle offsets only, no
 - eye-ending streaks, single duck state transition (hull/eye/predictor).
+- Duck follow-ups from the Phase 3 report, closed here: `PM_CheckDuck` is now
+- C-exact (hold + ON_GROUND, airborne hold stands — no self-sustain), and
+- `CL_PredictPmove` seeds `pmFlags`/`grounded` from the snapshot, so ducked
+- prediction matches the authoritative tick bit-for-bit.
 - [ ] Phase 4 — play-verified gate: base1 driver-level bot asserting rendered
 - outcomes (barrels die, monster closes 300→100u, door re-closes, secret
 - holds, TTK). No gameplay card closes without it.

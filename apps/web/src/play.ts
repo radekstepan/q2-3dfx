@@ -1031,6 +1031,10 @@ export class LocalDriver implements HostDriver {
         id: PLAYER_ID,
         origin: [this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!],
         velocity: [this.pm.velocity[0]!, this.pm.velocity[1]!, this.pm.velocity[2]!],
+        // Seed for CL_PredictPmove: duck/hull must replay from authoritative
+        // state or prediction diverges while crouched (Phase 3 report).
+        pmFlags: this.pm.pmFlags,
+        grounded: this.pm.groundEntity !== -1,
       },
     ];
     // Server-authoritative monsters (Phase 0 single sim): corpses persist

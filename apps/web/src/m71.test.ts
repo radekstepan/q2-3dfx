@@ -106,6 +106,10 @@ describe('M7.1 crouch UX (headless)', () => {
     // What Host.buildUserCmd produces while C is held: BUTTON_DUCK set.
     expect(isDuckHeldCmd({ buttons: BUTTON_DUCK })).toBe(true);
     driver.step({ ...neutralCmd(), buttons: BUTTON_DUCK }, 0.1);
+    // First held tick categorizes (C: ON_GROUND comes from the previous
+    // tick); the second held tick ducks and holds the ducked hull.
+    expect(driver.pm.maxs[2]).toBe(32);
+    driver.step({ ...neutralCmd(), buttons: BUTTON_DUCK }, 0.1);
     expect(driver.pm.maxs[2]).toBe(4);
     expect(driver.pm.mins[2]).toBe(-24);
     expect(driver.pm.viewheight).toBe(12);

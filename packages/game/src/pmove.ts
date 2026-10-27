@@ -473,12 +473,13 @@ export function PM_CategorizePosition(st: PmoveState): void {
 export const BUTTON_DUCK_BIT = 8;
 
 export function PM_CheckDuck(st: PmoveState, cmd: UserCmd): void {
-  // C qcommon/pmove.c PM_CheckDuck: duck when cmd.upmove < 0 on ground.
-  // Local extension: holding crouch/duck (BUTTON_DUCK bit 8, set by @q2/input
-  // for KeyC) also ducks — the web driver never sends negative upmove.
-  const wantDuck =
-    (cmd.upmove < 0 || (cmd.buttons & BUTTON_DUCK_BIT) !== 0) &&
-    (st.pmFlags & PMF_ON_GROUND || (st.pmFlags & PMF_DUCKED) !== 0 || st.groundEntity !== -1);
+  // C qcommon/pmove.c PM_CheckDuck: duck hold is cmd.upmove < 0 AND on ground
+  // (previous tick's PMF_ON_GROUND). Local extension: holding crouch/duck
+  // (BUTTON_DUCK bit 8 from @q2/input KeyC) also ducks — the web driver
+  // never sends negative upmove. Airborne + hold STANDS (C: the else branch
+  // tries to stand when headroom allows) — no self-sustaining DUCKED flag.
+  const hold = cmd.upmove < 0 || (cmd.buttons & BUTTON_DUCK_BIT) !== 0;
+  const wantDuck = hold && (st.pmFlags & PMF_ON_GROUND) !== 0;
   if (wantDuck) {
     st.pmFlags |= PMF_DUCKED;
   } else if (st.pmFlags & PMF_DUCKED) {

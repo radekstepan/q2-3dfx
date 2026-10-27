@@ -14,7 +14,7 @@
 // Interpolation of remote entities is untouched by the pmove hookup.
 
 import { getCVarNumber } from '@q2/config';
-import { makePmoveState, pmoveFull } from '@q2/game';
+import { makePmoveState, pmoveFull, PMF_ON_GROUND } from '@q2/game';
 
 export type Origin3 = [number, number, number];
 
@@ -23,6 +23,10 @@ export interface EntityState {
   origin: Origin3;
   velocity: Origin3;
   angles?: Origin3;
+  /** Authoritative pm_flags at snapshot time (PMF_DUCKED etc.); seeds replay. */
+  pmFlags?: number;
+  /** True when the entity was on the ground (seeds groundEntity for duck). */
+  grounded?: boolean;
 }
 
 /** One 10Hz server sample. */
@@ -144,6 +148,18 @@ export function CL_PredictPmove(
   st.velocity[0] = ent.velocity[0];
   st.velocity[1] = ent.velocity[1];
   st.velocity[2] = ent.velocity[2];
+  // Seed physics state, not just kinematics: the first replayed step runs
+  // PM_CheckDuck before PM_CategorizePosition, so a crouched snapshot must
+  // carry DUCKED + grounded-ness or the replay stands up for one step and
+  // the predicted hull diverges from the authoritative one while ducked.
+  // Fields are optional (devroom/legacy snapshots omit them) — only apply
+  // when present so default replay behavior is unchanged.
+  if (ent.pmFlags !== undefined) st.pmFlags = ent.pmFlags;
+  if (ent.grounded !== undefined) {
+    st.groundEntity = ent.grounded ? 0 : -1;
+    if (ent.grounded) st.pmFlags |= PMF_ON_GROUND;
+    else st.pmFlags &= ~PMF_ON_GROUND;
+  }
   if (ent.angles) {
     st.viewAngles[0] = ent.angles[0];
     st.viewAngles[1] = ent.angles[1];

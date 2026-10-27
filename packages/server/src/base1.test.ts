@@ -31,6 +31,7 @@ import {
   pmoveFull,
   PM_CheckDuck,
   PMF_DUCKED,
+  PMF_ON_GROUND,
   EXPLOBOX_MAXS,
   EXPLOBOX_MINS,
   MONSTER_HULL_MAXS,
@@ -1400,7 +1401,8 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     // is 56 (maxs +32). The west lintel (face x~=272) passes hulls <=48 and
     // blocks hulls >=52 — duck walks to the armor, standing stops short.
     const duck = makePmoveState();
-    duck.pmFlags |= PMF_DUCKED;
+    duck.pmFlags |= PMF_ON_GROUND; // C duck gate: hold + grounded (no sticky flag)
+    duck.groundEntity = 0;
     PM_CheckDuck(duck, { msec: 100, angles: v3(0, 0, 0), forwardmove: 0, sidemove: 0, upmove: -1, buttons: 0 });
     expect(duck.maxs[2]).toBe(4);
     expect(duck.mins[2]).toBe(-24);

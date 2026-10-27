@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { setCVar } from '@q2/config';
-import { PMF_DUCKED, makePmoveState, pmove, resetPmoveWorld, setPmoveWorld } from '@q2/game';
+import { PMF_DUCKED, PMF_ON_GROUND, makePmoveState, pmove, resetPmoveWorld, setPmoveWorld } from '@q2/game';
 import type { TraceFn, UserCmd } from '@q2/game';
 import {
   CL_Interpolate,
@@ -366,9 +366,9 @@ describe('stop settle (10Hz server, sub-tick renders)', () => {
    * Drive a headless pmove "server" at 10Hz: 1s of full forward run, then
    * `releaseTicks` zero-input ticks. Render the Predictor at sub-tick
    * offsets through every release interval and return all rendered x (plus
-   * the per-tick snapshots). `duck` holds BUTTON_DUCK in the staged cmds
-   * and sets PMF_DUCKED on the server each tick (the driver-side
-   * translation pending the game wiring — see `isDuckHeld`).
+   * the per-tick snapshots). `duck` holds BUTTON_DUCK in the staged cmds;
+   * the server holds the crouch via the real PM_CheckDuck path (buttons bit
+   * + ON_GROUND, no external flag forcing).
    */
   function settleRun(releaseTicks: number, duck: boolean): { xs: number[]; snaps: number[] } {
     setPmoveWorld(floorTrace);
@@ -387,7 +387,6 @@ describe('stop settle (10Hz server, sub-tick renders)', () => {
     // Run phase: 10 ticks at full forward speed.
     let time = 0;
     for (let t = 0; t < 10; t++) {
-      if (duck) server.pmFlags |= PMF_DUCKED;
       pmove(server, ucmd(100, 400, duck ? 8 : 0));
       time += 0.1;
     }
@@ -398,6 +397,10 @@ describe('stop settle (10Hz server, sub-tick renders)', () => {
           id: 1,
           origin: [server.origin[0]!, server.origin[1]!, server.origin[2]!] as [number, number, number],
           velocity: [server.velocity[0]!, server.velocity[1]!, server.velocity[2]!] as [number, number, number],
+          // Authoritative physics state seeds the replay (Phase 3): ducked
+          // snapshots must replay ducked or prediction diverges from server.
+          pmFlags: server.pmFlags,
+          grounded: server.groundEntity !== -1,
         },
       ],
     });
@@ -417,7 +420,6 @@ describe('stop settle (10Hz server, sub-tick renders)', () => {
         xs.push(ents.find((e) => e.id === 1)!.origin[0]);
         elapsed += ms;
       }
-      if (duck) server.pmFlags |= PMF_DUCKED;
       pmove(server, ucmd(100, 0, duck ? 8 : 0));
       time += 0.1;
       const s = takeSnap();
@@ -469,22 +471,35 @@ describe('stop settle (10Hz server, sub-tick renders)', () => {
     resetPmoveWorld();
     setCVar('cl_predict', 1);
     try {
-      // The driver-side translation the game still needs (PM_CheckDuck
-      // ignores the cmd bit): holding crouch sets PMF_DUCKED, which drops
+      // C PM_CheckDuck: hold (BUTTON_DUCK bit 8 / upmove<0) + ON_GROUND ducks
       // the hull to maxs.z=4 / viewheight=12 (standing: 32/22).
       const st = makePmoveState();
-      st.pmFlags |= PMF_DUCKED;
+      st.pmFlags |= PMF_ON_GROUND;
+      st.groundEntity = 0;
       pmove(st, {
         msec: 50,
         angles: new Float32Array([0, 0, 0]) as UserCmd['angles'],
         forwardmove: 0,
         sidemove: 0,
         upmove: 0,
-        buttons: 8, // BUTTON_DUCK rides along; hull comes from PMF_DUCKED
+        buttons: 8, // BUTTON_DUCK hold; hull comes from PM_CheckDuck
       });
       expect(st.maxs[2]).toBe(4);
       expect(st.viewheight).toBe(12);
       expect(PMF_DUCKED).toBe(1);
+      // Airborne hold stands (C: the else branch tries to stand) — no
+      // self-sustaining DUCKED while falling.
+      const air = makePmoveState();
+      air.pmFlags |= PMF_DUCKED;
+      pmove(air, {
+        msec: 50,
+        angles: new Float32Array([0, 0, 0]) as UserCmd['angles'],
+        forwardmove: 0,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 8,
+      });
+      expect(air.maxs[2]).toBe(32);
       // Ducked settle: same monotonic + tick-exact guarantees while held.
       const { xs, snaps } = settleRun(8, true);
       expect(snaps[snaps.length - 1]! - snaps[0]!).toBeGreaterThan(0);
@@ -493,6 +508,72 @@ describe('stop settle (10Hz server, sub-tick renders)', () => {
       }
       const tail = xs.slice(-7);
       for (const x of tail) expect(x).toBe(snaps[snaps.length - 1]!);
+    } finally {
+      setCVar('cl_predict', 1);
+      resetPmoveWorld();
+    }
+  });
+
+  it('ducked snapshot replays ducked: prediction matches authoritative pmove', () => {
+    resetPmoveWorld();
+    setPmoveWorld(floorTrace);
+    setCVar('cl_predict', 1);
+    try {
+      // Authoritative crouched state (grounded, DUCKED, ducked hull).
+      const server = makePmoveState();
+      server.origin = new Float32Array([0, 0, 24]) as unknown as typeof server.origin;
+      server.pmFlags |= PMF_ON_GROUND;
+      server.groundEntity = 0;
+      server.pmFlags |= PMF_DUCKED;
+      server.mins[2] = -24;
+      server.maxs[2] = 4;
+      const duckCmd = (msec: number): PredictCmd => ({
+        msec,
+        angles: [0, 0, 0],
+        forwardmove: 0,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 8,
+      });
+      const snap0: Snapshot = {
+        serverTime: 1.0,
+        entities: [
+          {
+            id: 1,
+            origin: [0, 0, 24],
+            velocity: [0, 0, 0],
+            pmFlags: server.pmFlags,
+            grounded: true,
+          },
+        ],
+      };
+      // Authoritative step: one 100ms duck-hold tick.
+      const ref = makePmoveState();
+      ref.origin = new Float32Array([0, 0, 24]) as unknown as typeof ref.origin;
+      ref.pmFlags = server.pmFlags;
+      ref.groundEntity = 0;
+      ref.mins[2] = -24;
+      ref.maxs[2] = 4;
+      pmove(ref, {
+        msec: 100,
+        angles: new Float32Array([0, 0, 0]) as UserCmd['angles'],
+        forwardmove: 0,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 8,
+      });
+      // Prediction from the flagged snapshot must land exactly there (pre-fix
+      // it replayed from flags 0 and stood the hull up for the first step).
+      expect(CL_PredictPmove(snap0, 1, [duckCmd(100)])).toEqual([
+        ref.origin[0]!,
+        ref.origin[1]!,
+        ref.origin[2]!,
+      ]);
+      // ...and the replayed hull stays ducked.
+      const st = makePmoveState();
+      st.pmFlags = snap0.entities[0]!.pmFlags!;
+      st.groundEntity = 0;
+      expect(st.pmFlags & PMF_DUCKED).toBe(PMF_DUCKED);
     } finally {
       setCVar('cl_predict', 1);
       resetPmoveWorld();
