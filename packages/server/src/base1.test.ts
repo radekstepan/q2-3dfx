@@ -46,7 +46,7 @@ import {
 import type { Edict, Mover, TraceFn, Trigger } from '@q2/game';
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
-import { SV_Init, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, SV_UseTargetname, fireTargets } from './index.js';
+import { SV_Init, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, SV_UseTargetname, SV_DamageMonster, fireTargets } from './index.js';
 import type { ServerState } from './index.js';
 import { SV_CarryRiders } from './index.js';
 import type { RiderBody } from './index.js';
@@ -490,6 +490,114 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       console.log(
         `WIRE mechanism: pit-floor overlap fires t37 -> ${(change as Edict).extra['map'] ?? 'changelevel'}`,
       );
+    } finally {
+      resetPmoveWorld();
+    }
+  });
+
+  it('exit stats: t37 pit overlap finishes via changelevel with sane counters', { timeout: 120000 }, () => {
+    // Headless half of the end-elevator stats proof (the driver half lives
+    // in base1-gate (w)): the server owns the finished state (BRAIN.md §15
+    // single-sim) — HelpComputer-lite counters (C p_hud.c: kills / goals /
+    // secrets over totals, plus level time) that the web HUD renders.
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st: ServerState = SV_Init();
+    SV_SpawnEntities(st, map.entities, (model) => {
+      if (!model.startsWith('*')) return null;
+      const n = Number.parseInt(model.slice(1), 10);
+      if (!Number.isFinite(n)) return null;
+      return modelBounds(map, n);
+    });
+    try {
+      SV_SetPmoveWorldFromBsp(map);
+      // Lump totals (C SP_ counts at spawn): every monster, 3 secrets (t91
+      // lift + t77 + t76), 1 goal (t92 behind the *11 trigger).
+      expect(st.totalMonsters).toBeGreaterThan(0);
+      expect(st.totalSecrets).toBe(3);
+      expect(st.totalGoals).toBe(1);
+      expect(st.killedMonsters).toBe(0);
+      expect(st.foundSecrets).toBe(0);
+      expect(st.foundGoals).toBe(0);
+      expect(st.finished).toBe(false);
+      // Real pit overlap (same body as the mechanism test).
+      const exitTrigger = st.triggers.find((t) => modelNum(t.ent) === 27)!;
+      expect(exitTrigger).toBeDefined();
+      for (let i = 0; i < 5; i++) {
+        SV_Tick(st, 0.1);
+        const pseudo: Edict = { ...exitTrigger!.ent };
+        triggerTouch(exitTrigger!, st.time, 'player', () => fireTargets(st, pseudo));
+      }
+      expect(st.firedThisTick).toContain('t37');
+      // Server-owned finish: reason exit, time + snapshot frozen at the tick.
+      expect(st.finished).toBe(true);
+      expect(st.finishReason).toBe('exit');
+      expect(st.finishTime).toBeGreaterThan(0);
+      expect(st.finishKills).toBe(0);
+      expect(st.finishSecrets).toBe(0);
+      expect(st.finishGoals).toBe(0);
+      // Sanity shape the HUD asserts: kills/secrets/goals never exceed totals.
+      expect(st.finishKills).toBeLessThanOrEqual(st.totalMonsters);
+      expect(st.finishSecrets).toBeLessThanOrEqual(st.totalSecrets);
+      expect(st.finishGoals).toBeLessThanOrEqual(st.totalGoals);
+      // Killing a soldier moves the kill counter (C Killed() — the funnel is
+      // SV_DamageMonster, the only monsterPain caller in src).
+      const first = st.monsters.find((m) => m.kind !== null)!;
+      expect(first).toBeDefined();
+      while (!first.state.dead && !first.state.gibbed) {
+        SV_DamageMonster(st, first, 25, mulberry32(7));
+      }
+      expect(st.killedMonsters).toBe(1);
+      // The screen stays frozen: later kills don't move the snapshot.
+      const second = st.monsters.find((m) => m.kind !== null && m !== first)!;
+      while (!second.state.dead && !second.state.gibbed) {
+        SV_DamageMonster(st, second, 25, mulberry32(7));
+      }
+      expect(st.killedMonsters).toBe(2);
+      expect(st.finishKills).toBe(0);
+    } finally {
+      resetPmoveWorld();
+    }
+  });
+
+  it('exit stats: *13 lift button finishes via t91 and counts its secret once', { timeout: 120000 }, () => {
+    // The reachable end-of-game action (the *27 pit is sealed rock in every
+    // plug state): pressing the end-lift call button fires t91, which starts
+    // the *12 train AND finds the t91 target_secret (same tick, same
+    // cascade — the button also holds TOP on wait -1, the one-way signature).
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st: ServerState = SV_Init();
+    SV_SpawnEntities(st, map.entities, (model) => {
+      if (!model.startsWith('*')) return null;
+      const n = Number.parseInt(model.slice(1), 10);
+      if (!Number.isFinite(n)) return null;
+      return modelBounds(map, n);
+    });
+    try {
+      SV_SetPmoveWorldFromBsp(map);
+      const train = st.trains.find((t) => t.ent.model === '*12')!;
+      expect(train.started).toBe(false);
+      const btn = st.movers.find((m) => m.ent.model === '*13')!;
+      expect(btn).toBeDefined();
+      expect(btn.wait).toBe(-1);
+      moverUse(btn, st.time);
+      let ticks = 0;
+      while (!train.started && ticks++ < 10) SV_Tick(st, 0.1);
+      expect(train.started).toBe(true);
+      expect(st.firedThisTick).toContain('t91');
+      expect(st.finished).toBe(true);
+      expect(st.finishReason).toBe('lift');
+      // The t91 secret counted exactly once in the same cascade (entities
+      // spawn in lump order: the secret precedes the train, so the snapshot
+      // already carries it).
+      expect(st.foundSecrets).toBe(1);
+      expect(st.finishSecrets).toBe(1);
+      // Single-use (C G_FreeEdict): re-firing t91 finds nothing new.
+      const again: Edict = { ...btn.ent };
+      fireTargets(st, again);
+      expect(st.foundSecrets).toBe(1);
+      expect(st.finishSecrets).toBe(1);
     } finally {
       resetPmoveWorld();
     }

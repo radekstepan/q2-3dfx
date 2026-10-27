@@ -277,10 +277,71 @@ export interface ServerState {
   trail: PlayerTrail;
   /** point_combat firing positions (g_misc.c SP_point_combat). */
   combatPoints: CombatPoint[];
+  // --- C level.* intermission counters (g_local.h level_locals_t) --------------
+  //
+  // Totals are fixed at spawn (skill-inhibited edicts never spawn, like C);
+  // found/killed accumulate during play and feed the finished-screen stats
+  // (HelpComputer-lite: kills / secrets / goals + level time). The driver
+  // renders them; the server owns them (BRAIN.md §15 single-sim).
+  /** Every spawned monster edict (C walkmonster_start_go counts all non-good-guy). */
+  totalMonsters: number;
+  /** Fresh monster death transitions (C Killed(): SVF_MONSTER, not GOOD_GUY). */
+  killedMonsters: number;
+  /** Spawned target_secret edicts (C SP_target_secret, SP-only). */
+  totalSecrets: number;
+  /** Single-use secret finds (C use_target_secret + G_FreeEdict). */
+  foundSecrets: number;
+  /** Spawned target_goal edicts (C SP_target_goal, SP-only). */
+  totalGoals: number;
+  /** Single-use goal completions (C use_target_goal + G_FreeEdict). */
+  foundGoals: number;
+  /**
+   * Server-owned finished state. Set once: 'exit' when a target_changelevel
+   * fires (C BeginIntermission-lite for SP — no map change, base2 is not
+   * shipped), 'lift' when the one-way end-lift button fires its train (the
+   * reachable end-of-game action; the *27 pit exit is sealed rock in every
+   * plug state). Stats snapshot freezes here; the sim keeps running (the
+   * lift still rides its leg). The driver mirrors this into its message/HUD
+   * only — it never decides it.
+   */
+  finished: boolean;
+  /** Which firing path finished the level ('', 'exit', 'lift'). */
+  finishReason: '' | 'exit' | 'lift';
+  /** level.time at the finish (snapshot for the stats screen). */
+  finishTime: number;
+  /** Counter snapshots at the finish (post-finish kills don't move the screen). */
+  finishKills: number;
+  finishSecrets: number;
+  finishGoals: number;
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [] };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0 };
+}
+
+/**
+ * Mark the level finished (server-owned; the driver renders only). First
+ * reason wins; the counter snapshot freezes here so the stats screen never
+ * moves under post-finish play.
+ */
+export function SV_FinishLevel(st: ServerState, reason: 'exit' | 'lift'): void {
+  if (st.finished) return;
+  st.finished = true;
+  st.finishReason = reason;
+  st.finishTime = st.time;
+  st.finishKills = st.killedMonsters;
+  st.finishSecrets = st.foundSecrets;
+  st.finishGoals = st.foundGoals;
+}
+
+/** Clear the finished state (respawn path: a new life re-opens the level). */
+export function SV_ClearFinished(st: ServerState): void {
+  st.finished = false;
+  st.finishReason = '';
+  st.finishTime = 0;
+  st.finishKills = 0;
+  st.finishSecrets = 0;
+  st.finishGoals = 0;
 }
 
 /** Link an edict into the world (SV_LinkEdict: register + solid bookkeeping). */
@@ -1330,6 +1391,14 @@ export function SV_SpawnEntities(
   // Team doors share one travel time (Think_CalcMoveSpeed: the shortest move
   // governs so multi-part doors arrive together).
   applyTeamMoveSpeeds(st.movers);
+  // C level.* totals (g_local.h): captured at spawn, before trigger_always
+  // fires a single frame later — every spawned monster counts (C
+  // walkmonster_start_go increments for all non-good-guy bodies; this sim
+  // has no good-guy flag and base1 ships none), every SP target_secret /
+  // target_goal counts (skill-inhibited edicts never spawned, like C).
+  st.totalMonsters = st.monsters.length;
+  st.totalSecrets = out.filter((e) => !e.freed && e.classname === 'target_secret').length;
+  st.totalGoals = out.filter((e) => !e.freed && e.classname === 'target_goal').length;
   for (const e of out) {
     if (!e.freed && e.classname === 'trigger_always' && e.target) {
       const pseudo: Edict = { ...e };
@@ -1450,9 +1519,42 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     // (monster_use). Movers/trains/relays keep their branches below.
     if (!m.edict.freed && m.edict.targetname === user.target) SV_UseMonster(m, true);
   }
+  let firedTrain = false;
   for (const e of st.entities) {
     if (e.freed || e.targetname !== user.target) continue;
     st.firedThisTick.push(e.targetname);
+    if (e.classname === 'target_secret') {
+      // C use_target_secret: single-use (G_FreeEdict) with the secret sound
+      // (default misc/secret.wav). The loop skips freed edicts, so freeing
+      // here counts exactly once; base1 secrets chain nowhere onward.
+      e.freed = true;
+      st.foundSecrets++;
+      st.sounds.push({
+        name: 'misc/secret.wav',
+        pos: v3(e.origin[0], e.origin[1], e.origin[2]),
+        born: st.time,
+      });
+      continue;
+    }
+    if (e.classname === 'target_goal') {
+      // C use_target_goal: single-use count (+ G_UseTargets/G_FreeEdict;
+      // no base1 goal chains onward, so no onward fire — documented).
+      e.freed = true;
+      st.foundGoals++;
+      st.sounds.push({
+        name: 'misc/secret.wav',
+        pos: v3(e.origin[0], e.origin[1], e.origin[2]),
+        born: st.time,
+      });
+      continue;
+    }
+    if (e.classname === 'target_changelevel') {
+      // C use_target_changelevel -> BeginIntermission: SP exits immediately
+      // (level.exitintermission = 1, no intermission screen outside DM/coop).
+      // base2 is not shipped, so the stand-in is the finished screen.
+      SV_FinishLevel(st, 'exit');
+      continue;
+    }
     const m = st.movers.find((mm) => mm.ent === e);
     if (m) {
       SV_UseMover(st, m, depth);
@@ -1475,8 +1577,26 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     } else {
       const tr = st.trains.find((tt) => tt.ent === e);
       // func_train / misc_strogg_ship use (train_use / ship use).
-      if (tr) startTrain(tr, st.time);
+      if (tr) {
+        startTrain(tr, st.time);
+        firedTrain = true;
+      }
     }
+  }
+  if (user.classname === 'func_button' && (firedTrain || user.target === 't4')) {
+    // End-of-level finish (base2-not-shipped stand-in, not C: C only exits
+    // through target_changelevel). Two base1 buttons qualify, both pressable
+    // only at the completed end-complex:
+    // - the one-way (wait -1, holds TOP) lift-call button firing a train —
+    //   base1's *13 (t91) starts the *12 exit lift (and finds its secret);
+    // - the plug-platform button firing 't4' — base1's *34 leans off the DOWN
+    //   plug top only (z 120..152 vs the 88 top; unreachable from the hall,
+    //   the shaft, or the UP plug), so pressing it means standing on the
+    //   lowered end elevator with the whole map behind you.
+    // The *27 pit exit behind the plug is sealed rock in every plug state,
+    // so these presses are the reachable end-of-game actions.
+    const btn = st.movers.find((mm) => mm.ent === user);
+    if (user.target === 't4' || (btn && btn.wait < 0)) SV_FinishLevel(st, 'lift');
   }
 }
 
@@ -2619,6 +2739,11 @@ export function SV_DamageMonster(
 ): 'gib' | 'dead' | 'pain' | 'none' {
   const wasAlive = !m.state.dead && !m.state.gibbed;
   const res = monsterPain(m.state, damage, rand);
+  if ((res === 'dead' || res === 'gib') && wasAlive) {
+    // C Killed(): every fresh SVF_MONSTER death counts (this sim has no
+    // AI_GOOD_GUY bodies; deadsoldier minces run a separate counter).
+    st.killedMonsters++;
+  }
   if ((res === 'dead' || res === 'gib') && wasAlive && m.edict.target) {
     // id monster_death_use: a dying monster fires its target (with the
     // enemy as activator) — the t39 -> t40 relay in base1 wakes/alerts the

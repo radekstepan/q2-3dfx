@@ -65,7 +65,7 @@ import { MODEL_EXTRA_STRIDE, traceBox, FACE_STRIDE } from '@q2/bsp';
 import type { BspMap } from '@q2/bsp';
 import { EXPLOBOX_MAXS, EXPLOBOX_MINS, PMF_DUCKED, SOLID_BBOX, deadsoldierFrameForSpawnflags, parseEntities, parseFloat } from '@q2/game';
 import { SV_ClipTrace, SV_SetPlayerHealth, SV_TraceFor, SV_UseMover, MASK_OPAQUE_C, MASK_PLAYERSOLID_C } from '@q2/server';
-import { bootPlay, rebootPlay, pumpExplosionLights } from './play.js';
+import { bootPlay, rebootPlay, pumpExplosionLights, drawPlayHud, FINISH_BLUE, formatLevelTime } from './play.js';
 
 const WEB_Q2_PAK = process.env.Q2_PAK;
 
@@ -1508,6 +1508,103 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect(w34.has('t91')).toBe(false);
     expect(train.started).toBe(true);
     expect(driver.events).not.toContain('exit');
+    expectInWorld(driver.pm.origin, driver.map!);
+  });
+
+  it('(w) the end-elevator button finishes the level: blue stats screen, sane counters', { timeout: 180000 }, async () => {
+    // User repro near (-1823,1540,112): standing on the DOWN plug top (plug
+    // *31 rest z 80..244, DOWN offset -156 -> top 88, origin 112) and leaning
+    // into the *34 platform button (box x -1848..-1839 — the hull touches its
+    // east face a few units west of the reported spot; the button is
+    // unreachable from anywhere else). Lump geometry: *34 fires t4 (the
+    // fires t91 (the *12 lift + its secret); the *27 pit behind the plug is
+    // sealed rock in every plug state, so these presses ARE the reachable
+    // end of the game (base2 is not shipped). The server owns the finished
+    // state; the HUD renders it centered in blue with HelpComputer-lite
+    // stats (kills / secrets / goals over totals + level time, C p_hud.c).
+    const boot = await bootBase1();
+    const { driver } = boot;
+    // Pure time formatter pins (M:SS from level.time, never wall-clock).
+    expect(formatLevelTime(0)).toBe('0:00');
+    expect(formatLevelTime(59)).toBe('0:59');
+    expect(formatLevelTime(60)).toBe('1:00');
+    expect(formatLevelTime(277)).toBe('4:37');
+    // Server totals at spawn (C SP_ counts): monsters live, 3 secrets (t91
+    // lift + t77 + t76), 1 goal (t92 behind *11) — all SP-spawned.
+    expect(driver.server.totalMonsters).toBeGreaterThan(0);
+    expect(driver.server.totalSecrets).toBe(3);
+    expect(driver.server.totalGoals).toBe(1);
+    expect(driver.server.finished).toBe(false);
+    // Camp the hall so the plug parks DOWN (touch opens it, TOP wait holds
+    // while camped — gate (t) pattern), then footprint the DOWN plug top and
+    // settle from above (the C +1/32 contact rest, never an exact teleport).
+    driver.pm.origin = v3(-1669, 1514, 120);
+    driver.pm.velocity = v3();
+    for (let i = 0; i < 120; i++) {
+      SV_SetPlayerHealth(driver.server, 100); // setup: hold the camper alive
+      driver.step(neutralCmd(), 0.1);
+    }
+    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
+    expect(plug.ent.origin[2]!).toBeCloseTo(-156, 0);
+    // Stage just east of the *34 face (button box x -1848..-1839, 1u touch
+    // slop): close enough to lean in, far enough that settle fires nothing.
+    driver.pm.origin = v3(-1815, 1540, 120);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    expect(driver.server.finished).toBe(false);
+    expect(driver.pm.onGround).toBe(true);
+    expect(driver.pm.groundEntity).toBe(plug.ent.num);
+    // The user spot: feet on the 88 top (origin 112), on the plug.
+    expect(driver.pm.origin[0]!).toBeCloseTo(-1815, 1);
+    expect(driver.pm.origin[1]!).toBeCloseTo(1540, 1);
+    expect(driver.pm.origin[2]!).toBeCloseTo(112, 0);
+    // Lean west into *34: the contact press fires t4 (the plug cycles — the
+    // sim keeps running, riders included) and the server marks the finish.
+    // (Per-tick collection: firedThisTick resets every SV_Tick.)
+    const fired = new Set<string>();
+    for (let i = 0; i < 30 && !driver.server.finished; i++) {
+      driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+      for (const t of driver.server.firedThisTick) fired.add(t);
+    }
+    expect(fired.has('t4')).toBe(true);
+    expect(driver.server.finished).toBe(true);
+    expect(driver.server.finishReason).toBe('lift');
+    expect(driver.server.finishTime).toBeGreaterThan(0);
+    // RENDERED verdict: the finished message carries the headline + the
+    // stats lines, with every counter sane (kills/secrets/goals <= totals).
+    const msg = driver.message;
+    expect(msg).toContain('LEVEL COMPLETE');
+    expect(msg).toContain('kills');
+    expect(msg).toContain('secrets');
+    expect(msg).toContain('goals');
+    expect(msg).toContain('time');
+    const kills = msg.match(/kills (\d+)\/(\d+)/)!;
+    const secrets = msg.match(/secrets (\d+)\/(\d+)/)!;
+    const goals = msg.match(/goals (\d+)\/(\d+)/)!;
+    const time = msg.match(/time (\d+:\d\d)/)!;
+    expect(kills).not.toBeNull();
+    expect(secrets).not.toBeNull();
+    expect(goals).not.toBeNull();
+    expect(time).not.toBeNull();
+    expect(Number(kills![1])).toBeLessThanOrEqual(Number(kills![2]));
+    expect(Number(secrets![1])).toBeLessThanOrEqual(Number(secrets![2]));
+    expect(Number(goals![1])).toBeLessThanOrEqual(Number(goals![2]));
+    expect(Number(kills![2])).toBeGreaterThan(0);
+    expect(Number(secrets![2])).toBe(3);
+    expect(Number(goals![2])).toBe(1);
+    // The level never exits from the press (no base2 to go to): no 'exit'
+    // event, no invincibility — but the finished screen announced itself.
+    expect(driver.events).toContain('finished');
+    expect(driver.events).not.toContain('exit');
+    expect(driver.exited).toBe(false);
+    // The screen persists: firing afterwards never overwrites it.
+    driver.step(attackCmd([0, 0, 0]), 0.1);
+    expect(driver.message).toBe(msg);
+    // In-canvas render path: the stats block lands in FINISH_BLUE pixels
+    // (centered multi-line block, post-`r_brightness` lift like fps/pos).
+    const target = { width: 320, height: 240, color: new Uint32Array(320 * 240) };
+    drawPlayHud(target, boot, { fps: 0, frame: 1 });
+    expect(target.color.some((c) => c === FINISH_BLUE)).toBe(true);
     expectInWorld(driver.pm.origin, driver.map!);
   });
 });

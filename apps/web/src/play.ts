@@ -87,6 +87,7 @@ import {
   SV_DrainTracers,
   SV_DrainSparks,
   SV_DrainSounds,
+  SV_ClearFinished,
   MASK_OPAQUE_C,
 } from '@q2/server';
 import type { ServerState, ServerMonster, ServerBarrel, ServerBolt, ServerExplosion, ServerDebris, ServerGib } from '@q2/server';
@@ -733,6 +734,8 @@ export class LocalDriver implements HostDriver {
   readonly changeTargets = new Set<string>();
   message = '';
   exited = false;
+  /** Finish screen already mirrored from the server (event pushed once). */
+  private finishShown = false;
   weapon: WeaponDef = WEAPON_BLASTER;
   shells = 0;
   bullets = 0;
@@ -1024,15 +1027,25 @@ export class LocalDriver implements HostDriver {
     this.updateBob();
     this.stepGunframe();
     this.emitDoorSounds();
-    // Exit scan runs after every firing path (point + brush triggers):
-    // each pushes the relay targetname into firedThisTick.
+    // Exit/finish scan runs after every firing path (point + brush triggers,
+    // buttons): each pushes the relay targetname into firedThisTick, and the
+    // server owns the finished state (SV_FinishLevel on target_changelevel /
+    // the end-lift button) — the driver only mirrors it into message/HUD.
     for (const t of this.server.firedThisTick) {
       if (this.changeTargets.has(t) && !this.exited) {
         this.exited = true;
-        this.message = 'LEVEL COMPLETE — base2 is not shipped yet. Thanks for playing!';
         this.events.push('exit');
       }
     }
+    // First tick with server-owned finished state: freeze the stats screen
+    // (snapshot counters, so post-finish kills don't move it). The real exit
+    // (t37) also sets exited above (invincible, like the old message path);
+    // the end-lift press ('lift') only shows the screen — the ride continues.
+    if (this.server.finished && !this.finishShown) {
+      this.finishShown = true;
+      if (this.server.finishReason !== 'exit') this.events.push('finished');
+    }
+    if (this.server.finished) this.message = formatFinishMessage(this.server);
     this.stepSparks(dt);
     this.checkPickups();
     this.handleAttack(cmd);
@@ -1049,6 +1062,16 @@ export class LocalDriver implements HostDriver {
     if (this.ps.health <= 0 && this.deadUntil > 0 && this.server.time >= this.deadUntil) {
       this.respawn();
     }
+  }
+
+  /**
+   * Status-line write (all HUD one-liners funnel here): once the server owns
+   * the finished state the stats screen stays put — kills, pickups and empty
+   * clicks no longer overwrite it. Death/respawn write directly (more urgent
+   * / clears the screen for the new life).
+   */
+  private setMessage(s: string): void {
+    if (!this.server.finished) this.message = s;
   }
 
   /**
@@ -1098,13 +1121,13 @@ export class LocalDriver implements HostDriver {
         if (!this.gibSeen.has(m.edict.num)) {
           this.gibSeen.add(m.edict.num);
           this.events.push('gib');
-          this.message = `${m.state.kind} minced`;
+          this.setMessage(`${m.state.kind} minced`);
         }
       } else if (m.state.dead) {
         if (!this.deadSeen.has(m.edict.num)) {
           this.deadSeen.add(m.edict.num);
           this.events.push('kill');
-          this.message = `${m.state.kind} down`;
+          this.setMessage(`${m.state.kind} down`);
         }
       } else if (m.state.health < prev) {
         this.events.push('hit');
@@ -1130,7 +1153,7 @@ export class LocalDriver implements HostDriver {
       if (Number.isFinite(hits) && hits > seen) {
         this.corpseGibSeen.set(e.num, hits);
         this.events.push('gib');
-        this.message = 'corpse minced';
+        this.setMessage('corpse minced');
       }
     }
     // Player damage dealt by the server tick/fire → pain/death edges.
@@ -1411,7 +1434,7 @@ export class LocalDriver implements HostDriver {
 
   selectWeapon(classname: string): void {
     if (!this.ps.weapons.includes(classname)) {
-      this.message = 'NO WEAPON';
+      this.setMessage('NO WEAPON');
       this.events.push('empty');
       return;
     }
@@ -1848,8 +1871,11 @@ export class LocalDriver implements HostDriver {
     this.deadUntil = -1;
     // A new life is vulnerable again: without this, a completed level left
     // `exited` set forever (spurious or real), and damagePlayer's
-    // `exited` guard made the player permanently invincible.
+    // `exited` guard made the player permanently invincible. The finished
+    // screen clears with it (the new life re-opens the level).
     this.exited = false;
+    this.finishShown = false;
+    SV_ClearFinished(this.server);
     this.message = '';
     this.events.push('respawn');
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
@@ -1889,7 +1915,7 @@ export class LocalDriver implements HostDriver {
       }
       this.syncAmmo();
       this.events.push('pickup');
-      this.message = c.replace(/_/g, ' ');
+      this.setMessage(c.replace(/_/g, ' '));
       // Real pak pickup sound (C g_items.c pickup_sound, incl. the suits).
       this.emitSound('items/pkup.wav', v3(px, py, pz));
       if (res.reason === 'weapon' && (c === 'weapon_shotgun' || c === 'weapon_machinegun')) {
@@ -2326,7 +2352,7 @@ export class LocalDriver implements HostDriver {
       rand: this.rand,
     });
     if (!res.fired) {
-      this.message = 'NO AMMO';
+      this.setMessage('NO AMMO');
       this.events.push('empty');
       this.lastShotAt = t;
       return;
@@ -2335,7 +2361,7 @@ export class LocalDriver implements HostDriver {
     if (this.weapon.ammoKind === 'bullets') this.ps.ammo['bullets'] = res.ammoLeft;
     this.syncAmmo();
     this.lastShotAt = t;
-    this.message = '';
+    this.setMessage('');
     this.events.push('shot');
     if (res.bolt) this.events.push('bolt');
     // Weapon_Generic-lite: firing starts at FIRE_FIRST (activate+1); the
@@ -3079,6 +3105,44 @@ export interface HudState {
   frame: number;
 }
 
+/** In-canvas finished-screen colour: opaque blue in 0xAABBGGRR (canvas
+ * colour). The end-of-level stats block renders centered in this tone —
+ * the blue status message from the original game.
+ */
+export const FINISH_BLUE = 0xffff0000;
+
+/**
+ * Pure level-time readout: `M:SS` from level.time seconds (float, never
+ * wall-clock per BRAIN.md §5). Feeds the finished-screen stats line.
+ */
+export function formatLevelTime(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/**
+ * Pure finished-screen text (server-owned snapshot in, lines out):
+ * the LEVEL COMPLETE headline plus HelpComputer-lite stats (C p_hud.c:
+ * kills / goals / secrets over totals, and the level time). The driver
+ * mirrors `server.finished` into `message` with this every tick; the HUD
+ * renders it centered in FINISH_BLUE.
+ */
+export function formatFinishMessage(server: ServerState): string {
+  return [
+    'LEVEL COMPLETE — base2 is not shipped yet. Thanks for playing!',
+    `kills ${server.finishKills}/${server.totalMonsters}  secrets ${server.finishSecrets}/${server.totalSecrets}  goals ${server.finishGoals}/${server.totalGoals}`,
+    `time ${formatLevelTime(server.finishTime)}`,
+  ].join('\n');
+}
+
+/**
+ * Pure anchor for one centered HUD line: x so the text sits in the middle
+ * of the buffer (clamped to >= 0 so tiny buffers clip instead of wrapping).
+ */
+export function finishLineAnchor(width: number, text: string): { x: number } {
+  return { x: Math.max(0, ((width - stringWidth(text)) / 2) | 0) };
+}
+
 /** In-canvas fps readout colour (conchars `drawString`, top-right in-view,
  * gated by `cl_showfps`). Drawn in `drawPlayHud` on the display buffer —
  * the same pre-blit HUD pass as the crosshair — so it matches the game
@@ -3207,7 +3271,18 @@ export function drawPlayHud(
   const hpColor = boot.driver.playerDead ? 0xffff3333 : hp <= 25 ? 0xffff9933 : white;
   drawString(target, 8, target.height - 18, `${boot.driver.weapon.classname} ${boot.driver.hudAmmo()}`, white);
   drawString(target, 8, target.height - 48, `hp ${hp}`, hpColor);
-  if (boot.driver.message) {
+  if (boot.driver.server.finished) {
+    // Finished screen: the multi-line stats block, centered horizontally in
+    // FINISH_BLUE (the original's blue status message), stacked just above
+    // screen center like C's centerprint. Drawn in the same pre-blit HUD
+    // pass as fps/pos — after the `r_brightness` scene lift — so the blue
+    // keeps its authored colour at any brightness.
+    const lines = boot.driver.message.split('\n');
+    const y0 = Math.max(8, ((target.height - lines.length * 8) / 2 - 8) | 0);
+    lines.forEach((line, i) => {
+      drawString(target, finishLineAnchor(target.width, line).x, y0 + i * 10, line, FINISH_BLUE);
+    });
+  } else if (boot.driver.message) {
     const msg = boot.driver.message.slice(0, 48);
     drawString(target, 8, target.height - 30, msg, 0xffffff00);
   }

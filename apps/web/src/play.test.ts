@@ -1232,6 +1232,9 @@ describe.runIf(!!WEB_Q2_PAK)('sweep gameplay: emitted channel names resolve to d
     'world/explod1.wav',
     // gibs (C g_misc.c ThrowGib/ThrowHead over misc/udeath.wav)
     'misc/udeath.wav',
+    // secrets + goals (C g_target.c use_target_secret/use_target_goal
+    // default noise — counted server-side, single-use)
+    'misc/secret.wav',
     // monster fire (C m_soldier.c/m_gunner.c/m_infantry.c sound_* names)
     'soldier/solatck1.wav',
     'soldier/solatck2.wav',

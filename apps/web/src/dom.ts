@@ -769,7 +769,7 @@ export function startPlayLoop(
       if (!sound) continue;
       if (ev === 'kill') blip(sound.ctx, sound.master, 660, 0.12);
       else if (ev === 'hit') blip(sound.ctx, sound.master, 440, 0.06);
-      else if (ev === 'exit') {
+      else if (ev === 'exit' || ev === 'finished') {
         blip(sound.ctx, sound.master, 523, 0.15);
         blip(sound.ctx, sound.master, 784, 0.25, 0.15);
       }
