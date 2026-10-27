@@ -1029,3 +1029,16 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - 10Hz snapshots (entity-frame RF_FRAMELERP landed; `play.ts`
 - TODO(interp) still open); surface-cache hit-rate ledger number on a
 - base1/demo1 flythrough (`testCacheStats` exposed, devroom 100% measured).
+- CLOSED 2026-10-26 (menu/HUD lane, checkboxes + pos readout): every
+- boolean cvar in the config panel is a checkbox (15 in `CHECKBOX_CVARS`:
+- `cl_showfps`/`cl_showpos`, all eight 0/1 `vd_*` fidelity switches,
+- `r_drawworld`/`cl_predict`/`cl_interp`, `sw_wasm`/`sw_accum`; stale 0/1
+- `CVAR_OPTIONS` entries removed, `sw_workers` stays a select), labels
+- left-aligned, every row carries its cvar-doc `title` tooltip
+- (`cvarDescription` + `CVAR_DESCRIPTIONS`, strings verbatim from the cvar
+- definitions). `pos` readout drops yaw (`pos X Y Z`, 3-arg
+- `formatPlayerPos`) in dim grey `POS_GREY 0xff999999` (replaces
+- `POS_YELLOW 0xff66ffff`; one step above the `dim` crosshair tone, still
+- painted post-`r_brightness`-lift so the display test's exact-colour pin
+- at 2.0 holds). Checkbox sweep test: toggling any checkbox fires nothing,
+- requests no lock, leaves no document listeners.

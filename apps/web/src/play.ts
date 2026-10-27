@@ -2939,9 +2939,12 @@ export interface HudState {
  * look and is never dimmed by the `r_brightness` scene lift. */
 export const FPS_GREEN = 0xff00ff00;
 
-/** In-canvas player-position readout colour (opaque #ff6-style yellow,
- * matching the retired DOM `#q2-pos` tint; same pre-blit HUD pass as fps). */
-export const POS_YELLOW = 0xff66ffff;
+/** In-canvas player-position readout colour (dim neutral grey 0x99 — a step
+ * above the HUD `dim` 0x88 crosshair tone so the two never collide in tests
+ * or on screen. The retired DOM `#q2-pos` tint was yellow). Drawn in
+ * the same pre-blit HUD pass as fps — after the `r_brightness` scene lift —
+ * so it keeps its authored colour and stays legible at any brightness. */
+export const POS_GREY = 0xff999999;
 
 /**
  * Pure anchor for the in-canvas fps slot: top-right, 8px margins, so the
@@ -2997,16 +3000,16 @@ function r1(v: number): string {
 }
 
 /**
- * Pure player-position readout text: `pos x y z yaw <yaw>`, each rounded
- * to 1 decimal (yaw = viewAngles[1], id convention). Drawn in-canvas
- * top-left via conchars glyphs (gated by `cl_showpos`, default ON).
+ * Pure player-position readout text: `pos x y z`, each rounded to 1 decimal.
+ * Drawn in-canvas top-left via conchars glyphs (gated by `cl_showpos`,
+ * default ON).
  */
-export function formatPlayerPos(x: number, y: number, z: number, yaw: number): string {
-  return `pos ${r1(x)} ${r1(y)} ${r1(z)} yaw ${r1(yaw)}`;
+export function formatPlayerPos(x: number, y: number, z: number): string {
+  return `pos ${r1(x)} ${r1(y)} ${r1(z)}`;
 }
 
 /**
- * Position readout text for a driver (pm.origin + viewAngles yaw).
+ * Position readout text for a driver (pm.origin, per-frame source).
  * Pure/headless-safe; `drawPlayHud` paints it in-canvas every frame.
  */
 export function playerPosText(driver: LocalDriver): string {
@@ -3014,7 +3017,6 @@ export function playerPosText(driver: LocalDriver): string {
     driver.pm.origin[0]!,
     driver.pm.origin[1]!,
     driver.pm.origin[2]!,
-    driver.pm.viewAngles[1]!,
   );
 }
 
@@ -3043,7 +3045,7 @@ export function drawPlayHud(
   }
   if (posVisible()) {
     const a = posHudAnchor();
-    drawString(target, a.x, a.y, playerPosText(boot.driver), POS_YELLOW);
+    drawString(target, a.x, a.y, playerPosText(boot.driver), POS_GREY);
   }
   const white = 0xffffffff;
   const cx = (target.width / 2) | 0;

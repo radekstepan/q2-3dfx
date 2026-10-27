@@ -10,7 +10,7 @@ import { ingestPak } from './pak.js';
 import type { WebPak } from './pak.js';
 
 registerCVar('cl_showfps', 1, 'show in-canvas fps readout top-right (conchars glyphs)');
-registerCVar('cl_showpos', 1, 'show in-canvas player-position readout top-left (pos x y z yaw)');
+registerCVar('cl_showpos', 1, 'show in-canvas player-position readout top-left (pos X Y Z)');
 
 /** Cvar gate for the fps readout (`cl_showfps`, default 1). */
 
@@ -116,20 +116,8 @@ export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   skill: ['0', '1', '2', '3'],
   map_source: ['devroom', 'pak'],
   sw_workers: ['0', '2', '4'],
-  cl_showfps: ['0', '1'],
   r_brightness: ['0.75', '1.0', '1.25', '1.5', '2.0'],
   vd_gamma: ['1.0', '1.3', '2.2'],
-  vd_16bit: ['0', '1'],
-  vd_dither: ['0', '1'],
-  vd_postfilter: ['0', '1'],
-  vd_bilinear: ['0', '1'],
-  vd_mipdither: ['0', '1'],
-  vd_fog: ['0', '1'],
-  vd_palettetex: ['0', '1'],
-  vd_overbright: ['0', '1'],
-  r_drawworld: ['0', '1'],
-  cl_predict: ['0', '1'],
-  cl_interp: ['0', '1'],
 };
 
 /** Re-register HUD cvars if a test `resetCVars()` wiped them, so the
@@ -139,7 +127,7 @@ function ensureHudCvars(): void {
     registerCVar('cl_showfps', 1, 'show in-canvas fps readout top-right (conchars glyphs)');
   }
   if (getCVar('cl_showpos') === undefined) {
-    registerCVar('cl_showpos', 1, 'show in-canvas player-position readout top-left (pos x y z yaw)');
+    registerCVar('cl_showpos', 1, 'show in-canvas player-position readout top-left (pos X Y Z)');
   }
 }
 
@@ -147,8 +135,31 @@ function ensureHudCvars(): void {
  * Boolean cvars rendered as checkboxes (element-local `change` listeners,
  * never document-level mouse wiring — so toggling them can never produce
  * game input under the canvas pointer-lock discipline).
+ *
+ * Every 0/1 cvar the panel can list lives here: the HUD gates (`cl_showfps`,
+ * `cl_showpos`), the Voodoo fidelity switches (`vd_*`, BRAIN.md §7.2), the
+ * client/world toggles (`cl_predict`, `cl_interp`, `r_drawworld`), and the
+ * span-backend switches (`sw_wasm`, `sw_accum` — registered lazily by
+ * `@q2/sw-renderer`, so they are pinned here even before first registration).
+ * `sw_workers` stays a select (0/2/4 band count, not boolean).
  */
-export const CHECKBOX_CVARS: ReadonlySet<string> = new Set(['cl_showpos']);
+export const CHECKBOX_CVARS: ReadonlySet<string> = new Set([
+  'cl_showfps',
+  'cl_showpos',
+  'vd_16bit',
+  'vd_dither',
+  'vd_postfilter',
+  'vd_bilinear',
+  'vd_mipdither',
+  'vd_fog',
+  'vd_palettetex',
+  'vd_overbright',
+  'r_drawworld',
+  'cl_predict',
+  'cl_interp',
+  'sw_wasm',
+  'sw_accum',
+]);
 
 /** True when this cvar renders as a checkbox (boolean 0/1 cvar). */
 export function cvarIsCheckbox(name: string): boolean {
@@ -210,6 +221,55 @@ export function cvarOptionLabels(name: string): readonly string[] | null {
   if (name === 'vid_resolution') return RESOLUTION_LABELS;
   if (name === 'map_source') return MAP_SOURCE_LABELS;
   return null;
+}
+
+/**
+ * On-hover descriptions for every menu row, copied verbatim from the cvar
+ * definitions (`@q2/config` defaults, the `registerCVar` docs in
+ * `play.ts`/`dom.ts`, `bands.ts`/`wasmSpans.ts` for the span switches).
+ * `cvarDescription` prefers the live registry doc and falls back here, so
+ * lazily-registered cvars (`sw_wasm`, `sw_accum`) still get tooltips before
+ * their first registration.
+ */
+export const CVAR_DESCRIPTIONS: Readonly<Record<string, string>> = {
+  cl_showfps: 'show in-canvas fps readout top-right (conchars glyphs)',
+  cl_showpos: 'show in-canvas player-position readout top-left (pos X Y Z)',
+  r_brightness: 'display-only post-resolve brightness lift 0.5..2.0',
+  skill: 'difficulty 0 easy 1 medium 2 hard 3 nightmare (latched at boot)',
+  map_source: 'map source: cached pak0.pak game (pak) or built-in devroom (devroom); changing it reboots the level',
+  vid_resolution: 'internal framebuffer WxH (latched: changing it reboots the level)',
+  vid_renderer: 'active refresh backend: software | voodoo',
+  vd_16bit: 'quantise 8:8:8 to RGB565 at resolve',
+  vd_dither: '4x4 ordered dither before quantise',
+  vd_postfilter: '2x2 "22-bit" RAMDAC post filter',
+  vd_bilinear: 'bilinear filtering',
+  vd_mipdither: 'single-TMU trilinear via mip dithering',
+  vd_lodbias: 'Glide LOD bias',
+  vd_fog: '64-entry table fog',
+  vd_gamma: 'Glide gamma lift',
+  vd_maxtexsize: '256x256 texture cap',
+  vd_zbits: '16-bit depth buffer',
+  vd_palettetex: '8-bit palettised textures',
+  vd_overbright: 'lightmap modulate x2 with clamp',
+  sw_gamma: 'software gamma',
+  sw_workers: 'banded SAB spanfill: N horizontal bands (M8.1, default 0 = single-threaded)',
+  sw_accum: 'coalesce frame span batches into one pool kick (M8.1, default 1 = on)',
+  sw_wasm: 'use the WASM spanfill backend (M9.1, default 0 = TS)',
+  r_drawworld: 'draw world geometry',
+  cl_predict: 'predict local player between 10Hz snapshots',
+  cl_interp: 'interpolate remote entities between snapshots',
+  s_volume: 'master sound volume 0..1',
+  sensitivity: 'mouse sensitivity',
+  m_yaw: 'mouse yaw scale',
+  m_pitch: 'mouse pitch scale',
+};
+
+/** On-hover description for a menu row (live registry doc wins, static map fallback). */
+export function cvarDescription(name: string): string {
+  for (const c of listCVars()) {
+    if (c.name === name && c.doc) return c.doc;
+  }
+  return CVAR_DESCRIPTIONS[name] ?? '';
 }
 
 /**
@@ -300,8 +360,13 @@ export function renderCvarPanel(
   for (const name of names) {
     const row = document.createElement('div');
     row.className = 'q2-cvar-row';
+    // On-hover description for the row (tooltip source: the cvar registry
+    // doc, static fallback in CVAR_DESCRIPTIONS — see cvarDescription).
+    const tip = cvarDescription(name);
+    if (tip) row.title = tip;
     const label = document.createElement('label');
     label.textContent = name;
+    if (tip) label.title = tip;
     const options = cvarOptions(name);
     const current = getCVarString(name);
     if (cvarIsCheckbox(name)) {
@@ -311,6 +376,7 @@ export function renderCvarPanel(
       const box = document.createElement('input') as HTMLInputElement;
       box.type = 'checkbox';
       box.checked = getCVarNumber(name) !== 0;
+      if (tip) box.title = tip;
       box.addEventListener('change', () => {
         try {
           setCVarFromString(name, box.checked ? '1' : '0');
@@ -323,6 +389,7 @@ export function renderCvarPanel(
       row.appendChild(box);
     } else if (options !== null) {
       const select = document.createElement('select');
+      if (tip) select.title = tip;
       // Reflect out-of-list values (e.g. sw_workers=8, r_brightness=1.1)
       // instead of silently showing the wrong preset.
       const choices = options.includes(current) ? options : [current, ...options];
@@ -350,6 +417,7 @@ export function renderCvarPanel(
     } else {
       const input = document.createElement('input');
       input.value = current;
+      if (tip) input.title = tip;
       input.addEventListener('change', () => {
         try {
           setCVarFromString(name, input.value);

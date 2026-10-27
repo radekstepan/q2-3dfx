@@ -12,7 +12,7 @@ import {
   FPS_GREEN,
   getBrightness,
   posHudAnchor,
-  POS_YELLOW,
+  POS_GREY,
   resolveDisplay,
 } from './play.js';
 import { cvarControlKind, cvarOptions, renderCvarPanel } from './dom.js';
@@ -50,8 +50,8 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
     expect(FPS_GREEN).toBe(0xff00ff00);
   });
 
-  it('POS_YELLOW is an opaque readable yellow in 0xAABBGGRR (canvas colour)', () => {
-    expect(POS_YELLOW).toBe(0xff66ffff);
+  it('POS_GREY is an opaque dim grey in 0xAABBGGRR (canvas colour)', () => {
+    expect(POS_GREY).toBe(0xff999999);
   });
 
   it('canvas draws fps top-right in-canvas when enabled, none when gated', () => {
@@ -147,7 +147,7 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
       // …and the crosshair centre pixel keeps full white.
       expect(target[60 * 160 + 80]).toBe(0xffffffff);
       // …and both in-canvas readouts stay legible with exact colours:
-      // fps `fps 60` top-right (green) and pos top-left (yellow).
+      // fps `fps 60` top-right (green) and pos top-left (dim grey).
       let green = 0;
       for (let y = 8; y < 16; y++) {
         for (let x = 104; x < 152; x++) {
@@ -155,13 +155,13 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
         }
       }
       expect(green).toBeGreaterThan(10);
-      let yellow = 0;
+      let grey = 0;
       for (let y = 8; y < 16; y++) {
         for (let x = 8; x < 160; x++) {
-          if (target[y * 160 + x] === POS_YELLOW) yellow++;
+          if (target[y * 160 + x] === POS_GREY) grey++;
         }
       }
-      expect(yellow).toBeGreaterThan(10);
+      expect(grey).toBeGreaterThan(10);
     } finally {
       setCVar('r_brightness', BRIGHTNESS_DEFAULT);
       setCVar('cl_showfps', 1);
@@ -169,12 +169,13 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
     }
   });
 
-  it('cvar panel uses <select> for known domains, text otherwise', () => {
+  it('cvar panel uses checkboxes for booleans, <select> for known domains, text otherwise', () => {
     expect(cvarControlKind('vid_renderer')).toBe('select');
     expect(cvarOptions('vid_renderer')).toEqual(['software', 'voodoo']);
     expect(cvarControlKind('sw_workers')).toBe('select');
     expect(cvarOptions('sw_workers')).toEqual(['0', '2', '4']);
-    expect(cvarControlKind('cl_showfps')).toBe('select');
+    expect(cvarControlKind('cl_showfps')).toBe('checkbox');
+    expect(cvarControlKind('vd_dither')).toBe('checkbox');
     expect(cvarControlKind('r_brightness')).toBe('select');
     expect(cvarOptions('r_brightness')).toContain('1.25');
     expect(cvarOptions('r_brightness')).toContain('2.0');

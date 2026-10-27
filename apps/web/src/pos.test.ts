@@ -5,9 +5,9 @@
 // pixels are asserted on headless framebuffers (same pattern as the fps
 // lane): no DOM overlay owns the readout anymore.
 import { afterEach, describe, expect, it } from 'vitest';
-import { getCVarNumber, resetCVars, setCVar } from '@q2/config';
-import { bootPlay, drawPlayHud, formatPlayerPos, playerPosText, posHudAnchor, posVisible, POS_YELLOW } from './play.js';
-import { cvarControlKind, cvarIsCheckbox, renderCvarPanel, showPosEnabled } from './dom.js';
+import { getCVarNumber, getCVarString, resetCVars, setCVar } from '@q2/config';
+import { bootPlay, drawPlayHud, formatPlayerPos, playerPosText, posHudAnchor, posVisible, POS_GREY } from './play.js';
+import { CHECKBOX_CVARS, cvarControlKind, cvarDescription, cvarIsCheckbox, renderCvarPanel, showPosEnabled } from './dom.js';
 
 afterEach(() => {
   resetCVars();
@@ -101,20 +101,20 @@ describe('player position readout (in-canvas conchars, top-left, cl_showpos)', (
     expect(posHudAnchor()).toEqual({ x: 8, y: 8 });
   });
 
-  it('formatPlayerPos is pure: x y z + yaw at 1 decimal', () => {
-    expect(formatPlayerPos(1.234, -2.26, 32, 90)).toBe('pos 1.2 -2.3 32.0 yaw 90.0');
-    expect(formatPlayerPos(0, 0, 0, 0)).toBe('pos 0.0 0.0 0.0 yaw 0.0');
-    expect(formatPlayerPos(-168, 0, 32, -0.04)).toBe('pos -168.0 0.0 32.0 yaw 0.0');
+  it('formatPlayerPos is pure: x y z at 1 decimal (no yaw)', () => {
+    expect(formatPlayerPos(1.234, -2.26, 32)).toBe('pos 1.2 -2.3 32.0');
+    expect(formatPlayerPos(0, 0, 0)).toBe('pos 0.0 0.0 0.0');
+    expect(formatPlayerPos(-168, 0, 32)).toBe('pos -168.0 0.0 32.0');
   });
 
-  it('playerPosText reads the live driver origin + yaw (per-frame source)', () => {
+  it('playerPosText reads the live driver origin (per-frame source)', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
     const text = playerPosText(driver);
     expect(text).toBe(
-      formatPlayerPos(driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]!, driver.pm.viewAngles[1]!),
+      formatPlayerPos(driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]!),
     );
-    expect(text).toMatch(/^pos -?\d+\.\d -?\d+\.\d -?\d+\.\d yaw -?\d+\.\d$/);
+    expect(text).toMatch(/^pos -?\d+\.\d -?\d+\.\d -?\d+\.\d$/);
   });
 
   it('cl_showpos gates the readout (default ON)', () => {
@@ -137,10 +137,10 @@ describe('player position readout (in-canvas conchars, top-left, cl_showpos)', (
       setCVar('cl_showpos', 1);
       const target = { width: 320, height: 240, color: new Uint32Array(320 * 240) };
       drawPlayHud(target, boot, { fps: 60, frame: 1 });
-      // Pos text starts at (8, 8); struck glyph pixels are POS_YELLOW.
-      expect(countIn(target.color, 320, 8, 8, 320, 16, POS_YELLOW)).toBeGreaterThan(10);
-      // Nothing yellow leaks into the lower HUD rows.
-      expect(countIn(target.color, 320, 0, 16, 320, 240, POS_YELLOW)).toBe(0);
+      // Pos text starts at (8, 8); struck glyph pixels are POS_GREY.
+      expect(countIn(target.color, 320, 8, 8, 320, 16, POS_GREY)).toBeGreaterThan(10);
+      // Nothing grey leaks into the lower HUD rows.
+      expect(countIn(target.color, 320, 0, 16, 320, 240, POS_GREY)).toBe(0);
     } finally {
       resetCVars();
     }
@@ -153,16 +153,37 @@ describe('player position readout (in-canvas conchars, top-left, cl_showpos)', (
       setCVar('cl_showpos', 0);
       const target = { width: 320, height: 240, color: new Uint32Array(320 * 240) };
       drawPlayHud(target, boot, { fps: 60, frame: 1 });
-      expect(target.color.some((c) => c === POS_YELLOW)).toBe(false);
+      expect(target.color.some((c) => c === POS_GREY)).toBe(false);
     } finally {
       resetCVars();
     }
   });
 
-  it('cl_showpos renders as a checkbox (cl_showfps keeps its select)', () => {
-    expect(cvarIsCheckbox('cl_showpos')).toBe(true);
+  it('every boolean cvar renders as a checkbox (no 0/1 selects left)', () => {
+    for (const name of CHECKBOX_CVARS) {
+      expect(cvarIsCheckbox(name)).toBe(true);
+      expect(cvarControlKind(name)).toBe('checkbox');
+    }
     expect(cvarControlKind('cl_showpos')).toBe('checkbox');
-    expect(cvarControlKind('cl_showfps')).toBe('select');
+    expect(cvarControlKind('cl_showfps')).toBe('checkbox');
+    expect(cvarControlKind('vd_dither')).toBe('checkbox');
+    expect(cvarControlKind('r_drawworld')).toBe('checkbox');
+    expect(cvarControlKind('cl_predict')).toBe('checkbox');
+    // Non-booleans keep their controls.
+    expect(cvarControlKind('sw_workers')).toBe('select');
+    expect(cvarControlKind('r_brightness')).toBe('select');
+    expect(cvarControlKind('vd_gamma')).toBe('select');
+  });
+
+  it('every menu row carries an on-hover description (tooltip source: cvar docs)', () => {
+    for (const name of CHECKBOX_CVARS) {
+      expect(cvarDescription(name).length).toBeGreaterThan(0);
+    }
+    expect(cvarDescription('cl_showpos')).toContain('pos X Y Z');
+    expect(cvarDescription('vd_dither')).toContain('dither');
+    expect(cvarDescription('r_drawworld')).toContain('world geometry');
+    expect(cvarDescription('cl_predict')).toContain('10Hz');
+    expect(cvarDescription('no_such_cvar')).toBe('');
   });
 
   it('checkbox toggles the cvar via element-local change (never document mouse)', () => {
@@ -195,6 +216,57 @@ describe('player position readout (in-canvas conchars, top-left, cl_showpos)', (
       box.dispatch('change');
       expect(getCVarNumber('cl_showpos')).toBe(1);
       expect(seen).toContainEqual(['cl_showpos', '1']);
+    } finally {
+      (globalThis as unknown as { document?: unknown }).document = prev;
+    }
+  });
+
+  it('toggling ANY checkbox fires nothing, requests no lock, leaves no listeners', () => {
+    const { doc, prev } = install();
+    try {
+      resetCVars();
+      const container = new FakeContainer();
+      const seen: Array<[string, string]> = [];
+      const names = renderCvarPanel(container, '', (n, v) => seen.push([n, v]));
+      for (const name of CHECKBOX_CVARS) {
+        if (!names.includes(name)) continue; // lazily registered: pinned statically above
+        const row = container.children.find((r) => r.children[0]?.textContent === name);
+        expect(row).toBeDefined();
+        const box = row!.children[1]!;
+        expect(box.type).toBe('checkbox');
+        const initial = getCVarString(name);
+        const flipped = initial === '1' ? '0' : '1';
+        box.checked = flipped === '1';
+        box.dispatch('change');
+        expect(getCVarString(name)).toBe(flipped);
+        expect(seen).toContainEqual([name, flipped]);
+        // Restore the pre-test value (no resetCVars: it would unregister
+        // lazily-registered span switches in this headless env).
+        box.checked = initial === '1';
+        box.dispatch('change');
+        expect(getCVarString(name)).toBe(initial);
+      }
+      // Still no document-level wiring of any kind: no mousedown/click that
+      // could become +attack, no pointer-lock request path from the panel.
+      for (const type of ['mousedown', 'mouseup', 'click', 'pointerlockchange', 'mousemove']) {
+        expect(doc.docListeners.get(type) ?? []).toHaveLength(0);
+      }
+    } finally {
+      (globalThis as unknown as { document?: unknown }).document = prev;
+    }
+  });
+
+  it('checkbox rows expose their description as a title tooltip', () => {
+    const { prev } = install();
+    try {
+      resetCVars();
+      const container = new FakeContainer();
+      renderCvarPanel(container, '', () => undefined);
+      const row = container.children.find((r) => r.children[0]?.textContent === 'cl_showpos');
+      expect(row).toBeDefined();
+      expect((row as unknown as { title?: string }).title).toContain('pos X Y Z');
+      expect((row!.children[0] as unknown as { title?: string }).title).toContain('pos X Y Z');
+      expect((row!.children[1] as unknown as { title?: string }).title).toContain('pos X Y Z');
     } finally {
       (globalThis as unknown as { document?: unknown }).document = prev;
     }
