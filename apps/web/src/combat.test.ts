@@ -199,8 +199,11 @@ describe.runIf(!!WEB_Q2_PAK)('per-skin soldier rendering (real pak, Q2_PAK)', ()
   it('monsters render with their per-skin handles (light ≠ shotgun)', { timeout: 180000 }, async () => {
     const boot = await bootPak();
     const { driver, host } = boot;
-    const light = driver.monsters.find((m) => m.edict.extra['skinnum'] === '0')!;
-    const plain = driver.monsters.find((m) => m.edict.extra['skinnum'] === '2')!;
+    // Awake bodies only: the dormant t55 pair is SVF_NOCLIENT until the
+    // shotgun pickup wakes it (not in the snapshot before then).
+    const awake = driver.monsters.filter((m) => !(m.triggered && !m.woken));
+    const light = awake.find((m) => m.edict.extra['skinnum'] === '0')!;
+    const plain = awake.find((m) => m.edict.extra['skinnum'] === '2')!;
     expect(light).toBeDefined();
     expect(plain).toBeDefined();
     // Exercise the snapshot→Host path (frames + origins flow as before).
@@ -209,5 +212,42 @@ describe.runIf(!!WEB_Q2_PAK)('per-skin soldier rendering (real pak, Q2_PAK)', ()
     expect(snap.entities.some((e) => e.id === plain.edict.num)).toBe(true);
     const stats = host.frame(100);
     expect(stats.pixels).toBeGreaterThan(0);
+  });
+
+  it('infantry renders on the infantry mesh, not the soldier mesh', { timeout: 180000 }, async () => {
+    const boot = await bootPak();
+    const { driver } = boot;
+    const models = boot.models!;
+    // Skill 1 spawns 3 base1 infantries; all render their own MD2 + skin.
+    const infantries = driver.monsters.filter((m) => m.state.kind === 'infantry');
+    expect(infantries.length).toBeGreaterThan(0);
+    expect(models.infantry).toBeGreaterThanOrEqual(0);
+    expect(models.infantry).not.toBe(models.monster);
+    for (const inf of infantries) {
+      expect(driver.entityModel(inf.edict.num)).toEqual({ model: models.infantry, skin: models.infantrySkin });
+      // Infantry frame numbers play on the infantry mesh (the old fallback
+      // read them as soldier frames — wrong poses on the wrong skeleton).
+      expect(driver.entityFrame(inf.edict.num)).toBeGreaterThanOrEqual(0);
+    }
+    // Soldier contract intact: mesh handle 0, per-skin skins.
+    const plain = driver.monsters.find((m) => m.edict.extra['skinnum'] === '2')!;
+    expect(driver.entityModel(plain.edict.num)).toEqual({ model: models.monster, skin: models.monsterSkin });
+  });
+});
+
+describe('dormant monsters stay out of the snapshot (SVF_NOCLIENT)', () => {
+  it('triggered-unwoken bodies are not submitted; waking re-submits them', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    const m = SV_SpawnMonster(driver.server, 'monster_soldier', v3(32, 100, 24));
+    m.triggered = true;
+    m.woken = false;
+    m.seen = false;
+    let snap = driver.snapshot(driver.server.time);
+    expect(snap.entities.some((e) => e.id === m.edict.num)).toBe(false);
+    expect(driver.entityFrame(m.edict.num)).toBeGreaterThanOrEqual(0); // frame math still safe
+    driver.server.monsters.find((x) => x.edict.num === m.edict.num)!.woken = true;
+    snap = driver.snapshot(driver.server.time);
+    expect(snap.entities.some((e) => e.id === m.edict.num)).toBe(true);
   });
 });

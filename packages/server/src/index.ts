@@ -195,6 +195,8 @@ export const SPAWNFLAG_NOT_EASY = 256;
 export const SPAWNFLAG_NOT_MEDIUM = 512;
 export const SPAWNFLAG_NOT_HARD = 1024;
 export const SPAWNFLAG_NOT_DEATHMATCH = 2048;
+/** id g_local.h: Touch_Item fired the item's targets (set on first take). */
+export const ITEM_TARGETS_USED = 0x00040000;
 export const SPAWNFLAG_NOT_COOP = 4096;
 
 /**
@@ -480,6 +482,8 @@ export interface ServerMonster {
   ambush: boolean;
   /** spawnflags & 2: triggered — dormant until used (monster_triggered_start). */
   triggered: boolean;
+  /** monster_triggered_spawn ran (solid, visible, thinking). */
+  woken: boolean;
   /** latched the first tick with line of sight (ambush acquire). */
   seen: boolean;
 }
@@ -915,6 +919,7 @@ export function SV_SpawnEntities(
         kind,
         ambush: (e.spawnflags & 1) !== 0,
         triggered: (e.spawnflags & 2) !== 0,
+        woken: false,
         seen: false,
       };
       st.monsters.push(monster);
@@ -962,6 +967,30 @@ export function SV_SpawnEntities(
   return out;
 }
 
+/**
+ * id G_UseTargets on a monster edict (g_monster.c): TRIGGER_SPAWN bodies
+ * wake via monster_triggered_spawn_use (solid + visible + thinking next
+ * frame; the activator becomes the enemy unless ambush holds it), while a
+ * live non-triggered monster answers monster_use by acquiring the activator
+ * (seen latches so it attacks/pursues instead of idling). Dead/gibbed
+ * bodies ignore uses. `byPlayer` marks a client activator (pickup/death
+ * chains in this sim are always player-caused; doors/buttons pass false).
+ */
+export function SV_UseMonster(m: ServerMonster, byPlayer: boolean): void {
+  if (m.state.gibbed || m.state.dead) return;
+  if (m.triggered && !m.woken) {
+    // monster_triggered_start -> monster_triggered_spawn_use: one frame
+    // delay in C before think resumes (nextthink = level.time + FRAMETIME);
+    // the lite sim wakes immediately (think runs next tick anyway).
+    m.woken = true;
+    // monster_triggered_spawn: non-ambush FoundTarget (acquire now), ambush
+    // keeps enemy NULL and waits for line of sight.
+    if (byPlayer && !m.ambush) m.seen = true;
+    return;
+  }
+  if (!m.triggered && byPlayer) m.seen = true;
+}
+
 /** Fire a "use" on every entity with the given targetname (button/trigger path). */
 export function SV_UseTargetname(st: ServerState, targetname: string): void {
   for (const m of st.movers) {
@@ -969,6 +998,9 @@ export function SV_UseTargetname(st: ServerState, targetname: string): void {
   }
   for (const tr of st.trains) {
     if (tr.ent.targetname === targetname) startTrain(tr, st.time);
+  }
+  for (const m of st.monsters) {
+    if (!m.edict.freed && m.edict.targetname === targetname) SV_UseMonster(m, true);
   }
   for (const e of st.entities) {
     if (e.targetname === targetname && e.classname === 'trigger_relay') {
@@ -1004,6 +1036,12 @@ export const MAX_USETARGETS_DEPTH = 16;
 /** G_UseTargets equivalent: use every entity targeted by `user`. */
 export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
   if (!user.target || depth > MAX_USETARGETS_DEPTH) return;
+  for (const m of st.monsters) {
+    // G_UseTargets reaches monster edicts by targetname: TRIGGER_SPAWN
+    // bodies wake (monster_triggered_spawn_use), live others alert
+    // (monster_use). Movers/trains/relays keep their branches below.
+    if (!m.edict.freed && m.edict.targetname === user.target) SV_UseMonster(m, true);
+  }
   for (const e of st.entities) {
     if (e.freed || e.targetname !== user.target) continue;
     st.firedThisTick.push(e.targetname);
@@ -1269,7 +1307,7 @@ export function SV_MonsterTick(
   const sightTrace = opts?.sightTrace ?? trace;
   const playerView = opts?.playerViewheight ?? PLAYER_VIEWHEIGHT;
   for (const m of st.monsters) {
-    if (m.triggered || m.kind === null) continue;
+    if (m.kind === null || (m.triggered && !m.woken)) continue;
     const ms: MonsterState = m.state;
     if (ms.gibbed) continue;
     if (ms.dead) {
@@ -1418,6 +1456,14 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
  * DoRespawn. `delay` overrides the id table; `now` defaults to level.time.
  */
 export function SV_ConsumePickup(st: ServerState, ent: Edict, delay?: number, now?: number): number {
+  // id Touch_Item: a successful grab fires the item's target once
+  // (G_UseTargets, ITEM_TARGETS_USED) — base1's shotgun fires t55, waking
+  // the two TRIGGER_SPAWN soldiers. The NOT_* strip at spawn never touches
+  // this bit, and nothing clears it, so re-takes after DoRespawn stay quiet.
+  if (ent.target && !(ent.spawnflags & ITEM_TARGETS_USED)) {
+    ent.spawnflags |= ITEM_TARGETS_USED;
+    fireTargets(st, ent);
+  }
   const t = now ?? st.time;
   const d = delay ?? respawnDelayFor(ent.classname);
   return SetRespawn(ent, d, t);
@@ -1679,6 +1725,7 @@ export function SV_SpawnMonster(
     kind,
     ambush: false,
     triggered: false,
+    woken: true,
     seen: true,
   };
   if (kind === 'soldier') {
@@ -1747,7 +1794,16 @@ export function SV_DamageMonster(
   damage: number,
   rand: () => number,
 ): 'gib' | 'dead' | 'pain' | 'none' {
+  const wasAlive = !m.state.dead && !m.state.gibbed;
   const res = monsterPain(m.state, damage, rand);
+  if ((res === 'dead' || res === 'gib') && wasAlive && m.edict.target) {
+    // id monster_death_use: a dying monster fires its target (with the
+    // enemy as activator) — the t39 -> t40 relay in base1 wakes/alerts the
+    // next ambush. Fires once, on the fresh transition (corpse re-hits
+    // return 'dead' again but must not re-fire); item drops (self->item)
+    // are skipped — no base1 monster carries one.
+    fireTargets(st, m.edict);
+  }
   if (res === 'gib') {
     st.sounds.push({ name: GIB_SOUND, pos: v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]), born: st.time });
     const kinds: ServerGib['kind'][] = ['meat', 'meat', 'meat', 'chest', 'head'];
@@ -1881,7 +1937,7 @@ export function SV_RadiusDamage(
   if (!(radius > 0)) return;
   const canDamage = (target: Vec3): boolean => trace(pos, ZERO_HULL, ZERO_HULL, target).fraction >= 1;
   for (const m of st.monsters) {
-    if (m.state.dead || m.state.gibbed) continue;
+    if (m.state.dead || m.state.gibbed || (m.triggered && !m.woken)) continue;
     const cx = m.edict.origin[0]! + (MONSTER_HULL_MINS[0]! + MONSTER_HULL_MAXS[0]!) / 2;
     const cy = m.edict.origin[1]! + (MONSTER_HULL_MINS[1]! + MONSTER_HULL_MAXS[1]!) / 2;
     const cz = m.edict.origin[2]! + (MONSTER_HULL_MINS[2]! + MONSTER_HULL_MAXS[2]!) / 2;
@@ -2117,6 +2173,68 @@ function resolveMonsterFire(
 }
 
 /**
+ * Nearest-hit bias for the touch resolution (id SV_ClipMoveToEntities ties
+ * go to the world). Shared by the sky gate and the impact resolver so both
+ * agree on who wins the step.
+ */
+const TOUCH_EPS = 1e-6;
+
+interface BoltSweep {
+  tPlayer: number | null;
+  tMonster: number | null;
+  hitMonster: ServerMonster | null;
+  tBarrel: number | null;
+  hb: ServerBarrel | null;
+}
+
+/**
+ * Sweep one bolt step against linked edicts (SV_ClipMoveToEntities half of
+ * the C touch): nearest player-box hit for foe bolts, nearest monster +
+ * barrel for player bolts. Dormant TRIGGER_SPAWN monsters are SOLID_NOT in
+ * C and skip until woken; gibbed bodies are gone; corpses stay hittable.
+ */
+function sweepBoltEntities(st: ServerState, bolt: ServerBolt, player: SVPlayerBody, seg: Vec3): BoltSweep {
+  let tPlayer: number | null = null;
+  if (bolt.foe) {
+    // Soldier return fire: test the player box.
+    const pmins = v3(player.pos[0]! + player.mins[0]!, player.pos[1]! + player.mins[1]!, player.pos[2]! + player.mins[2]!);
+    const pmaxs = v3(player.pos[0]! + player.maxs[0]!, player.pos[1]! + player.maxs[1]!, player.pos[2]! + player.maxs[2]!);
+    tPlayer = segmentAabbSeg(bolt.pos, seg, pmins, pmaxs);
+  }
+  let hitMonster: ServerMonster | null = null;
+  let tMonster: number | null = null;
+  if (!bolt.foe) {
+    for (const m of st.monsters) {
+      if (m.state.gibbed || (m.triggered && !m.woken)) continue;
+      const tHit = segmentAabbSeg(
+        bolt.pos, seg,
+        v3(m.edict.origin[0]! + MONSTER_HULL_MINS[0]!, m.edict.origin[1]! + MONSTER_HULL_MINS[1]!, m.edict.origin[2]! + MONSTER_HULL_MINS[2]!),
+        v3(m.edict.origin[0]! + MONSTER_HULL_MAXS[0]!, m.edict.origin[1]! + MONSTER_HULL_MAXS[1]!, m.edict.origin[2]! + MONSTER_HULL_MAXS[2]!),
+      );
+      if (tHit !== null && (tMonster === null || tHit < tMonster)) {
+        tMonster = tHit;
+        hitMonster = m;
+      }
+    }
+  }
+  let hb: ServerBarrel | null = null;
+  let tBarrel: number | null = null;
+  if (!bolt.foe) {
+    for (const b of st.barrels) {
+      if (b.edict.freed) continue;
+      const tHit = b.isFunc
+        ? segmentAabbSeg(bolt.pos, seg, v3(b.origin[0]! - b.size[0]! / 2, b.origin[1]! - b.size[1]! / 2, b.origin[2]! - b.size[2]! / 2), v3(b.origin[0]! + b.size[0]! / 2, b.origin[1]! + b.size[1]! / 2, b.origin[2]! + b.size[2]! / 2))
+        : segmentAabbSeg(bolt.pos, seg, v3(b.origin[0]! + EXPLOBOX_MINS[0]!, b.origin[1]! + EXPLOBOX_MINS[1]!, b.origin[2]! + EXPLOBOX_MINS[2]!), v3(b.origin[0]! + EXPLOBOX_MAXS[0]!, b.origin[1]! + EXPLOBOX_MAXS[1]!, b.origin[2] + EXPLOBOX_MAXS[2]!));
+      if (tHit !== null && (tBarrel === null || tHit < tBarrel)) {
+        tBarrel = tHit;
+        hb = b;
+      }
+    }
+  }
+  return { tPlayer, tMonster, hitMonster, tBarrel, hb };
+}
+
+/**
  * Step flying blaster bolts. Life expires on SERVER time (G_FreeEdict at
  * level.time + 2); movement integrates the tick quantum. Foe bolts test the
  * player box and damage the player; player bolts test monsters first, then
@@ -2140,14 +2258,27 @@ function stepBoltFlight(
       bolt.pos[2]! + bolt.dir[2]! * stepLen,
     );
     // EF_BLASTER trail (cl_fx.c CL_BlasterTrail): yellow puffs every ~5u.
-    // The wall trace runs FIRST: a SURF_SKY hit (g_weapon.c blaster_touch
-    // sky gate) frees the bolt with no trail, no explosion, no dlight and
-    // no sound — fully silent. Wall hits keep the legacy order (trail puffs
-    // lay down to the impact point, then the flash detonates).
+    // Touch order (g_phys.c SV_Physics_FlyMissile + SV_ClipMoveToEntities):
+    // id traces the step against the world AND linked edicts together and
+    // resolves the NEAREST hit — the old wall-first order detonated on any
+    // wall inside the 100u step even when a barrel or monster stood closer
+    // along the same segment (blaster could not kill barrels backed by a
+    // wall, and foe bolts fizzled on doorframes past the player). The sky
+    // gate (g_weapon.c blaster_touch) still frees silently, but only when
+    // the wall actually wins the step: an edict in front of a sky face
+    // still takes the hit, like C's tr.ent short-circuiting the surf check.
     let dead = st.time - bolt.born >= bolt.life;
     const wall = dead ? null : trace(bolt.pos, ZERO_HULL, ZERO_HULL, next);
+    const seg = v3(next[0]! - bolt.pos[0]!, next[1]! - bolt.pos[1]!, next[2]! - bolt.pos[2]!);
+    const sweep = sweepBoltEntities(st, bolt, player, seg);
     if (!dead && wall && wall.fraction < 1 && traceHitSky(wall)) {
-      dead = true;
+      // Sky frees only when no edict beats the wall to the hit.
+      const tWall = wall.fraction;
+      const beaten =
+        (sweep.tPlayer !== null && sweep.tPlayer < tWall - TOUCH_EPS) ||
+        (sweep.tMonster !== null && sweep.tMonster < tWall - TOUCH_EPS) ||
+        (sweep.tBarrel !== null && sweep.tBarrel < tWall - TOUCH_EPS);
+      if (!beaten) dead = true;
     }
     if (dead) {
       st.bolts.splice(i, 1);
@@ -2169,81 +2300,47 @@ function stepBoltFlight(
       });
     }
     {
-      // Wall touch (g_weapon.c blaster_touch): everything non-sky detonates
-      // via SV_BlasterImpact.
-      if (wall!.fraction < 1) {
+      // Nearest wins; ties fall through to the wall (the bolt face-plants
+      // rather than phasing into the edict), matching the C trace bias.
+      const tWall = wall!.fraction;
+      const { tPlayer, tMonster, hitMonster, tBarrel, hb } = sweep;
+      const eps = TOUCH_EPS;
+      if (tPlayer !== null && tPlayer < tWall - eps && (tMonster === null || tPlayer <= tMonster) && (tBarrel === null || tPlayer <= tBarrel)) {
+        const hitPos = v3(bolt.pos[0]! + seg[0]! * tPlayer, bolt.pos[1]! + seg[1]! * tPlayer, bolt.pos[2]! + seg[2]! * tPlayer);
+        SV_BlasterImpact(st, hitPos, bolt.damage, null, rand);
+        if (st.playerHealth > 0) {
+          SV_DamagePlayer(st, bolt.damage);
+          st.sparks.push({
+            pos: v3(player.pos[0], player.pos[1], player.pos[2]! + player.view),
+            color: 200 + ((rand() * 55) | 0),
+            vel: null,
+            ttl: SV_SPARK_TTL,
+            born: st.time,
+          });
+        }
+        dead = true;
+      } else if (hitMonster !== null && tMonster !== null && tMonster < tWall - eps && (tBarrel === null || tMonster <= tBarrel)) {
         const hitPos = v3(
-          bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * wall!.fraction,
-          bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * wall!.fraction,
-          bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * wall!.fraction,
+          bolt.pos[0]! + seg[0]! * tMonster,
+          bolt.pos[1]! + seg[1]! * tMonster,
+          bolt.pos[2]! + seg[2]! * tMonster,
+        );
+        SV_BlasterImpact(st, hitPos, bolt.damage, hitMonster, rand);
+        dead = true;
+      } else if (hb !== null && tBarrel !== null && tBarrel < tWall - eps) {
+        SV_DamageBarrel(st, hb, bolt.damage);
+        SV_BlasterImpact(st, v3(hb.origin[0], hb.origin[1], hb.origin[2]), bolt.damage, null, rand);
+        dead = true;
+      } else if (tWall < 1) {
+        // Wall touch (g_weapon.c blaster_touch): everything non-sky
+        // detonates via SV_BlasterImpact.
+        const hitPos = v3(
+          bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * tWall,
+          bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * tWall,
+          bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * tWall,
         );
         SV_BlasterImpact(st, hitPos, bolt.damage, null, rand);
         dead = true;
-      } else if (bolt.foe) {
-        // Soldier return fire: test the player box.
-        const seg = v3(next[0]! - bolt.pos[0]!, next[1]! - bolt.pos[1]!, next[2]! - bolt.pos[2]!);
-        const pmins = v3(player.pos[0]! + player.mins[0]!, player.pos[1]! + player.mins[1]!, player.pos[2]! + player.mins[2]!);
-        const pmaxs = v3(player.pos[0]! + player.maxs[0]!, player.pos[1]! + player.maxs[1]!, player.pos[2]! + player.maxs[2]!);
-        const tHit = segmentAabbSeg(bolt.pos, seg, pmins, pmaxs);
-        if (tHit !== null) {
-          const hitPos = v3(bolt.pos[0]! + seg[0]! * tHit, bolt.pos[1]! + seg[1]! * tHit, bolt.pos[2]! + seg[2]! * tHit);
-          SV_BlasterImpact(st, hitPos, bolt.damage, null, rand);
-          if (st.playerHealth > 0) {
-            SV_DamagePlayer(st, bolt.damage);
-            st.sparks.push({
-              pos: v3(player.pos[0], player.pos[1], player.pos[2]! + player.view),
-              color: 200 + ((rand() * 55) | 0),
-              vel: null,
-              ttl: SV_SPARK_TTL,
-              born: st.time,
-            });
-          }
-          dead = true;
-        }
-      } else {
-        // Flesh touch: monsters first (T_Damage ENERGY), then barrels.
-        const seg = v3(next[0]! - bolt.pos[0]!, next[1]! - bolt.pos[1]!, next[2]! - bolt.pos[2]!);
-        let hitMonster: ServerMonster | null = null;
-        let bestT = 1;
-        for (const m of st.monsters) {
-          if (m.state.gibbed) continue;
-          const tHit = segmentAabbSeg(
-            bolt.pos, seg,
-            v3(m.edict.origin[0]! + MONSTER_HULL_MINS[0]!, m.edict.origin[1]! + MONSTER_HULL_MINS[1]!, m.edict.origin[2]! + MONSTER_HULL_MINS[2]!),
-            v3(m.edict.origin[0]! + MONSTER_HULL_MAXS[0]!, m.edict.origin[1]! + MONSTER_HULL_MAXS[1]!, m.edict.origin[2]! + MONSTER_HULL_MAXS[2]!),
-          );
-          if (tHit !== null && tHit < bestT) {
-            bestT = tHit;
-            hitMonster = m;
-          }
-        }
-        if (hitMonster) {
-          const hitPos = v3(
-            bolt.pos[0]! + seg[0]! * bestT,
-            bolt.pos[1]! + seg[1]! * bestT,
-            bolt.pos[2]! + seg[2]! * bestT,
-          );
-          SV_BlasterImpact(st, hitPos, bolt.damage, hitMonster, rand);
-          dead = true;
-        } else {
-          let hb: ServerBarrel | null = null;
-          let bt = 1;
-          for (const b of st.barrels) {
-            if (b.edict.freed) continue;
-            const tHit = b.isFunc
-              ? segmentAabbSeg(bolt.pos, seg, v3(b.origin[0]! - b.size[0]! / 2, b.origin[1]! - b.size[1]! / 2, b.origin[2]! - b.size[2]! / 2), v3(b.origin[0]! + b.size[0]! / 2, b.origin[1]! + b.size[1]! / 2, b.origin[2]! + b.size[2]! / 2))
-              : segmentAabbSeg(bolt.pos, seg, v3(b.origin[0]! + EXPLOBOX_MINS[0]!, b.origin[1]! + EXPLOBOX_MINS[1]!, b.origin[2]! + EXPLOBOX_MINS[2]!), v3(b.origin[0]! + EXPLOBOX_MAXS[0]!, b.origin[1]! + EXPLOBOX_MAXS[1]!, b.origin[2] + EXPLOBOX_MAXS[2]!));
-            if (tHit !== null && tHit < bt) {
-              bt = tHit;
-              hb = b;
-            }
-          }
-          if (hb && !hb.edict.freed) {
-            SV_DamageBarrel(st, hb, bolt.damage);
-            SV_BlasterImpact(st, v3(hb.origin[0], hb.origin[1], hb.origin[2]), bolt.damage, null, rand);
-            dead = true;
-          }
-        }
       }
     }
     if (dead) st.bolts.splice(i, 1);
@@ -2306,7 +2403,7 @@ function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
   const rand = game.rand ?? Math.random;
   // Monsters use doors (Touch_DoorTrigger; NOMONSTER sliders ignore them).
   for (const m of st.monsters) {
-    if (m.state.dead || m.state.gibbed || m.triggered || m.kind === null) continue;
+    if (m.state.dead || m.state.gibbed || (m.triggered && !m.woken) || m.kind === null) continue;
     SV_TouchDoorsAt(st, { origin: m.edict.origin, mins: MONSTER_HULL_MINS, maxs: MONSTER_HULL_MAXS }, 'monster');
   }
   // Think + C-cadence return fire (damage, bolts, tracers, muzzles, sounds).
@@ -2525,9 +2622,10 @@ export function SV_PlayerFire(
     let hitMonster: ServerMonster | null = null;
     const seg = v3(far[0]! - opts.eye[0]!, far[1]! - opts.eye[1]!, far[2]! - opts.eye[2]!);
     for (const m of st.monsters) {
-      if (m.state.gibbed) continue;
+      if (m.state.gibbed || (m.triggered && !m.woken)) continue;
       // No dead-skip: corpses stay hittable (takedamage YES) so re-hitting
-      // them minces (g_combat.c T_Damage gib-first ordering).
+      // them minces (g_combat.c T_Damage gib-first ordering). Dormant
+      // TRIGGER_SPAWN bodies skip (SOLID_NOT until woken).
       const tHit = segmentAabbSeg(
         opts.eye, seg,
         v3(m.edict.origin[0]! + MONSTER_HULL_MINS[0]!, m.edict.origin[1]! + MONSTER_HULL_MINS[1]!, m.edict.origin[2]! + MONSTER_HULL_MINS[2]!),

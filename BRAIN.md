@@ -1092,6 +1092,11 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - explosions (additive frozen-contract evolution); in-canvas fps; renderer
 - hot-swap (no reboot); machinegun per-shot kick walk; melee/grenade real
 - sounds (`melee2.wav`, grenade attack).
+- CLOSED 2026-10-26 (touch regressions): bolt nearest-wins (wall no longer
+- shadows edicts in the same step — all 9 exploboxes die to the blaster);
+- TRIGGER_SPAWN wake/use chains (pickup targets once, death fires target,
+- dormant bodies SVF_NOCLIENT-until-woken — the t55 shotgun trap works);
+- infantry renders on its own MD2/skin (not the soldier mesh).
 - OPEN (next push): full monster AI depth — player-trail pursuit around
 - corners, M_CheckAttack chance/as-state table, soldier duck, combat points,
 - skill-scaled aggression (the bigger M5.3 job); func_door_secret / rotating

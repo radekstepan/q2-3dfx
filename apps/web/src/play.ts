@@ -72,6 +72,7 @@ import {
   SV_TraceFor,
   SV_ClipTrace,
   SV_PlayerFire,
+  SV_UseTargetname,
   SV_DamagePlayer,
   SV_SetPlayerHealth,
   SV_DrainMuzzles,
@@ -1039,9 +1040,11 @@ export class LocalDriver implements HostDriver {
     ];
     // Server-authoritative monsters (Phase 0 single sim): corpses persist
     // (id keeps the dead edict rendering its last death frame); gibbed
-    // bodies (DEAD_DEAD) leave the snapshot.
+    // bodies (DEAD_DEAD) leave the snapshot. Dormant TRIGGER_SPAWN bodies
+    // are SVF_NOCLIENT in C (monster_triggered_start) and stay out until
+    // a use wakes them.
     for (const m of this.server.monsters) {
-      if (m.state.gibbed) continue;
+      if (m.state.gibbed || (m.triggered && !m.woken)) continue;
       entities.push({
         id: m.edict.num,
         origin: [m.edict.origin[0]!, m.edict.origin[1]!, m.edict.origin[2]!],
@@ -1446,6 +1449,10 @@ export class LocalDriver implements HostDriver {
     const m = this.server.monsters.find((m) => m.edict.num === id);
     if (!m || !this.models) return null;
     if (m.state.kind === 'gunner') return { model: this.models.gunner, skin: this.models.gunnerSkin };
+    // Infantry renders its own MD2 (m_infantry.c frames); falling back to
+    // the soldier mesh here played infantry frame numbers on soldier
+    // geometry (wrong-pose reports) — the handles above fix that.
+    if (m.state.kind === 'infantry') return { model: this.models.infantry, skin: this.models.infantrySkin };
     return { model: this.models.monster, skin: this.soldierSkinFor(this.monsterSkin(m)) };
   }
 
@@ -1653,6 +1660,14 @@ export class LocalDriver implements HostDriver {
       if (!res.picked) continue;
       e.freed = true;
       healed = true;
+      // id Touch_Item: a successful grab fires the item's target once
+      // (G_UseTargets, ITEM_TARGETS_USED) — base1's shotgun fires t55 and
+      // wakes the two TRIGGER_SPAWN soldiers. Once-ever per edict (the
+      // server tracks the same bit on its path via SV_ConsumePickup).
+      if (e.target && e.extra['targetsUsed'] === undefined) {
+        e.extra['targetsUsed'] = '1';
+        SV_UseTargetname(this.server, e.target);
+      }
       this.syncAmmo();
       this.events.push('pickup');
       this.message = c.replace(/_/g, ' ');
@@ -2246,7 +2261,7 @@ export interface PlayBoot {
  * the HostDriver viewModel contract, and the 2D silhouette is skipped when
  * a pak view model is registered (see usesViewModel3D).
  * Until per-kind model selection lands, every monster renders as the
- * soldier mesh/skin. Per-file fallback is the box-critter so one corrupt
+ * soldier mesh/skin (gunner + infantry resolve to their own MD2/skins). Per-file fallback is the box-critter so one corrupt
  * lump can never shift later handles or break the boot.
  */
 export interface PakModelHandles {
@@ -2261,6 +2276,10 @@ export interface PakModelHandles {
   gunner: number;
   /** PCX skin handle for the gunner MD2. */
   gunnerSkin: number;
+  /** Infantry MD2 (monster_infantry; appended after gunner, same rule). */
+  infantry: number;
+  /** PCX skin handle for the infantry MD2. */
+  infantrySkin: number;
   weapons: Record<string, number>;
   /** PCX skin handle per weapon classname (parallel to `weapons`). */
   weaponSkins: Record<string, number>;
@@ -2348,6 +2367,8 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
   const soldierSsSkin = loadSkin('models/monsters/soldier/skin_ss.pcx');
   const gunnerSkin = loadSkin(skinForMonster('gunner'));
   const gunner = loadModel(modelForMonster('gunner'));
+  const infantrySkin = loadSkin(skinForMonster('infantry'));
+  const infantry = loadModel(modelForMonster('infantry'));
   const weapons: Record<string, number> = {};
   const weaponSkins: Record<string, number> = {};
   for (const cls of ['weapon_blaster', 'weapon_shotgun', 'weapon_machinegun']) {
@@ -2407,7 +2428,7 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
   const bannerSkin = loadSkin(BANNER_SKIN);
   const banner = loadModel(BANNER_MODEL);
   return {
-    monster, monsterSkin, soldierLightSkin, soldierSsSkin, gunner, gunnerSkin, weapons, weaponSkins, bolt, boltSkin, barrel, barrelSkin,
+    monster, monsterSkin, soldierLightSkin, soldierSsSkin, gunner, gunnerSkin, infantry, infantrySkin, weapons, weaponSkins, bolt, boltSkin, barrel, barrelSkin,
     explode, explodeSkin, blast, blastSkin,
     debris1, debris1Skin, debris2, debris2Skin, debris3, debris3Skin,
     gibMeat, gibMeatSkin, gibChest, gibChestSkin, gibBone, gibBoneSkin, gibHead, gibHeadSkin,

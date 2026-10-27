@@ -12,8 +12,11 @@
 //   (c) a touched door renders open then re-closes when clear,
 //   (d) the stair-secret drop stays in-bounds on the deck,
 //   (e) point-blank blaster TTK on a soldier is <= 4 hits at skill 1,
-//   (f) skill-change reboot re-filters the roster (3/5/3 infantry, 17/19/17),
+//   (f) skill-change reboot re-filters the roster (3/5/3 infantry, 15/17/15
+//       submitted — the dormant t55 pair is SVF_NOCLIENT until woken),
 //   (g) doors + glass render CLOSED at spawn (the graft).
+//   (h) shotgun pickup wakes the t55 TRIGGER_SPAWN pair (Touch_Item target),
+//       which the snapshot then carries as it closes on the player.
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { resetCVars, setCVar } from '@q2/config';
 import type { UserCmdT } from '@q2/input';
@@ -228,7 +231,10 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     const boot = await bootBase1();
     const { driver } = boot;
     expect(driver.server.skill).toBe(1);
-    const target = driver.server.monsters.find((m) => m.edict.extra['skinnum'] === '2')!;
+    // Point-blank target must be awake: dormant TRIGGER_SPAWN bodies are
+    // SOLID_NOT in C (unhittable until a use wakes them) — the t55 soldier
+    // is skin 2 but dormant, so it no longer counts as a target.
+    const target = driver.server.monsters.find((m) => m.edict.extra['skinnum'] === '2' && !(m.triggered && !m.woken))!;
     driver.pm.origin = v3(target.edict.origin[0]! + 48, target.edict.origin[1]!, target.edict.origin[2]! + 24);
     driver.pm.velocity = v3();
     const yaw = yawAt(
@@ -251,7 +257,7 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect(driver.entityFrame(target.edict.num)).toBeGreaterThan(0);
   });
 
-  it('(f) skill-change reboot re-filters the roster (3/5/3 infantry, 17/19/17)', { timeout: 180000 }, async () => {
+  it('(f) skill-change reboot re-filters the roster (3/5/3 infantry, 15/17/15)', { timeout: 180000 }, async () => {
     const infantry = (boot: { driver: { server: { entities: { classname: string }[] } } }): number =>
       boot.driver.server.entities.filter((e) => e.classname === 'monster_infantry').length;
     const snapMonsters = (boot: { driver: { snapshot(t: number): { entities: unknown[] }; server: { time: number } } }): number =>
@@ -260,7 +266,9 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     const easy = await bootBase1();
     expect(easy.driver.server.skill).toBe(0);
     expect(infantry(easy)).toBe(3);
-    expect(snapMonsters(easy)).toBe(17); // submitted roster, not just spawn lists
+    // 15 submitted: the dormant t55 pair stays out (SVF_NOCLIENT) until the
+    // shotgun pickup wakes it — the old 17 counted two unshootable statues.
+    expect(snapMonsters(easy)).toBe(15);
     // "Change the dropdown": the menu sets the cvar and re-calls the boot
     // path (rebootPlay), so the new skill applies to this level immediately.
     setCVar('skill', 2);
@@ -268,13 +276,13 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect(hard.pak).not.toBeNull();
     expect(hard.driver.server.skill).toBe(2);
     expect(infantry(hard)).toBe(5);
-    expect(snapMonsters(hard)).toBe(19);
+    expect(snapMonsters(hard)).toBe(17);
     // And back down: the roster re-filters the other way too.
     setCVar('skill', 1);
     const med = rebootPlay(hard);
     expect(med.driver.server.skill).toBe(1);
     expect(infantry(med)).toBe(3);
-    expect(snapMonsters(med)).toBe(17);
+    expect(snapMonsters(med)).toBe(15);
   });
 
   it('(g) doors + glass render CLOSED at spawn (the graft)', { timeout: 180000 }, async () => {
@@ -313,5 +321,40 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
       }
       expect(live).toBeGreaterThan(0);
     }
+  });
+
+  it('(h) shotgun pickup wakes the t55 pair, which then closes in', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    // RENDERED verdict setup: the pair starts dormant (SVF_NOCLIENT in C),
+    // so the snapshot must NOT carry either of them yet.
+    const pair = driver.server.monsters.filter((m) => m.edict.targetname === 't55');
+    expect(pair.length).toBe(2);
+    for (const m of pair) expect(m.triggered && !m.woken).toBe(true);
+    let snap = driver.snapshot(driver.server.time);
+    for (const m of pair) expect(snap.entities.some((e) => e.id === m.edict.num)).toBe(false);
+    // The lump link: base1's shotgun fires t55 on pickup (Touch_Item).
+    const gun = driver.server.entities.find((e) => e.classname === 'weapon_shotgun' && e.target === 't55')!;
+    expect(gun).toBeDefined();
+    // Walk the pickup: teleport onto the gun and settle a few ticks.
+    driver.pm.origin = v3(gun.origin[0]!, gun.origin[1]!, gun.origin[2]!);
+    driver.pm.velocity = v3();
+    let n = 0;
+    while (!driver.events.includes('pickup') && n++ < 30) driver.step(neutralCmd(), 0.1);
+    expect(driver.events).toContain('pickup');
+    // Both soldiers woke and the snapshot carries them again.
+    for (const m of pair) expect(m.woken).toBe(true);
+    snap = driver.snapshot(driver.server.time);
+    for (const m of pair) expect(snap.entities.some((e) => e.id === m.edict.num)).toBe(true);
+    // They close on the live player: rendered travel toward the body.
+    const m0 = pair[0]!;
+    const gap = (): number =>
+      Math.hypot(m0.edict.origin[0]! - driver.pm.origin[0]!, m0.edict.origin[1]! - driver.pm.origin[1]!);
+    const d0 = gap();
+    let t = 0;
+    while (gap() > Math.max(60, d0 - 100) && t++ < 300 && driver.playerHealth > 0) {
+      driver.step(neutralCmd(), 0.1);
+    }
+    expect(gap()).toBeLessThan(d0);
   });
 });
