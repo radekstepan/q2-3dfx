@@ -996,6 +996,17 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - cascade reaches t91 — real-data audit proves only t91 starts it):
 - door-open pins + 120-targetname no-fan-out audit. Gate (q) pins the
 - rendered death bolt + muzzle in the death-frame 21/24 window (17/17).
+- CLOSED 2026-10-26 (movers/clip lane): elevator parked on door-open
+- (DRIVER-LOOP proof, not a server BFS: touch-open + walk-in + ride/board
+- attempts + button approach + combat soak — no t91, *12 origin (0,0,0),
+- mesh offset 0 while the plug/doors cycle; the only exit motion is the
+- C-correct *31 descent; mesh tracks sim bit-exactly on a legit ride) and
+- the -384,33 debris glue (live func_wall *9 slab, not leftover: the clip
+- sweep lacked the C DIST_EPSILON enter bias, so clip landings rested
+- exactly on contact — a C-unreachable allsolid state; world landings rest
+- +1/32. Bias ported from CM_ClipBoxToBrush, landings +1/32 grounded).
+- Gate (r)/(s) pin it (19/19 green); west of the spot the world rock face
+- at x=-412 holds per the C trace rule (stays).
 - OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
 - (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
 - `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`

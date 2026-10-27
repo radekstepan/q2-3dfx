@@ -44,6 +44,16 @@
 //   (q) a dying soldier fires its last-ditch shot (death1 frames 21/24):
 //       the foe bolt renders in flight out of the corpse's muzzle, aimed
 //       back at the player, plus the muzzle-flash drain.
+//   (r) exit-door-open leaves the lift parked: opening the *31 plug (touch
+//       volume, then the real walk-in through the *32/*33 doors) never
+//       starts the *12 func_train and never moves its brush mesh — the
+//       sim origin stays (0,0,0) and the rendered offset stays 0 while the
+//       doors cycle around it (no t91 cascade, no graft coupling).
+//   (s) walk-out from the debris spot (-384.4,33.8,-16): the body settles
+//       from above onto the func_wall *9 slab top and walks N/S/E standing,
+//       N crouched, and W to the world rock face at x=-412 (the stop is the
+//       C world trace blocking, not glue); a soldier chasing through the
+//       spot reaches the player. No jump anywhere.
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { resetCVars, setCVar } from '@q2/config';
 import { BUTTON_DUCK } from '@q2/input';
@@ -1000,5 +1010,159 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect(boltSeenAt).toBeLessThanOrEqual(36);
     expect(monshotTick).toBeGreaterThanOrEqual(16);
     expect(monshotTick).toBeLessThanOrEqual(36);
+  });
+
+  it('(r) exit-door-open leaves the lift parked (mesh + sim)', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    // The end-of-level lift: the *12 func_train waits for the *13 button
+    // (t91) and parks at its first corner (origin == brush rest).
+    const train = driver.server.trains.find((t) => !t.ship)!;
+    expect(train.ent.model).toBe('*12');
+    expect([...train.ent.origin]).toEqual([0, 0, 0]);
+    expect(train.started).toBe(false);
+    expect(driver.doorRenderOffset('*12')).toEqual([0, 0, 0]);
+    // Watch every tick for a t91 cascade (the server unit pin only fired
+    // targetnames headlessly; here the full driver loop runs — triggers,
+    // pickups, monster door touches, fuses — exactly like the game).
+    let saw91 = false;
+    // Phase 1: open the exit door the way the game does — walk the body
+    // into the plug-mouth touch volume so SV_TouchDoorsAt fires through
+    // the real driver tick (gate (c) teleports here; same volume).
+    driver.pm.origin = v3(-1774, 1536, 104);
+    driver.pm.velocity = v3();
+    let doorTravel = 0;
+    for (let i = 0; i < 120; i++) {
+      driver.step(neutralCmd(), 0.1);
+      if (driver.server.firedThisTick.includes('t91')) saw91 = true;
+      doorTravel = Math.max(doorTravel, mag3(driver.doorRenderOffset('*31')!));
+    }
+    // Non-vacuous: the plug genuinely travelled its 156u down leg.
+    expect(doorTravel).toBeGreaterThan(100);
+    // Phase 2: the real walk-in through the *32/*33 entry doors.
+    driver.pm.origin = v3(-1560, 1536, 150);
+    driver.pm.velocity = v3();
+    let doorCycle = 0;
+    for (let i = 0; i < 200 && driver.playerHealth > 0; i++) {
+      driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+      if (driver.server.firedThisTick.includes('t91')) saw91 = true;
+      doorCycle = Math.max(doorCycle, mag3(driver.doorRenderOffset('*32')!));
+    }
+    // Non-vacuous: the entry doors cycled as the bot walked through.
+    expect(doorCycle).toBeGreaterThan(30);
+    // RENDERED + SIM verdict: the lift never started and never moved —
+    // the brush mesh sits at the parked pose while the doors cycled.
+    expect(saw91).toBe(false);
+    expect(train.started).toBe(false);
+    expect([...train.ent.origin]).toEqual([0, 0, 0]);
+    expect(driver.doorRenderOffset('*12')).toEqual([0, 0, 0]);
+  });
+
+  it('(s) walk-out from the debris spot (-384.4,33.8,-16), both hulls + soldier', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    const map = driver.map!;
+    // The solid under the spot is the LIVE func_wall *9 slab (standing
+    // clip, C SOLID_BSP — not a leftover freed clip, not debris): pin it.
+    const w9 = driver.server.entities.find((e) => !e.freed && e.classname === 'func_wall' && e.model === '*9')!;
+    expect(w9).toBeDefined();
+    expect(driver.server.brushClips.has(w9.num)).toBe(true);
+    // The old clip sweep landed exactly on contact (feet -40 = slab top
+    // -40), so every overlapping sweep read allsolid and the body glued
+    // (0.0 in every direction). The C DIST_EPSILON enter bias lands +1/32
+    // proud, so settle from above the way the engine does (an exact-plane
+    // teleport wedges even in C — d1 == 0 counts as inside — exactly like
+    // gate (l), so the test falls in, never teleports exact).
+    const settle = (): void => {
+      driver.pm.origin = v3(-384.4, 33.8, 60);
+      driver.pm.velocity = v3();
+      for (let i = 0; i < 30; i++) driver.step(neutralCmd(), 0.1);
+      expect(driver.pm.onGround).toBe(true);
+    };
+    settle();
+    expect(driver.pm.origin[0]!).toBeCloseTo(-384.4, 1);
+    expect(driver.pm.origin[1]!).toBeCloseTo(33.8, 1);
+    expect(driver.pm.origin[2]!).toBeCloseTo(-16, 1);
+    // Standing hull walks N/S/E with no jump and no crouch (glue reads
+    // exactly 0.0, so any generous threshold discriminates).
+    const legs: Array<[string, number, number]> = [
+      ['E', 0, 100],
+      ['N', 90, 50],
+      ['S', 270, 100],
+    ];
+    for (const [nm, yaw, min] of legs) {
+      settle();
+      const bx = driver.pm.origin[0]!;
+      const by = driver.pm.origin[1]!;
+      for (let i = 0; i < 20; i++) {
+        driver.step({ msec: 100, angles: [0, yaw, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+      }
+      const moved = Math.hypot(driver.pm.origin[0]! - bx, driver.pm.origin[1]! - by);
+      expect(moved).toBeGreaterThan(min);
+      expectInWorld(driver.pm.origin, map);
+    }
+    // Crouched hull walks too.
+    settle();
+    {
+      const bx = driver.pm.origin[0]!;
+      const by = driver.pm.origin[1]!;
+      for (let i = 0; i < 20; i++) {
+        driver.step({ msec: 100, angles: [0, 90, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: BUTTON_DUCK }, 0.1);
+      }
+      expect(Math.hypot(driver.pm.origin[0]! - bx, driver.pm.origin[1]! - by)).toBeGreaterThan(20);
+      expectInWorld(driver.pm.origin, map);
+    }
+    // West walks freely until the world rock face at x=-412 (hull contact
+    // at origin -428) and stops there: the stop is the C world trace
+    // blocking (fraction < 1 on the C player mask — solid rock holds in C
+    // too and must stay), not glue. Pressing on proves it holds.
+    settle();
+    for (let i = 0; i < 20; i++) {
+      driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+    }
+    const wx = driver.pm.origin[0]!;
+    const wy = driver.pm.origin[1]!;
+    expect(-384.4 - wx).toBeGreaterThan(40);
+    for (let i = 0; i < 20; i++) {
+      driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+    }
+    expect(Math.hypot(driver.pm.origin[0]! - wx, driver.pm.origin[1]! - wy)).toBeLessThan(3);
+    const worldOnly = SV_TraceFor(map, MASK_PLAYERSOLID_C);
+    const rock = worldOnly(
+      v3(driver.pm.origin[0], driver.pm.origin[1], driver.pm.origin[2]),
+      v3(-16, -16, -24),
+      v3(16, 16, 32),
+      v3(driver.pm.origin[0]! - 64, driver.pm.origin[1], driver.pm.origin[2]),
+    );
+    expect(rock.fraction).toBeLessThan(1);
+    expectInWorld(driver.pm.origin, map);
+    // A soldier chasing through the spot reaches the player: the courtyard
+    // light soldier (#341, awake chaser like gate (b)) runs the lane from
+    // the south side while the player holds the north side.
+    const A = driver.server.monsters.find((m) => m.edict.num === 341)!;
+    expect(A).toBeDefined();
+    driver.pm.origin = v3(-384.4, 100, 60);
+    driver.pm.velocity = v3();
+    A.edict.origin = v3(-384.4, -60, 60);
+    let minAy = Infinity;
+    let maxAy = -Infinity;
+    let minGap = Infinity;
+    for (let t = 0; t < 150 && driver.playerHealth > 0; t++) {
+      driver.step(neutralCmd(), 0.1);
+      minAy = Math.min(minAy, A.edict.origin[1]!);
+      maxAy = Math.max(maxAy, A.edict.origin[1]!);
+      minGap = Math.min(
+        minGap,
+        Math.hypot(A.edict.origin[0]! - driver.pm.origin[0]!, A.edict.origin[1]! - driver.pm.origin[1]!),
+      );
+      if (minGap < 40) break;
+    }
+    // Through the spot band (crosses y=33.8) and closing on the player
+    // (the gate-(b) close bar: the run may end stood off at firing range,
+    // so the verdict is the minimum over the run).
+    expect(minAy).toBeLessThan(33.8);
+    expect(maxAy).toBeGreaterThan(33.8);
+    expect(minGap).toBeLessThan(100);
+    expectInWorld(driver.pm.origin, map);
   });
 });

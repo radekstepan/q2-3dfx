@@ -117,7 +117,7 @@ import {
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import { AngleVectors } from '@q2/math';
-import { traceBox } from '@q2/bsp';
+import { DIST_EPSILON, traceBox } from '@q2/bsp';
 import type { BspMap } from '@q2/bsp';
 import {
   CRUSH_DAMAGE,
@@ -431,10 +431,15 @@ export function SV_RemoveBrushClip(st: ServerState, ent: Edict): void {
 }
 
 /**
- * Swept player/monster box vs one static brush AABB. Same conventions as the
- * traversal driver's door sweep (CM_ClipBoxToBrush: starting inside only
- * stops the move when the end is inside too; bodies resting exactly on the
- * slab boundary keep moving).
+ * Swept player/monster box vs one static brush AABB. Ports qcommon/cmodel.c
+ * CM_ClipBoxToBrush: starting inside only stops the move when the end is
+ * inside too (leaving counts as fraction 1), and the enter/leave fractions
+ * carry the C DIST_EPSILON (1/32) bias so contact stops a hair short — a
+ * landing never rests exactly on the plane. Without the bias a body
+ * standing exactly on a clip top reads allsolid on every overlapping sweep
+ * and glues in place (C landings always rest +1/32, so the exact state is
+ * unreachable there). The boundary-inclusive inside test matches C's
+ * d1 == 0 counts-as-inside position rule.
  */
 export function sweepBrushBox(
   start: Vec3, end: Vec3,
@@ -464,7 +469,10 @@ export function sweepBrushBox(
     }
     return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: true };
   }
-  let tmin = 0, tmax = 1, axis = -1, sign = 0;
+  // C enterfrac starts at -1 so a contact entry (biased fraction <= 0)
+  // still records the hit axis and clamps to fraction 0 (grounded); only
+  // a trace that never approaches (all entries <= -1) misses.
+  let tmin = -1, tmax = 1, tminRaw = 0, axis = -1, sign = 0;
   for (let i = 0; i < 3; i++) {
     const d = end[i]! - start[i]!;
     if (Math.abs(d) < 1e-9) {
@@ -482,18 +490,26 @@ export function sweepBrushBox(
       t2 = t;
       s = 1;
     }
-    if (t1 > tmin) {
-      tmin = t1;
+    // C enter/leave bias: f = (d1 -+ DIST_EPSILON) / (d1 - d2), i.e. the
+    // slab entry shifts earlier by eps/|d| and the exit later by eps/|d|.
+    // The startsolid flag stays on the unbiased entry (C sets it from the
+    // strict inside test, not from the biased fraction).
+    const bias = DIST_EPSILON / Math.abs(d);
+    const t1b = t1 - bias;
+    const t2b = t2 + bias;
+    if (t1 > tminRaw) tminRaw = t1;
+    if (t1b > tmin) {
+      tmin = t1b;
       axis = i;
       sign = s;
     }
-    if (t2 < tmax) tmax = t2;
+    if (t2b < tmax) tmax = t2b;
     if (tmin > tmax) return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: false };
   }
   if (axis < 0) return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: false };
   const n = v3(0, 0, 0);
   n[axis] = sign;
-  return { fraction: Math.max(0, Math.min(1, tmin)), normal: n, allsolid: false, startsolid: tmin <= 0 };
+  return { fraction: Math.max(0, Math.min(1, tmin)), normal: n, allsolid: false, startsolid: tminRaw <= 0 };
 }
 
 /**
