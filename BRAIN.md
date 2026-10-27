@@ -970,7 +970,14 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - waterlevel 3, airLeft 12s grace, 4,6,8…15 ramp at 1/s, watr_in/gurp/gasp
 - hooks, resurface recovery; vault engages at a real wall). Remaining tail:
 - breather/envirosuit have no items (air runs on schedule).
-- CLOSED 2026-10-26 (HUD lane): fps is a top-right DOM overlay (`#q2-fps`, `cl_showfps`; in-canvas fps deleted so the counter never touches renderer output) and player coords are a top-left DOM overlay (`#q2-pos`, `pos x y z yaw <yaw>` 1-decimal per frame, `cl_showpos` default ON with a menu checkbox; menu clicks stay input-free under canvas pointer-lock).
+- CLOSED 2026-10-26 (HUD lane, reverses 105ff90): `fps N` (gated by
+- `cl_showfps`) renders top-right INSIDE the framebuffer and `pos x y z yaw
+- <yaw>` (gated by `cl_showpos`, default ON) top-left INSIDE the framebuffer,
+- both via conchars glyphs (`drawString` in `drawPlayHud`'s pre-blit HUD pass,
+- after the `r_brightness` scene lift, so colours stay authored and legible
+- at default brightness). The DOM `#q2-fps`/`#q2-pos` overlays and their
+- updaters are deleted (gates unchanged, just the sink); menu clicks stay
+- input-free under canvas pointer-lock.
 - CLOSED 2026-10-26 (window/corpse content lane): the spawn-room "third
 - barrel" is func_explosive *20 (lump: 2 misc_explobox at (136,40,0) +
 - (184,-24,0), 1 func_explosive *20; *30 is the second brush). Barrel MD2

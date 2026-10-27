@@ -7,9 +7,12 @@ import {
   BRIGHTNESS_MAX,
   BRIGHTNESS_MIN,
   drawPlayHud,
+  formatFpsText,
   fpsHudAnchor,
   FPS_GREEN,
   getBrightness,
+  posHudAnchor,
+  POS_YELLOW,
   resolveDisplay,
 } from './play.js';
 import { cvarControlKind, cvarOptions, renderCvarPanel } from './dom.js';
@@ -28,32 +31,54 @@ function meanRGB(buf: Uint32Array): number {
 }
 
 describe('display path (fps anchor, brightness, cvar controls)', () => {
-  it('fpsHudAnchor is a legacy top-left helper (DOM overlay owns the counter)', () => {
-    const text = 'fps 60';
+  it('fpsHudAnchor pins the top-right slot (8px margins, clamped)', () => {
+    const text = formatFpsText(60);
+    expect(text).toBe('fps 60');
     const a = fpsHudAnchor(160, text);
-    expect(a).toEqual({ x: 8, y: 8 });
-    // Tiny screens clamp the same way (still top-left, never negative).
-    expect(fpsHudAnchor(40, text)).toEqual({ x: 8, y: 8 });
+    expect(a).toEqual({ x: 104, y: 8 });
+    // Tiny screens clamp the same way (still top-right, never negative).
+    expect(fpsHudAnchor(40, text)).toEqual({ x: 0, y: 8 });
     // Same input, same anchor (pure).
     expect(fpsHudAnchor(160, text)).toEqual(a);
   });
 
-  it('FPS_GREEN is an opaque readable green in 0xAABBGGRR (legacy canvas colour)', () => {
+  it('posHudAnchor pins the top-left slot (8px margins)', () => {
+    expect(posHudAnchor()).toEqual({ x: 8, y: 8 });
+  });
+
+  it('FPS_GREEN is an opaque readable green in 0xAABBGGRR (canvas colour)', () => {
     expect(FPS_GREEN).toBe(0xff00ff00);
   });
 
-  it('canvas never draws fps text (DOM #q2-fps overlay owns the counter)', () => {
+  it('POS_YELLOW is an opaque readable yellow in 0xAABBGGRR (canvas colour)', () => {
+    expect(POS_YELLOW).toBe(0xff66ffff);
+  });
+
+  it('canvas draws fps top-right in-canvas when enabled, none when gated', () => {
     const boot = bootPlay({ width: 160, height: 120 });
-    // Enabled or gated: the canvas stays fps-free either way.
-    for (const v of [1, 0]) {
-      setCVar('cl_showfps', v);
-      try {
-        const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
-        drawPlayHud(target, boot, { fps: 60, frame: 1 });
-        expect(target.color.some((c) => c === FPS_GREEN)).toBe(false);
-      } finally {
-        setCVar('cl_showfps', 1);
+    // Enabled: green struck pixels land in the top-right readout row.
+    setCVar('cl_showfps', 1);
+    try {
+      const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
+      drawPlayHud(target, boot, { fps: 60, frame: 1 });
+      let green = 0;
+      for (let y = 8; y < 16; y++) {
+        for (let x = 104; x < 152; x++) {
+          if (target.color[y * 160 + x] === FPS_GREEN) green++;
+        }
       }
+      expect(green).toBeGreaterThan(10);
+    } finally {
+      setCVar('cl_showfps', 1);
+    }
+    // Gated: the canvas stays fps-free.
+    setCVar('cl_showfps', 0);
+    try {
+      const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
+      drawPlayHud(target, boot, { fps: 60, frame: 1 });
+      expect(target.color.some((c) => c === FPS_GREEN)).toBe(false);
+    } finally {
+      setCVar('cl_showfps', 1);
     }
   });
 
@@ -112,6 +137,8 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
     const boot = bootPlay({ width: 160, height: 120 });
     runFrames(boot.host, 0, 500);
     setCVar('r_brightness', 2.0);
+    setCVar('cl_showfps', 1);
+    setCVar('cl_showpos', 1);
     try {
       const target = resolveDisplay(boot);
       drawPlayHud({ width: 160, height: 120, color: target }, boot, { fps: 60, frame: 1 });
@@ -119,8 +146,26 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
       expect(target.some((c) => c === 0xffffffff)).toBe(true);
       // …and the crosshair centre pixel keeps full white.
       expect(target[60 * 160 + 80]).toBe(0xffffffff);
+      // …and both in-canvas readouts stay legible with exact colours:
+      // fps `fps 60` top-right (green) and pos top-left (yellow).
+      let green = 0;
+      for (let y = 8; y < 16; y++) {
+        for (let x = 104; x < 152; x++) {
+          if (target[y * 160 + x] === FPS_GREEN) green++;
+        }
+      }
+      expect(green).toBeGreaterThan(10);
+      let yellow = 0;
+      for (let y = 8; y < 16; y++) {
+        for (let x = 8; x < 160; x++) {
+          if (target[y * 160 + x] === POS_YELLOW) yellow++;
+        }
+      }
+      expect(yellow).toBeGreaterThan(10);
     } finally {
       setCVar('r_brightness', BRIGHTNESS_DEFAULT);
+      setCVar('cl_showfps', 1);
+      setCVar('cl_showpos', 1);
     }
   });
 

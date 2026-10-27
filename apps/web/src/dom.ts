@@ -9,12 +9,10 @@ import type { Framebuffer } from '@q2/renderer-api';
 import { ingestPak } from './pak.js';
 import type { WebPak } from './pak.js';
 
-registerCVar('cl_showfps', 1, 'show DOM fps overlay (and in-canvas fps readout)');
-registerCVar('cl_showpos', 1, 'show DOM player-position overlay top-left (pos x y z yaw)');
+registerCVar('cl_showfps', 1, 'show in-canvas fps readout top-right (conchars glyphs)');
+registerCVar('cl_showpos', 1, 'show in-canvas player-position readout top-left (pos x y z yaw)');
 
-/** DOM overlay element ids (see index.html). FPS top-right, pos top-left. */
-export const FPS_OVERLAY_ID = 'q2-fps';
-export const POS_OVERLAY_ID = 'q2-pos';
+/** Cvar gate for the fps readout (`cl_showfps`, default 1). */
 
 export interface ProgressState {
   fraction: number;
@@ -37,14 +35,6 @@ export function setProgress(el: unknown, fraction: number, label: string): Progr
   return state;
 }
 
-/** Pure helper: readable fps line with ms/frame for the DOM overlay. */
-export function formatFps(fps: number): string {
-  if (!Number.isFinite(fps) || fps <= 0) return 'fps --';
-  const rounded = Math.round(fps);
-  const ms = 1000 / fps;
-  return `fps ${rounded} · ${ms.toFixed(1)} ms`;
-}
-
 /** Cvar gate for the fps readout (`cl_showfps`, default 1). */
 export function showFpsEnabled(): boolean {
   // resetCVars() restores only compiled-in defaults; an absent cl_showfps
@@ -58,52 +48,6 @@ export function showPosEnabled(): boolean {
   // Absent (e.g. after a reset in tests) means the default-on state.
   if (getCVar('cl_showpos') === undefined) return true;
   return getCVarNumber('cl_showpos') !== 0;
-}
-
-/**
- * Write the fps line into a DOM node. DOM-guarded: with no `document`
- * (Node/vitest) or a null element it just returns the text. Returns the
- * text written (or that would have been written).
- */
-export function updateFpsOverlay(el: unknown, fps: number, visible = true): string {
-  const text = formatFps(fps);
-  const node = el as { textContent?: unknown; style?: { display?: string } } | null;
-  if (!node || typeof node !== 'object') return text;
-  try {
-    if (visible) {
-      if (typeof node.textContent === 'string' || node.textContent === undefined) {
-        (node as { textContent: string }).textContent = text;
-      }
-      if (node.style && typeof node.style === 'object') node.style.display = '';
-    } else if (node.style && typeof node.style === 'object') {
-      node.style.display = 'none';
-    }
-  } catch {
-    /* non-DOM stub */
-  }
-  return text;
-}
-
-/**
- * Write the position line into a DOM node. DOM-guarded like
- * `updateFpsOverlay`: null / non-DOM input just returns the text.
- */
-export function updatePosOverlay(el: unknown, text: string, visible = true): string {
-  const node = el as { textContent?: unknown; style?: { display?: string } } | null;
-  if (!node || typeof node !== 'object') return text;
-  try {
-    if (visible) {
-      if (typeof node.textContent === 'string' || node.textContent === undefined) {
-        (node as { textContent: string }).textContent = text;
-      }
-      if (node.style && typeof node.style === 'object') node.style.display = '';
-    } else if (node.style && typeof node.style === 'object') {
-      node.style.display = 'none';
-    }
-  } catch {
-    /* non-DOM stub */
-  }
-  return text;
 }
 
 /** Blit a 0xAABBGGRR framebuffer into a <canvas> via putImageData. */
@@ -188,14 +132,14 @@ export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   cl_interp: ['0', '1'],
 };
 
-/** Re-register HUD overlay cvars if a test `resetCVars()` wiped them, so the
+/** Re-register HUD cvars if a test `resetCVars()` wiped them, so the
  * menu panel keeps listing them and headless boots stay deterministic. */
 function ensureHudCvars(): void {
   if (getCVar('cl_showfps') === undefined) {
-    registerCVar('cl_showfps', 1, 'show DOM fps overlay (and in-canvas fps readout)');
+    registerCVar('cl_showfps', 1, 'show in-canvas fps readout top-right (conchars glyphs)');
   }
   if (getCVar('cl_showpos') === undefined) {
-    registerCVar('cl_showpos', 1, 'show DOM player-position overlay top-left (pos x y z yaw)');
+    registerCVar('cl_showpos', 1, 'show in-canvas player-position readout top-left (pos x y z yaw)');
   }
 }
 
@@ -435,7 +379,7 @@ export function setRendererChoice(kind: string): void {
 
 import type { Host } from '@q2/host';
 import type { LocalDriver, PlayBoot } from './play.js';
-import { drawPlayHud, playerPosText, pumpExplosionLights, pumpMuzzleLight, pumpTracers, resolveDisplay } from './play.js';
+import { drawPlayHud, pumpExplosionLights, pumpMuzzleLight, pumpTracers, resolveDisplay } from './play.js';
 import { attachToCanvas } from '@q2/input/dom';
 import { readPakEntry, findPakSoundEntry } from './pak.js';
 import type { Mixer, MixedChannel } from '@q2/sound';
@@ -624,10 +568,6 @@ export function startPlayLoop(
   let lastT = -1;
   let fps = 60;
   let frame = 0;
-  // Display-only DOM readouts (never touch renderer output): fps top-right,
-  // player position top-left. Queried once; per-frame updates below.
-  const fpsEl = document.querySelector(`#${FPS_OVERLAY_ID}`);
-  const posEl = document.querySelector(`#${POS_OVERLAY_ID}`);
   const tick = (nowMs: number): void => {
     if (stopped) return;
     if (lastT >= 0) {
@@ -647,11 +587,9 @@ export function startPlayLoop(
       { fps, frame: frame++ },
     );
     blitToCanvas(el, { ...host.fb, color: target });
-    // DOM overlays, post-resolve: the canvas pixels are already blitted, so
-    // these readouts can never alter renderer output. Gated by
-    // cl_showfps (fps) / cl_showpos (position, default ON).
-    updateFpsOverlay(fpsEl, fps, showFpsEnabled());
-    updatePosOverlay(posEl, playerPosText(driver), showPosEnabled());
+    // The fps (`cl_showfps`) and position (`cl_showpos`, default ON)
+    // readouts are in-canvas conchars glyphs painted by drawPlayHud above
+    // (top-right / top-left of the framebuffer itself) — no DOM overlay.
     // Per-channel positional audio: Mixer.mix() gains drive real nodes.
     // The driver already set the listener + started channels in step().
     if (sound) syncMixerToBrowser(sound, driver.mixer);

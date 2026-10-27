@@ -2933,25 +2933,42 @@ export interface HudState {
   frame: number;
 }
 
-/** In-canvas fps readout colour (legacy: the counter moved to the DOM
- * `#q2-fps` overlay top-right, display-only post-resolve, so it never
- * touches renderer output. Kept exported for compat; `drawPlayHud` no
- * longer paints it — see `formatFps`/`updateFpsOverlay` in `dom.ts`. */
+/** In-canvas fps readout colour (conchars `drawString`, top-right in-view,
+ * gated by `cl_showfps`). Drawn in `drawPlayHud` on the display buffer —
+ * the same pre-blit HUD pass as the crosshair — so it matches the game
+ * look and is never dimmed by the `r_brightness` scene lift. */
 export const FPS_GREEN = 0xff00ff00;
 
+/** In-canvas player-position readout colour (opaque #ff6-style yellow,
+ * matching the retired DOM `#q2-pos` tint; same pre-blit HUD pass as fps). */
+export const POS_YELLOW = 0xff66ffff;
+
 /**
- * Pure anchor for the legacy in-canvas fps slot (top-left, 8px margins).
- * Deprecated: the counter is now the DOM `#q2-fps` overlay (top-right);
- * kept exported for compat, no longer used by `drawPlayHud`.
+ * Pure anchor for the in-canvas fps slot: top-right, 8px margins, so the
+ * counter never covers the world center or the controls panel. Clamped to
+ * x >= 0 so tiny buffers clip instead of wrapping.
  */
 export function fpsHudAnchor(width: number, text: string): { x: number; y: number } {
-  void width;
-  void text;
+  return { x: Math.max(0, width - stringWidth(text) - 8), y: 8 };
+}
+
+/**
+ * Pure anchor for the in-canvas player-position slot: top-left, 8px
+ * margins (mirrors the fps slot's y so both readouts share one HUD row).
+ */
+export function posHudAnchor(): { x: number; y: number } {
   return { x: 8, y: 8 };
 }
 
 /**
- * Cvar gate for the fps readout (`cl_showfps`, default 1).
+ * Pure in-canvas fps readout text: `fps N` (integer, conchars glyphs).
+ */
+export function formatFpsText(fps: number): string {
+  return `fps ${Math.round(fps)}`;
+}
+
+/**
+ * Cvar gate for the in-canvas fps readout (`cl_showfps`, default 1).
  * Mirrors dom.showFpsEnabled without importing the DOM layer (this module
  * is headless-safe; dom.ts imports from here, never the reverse).
  */
@@ -2962,9 +2979,10 @@ export function fpsVisible(): boolean {
 }
 
 /**
- * Cvar gate for the DOM position readout (`cl_showpos`, default 1 = ON so
- * users can report issue locations). Mirrors dom.showPosEnabled without
- * importing the DOM layer (headless-safe; dom.ts imports from here).
+ * Cvar gate for the in-canvas position readout (`cl_showpos`, default 1 =
+ * ON so users can report issue locations). Mirrors dom.showPosEnabled
+ * without importing the DOM layer (headless-safe; dom.ts imports from
+ * here).
  */
 export function posVisible(): boolean {
   if (getCVar('cl_showpos') === undefined) return true;
@@ -2980,8 +2998,8 @@ function r1(v: number): string {
 
 /**
  * Pure player-position readout text: `pos x y z yaw <yaw>`, each rounded
- * to 1 decimal (yaw = viewAngles[1], id convention). Display-only: the DOM
- * `#q2-pos` overlay (top-left) shows this; it never touches canvas pixels.
+ * to 1 decimal (yaw = viewAngles[1], id convention). Drawn in-canvas
+ * top-left via conchars glyphs (gated by `cl_showpos`, default ON).
  */
 export function formatPlayerPos(x: number, y: number, z: number, yaw: number): string {
   return `pos ${r1(x)} ${r1(y)} ${r1(z)} yaw ${r1(yaw)}`;
@@ -2989,7 +3007,7 @@ export function formatPlayerPos(x: number, y: number, z: number, yaw: number): s
 
 /**
  * Position readout text for a driver (pm.origin + viewAngles yaw).
- * Pure/headless-safe; the dom rAF tick calls this per frame.
+ * Pure/headless-safe; `drawPlayHud` paints it in-canvas every frame.
  */
 export function playerPosText(driver: LocalDriver): string {
   return formatPlayerPos(
@@ -3003,18 +3021,30 @@ export function playerPosText(driver: LocalDriver): string {
 /** Draw crosshair + status lines onto a 0xAABBGGRR buffer (runs post-resolve).
  *
  * The play canvas shows world + crosshair + weapon/ammo + hp + message
- * (+ the devroom hint and death bars). The fps counter and the player
- * position readout are deliberately NOT drawn here: they are DOM overlays
- * (`#q2-fps` top-right, `#q2-pos` top-left, updated per frame in dom.ts
- * after resolve) so they never touch renderer output. `hud.fps` is legacy
- * (kept for signature compat) and ignored.
+ * (+ the devroom hint and death bars) + the in-canvas `fps N` counter
+ * top-right (gated by `cl_showfps`) + the in-canvas player-position readout
+ * top-left (gated by `cl_showpos`, default ON). Both readouts use conchars
+ * glyphs (`drawString`), drawn in this same pre-blit HUD pass — after the
+ * `r_brightness` scene lift — so they keep their authored colours exactly
+ * like the crosshair. `hud.fps` feeds the fps counter; `hud.frame` is
+ * kept for signature compat and ignored.
  */
 export function drawPlayHud(
   target: { width: number; height: number; color: Uint32Array },
   boot: PlayBoot,
   hud: HudState,
 ): void {
-  void hud;
+  // In-canvas readouts first, so later HUD rows paint over them on tiny
+  // buffers instead of the reverse.
+  if (fpsVisible() && Number.isFinite(hud.fps) && hud.fps > 0) {
+    const text = formatFpsText(hud.fps);
+    const a = fpsHudAnchor(target.width, text);
+    drawString(target, a.x, a.y, text, FPS_GREEN);
+  }
+  if (posVisible()) {
+    const a = posHudAnchor();
+    drawString(target, a.x, a.y, playerPosText(boot.driver), POS_YELLOW);
+  }
   const white = 0xffffffff;
   const cx = (target.width / 2) | 0;
   const cy = (target.height / 2) | 0;

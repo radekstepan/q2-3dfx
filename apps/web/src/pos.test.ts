@@ -1,19 +1,13 @@
-// Player-position DOM overlay (HUD lane): top-left `#q2-pos`, gated by
-// `cl_showpos` (default ON), checkbox in the menu panel. Headless-safe:
-// DOM-light fake `document` around `renderCvarPanel` (same pattern as
-// canvas-lock.test.ts); globals restored after each test.
+// Player-position in-canvas readout (HUD lane): top-left conchars glyphs,
+// gated by `cl_showpos` (default ON), checkbox in the menu panel.
+// Headless-safe: DOM-light fake `document` around `renderCvarPanel` (same
+// pattern as canvas-lock.test.ts); globals restored after each test. Glyph
+// pixels are asserted on headless framebuffers (same pattern as the fps
+// lane): no DOM overlay owns the readout anymore.
 import { afterEach, describe, expect, it } from 'vitest';
 import { getCVarNumber, resetCVars, setCVar } from '@q2/config';
-import { bootPlay, formatPlayerPos, playerPosText, posVisible } from './play.js';
-import {
-  cvarControlKind,
-  cvarIsCheckbox,
-  FPS_OVERLAY_ID,
-  POS_OVERLAY_ID,
-  renderCvarPanel,
-  showPosEnabled,
-  updatePosOverlay,
-} from './dom.js';
+import { bootPlay, drawPlayHud, formatPlayerPos, playerPosText, posHudAnchor, posVisible, POS_YELLOW } from './play.js';
+import { cvarControlKind, cvarIsCheckbox, renderCvarPanel, showPosEnabled } from './dom.js';
 
 afterEach(() => {
   resetCVars();
@@ -83,10 +77,28 @@ function install(): { doc: FakeDocument; prev: unknown } {
   return { doc, prev };
 }
 
-describe('player position overlay (top-left DOM, cl_showpos)', () => {
-  it('overlay ids pin the screen corners (fps top-right, pos top-left)', () => {
-    expect(FPS_OVERLAY_ID).toBe('q2-fps');
-    expect(POS_OVERLAY_ID).toBe('q2-pos');
+/** Count pixels of one colour inside a rectangle (headless glyph assertion). */
+function countIn(
+  color: Uint32Array,
+  width: number,
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  rgba: number,
+): number {
+  let n = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      if (color[y * width + x] === rgba) n++;
+    }
+  }
+  return n;
+}
+
+describe('player position readout (in-canvas conchars, top-left, cl_showpos)', () => {
+  it('posHudAnchor pins the top-left slot (8px margins)', () => {
+    expect(posHudAnchor()).toEqual({ x: 8, y: 8 });
   });
 
   it('formatPlayerPos is pure: x y z + yaw at 1 decimal', () => {
@@ -118,16 +130,33 @@ describe('player position overlay (top-left DOM, cl_showpos)', () => {
     expect(posVisible()).toBe(true);
   });
 
-  it('updatePosOverlay is DOM-guarded and toggles visibility on stub nodes', () => {
-    expect(typeof document).toBe('undefined');
-    expect(updatePosOverlay(null, 'pos 1.0 2.0 3.0 yaw 4.0')).toBe('pos 1.0 2.0 3.0 yaw 4.0');
-    const shown = { textContent: '', style: { display: 'none' } };
-    const text = updatePosOverlay(shown, 'pos 1.0 2.0 3.0 yaw 4.0', true);
-    expect(shown.textContent).toBe(text);
-    expect(shown.style.display).toBe('');
-    const hidden = { textContent: 'pos 1.0 2.0 3.0 yaw 4.0', style: { display: '' } };
-    updatePosOverlay(hidden, 'pos 1.0 2.0 3.0 yaw 4.0', false);
-    expect(hidden.style.display).toBe('none');
+  it('drawPlayHud paints yellow conchars glyphs top-left when enabled', () => {
+    resetCVars();
+    try {
+      const boot = bootPlay({ width: 320, height: 240 });
+      setCVar('cl_showpos', 1);
+      const target = { width: 320, height: 240, color: new Uint32Array(320 * 240) };
+      drawPlayHud(target, boot, { fps: 60, frame: 1 });
+      // Pos text starts at (8, 8); struck glyph pixels are POS_YELLOW.
+      expect(countIn(target.color, 320, 8, 8, 320, 16, POS_YELLOW)).toBeGreaterThan(10);
+      // Nothing yellow leaks into the lower HUD rows.
+      expect(countIn(target.color, 320, 0, 16, 320, 240, POS_YELLOW)).toBe(0);
+    } finally {
+      resetCVars();
+    }
+  });
+
+  it('drawPlayHud paints no pos pixels when gated', () => {
+    resetCVars();
+    try {
+      const boot = bootPlay({ width: 320, height: 240 });
+      setCVar('cl_showpos', 0);
+      const target = { width: 320, height: 240, color: new Uint32Array(320 * 240) };
+      drawPlayHud(target, boot, { fps: 60, frame: 1 });
+      expect(target.color.some((c) => c === POS_YELLOW)).toBe(false);
+    } finally {
+      resetCVars();
+    }
   });
 
   it('cl_showpos renders as a checkbox (cl_showfps keeps its select)', () => {
