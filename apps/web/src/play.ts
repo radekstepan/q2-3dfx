@@ -1830,12 +1830,29 @@ export class LocalDriver implements HostDriver {
     return [...this.graftedFaces];
   }
 
+  /**
+   * Test hook: measured render-side displacement of a brush mover's baked
+   * verts (DoorSync baseVerts vs live verts, first face/first vertex). Zero
+   * at spawn means the door renders CLOSED; nonzero after a touch means the
+   * slab visibly moved. Null when the model has no synced faces.
+   */
+  doorRenderOffset(model: string): [number, number, number] | null {
+    const d = this.doors.find((x) => x.ent.model === model);
+    if (!d || d.faces.length === 0) return null;
+    const s = d.faces[0]!;
+    const b = d.baseVerts[0]!;
+    return [s.verts[0]! - b[0]!, s.verts[1]! - b[1]!, s.verts[2]! - b[2]!];
+  }
+
   private syncDoors(): void {
     for (const d of this.doors) {
       const ox = d.ent.origin[0]! - d.rest[0]!;
       const oy = d.ent.origin[1]! - d.rest[1]!;
       const oz = d.ent.origin[2]! - d.rest[2]!;
-      if (ox === 0 && oy === 0 && oz === 0) continue;
+      // No skip when at rest: the final mover step lands exactly on pos1,
+      // and skipping that tick would leave the baked verts holding the last
+      // in-flight offset (up to one speed-step visibly open while the sim
+      // reads closed). Always re-apply base + displacement instead.
       for (let i = 0; i < d.faces.length; i++) {
         const s = d.faces[i]!;
         const bv = d.baseVerts[i]!;

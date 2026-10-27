@@ -1039,6 +1039,6 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - C-exact (hold + ON_GROUND, airborne hold stands — no self-sustain), and
 - `CL_PredictPmove` seeds `pmFlags`/`grounded` from the snapshot, so ducked
 - prediction matches the authoritative tick bit-for-bit.
-- [ ] Phase 4 — play-verified gate: base1 driver-level bot asserting rendered
+- [x] Phase 4 — play-verified gate: base1 driver-level bot asserting rendered
 - outcomes (barrels die, monster closes 300→100u, door re-closes, secret
 - holds, TTK). No gameplay card closes without it.
