@@ -94,7 +94,7 @@ import type { ServerState, ServerMonster, ServerBarrel, ServerBolt, ServerExplos
 import { ATTN_NORM, Mixer } from '@q2/sound';
 import { parseMD2, parseWAL, parsePCX } from '@q2/formats';
 import type { Pcx } from '@q2/formats';
-import { resolveFrame } from '@q2/voodoo';
+import { expandRGB565, gammaLUT, resolveFrame } from '@q2/voodoo';
 import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import { SERVER_DT, getCVar, getCVarNumber, getCVarString, registerCVar } from '@q2/config';
@@ -2981,7 +2981,31 @@ export function resolveDisplay(boot: PlayBoot): Uint32Array {
   // there. Classic path: the same array (behaviour unchanged).
   const live = boot.refresh.getFramebuffer().color;
   if (getCVarString('vid_renderer') === 'voodoo') {
-    resolveFrame(live, boot.fb565, boot.display, host.fb.width, host.fb.height);
+    const w = host.fb.width;
+    const h = host.fb.height;
+    const n = w * h;
+    // Canary for pre-fix `resolveFrame` (astra §2 defect #1): it only fills
+    // `display` when `vd_postfilter` is on, leaving last frame's
+    // (HUD-painted) pixels stale when off. The sentinel alpha (0x12) can
+    // never occur in real resolve output (always opaque 0xFF), so a
+    // surviving sentinel proves `display` was left untouched and the web
+    // side backfills the current frame below. Once the voodoo fix lands,
+    // `resolveFrame` overwrites the canary with real output (565 expand
+    // when `vd_16bit` is on, `resolveRGB888` when off) and the backfill
+    // never runs — robust to both behaviours with zero extra passes.
+    let canary = false;
+    if (getCVarNumber('vd_postfilter') === 0 && n > 0) {
+      boot.display[0] = VOODOO_STALE_SENTINEL;
+      canary = true;
+    }
+    resolveFrame(live, boot.fb565, boot.display, w, h);
+    if (canary && boot.display[0] === VOODOO_STALE_SENTINEL) {
+      if (getCVarNumber('vd_16bit') !== 0) {
+        for (let i = 0; i < n; i++) boot.display[i] = expandRGB565(boot.fb565[i]!);
+      } else {
+        backfillRGB888(live, boot.display, n);
+      }
+    }
     applyBrightness(boot.display, brightness);
     return boot.display;
   }
@@ -2989,6 +3013,38 @@ export function resolveDisplay(boot: PlayBoot): Uint32Array {
   boot.display.set(live);
   applyBrightness(boot.display, brightness);
   return boot.display;
+}
+
+/**
+ * Sentinel marking an unwritten voodoo display pixel (see `resolveDisplay`).
+ * Alpha 0x12 is impossible in resolve output (always opaque), so a survivor
+ * unambiguously detects the pre-fix `resolveFrame` stale path.
+ */
+const VOODOO_STALE_SENTINEL = 0x12345678;
+
+/**
+ * Genuine RGB888 backfill for the `vd_16bit`-off + postfilter-off corner
+ * under pre-fix `resolveFrame`: gamma-lifted copy of the live frame, no
+ * dither, no reconstruction. The bypass keeps the gamma stage and skips the
+ * quantiser (astra §2 defect #2), mirroring `resolveRGB888` semantics so the
+ * web side converges to the same pixels once the voodoo fix lands.
+ * Zero-alloc; display-only, never renderer state.
+ */
+function backfillRGB888(src: Uint32Array, dst: Uint32Array, n: number): void {
+  const gamma = getCVarNumber('vd_gamma');
+  const lut = gamma !== 1 && gamma > 0 && Number.isFinite(gamma) ? gammaLUT(gamma) : null;
+  for (let i = 0; i < n; i++) {
+    const px = src[i]!;
+    let r = px & 255;
+    let g = (px >> 8) & 255;
+    let b = (px >> 16) & 255;
+    if (lut !== null) {
+      r = lut[r]!;
+      g = lut[g]!;
+      b = lut[b]!;
+    }
+    dst[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+  }
 }
 
 /**
