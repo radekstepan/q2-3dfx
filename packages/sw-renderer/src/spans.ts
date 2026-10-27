@@ -77,30 +77,15 @@ export interface Span {
 }
 
 export interface SpanList {
-  /** Preallocated pool; only [start, count) is active. Never truncate. */
+  /** Preallocated pool; only [0, count) is active. Never truncate. */
   spans: Span[];
   count: number;
-  /**
-   * Active window base (M8.1 batch-range draw): readers process
-   * [start, count), so a per-surface batch draws only its own tail instead
-   * of rescanning the whole cumulative list. Undefined = 0 (legacy full
-   * lists behave exactly as before). Set per batch by the frame loop;
-   * producers that fill from 0 leave it unset.
-   */
-  start?: number;
-}
-
-/** Active window base (undefined = 0). Read once per batch, never per pixel. */
-function listStart(list: SpanList): number {
-  const s = list.start ?? 0;
-  return s < 0 ? 0 : s;
 }
 
 /** Wrap a pool array as a list view (no allocation if reused by caller). */
 export function spanListView(pool: Span[], count: number, out: SpanList): SpanList {
   out.spans = pool;
   out.count = count;
-  out.start = 0;
   return out;
 }
 
@@ -283,10 +268,9 @@ export function drawSpansSoftware(
   const { wshift, wmask, hmask } = textureMasks(tex);
   const spans = list.spans;
   const n = list.count < spans.length ? list.count : spans.length;
-  const s0 = listStart(list);
   let pixels = 0;
   let drawn = 0;
-  for (let si = s0 < n ? s0 : n; si < n; si++) {
+  for (let si = 0; si < n; si++) {
     const s = spans[si]!;
     if (s.kind !== SPAN_OPAQUE) continue;
     if (s.y < 0 || s.y >= fbH) continue;
@@ -343,10 +327,9 @@ export function drawSpansTurbulent(
   const spans = list.spans;
   const phase = ((time * 64) | 0) & (turbTable.length - 1);
   const tn = list.count < spans.length ? list.count : spans.length;
-  const s0 = listStart(list);
   let pixels = 0;
   let drawn = 0;
-  for (let si = s0 < tn ? s0 : tn; si < tn; si++) {
+  for (let si = 0; si < tn; si++) {
     const s = spans[si]!;
     if (s.kind !== SPAN_TURBULENT) continue;
     if (s.y < 0 || s.y >= fbH) continue;
@@ -390,10 +373,9 @@ export function drawSpansFlatPerSpan(
 ): { pixels: number; spans: number } {
   const spans = list.spans;
   const n = list.count < spans.length ? list.count : spans.length;
-  const s0 = listStart(list);
   let pixels = 0;
   let drawn = 0;
-  for (let si = s0 < n ? s0 : n; si < n; si++) {
+  for (let si = 0; si < n; si++) {
     const s = spans[si]!;
     if (s.kind !== SPAN_FLAT) continue;
     if (s.y < 0 || s.y >= fbH) continue;
@@ -420,10 +402,9 @@ export function drawSpansFlat(
 ): { pixels: number; spans: number } {
   const spans = list.spans;
   const n = list.count < spans.length ? list.count : spans.length;
-  const s0 = listStart(list);
   let pixels = 0;
   let drawn = 0;
-  for (let si = s0 < n ? s0 : n; si < n; si++) {
+  for (let si = 0; si < n; si++) {
     const s = spans[si]!;
     if (s.kind !== SPAN_FLAT) continue;
     if (s.y < 0 || s.y >= fbH) continue;
@@ -714,12 +695,11 @@ export function drawSpansTranslucent(
   const { wshift, wmask, hmask } = textureMasks(tex);
   const spans = list.spans;
   const n = list.count < spans.length ? list.count : spans.length;
-  const s0 = listStart(list);
   const tmask = turbTable ? turbTable.length - 1 : 0;
   const timePhase = turbTable ? (((time * 64) | 0) & tmask) : 0;
   let pixels = 0;
   let drawn = 0;
-  for (let si = s0 < n ? s0 : n; si < n; si++) {
+  for (let si = 0; si < n; si++) {
     const s = spans[si]!;
     if (s.kind !== SPAN_TRANS33 && s.kind !== SPAN_TRANS66) continue;
     if (s.y < 0 || s.y >= fbH) continue;

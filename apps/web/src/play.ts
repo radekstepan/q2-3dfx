@@ -6,10 +6,11 @@
 //   doors/triggers/movers, static soldier/gunner placeholders you can shoot).
 import { Host } from '@q2/host';
 import type { ExtraRenderable, HostDriver } from '@q2/host';
-import { BUTTON_ATTACK, isDuckHeld } from '@q2/input';
+import { BUTTON_ATTACK, BUTTON_USE, buildUserCmd, isDuckHeld } from '@q2/input';
 import type { UserCmdT } from '@q2/input';
-import type { Snapshot } from '@q2/client';
+import type { PredictCmd, Snapshot } from '@q2/client';
 import {
+  calcViewOrigin,
   drawString,
   fillRect,
   lerpAngle,
@@ -65,16 +66,19 @@ import type {
   PlayerState,
 } from '@q2/game';
 import {
+  SV_CarryRiders,
   SV_Init,
   SV_SetSkill,
   SV_SpawnEntities,
   SV_Tick,
+  SV_TouchButtonsAt,
   SV_TouchTriggersAt,
   SV_TouchDoorsAt,
   SV_DropTraceFor,
   SV_TraceFor,
   SV_ClipTrace,
   SV_PlayerFire,
+  SV_UseButton,
   SV_UseTargetname,
   SV_DamagePlayer,
   SV_SetPlayerHealth,
@@ -92,9 +96,11 @@ import type { Pcx } from '@q2/formats';
 import { resolveFrame } from '@q2/voodoo';
 import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
-import { getCVar, getCVarString, registerCVar } from '@q2/config';
+import { SERVER_DT, getCVar, getCVarNumber, getCVarString, registerCVar } from '@q2/config';
+import type { Entity, RefDef } from '@q2/renderer-api';
 import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
+import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
 
 export type RendererKind = 'software' | 'voodoo';
 
@@ -971,6 +977,27 @@ export class LocalDriver implements HostDriver {
       nav: null,
       rand: this.rand,
     });
+    // Pusher carry (id g_phys.c SV_Push rider pass): the platform JUST moved
+    // in SV_Tick, so a body standing on it (groundEntity == pusher, linked by
+    // pmove's ground trace against the mover clips) rides along NOW — before
+    // touches/snapshot/render read the body for this tick. This is the C
+    // SV_Physics_Pusher-then-client order (movers displace, riders follow,
+    // then the frame is presented). Carrying here (current tick's
+    // moverDeltas) ends the step exact; carrying pre-pmove instead would lag
+    // one tick behind the platform (measured: -4u at the 40u/s train speed).
+    // Without this the platform slides out from under a standing rider and
+    // the next ground trace misses — the exit-lift fall-through (the DRIVER
+    // path never applied the displacement M7.4 proved server-side).
+    SV_CarryRiders(this.server, [
+      {
+        origin: this.pm.origin,
+        mins: this.pm.mins,
+        maxs: this.pm.maxs,
+        groundEntity: this.pm.groundEntity,
+        onGround: this.pm.onGround,
+      },
+    ]);
+    this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
 
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
     SV_TouchTriggersAt(this.server, 'player', this.playerEdict);
@@ -978,6 +1005,15 @@ export class LocalDriver implements HostDriver {
     // competing checkDoorTouch is deleted; this call opens doors the same
     // way the WIRE bot does (expanded 60in x/y volume, NOMONSTER gated).
     SV_TouchDoorsAt(this.server, {
+      origin: v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]),
+      mins: v3(this.pm.mins[0], this.pm.mins[1], this.pm.mins[2]),
+      maxs: v3(this.pm.maxs[0], this.pm.maxs[1], this.pm.maxs[2]),
+    }, 'player');
+    // Button touch (id button_touch, g_func.c): walking into a touchable
+    // func_button (no targetname, no health) presses it — C button_fire,
+    // a no-op while the button is UP/TOP. Buttons own no trigger volumes,
+    // so the door path above never reaches them.
+    SV_TouchButtonsAt(this.server, {
       origin: v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]),
       mins: v3(this.pm.mins[0], this.pm.mins[1], this.pm.mins[2]),
       maxs: v3(this.pm.maxs[0], this.pm.maxs[1], this.pm.maxs[2]),
@@ -1000,6 +1036,11 @@ export class LocalDriver implements HostDriver {
     this.stepSparks(dt);
     this.checkPickups();
     this.handleAttack(cmd);
+    // E-use (driver `use` key / right-mouse): press the aimed func_button
+    // within reach inside the facing cone (C button_use semantics via
+    // SV_UseButton: UP/TOP no-op, wait/-1 holds TOP, only the aimed button
+    // fires). The exit lift is un-ridable without its *13/*34 call buttons.
+    if ((cmd.buttons & BUTTON_USE) !== 0) this.pressUseButton();
     // Single drain point: server event queues from the tick AND the fire
     // above (muzzles, tracers, sparks, sounds) become driver cosmetics here.
     this.drainServerEvents();
@@ -2240,6 +2281,33 @@ export class LocalDriver implements HostDriver {
     }
   }
 
+  /**
+   * E-use a func_button (driver `use` key / right-mouse): the eye sits at
+   * the authoritative viewheight and the forward comes from the live view
+   * angles; SV_UseButton picks the aimed button (reach + facing cone, wall
+   * rejected) and presses it with C button_use semantics. Emits 'use' when
+   * a button actually starts moving (drives the gate (v) verdict).
+   */
+  private pressUseButton(): void {
+    if (this.playerDead) return;
+    const eye = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + this.pm.viewheight);
+    const fwd = v3();
+    const right = v3();
+    const up = v3();
+    AngleVectors(this.pm.viewAngles, fwd, right, up);
+    const used = SV_UseButton(this.server, eye, fwd, { trace: this.worldTrace });
+    if (used) this.events.push('use');
+  }
+
+  /**
+   * Fire the selected weapon (Phase 0 single sim): the driver computes the
+   * shot (eye/feet/angles from input) but the server applies it via
+   * SV_PlayerFire — ammo, muzzle dlight, bolts, hitscan pellet traces,
+   * pain/gib/barrel damage, impact sparks and sounds are all server-owned.
+   * Muzzle/tracer visuals reach the pump through drainServerEvents (end of
+   * step). Weapon_Generic-lite gunframe + view kick stay driver-side
+   * (viewmodel cosmetics).
+   */
   private handleAttack(cmd: UserCmdT): void {    if (!(cmd.buttons & BUTTON_ATTACK)) return;
     if (this.playerDead) return;
     const t = this.server.time;
@@ -2880,13 +2948,18 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
 export function resolveDisplay(boot: PlayBoot): Uint32Array {
   const { host } = boot;
   const brightness = getBrightness();
+  // Source the LIVE renderer color plane, not host.fb.color: with a worker
+  // pool attached the renderer adopts the pool's shared color plane (and
+  // the wasm backend draws into wasm memory), so host.fb.color is stale
+  // there. Classic path: the same array (behaviour unchanged).
+  const live = boot.refresh.getFramebuffer().color;
   if (getCVarString('vid_renderer') === 'voodoo') {
-    resolveFrame(host.fb.color, boot.fb565, boot.display, host.fb.width, host.fb.height);
+    resolveFrame(live, boot.fb565, boot.display, host.fb.width, host.fb.height);
     applyBrightness(boot.display, brightness);
     return boot.display;
   }
-  if (brightness === 1) return host.fb.color;
-  boot.display.set(host.fb.color);
+  if (brightness === 1) return live;
+  boot.display.set(live);
   applyBrightness(boot.display, brightness);
   return boot.display;
 }
@@ -3249,4 +3322,227 @@ function drawViewModel(
   // Placeholder caption: short weapon name above the silhouette.
   const short = cls.replace(/^weapon_/, '');
   if (w >= 120 && h >= 100) drawString(target, gx, gy - 10, short, 0xffbbbbbb);
+}
+
+/* --- async render (M8.1 browser lane) ------------------------------------
+ *
+ * The browser main thread can never block (Atomics.wait throws), so the
+ * worker-pool frame kick must complete without blocking: beginFrame +
+ * geometry run synchronously, then flushFrameAsync/resolveFrameAsync drain
+ * the pool message-driven while the main thread drains its own band. The
+ * renderer exposes this as renderViewAsync/endFrameAsync
+ * (@q2/sw-renderer, bit-identical to the sync path); this module wires it
+ * into the play loop as frameAsync, a line-for-line async twin of
+ * Host.frame + Host.renderCurrentView (cited below). The sync path is
+ * untouched — dom.ts adopts frameAsync with a one-line tick change (see
+ * the M7.1 card; dom.ts is outside this change's file lock).
+ *
+ * Host privates (serverAcc/lastNow/ownedCmds) live here instead, in
+ * AsyncLoopState; everything else goes through public Host/Driver APIs so
+ * the sim stays canonical. A differential test pins frameAsync ==
+ * host.frame pixel-for-pixel on scripted input.
+ */
+
+/** Per-boot async-loop state (mirrors Host's private frame accumulators). */
+export interface AsyncLoopState {
+  lastNow: number;
+  serverAcc: number;
+  ownedCmds: PredictCmd[];
+}
+
+/** Fresh async-loop state (lastNow < 0 latches the first timestamp). */
+export function createAsyncLoopState(): AsyncLoopState {
+  return { lastNow: -1, serverAcc: 0, ownedCmds: [] };
+}
+
+/**
+ * Attach a browser worker pool to this boot's renderer (M8.1 async banding
+ * for the web lane). Honors `sw_workers` like the sync path: 0 (default)
+ * or unavailable (headless, no SAB, no isolation) leaves the
+ * single-threaded planes active and returns null. Call once after bootPlay
+ * (and after any rebootPlay, which rebuilds the renderer).
+ */
+export function attachBrowserPool(boot: PlayBoot, workers = 3): BrowserBandPool | null {
+  const { refresh, host } = boot;
+  try {
+    refresh.syncWorkersFromCvar();
+  } catch {
+    return null;
+  }
+  if (!refresh.isWorkersActive()) return null;
+  if (!browserPoolAvailable()) return null;
+  const n = Math.max(1, Math.min(7, Math.floor(workers)));
+  const pool = BrowserBandPool.create(n, host.fb.width, host.fb.height);
+  if (!pool) return null;
+  refresh.attachWorkerPool(pool);
+  return pool;
+}
+
+/**
+ * Advance the sim exactly like Host.frame (same dt clamp, same cmd build,
+ * same 10Hz ticks, same snapshot ingest, same owned-cmds stream, same
+ * offline branch) using only public Host APIs. Cited: @q2/host frame().
+ */
+export function stepAsyncSim(host: Host, st: AsyncLoopState, nowMs: number): void {
+  if (st.lastNow < 0) st.lastNow = nowMs;
+  let dt = (nowMs - st.lastNow) / 1000;
+  st.lastNow = nowMs;
+  if (!(dt >= 0) || dt > 0.25) dt = 0.016;
+
+  const msec = Math.max(1, Math.round(dt * 1000));
+  host.lastCmd = buildUserCmd(host.input, msec, {
+    sensitivity: getCVarNumber('sensitivity') || 3,
+    mYaw: getCVarNumber('m_yaw') || 0.022,
+    mPitch: getCVarNumber('m_pitch') || 0.022,
+  });
+
+  st.serverAcc += dt;
+  while (st.serverAcc >= SERVER_DT) {
+    st.serverAcc -= SERVER_DT;
+    // Host.serverTick inlined (public fields only): advance time, step the
+    // driver with the latest cmd, ingest the authoritative snapshot.
+    host.serverTime += SERVER_DT;
+    const driver = host.driver;
+    if (driver) {
+      const cmd: UserCmdT = host.lastCmd ?? {
+        msec: Math.max(1, Math.round(SERVER_DT * 1000)),
+        angles: [...host.input.angles] as [number, number, number],
+        forwardmove: 0,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 0,
+      };
+      driver.step(cmd, SERVER_DT);
+      const snap: Snapshot = driver.snapshot(host.serverTime);
+      host.ingestSnapshot(snap);
+      const local = snap.entities.find((e) => e.id === host.localPlayerId);
+      if (local) {
+        host.playerOrigin = [...local.origin] as [number, number, number];
+        host.playerVelocity = [...local.velocity] as [number, number, number];
+      }
+    } else {
+      host.ingestSnapshot({
+        serverTime: host.serverTime,
+        entities: [
+          { id: host.localPlayerId, origin: [...host.playerOrigin], velocity: [...host.playerVelocity] },
+        ],
+      });
+    }
+  }
+  if (host.lastCmd) {
+    st.ownedCmds.push({
+      msec: host.lastCmd.msec,
+      angles: [...host.lastCmd.angles],
+      forwardmove: host.lastCmd.forwardmove,
+      sidemove: host.lastCmd.sidemove,
+      upmove: host.lastCmd.upmove,
+      buttons: host.lastCmd.buttons,
+    });
+    if (st.ownedCmds.length > 120) st.ownedCmds.splice(0, st.ownedCmds.length - 120);
+    host.predictor.setPendingCmds(st.ownedCmds);
+  }
+  if (!host.driver && getCVarNumber('cl_predict') !== 0 && host.lastCmd) {
+    const step = msec / 1000;
+    host.playerVelocity[0] = host.lastCmd.forwardmove * 0.5;
+    host.playerVelocity[1] = host.lastCmd.sidemove * 0.5;
+    host.playerOrigin[0] += host.playerVelocity[0] * step;
+    host.playerOrigin[1] += host.playerVelocity[1] * step;
+  }
+}
+
+/**
+ * Build the current predicted/interpolated view + renderables exactly like
+ * Host.renderCurrentView (same ducked-eye rule, same one-tick kick, same
+ * driver hooks, same eye-anchored viewmodel). `remainder` is the async
+ * loop's sub-tick remainder (mirrors Host's serverTime + serverAcc render
+ * clock). Cited: @q2/host renderCurrentView().
+ */
+export function buildAsyncView(host: Host, remainder = 0): { view: RefDef; renderables: Entity[] } {
+  const now = host.serverTime + remainder;
+  const entities = host.predictor.renderEntities(now, host.localPlayerId);
+  let base: [number, number, number] = host.playerOrigin;
+  if (host.driver) {
+    const local = entities.find((e) => e.id === host.localPlayerId);
+    if (local) base = local.origin;
+  }
+  const viewBase: [number, number, number] = host.lastCmd
+    ? [host.lastCmd.angles[0], host.lastCmd.angles[1], host.lastCmd.angles[2]]
+    : [0, 0, 0];
+  const kick = host.driver?.viewKick?.() ?? null;
+  const angles: [number, number, number] = kick
+    ? [viewBase[0] + kick.angles[0], viewBase[1] + kick.angles[1], viewBase[2] + kick.angles[2]]
+    : viewBase;
+  const drvPm = (host.driver as unknown as { pm?: { viewheight?: unknown } } | null)?.pm;
+  const drvView = typeof drvPm?.viewheight === 'number' ? drvPm.viewheight : null;
+  const ducked = drvView !== null ? drvView !== 22 : (host.lastCmd ? (host.lastCmd.buttons & 8) !== 0 || host.lastCmd.upmove < 0 : false);
+  let eye = calcViewOrigin(base, ducked);
+  if (kick) eye = [eye[0] + kick.origin[0], eye[1] + kick.origin[1], eye[2] + kick.origin[2]];
+  const view: RefDef = {
+    origin: new Float32Array(eye) as RefDef['origin'],
+    angles: new Float32Array(angles) as RefDef['angles'],
+    fovX: 90,
+    time: host.serverTime,
+    lightStyles: new Float32Array(256).fill(1),
+  };
+  const renderables: Entity[] = entities
+    .filter((e) => e.id !== host.localPlayerId)
+    .map((e) => {
+      const handles = host.driver?.entityModel?.(e.id) ?? null;
+      const ea = host.driver?.entityAngles?.(e.id) ?? null;
+      return {
+        model: handles?.model ?? 0,
+        origin: new Float32Array(e.origin) as Entity['origin'],
+        angles: new Float32Array(ea ?? [0, 0, 0]) as Entity['angles'],
+        frame: host.driver?.entityFrame?.(e.id) ?? 0,
+        skin: handles?.skin ?? 0,
+      };
+    });
+  const extras = host.driver?.extraEntities?.() ?? null;
+  if (extras) {
+    for (const x of extras) {
+      renderables.push({
+        model: x.model ?? 0,
+        origin: new Float32Array(x.origin) as Entity['origin'],
+        angles: new Float32Array(x.angles ?? [0, 0, 0]) as Entity['angles'],
+        frame: x.frame ?? 0,
+        skin: x.skin ?? 0,
+        ...(x.oldframe !== undefined ? { oldframe: x.oldframe } : {}),
+        ...(x.backlerp !== undefined ? { backlerp: x.backlerp } : {}),
+        ...(x.alpha !== undefined ? { alpha: x.alpha } : {}),
+      });
+    }
+  }
+  const vm = host.driver?.viewModel?.() ?? null;
+  if (vm && view.fovX <= 90) {
+    const gunDelta = host.driver?.gunAnglesDelta?.() ?? null;
+    const gunAngles: [number, number, number] = gunDelta
+      ? [angles[0] + gunDelta[0], angles[1] + gunDelta[1], angles[2] + gunDelta[2]]
+      : angles;
+    renderables.push({
+      model: vm.model,
+      origin: new Float32Array(eye) as Entity['origin'],
+      angles: new Float32Array(gunAngles) as Entity['angles'],
+      frame: vm.frame,
+      skin: vm.skin,
+      depthHack: true,
+    });
+  }
+  return { view, renderables };
+}
+
+/**
+ * One async play-loop frame (the browser rAF body): pumps, sim, async
+ * render, resolve. Returns the display buffer (same contract as
+ * resolveDisplay). The dom tick keeps HUD + blit + sound after the await.
+ */
+export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: number): Promise<Uint32Array> {
+  pumpMuzzleLight(boot);
+  pumpExplosionLights(boot);
+  pumpTracers(boot);
+  stepAsyncSim(boot.host, st, nowMs);
+  const { view, renderables } = buildAsyncView(boot.host, st.serverAcc);
+  boot.refresh.beginFrame();
+  await boot.refresh.renderViewAsync(view, boot.host.world, renderables);
+  await boot.refresh.endFrameAsync();
+  return resolveDisplay(boot);
 }

@@ -20,7 +20,9 @@
     "@q2/formats": "workspace:*",
     "@q2/renderer-api": "workspace:*",
     "@q2/sw-renderer": "workspace:*",
-    "@q2/testkit": "workspace:*"
+    "@q2/testkit": "workspace:*",
+    "web": "workspace:*",
+    "@q2/input": "workspace:*"
   },
   "devDependencies": {
     "tsup": "^8.3.5",

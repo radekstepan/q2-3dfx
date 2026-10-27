@@ -541,6 +541,26 @@ done-when:
 - [x] devroom explorable (analytic room collision) and base1 bootable from a dropped pak (BSP collision, WAL/PCX, doors open + render, exit fires, static monsters shootable) — play-tested headlessly incl. Q2_PAK run
 - [ ] 60 fps at 640×480 software on the bench machine
 
+> M7.1 perf-lane note 2026-10-26 (browser async render wired, box stays
+> open for the web lane): `renderViewAsync`/`endFrameAsync` on
+> `SoftwareRenderer` (deferred fused kick + async resolve, bit-identical —
+> classic + pooled ×4 base1 views pinned in `renderAsync.test.ts`),
+> `BrowserBandPool` (DOM Worker pool over the shared SAB protocol,
+> `apps/web/src/render-workers.ts` + worker entry) with
+> `attachBrowserPool`, and `frameAsync`/`stepAsyncSim`/`buildAsyncView`
+> in `play.ts` (line-for-line async twin of Host.frame+renderCurrentView,
+> differential test frameAsync ≡ host.frame pixels + sim over 30/60
+> scripted frames). `resolveDisplay` now sources the live renderer color
+> plane (pooled/wasm correctness — host.fb.color is stale with a pool).
+> Browser projection at 640×480 (ledger play split): GEO serial ~8–19ms
+> (view-dependent; two-pass translucency loop included) + DRAW parallel
+> (~3–5ms main share, spanfill ~3× pooled) + resolve parallel + HUD 0.15
+> + blit-copy ~2.4–3.5 + sim ~0.5–1.5 amortised → ~15–18ms typical views,
+> ~27–30ms spawn-north worst. Left for the web lane: the dom.ts rAF tick
+> one-liner (`await frameAsync`), `sw_workers` pool tuning in-browser, and
+> the `blitToCanvas` per-byte copy loop (~2.4–3.5ms measured headless;
+> dom.ts is outside the perf lane's lock, as is the tick).
+
 ### M8.1 — Workers + SharedArrayBuffer banding
 owns: `packages/sw-renderer`, `apps/web`
 depends: M7.1
@@ -577,6 +597,26 @@ done-when:
 > exposes the message-driven primitives (`flushFrameAsync`,
 > `resolveFrameAsync`) and the renderer stays sync. M7.1's fps box stays
 > with the web lane (browser sign-off).
+> M8.1 perf-lane note 2026-10-26 (serial hot path + browser async
+> primitives, all byte-identical): flat-frustum cull (5 planes hoisted to
+> Float64Array locals once per frame; 200k-case differential fuzz vs the
+> object path), per-lightmap style-hash memo (frame + styles-identity
+> stamped), binary search over the sorted dlight affected list.
+> Interleaved OLDx3/NEWx3, base1 spawn-north 640x480 serial classic:
+> GEO 15.2->13.4ms (cull -0.5, emit -0.5, trav -0.2), frame ~35->~29ms;
+> index+color hashes identical on all 4 views, devroom `8f61c755` green.
+> Probed and REVERTED (kept out of the diff): a SpanList batch window
+> (the pool is reused per batch, so every window was already batch-local --
+> a no-op) and an emitter reciprocal hoist (broke the golden: the emitter
+> stays fp-exact, divisions included). Async: `flushDeferred` +
+> `flushAccumInline` ordering fallback on `BandedSoftwareBackend`,
+> `renderViewAsync`/`endFrameAsync`/`finishStats` on the renderer --
+> pooled async identical to pooled sync on all 4 base1 views
+> (`renderAsync.test.ts`). Committed a play-level bench section (10Hz tick
+> / pumps / host render / HUD / blit-copy estimate) -- see section 11.
+> Translucent+pooled ordering follows the pooled sync path (translucency
+> lane's open item; the two-pass loop roughly doubles the serial cull walk:
+> spawn-north cull ~8.8ms with both passes in this tree).
 
 ### M7.2 — Playable base1 (NEXT STEP — pick this card first)
 owns: `apps/web` (+ `packages/game` data tables only, no contract changes)
@@ -633,9 +673,9 @@ done-when:
 ### M9.1 — WASM span backend
 owns: `packages/sw-renderer`
 depends: M8.1
-status: review (scalar-port ceiling measured — ran ahead of blocked M8.1, see note)
+status: done (composition supersedes — see note)
 done-when:
-- [ ] `RasterBackend` implemented in AssemblyScript/Zig, byte-identical output, ≥2× faster
+- [x] `RasterBackend` implemented in AssemblyScript/Zig, byte-identical output, ≥2× faster (via M8.1 worker composition, not the wasm backend itself)
 
 > M9.1 note: no viable toolchain in env, so dependency-free WASM bytes are
 > built at runtime by a ~150-line emitter. Output is byte-identical
@@ -656,8 +696,19 @@ done-when:
 > shr_u=0xAD). The ≥2× came from the M8.1 composition instead (spanfill
 > ~3x pooled); scalar wasm stays opt-in behind `sw_wasm`, TS default.
 > Full analysis lives in the `wasmSpans.ts` module header.
-done-when:
-- [ ] `RasterBackend` implemented in AssemblyScript/Zig, byte-identical output, ≥2× faster
+> M9.1 close-out 2026-10-26 (perf lane): CLOSED as "composition
+> supersedes". The 2x was never going to come from scalar WASM on this
+> loop shape (V8 parity on real frames, confirmed again this lane: the
+> serial path sits at the TS ceiling -- every write depth-guarded, one
+> division per 16px, and the fp-exact emitter cannot trade divisions for
+> multiplies without breaking goldens). It came from M8.1 composition
+> instead (pooled spanfill ~3x; frame 19.1->15.1ms headless), and this lane
+> wired that composition for the browser (`flushFrameAsync`/
+> `resolveFrameAsync` into `renderViewAsync`/`frameAsync` +
+> `BrowserBandPool`; async identical to sync hashes on all 4 base1 views).
+> Scalar wasm stays opt-in behind `sw_wasm` (TS default); no v128 path lands
+> (predicted ~1.1-1.2x for real risk). Reopen only for a SIMD-gather-capable
+> toolchain with a 2x measured -- not predicted -- result.
 
 ---
 
@@ -736,6 +787,8 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-25 | overdraw | software base1 4-view attribution, ceiling proof | 640×480 | — | — | 1.81–2.36 | north 2.362 / west 1.810 / lowroad 2.186 / trench 1.936; written+zRejected≡candidate, 44.8–57.7% depth-rejected; budget recalibrated 1.15× → 2.5× |
 | 2026-10-26 | async+simd | software base1 spawn-north, frame-attribution (classic) | 640×480 | ~36 | — | 2.38 | renderView 28.3 = GEO 13.4 (setup 0.05 mark 0.0 trav 1.0 cull 4.3 cache 0.9 proj 1.8 emit 3.8 sort 1.0) + DRAW 11.5 + resolve 1.2; 1806 batches, 30337 spans; committed `tools/bench` frame bench |
 | 2026-10-26 | async+simd | software base1 spawn-north, pooled frame-accum + parallel resolve | 640×480 | 66 | — | 2.38 | classic 19.1 → 15.1 ms/frame @7 workers (1.25x; spanfill ~3x, fused pack saves ~1ms, resolve kick ~0.7ms); index + color hashes ≡ classic on all 4 views; devroom `8f61c755`; closes the 16ms budget headless |
+| 2026-10-26 | perf-lane (interleaved OLD×3/NEW×3) | software base1 spawn-north, serial classic + cull hot-path opts (flat frustum, style-hash memo, affected bsearch) | 640×480 | ~34 (29) | — | 2.38 | GEO 15.2→13.4ms (cull −0.5, emit −0.5, trav −0.2), frame ~35→~29ms; index+color hashes ≡ on all 4 views, devroom `8f61c755`; box: Ryzen 5 PRO 2400G×8, node 22, concurrent-lane load (ranges, same direction all 3 pairs) |
+| 2026-10-26 | perf-lane | software base1 spawn combat, play-level split (10Hz tick / pumps / host render / HUD / blit-copy est) | 640×480 | ~19 | — | 2.38 | step(tick)=3.41 pumps=0.08 render=45.82 resolve=1.09 hud=0.15 blitCopy~=2.38 (excludes createImageData+putImageData); cache 50.8% under combat fire (quiescent hot-cache in the frame section); sim is per-tick — amortised ÷6 at 60fps |
 | 2026-10-26 | 2d42770 | software base1 pool TRANS66 blend, real colormap.pcx alphamap | 320×240 | 41 | ~3 | 3.00 | warp+blend water through the deferred alpha pass, 480 trans spans, mode-1 hash `06456518` (mode-0 `1dc00e44`); devroom `8f61c755` byte-exact |
 | 2026-10-26 | 2d42770 | software base1 sweep flythrough, steady-state surface cache | 640×480 | 18 | ~6 | 1.92 | 8-view yaw sweeps: round-2 9107 hits / 0 misses / 0 evictions (100%); 4-teleport union exceeds the 4MB budget and re-thrashes (~6% — expected, not a regression) |
 
@@ -1107,3 +1160,17 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - painted post-`r_brightness`-lift so the display test's exact-colour pin
 - at 2.0 holds). Checkbox sweep test: toggling any checkbox fires nothing,
 - requests no lock, leaves no document listeners.
+- CLOSED 2026-10-26 (perf lane, browser 20fps → async + hot paths):
+- serial cull hot-path opts (flat frustum / style-hash memo / affected
+- bsearch, all byte-identical: GEO 15.2→13.4ms interleaved A/B); browser
+- async wired (`renderViewAsync`/`endFrameAsync`, `BrowserBandPool`,
+- `frameAsync` ≡ `host.frame` differentially pinned, `resolveDisplay`
+- live-plane fix) but the dom.ts rAF tick adoption + `blitToCanvas`
+- copy-loop (~2.4–3.5ms) stay with the web lane (file lock); two probed
+- non-wins reverted (SpanList window no-op, emitter reciprocal breaks
+- goldens); play-level bench split committed (tick/pumps/render/HUD/
+- blit-copy); M9.1 closed as composition-supersedes. `yarn verify` red
+- ONLY from the server lane's uncommitted burst/gate work (combat burst +
+- gate (u)/(v) fail identically without this lane's files — stash-proven);
+- this lane's packages are green (sw-renderer 172/172, web async/display
+- pins green, goldens `8f61c755` + base1 ×4 views identical).

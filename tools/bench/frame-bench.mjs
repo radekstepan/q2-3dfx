@@ -8,3 +8,5 @@ if (!pak) {
 }
 const { runFrameBench } = await import('./dist/index.mjs');
 await runFrameBench(pak, Number(process.env.SW_BENCH_WORKERS ?? 5));
+const { playBench } = await import('./dist/index.mjs');
+playBench(pak);

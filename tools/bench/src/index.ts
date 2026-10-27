@@ -16,6 +16,7 @@ export {
   swRendererEsmPath, BASE1_VIEWS,
   type AttribView, type FrameWorld, type PhaseRow, type PoolRow,
 } from './frame.js';
+export { playBench, type PlayBenchRow } from './playbench.js';
 
 export async function runBenchTool(opts: BenchOptions = {}): Promise<string> {
   const width = opts.width ?? 640;

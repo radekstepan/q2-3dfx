@@ -8,9 +8,9 @@ import type {
 } from '@q2/renderer-api';
 import type { MiniLightmap } from './worldNodes.js';import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
 import { SurfaceCache, hashLightStyles, type SurfaceBlock } from './surfaceCache.js';
-import { setupCamera, setupCameraInto, type Camera } from './camera.js';
+import { setupCamera, setupCameraInto, culledByFlatFrustum, type Camera } from './camera.js';
 import {
-  collectVisibleSurfaces, findLeaf, isMiniWorld, surfFrustumCulled,
+  collectVisibleSurfaces, findLeaf, isMiniWorld,
   type MiniSurf, type MiniWorld,
 } from './worldNodes.js';
 import {
@@ -939,7 +939,7 @@ export class SoftwareRenderer implements Refresh {
       // Diag buckets accumulate on pass 0 only: pass 1 re-walks the set for
       // the deferred alpha draw and must not recount admitted surfaces.
       if (surf.n < 3) { if (d && pass === 0) d.degenerate++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
-      if (surfFrustumCulled(cam, surf)) { if (d && pass === 0) d.frustumCulled++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
+      if (culledByFlatFrustum(this.frustumFlat, surf.mins, surf.maxs)) { if (d && pass === 0) d.frustumCulled++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
       // backface cull for single-sided world polys (id draws these too and
       // lets the z-buffer reject them; skipping is output-identical and
       // saves the span work). Turbulent (water) and sky stay double-sided:

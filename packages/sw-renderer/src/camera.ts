@@ -108,6 +108,32 @@ export function boxOnFrustumSide(
   return 3;
 }
 
+/**
+ * Flat-frustum cull (M8.1 hot path): the 5 planes packed as
+ * [nx,ny,nz,dist]×5 in one Float64Array, hoisted once per frame by the
+ * caller. Same arithmetic as culledByFrustum (inward normals, outside iff
+ * both corners are behind the plane), without the per-surface/per-plane
+ * object + Float32Array property chasing and call layers. Bit-identical:
+ * the plane packing is exact (f64 stores of f32 values) and the corner
+ * selection matches boxOnFrustumSide op-for-op.
+ */
+export function culledByFlatFrustum(
+  fp: Float64Array, mins: Float32Array, maxs: Float32Array,
+): boolean {
+  const minx = mins[0]!, miny = mins[1]!, minz = mins[2]!;
+  const maxx = maxs[0]!, maxy = maxs[1]!, maxz = maxs[2]!;
+  for (let p = 0; p < 20; p += 4) {
+    const nx = fp[p]!, ny = fp[p + 1]!, nz = fp[p + 2]!, dist = fp[p + 3]!;
+    let d1: number, d2: number;
+    if (nx > 0) { d1 = nx * maxx; d2 = nx * minx; } else { d1 = nx * minx; d2 = nx * maxx; }
+    if (ny > 0) { d1 += ny * maxy; d2 += ny * miny; } else { d1 += ny * miny; d2 += ny * maxy; }
+    if (nz > 0) { d1 += nz * maxz; d2 += nz * minz; } else { d1 += nz * minz; d2 += nz * maxz; }
+    d1 -= dist; d2 -= dist;
+    if (d1 < 0 && d2 < 0) return true;
+  }
+  return false;
+}
+
 /** True when the bbox is entirely outside any frustum plane. */
 export function culledByFrustum(cam: Camera, mins: Float32Array, maxs: Float32Array): boolean {
   for (let i = 0; i < cam.frustum.length; i++) {

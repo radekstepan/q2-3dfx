@@ -773,6 +773,15 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
    */
   accumEnabled = true;
   /**
+   * Deferred async-render mode (M8.1 browser lane): when true, the
+   * end-of-geometry kick is skipped — `flushAccumAsync` completes the frame
+   * later without blocking the calling thread. A mid-loop sequencing break
+   * still replays staged batches inline immediately (ordering), so the
+   * deferred kick only ever covers later batches; every write stays
+   * depth-guarded, hence output-identical. Set by renderViewAsync.
+   */
+  flushDeferred = false;
+  /**
    * Fused-emission staging for the CURRENT batch (M8.1): the renderer sets
    * this from the pool's flatCursor() before emitSpansForPoly runs, so
    * drawSpans can record the descriptor without re-packing. base < 0 means
@@ -821,7 +830,15 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
         )) {
         return;
       }
-      this.flushAccum();
+      if (this.flushDeferred) {
+        // Async frame: a sync kick would block the calling thread, so
+        // replay staged batches inline now (ordering preserved) and run
+        // this batch inline after them. The later async kick finds nothing
+        // pending and no-ops. Depth-guarded convergence: identical output.
+        this.flushAccumInline();
+      } else {
+        this.flushAccum();
+      }
       this.runInline(list, tex, light);
       return;
     }
@@ -868,6 +885,21 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
       this.clearedFrame = d.frame();
       return;
     }
+    const q = d.drawInlineAll();
+    this.spansDrawn += q.spans;
+    this.pixelsDrawn += q.pixels;
+    this.clearedFrame = d.frame();
+  }
+
+  /**
+   * Inline replay of every staged batch on the calling thread (ordering
+   * fallback for the deferred async path, which must never block): clears
+   * and replays in pack order, tallies into the backend counters. Identical
+   * output via depth-guarded convergence.
+   */
+  flushAccumInline(): void {
+    const d = this.dispatcher;
+    if (!d || !this.accumEnabled || d.accumPending() === 0) return;
     const q = d.drawInlineAll();
     this.spansDrawn += q.spans;
     this.pixelsDrawn += q.pixels;
