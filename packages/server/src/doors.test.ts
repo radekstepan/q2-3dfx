@@ -3,13 +3,14 @@
 // every mover is built from a hand-made edict, matching the C spawn inputs.
 
 import { describe, expect, it } from 'vitest';
-import { spawnDoor, spawnEdict } from '@q2/game';
+import { moverThink, spawnDoor, spawnEdict } from '@q2/game';
 import { v3 } from '@q2/math';
 import {
   CRUSH_DAMAGE,
   DOOR_SOUND_END,
   DOOR_SOUND_START,
   applyTeamMoveSpeeds,
+  doorTouchUse,
   rotBlocked,
   rotGoDown,
   rotGoUp,
@@ -319,10 +320,83 @@ describe('func_door_rotating (SP_func_door_rotating)', () => {
     expect(debris).toEqual({ dmg: CRUSH_DAMAGE, crush: true, action: 'continue' });
   });
 
+
   it('rotGoDown/rotGoUp drive the legs directly', () => {
     const rm = spawnRotDoor(rotEdict());
     rotGoDown(rm, 3.0);
     expect(rm.state).toBe('going_down');
     expect(rm.legEnd).toBeCloseTo(3.0, 9); // already at start: zero travel
+  });
+});
+
+describe('doorTouchUse (C door_use/door_go_up slider touch parity)', () => {
+  it('opens from bottom, holds at top, never restarts the leg', () => {
+    // C door_go_up: BOTTOM starts the UP leg; UP is an early return; TOP
+    // only resets nextthink (never restarts the leg or re-fires targets).
+    const door = spawnDoor(spawnEdict({ classname: 'func_door' }), 0, 128);
+    expect(doorTouchUse(door, 1.0)).toBe('opened');
+    expect(door.state).toBe('going_up');
+    const leg = door.legEnd;
+    expect(doorTouchUse(door, 2.0)).toBeNull();
+    expect(door.legEnd).toBe(leg);
+    // Ride the leg out to WAITING (TOP-with-pending-close, wait 3).
+    let now = 1.0;
+    for (let i = 0; i < 40 && door.state !== 'waiting'; i++) {
+      now += 0.1;
+      moverThink(door, now);
+    }
+    expect(door.state).toBe('waiting');
+    expect([...door.ent.origin]).toEqual([...door.pos2]);
+    const waitEnd = door.waitEnd;
+    // Touch while waiting: C resets the FULL wait — leg and state untouched.
+    expect(doorTouchUse(door, now + 1.0)).toBe('held');
+    expect(door.state).toBe('waiting');
+    expect(door.legEnd).toBe(leg);
+    expect(door.waitEnd).toBeCloseTo(now + 1.0 + door.wait, 9);
+    expect(door.waitEnd).toBeGreaterThan(waitEnd);
+    // Without further touch the wait expires: closes and latches at pos1.
+    for (let i = 0; i < 80 && door.state !== 'bottom'; i++) {
+      now += 0.1;
+      moverThink(door, now);
+    }
+    expect(door.state).toBe('bottom');
+    expect([...door.ent.origin]).toEqual([...door.pos1]);
+  });
+
+  it('reverses a mid-close touch (C door_go_up from DOWN)', () => {
+    const door = spawnDoor(spawnEdict({ classname: 'func_door' }), 0, 128);
+    doorTouchUse(door, 0);
+    let now = 0;
+    for (let i = 0; i < 40 && door.state !== 'waiting'; i++) {
+      now += 0.1;
+      moverThink(door, now);
+    }
+    // Let the wait expire and catch it mid-close.
+    for (let i = 0; i < 40 && door.state !== 'going_down'; i++) {
+      now += 0.1;
+      moverThink(door, now);
+    }
+    expect(door.state).toBe('going_down');
+    const mid = v3(door.ent.origin[0], door.ent.origin[1], door.ent.origin[2]);
+    expect(doorTouchUse(door, now)).toBe('opened');
+    expect(door.state).toBe('going_up');
+    // The UP leg restarts from the current origin (C Move_Calc from here).
+    const dist = Math.hypot(door.pos2[0]! - mid[0]!, door.pos2[1]! - mid[1]!, door.pos2[2]! - mid[2]!);
+    expect(door.legEnd).toBeCloseTo(now + dist / door.speed, 9);
+  });
+
+  it('TOGGLE closes on touch at top, opens at bottom', () => {
+    // C door_use TOGGLE branch: UP/TOP reverses every paired door down;
+    // every other state runs door_go_up.
+    const door = spawnDoor(spawnEdict({ classname: 'func_door', spawnflags: '32' }), 0, 128);
+    expect(doorTouchUse(door, 0)).toBe('opened');
+    let now = 0;
+    for (let i = 0; i < 40 && door.state !== 'top'; i++) {
+      now += 0.1;
+      moverThink(door, now);
+    }
+    expect(door.state).toBe('top');
+    expect(doorTouchUse(door, now)).toBe('closed');
+    expect(door.state).toBe('going_down');
   });
 });

@@ -1014,6 +1014,26 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - +1/32. Bias ported from CM_ClipBoxToBrush, landings +1/32 grounded).
 - Gate (r)/(s) pin it (19/19 green); west of the spot the world rock face
 - at x=-412 holds per the C trace rule (stays).
+- CLOSED 2026-10-26 (movers lane, exit-lift auto-cycle): the doors at
+- (-1669,1514,120) cycled open/close forever with the player standing
+- still (7 *33 cycles in 400 driver ticks). Root cause in
+- `SV_TouchDoorsAt` (packages/server/src/index.ts): the slider trigger
+- volume followed the moving door (live-origin offset) while C
+- `Think_SpawnDoorTrigger` bakes ONE static trigger from the rest bounds,
+- so the slab slid out from under the camper, the TOP wait expired, and
+- it re-touched in a loop; the touch also re-ran `moverUse` from WAITING
+- every tick (zero-leg restart → per-tick target re-fire + door-sound
+- edges) where C `door_go_up` on TOP only resets the wait. Fixed volumes
+- + new `doorTouchUse` (packages/server/src/doors.ts: UP no-op,
+- TOP/WAITING full-wait reset, BOTTOM/DOWN start the UP leg + fire the
+- target once, TOGGLE reverses at TOP); rot branch now reaches TOP bodies
+- too (rotUse already encodes the C reset). base1 ships no func_plat and
+- no TOGGLE sliders; *32's t75 target dangles, so no cascade existed.
+- Gate (t) pins it in the driver loop: 400-tick camp parks all three
+- slabs open (offsets frozen, *12 never starts), then the *13 button
+- chain runs the *12 train t88→t89→t90 once and it parks 150 ticks with
+- nobody aboard (rendered/sim (-16,0,40)). 20/20 green; unit pins fail
+- red pre-fix.
 - CLOSED 2026-10-26 (infantry spin/cock lane): the spin is real
 - (m_infantry.c `infantry_cock_gun`, attack1 frame 4 = attak104/md2 187:
 - chaingun spin/crank, infatck3.wav, arms the 1.0–2.5s burst pausetime —

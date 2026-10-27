@@ -396,6 +396,53 @@ export function secretDie(sm: SecretMover, now: number): boolean {
 // and closes when triggered). door_go_up/down dispatch on classname; sounds
 // fire on leg start (sound_start) and arrival (sound_end) like linear doors.
 
+/**
+ * C door_use/door_go_up for the slider touch path (game/g_func.c): GOING_UP
+ * → nothing (C returns early: already going up); TOP (or WAITING, our
+ * TOP-with-a-pending-close) → reset the FULL wait, no leg restart and no
+ * target fire (C only resets nextthink); TOGGLE at UP/TOP/WAITING → start
+ * the DOWN leg (C reverses paired doors); otherwise (BOTTOM, or DOWN
+ * mid-close) → start the UP leg from the current origin.
+ *
+ * Returns 'opened' when an UP leg starts (caller fires the door's target
+ * once, like C door_go_up's G_UseTargets), 'closed' on a TOGGLE close (C
+ * door_go_down fires no targets), 'held' on a TOP wait reset, null when
+ * already going up.
+ */
+export function doorTouchUse(m: Mover, now: number): 'opened' | 'closed' | 'held' | null {
+  if (m.state === MOVER_GOING_UP) return null;
+  if (m.ent.spawnflags & DOOR_TOGGLE) {
+    if (m.state === MOVER_TOP || m.state === MOVER_WAITING) {
+      m.state = MOVER_GOING_DOWN;
+      const dx = m.pos1[0]! - m.ent.origin[0]!;
+      const dy = m.pos1[1]! - m.ent.origin[1]!;
+      const dz = m.pos1[2]! - m.ent.origin[2]!;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      m.legEnd = now + (m.speed > 0 ? dist / m.speed : 0);
+      m.waitEnd = -1;
+      m.ent.state = m.state;
+      return 'closed';
+    }
+    // TOGGLE at BOTTOM/DOWN falls through to the UP leg below (C door_use
+    // runs door_go_up for every other state).
+  } else if (m.state === MOVER_TOP || m.state === MOVER_WAITING) {
+    if (m.wait >= 0) {
+      m.waitEnd = now + m.wait;
+      m.ent.state = m.state;
+    }
+    return 'held';
+  }
+  m.state = MOVER_GOING_UP;
+  const dx = m.pos2[0]! - m.ent.origin[0]!;
+  const dy = m.pos2[1]! - m.ent.origin[1]!;
+  const dz = m.pos2[2]! - m.ent.origin[2]!;
+  const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  m.legEnd = now + (m.speed > 0 ? dist / m.speed : 0);
+  m.waitEnd = -1;
+  m.ent.state = m.state;
+  return 'opened';
+}
+
 export interface RotMover {
   ent: Edict;
   /** Closed angles (C pos1; mapper angles are VectorClear'ed). */

@@ -124,6 +124,7 @@ import {
   DOOR_SOUND_START,
   MOVER_TOUCH_DEBOUNCE,
   applyTeamMoveSpeeds,
+  doorTouchUse,
   rotThink,
   rotUse,
   secretThink,
@@ -1294,10 +1295,11 @@ export const MAX_USETARGETS_DEPTH = 16;
  * Use a rotating door the id way (door_use / door_go_up, angular branch):
  * an opening leg plays sound_start and fires the door's target right away
  * (C door_go_up runs G_UseTargets); TOGGLE close legs fire nothing.
+ * Returns the rotUse verdict so touch sites can share the one call.
  */
-export function SV_UseRotDoor(st: ServerState, rm: RotMover): void {
+export function SV_UseRotDoor(st: ServerState, rm: RotMover): 'opened' | 'closed' | null {
   const res = rotUse(rm, st.time);
-  if (res === null) return;
+  if (res === null) return null;
   if (res === 'opened') {
     if (!rm.silent) {
       st.sounds.push({
@@ -1308,6 +1310,7 @@ export function SV_UseRotDoor(st: ServerState, rm: RotMover): void {
     }
     fireTargets(st, rm.ent);
   }
+  return res;
 }
 
 /** G_UseTargets equivalent: use every entity targeted by `user`. */
@@ -1409,18 +1412,29 @@ export function SV_TouchTriggersAt(
 /**
  * Touch door trigger fields (id Touch_DoorTrigger, g_func.c): every func_door
  * (and func_door_rotating — SP_func_door_rotating installs the same think)
- * spawns an invisible trigger volume from its brush bounds expanded 60 in
- * x/y (Think_SpawnDoorTrigger). A body overlapping a closed/waiting door's
- * volume uses the door (door_use), exactly like the bot driver mirrors.
- * Doors without registered brush bounds (no modelSizes hook) are skipped.
+ * spawns one STATIC invisible trigger volume from its rest brush bounds
+ * expanded 60 in x/y (Think_SpawnDoorTrigger). A body overlapping the volume
+ * uses the door (door_use), exactly like the bot driver mirrors. Doors
+ * without registered brush bounds (no modelSizes hook) are skipped.
  * func_door_secret spawns NO trigger in C, so secrets never open on touch.
  *
+ * Two C-parity rules live here (both were violated before and produced the
+ * exit-hall auto-cycle: the volume used to follow the moving door, and a
+ * touch on a waiting door restarted its leg every tick):
+ * - the volume is baked from the REST bounds and never follows the door. A
+ *   follower volume strands a camper outside once the slab slides away, so
+ *   the TOP wait expires, the door closes, re-touches, and cycles forever.
+ * - a touch runs C door_go_up (doorTouchUse for sliders, rotUse for
+ *   rotators): GOING_UP is a no-op, TOP/WAITING only resets the full wait
+ *   (no leg restart, no target re-fire), BOTTOM — or DOWN mid-close —
+ *   starts the UP leg and fires the door's target once.
+ *
  * C gates (Touch_DoorTrigger): monsters never trip DOOR_NOMONSTER doors
- * (spawnflags & 8 — both base1 sliders carry it), and touches debounce at
- * 1Hz. The debounce is implicit here: moverUse only re-fires from
- * bottom/waiting, so a body already inside merely refreshes the wait —
- * exactly the C door_go_up-on-TOP wait reset. Pass toucherClass 'monster'
- * for monster bodies so the NOMONSTER gate applies.
+ * (spawnflags & 8 — both base1 sliders carry it). C also debounces touches
+ * at 1Hz; that only rate-limits redundant door_use calls (every touch here
+ * is already idempotent or a one-shot leg start), so no debounce is kept.
+ * Pass toucherClass 'monster' for monster bodies so the NOMONSTER gate
+ * applies.
  *
  * Returns the doors that started moving (sliders and rotators).
  */
@@ -1432,23 +1446,26 @@ export function SV_TouchDoorsAt(
   const used: Array<Mover | RotMover> = [];
   for (const m of st.movers) {
     if (m.ent.classname !== 'func_door') continue;
-    if (m.state !== MOVER_BOTTOM && m.state !== MOVER_WAITING) continue;
     // id Touch_DoorTrigger: NOMONSTER doors ignore monster touches.
     if (toucherClass === 'monster' && m.ent.spawnflags & DOOR_NOMONSTER) continue;
     const b = st.moverBounds.get(m.ent.num);
     if (!b) continue;
-    const ox = m.ent.origin[0]! - m.pos1[0]!;
-    const oy = m.ent.origin[1]! - m.pos1[1]!;
-    const oz = m.ent.origin[2]! - m.pos1[2]!;
-    const tmins = new Float32Array([b.mins[0]! + ox - 60, b.mins[1]! + oy - 60, b.mins[2]! + oz]);
-    const tmaxs = new Float32Array([b.maxs[0]! + ox + 60, b.maxs[1]! + oy + 60, b.maxs[2]! + oz]);
+    // C Think_SpawnDoorTrigger bakes the trigger ONCE from the rest bounds
+    // (unioned over the teamchain, +60 x/y) — it never follows the door.
+    const tmins = new Float32Array([b.mins[0]! - 60, b.mins[1]! - 60, b.mins[2]!]);
+    const tmaxs = new Float32Array([b.maxs[0]! + 60, b.maxs[1]! + 60, b.maxs[2]!]);
     if (!bodyOverlapsBounds(body.origin, body.mins, body.maxs, tmins, tmaxs)) continue;
-    // door_use → door_go_up: fires the door's own target as it starts moving.
-    SV_UseMover(st, m);
-    used.push(m);
+    // C door_use → door_go_up: opens (firing the door's own target as the
+    // leg starts), holds TOP open, or reverses a close — never restarts.
+    const res = doorTouchUse(m, st.time);
+    if (res === 'opened') {
+      if (m.ent.target) fireTargets(st, m.ent, 1);
+      used.push(m);
+    } else if (res === 'closed') {
+      used.push(m);
+    }
   }
   for (const rm of st.rotDoors) {
-    if (rm.state !== MOVER_BOTTOM && rm.state !== MOVER_WAITING) continue;
     if (toucherClass === 'monster' && rm.ent.spawnflags & DOOR_NOMONSTER) continue;
     const b = st.moverBounds.get(rm.ent.num);
     if (!b) continue;
@@ -1458,9 +1475,11 @@ export function SV_TouchDoorsAt(
     const tmins = new Float32Array([b.mins[0]! - 60, b.mins[1]! - 60, b.mins[2]!]);
     const tmaxs = new Float32Array([b.maxs[0]! + 60, b.maxs[1]! + 60, b.maxs[2]!]);
     if (!bodyOverlapsBounds(body.origin, body.mins, body.maxs, tmins, tmaxs)) continue;
-    // door_use → door_go_up (angular): fires the target as it starts moving.
-    SV_UseRotDoor(st, rm);
-    used.push(rm);
+    // door_use → door_go_up (angular): opens (firing the target as the leg
+    // starts, like sliders), holds TOP open, TOGGLE closes. rotUse already
+    // encodes all of that, so TOP bodies reach it too.
+    const res = SV_UseRotDoor(st, rm);
+    if (res !== null) used.push(rm);
   }
   return used;
 }

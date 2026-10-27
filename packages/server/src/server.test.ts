@@ -346,9 +346,9 @@ describe('skill cvar + spawn gating (g_spawn.c, g_combat.c)', () => {
   it('doors spawn closed (no START_OPEN), open on touch, auto-close when clear', () => {
     // C SP_func_door: without START_OPEN the slab rests at pos1 in STATE_BOTTOM;
     // door_hit_top schedules door_go_down after `wait`, door_hit_bottom ends
-    // at STATE_BOTTOM. Touch_DoorTrigger debounce is implicit: moverUse only
-    // re-fires from bottom/waiting (re-touch refreshes the wait, like C's
-    // door_go_up-on-TOP nextthink reset), so a clear area always returns to pos1.
+    // at STATE_BOTTOM. A camper only resets the TOP wait (C door_go_up-on-TOP
+    // nextthink reset via doorTouchUse) — no leg restart, no target re-fire —
+    // so a clear area always returns to pos1.
     const lump =
       `{ "classname" "worldspawn" }\n` +
       `{ "classname" "func_door" "model" "*1" "angle" "0" "distance" "128" "speed" "100" "wait" "3" }\n`;
@@ -378,6 +378,54 @@ describe('skill cvar + spawn gating (g_spawn.c, g_combat.c)', () => {
     }
     expect(sawTop).toBe(true);
     // ... then come back down and latch at pos1/bottom (3s wait + 1.2s legs).
+    for (let i = 0; i < 200 && door.state !== 'bottom'; i++) SV_Tick(st);
+    expect(door.state).toBe('bottom');
+    expect([...door.ent.origin]).toEqual([...door.pos1]);
+  });
+
+  it('a camper parks the door open: no close/reopen cycle, target fires once', () => {
+    // C Think_SpawnDoorTrigger bakes ONE static trigger from the rest bounds
+    // and C door_go_up on TOP only resets the wait. The old follower volume
+    // stranded campers outside once the slab slid away (the exit *33 cycled
+    // open/close forever with the player standing still), and the old touch
+    // restarted the waiting leg every tick (re-firing the door's target and
+    // the door sound). Camped now: opens once, parks, fires the target once.
+    const lump =
+      `{ "classname" "worldspawn" }\n` +
+      `{ "classname" "func_door" "model" "*1" "angle" "0" "speed" "100" "wait" "3" "target" "t1" }\n` +
+      `{ "classname" "trigger_relay" "targetname" "t1" }\n`;
+    const bounds = { mins: new Float32Array([-32, -32, 0]), maxs: new Float32Array([32, 32, 96]) };
+    resetEdictNums();
+    const st = SV_Init();
+    SV_SpawnEntities(st, lump, (m) => (m === '*1' ? bounds : null));
+    const door = st.movers[0]!;
+    // Edge camper: just inside the closed volume's west edge (x -92..92).
+    // A follower volume would abandon this body once the slab slides +56x
+    // (-36..148) and the door would cycle; the fixed volume holds it open.
+    const camp = (fires: string[]): void => {
+      SV_Tick(st);
+      SV_TouchDoorsAt(st, {
+        origin: v3(-80, 0, 32),
+        mins: v3(-16, -16, -24),
+        maxs: v3(16, 16, 32),
+      });
+      for (const t of st.firedThisTick) fires.push(t);
+    };
+    const fires: string[] = [];
+    camp(fires); // the opening touch
+    expect(door.state).toBe('going_up');
+    // Camp 200 ticks the way the driver does (tick then touch every tick).
+    let sawDown = false;
+    for (let i = 0; i < 200; i++) {
+      camp(fires);
+      if (door.state === 'going_down') sawDown = true;
+    }
+    expect(sawDown).toBe(false);
+    expect(door.state).toBe('waiting');
+    expect([...door.ent.origin]).toEqual([...door.pos2]);
+    // The door's target fired exactly once (the opening leg), not every tick.
+    expect(fires.filter((t) => t === 't1')).toHaveLength(1);
+    // The camper leaves: the wait expires, the slab returns and latches shut.
     for (let i = 0; i < 200 && door.state !== 'bottom'; i++) SV_Tick(st);
     expect(door.state).toBe('bottom');
     expect([...door.ent.origin]).toEqual([...door.pos1]);

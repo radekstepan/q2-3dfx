@@ -64,7 +64,7 @@ import type { Entity } from '@q2/renderer-api';
 import { MODEL_EXTRA_STRIDE, traceBox, FACE_STRIDE } from '@q2/bsp';
 import type { BspMap } from '@q2/bsp';
 import { EXPLOBOX_MAXS, EXPLOBOX_MINS, PMF_DUCKED, SOLID_BBOX, deadsoldierFrameForSpawnflags, parseEntities, parseFloat } from '@q2/game';
-import { SV_ClipTrace, SV_SetPlayerHealth, SV_TraceFor, MASK_OPAQUE_C, MASK_PLAYERSOLID_C } from '@q2/server';
+import { SV_ClipTrace, SV_SetPlayerHealth, SV_TraceFor, SV_UseMover, MASK_OPAQUE_C, MASK_PLAYERSOLID_C } from '@q2/server';
 import { bootPlay, rebootPlay, pumpExplosionLights } from './play.js';
 
 const WEB_Q2_PAK = process.env.Q2_PAK;
@@ -1056,6 +1056,100 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect(train.started).toBe(false);
     expect([...train.ent.origin]).toEqual([0, 0, 0]);
     expect(driver.doorRenderOffset('*12')).toEqual([0, 0, 0]);
+  });
+
+  it('(t) the exit lift waits for the player: doors park while camped, the train runs once and parks', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    // The exit lift complex: the *31 plug (drops 156), the *32/*33 entry
+    // sliders (64 sideways each), and the *12 func_train (t91 → t88 → t89
+    // (wait .5) → t90, one-way). Lump geometry: the reported spot sits just
+    // east of the *32 door, inside the *31/*32/*33 rest trigger volumes.
+    const train = driver.server.trains.find((t) => t.ent.model === '*12')!;
+    expect(train).toBeDefined();
+    // Phase 1: camp the reported spot — nearby, aboard nothing — 400 ticks.
+    // C Touch_DoorTrigger volumes are baked from the rest bounds, so the
+    // doors open once and the TOP wait keeps resetting while camped: they
+    // park open instead of cycling closed/open (the old follower volume let
+    // *33 slide out from under the camper and it cycled 7× in 400 ticks).
+    driver.pm.origin = v3(-1669, 1514, 120);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 5);
+    expect(driver.pm.onGround).toBe(true);
+    const off = (m: string): [number, number, number] => driver.doorRenderOffset(m)!;
+    expect(off('*31')).not.toBeNull();
+    expect(off('*32')).not.toBeNull();
+    expect(off('*33')).not.toBeNull();
+    expect(off('*12')).not.toBeNull();
+    const park31: Array<[number, number, number]> = [];
+    const park32: Array<[number, number, number]> = [];
+    const park33: Array<[number, number, number]> = [];
+    for (let i = 0; i < 400; i++) {
+      SV_SetPlayerHealth(driver.server, 100); // setup: hold the camper alive
+      driver.step(neutralCmd(), 0.1);
+      // The lift never starts while the doors cycle: no t91 cascade.
+      expect(train.started).toBe(false);
+      expect([...train.ent.origin]).toEqual([0, 0, 0]);
+      expect(off('*12')).toEqual([0, 0, 0]);
+      if (i >= 60) {
+        park31.push(off('*31'));
+        park32.push(off('*32'));
+        park33.push(off('*33'));
+      }
+    }
+    // Non-vacuous: every slab genuinely travelled open (plug 156 down,
+    // sliders 64 sideways) and then parked — rendered offsets frozen.
+    expect(mag3(off('*31'))).toBeGreaterThan(100);
+    expect(mag3(off('*32'))).toBeGreaterThan(30);
+    expect(mag3(off('*33'))).toBeGreaterThan(30);
+    for (const [nm, trace] of [['*31', park31], ['*32', park32], ['*33', park33]] as const) {
+      for (const o of trace) expect(o).toEqual(trace[0]);
+      void nm;
+    }
+    // Phase 2: board the lift and press its call button. The driver has no
+    // button-touch path, so the press runs the button's own use entry — the
+    // same call its touch would make — and every verdict below is rendered
+    // or sim-travel state. (Movers are not solid to the driver trace, so
+    // boarding parks the origin on the lift footprint; the lift's travel
+    // and park are what this pins.)
+    driver.pm.origin = v3(-2056, 1536, 20);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    expectInWorld(driver.pm.origin, driver.map!);
+    const btn = driver.server.movers.find((m) => m.ent.model === '*13')!;
+    expect(btn).toBeDefined();
+    SV_UseMover(driver.server, btn);
+    // Step back to the safe camp while the lift runs (arrival must park
+    // with no second cycle and nobody aboard).
+    driver.pm.origin = v3(-1669, 1514, 120);
+    driver.pm.velocity = v3();
+    let peak = 0;
+    for (let i = 0; i < 60; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+      peak = Math.max(peak, mag3(off('*12')));
+    }
+    // RENDERED verdict: the lift travelled (offset peaked far from rest).
+    expect(peak).toBeGreaterThan(10);
+    // Arrival: the far corner t90 (-2080,1472,-8) minus the brush-mins base
+    // (-2064,1472,-48) = (-16, 0, 40), rendered and simulated identically.
+    const endOff = off('*12');
+    expect(endOff[0]!).toBeCloseTo(-16, 0);
+    expect(endOff[1]!).toBeCloseTo(0, 0);
+    expect(endOff[2]!).toBeCloseTo(40, 0);
+    expect(train.arrived).toBe(true);
+    expect(train.ent.origin[0]!).toBeCloseTo(-16, 6);
+    expect(train.ent.origin[1]!).toBeCloseTo(0, 6);
+    expect(train.ent.origin[2]!).toBeCloseTo(40, 6);
+    // Parks again with nobody aboard: 150 ticks, zero further motion.
+    for (let i = 0; i < 150; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+      expect(off('*12')).toEqual(endOff);
+    }
+    expect(train.arrived).toBe(true);
+    expect(driver.playerHealth).toBeGreaterThan(0);
+    expectInWorld(driver.pm.origin, driver.map!);
   });
 
   it('(s) walk-out from the debris spot (-384.4,33.8,-16), both hulls + soldier', { timeout: 180000 }, async () => {
