@@ -128,8 +128,13 @@ describe('monsters (M5.3)', () => {
     expect(monsterRange(5000)).toBe(RANGE_FAR);
   });
 
-  it('selects melee in melee range, ranged otherwise', () => {
-    expect(selectAttack('soldier', 10, mulberry32(1))).toBe('melee');
+  it('selects melee in melee range (gunner), guns otherwise', () => {
+    // Soldier melee is NULL in C: even at 10u the soldier fires its skin
+    // gun (M_CheckAttack melee branch sets AS_MISSILE). Only the gunner
+    // keeps a melee-range choice here (infantry melee lives in its own
+    // attack2 smack path).
+    const s10 = selectAttack('soldier', 10, mulberry32(1));
+    expect(s10 === 'shotgun' || s10 === 'blaster').toBe(true);
     expect(selectAttack('gunner', 10, mulberry32(1))).toBe('melee');
     const s = selectAttack('soldier', 200, mulberry32(7));
     expect(s === 'shotgun' || s === 'blaster').toBe(true);

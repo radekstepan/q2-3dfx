@@ -923,12 +923,18 @@ export function burstRefire(skill: number, machinegunClass: boolean, rand: () =>
  */
 export function selectAttack(kind: MonsterKind, dist: number, rand: () => number, skin = 2): AttackChoice {
   const r = monsterRange(dist);
-  if (r === RANGE_MELEE) return 'melee';
+  // Soldier melee is NULL in C (m_soldier.c never assigns monsterinfo.melee;
+  // M_CheckAttack's melee branch sets AS_MISSILE). C soldier_attack has no
+  // range branch at all — skins 4+ always play attack4, lighter skins roll
+  // attack1/attack2 — so the soldier NEVER takes the melee rule below, even
+  // at point-blank: it fires its gun into the target (the event label still
+  // reads 'melee' under 80u, but the move and the resolved gunfire don't).
   if (kind === 'soldier') {
     if (soldierWeaponForSkin(skin) === 'machinegun') return 'machinegun';
-    if (r === RANGE_NEAR || r === RANGE_MID) return rand() < 0.5 ? 'shotgun' : 'blaster';
+    if (r === RANGE_NEAR || r === RANGE_MID || r === RANGE_MELEE) return rand() < 0.5 ? 'shotgun' : 'blaster';
     return 'none';
   }
+  if (r === RANGE_MELEE) return 'melee';
   if (kind === 'infantry') {
     if (r === RANGE_NEAR || r === RANGE_MID) return 'machinegun';
     return 'none';

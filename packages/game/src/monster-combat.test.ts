@@ -43,7 +43,10 @@ describe('monster fight-back contract (M7.2 regression)', () => {
 
   it("selectAttack never idles at close range (no null/'idle'/'none')", () => {
     for (const dist of [10, 50, MELEE_DISTANCE - 1]) {
-      expect(selectAttack('soldier', dist, mulberry32(0x51ab))).toBe('melee');
+      // Soldier melee is NULL in C (M_CheckAttack melee branch sets
+      // AS_MISSILE): even at point-blank the soldier fires its skin gun.
+      const s = selectAttack('soldier', dist, mulberry32(0x51ab));
+      expect(s === 'shotgun' || s === 'blaster').toBe(true);
       expect(selectAttack('gunner', dist, mulberry32(0x51ab))).toBe('melee');
     }
     // Just outside melee the soldier still fires (never 'none' inside 1000).
@@ -55,10 +58,12 @@ describe('monster fight-back contract (M7.2 regression)', () => {
 
   it('soldier at 50 units with LOS deals damage within 2s', () => {
     // Mirrors the documented monsterCombat decision in apps/web/src/play.ts:
-    // clear LOS, range gate <= 1000, ~1/s per-monster rate limit, melee
-    // always lands, ranged uses the near 0.6 hit chance. Uses only game
-    // primitives (the driver itself is web-owned and cannot be imported
-    // here without violating the package dependency graph).
+    // clear LOS, range gate <= 1000, ~1/s per-monster rate limit. Soldier
+    // melee is NULL in C, so at 50u the soldier fires its skin gun
+    // point-blank (0.6 hit chance × 5) instead of the old always-landing
+    // 10-dmg touch. Uses only game primitives (the driver itself is
+    // web-owned and cannot be imported here without violating the package
+    // dependency graph).
     const rand = mulberry32(0x51ab);
     const state = spawnMonster('soldier');
     expect(state.dead).toBe(false);
@@ -72,19 +77,17 @@ describe('monster fight-back contract (M7.2 regression)', () => {
       if (dist > 1000) continue; // range gate
       // LOS clear (stubbed: caller traceShot fraction === 1)
       const choice = selectAttack(state.kind, dist, rand);
-      if (choice === 'melee') {
-        lastAttack = time;
-        damage += 10; // soldier touch damage in monsterCombat
-      } else if (choice === 'shotgun' || choice === 'blaster') {
+      if (choice === 'shotgun' || choice === 'blaster') {
         lastAttack = time;
         if (rand() < 0.6) damage += 5;
       } else {
-        throw new Error(`soldier at 50 must attack, got ${String(choice)}`);
+        throw new Error(`soldier at 50 must fire its gun, got ${String(choice)}`);
       }
     }
     expect(damage).toBeGreaterThan(0);
-    // Melee always commits: two rate-limited hits land in 2s (10 + 10).
-    expect(damage).toBe(20);
+    // Two rate-limited point-blank gunfire hits land in 2s (5 + 5) with
+    // this seed — deterministic: the seeded stream lands both 0.6 rolls.
+    expect(damage).toBe(10);
   });
 });
 

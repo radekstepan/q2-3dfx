@@ -240,7 +240,8 @@ describe('machinegun soldier fire pattern (m_soldier.c soldier_fire)', () => {
     // default (no skin) is the normal shotgun-skin class
     const c = selectAttack('soldier', 200, mulberry32(7));
     expect(c === 'shotgun' || c === 'blaster').toBe(true);
-    // melee still wins in range for every skin
-    expect(selectAttack('soldier', 10, mulberry32(7), 4)).toBe('melee');
+    // point-blank is still the skin gun for soldiers (C soldier_attack has
+    // no range branch; soldier melee is NULL) — ss commits to machinegun
+    expect(selectAttack('soldier', 10, mulberry32(7), 4)).toBe('machinegun');
   });
 });

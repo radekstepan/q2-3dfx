@@ -1973,7 +1973,17 @@ export function SV_MonsterTick(
     // frames): chase decisions would re-roll it into run/attack, so the
     // duck steers with the goal but takes no chase decisions until it
     // finishes. Think + locomotion below still advance it.
-    if (ms.move !== 'duck') {
+    // A live sustained-fire hold owns the body like a playing duck (C
+    // M_MoveFrame freezes the frame and re-runs the thinkfunc; ai_run
+    // movement continues via locomotion below, but no new attack decision
+    // is rolled mid-hold — otherwise M_CheckAttack's cooldown would
+    // re-roll the frozen fire frame into run after one round and the
+    // 4–11 round burst would die at one bullet). Live = flag set on the
+    // fire frame (covers the expiry tick too, so the C expiry bullet
+    // fires before the frame advances); a stranded flag is cleared by the
+    // range check below.
+    const holdLive = m.burstHeld && sustainedFireFrame(m.kind, ms.move, ms.frame);
+    if (ms.move !== 'duck' && !holdLive) {
       monsterChaseMove(ms, pos, playerPos, navEff, m.combatGoal ? false : gated, rand, {
         time: now,
         skill: st.skill,

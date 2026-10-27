@@ -172,9 +172,8 @@ describe('hitscan tracer color (no green lasers)', () => {
           const endDist = Math.hypot(end[0]! - eye[0]!, end[1]! - eye[1]!, end[2]! - eye[2]!);
           // The streak flies at the eye and stops short by exactly its
           // un-flown remainder — never overshooting onto the eye. (The
-          // ss machinegun fires a 3-round ±40 fan, so the exact pin only
-          // holds for the aimed shotgun round; the fan rounds still
-          // shorten the gap substantially and stop well clear.)
+          // ss machinegun fires sustained single rounds, so every round
+          // is aimed; the exact pin holds for each.)
           if (skin === 2) expect(endDist).toBeCloseTo(eyeDist0 - t.length, 0);
           else expect(endDist).toBeLessThan(eyeDist0);
           expect(endDist).toBeGreaterThan(10);
@@ -212,23 +211,31 @@ describe('hitscan tracer color (no green lasers)', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
     SV_SpawnMonster(driver.server, 'monster_soldier_ss', v3(32, 100, 24));
-    let sawBurst = false;
-    for (let i = 0; i < 200 && !sawBurst; i++) {
+    // C-true sustained fire (m_soldier.c attack4 + AI_HOLD_FRAME): one
+    // single round per 0.1s tick over a 0.3–1.0s hold (4–11 rounds), NOT a
+    // same-tick 3-round fan. Accumulate across the burst window.
+    let burstRounds = 0;
+    let burstTicks = 0;
+    let inBurst = false;
+    for (let i = 0; i < 200 && burstTicks < 15; i++) {
       driver.step(neutralCmd(), 0.1);
       const got = driver.drainTracers();
-      if (got.length >= 3) {
-        // One fire event = a 3-round fan (id HOLD_FRAME burst): all yellow.
-        for (const t of got) {
-          expect(t.color).toBe(HITSCAN_TRACER_COLOR);
-          expect(isGreenBoltColor(t.color)).toBe(false);
-        }
-        sawBurst = true;
-      } else {
-        expect(got.every((t) => !isGreenBoltColor(t.color))).toBe(true);
+      for (const t of got) {
+        expect(t.color).toBe(HITSCAN_TRACER_COLOR);
+        expect(isGreenBoltColor(t.color)).toBe(false);
       }
+      if (!inBurst) {
+        if (got.length > 0) inBurst = true;
+        continue;
+      }
+      // Inside the burst: at most one round per tick (sustained, not fan).
+      expect(got.length).toBeLessThanOrEqual(1);
+      burstRounds += got.length;
+      burstTicks++;
     }
+    expect(inBurst).toBe(true);
+    expect(burstRounds).toBeGreaterThanOrEqual(3);
     expect(driver.events).toContain('monshot');
-    expect(sawBurst).toBe(true);
     // The ss attack sound (verified present in pak0.pak) fires with the burst.
     const names = driver.mixer.mix().map((c) => c.name);
     expect(names).toContain('soldier/solatck3.wav');
