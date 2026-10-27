@@ -464,11 +464,20 @@ export function sweepBrushBox(
  * standing). Drivers that move bodies (pmove, monster locomotion) should run
  * against this instead of the bare world trace so walls block until
  * SV_RemoveBrushClip opens them.
+ *
+ * C trace.ent for SOLID_BSP (g_phys.c SV_ClipMoveToEntities): the clip that
+ * stops the move owns the hit, so its edict num is reported as entityNum
+ * (traceBox itself always reports 0 = world). Bolt/pellet/radius code uses
+ * this to resolve touches against the brush edict itself (func_explosive
+ * takes direct fire, not just splash) instead of detonating on an anonymous
+ * wall. Movement consumers ignore entityNum (fraction/endpos/normal only),
+ * except pmove's groundEntity which simply records the stood-upon clip.
  */
 export function SV_ClipTrace(st: ServerState, worldTrace: TraceFn): TraceFn {
   return (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => {
     let best = worldTrace(start, mins, maxs, end);
-    for (const b of st.brushClips.values()) {
+    let clipEnt = -1;
+    for (const [num, b] of st.brushClips) {
       const hit = sweepBrushBox(start, end, mins, maxs, b.mins, b.maxs);
       if (hit.fraction < best.fraction || hit.allsolid) {
         const f = hit.fraction;
@@ -486,8 +495,10 @@ export function SV_ClipTrace(st: ServerState, worldTrace: TraceFn): TraceFn {
           contents: best.contents,
           surfaceFlags: best.surfaceFlags,
         };
+        clipEnt = num;
       }
     }
+    if (clipEnt >= 0) best.entityNum = clipEnt;
     return best;
   };
 }
@@ -1437,6 +1448,11 @@ function losClear(
  * probes (the gravity leg) pass through untouched — stepping applies only
  * to horizontal moves. M_CheckBottom's dangling-corner veto is omitted;
  * the drop must land (fraction < 1) or the step is rejected.
+ *
+ * `maxs` is the caller's hull top (ducking soldiers shrink to the C duck
+ * hull via monsterHullMaxs — a standing hull mid-duck wedges under gaps
+ * the C duck passes); mins never change (C soldier_duck_down only lowers
+ * maxs[2]).
  */
 function stepHullTrace(
   trace: TraceFn,
@@ -2202,6 +2218,18 @@ export function SV_DamageMonster(
 }
 
 /**
+ * Live func_explosive barrel owning a brush-clip edict num (SV_ClipTrace
+ * entityNum). Null for world hits (0), func_walls (no barrel record) and
+ * dead/fused brushes. Shared by the bolt and hitscan touch paths so both
+ * resolve a SOLID_BSP touch against the brush edict itself, like C.
+ */
+export function barrelOfClip(st: ServerState, entityNum: number): ServerBarrel | null {
+  if (entityNum < 0) return null;
+  const b = st.barrels.find((bb) => bb.isFunc && !bb.edict.freed && bb.edict.num === entityNum);
+  return b ?? null;
+}
+
+/**
  * T_Damage on a barrel (g_misc.c barrel_delay): the first lethal hit frees
  * the edict (takedamage NO) + arms a 0.2s fuse (think = barrel_explode at
  * level.time + 2 frames), then the fuse runs T_RadiusDamage + BecomeExplosion.
@@ -2294,7 +2322,15 @@ export function SV_SpawnExplosion(
  * bbox CENTER (mins+maxs)/2, points = dmg - 0.5*len, the attacker takes
  * half, and CanDamage (LOS) must pass or the entity is skipped. Barrels
  * chain through the 0.2s fuse (SV_DamageBarrel). Corpses keep their skip
- * (radius never minces — only direct fire does).
+ * (radius never minces — only direct fire does). C deals damage only when
+ * points > 0 (a dmg-0 blast chips nothing); the caller-side min-1 applies
+ * to positive falloff only.
+ *
+ * C CanDamage (g_combat.c) special-cases MOVETYPE_PUSH: bmodels measure to
+ * the bbox midpoint and the trace ending INSIDE the brush itself
+ * (trace.ent == targ) counts as damageable. Without that self-hit rule a
+ * func_explosive's own clip blocks its LOS and splash can never kill it —
+ * base1's opener (barrels blowing the *20 wall) stops working.
  */
 export function SV_RadiusDamage(
   st: ServerState,
@@ -2316,13 +2352,16 @@ export function SV_RadiusDamage(
     const len = Math.hypot(center[0]! - pos[0]!, center[1]! - pos[1]!, center[2]! - pos[2]!);
     if (len >= radius) continue;
     if (!canDamage(center)) continue;
-    SV_DamageMonster(st, m, Math.max(1, Math.round(radiusDamagePoints(dmg, len))), rand);
+    const pts = radiusDamagePoints(dmg, len);
+    if (!(pts > 0)) continue;
+    SV_DamageMonster(st, m, Math.max(1, Math.round(pts)), rand);
   }
   const pcenter = v3(player.pos[0], player.pos[1], player.pos[2]! + 4);
   const pd = Math.hypot(pcenter[0]! - pos[0]!, pcenter[1]! - pos[1]!, pcenter[2]! - pos[2]!);
   if (pd < radius && canDamage(pcenter)) {
     // The attacker (us, who shot the barrel) takes half damage.
-    SV_DamagePlayer(st, Math.max(1, Math.round(radiusDamageAttackerPoints(radiusDamagePoints(dmg, pd)))));
+    const atk = radiusDamageAttackerPoints(radiusDamagePoints(dmg, pd));
+    if (atk > 0) SV_DamagePlayer(st, Math.max(1, Math.round(atk)));
   }
   for (const b of st.barrels) {
     if (b.edict.freed) continue;
@@ -2332,8 +2371,13 @@ export function SV_RadiusDamage(
     const bcenter = v3(bx, by, bz);
     const bd = Math.hypot(bcenter[0]! - pos[0]!, bcenter[1]! - pos[1]!, bcenter[2]! - pos[2]!);
     if (bd >= radius) continue;
-    if (!canDamage(bcenter)) continue;
-    SV_DamageBarrel(st, b, Math.max(1, Math.round(radiusDamagePoints(dmg, bd))));
+    if (b.isFunc) {
+      const los = trace(pos, ZERO_HULL, ZERO_HULL, bcenter);
+      if (!(los.fraction >= 1 || los.entityNum === b.edict.num)) continue;
+    } else if (!canDamage(bcenter)) continue;
+    const pts = radiusDamagePoints(dmg, bd);
+    if (!(pts > 0)) continue;
+    SV_DamageBarrel(st, b, Math.max(1, Math.round(pts)));
   }
 }
 
@@ -2705,7 +2749,15 @@ function stepBoltFlight(
         dead = true;
       } else if (tWall < 1) {
         // Wall touch (g_weapon.c blaster_touch): everything non-sky
-        // detonates via SV_BlasterImpact.
+        // detonates via SV_BlasterImpact. When the winning wall face IS a
+        // live func_explosive clip (SV_ClipTrace entityNum — C
+        // SV_ClipMoveToEntities touches the SOLID_BSP edict itself), the
+        // bolt also damages the brush: a func wall shot dead-on takes the
+        // direct hit (barrel_delay fuse), not just the splash. Without this
+        // the clip and the damage bbox tie exactly and the wall always wins,
+        // leaving func_explosives undamageable by direct fire.
+        const clipBarrel = barrelOfClip(st, wall!.entityNum);
+        if (clipBarrel) SV_DamageBarrel(st, clipBarrel, bolt.damage);
         const hitPos = v3(
           bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * tWall,
           bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * tWall,
@@ -3039,6 +3091,11 @@ export function SV_PlayerFire(
       SV_DamageMonster(st, hitMonster, pl.damage, opts.rand);
     } else if (bestT < 1) {
       // TE_GUNSHOT / TE_SHOTGUN impact: gray sparks + smoke, no beam.
+      // Same SOLID_BSP touch rule as the bolt path: a pellet stopping on a
+      // live func_explosive clip damages the brush (dead-on shotgun blasts
+      // blow the wall), with the impact sparks drawn either way.
+      const clipBarrel = barrelOfClip(st, wall.entityNum);
+      if (clipBarrel) SV_DamageBarrel(st, clipBarrel, pl.damage);
       st.sparks.push({
         pos: hitPos,
         color: 200 + ((opts.rand() * 55) | 0),

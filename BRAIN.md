@@ -918,6 +918,24 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - Esc/unlock clears held fire via `pointerlockchange` (no stuck attack),
 - mouseup stays document-global, keyboard flow unchanged. Regression test
 - `apps/web/src/canvas-lock.test.ts` (panel vs canvas synthetic events).
+- CLOSED 2026-10-26 (explosive damageability): func_explosive takes direct
+- fire (clip-attributed SOLID_BSP touch: `SV_ClipTrace` reports the winning
+- clip's edict as `entityNum`, bolts/pellets damage that brush instead of
+- detonating on an anonymous wall — the old tie always went to the wall, so
+- funcs were immune) + radius via the C `CanDamage` MOVETYPE_PUSH self-hit
+- rule, and `points <= 0` falloff deals nothing (dmg-0 blasts chip nothing,
+- per g_combat.c). Blown brushes drop their clip, so the *20 corridor and
+- the *30 slab walk open; debris stays visual-only (never in any clip).
+- Gate (l)/(m)/(n) green: blown-door walk + crouch/stand/move-out on the
+- debris (never stuck), crawlspace barrels + *30 slab die to blaster fire,
+- all 9 exploboxes rest on the hull-trace floor (server origin and rendered
+- mesh bottom within epsilon). (a) now pins the authentic opener chain
+- (spawn pair 28 debris + *20 wall 24 = 52). Adjacent quirk, NOT this lane
+- (needs a @q2/bsp or @q2/game owner): a hull parked EXACTLY on the plane
+- reads allsolid (C-identical `d1 == 0` + ±1 leaf expansion in the
+- position-test special case), so an exact-plane teleport can't stand back
+- up — real falls rest at +1/32 and stand fine. Gate (l) settles from above
+- to play it the way the engine does.
 - OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
 - (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
 - `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`

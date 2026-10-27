@@ -24,14 +24,26 @@
 //       than at skill 3 (M_CheckAttack chance table, sight delay, refire).
 //   (k) soldier duck: incoming blaster fire puts the rendered frame in the
 //       duck range (soldier_dodge → duck move, hull shrink).
+//   (l) the blown *20 func wall walks open (dead-on blaster damages the
+//       brush itself → fuse → clip removed), crouching on the debris never
+//       wedges (in-bounds throughout, stands back up, moves out; debris is
+//       visual-only).
+//   (m) shotgun-secret crawlspace barrels (+ the *30 slab) die to blaster
+//       fire (rendered barrels gone, clips open).
+//   (n) all 9 misc_exploboxes rest on the hull-trace floor (server origin
+//       and rendered mesh bottom within epsilon — the (a) pin for every
+//       barrel, not just the spawn pair).
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { resetCVars, setCVar } from '@q2/config';
+import { BUTTON_DUCK } from '@q2/input';
 import type { UserCmdT } from '@q2/input';
 import { v3 } from '@q2/math';
+import type { Vec3 } from '@q2/math';
 import type { Entity } from '@q2/renderer-api';
 import { MODEL_EXTRA_STRIDE, traceBox } from '@q2/bsp';
-import { parseEntities } from '@q2/game';
-import { SV_TraceFor, MASK_OPAQUE_C, MASK_PLAYERSOLID_C } from '@q2/server';
+import type { BspMap } from '@q2/bsp';
+import { EXPLOBOX_MAXS, EXPLOBOX_MINS, PMF_DUCKED, parseEntities } from '@q2/game';
+import { SV_ClipTrace, SV_SetPlayerHealth, SV_TraceFor, MASK_OPAQUE_C, MASK_PLAYERSOLID_C } from '@q2/server';
 import { bootPlay, rebootPlay, pumpExplosionLights } from './play.js';
 
 const WEB_Q2_PAK = process.env.Q2_PAK;
@@ -46,6 +58,16 @@ function attackCmd(angles: [number, number, number] = [0, 0, 0]): UserCmdT {
 
 function stepDriver(driver: { step(cmd: UserCmdT, dt: number): void }, cmd: UserCmdT, n: number): void {
   for (let i = 0; i < n; i++) driver.step(cmd, 0.1);
+}
+
+/** World-bounds check shared by the traversal verdicts (same box as (d)). */
+function expectInWorld(origin: Vec3, map: BspMap): void {
+  const mins = [...map.modelsMins.slice(0, 3)];
+  const maxs = [...map.modelsMaxs.slice(0, 3)];
+  for (let i = 0; i < 3; i++) {
+    expect(origin[i]!).toBeGreaterThanOrEqual(mins[i]! - 32);
+    expect(origin[i]!).toBeLessThanOrEqual(maxs[i]! + 32);
+  }
 }
 
 async function bootBase1(width = 96, height = 72) {
@@ -101,10 +123,12 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
       stepDriver(driver, neutralCmd(), 5);
       expect(driver.events).toContain('explosion');
     }
-    // RENDERED verdict: both fuses blew (one 'barrel' edge per freed barrel),
-    // and the blast is submitted as explosion + debris MD2 extras with live
-    // dlights. Neither freed barrel is submitted anymore.
-    expect(driver.events.filter((e) => e === 'barrel').length).toBe(2);
+    // RENDERED verdict: the fuses blew ('barrel' edges — the *20 chain can
+    // land on the same tick as a lethal bolt hit, coalescing two frees
+    // into one edge, so >= 2), and the blast is submitted as explosion +
+    // debris MD2 extras with live dlights. Neither freed barrel is
+    // submitted anymore.
+    expect(driver.events.filter((e) => e === 'barrel').length).toBeGreaterThanOrEqual(2);
     const extras = driver.extraEntities()!;
     for (const target of spawnBarrels) {
       const tx = target.origin[0]!;
@@ -115,7 +139,13 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     const boomModels = new Set([boot.models!.explode, boot.models!.blast]);
     expect(extras.some((x) => x.model !== undefined && boomModels.has(x.model))).toBe(true);
     const debrisModels = new Set([boot.models!.debris1, boot.models!.debris2, boot.models!.debris3]);
-    expect(extras.filter((x) => x.model !== undefined && debrisModels.has(x.model)).length).toBe(28);
+    // 28 from the spawn pair (2 big + 4 corner + 8 small each) plus 24 from
+    // the *20 wall the first blast chains into — the C opener: the splash
+    // reaches the brush bbox center (self-hit rule), 150 - 0.5*160 = 70 pts
+    // vs 10 hp. Mass-800 recipe = 8 big + 16 small.
+    expect(driver.server.barrels.find((b) => b.isFunc && b.edict.model === '*20')!.edict.freed).toBe(true);
+    expect(driver.server.brushClips.has(driver.server.barrels.find((b) => b.isFunc && b.edict.model === '*20')!.edict.num)).toBe(false);
+    expect(extras.filter((x) => x.model !== undefined && debrisModels.has(x.model)).length).toBe(52);
     expect(pumpExplosionLights(boot)).toBeGreaterThan(0);
   });
 
@@ -547,5 +577,214 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
       }
     }
     expect(duckSeen).toBe(true);
+  });
+
+  it('(l) the blown *20 wall walks open; crouch on debris never wedges', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    const map = driver.map!;
+    // The first blown-up door: the *20 func_explosive wall across the start
+    // corridor (x -72..128, y 136..144, z 16..112).
+    const b20 = driver.server.barrels.find((b) => b.isFunc && b.edict.model === '*20')!;
+    expect(b20).toBeDefined();
+    expect(driver.server.brushClips.has(b20.edict.num)).toBe(true);
+    // Stand south of the wall and shoot it dead-on. The SOLID_BSP touch
+    // damages the brush itself (barrel_delay fuse) — without the
+    // clip-attribution fix the clip ties the damage bbox, the wall wins,
+    // and the func is immune forever.
+    driver.pm.origin = v3(28, 60, 30);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    expect(driver.pm.onGround).toBe(true);
+    // Settle from above: a real fall lands at the +1/32 contact rest. An
+    // exact-plane teleport parks the hull bottom exactly on the plane,
+    // which the C position test also reports as solid (d1 == 0 counts as
+    // inside) — that would wedge the stand-up check artificially.
+    let ticks = 0;
+    while (!b20.edict.freed && ticks++ < 40) driver.step(attackCmd([0, 90, 0]), 0.1);
+    expect(b20.edict.freed).toBe(true);
+    stepDriver(driver, neutralCmd(), 5);
+    // RENDERED verdict: the fuse blew (explosion + debris submitted), the
+    // dead brush is fully non-solid (clip gone), and no barrel renders at
+    // the wall anymore.
+    expect(driver.server.brushClips.has(b20.edict.num)).toBe(false);
+    expect(driver.events).toContain('barrel');
+    expect(driver.events).toContain('explosion');
+    expect(driver.server.debris.length).toBeGreaterThan(0);
+    const extras = driver.extraEntities()!;
+    expect(
+      extras.filter((x) => x.model === boot.models!.barrel && Math.hypot(x.origin![0]! - 28, x.origin![1]! - 140) < 1),
+    ).toHaveLength(0);
+    // Debris is visual-only: player-hull sweeps pass straight through
+    // resting chunks (chunks never enter any clip trace, so they can never
+    // wedge a hull — the *20 wall scatters them ±200 in x, C-identical wide
+    // jitter, so proximity-to-path proves nothing; penetration does).
+    let wt = 0;
+    while (driver.server.debris.length > 0 && driver.server.debris.every((d) => !d.rest) && wt++ < 30) {
+      driver.step(neutralCmd(), 0.1);
+    }
+    const trace = SV_ClipTrace(driver.server, SV_TraceFor(map));
+    const rested = driver.server.debris.filter((d) => d.rest);
+    expect(rested.length).toBeGreaterThan(0);
+    const byDist = [...rested].sort(
+      (a, b) => Math.hypot(a.origin[0]! - 28, a.origin[1]! - 140) - Math.hypot(b.origin[0]! - 28, b.origin[1]! - 140),
+    );
+    let clear = 0;
+    for (const d of byDist.slice(0, 6)) {
+      const t = trace(
+        v3(d.origin[0], d.origin[1]! - 24, d.origin[2]! + 24),
+        v3(-16, -16, -24),
+        v3(16, 16, 32),
+        v3(d.origin[0], d.origin[1]! + 24, d.origin[2]! + 24),
+      );
+      if (t.fraction === 1) clear++;
+    }
+    expect(clear).toBeGreaterThan(0);
+    // Crouch on the debris field: hull shrinks, position stays in-bounds.
+    for (let i = 0; i < 10; i++) {
+      driver.step({ msec: 100, angles: [0, 90, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_DUCK }, 0.1);
+    }
+    expect(driver.pm.pmFlags & PMF_DUCKED).toBe(PMF_DUCKED);
+    expect(driver.pm.maxs[2]).toBe(4);
+    expect(driver.pm.viewheight).toBe(12);
+    expectInWorld(driver.pm.origin, map);
+    // Release: headroom is free (corridor ceiling 112), so the hull grows
+    // back instead of wedging ducked.
+    stepDriver(driver, neutralCmd([0, 90, 0]), 10);
+    expect(driver.pm.pmFlags & PMF_DUCKED).toBe(0);
+    expect(driver.pm.maxs[2]).toBe(32);
+    expectInWorld(driver.pm.origin, map);
+    // Walk the blown doorway at patrol pace (10u/tick stays on the upper
+    // floor instead of sprinting off the trench edge past it): up the
+    // 16-step, through the wall gap, stop on the far side.
+    let n = 0;
+    while (driver.pm.origin[1]! <= 144 && n++ < 60) {
+      driver.step({ msec: 100, angles: [0, 90, 0], forwardmove: 100, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+    }
+    expect(driver.pm.origin[1]!).toBeGreaterThan(140);
+    expect(driver.pm.origin[1]!).toBeLessThan(200);
+    // Stepped up onto the upper floor (not still blocked on the low side).
+    expect(driver.pm.origin[2]!).toBeGreaterThan(30);
+    expect(driver.pm.origin[2]!).toBeLessThan(50);
+    let settle = 0;
+    while (!driver.pm.onGround && settle++ < 10) stepDriver(driver, neutralCmd([0, 90, 0]), 1);
+    expect(driver.pm.onGround).toBe(true);
+    expectInWorld(driver.pm.origin, map);
+    // And the player can still move out afterward — never stuck. Head back
+    // south the way they came (open floor, down the step).
+    const bx = driver.pm.origin[0]!;
+    const by = driver.pm.origin[1]!;
+    stepDriver(driver, { msec: 100, angles: [0, 270, 0], forwardmove: 100, sidemove: 0, upmove: 0, buttons: 0 }, 8);
+    expect(Math.hypot(driver.pm.origin[0]! - bx, driver.pm.origin[1]! - by)).toBeGreaterThan(5);
+    expect(driver.pm.onGround).toBe(true);
+    expectInWorld(driver.pm.origin, map);
+  });
+
+  it('(m) shotgun-secret crawlspace barrels die to blaster fire', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    const map = driver.map!;
+    // The two exploboxes by the shotgun secret, plus the *30 slab between
+    // them (112x120x19 brush rendered as a barrel proxy). All three take
+    // direct blaster fire through the clip-attributed touch.
+    const at = (x: number, y: number): NonNullable<ReturnType<typeof driver.server.barrels.find>> =>
+      driver.server.barrels.find((b) => !b.isFunc && Math.abs(b.origin[0]! - x) < 2 && Math.abs(b.origin[1]! - y) < 2)!;
+    const b1 = at(950, -198);
+    const b2 = at(1060, -140);
+    const b30 = driver.server.barrels.find((b) => b.isFunc && b.edict.model === '*30')!;
+    expect(b1).toBeDefined();
+    expect(b2).toBeDefined();
+    expect(b30).toBeDefined();
+    // West stand with a clear lane to the first barrel; a level bead flies
+    // at z≈-178, inside the -192..-152 hull band.
+    driver.pm.origin = v3(900, -198, -168);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    expect(driver.pm.onGround).toBe(true);
+    const yaw1 = yawAt([driver.pm.origin[0]!, driver.pm.origin[1]!], [950, -198]);
+    let ticks = 0;
+    while (!b1.edict.freed && ticks++ < 60) driver.step(attackCmd([0, yaw1, 0]), 0.1);
+    expect(b1.edict.freed).toBe(true);
+    // The 150-dmg blast at ~50u would mince the bot (attacker-half ~62):
+    // top the pool back up so the demo continues (setup only; every
+    // verdict below is rendered/submitted state).
+    SV_SetPlayerHealth(driver.server, 100);
+    stepDriver(driver, neutralCmd(), 5);
+    // Second barrel from the north stand (a chain may free it early — the
+    // loop then exits immediately, honestly).
+    driver.pm.origin = v3(1060, -70, -168);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    const yaw2 = yawAt([driver.pm.origin[0]!, driver.pm.origin[1]!], [1060, -140]);
+    ticks = 0;
+    while (!b2.edict.freed && ticks++ < 60) driver.step(attackCmd([0, yaw2, 0]), 0.1);
+    expect(b2.edict.freed).toBe(true);
+    SV_SetPlayerHealth(driver.server, 100);
+    stepDriver(driver, neutralCmd(), 5);
+    // The *30 slab itself, aimed at its bbox center from the west stand.
+    driver.pm.origin = v3(900, -184, -168);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    const aimSlab = (): [number, number, number] => {
+      const e = [driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + 22];
+      const c = [b30.origin[0]!, b30.origin[1]!, b30.origin[2]!];
+      const dx = c[0]! - e[0]!;
+      const dy = c[1]! - e[1]!;
+      const dz = c[2]! - e[2]!;
+      const l = Math.hypot(dx, dy) || 1;
+      return [(Math.atan2(-dz, l) * 180) / Math.PI, (Math.atan2(dy, dx) * 180) / Math.PI, 0];
+    };
+    ticks = 0;
+    while (!b30.edict.freed && ticks++ < 60) driver.step(attackCmd(aimSlab()), 0.1);
+    expect(b30.edict.freed).toBe(true);
+    stepDriver(driver, neutralCmd(), 5);
+    // RENDERED verdicts: the dead brush fully opened (clip gone), the blasts
+    // submitted, and none of the three renders as a barrel anymore.
+    expect(driver.server.brushClips.has(b30.edict.num)).toBe(false);
+    expect(driver.events.filter((e) => e === 'barrel').length).toBeGreaterThanOrEqual(3);
+    expect(driver.events).toContain('explosion');
+    expect(driver.server.debris.length).toBeGreaterThan(0);
+    const extras = driver.extraEntities()!;
+    for (const [tx, ty] of [[950, -198], [1060, -140]] as const) {
+      expect(
+        extras.filter((x) => x.model === boot.models!.barrel && Math.hypot(x.origin![0]! - tx, x.origin![1]! - ty) < 1),
+      ).toHaveLength(0);
+    }
+    expect(driver.pm.onGround).toBe(true);
+    expectInWorld(driver.pm.origin, map);
+  });
+
+  it('(n) all 9 exploboxes rest on the hull-trace floor (server + rendered)', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    const map = driver.map!;
+    // The sim truth: the clip-wrapped C-mask trace the driver moves with.
+    const trace = SV_ClipTrace(driver.server, SV_TraceFor(map));
+    const boxes = driver.server.barrels.filter((b) => !b.isFunc);
+    expect(boxes).toHaveLength(9);
+    // Rendered roster mirrors the live roster 1:1 (no doubles): 9 explobox
+    // meshes at their hull bottoms plus the 2 func bbox-bottom proxies.
+    const rendered = driver.extraEntities()!.filter((x) => x.model === boot.models!.barrel);
+    expect(rendered).toHaveLength(11);
+    for (const b of boxes) {
+      // Server hull rests on the floor: a 256-down hull drop ends at the
+      // origin (C M_droptofloor contact rides the 1/32 epsilon, never a
+      // hover — 0.05 tolerance).
+      const drop = trace(
+        v3(b.origin[0], b.origin[1], b.origin[2]! + 1),
+        EXPLOBOX_MINS,
+        EXPLOBOX_MAXS,
+        v3(b.origin[0], b.origin[1], b.origin[2]! - 256),
+      );
+      expect(drop.endpos[2]!).toBeCloseTo(b.origin[2]!, 1);
+      // The rendered mesh bottom (MD2 pivot = box bottom = origin) sits on
+      // that same floor.
+      const got = rendered.find(
+        (x) => Math.hypot(x.origin![0]! - b.origin[0]!, x.origin![1]! - b.origin[1]!) < 1,
+      );
+      expect(got).toBeDefined();
+      expect(got!.origin![2]!).toBeCloseTo(b.origin[2]!, 1);
+      expect(got!.origin![2]!).toBeCloseTo(drop.endpos[2]!, 1);
+    }
   });
 });
