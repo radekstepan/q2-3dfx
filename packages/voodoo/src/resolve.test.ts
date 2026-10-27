@@ -6,6 +6,7 @@ import {
   applyPostFilter,
   bayerThreshold,
   capTextureSizeFrame,
+  defaultResolveRGB888Options,
   defaultVoodooState,
   ditherOffsetG,
   ditherOffsetRB,
@@ -17,6 +18,7 @@ import {
   readVoodooState,
   resolveFrame,
   resolveRGB565,
+  resolveRGB888,
 } from './index.js';
 
 describe('gammaLUT', () => {
@@ -142,6 +144,102 @@ describe('applyPostFilter', () => {
     const dst = new Uint32Array(1);
     applyPostFilter(src, dst, 1, 1);
     expect(dst[0]).toBe(0xffffffff);
+  });
+});
+
+describe('resolveFrame display fill (astra §2.1)', () => {
+  const w = 4;
+  const h = 4;
+  const stNoPost = { ...defaultVoodooState(), postfilter: false, gamma: 1, dither: false };
+  it('postfilter off still fills display by expanding the fresh 565 target', () => {
+    const src = new Uint32Array(w * h).fill(0xff0000ff); // opaque red 0xAABBGGRR
+    const dst = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h).fill(0xdeadbeef); // stale sentinel
+    resolveFrame(src, dst, display, w, h, stNoPost);
+    const ref = expandRGB565(quantiseRGB565(255, 0, 0));
+    for (let i = 0; i < w * h; i++) {
+      expect(display[i]).toBe(ref);
+      expect(display[i]).not.toBe(0xdeadbeef);
+    }
+  });
+  it('red then green frames leave no stale pixels with postfilter off', () => {
+    const dst = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h).fill(0xdeadbeef);
+    resolveFrame(new Uint32Array(w * h).fill(0xff0000ff), dst, display, w, h, stNoPost);
+    const redRef = expandRGB565(quantiseRGB565(255, 0, 0));
+    for (let i = 0; i < w * h; i++) expect(display[i]).toBe(redRef);
+    resolveFrame(new Uint32Array(w * h).fill(0xff00ff00), dst, display, w, h, stNoPost);
+    const greenRef = expandRGB565(quantiseRGB565(0, 255, 0));
+    expect(greenRef).not.toBe(redRef);
+    for (let i = 0; i < w * h; i++) expect(display[i]).toBe(greenRef);
+  });
+  it('postfilter on still box-filters (unchanged behaviour)', () => {
+    const stPost = { ...stNoPost, postfilter: true };
+    const src = new Uint32Array(w * h).fill(0xff808080);
+    const dst = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h);
+    resolveFrame(src, dst, display, w, h, stPost);
+    const ref = expandRGB565(dst[0]!);
+    for (let i = 0; i < w * h; i++) expect(display[i]).toBe(ref);
+  });
+});
+
+describe('resolveRGB888 bypass (astra §2.2)', () => {
+  it('passes values through that RGB565 cannot represent (gamma 1, no dither)', () => {
+    // Sub-LSB values 1..7 all truncate to r5 = 0 in 565 — the bypass keeps them.
+    for (const v of [1, 2, 3, 5, 7, 100, 127, 200, 254]) {
+      const src = new Uint32Array([(0xff000000 | v) >>> 0]);
+      const dst = new Uint32Array(1);
+      resolveRGB888(src, dst, 1, 1, { gamma: 1, dither: false });
+      expect(dst[0]).toBe((0xff000000 | v) >>> 0);
+    }
+    // The 565 path provably loses sub-LSB values:
+    for (const v of [1, 2, 3, 4, 5, 6, 7]) {
+      expect(quantiseRGB565(v, 0, 0)).toBe(quantiseRGB565(0, 0, 0));
+    }
+  });
+  it('preserves channel order 0xAABBGGRR and forces opaque alpha', () => {
+    const src = new Uint32Array([0x00332211]); // alpha 0, B=0x33 G=0x22 R=0x11
+    const dst = new Uint32Array(1);
+    resolveRGB888(src, dst, 1, 1, { gamma: 1, dither: false });
+    expect(dst[0]).toBe(0xff332211);
+    expect(dst[0]! & 255).toBe(0x11);
+    expect((dst[0]! >> 8) & 255).toBe(0x22);
+    expect((dst[0]! >> 16) & 255).toBe(0x33);
+    expect((dst[0]! >>> 24) & 255).toBe(0xff);
+  });
+  it('applies the same gamma LUT stage as the 565 path', () => {
+    const lut = gammaLUT(1.3);
+    const src = new Uint32Array([(0xff4080c0 | 0xff000000) >>> 0]);
+    const dst = new Uint32Array(1);
+    resolveRGB888(src, dst, 1, 1, { gamma: 1.3, dither: false });
+    expect(dst[0]).toBe((0xff000000 | (lut[0x40]! << 16) | (lut[0x80]! << 8) | lut[0xc0]!) >>> 0);
+  });
+  it('defaults to gamma 1.3 with dither off', () => {
+    expect(defaultResolveRGB888Options()).toEqual({ gamma: 1.3, dither: false });
+  });
+  it('resolveFrame with quantise:false fills display with RGB888 (dither/postfilter bypassed)', () => {
+    const w = 8;
+    const h = 8;
+    const src = new Uint32Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      const v = (i * 37 + 3) & 255; // ramp incl. values absent from 565
+      src[i] = (0xff000000 | (v << 16) | (v << 8) | v) >>> 0;
+    }
+    // Even with dither + postfilter cvars on, the bypass path skips both.
+    const st = { ...defaultVoodooState(), quantise: false, gamma: 1, dither: true, postfilter: true };
+    const dst565 = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h).fill(0xdeadbeef);
+    resolveFrame(src, dst565, display, w, h, st);
+    const ref = new Uint32Array(w * h);
+    resolveRGB888(src, ref, w, h, { gamma: 1, dither: false });
+    expect(display).toEqual(ref);
+    // Ramp values survive: byte-exact passthrough at gamma 1.
+    expect(display).toEqual(src);
+    // dst565 stays packed for compat readers (legacy rounding path).
+    const ref565 = new Uint16Array(w * h);
+    resolveRGB565(src, ref565, w, h, { gamma: 1, dither: true, quantise: false });
+    expect(dst565).toEqual(ref565);
   });
 });
 

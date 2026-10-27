@@ -120,6 +120,66 @@ export function samplePalette(
   }
 }
 
+// --- Expanded RGB textures -------------------------------------------------
+
+/**
+ * Sample an expanded RGB(A) texture: tex holds w*h RGB triplets
+ * (tex[(y*w+x)*3 + c], c = 0..2 for R,G,B), i.e. palette/WAL data already
+ * expanded to 8:8:8 at upload time. Same bilinear/nearest policy as
+ * samplePalette — bilinear=true filters the four neighbouring TEXELS'
+ * colours (what the Voodoo does with non-paletted textures); false point
+ * samples. Writes RGB to out[off..off+2]. Module scratch only.
+ *
+ * Representation note (astra §2.3): vd_palettetex selects the UPLOAD
+ * policy (paletted vs expanded storage), never the filter. Both this and
+ * samplePalette obey the same vd_bilinear switch; on identical colours
+ * they must produce identical output (see sampler.test.ts).
+ */
+export function sampleRGBTexture(
+  tex: Uint8Array,
+  w: number,
+  h: number,
+  u: number,
+  v: number,
+  out: Uint8Array,
+  off: number,
+  bilinear = true,
+): void {
+  const uc = u < 0 ? 0 : u > w - 1 ? w - 1 : u;
+  const vc = v < 0 ? 0 : v > h - 1 ? h - 1 : v;
+  const x0 = uc | 0;
+  const y0 = vc | 0;
+  if (!bilinear) {
+    // Point sample: round to nearest texel centre (matches sampleNearest).
+    let nx = Math.round(uc);
+    let ny = Math.round(vc);
+    nx = nx < 0 ? 0 : nx > w - 1 ? w - 1 : nx;
+    ny = ny < 0 ? 0 : ny > h - 1 ? h - 1 : ny;
+    const p = (ny * w + nx) * 3;
+    out[off] = tex[p]!;
+    out[off + 1] = tex[p + 1]!;
+    out[off + 2] = tex[p + 2]!;
+    return;
+  }
+  const x1 = x0 + 1 < w ? x0 + 1 : x0;
+  const y1 = y0 + 1 < h ? y0 + 1 : y0;
+  const fu = Math.round((uc - x0) * 256);
+  const fv = Math.round((vc - y0) * 256);
+  const pa = (y0 * w + x0) * 3;
+  const pb = (y0 * w + x1) * 3;
+  const pc = (y1 * w + x0) * 3;
+  const pd = (y1 * w + x1) * 3;
+  const w00 = (256 - fu) * (256 - fv);
+  const w10 = fu * (256 - fv);
+  const w01 = (256 - fu) * fv;
+  const w11 = fu * fv;
+  out[off] = (w00 * tex[pa]! + w10 * tex[pb]! + w01 * tex[pc]! + w11 * tex[pd]! + 32768) >> 16;
+  out[off + 1] =
+    (w00 * tex[pa + 1]! + w10 * tex[pb + 1]! + w01 * tex[pc + 1]! + w11 * tex[pd + 1]! + 32768) >> 16;
+  out[off + 2] =
+    (w00 * tex[pa + 2]! + w10 * tex[pb + 2]! + w01 * tex[pc + 2]! + w11 * tex[pd + 2]! + 32768) >> 16;
+}
+
 // --- Mip LOD + mip-dithering ------------------------------------------------
 
 /**
@@ -134,15 +194,31 @@ export function mipRho(dudx: number, dvdx: number, dudy: number, dvdy: number): 
 }
 
 /**
- * Mipmap LOD: lod = log2(rho) - bias (BRAIN.md §7.2; Glide default bias
- * vd_lodbias = -0.35). Clamped to >= 0. Throws on non-positive rho.
+ * Mipmap LOD: lod = log2(rho) + bias, clamped to [0, maxLevel].
+ *
+ * Sign convention follows the Voodoo tLOD.lodbias register (prog guide
+ * §textureMode/tLOD): the bias is ADDED to log2(rho), so a NEGATIVE bias
+ * (Glide default vd_lodbias = -0.35) favours FINER detail and a positive
+ * bias favours coarser levels. (The previous `- bias` sign was backwards;
+ * changed intentionally per astra §2.4 — negative bias now sharpens.)
+ *
+ * Robustness: rho <= 0 (constant UVs, magnification) clamps to epsilon
+ * 1e-6 instead of throwing, yielding LOD 0 after the lower clamp; only
+ * non-finite rho/bias (NaN, ±Infinity) throw. maxLevel defaults to
+ * +Infinity (no upper clamp); pass the mip chain length - 1 to bound it.
  */
-export function mipLevel(rho: number, bias: number): number {
-  if (!(rho > 0) || !Number.isFinite(rho)) {
-    throw new Error(`[voodoo] mipLevel: rho must be positive finite, got ${rho}`);
+export function mipLevel(rho: number, bias: number, maxLevel = Number.POSITIVE_INFINITY): number {
+  if (!Number.isFinite(rho) || !Number.isFinite(bias)) {
+    throw new Error(`[voodoo] mipLevel: rho and bias must be finite, got ${rho}, ${bias}`);
   }
-  const lod = Math.log2(rho) - bias;
-  return lod < 0 ? 0 : lod;
+  if (Number.isNaN(maxLevel)) {
+    throw new Error(`[voodoo] mipLevel: maxLevel must not be NaN`);
+  }
+  const r = rho <= 0 ? 1e-6 : rho;
+  const lod = Math.log2(r) + bias;
+  if (!(lod > 0)) return 0;
+  const cap = maxLevel < 0 ? 0 : maxLevel;
+  return lod > cap ? cap : lod;
 }
 
 /**

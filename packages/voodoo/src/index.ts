@@ -15,8 +15,8 @@ export * from './capture.js';
 export * from './resolve.js';
 export * from './sampler.js';
 
-import { applyPostFilter, quantiseDepth, resolveRGB565 } from './resolve.js';
-import { applyFog, capTextureSize, modulateLightmap, samplePalette } from './sampler.js';
+import { applyPostFilter, expandRGB565, quantiseDepth, resolveRGB565, resolveRGB888 } from './resolve.js';
+import { applyFog, capTextureSize, modulateLightmap, samplePalette, sampleRGBTexture } from './sampler.js';
 
 export interface VoodooState {
   gamma: number;
@@ -72,6 +72,15 @@ export function readVoodooState(): VoodooState {
  * Full M4.1 frame resolve: gamma -> dither -> RGB565, then the 2x2 box
  * post filter into display (when enabled and provided). Zero-alloc inner
  * loops; pass display = null to skip the postfilter stage.
+ *
+ * Display contract (astra §2.1/§2.2):
+ * - quantise on, postfilter on: display = 2x2 box of the 565 target.
+ * - quantise on, postfilter off: display = per-pixel expandRGB565 of the
+ *   freshly packed target (NEVER stale — every pixel is rewritten).
+ * - quantise off (vd_16bit=0 debug bypass): display = resolveRGB888
+ *   output (gamma on, dither/postfilter bypassed); dst565 is still packed
+ *   via resolveRGB565 for compat readers. Pass display = null to skip the
+ *   display plane entirely.
  */
 export function resolveFrame(
   src: Uint32Array,
@@ -81,13 +90,31 @@ export function resolveFrame(
   h: number,
   st: VoodooState = readVoodooState(),
 ): void {
+  if (!st.quantise) {
+    // Genuine RGB888 debug bypass: gamma stays on, dither/postfilter off.
+    resolveRGB565(src, dst565, w, h, { gamma: st.gamma, dither: st.dither, quantise: st.quantise });
+    if (display !== null) resolveRGB888(src, display, w, h, { gamma: st.gamma, dither: false });
+    return;
+  }
   resolveRGB565(src, dst565, w, h, { gamma: st.gamma, dither: st.dither, quantise: st.quantise });
-  if (st.postfilter && display !== null) applyPostFilter(dst565, display, w, h);
+  if (display === null) return;
+  if (st.postfilter) {
+    applyPostFilter(dst565, display, w, h);
+    return;
+  }
+  // Postfilter off: expand every newly packed pixel — no stale pixels.
+  const n = w * h;
+  for (let i = 0; i < n; i++) display[i] = expandRGB565(dst565[i]!);
 }
 
 /**
  * Cvar-aware depth banding: quantise stored 1/z to st.zbits (vd_zbits).
  * bits >= 24 (or <= 0) is a pass-through.
+ *
+ * DISPLAY/BANDING APPROXIMATION ONLY — NOT a depth-buffer emulation
+ * (astra §2.5): post-hoc on already-resolved depth, cannot affect
+ * visibility. True emulation must quantise BEFORE test/write against a
+ * future internal quantized plane. Framebuffer.depth keeps 1/z semantics.
  */
 export function quantiseDepthFrame(
   depth: Float32Array,
@@ -109,9 +136,12 @@ export function capTextureSizeFrame(
 }
 
 /**
- * Cvar-aware texture sample: honours vd_bilinear + vd_palettetex.
- * With either off the texture point-samples (single nearest index expanded
- * through the palette). Writes RGB to out[off..off+2].
+ * Cvar-aware paletted texture sample. Filtering is governed by vd_bilinear
+ * ONLY: vd_palettetex selects the upload/representation policy (paletted
+ * vs expanded storage) and must NOT gate filtering (astra §2.3). With
+ * bilinear off the texture point-samples (single nearest index expanded
+ * through the palette). Writes RGB to out[off..off+2]. For the expanded
+ * RGB-triplet path with the same policy see sampleRGBTextureFrame.
  */
 export function sampleTexture(
   indices: Uint8Array,
@@ -124,7 +154,26 @@ export function sampleTexture(
   off: number,
   st: VoodooState = readVoodooState(),
 ): void {
-  samplePalette(indices, palette, w, h, u, v, out, off, st.bilinear && st.palettetex);
+  samplePalette(indices, palette, w, h, u, v, out, off, st.bilinear);
+}
+
+/**
+ * Cvar-aware expanded-RGB texture sample: tex holds w*h RGB triplets
+ * (upload-time expanded storage, the vd_palettetex=0 representation).
+ * Same bilinear/nearest policy as sampleTexture, driven by vd_bilinear
+ * only. Writes RGB to out[off..off+2].
+ */
+export function sampleRGBTextureFrame(
+  tex: Uint8Array,
+  w: number,
+  h: number,
+  u: number,
+  v: number,
+  out: Uint8Array,
+  off: number,
+  st: VoodooState = readVoodooState(),
+): void {
+  sampleRGBTexture(tex, w, h, u, v, out, off, st.bilinear);
 }
 
 /**

@@ -52,7 +52,7 @@ Emulate **all** of the following; each is a cvar in `@q2/config` so we can A/B t
 | 2×2 "22-bit" RAMDAC post filter | box filter of the dithered buffer on output | `vd_postfilter` |
 | Bilinear filtering | 4-tap, 8-bit fractional weights, fixed point | `vd_bilinear` |
 | Single-TMU "trilinear" | mipmap dithering: per-pixel pick LOD *n* or *n+1* by Bayer threshold vs LOD fraction | `vd_mipdither` |
-| LOD bias (Glide default ≈ -0.35) | subtract from computed `log2(rho)` | `vd_lodbias` |
+| LOD bias (Glide default ≈ -0.35) | added to computed `log2(rho)` (tLOD.lodbias convention; negative favours finer) | `vd_lodbias` |
 | Table fog (64 entries, exp²) | per-pixel table lookup on w, blend to fog colour | `vd_fog` |
 | Glide gamma ≈ 1.3 | LUT applied before dithering | `vd_gamma` |
 | 256×256 texture cap | asset cooker downsamples oversized WALs | `vd_maxtexsize` |

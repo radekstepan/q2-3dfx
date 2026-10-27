@@ -17,6 +17,8 @@ import {
   sampleBilinear,
   sampleNearest,
   samplePalette,
+  sampleRGBTexture,
+  sampleRGBTextureFrame,
   sampleTexture,
   shadePixel,
 } from './index.js';
@@ -84,22 +86,88 @@ describe('samplePalette', () => {
 });
 
 describe('mip LOD', () => {
-  it('lod = log2(rho) - bias', () => {
+  it('lod = log2(rho) + bias (tLOD.lodbias convention)', () => {
     expect(mipLevel(4, 0)).toBe(2);
     expect(mipLevel(1, 0)).toBe(0);
-    expect(mipLevel(4, -0.35)).toBeCloseTo(2.35, 10);
-    expect(mipLevel(1, -0.35)).toBeCloseTo(0.35, 10);
+    expect(mipLevel(4, 0.35)).toBeCloseTo(2.35, 10);
+    expect(mipLevel(1, 0.35)).toBeCloseTo(0.35, 10);
     expect(mipLevel(0.5, 0)).toBe(0); // clamped, never negative
   });
-  it('rejects non-positive rho', () => {
-    expect(() => mipLevel(0, 0)).toThrow();
-    expect(() => mipLevel(-2, 0)).toThrow();
+  it('negative bias favours finer detail, positive bias coarser', () => {
+    expect(mipLevel(4, -0.35)).toBeCloseTo(1.65, 10);
+    expect(mipLevel(4, -0.35)).toBeLessThan(mipLevel(4, 0));
+    expect(mipLevel(4, 0.5)).toBeGreaterThan(mipLevel(4, 0));
+    expect(mipLevel(1, -0.35)).toBe(0); // -0.35 clamps to 0, never negative
+  });
+  it('clamps tiny/zero/negative rho to epsilon (constant UVs, magnification)', () => {
+    expect(mipLevel(0, 0)).toBe(0); // no throw: LOD 0
+    expect(mipLevel(-2, 0)).toBe(0); // no throw: LOD 0
+    expect(mipLevel(1e-12, 0)).toBe(0);
+  });
+  it('still rejects non-finite rho/bias', () => {
     expect(() => mipLevel(Number.NaN, 0)).toThrow();
+    expect(() => mipLevel(Number.POSITIVE_INFINITY, 0)).toThrow();
+    expect(() => mipLevel(1, Number.NaN)).toThrow();
+  });
+  it('clamps to [0, maxLevel] when a chain length is given', () => {
+    expect(mipLevel(16, 0, 3)).toBe(3);
+    expect(mipLevel(1024, -0.35, 2)).toBe(2);
+    expect(mipLevel(0.25, 0, 3)).toBe(0);
+    expect(mipLevel(4, 0, 5)).toBe(2); // inside bounds: untouched
   });
   it('mipRho takes the max gradient length', () => {
     expect(mipRho(3, 4, 0, 0)).toBe(5);
     expect(mipRho(0, 0, 1, 0)).toBe(1);
     expect(mipRho(1, 0, 0, 2)).toBe(2);
+  });
+});
+
+describe('sampleRGBTexture (astra §2.3)', () => {
+  // 2x2 of unrelated colours: red / green / blue / white.
+  const rgb = new Uint8Array([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]);
+  const pal = new Uint8Array(768);
+  pal[1 * 3] = 255; // index 1 = red
+  pal[2 * 3 + 1] = 255; // index 2 = green
+  pal[3 * 3 + 2] = 255; // index 3 = blue
+  pal[4 * 3] = 255;
+  pal[4 * 3 + 1] = 255;
+  pal[4 * 3 + 2] = 255; // index 4 = white
+  const idx = new Uint8Array([1, 2, 3, 4]);
+  it('interpolates colours, not palette indices', () => {
+    const out = new Uint8Array(3);
+    sampleRGBTexture(rgb, 2, 2, 0.5, 0.5, out, 0, true);
+    // (255+0+0+255)/4 etc = 127.5 -> 128 per channel: true colour average.
+    expect([...out]).toEqual([128, 128, 128]);
+    // Averaging the raw indices (1+2+3+4)/4 = 2.5 -> green would be WRONG;
+    // the byte-average of indices is meaningless here, colour average is not.
+    expect(out[0]).not.toBe(2);
+  });
+  it('matches the paletted path on identical colours', () => {
+    for (const [u, v] of [
+      [0, 0],
+      [0.5, 0.5],
+      [0.25, 0.75],
+      [1, 1],
+    ] as Array<[number, number]>) {
+      const a = new Uint8Array(3);
+      const b = new Uint8Array(3);
+      sampleRGBTexture(rgb, 2, 2, u, v, a, 0, true);
+      samplePalette(idx, pal, 2, 2, u, v, b, 0, true);
+      expect([...a]).toEqual([...b]);
+    }
+  });
+  it('point-samples the nearest texel when bilinear is false', () => {
+    const out = new Uint8Array(3);
+    sampleRGBTexture(rgb, 2, 2, 0.6, 0.1, out, 0, false);
+    expect([...out]).toEqual([0, 255, 0]); // nearest is (1,0) -> green
+  });
+  it('cvar wrapper follows vd_bilinear only (vd_palettetex is storage, not filter)', () => {
+    const out = new Uint8Array(3);
+    const st = { ...readVoodooState(), bilinear: true, palettetex: false };
+    sampleRGBTextureFrame(rgb, 2, 2, 0.5, 0.5, out, 0, st);
+    expect([...out]).toEqual([128, 128, 128]); // still filters when expanded
+    sampleRGBTextureFrame(rgb, 2, 2, 0.5, 0.5, out, 0, { ...st, bilinear: false });
+    expect([...out]).toEqual([255, 255, 255]); // nearest (1,1) -> white
   });
 });
 
@@ -199,7 +267,7 @@ describe('capTextureSize', () => {
 });
 
 describe('cvar-driven sampler', () => {
-  it('vd_bilinear / vd_palettetex force point sampling when off', () => {
+  it('vd_bilinear alone switches filtering; vd_palettetex does not gate it', () => {
     const pal = new Uint8Array(768);
     for (let i = 0; i < 256; i++) {
       pal[i * 3] = i;
@@ -216,10 +284,12 @@ describe('cvar-driven sampler', () => {
       setCVar('vd_bilinear', 0);
       sampleTexture(idx, pal, 2, 2, 0.5, 0.5, out, 0);
       expect(out[0]).toBe(0); // nearest (1,1) -> index 0
+      // astra §2.3: palettetex=false is a storage policy, NOT a filter
+      // switch — with bilinear still on, filtering continues.
       setCVar('vd_bilinear', 1);
       setCVar('vd_palettetex', 0);
       sampleTexture(idx, pal, 2, 2, 0.5, 0.5, out, 0);
-      expect(out[0]).toBe(0);
+      expect(out[0]).toBe(128);
     } finally {
       setCVar('vd_bilinear', 1);
       setCVar('vd_palettetex', 1);

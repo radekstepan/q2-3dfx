@@ -3,7 +3,11 @@
 // Pipeline order (fixed, matches Glide on Voodoo3):
 //   8:8:8 framebuffer -> gamma LUT -> 4x4 ordered dither -> RGB565 quantise
 //   -> optional 2x2 box ("22-bit" RAMDAC post filter) for display.
-//   Depth: stored 1/z quantised to vd_zbits bits (16-bit W-buffer banding).
+//   Depth: stored 1/z quantised to vd_zbits bits is a DISPLAY/BANDING
+//   approximation only, NOT a depth-buffer emulation (see quantiseDepth).
+//   True depth emulation must quantise BEFORE the depth test/write against
+//   an internal quantized plane; Framebuffer.depth keeps its documented 1/z
+//   semantics (frozen @q2/renderer-api contract).
 //
 // Conventions: colour is Uint32 0xAABBGGRR (see @q2/renderer-api Framebuffer).
 // Inner loops use typed arrays only and allocate nothing.
@@ -62,7 +66,11 @@ export interface ResolveOptions {
   gamma: number;
   /** 4x4 ordered dither before quantise. */
   dither: boolean;
-  /** Quantise 8:8:8 -> 5:6:5 (vd_16bit). Off = round-to-nearest packing. */
+  /**
+   * Quantise 8:8:8 -> 5:6:5 (vd_16bit). Off still packs 565 (round-to-nearest
+   * instead of truncating) for backwards compatibility — it is NOT a true
+   * bypass. Use resolveRGB888 for the genuine RGB888 debug path.
+   */
   quantise: boolean;
 }
 
@@ -73,6 +81,9 @@ export function defaultResolveOptions(): ResolveOptions {
 /**
  * M4.1 resolve: src 8:8:8 (0xAABBGGRR) -> dst RGB565.
  * Zero-alloc inner loop; reads the (cached) gamma LUT once per call.
+ * NOTE (astra §2.2): quantise:false still packs 565, only changing the
+ * rounding (round-to-nearest vs truncate). It is kept byte-compatible for
+ * existing dst565 readers; the genuine RGB888 bypass is resolveRGB888.
  */
 export function resolveRGB565(
   src: Uint32Array,
@@ -121,6 +132,75 @@ export function resolveRGB565(
           ((g6 > 63 ? 63 : g6) << 5) |
           (b5 > 31 ? 31 : b5);
       }
+    }
+  }
+}
+
+// --- RGB888 debug bypass (vd_16bit off) ------------------------------------
+
+export interface ResolveRGB888Options {
+  /**
+   * Display gamma lift; 1.0 disables the stage. The gamma stage REMAINS
+   * active in this path (same LUT/semantics as resolveRGB565) — only the
+   * quantise is bypassed. Documented per astra §2.2.
+   */
+  gamma: number;
+  /**
+   * Ordered dither before write. Default OFF in this path (per guide: there
+   * is no quantiser for the dither to feed); enabling it just perturbs the
+   * 8-bit values with the same pre-quantise offsets — a debug-only knob,
+   * not hardware behaviour.
+   */
+  dither: boolean;
+}
+
+export function defaultResolveRGB888Options(): ResolveRGB888Options {
+  return { gamma: 1.3, dither: false };
+}
+
+/**
+ * Genuine RGB888 debug path (vd_16bit off): src 8:8:8 (0xAABBGGRR) -> dst32
+ * 8:8:8 (0xFFBBGGRR, opaque alpha), preserving values that RGB565 cannot
+ * represent. Applies the gamma LUT, optionally the ordered-dither offsets
+ * (default off), and NO postfilter — the caller (resolveFrame) bypasses
+ * dither reconstruction in this path. Zero-alloc inner loop.
+ */
+export function resolveRGB888(
+  src: Uint32Array,
+  dst32: Uint32Array,
+  w: number,
+  h: number,
+  opts: ResolveRGB888Options = defaultResolveRGB888Options(),
+): void {
+  if (dst32.length < w * h || src.length < w * h) {
+    throw new Error('[voodoo] resolveRGB888: buffer too small');
+  }
+  const lut = opts.gamma !== 1 ? gammaLUT(opts.gamma) : null;
+  const n = w * h;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    const pos = (y & 3) << 2;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      const px = src[i]!;
+      let r = px & 255;
+      let g = (px >> 8) & 255;
+      let b = (px >> 16) & 255;
+      if (lut !== null) {
+        r = lut[r]!;
+        g = lut[g]!;
+        b = lut[b]!;
+      }
+      if (opts.dither) {
+        const p = pos | (x & 3);
+        r += DITHER_RB_POS[p]!;
+        g += DITHER_G_POS[p]!;
+        b += DITHER_RB_POS[p]!;
+        r = r < 0 ? 0 : r > 255 ? 255 : r;
+        g = g < 0 ? 0 : g > 255 ? 255 : g;
+        b = b < 0 ? 0 : b > 255 ? 255 : b;
+      }
+      dst32[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
     }
   }
 }
@@ -188,6 +268,15 @@ export function applyPostFilter(src565: Uint16Array, dst32: Uint32Array, w: numb
  * Quantise stored 1/z depth to `bits` bits (vd_zbits, default 16):
  * q = round(v * (2^bits - 1)) / (2^bits - 1). In-place, zero-alloc.
  * bits >= 24 is a no-op (Float32 mantissa); bits <= 0 is a no-op.
+ *
+ * DISPLAY/BANDING APPROXIMATION ONLY — NOT a depth-buffer emulation
+ * (astra §2.5). This runs post-hoc on already-resolved depth and therefore
+ * cannot affect visibility: no depth test consults its output. A faithful
+ * W/Z emulation must quantise to 0..65535 BEFORE each depth test/write
+ * (with a defined clear value, compare op and tie rule derived from the
+ * projection near/far planes), against a future internal quantized plane.
+ * Framebuffer.depth keeps its documented 1/z semantics (frozen contract —
+ * this helper never changes its meaning, only its banding).
  */
 export function quantiseDepth(depth: Float32Array, bits = 16): void {
   if (!(bits > 0) || bits >= 24) return;
