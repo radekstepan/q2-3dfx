@@ -961,9 +961,14 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - + soldier pursuit (`debris-water.test.ts`), waterjump single-impulse +
 - vault-needs-wall (`water.test.ts`), crawlspace eye under the roof,
 - drowning ramp. Gate (l) viewheight pin updated -2, 17/17 green.
-- Follow-ups (other lanes): web driver still installs the legacy
-- solid-less contents (one-line `bspPointContentsFor` switch when that lane
-- touches `play.ts`, until then the vault stays inert in the browser);
+- CLOSED 2026-10-26 (browser drowning, water lane): the web driver now
+- installs the solid-aware `bspPointContentsFor` for `setPmoveWorld` AND
+- passes it as `contents` into every `SV_Tick`, so `stepWorldEffects`
+- samples the real base1 leaves in-browser (the tick fell back to the null
+- `SV_WorldContents` before and early-returned — the browser never drowned).
+- Play-verified in the driver loop (`drowning.test.ts`, real low-road pool:
+- waterlevel 3, airLeft 12s grace, 4,6,8…15 ramp at 1/s, watr_in/gurp/gasp
+- hooks, resurface recovery; vault engages at a real wall). Remaining tail:
 - breather/envirosuit have no items (air runs on schedule).
 - CLOSED 2026-10-26 (HUD lane): fps is a top-right DOM overlay (`#q2-fps`, `cl_showfps`; in-canvas fps deleted so the counter never touches renderer output) and player coords are a top-left DOM overlay (`#q2-pos`, `pos x y z yaw <yaw>` 1-decimal per frame, `cl_showpos` default ON with a menu checkbox; menu clicks stay input-free under canvas pointer-lock).
 - CLOSED 2026-10-26 (window/corpse content lane): the spawn-room "third

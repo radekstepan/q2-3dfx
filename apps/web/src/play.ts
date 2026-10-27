@@ -35,7 +35,7 @@ import {
   pmoveFull,
   PMF_DUCKED,
   setPmoveWorld,
-  bspContentsFor,
+  bspPointContentsFor,
   findWeapon,
   mulberry32,
   WEAPON_BLASTER,
@@ -60,6 +60,7 @@ import type {
   Trigger,
   WeaponDef,
   TraceResult,
+  PointContentsFn,
   PlayerState,
 } from '@q2/game';
 import {
@@ -736,6 +737,15 @@ export class LocalDriver implements HostDriver {
    * hookup remains in the driver path (setPmoveWorldFromBsp/bspTraceFor).
    */
   private worldTrace: (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => TraceResult;
+  /**
+   * Solid-aware point contents for the pmove world AND the server
+   * P_WorldEffects sampler (game/p_view.c): `bspPointContentsFor` carries
+   * the SOLID bit the legacy `bspContentsFor` dropped. The pmove vault
+   * wall probe (`& CONTENTS_SOLID`) and the server drowning sampler read
+   * through this; dry-land consumers test MASK_WATER only, so dry-land
+   * traces stay bit-identical. Devroom has no water (always dry).
+   */
+  private worldContents: PointContentsFn = () => 0;
   /** C MASK_OPAQUE sight trace for monster visible() (ignores WINDOW glass). */
   private sightTrace: ((start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => TraceResult) | null = null;
   /** Muzzle flash expiry (server time) + world pos for the dlight/HUD flash. */
@@ -819,7 +829,15 @@ export class LocalDriver implements HostDriver {
       // from the driver path (it dropped through clip floors into the void).
       this.worldTrace = SV_ClipTrace(this.server, SV_TraceFor(built.map));
       this.sightTrace = SV_TraceFor(built.map, MASK_OPAQUE_C);
-      setPmoveWorld(this.worldTrace, bspContentsFor(built.map));
+      // Solid-aware contents (water.ts bspPointContentsFor, NOT the legacy
+      // solid-less bspContentsFor): the pmove vault probe (`& CONTENTS_SOLID`)
+      // and the server P_WorldEffects sampler both read through this. With
+      // the legacy hook the browser never categorized water (no drowning —
+      // SV_WorldContents stayed null so the tick sampler early-returned) and
+      // the vault stayed inert (the SOLID probe is always false without the
+      // bit). Dry-land consumers test MASK_WATER only: bit-identical there.
+      this.worldContents = bspPointContentsFor(built.map);
+      setPmoveWorld(this.worldTrace, this.worldContents);
       // Skill latch (id CVAR_LATCH, g_spawn.c): the server filters spawns,
       // damage scale, and the roster from st.skill — set it before spawning.
       SV_SetSkill(this.server, getSkill());
@@ -845,7 +863,7 @@ export class LocalDriver implements HostDriver {
       this.map = null;
       this.mini = createDevroom();
       this.worldTrace = devroomTrace;
-      setPmoveWorld(devroomTrace, () => 0);
+      setPmoveWorld(devroomTrace, this.worldContents);
       this.playerEdict = spawnEdict({ classname: 'player' });
       this.pm.origin = v3(-168, 0, 32);
       this.pm.velocity = v3();
@@ -921,6 +939,11 @@ export class LocalDriver implements HostDriver {
       },
       trace: this.worldTrace,
       sightTrace: this.sightTrace ?? this.worldTrace,
+      // Solid-aware contents for the P_WorldEffects sampler: without this
+      // the tick falls back to SV_WorldContents (null — no map was ever
+      // wired through SV_SetPmoveWorldFromBsp in the driver path) and
+      // drowning never runs in the browser.
+      contents: this.worldContents,
       nav: null,
       rand: this.rand,
     });
@@ -1364,6 +1387,24 @@ export class LocalDriver implements HostDriver {
     return this.ps.health;
   }
 
+  /**
+   * Seconds of air left (P_WorldEffects air supply, game/p_view.c): 12 at
+   * grace, draining toward 0 while the head is under (waterlevel 3), then
+   * the C drowning ramp. HUD air-indicator state, exposed only (no HUD
+   * text owned here).
+   */
+  get playerAirLeft(): number {
+    return this.server.playerAirLeft;
+  }
+
+  /**
+   * Positional sound names emitted this session, in order (test hook):
+   * the P_WorldEffects enter/exit/gasp/burn/drown hooks land here via the
+   * server sound drain, so driver-loop tests can pin them without touching
+   * the mixer or the HUD.
+   */
+  readonly heardSounds: string[] = [];
+
   get playerDead(): boolean {
     return this.ps.health <= 0;
   }
@@ -1617,6 +1658,7 @@ export class LocalDriver implements HostDriver {
   }
 
   private emitSound(name: string, origin: Vec3, attn = ATTN_NORM, masterVol = 1): number {
+    this.heardSounds.push(name);
     const id = this.mixer.startSound({
       origin: [origin[0]!, origin[1]!, origin[2]!],
       fixedOrigin: false,
