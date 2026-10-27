@@ -191,6 +191,12 @@ export interface Entity {
   frame: number; skin: TextureHandle;
   /** RF_DEPTHHACK: alias backend scales stored 1/z by 3 (eye-anchored viewmodel). */
   depthHack?: boolean;
+  /** RF_FRAMELERP previous frame (explosion smoothing): alias backend lerps oldframe -> frame. */
+  oldframe?: number;
+  /** RF_FRAMELERP blend 0..1 (1 = fully oldframe). Defaults to 0; clamped. */
+  backlerp?: number;
+  /** Translucency 0..1 (1 = opaque): screen-door fade for explosions. */
+  alpha?: number;
 }
 export interface Refresh {
   init(fb: Framebuffer): void;
@@ -693,9 +699,11 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 - golden `9a87c5c5` + no-scroll/fallback pins; Q2_PAK `unit1_` render logged.
 - Stop jitter: predictor run-coalescing (msec-ignored, exact vs 100ms server
 - tick) + zero-velocity snap (`speed<1` + zero inputs → snapshot origin).
-- Still open: sky-hit silent free (needs `SURF_SKY` trace flag), machinegun
-- per-shot kick walk, melee/grenade sound placeholders, `Entity.alpha` /
-- `oldframe/backlerp` for translucent-smooth explosions (frozen-contract PR).
+- Still open (server lane owns the trace flag): sky-hit silent free (needs
+- `SURF_SKY` trace flag), machinegun per-shot kick walk, melee/grenade sound
+- placeholders. DONE 2026-10-26 (regression wave): `Entity.alpha` /
+- `oldframe/backlerp` for translucent-smooth explosions (frozen-contract
+- additive PR: renderer-api + alias backend + host forwarding + web extras).
 ### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #5, all landed):
 - Regression locks (`@q2/game`): explosion kinds/frames/dlights/sparks/debris/
 - radius-damage, soldier/gunner frame tables + corpse-hold + gib-overkill,
@@ -721,8 +729,10 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 - `SV_SetSkill`), crouch-C hint, `DoorSync` follows mover displacement incl.
 - func_train, ships/banners/flyers/items render from roster (no PVS cull).
 - Still open: INFANTRY lite def (`monsters.ts`) so 5 base1 infantries simulate;
-- `apps/web` spawns DM-only items in SP (no skill inhibit); barrel MD2 render
-- origin vs entity origin; sky-hit silent free; machinegun per-shot kick walk.
+- barrel MD2 render origin vs entity origin; machinegun per-shot kick walk.
+- DONE 2026-10-26 (regression wave, web side): DM-only items inhibited
+- (`checkPickups`/`livePickupCount`/`extraEntities` skill gate); sky-hit
+- silent free web-side (live-explosions-only rendering + tests).
 ### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #6, all landed):
 - Sky black at angles (`@q2/sw-renderer`): root cause was `BandWorkerPool`
 - staging — 64KB SAB slot truncated the 384KB unit1_ strip to the `rt` tile,
@@ -748,8 +758,23 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 - Skill change now reboots the level with the new skill applied before spawn.
 - Resolution dropdown (`vid_resolution` 320×240–1024×768): reboot resizes the
 - framebuffer + canvas, CSS upscale stays ×2.
-- Still open: INFANTRY lite def; DM-only items spawning in SP; machinegun
-- per-shot kick walk; sky-hit silent free.
+- Still open: INFANTRY lite def; machinegun per-shot kick walk. Closed
+- 2026-10-26 (regression wave, web side): DM-only items inhibited
+- (`checkPickups`/`livePickupCount`/`extraEntities` skip skill-inhibited +
+- freed edicts via `skillInhibits` on the lump `spawnflags` in `extra`);
+- sky-hit silent free web-side (driver renders live explosions only —
+- `extraEntities`/`drainExplosions` prune by frame life, freed-sky bolts
+- queue nothing, verified + tested; the server `SURF_SKY` trace flag is the
+- server lane's job).
+- Server lane CLOSED 2026-10-26 (gameplay wave, `@q2/game` + `@q2/server`):
+- [x] INFANTRY lite def (`monsters.ts` INFANTRY tables, 100hp/-40/200;
+- server spawns base1's 5 with soldier-grade think/chase/locomotion).
+- [x] DM-only items in SP verified server-side (1792 absent at skills 0-3;
+- `dmOnlyInSP` helper exposed, `apps/web` untouched).
+- [x] sky-hit silent free server-side (`SURF_SKY` → `surfaceFlags` →
+- silent bolt free, zero explosions/sparks).
+- [x] machinegun per-shot kick walk (`machinegunKick` + `SV_PlayerFire`
+- branch) + real melee (`melee2.wav`) / grenade (`gunatck3.wav`) sounds.
 ### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #7, all landed):
 - Blaster tile-row dlight (`@q2/sw-renderer`): `bspToMiniWorld` sized luxel
 - grids `floor(span/16)+1` but id `CalcSurfaceExtents` uses floor(min/16)..
@@ -780,8 +805,14 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 - behavior-compatible; whole-roster port stays an M5.3 job. Kept our
 - `BUTTON_DUCK`/KeyC extension (their `+movedown`/upmove equivalent) since
 - pmove honors both C-faithful `upmove<0` and the hold bit.
-- Still open: INFANTRY lite def; DM-only items spawning in SP; machinegun
-- per-shot kick walk; sky-hit silent free.
+- Still open: INFANTRY lite def; machinegun per-shot kick walk. Closed
+- 2026-10-26 (regression wave, web side): DM-only items inhibited
+- (`checkPickups`/`livePickupCount`/`extraEntities` skip skill-inhibited +
+- freed edicts via `skillInhibits` on the lump `spawnflags` in `extra`);
+- sky-hit silent free web-side (driver renders live explosions only —
+- `extraEntities`/`drainExplosions` prune by frame life, freed-sky bolts
+- queue nothing, verified + tested; the server `SURF_SKY` trace flag is the
+- server lane's job).
 ### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #3, all landed):
 - Blaster projectiles now C-faithful (`g_weapon.c`/`p_weapon.c`/`cl_fx.c`):
 - spawn = literal `G_ProjectSource` from feet (`+ fwd*24 + right*8`, `z += viewheight-8`);
@@ -797,9 +828,13 @@ riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
 - Enemies face + animate: `entityAngles` returns stored yaw (was null), corpses
 - persist with death move held on last frame, attack latched mid-move with
 - `FacingIdeal` ±45° gate, yaw clamped per-tick (`M_ChangeYaw`, speed 20).
-- Still open: sky-hit silent free (needs SURF_SKY flag in trace), ex_misc
-- explosion billboard + lasfly loop (renderer/audio hooks), LerpAngle yaw interp
-- + RF_FRAMELERP vertex lerp (needs frozen-contract Entity `oldframe/backlerp`).
+- Still open (server lane owns the rest): sky-hit silent free needs the
+- SURF_SKY flag in the trace; ex_misc explosion billboard + lasfly loop
+- (renderer/audio hooks); LerpAngle yaw interp. DONE 2026-10-26 (regression
+- wave): RF_FRAMELERP vertex lerp + `Entity.alpha` screen-door translucency
+- (frozen-contract additive `oldframe`/`backlerp`/`alpha`, alias backend
+- lerp + Bayer fade, host `ExtraRenderable` forwarding, web explosion
+- extras emit oldframe/backlerp/alpha).
 - Pickups respawn: DONE (M7.4, DM-style ~30s timers in SP).
 - `syncMixerToBrowser` per-name pak wav decode: DONE (lazy per-channel decode,
   24-entry cache, shot/synth fallback). Follow-up: several driver channel names
@@ -1042,3 +1077,25 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - [x] Phase 4 — play-verified gate: base1 driver-level bot asserting rendered
 - outcomes (barrels die, monster closes 300→100u, door re-closes, secret
 - holds, TTK). No gameplay card closes without it.
+- ENFORCEMENT (2026-10-26): the gate is blocking, not advisory. A gameplay
+- card (`packages/game`, `packages/server`, `apps/web` gameplay behaviour)
+- may move to `done` only when `apps/web/src/base1-gate.test.ts` is green on
+- that PR (real base1 lump, real tick loop, asserts on rendered/submitted
+- state). Reviewer checks the gate run; `yarn verify` must include it.
+- Per-batch "Still open" tails elsewhere in §9 are SUPERSEDED by the single
+- consolidated list below — do not add new per-batch tails, update this one.
+### Consolidated still-open (2026-10-26 regression + gameplay wave, single list)
+- CLOSED: infantry sim (INFANTRY lite def + think/chase/locomotion, 5 base1
+- infantries simulate); DM-only items in SP (server `inhibitedBySkill` +
+- web skill gate); sky-hit silent free (server `SURF_SKY`→`surfaceFlags` +
+- web live-explosions-only); `Entity.alpha`/`oldframe`/`backlerp` smooth
+- explosions (additive frozen-contract evolution); in-canvas fps; renderer
+- hot-swap (no reboot); machinegun per-shot kick walk; melee/grenade real
+- sounds (`melee2.wav`, grenade attack).
+- OPEN (next push): full monster AI depth — player-trail pursuit around
+- corners, M_CheckAttack chance/as-state table, soldier duck, combat points,
+- skill-scaled aggression (the bigger M5.3 job); func_door_secret / rotating
+- doors, Think_CalcMoveSpeed, func_train_find path corners; demo1 fallback
+- map when no retail pak is present; 60fps @640×480 (M8.1 async-render +
+- M9.1 SIMD v128); M4.1 human side-by-side vs Voodoo3 capture; saves, menus
+- beyond the cvar panel, multiplayer (explicit non-goal).

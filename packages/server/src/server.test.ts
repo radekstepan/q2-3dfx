@@ -333,13 +333,14 @@ describe('skill cvar + spawn gating (g_spawn.c, g_combat.c)', () => {
     expect(hardEnts.map((e) => e.classname).sort()).toEqual(['ammo_shells', 'weapon_shotgun', 'worldspawn']);
   });
 
-  it('monsterKindOf: soldiers map, gunner maps, infantry stays unmapped', () => {
+  it('monsterKindOf: soldiers, gunner and infantry all map onto lite defs', () => {
     // SP_monster_soldier_light is a soldier with a different skin; infantry
-    // has no lite def yet (needs an INFANTRY table in monsters.ts — reported).
+    // maps onto the INFANTRY lite def (m_infantry.c tables in monsters.ts).
     expect(monsterKindOf('monster_soldier')).toBe('soldier');
     expect(monsterKindOf('monster_soldier_light')).toBe('soldier');
     expect(monsterKindOf('monster_gunner')).toBe('gunner');
-    expect(monsterKindOf('monster_infantry')).toBeNull();
+    expect(monsterKindOf('monster_infantry')).toBe('infantry');
+    expect(monsterKindOf('monster_berserk')).toBeNull();
   });
 
   it('doors spawn closed (no START_OPEN), open on touch, auto-close when clear', () => {

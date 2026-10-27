@@ -881,15 +881,32 @@ export class SoftwareRenderer implements Refresh {
         // reads as a soldier instead of a checker-textured box.
         const skin = this.skins[e.skin] ?? (m.fallback ? this.getGunSkin() : this.getSoldierSkin());
         // Real MD2s carry hundreds of frames; wrap game-provided indices.
+        // RF_FRAMELERP (Entity.oldframe/backlerp): oldframe -> frame by
+        // backlerp (cl_tent.c explosion smoothing). Unset oldframe means no
+        // lerp (frameA == frameB, blend 0) — bit-identical to the old path.
         const nf = m.data.numFrames > 0 ? m.data.numFrames : 1;
-        const fr = ((e.frame % nf) + nf) % nf;
+        const wrap = (f: number): number => ((f % nf) + nf) % nf;
+        const fr = wrap(e.frame);
+        const hasOld = e.oldframe !== undefined && Number.isFinite(e.oldframe);
+        const frA = hasOld ? wrap(e.oldframe as number) : fr;
+        let lerp = e.backlerp ?? 0;
+        if (!Number.isFinite(lerp)) lerp = 0;
+        if (lerp < 0) lerp = 0; else if (lerp > 1) lerp = 1;
+        if (!hasOld) lerp = 0;
+        // Entity.alpha (default opaque): screen-door translucency for fading
+        // explosions; fully transparent entities are skipped entirely.
+        let alpha = e.alpha ?? 1;
+        if (!Number.isFinite(alpha)) alpha = 1;
+        if (alpha <= 0) continue;
+        if (alpha > 1) alpha = 1;
         drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
           mesh: m.data, origin: e.origin, angles: e.angles,
-          frameA: fr, frameB: fr, lerp: 0,
+          frameA: frA, frameB: fr, lerp,
           lightAngle: ((e.angles[1]! * 256) / 360) & 255,
           // First-person viewmodel (Entity.depthHack = RF_DEPTHHACK):
           // bias stored 1/z so the eye-anchored gun wins vs nearby walls.
           depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
+          alpha: alpha >= 1 ? undefined : alpha,
         }, skin, cam, this.anorms, this.shadeDots, this.colormap);
       } else if (m.kind === 'sp2') {
         const skin = this.skins[e.skin] ?? devSkin0(worldData);

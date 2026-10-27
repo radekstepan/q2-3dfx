@@ -28,6 +28,7 @@ import {
   moverUse,
   mulberry32,
   parseEntities,
+  parseVec3,
   pmoveFull,
   PM_CheckDuck,
   PMF_DUCKED,
@@ -60,7 +61,9 @@ import {
   SV_SetSkill,
   SV_TouchDoorsAt,
   SV_TraceFor,
+  dmOnlyInSP,
   droptofloor,
+  inhibitedBySkill,
 } from './index.js';
 
 const Q2_PAK = process.env.Q2_PAK;
@@ -1669,8 +1672,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     const { map } = loadBase1();
     const dicts = parseEntities(map.entities);
     expect(dicts.filter((d) => d.classname === 'monster_gunner')).toHaveLength(0);
-    // base1's two monster types are soldier variants (14) + infantry (5);
-    // infantry has no lite def yet (see monsterKindOf report in server.test).
+    // base1's two monster types are soldier variants (14) + infantry (5).
     expect(dicts.filter((d) => d.classname === 'monster_soldier' || d.classname === 'monster_soldier_light')).toHaveLength(14);
     expect(dicts.filter((d) => d.classname === 'monster_infantry')).toHaveLength(5);
     // the exit machinegun is spawnflags 1792 = NOT_EASY|NOT_MEDIUM|NOT_HARD
@@ -1712,6 +1714,88 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
         expect(lights).toHaveLength(6);
         expect(normals).toHaveLength(8);
       }
+    }
+  });
+  it('infantry: base1 roster simulates at every skill (3 always + 2 at 2+)', { timeout: 120000 }, () => {
+    // m_infantry.c SP_monster_infantry: 100hp / gib -40 / mass 200. Base1
+    // fields 5 (3× spawnflags 1 ambush, 2× 769 = NOT_EASY|NOT_MEDIUM|ambush),
+    // so skills 0/1 see the 3 ambushers and skills 2/3 see all 5. Every
+    // spawned infantry carries a real lite state (same think/chase/
+    // locomotion as soldier: ambush-LOS acquire, stair climb).
+    const { map } = loadBase1();
+    const dicts = parseEntities(map.entities);
+    expect(dicts.filter((d) => d.classname === 'monster_infantry')).toHaveLength(5);
+    for (const skill of [0, 1, 2, 3]) {
+      resetEdictNums();
+      const st = SV_Init();
+      const edicts = spawnWith(st, map, skill, true);
+      const lump = dicts.filter((d) => d.classname === 'monster_infantry');
+      const want = lump.filter((d) => !inhibitedBySkill(Number.parseInt(d.spawnflags, 10), skill)).length;
+      expect(want).toBe(skill < 2 ? 3 : 5);
+      const spawned = findByClassname(edicts, 'monster_infantry');
+      expect(spawned).toHaveLength(want);
+      expect(st.monsters.filter((m) => m.kind === 'infantry')).toHaveLength(want);
+      for (const e of spawned) {
+        const m = st.monsters.find((mm) => mm.edict === e)!;
+        expect(m.kind).toBe('infantry');
+        expect(m.state.health).toBe(100);
+        expect(m.state.move).toBe('stand');
+      }
+    }
+    // Think wiring: an always-spawn ambusher (t40) acquires on LOS and
+    // closes with the same chase/locomotion as the soldier runner. A
+    // permissive stub trace keeps the assertion geometry-free (shared
+    // SV_MonsterTick path — no kind-specific branches besides stand/death
+    // names and fire sounds).
+    resetEdictNums();
+    const st = SV_Init();
+    spawnWith(st, map, 1, true);
+    const t40 = st.monsters.find((m) => m.edict.targetname === 't40')!;
+    expect(t40.kind).toBe('infantry');
+    expect(t40.ambush).toBe(true);
+    const stub: TraceFn = (start: Vec3, _mins: Vec3, _maxs: Vec3, end: Vec3) => ({
+      fraction: 1,
+      endpos: v3(end[0], end[1], end[2]),
+      planeNormal: v3(0, 0, 1),
+      allsolid: false,
+      startsolid: false,
+      entityNum: -1,
+      contents: 0,
+    });
+    const near = v3(t40.edict.origin[0]! + 300, t40.edict.origin[1], t40.edict.origin[2]);
+    SV_MonsterTick(st, near, stub, null, mulberry32(1234));
+    expect(t40.seen).toBe(true);
+    expect(t40.state.move).not.toBe('stand');
+    expect(t40.edict.origin[0]!).toBeGreaterThan(-1768);
+  });
+  it('DM-only items stay out of SP: every 1792-flagged lump edict absent at skills 0-3', { timeout: 120000 }, () => {
+    // g_spawn.c: 1792 = NOT_EASY|NOT_MEDIUM|NOT_HARD inhibits at every SP
+    // skill (the exit machinegun, the BFG/hyperblaster/supershotgun caches,
+    // armor and the ammo piles); deathmatch spawns them (DM branch checks
+    // NOT_DEATHMATCH alone). The server filters through dmOnlyInSP so the
+    // web lane never duplicates the table (apps/web untouched).
+    const { map } = loadBase1();
+    const dicts = parseEntities(map.entities);
+    const dmOnly = dicts.filter((d) => d.spawnflags === '1792');
+    expect(dmOnly.length).toBeGreaterThan(0);
+    expect(dmOnly.some((d) => d.classname === 'weapon_machinegun')).toBe(true);
+    for (const d of dmOnly) expect(dmOnlyInSP(Number.parseInt(d.spawnflags, 10))).toBe(true);
+    for (const skill of [0, 1, 2, 3]) {
+      resetEdictNums();
+      const st = SV_Init();
+      const edicts = spawnWith(st, map, skill, true);
+      for (const d of dmOnly) {
+        const want = parseVec3(d.origin, v3(0, 0, 0));
+        const hits = edicts.filter(
+          (e) =>
+            e.classname === d.classname &&
+            Math.abs(e.origin[0]! - want[0]!) < 0.5 &&
+            Math.abs(e.origin[1]! - want[1]!) < 0.5 &&
+            Math.abs(e.origin[2]! - want[2]!) < 0.5,
+        );
+        expect(hits).toHaveLength(0);
+      }
+      expect(findByClassname(edicts, 'weapon_machinegun')).toHaveLength(0);
     }
   });
   it('glass walls spawn in SP; z=0 barrels rest on the floor away from them', { timeout: 120000 }, () => {
@@ -1762,12 +1846,9 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     const ed1 = spawnWith(st1, map, 1, true);
     expect(ed1.length).toBe(606);
     expect(st1.monsters).toHaveLength(17);
-    expect(st1.monsters.filter((m) => m.kind)).toHaveLength(14);
-    expect(st1.monsters.filter((m) => m.kind === null).map((m) => m.edict.classname).sort()).toEqual([
-      'monster_infantry',
-      'monster_infantry',
-      'monster_infantry',
-    ]);
+    // All 17 map onto lite defs now (14 soldiers + 3 skill-1 infantries).
+    expect(st1.monsters.filter((m) => m.kind)).toHaveLength(17);
+    expect(st1.monsters.filter((m) => m.kind === 'infantry')).toHaveLength(3);
     expect(findByClassname(ed1, 'func_door')).toHaveLength(4);
     expect(st1.triggers).toHaveLength(22);
     expect(st1.movers).toHaveLength(6);

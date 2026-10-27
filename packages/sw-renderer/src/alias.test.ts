@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ANORM_COUNT, buildANorms, buildShadeDots, createBoxMesh,
   drawAliasInstance, fillAffineTri,
+  clampBacklerp, aliasAlphaKeeps,
 } from './alias.js';
 import { drawSprite } from './sprites.js';
 import { drawParticles, projectParticles } from './particles.js';
@@ -333,5 +334,108 @@ describe('particles', () => {
     expect(out[0]!.x).toBe(32);
     expect(out[0]!.y).toBe(32);
     expect(out[0]!.iz).toBeCloseTo(0.01, 6);
+  });
+});
+
+describe('RF_FRAMELERP helpers (Entity.oldframe/backlerp/alpha)', () => {
+  it('clampBacklerp clamps to [0,1], non-finite -> 0', () => {
+    expect(clampBacklerp(0.5)).toBe(0.5);
+    expect(clampBacklerp(0)).toBe(0);
+    expect(clampBacklerp(1)).toBe(1);
+    expect(clampBacklerp(-0.2)).toBe(0);
+    expect(clampBacklerp(1.7)).toBe(1);
+    expect(clampBacklerp(Number.NaN)).toBe(0);
+    expect(clampBacklerp(undefined)).toBe(0);
+  });
+
+  it('aliasAlphaKeeps: opaque default, transparent zero, Bayer dither between', () => {
+    expect(aliasAlphaKeeps(3, 5, undefined)).toBe(true);
+    expect(aliasAlphaKeeps(3, 5, 1)).toBe(true);
+    expect(aliasAlphaKeeps(3, 5, 2)).toBe(true);
+    expect(aliasAlphaKeeps(3, 5, Number.NaN)).toBe(true);
+    expect(aliasAlphaKeeps(3, 5, 0)).toBe(false);
+    expect(aliasAlphaKeeps(3, 5, -1)).toBe(false);
+    // 4x4 Bayer holds 8/16 cells below 0.5 -> exactly half the 16 cells keep.
+    let kept = 0;
+    for (let y = 0; y < 4; y++) {
+      for (let x = 0; x < 4; x++) {
+        if (aliasAlphaKeeps(x, y, 0.5)) kept++;
+      }
+    }
+    expect(kept).toBe(8);
+  });
+
+  it('backlerp interpolates verts oldframe -> frame (lerp math)', () => {
+    const cam = testCam();
+    const anorms = buildANorms();
+    const dots = buildShadeDots(anorms);
+    const skin = flatSkin(100);
+    // Two frames 6 units apart LATERALLY (y): lerp 0 == frameA pose,
+    // lerp 1 == frameB pose. (A pure depth/x shift would be sub-pixel at
+    // this distance and rasterise identically — that is perspective, not
+    // a lerp failure.) Normals vary per vert and texel 100 survives
+    // colormap grade 21 (texels <95 shade to index 0 and would be
+    // invisible against the background — an all-zero buffer compares
+    // equal no matter the geometry).
+    const mesh = {
+      frames: new Float32Array([20, 0, 0, 20, 5, 0, 20, 0, 10, 20, 6, 0, 20, 11, 0, 20, 6, 10]),
+      normals: new Uint8Array([5, 80, 120, 5, 80, 120]),
+      numVerts: 3,
+      numFrames: 2,
+      numTris: 1,
+      tris: new Uint16Array([0, 1, 2]),
+      numSt: 3,
+      st: new Float32Array([0, 0, 16, 0, 8, 16]),
+    };
+    const base = {
+      mesh, origin: new Float32Array([0, 0, 0]), angles: new Float32Array([0, 0, 0]),
+      lightAngle: 0,
+    };
+    const run = (frameA: number, frameB: number, lerp: number): { idx: Uint8Array; zb: Float32Array; pixels: number } => {
+      const idx = new Uint8Array(64 * 64);
+      const zb = new Float32Array(64 * 64);
+      const pixels = drawAliasInstance(idx, zb, 64, 64, { ...base, frameA, frameB, lerp }, skin, cam, anorms, dots, colormap);
+      return { idx, zb, pixels };
+    };
+    const a = run(0, 0, 0);
+    const b = run(1, 1, 0);
+    const mid = run(0, 1, 0.5);
+    expect(a.pixels).toBeGreaterThan(0);
+    expect(b.pixels).toBeGreaterThan(0);
+    // Midpoint differs from both endpoints (true interpolation, not a pop).
+    expect(mid.idx.some((v, i) => v !== a.idx[i])).toBe(true);
+    expect(mid.idx.some((v, i) => v !== b.idx[i])).toBe(true);
+    // Endpoints of the blend equal the frozen frames.
+    const aEnd = run(0, 1, 0);
+    const bEnd = run(0, 1, 1);
+    expect([...aEnd.idx]).toEqual([...a.idx]);
+    expect([...bEnd.idx]).toEqual([...b.idx]);
+  });
+
+  it('alpha 0 draws nothing, alpha 1 is bit-identical to unset, partial dithers', () => {
+    const cam = testCam();
+    const anorms = buildANorms();
+    const dots = buildShadeDots(anorms);
+    const skin = flatSkin(14);
+    const mesh = createBoxMesh(10);
+    const base = {
+      mesh, origin: new Float32Array([80, 0, 10]), angles: new Float32Array([0, 0, 0]),
+      frameA: 0, frameB: 1, lerp: 0.5, lightAngle: 0,
+    };
+    const mk = () => ({ idx: new Uint8Array(64 * 64), zb: new Float32Array(64 * 64) });
+    const ref = mk();
+    const pRef = drawAliasInstance(ref.idx, ref.zb, 64, 64, { ...base }, skin, cam, anorms, dots, colormap);
+    const opaque = mk();
+    const pOpaque = drawAliasInstance(opaque.idx, opaque.zb, 64, 64, { ...base, alpha: 1 }, skin, cam, anorms, dots, colormap);
+    expect(pOpaque).toBe(pRef);
+    expect([...opaque.idx]).toEqual([...ref.idx]);
+    const gone = mk();
+    const pGone = drawAliasInstance(gone.idx, gone.zb, 64, 64, { ...base, alpha: 0 }, skin, cam, anorms, dots, colormap);
+    expect(pGone).toBe(0);
+    expect(gone.idx.every((v) => v === 0)).toBe(true);
+    const half = mk();
+    const pHalf = drawAliasInstance(half.idx, half.zb, 64, 64, { ...base, alpha: 0.5 }, skin, cam, anorms, dots, colormap);
+    expect(pHalf).toBeGreaterThan(0);
+    expect(pHalf).toBeLessThan(pRef);
   });
 });

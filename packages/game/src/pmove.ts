@@ -65,6 +65,12 @@ export interface TraceResult {
   startsolid: boolean;
   entityNum: number; // -1 = world/none
   contents: number;
+  /**
+   * Surface flags of the hit brushside's texinfo (q_shared.h SURF_* bits,
+   * e.g. SURF_SKY from @q2/bsp) — the C trace_t.surface->flags equivalent.
+   * Additive optional: absent/0 when the trace never hit a brush.
+   */
+  surfaceFlags?: number;
 }
 
 export type TraceFn = (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => TraceResult;

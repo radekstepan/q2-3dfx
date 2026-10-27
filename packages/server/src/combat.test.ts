@@ -376,7 +376,7 @@ describe('Phase 2: C damage/skill tables (soldier skins + infantry)', () => {
     expect(st.playerHealth).toBe(90);
   });
 
-  it('infantry C numbers are the sim contract when the lite def lands', () => {
+  it('infantry C numbers back the lite def (m_infantry.c, now simulated)', () => {
     // m_infantry.c SP_monster_infantry: 100hp / gib -40 / mass 200;
     // InfantryMachineGun: bullet dmg 3 kick 4 spread 300/500;
     // infantry_smack: fire_hit dmg 5+(rand%5) kick 50.

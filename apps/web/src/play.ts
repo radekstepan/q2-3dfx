@@ -1095,20 +1095,33 @@ export class LocalDriver implements HostDriver {
     }
     if (this.models) {
       // Server-owned explosion visuals (pruned server-side by frame life).
+      // RF_FRAMELERP smoothing: oldframe = previous frame, backlerp =
+      // 1 - frac (cl_tent.c frac stepping), so frames interpolate instead
+      // of popping; alpha fades over the life (ex_poly 16-frame alpha,
+      // ex_misc linear) so the alias backend screen-doors to translucent.
+      // Freed-sky bolts never reach this list (the server frees them
+      // silently with no explosion record), so no remnant renders here.
       for (const e of this.server.explosions) {
         const age = this.server.time - e.born;
         const frames = explosionFrames(e.kind);
         if (age < 0 || age >= frames * 0.1) continue;
         const f = Math.floor(age / 0.1);
+        const frac = age / 0.1 - f;
         // TE_EXPLOSION1/2 render the r_explode MD2 (cl_mod_explo4, 15f/19f);
         // TE_BLASTER's 4f ex_misc renders the explode MD2 (cl_mod_explode).
         const isBlast = e.kind === 'blaster';
+        const alpha = isBlast
+          ? 1 - age / EXPLOSION_LIGHT_WINDOW
+          : (16 - f) / 16;
         out.push({
           origin: [e.pos[0]!, e.pos[1]!, e.pos[2]!],
           angles: [0, e.yaw, 0],
           model: isBlast ? this.models.blast : this.models.explode,
           skin: isBlast ? this.models.blastSkin : this.models.explodeSkin,
           frame: e.baseframe + f,
+          oldframe: e.baseframe + Math.max(0, f - 1),
+          backlerp: Math.max(0, Math.min(1, 1 - frac)),
+          alpha: Math.max(0, Math.min(1, alpha)),
         });
       }
       // Server-owned debris/gibs (SV_Physics_Toss-lite, stepped in SV_Tick).
@@ -1140,8 +1153,13 @@ export class LocalDriver implements HostDriver {
       // logic in checkPickups. This is what makes the low-hole armor
       // shards visible: entity submits have no PVS/frustum cull in the
       // renderer (z-test only), so a shard at z=-216 renders like any other.
+      // DM-only edicts (spawnflags 1792 = NOT_EASY|NOT_MEDIUM|NOT_HARD) are
+      // inhibited at every SP skill: the server skips them at spawn AND the
+      // driver re-checks the lump spawnflags from extra (the numeric
+      // spawnflags field is C-stripped post-spawn, so extra is authoritative).
       for (const e of this.server.entities) {
         if (e.freed) continue;
+        if (skillInhibits(parseSpawnflags(e.extra ?? {}), getSkill())) continue;
         const h = this.models.items[e.classname];
         if (!h) continue;
         out.push({
@@ -1196,9 +1214,12 @@ export class LocalDriver implements HostDriver {
   /** Test hook: live pickup extras (unpicked, skill-kept item/weapon/ammo). */
   livePickupCount(): number {
     if (!this.models) return 0;
+    const skill = getSkill();
     let n = 0;
     for (const e of this.server.entities) {
-      if (!e.freed && this.models.items[e.classname]) n++;
+      if (e.freed) continue;
+      if (skillInhibits(parseSpawnflags(e.extra ?? {}), skill)) continue;
+      if (this.models.items[e.classname]) n++;
     }
     return n;
   }
@@ -1608,15 +1629,20 @@ export class LocalDriver implements HostDriver {
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
   }
 
-  /** Walk-over pickups: item/weapon/ammo edicts grant via pickupItem. */
+  /** Walk-over pickups: item/weapon/ammo edicts grant via pickupItem.
+   * Skill-inhibited (DM-only 1792 at every SP skill) and freed edicts are
+   * skipped, mirroring extraEntities/livePickupCount (spawnflags read from
+   * the lump dict in extra — the numeric field is C-stripped post-spawn). */
   private checkPickups(): void {
     if (this.playerDead) return;
     const px = this.pm.origin[0]!;
     const py = this.pm.origin[1]!;
     const pz = this.pm.origin[2]!;
     let healed = false;
+    const skill = getSkill();
     for (const e of this.server.entities) {
       if (e.freed) continue;
+      if (skillInhibits(parseSpawnflags(e.extra ?? {}), skill)) continue;
       const c = e.classname;
       if (!c.startsWith('item_') && !c.startsWith('weapon_') && !c.startsWith('ammo_')) continue;
       const dx = Math.abs(px - e.origin[0]!);
@@ -2482,9 +2508,24 @@ export function bootPlay(opts: {
  */
 export function rebootPlay(prev: PlayBoot): PlayBoot {
   const pak = getMapSource() === MAP_SOURCE_PAK ? prev.pak : null;
-  // Renderer re-latches from the vid_renderer cvar like the other
-  // REBOOT_CVARS (resolution/skill/map): the menu owns the choice now.
+  // Renderer is NOT re-latched here: vid_renderer hot-swaps in place
+  // (see applyRendererCvar) without rebuilding Host/LocalDriver/server
+  // state. Skill/resolution/map still reboot through this path.
   return bootPlay({ pak });
+}
+
+/**
+ * Hot-swap the renderer backend in place (vid_renderer menu switch without
+ * a reboot): re-latches `boot.renderer` from the cvar and returns it. The
+ * resolve path (resolveDisplay) already reads the cvar every frame, so no
+ * Host/LocalDriver/server state is touched — player pos, health, ammo and
+ * monsters survive the switch. Pure except for the boot.renderer write;
+ * headless-safe.
+ */
+export function applyRendererCvar(boot: PlayBoot): RendererKind {
+  const next: RendererKind = getCVarString('vid_renderer') === 'voodoo' ? 'voodoo' : 'software';
+  boot.renderer = next;
+  return next;
 }
 
 /** Resolve the software framebuffer for display (voodoo post chain or direct).
@@ -2623,35 +2664,46 @@ export interface HudState {
   frame: number;
 }
 
-/** In-canvas fps readout colour (legacy: the canvas no longer draws fps —
- * the DOM overlay from updateFpsOverlay is the fps counter now; kept
- * exported for the pure-helper tests and index re-exports). */
+/** In-canvas fps readout colour (C-faithful: the game view owns the counter,
+ * drawn top-left in-view, gated by cl_showfps). */
 export const FPS_GREEN = 0xff00ff00;
 
 /**
- * Pure anchor for the legacy in-canvas fps slot: top-right, 8px margins.
- * Kept exported (pure, tested); the canvas no longer draws fps text.
+ * Pure anchor for the in-canvas fps slot: top-left, 8px margins, so the
+ * counter never covers the controls panel (the DOM overlay is gone).
  */
 export function fpsHudAnchor(width: number, text: string): { x: number; y: number } {
-  return { x: Math.max(0, width - stringWidth(text) - 8), y: 8 };
+  void width;
+  void text;
+  return { x: 8, y: 8 };
+}
+
+/**
+ * Cvar gate for the in-canvas fps readout (`cl_showfps`, default 1).
+ * Mirrors dom.showFpsEnabled without importing the DOM layer (this module
+ * is headless-safe; dom.ts imports from here, never the reverse).
+ */
+export function fpsVisible(): boolean {
+  if (getCVar('cl_showfps') === undefined) return true;
+  const raw = getCVar('cl_showfps');
+  return Number(raw) !== 0;
 }
 
 /** Draw crosshair + status lines onto a 0xAABBGGRR buffer (runs post-resolve).
  *
- * The play canvas shows ONLY world + crosshair + weapon/ammo + hp + message
- * (+ the devroom hint and death bars). Position readout, the controls hint,
- * and the green in-canvas fps text are deliberately NOT drawn here: the
- * controls live in the menu panel (index.html #q2-help), the fps counter
- * lives in the DOM overlay (updateFpsOverlay, gated by cl_showfps), and a
- * position readout has no place in the game view. The real in-game fps
- * counter (DOM overlay) is untouched.
+ * The play canvas shows world + crosshair + weapon/ammo + hp + message
+ * (+ the devroom hint and death bars) + the in-canvas `fps N` counter
+ * top-left (gated by cl_showfps). Position readout and the controls hint
+ * are deliberately NOT drawn here: the controls live in the menu panel
+ * (index.html #q2-help) and a position readout has no place in the game
+ * view. The DOM #q2-fps overlay is gone (it sat over the controls panel);
+ * this in-canvas text is the only fps counter.
  */
 export function drawPlayHud(
   target: { width: number; height: number; color: Uint32Array },
   boot: PlayBoot,
   hud: HudState,
 ): void {
-  void hud;
   const white = 0xffffffff;
   const cx = (target.width / 2) | 0;
   const cy = (target.height / 2) | 0;
@@ -2662,6 +2714,14 @@ export function drawPlayHud(
   // 3D view model (pak) replaces the 2D silhouette — never double-draw.
   if (usesViewModel3D(boot)) drawDeathBars(target, boot);
   else drawViewModel(target, boot);
+  // In-canvas fps counter, top-left in-view (never over the controls
+  // panel), gated by cl_showfps. Drawn first so later HUD rows paint over
+  // it on tiny buffers instead of the reverse.
+  if (fpsVisible() && Number.isFinite(hud.fps) && hud.fps > 0) {
+    const text = `fps ${Math.round(hud.fps)}`;
+    const a = fpsHudAnchor(target.width, text);
+    drawString(target, a.x, a.y, text, FPS_GREEN);
+  }
   const hp = boot.driver.playerHealth;
   const hpColor = boot.driver.playerDead ? 0xffff3333 : hp <= 25 ? 0xffff9933 : white;
   drawString(target, 8, target.height - 18, `${boot.driver.weapon.classname} ${boot.driver.hudAmmo()}`, white);

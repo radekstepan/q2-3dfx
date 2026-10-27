@@ -244,7 +244,7 @@ describe('Phase 2 C HP/damage tables (m_soldier.c, m_infantry.c)', () => {
     expect(SOLDIER_HP.machinegun).toBe(40);
   });
 
-  it('infantry C numbers are pinned (m_infantry.c, no lite sim def yet)', () => {
+  it('infantry C numbers back the lite def (m_infantry.c, now simulated)', () => {
     // SP_monster_infantry: 100hp, gib -40, mass 200. InfantryMachineGun ->
     // monster_fire_bullet dmg 3 kick 4 spread 300/500; infantry_smack ->
     // fire_hit dmg 5+(rand%5) kick 50.

@@ -4,6 +4,7 @@ import type { UserCmdT } from '@q2/input';
 import {
   bootPlay,
   rebootPlay,
+  applyRendererCvar,
   getResolution,
   parseResolution,
   getMapSource,
@@ -35,13 +36,41 @@ afterEach(() => {
 });
 
 describe('menu reboot: skill + resolution (headless)', () => {
-  it('skill, vid_resolution, and map_source reboot; nothing else does', () => {
+  it('skill, vid_resolution, and map_source reboot; renderer hot-swaps instead', () => {
     expect(cvarNeedsReboot('skill')).toBe(true);
     expect(cvarNeedsReboot('vid_resolution')).toBe(true);
     expect(cvarNeedsReboot('map_source')).toBe(true);
-    expect(cvarNeedsReboot('vid_renderer')).toBe(true);
+    // vid_renderer hot-swaps in place (no reboot): the resolve path reads
+    // the cvar every frame, so Host/LocalDriver/server state survives.
+    expect(cvarNeedsReboot('vid_renderer')).toBe(false);
     expect(cvarNeedsReboot('r_brightness')).toBe(false);
     expect(cvarNeedsReboot('cl_showfps')).toBe(false);
+  });
+
+  it('vid_renderer hot-swaps in place: no reboot, state preserved', () => {
+    setCVar('vid_renderer', 'software');
+    const b = bootPlay({});
+    expect(b.renderer).toBe('software');
+    // Walk a frame so there is live sim state to preserve.
+    b.host.frame(100);
+    const px = [...b.host.playerOrigin];
+    const hp = b.driver.playerHealth;
+    const hostRef = b.host;
+    const driverRef = b.driver;
+    // "Change the dropdown": re-latch only, no boot rebuild.
+    setCVar('vid_renderer', 'voodoo');
+    expect(cvarNeedsReboot('vid_renderer')).toBe(false);
+    expect(applyRendererCvar(b)).toBe('voodoo');
+    expect(b.renderer).toBe('voodoo');
+    expect(b.host).toBe(hostRef);
+    expect(b.driver).toBe(driverRef);
+    expect([...b.host.playerOrigin]).toEqual(px);
+    expect(b.driver.playerHealth).toBe(hp);
+    // And back: resolveDisplay follows the cvar live either way.
+    setCVar('vid_renderer', 'software');
+    expect(applyRendererCvar(b)).toBe('software');
+    expect(b.renderer).toBe('software');
+    expect(b.host).toBe(hostRef);
   });
 
   it('bootPlay honors the persisted vid_renderer cvar; rebootPlay keeps it', () => {

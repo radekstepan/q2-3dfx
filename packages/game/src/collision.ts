@@ -7,8 +7,9 @@
 // (q_shared.h: WATER 32, SLIME 16, LAVA 8, LADDER 0x20000000) to the pmove
 // bits (pmove.c: WATER 2, SLIME 4, LAVA 8, LADDER 16).
 import type { Bsp38 } from '@q2/formats';
-import { traceBox, pointLeaf, LEAF_STRIDE } from '@q2/bsp';
+import { traceBox, pointLeaf, LEAF_STRIDE, SURF_SKY } from '@q2/bsp';
 import type { Vec3 } from '@q2/math';
+import type { TraceFn, TraceResult, PointContentsFn } from './pmove.js';
 import {
   setPmoveWorld,
   resetPmoveWorld,
@@ -17,7 +18,6 @@ import {
   CONTENTS_LAVA,
   CONTENTS_LADDER,
 } from './pmove.js';
-import type { TraceFn, PointContentsFn } from './pmove.js';
 
 /** Q2 BSP contents bits (game/q_shared.h) relevant to movement. */
 export const BSP_CONTENTS_WATER = 32;
@@ -39,9 +39,20 @@ export function bspTraceFor(world: Bsp38, mask: number = MASK_PLAYERSOLID): Trac
       startsolid: t.startsolid,
       entityNum: t.entityNum,
       contents: t.contents,
+      surfaceFlags: t.surfaceFlags,
     };
   };
 }
+
+/**
+ * C blaster_touch sky gate (g_weapon.c): a bolt whose wall trace hit a
+ * SURF_SKY surface frees silently — no explosion, no dlight, no sound.
+ */
+export function traceHitSky(t: TraceResult): boolean {
+  return ((t.surfaceFlags ?? 0) & SURF_SKY) !== 0;
+}
+
+export { SURF_SKY };
 
 /** Map a Q2 BSP leaf-contents value to pmove contents bits. */
 export function mapBspContents(contents: number): number {

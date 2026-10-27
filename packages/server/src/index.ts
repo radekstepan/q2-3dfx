@@ -59,6 +59,14 @@ import {
   GIB_SOUND,
   HITSCAN_TRACER_COLOR,
   SOLDIER_WEAPON_STATS,
+  machinegunKick,
+  infantryMeleeDamage,
+  traceHitSky,
+  INFANTRY_C,
+  INFANTRY_GUN_SOUND,
+  INFANTRY_MELEE_SOUND,
+  GUNNER_GRENADE_SOUND,
+  MZ2_INFANTRY_MACHINEGUN_1,
   MZ2_GUNNER_GRENADE_1,
   MZ2_GUNNER_MACHINEGUN_1,
   MZ2_SOLDIER_BLASTER_1,
@@ -206,6 +214,23 @@ export function inhibitedBySkill(spawnflags: number, skill: number): boolean {
 }
 
 /**
+ * True when the entity never spawns in SP at any skill (g_spawn.c: the
+ * 1792-flagged exit machinegun + ammo caches carry NOT_EASY|NOT_MEDIUM|
+ * NOT_HARD, so every SP skill inhibits them; deathmatch spawns them since
+ * the DM branch only checks NOT_DEATHMATCH). Web-lane helper (do not
+ * duplicate the table in apps/web): filter SP pickups through this instead
+ * of reimplementing skill gating.
+ */
+export function dmOnlyInSP(spawnflags: number): boolean {
+  return (
+    inhibitedBySkill(spawnflags, 0) &&
+    inhibitedBySkill(spawnflags, 1) &&
+    inhibitedBySkill(spawnflags, 2) &&
+    inhibitedBySkill(spawnflags, 3)
+  );
+}
+
+/**
  * Damage dealt TO the player scales by this (g_combat.c: easy halves it).
  * Health is not skill-scaled in id (only damage, pain, aim and the roster).
  *
@@ -279,6 +304,7 @@ export function SV_TraceFor(map: BspMap, mask: number = MASK_PLAYERSOLID_C): Tra
       startsolid: t.startsolid,
       entityNum: t.entityNum,
       contents: t.contents,
+      surfaceFlags: t.surfaceFlags,
     };
   };
 }
@@ -417,6 +443,7 @@ export function SV_ClipTrace(st: ServerState, worldTrace: TraceFn): TraceFn {
           startsolid: hit.startsolid,
           entityNum: best.entityNum,
           contents: best.contents,
+          surfaceFlags: best.surfaceFlags,
         };
       }
     }
@@ -447,9 +474,7 @@ export function droptofloor(origin: Vec3, mins: Vec3, maxs: Vec3, trace: TraceFn
 export interface ServerMonster {
   edict: Edict;
   state: MonsterState;
-  /** soldier | gunner, or null when no lite def exists (monster_infantry:
-   * needs an INFANTRY table in packages/game/src/monsters.ts — reported,
-   * out of this package's lock; the edict still spawns and renders). */
+  /** soldier | gunner | infantry (unmapped kinds stay present but dormant). */
   kind: MonsterKind | null;
   /** spawnflags & 1: ambush — holds position until it sees the player. */
   ambush: boolean;
@@ -461,13 +486,14 @@ export interface ServerMonster {
 
 /**
  * Map a monster classname onto the lite defs. monster_soldier_light is a
- * soldier with a different skin (SP_monster_soldier_light); infantry and
- * the rest have no lite table yet and map to null (present, not simulated).
+ * soldier with a different skin (SP_monster_soldier_light); infantry maps
+ * onto the INFANTRY lite def (@q2/game monsters.ts).
  */
 export function monsterKindOf(classname: string): MonsterKind | null {
   if (classname === 'monster_soldier' || classname === 'monster_soldier_light') return 'soldier';
   if (classname === 'monster_soldier_ss') return 'soldier';
   if (classname === 'monster_gunner') return 'gunner';
+  if (classname === 'monster_infantry') return 'infantry';
   return null;
 }
 
@@ -1182,9 +1208,13 @@ function stepHullTrace(
 function attackOfMove(kind: MonsterKind, move: string): AttackChoice {
   switch (move) {
     case 'attack1':
-      return 'shotgun';
+      // Soldier attack1 is the shotgun strafe; infantry attack1 is the
+      // machinegun strafe (m_infantry.c attack1 = InfantryMachineGun).
+      return kind === 'infantry' ? 'machinegun' : 'shotgun';
     case 'attack2':
-      return 'blaster';
+      // Soldier attack2 is the blaster/shotgun volley; infantry attack2 is
+      // the melee smack (m_infantry.c attack2 = infantry_smack).
+      return kind === 'infantry' ? 'melee' : 'blaster';
     case 'attack_chain':
     case 'fire_chain':
     case 'endfire_chain':
@@ -1201,8 +1231,8 @@ function attackOfMove(kind: MonsterKind, move: string): AttackChoice {
  * One 10Hz monster tick for every spawned monster (the M7.2 driver runs the
  * same @q2/game primitives in apps/web; this is the server-authoritative
  * equivalent used by tests and headless sims):
- * - triggered (spawnflags & 2) and unmapped (infantry: no lite def) monsters
- *   stay dormant;
+ * - triggered (spawnflags & 2) and unmapped (no lite def) monsters stay
+ *   dormant;
  * - ambush (spawnflags & 1) monsters hold their stand pose until line of
  *   sight latches `seen` — the base1 opener: the start-room soldier waits
  *   until the player rounds the corner, then runs at them. Sight is C
@@ -1212,8 +1242,9 @@ function attackOfMove(kind: MonsterKind, move: string): AttackChoice {
  *   graph; null builds a trivial two-node graph, i.e. straight steering),
  *   monsterLocomotion steps the body with a C SV_movestep stair-climbing
  *   hull trace plus gravity, and monsterThink advances the frame;
- * - every 'fire' frame with line of sight emits a MonsterEvent carrying the
- *   skill damage scale, so drivers land shots on the muzzle flash.
+ * - every 'fire'/'melee' frame with line of sight emits a MonsterEvent
+ *   carrying the skill damage scale, so drivers land shots on the muzzle
+ *   flash (infantry's smack tags 'melee', everything ballistic tags 'fire').
  */
 export interface MonsterTickOpts {
   /** Eye height of the player body (22 standing, 12 ducked, pmove.c). */
@@ -1282,7 +1313,7 @@ export function SV_MonsterTick(
     });
     const playedIdx = ms.frame;
     const action = monsterThink(ms);
-    if (action === 'fire' && canSee) {
+    if ((action === 'fire' || action === 'melee') && canSee) {
       events.push({
         num: m.edict.num,
         classname: m.edict.classname,
@@ -1620,9 +1651,10 @@ function skinOf(m: ServerMonster): number {
 
 /**
  * Spawn a synthetic monster (test hook + devroom synthetics): creates and
- * links the edict, maps the classname onto the lite defs (unmapped kinds
- * stay present but dormant, like the lump path), faces yaw. Seen latches
- * immediately so synthetic bodies act without an acquire walk.
+ * links the edict, maps the classname onto the lite defs (soldier/gunner/
+ * infantry; unmapped kinds stay present but dormant, like the lump path),
+ * faces yaw. Seen latches immediately so synthetic bodies act without an
+ * acquire walk.
  */
 export function SV_SpawnMonster(
   st: ServerState,
@@ -1961,11 +1993,13 @@ function spawnBarrelDebris(
 
 /**
  * Resolve one monster 'fire' frame (m_soldier.c soldier_fire / m_gunner.c
- * GunnerFire+GunnerGrenade): the soldier weapon is skin-determined (never
- * random); blaster skins spawn a real foe bolt, shotgun/machinegun skins
- * draw short yellow muzzle streaks and roll id's pHit, grenades leave the
- * tube only on the C frames, melee commits at close range through the
- * attack move. Every shot carries its enemy muzzle dlight.
+ * GunnerFire+GunnerGrenade / m_infantry.c InfantryMachineGun+infantry_smack):
+ * the soldier weapon is skin-determined (never random); blaster skins spawn
+ * a real foe bolt, shotgun/machinegun skins draw short yellow muzzle
+ * streaks and roll id's pHit, grenades leave the tube only on the C
+ * frames, infantry melee (attack2) resolves the true smack while
+ * soldier/gunner point-blank events resolve as gunfire (their C melee is
+ * NULL). Every shot carries its enemy muzzle dlight.
  */
 function resolveMonsterFire(
   st: ServerState,
@@ -1994,6 +2028,7 @@ function resolveMonsterFire(
     else flashId = MZ2_SOLDIER_SHOTGUN_1;
   } else if (move === 'attack_grenade') flashId = MZ2_GUNNER_GRENADE_1 + (ev.frame % 4);
   else if (m.kind === 'gunner') flashId = MZ2_GUNNER_MACHINEGUN_1 + (ev.frame % 8);
+  else if (m.kind === 'infantry') flashId = MZ2_INFANTRY_MACHINEGUN_1 + (ev.frame % 13);
   const muzzle = projectSource(
     v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]),
     monsterFlashOffset(flashId),
@@ -2024,13 +2059,33 @@ function resolveMonsterFire(
     st.muzzles.splice(flashIdx, 1);
     return;
   }
-  // Melee commits at close range through the attack move.
-  if (dist < 96 && (move === 'attack1' || move === 'attack_chain')) {
-    SV_DamagePlayer(st, m.kind === 'gunner' ? 15 : 10);
-    st.sounds.push({ name: 'monster/melee.wav', pos: chest, born: st.time });
+  // True melee belongs to infantry only (m_infantry.c: attack2 frames into
+  // infantry_smack, fire_hit dmg 5+(rand%5) kick 50, melee2.wav on connect;
+  // the swing (infatck2.wav) plays at the wind-up frame, which the lite sim
+  // collapses into the smack event). Soldier/gunner melee is NULL in C — at
+  // melee range they fire their guns point-blank, so non-infantry events
+  // fall through to the gunfire branches below with the guns' real sounds.
+  if (m.kind === 'infantry' && move === 'attack2') {
+    if (dist < 96) {
+      SV_DamagePlayer(st, infantryMeleeDamage(rand));
+      st.sounds.push({ name: INFANTRY_MELEE_SOUND, pos: chest, born: st.time });
+    }
     return;
   }
   const pHit = dist < 500 ? 0.6 : 0.25;
+  // Infantry machinegun: single bullet per trigger (m_infantry.c
+  // InfantryMachineGun -> monster_fire_bullet dmg 3 kick 4 spread 300/500,
+  // infatck1.wav). The C AI_HOLD_FRAME re-fire across pausetime collapses
+  // to the one lite fire frame, so no 3-round fan like the soldier ss.
+  if (m.kind === 'infantry') {
+    st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
+    st.sounds.push({ name: INFANTRY_GUN_SOUND, pos: chest, born: st.time });
+    if (rand() < pHit) {
+      SV_DamagePlayer(st, INFANTRY_C.bulletDamage);
+      st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
+    }
+    return;
+  }
   // Soldier machinegun skin: 3-round burst (id monster_fire_bullet dmg 2 ×
   // the HOLD_FRAME repeat), fanned ±40u at 8192 like the pellet spread
   // basis; each round rolls pHit independently and draws its own SHORT
@@ -2051,7 +2106,7 @@ function resolveMonsterFire(
   let sound = SOLDIER_WEAPON_STATS.shotgun.sound;
   if (m.kind === 'gunner') {
     dmg = move === 'attack_grenade' ? 12 : 6;
-    sound = move === 'attack_grenade' ? 'gunner/gunatck3.wav' : 'gunner/gunatck2.wav';
+    sound = move === 'attack_grenade' ? GUNNER_GRENADE_SOUND : 'gunner/gunatck2.wav';
   }
   st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
   st.sounds.push({ name: sound, pos: chest, born: st.time });
@@ -2085,6 +2140,19 @@ function stepBoltFlight(
       bolt.pos[2]! + bolt.dir[2]! * stepLen,
     );
     // EF_BLASTER trail (cl_fx.c CL_BlasterTrail): yellow puffs every ~5u.
+    // The wall trace runs FIRST: a SURF_SKY hit (g_weapon.c blaster_touch
+    // sky gate) frees the bolt with no trail, no explosion, no dlight and
+    // no sound — fully silent. Wall hits keep the legacy order (trail puffs
+    // lay down to the impact point, then the flash detonates).
+    let dead = st.time - bolt.born >= bolt.life;
+    const wall = dead ? null : trace(bolt.pos, ZERO_HULL, ZERO_HULL, next);
+    if (!dead && wall && wall.fraction < 1 && traceHitSky(wall)) {
+      dead = true;
+    }
+    if (dead) {
+      st.bolts.splice(i, 1);
+      continue;
+    }
     const trailSteps = Math.min(8, Math.max(1, Math.round(stepLen / 5)));
     for (let k = 1; k <= trailSteps; k++) {
       const f = k / (trailSteps + 1);
@@ -2100,17 +2168,14 @@ function stepBoltFlight(
         born: st.time,
       });
     }
-    let dead = st.time - bolt.born >= bolt.life;
-    if (!dead) {
-      // Wall touch (blaster_touch: sky frees silently, wall explodes).
-      // TODO(sky): the trace carries no SURF_SKY flag, so sky hits explode
-      // here; free the bolt silently once the trace carries the surface flag.
-      const wall = trace(bolt.pos, ZERO_HULL, ZERO_HULL, next);
-      if (wall.fraction < 1) {
+    {
+      // Wall touch (g_weapon.c blaster_touch): everything non-sky detonates
+      // via SV_BlasterImpact.
+      if (wall!.fraction < 1) {
         const hitPos = v3(
-          bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * wall.fraction,
-          bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * wall.fraction,
-          bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * wall.fraction,
+          bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * wall!.fraction,
+          bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * wall!.fraction,
+          bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * wall!.fraction,
         );
         SV_BlasterImpact(st, hitPos, bolt.damage, null, rand);
         dead = true;
@@ -2332,6 +2397,12 @@ export interface SVFireOpts {
   trace: TraceFn;
   /** Caller-seeded RNG (spread, muzzle radius, gibs). */
   rand: () => number;
+  /**
+   * Pre-trigger machinegun burst count (client->machinegun_shots, p_weapon.c
+   * Machinegun_Fire). The driver owns the counter across ticks; default 0
+   * (fresh trigger pull). Ignored for non-machinegun weapons.
+   */
+  machinegunShots?: number;
 }
 
 /** Player fire outcome (ammo sync for the driver's HUD state). */
@@ -2341,6 +2412,16 @@ export interface SVFireResult {
   ammoLeft: number;
   /** True when a player bolt was spawned (authentic fire_blaster). */
   bolt: boolean;
+  /**
+   * Latched post-trigger burst count (C: shots+1 clamped at 9 in SP).
+   * Echoes the input when the weapon is not the machinegun or the trigger
+   * did not fire, so the driver can store it back verbatim.
+   */
+  machinegunShots?: number;
+  /** Per-shot kick_origin (id client->kick_origin), machinegun only. */
+  kickOrigin?: Vec3;
+  /** Per-shot kick_angles (id client->kick_angles), machinegun only. */
+  kickAngles?: Vec3;
 }
 
 /**
@@ -2364,7 +2445,7 @@ export function SV_PlayerFire(
   const res = fireWeapon(def, opts.ammo, opts.rand, false);
   if (!res.fired) {
     st.sounds.push({ name: 'weapons/noammo.wav', pos: v3(opts.eye[0], opts.eye[1], opts.eye[2]), born: st.time });
-    return { fired: false, reason: res.reason, ammoLeft: res.ammoLeft, bolt: false };
+    return { fired: false, reason: res.reason, ammoLeft: res.ammoLeft, bolt: false, machinegunShots: opts.machinegunShots ?? 0 };
   }
   const fwd = v3();
   const right = v3();
@@ -2388,6 +2469,18 @@ export function SV_PlayerFire(
     born: st.time,
     foe: false,
   });
+  // Machinegun per-shot kick walk (p_weapon.c Machinegun_Fire): the driver
+  // owns machinegun_shots across ticks and passes the pre-trigger count in;
+  // the latched count + kick vectors come back for the view/weapon kick.
+  let machinegunShots = opts.machinegunShots ?? 0;
+  let kickOrigin: Vec3 | undefined;
+  let kickAngles: Vec3 | undefined;
+  if (weaponKind === 'weapon_machinegun') {
+    const kick = machinegunKick(machinegunShots, opts.rand);
+    kickOrigin = kick.kickOrigin;
+    kickAngles = kick.kickAngles;
+    machinegunShots = kick.shots;
+  }
   // Authentic blaster: G_ProjectSource from the feet (start = feet +
   // fwd*24 + right*8, z += viewheight-8). The bolt leaves the gun muzzle.
   // Hull-swept spawn (Phase 2): when the muzzle plants inside solid
@@ -2402,7 +2495,7 @@ export function SV_PlayerFire(
     const spawn = resolveBoltSpawn(opts.trace, dir, start);
     if (spawn.embedded) {
       SV_BlasterImpact(st, start, res.bolt.damage, null, opts.rand);
-      return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: false };
+      return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: false, machinegunShots };
     }
     st.bolts.push({
       pos: spawn.pos,
@@ -2413,7 +2506,7 @@ export function SV_PlayerFire(
       foe: false,
       born: st.time,
     });
-    return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: true };
+    return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: true, machinegunShots };
   }
   for (const pl of res.pellets) {
     const dir = v3(
@@ -2479,5 +2572,5 @@ export function SV_PlayerFire(
       });
     }
   }
-  return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: false };
+  return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: false, machinegunShots, kickOrigin, kickAngles };
 }

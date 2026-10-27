@@ -135,6 +135,15 @@ export {
   soldierWeaponForSkin,
   selectSoldierAttack,
   attackFiresBolt,
+  machinegunKick,
+  MACHINEGUN_KICK_MAX_SHOTS,
+  INFANTRY_GUN_SOUND,
+  INFANTRY_SWING_SOUND,
+  INFANTRY_MELEE_SOUND,
+  INFANTRY_COCK_SOUND,
+  GUNNER_GRENADE_SOUND,
+  MONSTER_MELEE_SOUND_ALIAS,
+  infantryMeleeDamage,
   YELLOW_COLOR_BASE,
   YELLOW_COLOR_END,
   GREEN_COLOR_BASE,
@@ -144,6 +153,7 @@ export {
 export type { WeaponDef, Pellet, FireResult, BoltSpec, MuzzleSpec, SoldierSkin } from './weapons.js';
 export type { BoltSpawnResolution } from './weapons.js';
 export type { SoldierWeaponStats, SoldierFireEvent, SoldierFireWeapon } from './weapons.js';
+export type { MachinegunKick } from './weapons.js';
 export {
   MUZZLE_LIGHT_COLOR,
   MUZZLE_LIGHT_INTENSITY,
@@ -171,6 +181,9 @@ export {
   SOLDIER_HP,
   SOLDIER_GIB_HEALTH,
   INFANTRY_C,
+  INFANTRY,
+  INFANTRY_HP,
+  INFANTRY_GIB_HEALTH,
   MONSTER_HULL_MINS,
   MONSTER_HULL_MAXS,
   MONSTER_STEP_HEIGHT,
@@ -225,6 +238,19 @@ export {
   MZ2_SOLDIER_BLASTER_8,
   MZ2_SOLDIER_SHOTGUN_8,
   MZ2_SOLDIER_MACHINEGUN_8,
+  MZ2_INFANTRY_MACHINEGUN_1,
+  MZ2_INFANTRY_MACHINEGUN_2,
+  MZ2_INFANTRY_MACHINEGUN_3,
+  MZ2_INFANTRY_MACHINEGUN_4,
+  MZ2_INFANTRY_MACHINEGUN_5,
+  MZ2_INFANTRY_MACHINEGUN_6,
+  MZ2_INFANTRY_MACHINEGUN_7,
+  MZ2_INFANTRY_MACHINEGUN_8,
+  MZ2_INFANTRY_MACHINEGUN_9,
+  MZ2_INFANTRY_MACHINEGUN_10,
+  MZ2_INFANTRY_MACHINEGUN_11,
+  MZ2_INFANTRY_MACHINEGUN_12,
+  MZ2_INFANTRY_MACHINEGUN_13,
 } from './m_flash.js';
 export { findPath, isReachable, nearestNode } from './pathfind.js';
 export type { PortalGraph } from './pathfind.js';
@@ -311,6 +337,8 @@ export {
   bspTraceFor,
   bspContentsFor,
   mapBspContents,
+  traceHitSky,
+  SURF_SKY,
   setPmoveWorldFromBsp,
   resetPmoveWorld as resetPmoveWorldFromBsp,
   BSP_CONTENTS_WATER,

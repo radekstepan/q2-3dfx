@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { setCVar, getCVarString } from '@q2/config';
-import { stringWidth } from '@q2/client';
 import {
   applyBrightness,
   bootPlay,
@@ -29,15 +28,13 @@ function meanRGB(buf: Uint32Array): number {
 }
 
 describe('display path (fps anchor, brightness, cvar controls)', () => {
-  it('fpsHudAnchor is a pure top-right helper', () => {
+  it('fpsHudAnchor is a pure top-left helper (never over the controls panel)', () => {
     const text = 'fps 60';
     const a = fpsHudAnchor(160, text);
-    expect(a.y).toBe(8);
-    expect(a.x).toBe(160 - stringWidth(text) - 8);
-    expect(a.x).toBeGreaterThan(80);
-    // Tiny screens clamp instead of going negative.
-    expect(fpsHudAnchor(40, text).x).toBe(0);
-    // Same text, same anchor (pure, font-metric driven).
+    expect(a).toEqual({ x: 8, y: 8 });
+    // Tiny screens clamp the same way (still top-left, never negative).
+    expect(fpsHudAnchor(40, text)).toEqual({ x: 8, y: 8 });
+    // Same input, same anchor (pure).
     expect(fpsHudAnchor(160, text)).toEqual(a);
   });
 
@@ -45,20 +42,27 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
     expect(FPS_GREEN).toBe(0xff00ff00);
   });
 
-  it('canvas never draws fps text (the DOM overlay is the fps counter)', () => {
+  it('canvas draws the fps text top-left in-view when enabled (no DOM overlay)', () => {
     const boot = bootPlay({ width: 160, height: 120 });
-    // Old behaviour drew `fps N` green top-right in-canvas; the clutter fix
-    // removed it (fps already shows in the DOM #q2-fps overlay). Both
-    // cl_showfps states must leave the canvas fps-free.
-    for (const v of [0, 1]) {
+    // Enabled: the in-canvas HUD owns the counter (top-left, FPS_GREEN).
+    for (const v of [1]) {
       setCVar('cl_showfps', v);
       try {
         const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
         drawPlayHud(target, boot, { fps: 60, frame: 1 });
-        expect(target.color.some((c) => c === FPS_GREEN)).toBe(false);
+        expect(target.color.some((c) => c === FPS_GREEN)).toBe(true);
       } finally {
         setCVar('cl_showfps', 1);
       }
+    }
+    // Gated: the canvas stays fps-free.
+    setCVar('cl_showfps', 0);
+    try {
+      const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
+      drawPlayHud(target, boot, { fps: 60, frame: 1 });
+      expect(target.color.some((c) => c === FPS_GREEN)).toBe(false);
+    } finally {
+      setCVar('cl_showfps', 1);
     }
   });
 

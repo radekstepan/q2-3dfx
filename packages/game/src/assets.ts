@@ -16,10 +16,11 @@
 import type { MonsterKind } from './monsters.js';
 import { monsterDef } from './monsters.js';
 
-/** Pak model lump for each lite monster (m_soldier.c / m_gunner.c). */
+/** Pak model lump for each lite monster (m_soldier.c / m_gunner.c / m_infantry.c). */
 export const MONSTER_MODELS: Record<MonsterKind, string> = {
   soldier: 'models/monsters/soldier/tris.md2',
   gunner: 'models/monsters/gunner/tris.md2',
+  infantry: 'models/monsters/infantry/tris.md2',
 };
 
 /** Pak skin lumps per monster. `default` is skin 0; soldier variants and
@@ -43,6 +44,11 @@ export const MONSTER_SKINS: Record<MonsterKind, { default: string; pain: string;
     default: 'models/monsters/gunner/skin.pcx',
     pain: 'models/monsters/gunner/pain.pcx',
     variants: ['models/monsters/gunner/skin.pcx', 'models/monsters/gunner/pain.pcx'],
+  },
+  infantry: {
+    default: 'models/monsters/infantry/skin.pcx',
+    pain: 'models/monsters/infantry/pain.pcx',
+    variants: ['models/monsters/infantry/skin.pcx', 'models/monsters/infantry/pain.pcx'],
   },
 };
 
@@ -100,6 +106,7 @@ export function monsterFrameFor(kind: MonsterKind, move: string): number | null 
 export function monsterKindForClassname(classname: string): MonsterKind | null {
   if (classname === 'monster_soldier') return 'soldier';
   if (classname === 'monster_gunner') return 'gunner';
+  if (classname === 'monster_infantry') return 'infantry';
   return null;
 }
 

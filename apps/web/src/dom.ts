@@ -214,10 +214,12 @@ export function cvarOptionLabels(name: string): readonly string[] | null {
 /**
  * Cvars that reboot the level when changed (latched in id, immediate here):
  * skill re-calls the boot path with SV_SetSkill applied before spawning,
- * vid_resolution reboots at the new framebuffer size. The browser boot
- * listens via renderCvarPanel's onChange and calls rebootPlay.
+ * vid_resolution reboots at the new framebuffer size. vid_renderer is NOT
+ * here: it hot-swaps in place (applyRendererCvar) without rebuilding
+ * Host/LocalDriver/server state. The browser boot listens via
+ * renderCvarPanel's onChange and calls rebootPlay.
  */
-export const REBOOT_CVARS: ReadonlySet<string> = new Set(['skill', 'vid_resolution', 'map_source', 'vid_renderer']);
+export const REBOOT_CVARS: ReadonlySet<string> = new Set(['skill', 'vid_resolution', 'map_source']);
 
 /** True when changing this cvar reboots the level (skill, vid_resolution). */
 export function cvarNeedsReboot(name: string): boolean {
@@ -546,7 +548,6 @@ export function startPlayLoop(
   let lastT = -1;
   let fps = 60;
   let frame = 0;
-  let lastOverlayMs = -Infinity;
   const tick = (nowMs: number): void => {
     if (stopped) return;
     if (lastT >= 0) {
@@ -566,16 +567,9 @@ export function startPlayLoop(
       { fps, frame: frame++ },
     );
     blitToCanvas(el, { ...host.fb, color: target });
-    // DOM overlay mirror of the in-canvas `fps N` (throttled to ~4Hz so
-    // text updates never cause layout thrash). Gated by `cl_showfps`.
-    if (nowMs - lastOverlayMs >= 250) {
-      lastOverlayMs = nowMs;
-      try {
-        updateFpsOverlay(document.getElementById('q2-fps'), fps, showFpsEnabled());
-      } catch {
-        /* DOM unavailable mid-teardown */
-      }
-    }
+    // No DOM fps overlay: the in-canvas HUD (drawPlayHud `fps N`, gated by
+    // cl_showfps) is the only counter, so nothing ever covers the controls
+    // panel.
     // Per-channel positional audio: Mixer.mix() gains drive real nodes.
     // The driver already set the listener + started channels in step().
     if (sound) syncMixerToBrowser(sound, driver.mixer);

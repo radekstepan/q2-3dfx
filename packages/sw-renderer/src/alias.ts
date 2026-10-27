@@ -342,6 +342,13 @@ export interface AliasInstance {
    * always uses the true 1/vz — only the depth value is scaled.
    */
   depthScale?: number;
+  /**
+   * Translucency 0..1 (Entity.alpha; default 1 = opaque). Implemented as
+   * deterministic 4x4 Bayer screen-door: pixels whose threshold exceeds
+   * alpha are skipped, so fading explosions read as translucent on the
+   * 8-bit path without any blending pass. Values clamp to [0,1].
+   */
+  alpha?: number;
 }
 
 /**
@@ -425,6 +432,9 @@ export function drawAliasInstance(
   void anorms;
   const row = (inst.lightAngle & 255) * ANORM_COUNT;
   const depthScale = inst.depthScale ?? 1;
+  const alpha = inst.alpha;
+  // Fully transparent: no pixels, no depth writes (freed-sky style fade).
+  if (alpha !== undefined && alpha <= 0) return 0;
   // Hoisted: identical for every vert of this instance (was recomputed
   // per vert with the same result).
   const shadeFrame = t < 0.5 ? inst.frameA : inst.frameB;
@@ -465,7 +475,7 @@ export function drawAliasInstance(
         v.v = clipIV[k]!;
         v.grade = clipIG[k]!;
       }
-      pixels += fillAffineTri(idx, zb, fbW, fbH, tv[0]!, tv[1]!, tv[2]!, skin, colormap);
+      pixels += fillAffineTri(idx, zb, fbW, fbH, tv[0]!, tv[1]!, tv[2]!, skin, colormap, alpha);
       continue;
     }
     // Straddler: Sutherland clip the view-space polygon at vz = near
@@ -486,15 +496,45 @@ export function drawAliasInstance(
       c.grade = clipOG[k]!;
     }
     pixels += fillAffineTri(idx, zb, fbW, fbH,
-      aliasClipped[0]!, aliasClipped[1]!, aliasClipped[2]!, skin, colormap);
+      aliasClipped[0]!, aliasClipped[1]!, aliasClipped[2]!, skin, colormap, alpha);
     if (m === 4) {
       pixels += fillAffineTri(idx, zb, fbW, fbH,
-        aliasClipped[0]!, aliasClipped[2]!, aliasClipped[3]!, skin, colormap);
+        aliasClipped[0]!, aliasClipped[2]!, aliasClipped[3]!, skin, colormap, alpha);
     }
   }
   return pixels;
 }
 
+/**
+ * Clamp an RF_FRAMELERP blend to [0,1]; non-finite -> 0 (no lerp).
+ * Pure helper so the frame path and tests share one rule.
+ */
+export function clampBacklerp(t: number | undefined): number {
+  if (!Number.isFinite(t as number)) return 0;
+  const v = t as number;
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** 4x4 Bayer threshold matrix (row-major), scaled to [0,1). */
+const BAYER4 = new Float32Array([
+  0 / 16, 8 / 16, 2 / 16, 10 / 16,
+  12 / 16, 4 / 16, 14 / 16, 6 / 16,
+  3 / 16, 11 / 16, 1 / 16, 9 / 16,
+  15 / 16, 7 / 16, 13 / 16, 5 / 16,
+]);
+
+/**
+ * Screen-door keep test for alias translucency (Entity.alpha): opaque when
+ * alpha >= 1 (or unset/non-finite), fully skipped when alpha <= 0, else keep
+ * the pixel when its 4x4 Bayer threshold is below alpha. Pure + deterministic.
+ */
+export function aliasAlphaKeeps(x: number, y: number, alpha: number | undefined): boolean {
+  if (alpha === undefined) return true;
+  if (!Number.isFinite(alpha) || alpha >= 1) return true;
+  if (alpha <= 0) return false;
+  const t = BAYER4[((y & 3) << 2) + (x & 3)]!;
+  return t < alpha;
+}
 let aliasScratchX = new Float32Array(4096);
 let aliasScratchY = new Float32Array(4096);
 let aliasScratchZ = new Float32Array(4096);
@@ -579,7 +619,11 @@ function clipPolyNear(near: number): number {
   return m;
 }
 
-/** Affine triangle filler: linear u/v/grade in screen space, 1/z depth test. */
+/** Affine triangle filler: linear u/v/grade in screen space, 1/z depth test.
+ * Optional `alpha` (Entity.alpha, default opaque): deterministic 4x4 Bayer
+ * screen-door — pixels whose threshold exceeds alpha are skipped entirely
+ * (no depth write), so fading explosions read as translucent. Opaque fast
+ * path (alpha undefined or >= 1) is bit-identical to the old filler. */
 export function fillAffineTri(
   idx: Uint8Array,
   zb: Float32Array,
@@ -588,10 +632,13 @@ export function fillAffineTri(
   a: TriVert, b: TriVert, c: TriVert,
   skin: AliasSkin,
   colormap: Uint8Array,
+  alpha?: number,
 ): number {
   // backface cull (screen-space winding)
   const area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
   if (area <= 0) return 0;
+  if (alpha !== undefined && alpha <= 0) return 0;
+  const translucent = alpha !== undefined && Number.isFinite(alpha) && (alpha as number) < 1;
   const wmask = skin.width - 1, hmask = skin.height - 1;
   const wshift = Math.round(Math.log2(skin.width));
   let minY = Math.max(0, Math.ceil(Math.min(a.y, b.y, c.y) - 0.5));
@@ -617,6 +664,8 @@ export function fillAffineTri(
     const x0 = Math.max(0, Math.ceil(xa - 0.5));
     const x1 = Math.min(fbW - 1, Math.floor(xb - 0.5));
     for (let x = x0; x <= x1; x++) {
+      // Screen-door translucency: skip (no depth write) before barycentric.
+      if (translucent && !aliasAlphaKeeps(x, y, alpha)) continue;
       const xc = x + 0.5;
       // barycentric
       const w0 = ((b.x - xc) * (c.y - yc) - (c.x - xc) * (b.y - yc)) * inv;

@@ -4,7 +4,7 @@
 // auto-boot below additionally wires canvas, drop zone, loop + HUD.
 import { setCVarFromString } from '@q2/config';
 import { bootToFirstFrame } from './devroom.js';
-import { bootPlay, getMapSource } from './play.js';
+import { applyRendererCvar, bootPlay, getMapSource } from './play.js';
 import type { PlayBoot, RendererKind } from './play.js';
 import { pakHasMaps } from './pak.js';
 import type { WebPak } from './pak.js';
@@ -18,7 +18,7 @@ export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
 export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';export { blitToCanvas, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, formatFps, updateFpsOverlay, showFpsEnabled, cvarOptions, cvarControlKind, cvarOptionLabels, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, MAP_SOURCE_LABELS, setMapSourceHasPak, getMapSourceHasPak, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS } from './dom.js';
 export type { PlayLoop } from './dom.js';
-export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpTracers, registerPakModels, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
+export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpTracers, registerPakModels, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, fpsVisible, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, applyRendererCvar, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
 export type { PakModelHandles, TracerBeam } from './play.js';
 
 export interface BootOptions {
@@ -72,6 +72,7 @@ if (typeof document !== 'undefined') {
     const progress = document.querySelector('#q2-progress');
     const cvars = document.querySelector('#q2-cvars');
     let current: { stop(): void } | null = null;
+    let currentBoot: PlayBoot | null = null;
     let lastPak: WebPak | null = null;
     let lastName: string | undefined;
     const startWithPak = (pak: WebPak | null, name?: string): void => {
@@ -89,6 +90,7 @@ if (typeof document !== 'undefined') {
       // fresh boot: SV_SetSkill before spawning, framebuffer at the menu
       // size), so the panel below needs no explicit size arguments.
       const boot = bootPlay({ pak: effective });
+      currentBoot = boot;
       current = dom.startPlayLoop(canvas, boot, { pak: effective });
       dom.setProgress(
         progress,
@@ -98,9 +100,16 @@ if (typeof document !== 'undefined') {
     };
     // Skill/resolution/map-source changes reboot the level at once (id
     // latches them; the menu applies them immediately by re-calling the
-    // boot path).
+    // boot path). vid_renderer hot-swaps in place instead: the resolve
+    // path reads the cvar every frame, so only the latched choice needs
+    // updating — Host/LocalDriver/server state (pos/hp/ammo/monsters)
+    // survives the switch.
     const onCvar = (cvarName: string): void => {
       dom.savePersistedCVars();
+      if (cvarName === 'vid_renderer') {
+        if (currentBoot) applyRendererCvar(currentBoot);
+        return;
+      }
       if (!dom.cvarNeedsReboot(cvarName)) return;
       startWithPak(lastPak, lastName);
     };

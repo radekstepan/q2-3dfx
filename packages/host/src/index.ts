@@ -94,6 +94,12 @@ export interface ExtraRenderable {
   model?: number;
   skin?: number;
   frame?: number;
+  /** RF_FRAMELERP previous frame (explosion smoothing); defaults to frame. */
+  oldframe?: number;
+  /** RF_FRAMELERP blend 0..1 (1 = fully oldframe); defaults to 0. */
+  backlerp?: number;
+  /** Translucency 0..1 (1 = opaque); defaults to 1. */
+  alpha?: number;
 }
 
 /**
@@ -329,6 +335,9 @@ export class Host {
           angles: new Float32Array(x.angles ?? [0, 0, 0]) as Entity['angles'],
           frame: x.frame ?? 0,
           skin: x.skin ?? 0,
+          ...(x.oldframe !== undefined ? { oldframe: x.oldframe } : {}),
+          ...(x.backlerp !== undefined ? { backlerp: x.backlerp } : {}),
+          ...(x.alpha !== undefined ? { alpha: x.alpha } : {}),
         });
       }
     }

@@ -13,6 +13,9 @@ import { asBspMap } from './pvs.js';
 
 export const DIST_EPSILON = 0.03125;
 
+/** id surface flag: don't draw, but add to skybox (game/q_shared.h). */
+export const SURF_SKY = 0x4;
+
 /** Swept-box trace result. First five fields are the frozen §6 contract. */
 export interface Trace {
   fraction: number;
@@ -24,6 +27,14 @@ export interface Trace {
   startsolid: boolean;
   allsolid: boolean;
   planeDist: number;
+  /**
+   * Surface flags of the hit brushside's texinfo (q_shared.h SURF_* bits,
+   * e.g. SURF_SKY) — the C trace_t.surface->flags equivalent
+   * (qcommon/cmodel.c CM_ClipBoxToBrush records the lead side's surface).
+   * Additive optional field: 0/absent when the trace never hit a brush
+   * (position tests and clean misses carry no surface, like C).
+   */
+  surfaceFlags?: number;
 }
 
 function v3(x = 0, y = 0, z = 0): Vec3 {
@@ -79,6 +90,8 @@ interface TraceCtx {
   planeNormal: Vec3;
   planeDist: number;
   brushContents: number;
+  /** Texinfo flags of the lead hit side (SURF_* bits); 0 when no hit yet. */
+  surfaceFlags: number;
   startsolid: boolean;
   allsolid: boolean;
   check: CheckState;
@@ -151,6 +164,18 @@ function clipBoxToBrush(ctx: TraceCtx, brushNum: number): void {
     ]) as Vec3;
     ctx.planeDist = w.planes[clipPlane * 4 + 3]!;
     ctx.brushContents = contents;
+    // C records trace->surface from the lead brushside's texinfo here
+    // (surf->flags carries SURF_SKY for sky brushes). This ctx doesn't
+    // track the lead side, so resolve it by plane: the first side of this
+    // brush on the clip plane. Coplanar sides with different texinfos on
+    // one plane are rare (sky vs solid never share a brush); first wins.
+    for (let i = 0; i < numsides; i++) {
+      const s = (first + i) * BRUSHSIDE_STRIDE;
+      if (w.brushsides[s]! === clipPlane) {
+        ctx.surfaceFlags = w.texinfoFlags[w.brushsides[s + 1]!] ?? 0;
+        break;
+      }
+    }
   }
 }
 
@@ -335,12 +360,13 @@ export function traceBox(world: Bsp38, start: Vec3, end: Vec3, mins: Vec3, maxs:
       startsolid: ctx ? ctx.startsolid : false,
       allsolid: ctx ? ctx.allsolid : false,
       planeDist: ctx ? ctx.planeDist : 0,
+      surfaceFlags: ctx ? ctx.surfaceFlags : 0,
     };
   };
 
   if (nNodes === 0) {
     endpos[0] = end[0]!; endpos[1] = end[1]!; endpos[2] = end[2]!;
-    return { fraction: 1, endpos, planeNormal: v3(), contents: 0, entityNum: 0, startsolid: false, allsolid: false, planeDist: 0 };
+    return { fraction: 1, endpos, planeNormal: v3(), contents: 0, entityNum: 0, startsolid: false, allsolid: false, planeDist: 0, surfaceFlags: 0 };
   }
 
   const headnode = w.modelsExtra.length >= 3 ? w.modelsExtra[0]! : 0;
@@ -353,6 +379,7 @@ export function traceBox(world: Bsp38, start: Vec3, end: Vec3, mins: Vec3, maxs:
     planeNormal: v3(),
     planeDist: 0,
     brushContents: 0,
+    surfaceFlags: 0,
     startsolid: false,
     allsolid: false,
     check: checkStateFor(w),
@@ -373,6 +400,7 @@ export function traceBox(world: Bsp38, start: Vec3, end: Vec3, mins: Vec3, maxs:
       fraction: ctx.fraction, endpos, planeNormal: ctx.planeNormal,
       contents: ctx.brushContents, entityNum: 0,
       startsolid: ctx.startsolid, allsolid: ctx.allsolid, planeDist: ctx.planeDist,
+      surfaceFlags: ctx.surfaceFlags,
     };
   }
 

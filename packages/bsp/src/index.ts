@@ -11,5 +11,5 @@ export {
   MODEL_EXTRA_STRIDE, AREA_STRIDE, AREAPORTAL_STRIDE,
 } from './bsp38.js';
 export { clusterPVS, decompressVis } from './pvs.js';
-export { traceBox, pointLeaf, DIST_EPSILON } from './trace.js';
+export { traceBox, pointLeaf, DIST_EPSILON, SURF_SKY } from './trace.js';
 export type { Trace } from './trace.js';

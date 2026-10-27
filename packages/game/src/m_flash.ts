@@ -48,6 +48,19 @@ export const MZ2_SOLDIER_MACHINEGUN_7 = 97;
 export const MZ2_SOLDIER_BLASTER_8 = 98;
 export const MZ2_SOLDIER_SHOTGUN_8 = 99;
 export const MZ2_SOLDIER_MACHINEGUN_8 = 100;
+export const MZ2_INFANTRY_MACHINEGUN_1 = 26;
+export const MZ2_INFANTRY_MACHINEGUN_2 = 27;
+export const MZ2_INFANTRY_MACHINEGUN_3 = 28;
+export const MZ2_INFANTRY_MACHINEGUN_4 = 29;
+export const MZ2_INFANTRY_MACHINEGUN_5 = 30;
+export const MZ2_INFANTRY_MACHINEGUN_6 = 31;
+export const MZ2_INFANTRY_MACHINEGUN_7 = 32;
+export const MZ2_INFANTRY_MACHINEGUN_8 = 33;
+export const MZ2_INFANTRY_MACHINEGUN_9 = 34;
+export const MZ2_INFANTRY_MACHINEGUN_10 = 35;
+export const MZ2_INFANTRY_MACHINEGUN_11 = 36;
+export const MZ2_INFANTRY_MACHINEGUN_12 = 37;
+export const MZ2_INFANTRY_MACHINEGUN_13 = 38;
 
 /** soldier/gunner slices of m_flash.c monster_flash_offset[] (id values). */
 const FLASH_OFFSETS: Record<number, [number, number, number]> = {
@@ -87,6 +100,21 @@ const FLASH_OFFSETS: Record<number, [number, number, number]> = {
   [MZ2_SOLDIER_BLASTER_8]: [31.5 * 1.2, 9.6 * 1.2, 10.1 * 1.2],
   [MZ2_SOLDIER_SHOTGUN_8]: [34.5 * 1.2, 9.6 * 1.2, 6.1 * 1.2],
   [MZ2_SOLDIER_MACHINEGUN_8]: [34.5 * 1.2, 9.6 * 1.2, 6.1 * 1.2],
+  // Infantry rows are raw (no *1.2 bake — only the soldier rows carry the
+  // MODEL_SCALE factor in the C table).
+  [MZ2_INFANTRY_MACHINEGUN_1]: [26.6, 7.1, 13.1],
+  [MZ2_INFANTRY_MACHINEGUN_2]: [18.2, 7.5, 15.4],
+  [MZ2_INFANTRY_MACHINEGUN_3]: [17.2, 10.3, 17.9],
+  [MZ2_INFANTRY_MACHINEGUN_4]: [17.0, 12.8, 20.1],
+  [MZ2_INFANTRY_MACHINEGUN_5]: [15.1, 14.1, 21.8],
+  [MZ2_INFANTRY_MACHINEGUN_6]: [11.8, 17.2, 23.1],
+  [MZ2_INFANTRY_MACHINEGUN_7]: [11.4, 20.2, 21.0],
+  [MZ2_INFANTRY_MACHINEGUN_8]: [9.0, 23.0, 18.9],
+  [MZ2_INFANTRY_MACHINEGUN_9]: [13.9, 18.6, 17.7],
+  [MZ2_INFANTRY_MACHINEGUN_10]: [15.4, 15.6, 15.8],
+  [MZ2_INFANTRY_MACHINEGUN_11]: [10.2, 15.2, 25.1],
+  [MZ2_INFANTRY_MACHINEGUN_12]: [-1.9, 15.1, 28.2],
+  [MZ2_INFANTRY_MACHINEGUN_13]: [-12.4, 13.0, 20.2],
 };
 
 /**

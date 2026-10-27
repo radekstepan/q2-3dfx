@@ -150,10 +150,12 @@ export const GUNNER: MonsterDef = {
   },
 };
 
-export type MonsterKind = 'soldier' | 'gunner';
+export type MonsterKind = 'soldier' | 'gunner' | 'infantry';
 
 export function monsterDef(kind: MonsterKind): MonsterDef {
-  return kind === 'soldier' ? SOLDIER : GUNNER;
+  if (kind === 'soldier') return SOLDIER;
+  if (kind === 'gunner') return GUNNER;
+  return INFANTRY;
 }
 
 export interface MonsterState {
@@ -232,10 +234,9 @@ export function monsterYawTo(from: Vec3, to: Vec3): number {
   return yaw;
 }
 
-/** id's yaw_speed per kind (m_soldier.c / m_gunner.c SP_ funcs): degrees of
- * M_ChangeYaw turn applied per 10Hz tick (the clamp is per call, not per
- * second — M_ChangeYaw runs once per frame). */
-export const MONSTER_YAW_SPEED: Record<MonsterKind, number> = { soldier: 20, gunner: 20 };
+/** id's yaw_speed per kind (m_soldier.c / m_gunner.c SP_ funcs; infantry
+ * inherits walkmonster_start's default 20 — m_infantry.c sets none). */
+export const MONSTER_YAW_SPEED: Record<MonsterKind, number> = { soldier: 20, gunner: 20, infantry: 20 };
 
 // --- C damage/HP tables (Phase 2 audit: m_soldier.c SP_ funcs, m_infantry.c) --
 //
@@ -266,10 +267,8 @@ export function soldierHealthForSkin(skin: number): number {
 }
 
 /**
- * C infantry tables (m_infantry.c SP_monster_infantry) as pure data. There
- * is no INFANTRY lite def yet (still open: infantry stays present-but-
- * dormant in the sim), so both lanes pin the C numbers here and converge on
- * them when the sim lands: 100hp / gib -40 / mass 200, ranged
+ * C infantry tables (m_infantry.c SP_monster_infantry) as pure data, now
+ * backed by the INFANTRY lite def below: 100hp / gib -40 / mass 200, ranged
  * monster_fire_bullet dmg 3 kick 4 spread 300/500 (m_infantry.c
  * InfantryMachineGun), melee fire_hit dmg 5+(rand%5) kick 50
  * (m_infantry.c infantry_smack).
@@ -298,6 +297,61 @@ export const INFANTRY_C: InfantryCStats = {
   meleeDamageMin: 5,
   meleeDamageMax: 9,
   meleeKick: 50,
+};
+
+/** C spawn HP (m_infantry.c SP_monster_infantry: no skin classes, all 100). */
+export const INFANTRY_HP = 100;
+/** C gib health shared by all infantry (m_infantry.c). */
+export const INFANTRY_GIB_HEALTH = -40;
+
+/**
+ * Build a move with per-frame action tags (id mframe_t func slots, data-only).
+ * `tags[i]` overrides frame i's action; untagged frames are plain 'move'.
+ */
+function taggedMove(
+  name: string,
+  first: number,
+  dists: number[],
+  end: string,
+  tags: Record<number, string>,
+): MonsterMove {
+  return {
+    name,
+    first,
+    last: first + dists.length - 1,
+    frames: dists.map((dist, i) => ({ dist, action: tags[i] ?? 'move' })),
+    end,
+  };
+}
+
+// Frame numbers are id's MD2 FRAME_* constants (m_infantry.h), dists are
+// the per-frame ai_stand/ai_walk/ai_run/ai_charge/ai_move values from
+// m_infantry.c (MD2 has 206 frames: gun02=0 … attak208=206).
+//
+// Attack fire tags: attack1 (FRAME_attak101-115, the machinegun) fires via
+// infantry_fire at its 11th frame (attak111 = InfantryMachineGun single
+// bullet; the C AI_HOLD_FRAME re-fire across pausetime collapses to this
+// one lite event); attack2 (FRAME_attak201-208, the melee) swings at frame
+// 3 (infantry_swing) and smacks at frame 6 (infantry_smack 5+(rand%5)
+// kick 50 — the 'melee' tag is what resolveMonsterFire keys off).
+export const INFANTRY: MonsterDef = {
+  classname: 'monster_infantry',
+  health: INFANTRY_HP,
+  gibHealth: INFANTRY_GIB_HEALTH,
+  mass: 200,
+  moves: {
+    stand: mv('stand', 50, new Array(22).fill(0), 'stand'),
+    walk: mv('walk', 74, [5, 4, 4, 5, 4, 5, 6, 4, 4, 4, 4, 5], 'walk'),
+    run: mv('run', 92, [10, 20, 5, 7, 30, 35, 2, 6], 'run'),
+    pain1: mv('pain1', 100, [-3, -2, -1, -2, -1, 1, -1, 1, 6, 2], 'run'),
+    pain2: mv('pain2', 110, [-3, -3, 0, -1, -2, 0, 0, 2, 5, 2], 'run'),
+    duck: mv('duck', 120, [-2, -5, 3, 4, 0], 'run'),
+    death1: mv('death1', 125, [-4, 0, 0, -1, -4, 0, 0, 0, -1, 3, 1, 1, -2, 2, 2, 9, 9, 5, -3, -3], 'dead'),
+    death2: mv('death2', 145, [0, 1, 5, -1, 0, 1, 1, 4, 3, 0, -2, -2, -3, -1, -2, 0, 2, 2, 3, -10, -7, -8, -6, 4, 0], 'dead'),
+    death3: mv('death3', 170, [0, 0, 0, -6, -11, -3, -11, 0, 0], 'dead'),
+    attack1: taggedMove('attack1', 184, [4, -1, -1, 0, -1, 1, 1, 2, -2, -3, 1, 5, -1, -2, -3], 'run', { 10: 'fire' }),
+    attack2: taggedMove('attack2', 199, [3, 6, 0, 8, 5, 8, 6, 3], 'run', { 5: 'melee' }),
+  },
 };
 
 /**
@@ -454,13 +508,27 @@ export function monsterPain(ms: MonsterState, damage: number, rand: () => number
   if (ms.dead) return 'dead';
   if (ms.health <= 0) {
     ms.dead = true;
-    ms.move = ms.kind === 'soldier' ? 'death1' : 'death';
+    // id infantry_die: n = rand() % 3 across the three death moves;
+    // soldier/gunner lite sims hold one death move each.
+    if (ms.kind === 'infantry') {
+      const pick = Math.floor(rand() * 3) % 3;
+      ms.move = pick === 0 ? 'death1' : pick === 1 ? 'death2' : 'death3';
+    } else {
+      ms.move = ms.kind === 'soldier' ? 'death1' : 'death';
+    }
     ms.frame = 0;
     return 'dead';
   }
-  // id skips pain anims probabilistically; keep deterministic via caller rng
+  // id skips pain anims probabilistically; keep deterministic via caller rng.
+  // (C infantry_pain also suppresses pain anims entirely at skill 3
+  // nightmare; the lite sim has no skill input, so aggression scaling stays
+  // a documented deviation — see selectAttack.)
   if (rand() < 0.4) {
-    ms.move = ms.kind === 'soldier' ? (rand() < 0.5 ? 'pain1' : 'pain2') : 'pain1';
+    if (ms.kind === 'infantry') {
+      ms.move = Math.floor(rand() * 2) === 0 ? 'pain1' : 'pain2';
+    } else {
+      ms.move = ms.kind === 'soldier' ? (rand() < 0.5 ? 'pain1' : 'pain2') : 'pain1';
+    }
     ms.frame = 0;
   }
   return 'pain';
@@ -469,14 +537,20 @@ export function monsterPain(ms: MonsterState, damage: number, rand: () => number
 export type AttackChoice = 'melee' | 'shotgun' | 'blaster' | 'machinegun' | 'chaingun' | 'grenade' | 'none';
 
 /**
- * Melee/ranged selection by range, mirroring soldier_attack/gunner_attack:
- * melee distance -> melee; near/mid -> weapon fire; far -> close in (none).
+ * Melee/ranged selection by range. Soldier picks its skin weapon at
+ * near/mid (see selectSoldierAttack); gunner sprays or lobs (the lite
+ * caller handles LOS for grenades); infantry (m_infantry.c infantry_attack)
+ * commits to the melee move in melee range, else the machinegun strafe.
  */
 export function selectAttack(kind: MonsterKind, dist: number, rand: () => number): AttackChoice {
   const r = monsterRange(dist);
   if (r === RANGE_MELEE) return 'melee';
   if (kind === 'soldier') {
     if (r === RANGE_NEAR || r === RANGE_MID) return rand() < 0.5 ? 'shotgun' : 'blaster';
+    return 'none';
+  }
+  if (kind === 'infantry') {
+    if (r === RANGE_NEAR || r === RANGE_MID) return 'machinegun';
     return 'none';
   }
   // gunner: grenade at mid without line-of-sight handled by caller; chain otherwise
@@ -513,6 +587,19 @@ export interface ChaseResult {
  * the foe bolt on attack2; server attackOfMove maps attack1 -> shotgun).
  * It must never be attack2 — the bolt move. */
 export function attackMoveFor(kind: MonsterKind, choice: AttackChoice): string {
+  // Infantry attack mapping (m_infantry.c infantry_attack): melee commits
+  // to attack2 (the smack), everything ballistic plays the attack1
+  // machinegun strafe.
+  if (kind === 'infantry') {
+    switch (choice) {
+      case 'melee':
+        return 'attack2';
+      case 'none':
+        return 'run';
+      default:
+        return 'attack1';
+    }
+  }
   switch (choice) {
     case 'shotgun':
       return 'attack1';

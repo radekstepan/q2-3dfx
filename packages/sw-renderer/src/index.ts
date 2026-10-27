@@ -79,6 +79,7 @@ export {
   isMd2Data, md2ToAliasMesh,
   MD2_CONVERT_MAX_TRIS, MD2_CONVERT_MAX_VERTS, MD2_CONVERT_MAX_FRAMES,
   drawAliasInstance, fillAffineTri, DEPTHHACK_SCALE,
+  clampBacklerp, aliasAlphaKeeps,
   type AliasMesh, type AliasInstance, type AliasSkin, type Md2Like,
 } from './alias.js';
 

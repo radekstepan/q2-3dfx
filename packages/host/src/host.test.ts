@@ -354,3 +354,35 @@ describe('host loop', () => {
     expect(stats.spans).toBe(0);
   });
 });
+
+describe('extraEntities RF_FRAMELERP/alpha forwarding', () => {
+  it('forwards oldframe/backlerp/alpha when set, omits when unset', () => {
+    const snap = (t: number) => ({
+      serverTime: t,
+      entities: [{ id: 1, origin: [0, 0, 32] as [number, number, number], velocity: [0, 0, 0] as [number, number, number] }],
+    });
+    const withExtras: HostDriver = {
+      spawn: () => ({ origin: [0, 0, 0] }),
+      step: () => {},
+      snapshot: snap,
+      extraEntities: () => [
+        { origin: [1, 2, 3], model: 5, skin: 6, frame: 7, oldframe: 6, backlerp: 0.5, alpha: 0.25 },
+        { origin: [4, 5, 6] },
+      ],
+    };
+    const refresh = new CaptureRefresh();
+    const host = new Host({ refresh, width: 64, height: 48, driver: withExtras });
+    host.ingestSnapshot({ serverTime: 1.0, entities: [{ id: 1, origin: [0, 0, 32], velocity: [0, 0, 0] }] });
+    host.lastCmd = { msec: 16, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
+    host.renderCurrentView();
+    const boom = refresh.lastEntities!.find((e) => e.origin[0] === 1)!;
+    expect(boom.oldframe).toBe(6);
+    expect(boom.backlerp).toBe(0.5);
+    expect(boom.alpha).toBe(0.25);
+    // Legacy extras stay unlerped + opaque (fields omitted, not zeroed).
+    const plain = refresh.lastEntities!.find((e) => e.origin[0] === 4)!;
+    expect(plain.oldframe).toBeUndefined();
+    expect(plain.backlerp).toBeUndefined();
+    expect(plain.alpha).toBeUndefined();
+  });
+});

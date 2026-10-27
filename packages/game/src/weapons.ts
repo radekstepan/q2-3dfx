@@ -459,6 +459,76 @@ export function soldierFireEvent(
 }
 
 /**
+ * id Machinegun_Fire kick walk (p_weapon.c): per-shot crandom() jitter on
+ * yaw/roll kick plus a pitch kick that grows with the held burst, and the
+ * burst counter ("raise the gun as it is firing"). `shots` is the
+ * pre-trigger machinegun_shots count (0 when the trigger is first pulled);
+ * the returned `shots` is the latched post-trigger count (clamped at 9 in
+ * SP; deathmatch never latches). Rand consumption order matches C exactly:
+ * kick_origin[1], kick_origin[2], kick_angles[1], kick_angles[2], then
+ * kick_origin[0] — crandom() = 2*rand-1 per call.
+ */
+export interface MachinegunKick {
+  kickOrigin: Vec3;
+  kickAngles: Vec3;
+  /** Latched burst count after this trigger pull. */
+  shots: number;
+}
+
+export const MACHINEGUN_KICK_MAX_SHOTS = 9;
+
+export function machinegunKick(
+  shots: number,
+  rand: () => number,
+  deathmatch = false,
+): MachinegunKick {
+  const crandom = (): number => rand() * 2 - 1;
+  const oy = crandom() * 0.35;
+  const oz = crandom() * 0.35;
+  const ay = crandom() * 0.7;
+  const az = crandom() * 0.7;
+  const ox = crandom() * 0.35;
+  const ax = shots * -1.5;
+  let next = shots;
+  if (!deathmatch) {
+    next = shots + 1;
+    if (next > MACHINEGUN_KICK_MAX_SHOTS) next = MACHINEGUN_KICK_MAX_SHOTS;
+  }
+  return { kickOrigin: v3(ox, oy, oz), kickAngles: v3(ax, ay, az), shots: next };
+}
+
+// --- monster melee/grenade sound names (C-correct, pak-relative) -------------
+//
+// g_weapon.c fire_grenade's in-flight loop is "weapons/hgrenc1b.wav"; the
+// per-monster fire sounds are precached per SP_ func (lowercased by the
+// driver — the pak stores mixed case, e.g. sound/gunner/Gunatck3.wav).
+// 'monster/melee.wav' is the old lite placeholder: it has NO pak
+// counterpart, so the mixer always fell back to synth. Lanes must stop
+// emitting it; MONSTER_MELEE_SOUND_ALIAS pins the string for the web lane's
+// legacy mapping (apps/web play.ts) until that lane re-points.
+
+/** m_infantry.c sound_gunshot (InfantryMachineGun single bullet). */
+export const INFANTRY_GUN_SOUND = 'infantry/infatck1.wav';
+/** m_infantry.c sound_punch_swing (attack2 frame 3 wind-up). */
+export const INFANTRY_SWING_SOUND = 'infantry/infatck2.wav';
+/** m_infantry.c sound_punch_hit (infantry_smack connect). */
+export const INFANTRY_MELEE_SOUND = 'infantry/melee2.wav';
+/** m_infantry.c sound_weapon_cock (attack1 frame 4 chamber). */
+export const INFANTRY_COCK_SOUND = 'infantry/infatck3.wav';
+/** m_gunner.c precached grenade fire sound (GunnerGrenade). */
+export const GUNNER_GRENADE_SOUND = 'gunner/gunatck3.wav';
+/** Legacy lite placeholder (no pak counterpart) — do not emit; alias only. */
+export const MONSTER_MELEE_SOUND_ALIAS = 'monster/melee.wav';
+
+/**
+ * id infantry_smack damage (m_infantry.c): fire_hit(self, aim,
+ * 5 + (rand() % 5), 50) — knockback kick 50 has no lite sim (no knockback
+ * physics for the player pool), so only the damage range is modelled here.
+ */
+export function infantryMeleeDamage(rand: () => number): number {
+  return 5 + Math.floor(rand() * 5);
+}
+/**
  * Resolve one trigger pull. `ammo` is the current reserve for the weapon's
  * ammoKind (ignored for the blaster). `rand` must return [0,1).
  */

@@ -25,14 +25,25 @@ export interface Entity {
   model: ModelHandle;
   origin: Vec3; angles: Vec3;
   frame: number; skin: TextureHandle;
-  /**
-   * RF_DEPTHHACK equivalent for the first-person viewmodel: the alias
-   * backend scales the entity's stored 1/z by 3 (ref_soft `s_ziscale *= 3`,
-   * r_alias.c) so the eye-anchored gun wins the depth test against nearby
-   * walls instead of sinking into them. Optional, defaults to false;
-   * world entities must leave it unset.
-   */
+  /** RF_DEPTHHACK: alias backend scales stored 1/z by 3 (eye-anchored viewmodel). */
   depthHack?: boolean;
+  /**
+   * RF_FRAMELERP previous frame (cl_tent.c explosion smoothing): the alias
+   * backend interpolates verts oldframe -> frame by backlerp. Optional,
+   * defaults to frame (no lerp); out-of-range values wrap like frame.
+   */
+  oldframe?: number;
+  /**
+   * RF_FRAMELERP blend 0..1 (1 = fully oldframe, 0 = fully frame).
+   * Optional, defaults to 0; clamped. Ignored unless oldframe is set.
+   */
+  backlerp?: number;
+  /**
+   * Translucency 0..1 (1 = opaque). The alias backend applies deterministic
+   * screen-door skip so fading explosions read as translucent on the 8-bit
+   * path. Optional, defaults to 1 (opaque); clamped.
+   */
+  alpha?: number;
 }
 
 export interface WorldModel {
