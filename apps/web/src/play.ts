@@ -263,16 +263,18 @@ export function getResolution(): { width: number; height: number } {
   return parseResolution(RESOLUTION_DEFAULT)!;
 }
 
-// --- crouch (M7.1 UX) ---
+// --- crouch (M7.1 UX, Phase 3 single duck state) ---
 //
 // The browser binding lives in @q2/input (KeyC → 'crouch' logical key,
 // BUTTON_DUCK on the built UserCmdT; attachToCanvas wires it with zero
-// web-side code). This package only translates + advertises it: step()
-// maps the cmd duck bit onto PMF_DUCKED before pmoveFull (the documented
-// input→driver convention), so the hull shrinks (maxs 32 → 4, viewheight
-// 22 → 12). Note: the host camera stays at +22 (calcViewOrigin is
-// host-owned), so the eye does not dip — collision (fitting under low
-// ceilings) is the part that works. HUD/help advertise the binding.
+// web-side code). This package translates the hold into PMF_DUCKED and lets
+// PM_CheckDuck own it: step() asserts the flag while the hold bit is down
+// (immediate engage, including the first tick when ground is not yet
+// categorized) and never clears it, so release flows through the
+// headroom-checked stand-up (hull maxs 32 → 4, viewheight 22 → 12). The host
+// eye follows the authoritative pm.viewheight (host-owned calcViewOrigin
+// call) and the mixer listener rides the same height — one transition per
+// edge, no per-tick flip-flop while held.
 
 /** One-line controls reference drawn in the HUD and mirrored in index.html. */
 export const CONTROLS_HINT = 'move WASD - crouch C - jump Space - use E - attack click - guns 1/2/3';
@@ -341,8 +343,6 @@ export const BANNER_MODEL = 'models/objects/banner/tris.md2';
 export const BANNER_SKIN = 'models/objects/banner/skin.pcx';
 
 const PLAYER_ID = 1;
-/** Eye height above the pm origin (matches PmoveState.viewheight). */
-const EYE = 22;
 /** id pellet spread basis: r/u are world units at 8192 range. */
 
 const REFIRE: Record<string, number> = {
@@ -858,11 +858,14 @@ export class LocalDriver implements HostDriver {
       this.pm.velocity = v3();
     } else {
       this.pm.viewAngles = new Float32Array(cmd.angles) as Vec3;
-      // Duck translation (@q2/input convention): the KeyC 'crouch' key sets
-      // BUTTON_DUCK on the built cmd (Host → driver untouched); the driver
-      // owns PMF_DUCKED until @q2/game wires it into PM_CheckDuck.
+      // Single duck state (Phase 3): PM_CheckDuck owns PMF_DUCKED. The
+      // driver only asserts the flag while the hold bit is down (immediate
+      // engage on press, including the first tick when ground is not yet
+      // categorized) and never clears it — release flows through
+      // PM_CheckDuck's headroom-checked stand-up, so letting go under a low
+      // ceiling keeps the hull ducked (C PM_CheckDuck semantics). Clearing
+      // here would pre-empt that check and stand up anywhere, unconditionally.
       if (isDuckHeld(gcmd)) this.pm.pmFlags |= PMF_DUCKED;
-      else this.pm.pmFlags &= ~PMF_DUCKED;
       pmoveFull(this.pm, gcmd);
     }
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
@@ -1552,7 +1555,7 @@ export class LocalDriver implements HostDriver {
     const right = v3();
     const up = v3();
     AngleVectors(this.pm.viewAngles, fwd, right, up);
-    const eye = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + EYE);
+    const eye = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + this.pm.viewheight);
     this.mixer.setListener(eye, right);
   }
 

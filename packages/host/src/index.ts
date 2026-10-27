@@ -283,7 +283,16 @@ export class Host {
     const angles: [number, number, number] = kick
       ? [viewBase[0] + kick.angles[0], viewBase[1] + kick.angles[1], viewBase[2] + kick.angles[2]]
       : viewBase;
-    let eye = calcViewOrigin(base, this.lastCmd ? (this.lastCmd.buttons & 8) !== 0 || this.lastCmd.upmove < 0 : false);
+    // Single duck state (Phase 3): the eye follows the authoritative pmove
+    // hull (driver pm.viewheight), not the raw cmd bit — the bit flips
+    // instantly (airborne holds, headroom-blocked stands) while PM_CheckDuck
+    // owns the transition. Feature-detected: drivers without a pm fall back
+    // to the legacy cmd-bit rule (offline mode behavior is unchanged).
+    const drvPm = (this.driver as unknown as { pm?: { viewheight?: unknown } } | null)?.pm;
+    const drvView = typeof drvPm?.viewheight === 'number' ? drvPm.viewheight : null;
+    // Standing height 22 (VIEW_HEIGHT in @q2/client); anything else is ducked.
+    const ducked = drvView !== null ? drvView !== 22 : (this.lastCmd ? (this.lastCmd.buttons & 8) !== 0 || this.lastCmd.upmove < 0 : false);
+    let eye = calcViewOrigin(base, ducked);
     if (kick) eye = [eye[0] + kick.origin[0], eye[1] + kick.origin[1], eye[2] + kick.origin[2]];
     const view: RefDef = {
       origin: new Float32Array(eye) as RefDef['origin'],
