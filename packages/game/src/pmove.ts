@@ -490,14 +490,18 @@ export function PM_CheckDuck(st: PmoveState, cmd: UserCmd): void {
     st.pmFlags |= PMF_DUCKED;
   } else if (st.pmFlags & PMF_DUCKED) {
     // Try to stand up: only clear if headroom allows (id traces maxs 32).
+    // C clears on !allsolid alone (exact-touch still counts as inside,
+    // same as the trace layer reports it).
     const standing = v3(st.maxs[0]!, st.maxs[1]!, 32);
     const trace = activeTrace(st.origin, st.mins, standing, st.origin);
-    if (!trace.allsolid && trace.fraction === 1) st.pmFlags &= ~PMF_DUCKED;
+    if (!trace.allsolid) st.pmFlags &= ~PMF_DUCKED;
   }
   if (st.pmFlags & PMF_DUCKED) {
     st.mins[2] = -24;
     st.maxs[2] = 4;
-    st.viewheight = 12;
+    // C PM_CheckDuck: ducked eye sits 2 units BELOW the origin (feet+22);
+    // the +12 guess put the crouched camera inside low ceilings.
+    st.viewheight = -2;
   } else {
     st.mins[2] = -24;
     st.maxs[2] = 32;
@@ -547,7 +551,10 @@ export function PM_CheckSpecialMovement(st: PmoveState, cmd: UserCmd): void {
   spot[0] = st.origin[0]! + (fx / fl) * 30;
   spot[1] = st.origin[1]! + (fy / fl) * 30;
   spot[2] = st.origin[2]! + 4;
-  if (activeContents(spot) & CONTENTS_SOLID) return;
+  // C PM_CheckSpecialMovement: the out-of-water vault needs a WALL at
+  // feet+4 (`!(cont & CONTENTS_SOLID)` bails). The inverted probe fired
+  // the 350u/s vault in open water whenever air sat 16u above the spot.
+  if (!(activeContents(spot) & CONTENTS_SOLID)) return;
   spot[2] += 16;
   if (activeContents(spot)) return;
   st.velocity[0] = (fx / fl) * 50;
@@ -663,9 +670,25 @@ export function pmoveFull(st: PmoveState, cmd: UserCmd): void {
   PM_CheckSpecialMovement(st, cmd);
   PM_CategorizePosition(st);
   if (st.pmTime > 0) {
-    // waterjump/teleport knockback path: decay pm_time, slide raw
+    // Drop timing counter. C Pmove consumes msec>>3 slices (min 1) — ours
+    // consumes the full tick, so land/vault windows run shorter, but the
+    // flag hygiene is C-exact: expiry clears WATERJUMP/LAND/TELEPORT,
+    // otherwise the landing lockout latches forever and CheckJump can never
+    // fire again. The land/teleport raw-slide path below is the legacy
+    // dry-land behaviour (kept bit-identical), while TIME_WATERJUMP runs
+    // C's vault branch: gravity, cancel as soon as falling, then step.
     st.pmTime -= msec;
-    if (st.pmTime < 0) st.pmTime = 0;
+    if (st.pmTime <= 0) {
+      st.pmTime = 0;
+      st.pmFlags &= ~(PMF_TIME_WATERJUMP | PMF_TIME_LAND | PMF_TIME_TELEPORT);
+    }
+    if (st.pmFlags & PMF_TIME_WATERJUMP) {
+      st.velocity[2] = st.velocity[2]! - st.gravity * frametime;
+      if (st.velocity[2]! < 0) {
+        st.pmFlags &= ~(PMF_TIME_WATERJUMP | PMF_TIME_LAND | PMF_TIME_TELEPORT);
+        st.pmTime = 0;
+      }
+    }
     stepSlideFallback(st.origin, st.velocity, st.mins, st.maxs, frametime);
     PM_CategorizePosition(st);
     return;

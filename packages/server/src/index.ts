@@ -17,8 +17,10 @@ import {
   SetRespawn,
   barrelDebrisSpeeds,
   barrelFuseAt,
+  AIR_GRACE,
   blasterMuzzle,
   blasterSpawn,
+  bspPointContentsFor,
   doorTravel,
   explosionBaseframe,
   explosionFrames,
@@ -34,6 +36,7 @@ import {
   moverThink,
   moverUse,
   muzzleRadius,
+  makeWorldEffectsState,
   parseEntities,
   parseFloat,
   projectSource,
@@ -41,10 +44,12 @@ import {
   radiusDamagePoints,
   radiusDamageRadius,
   respawnDelayFor,
+  sampleWaterLevel,
   soldierHealthForSkin,
   resolveBoltSpawn,
   resetEdictNums,
   soldierWeaponForSkin,
+  updateWorldEffects,
   spawnButton,
   spawnDoor,
   spawnEdict,
@@ -85,8 +90,10 @@ import type {
   MonsterState,
   Mover,
   PlayerTrail,
+  PointContentsFn,
   TraceFn,
   Trigger,
+  WorldEffectsState,
 } from '@q2/game';
 import {
   arriveCombatPoint,
@@ -105,7 +112,6 @@ import {
 } from './monster-ai.js';
 import type { CombatPoint } from './monster-ai.js';
 import {
-  bspContentsFor,
   setPmoveWorld,
 } from '@q2/game';
 import { v3 } from '@q2/math';
@@ -206,6 +212,19 @@ export interface ServerState {
   /** Authoritative player health (the driver mirrors it into HUD state). */
   playerHealth: number;
   playerMaxHealth: number;
+  /**
+   * P_WorldEffects drowning state (game/p_view.c): air supply, damage ramp,
+   * 1s drown debounce, enter/exit sound latch, lava burn-sound debounce.
+   * Ticked in SV_GameTick from the sampled waterlevel; the driver never
+   * carries it (predictor runs pmove only).
+   */
+  playerWorld: WorldEffectsState;
+  /**
+   * Seconds of air left for the HUD air indicator (P_WorldEffects
+   * air_finished - level.time, 12+ when not submerged). The HUD lane owns
+   * rendering; this field is the cross-lane value (no HUD files touched).
+   */
+  playerAirLeft: number;
   /** Player-trail ring (p_trail.c): pursuit memory when LOS breaks. */
   trail: PlayerTrail;
   /** point_combat firing positions (g_misc.c SP_point_combat). */
@@ -213,7 +232,7 @@ export interface ServerState {
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100, trail: trailInit(false), combatPoints: [] };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, trail: trailInit(false), combatPoints: [] };
 }
 
 /** Link an edict into the world (SV_LinkEdict: register + solid bookkeeping). */
@@ -370,10 +389,25 @@ export function SV_DropTraceFor(map: BspMap): TraceFn {
  * setPmoveWorldFromBsp but with MASK_PLAYERSOLID_C, so clip-deck floors and
  * stairs the mapper sealed with PLAYERCLIP/WINDOW hold the player the way
  * the C engine holds them.
+ *
+ * The contents hook carries the SOLID bit (bspPointContentsFor): the
+ * pmove waterjump wall probe (`& CONTENTS_SOLID`) and the server-side
+ * P_WorldEffects sampler read through it. Dry-land consumers only test
+ * MASK_WATER, so dry-land traces are bit-identical to the legacy hook.
  */
 export function SV_SetPmoveWorldFromBsp(map: BspMap): void {
-  setPmoveWorld(SV_TraceFor(map), bspContentsFor(map));
+  const contents = bspPointContentsFor(map);
+  SV_WorldContents = contents;
+  setPmoveWorld(SV_TraceFor(map), contents);
 }
+
+/**
+ * Solid-aware point contents installed by SV_SetPmoveWorldFromBsp (null
+ * before any map is wired: devroom/asset-free paths skip world effects).
+ * The server-side P_WorldEffects sampler reads through this; the driver
+ * installs it at boot, so no driver call-site changes are needed.
+ */
+export let SV_WorldContents: PointContentsFn | null = null;
 
 export function SV_SpawnMover(st: ServerState, m: Mover): void {
   SV_LinkEdict(st, m.ent);
@@ -2063,6 +2097,12 @@ export interface SVGameTick {
   nav?: MonsterNav | null;
   /** Caller-seeded RNG (deterministic tests); defaults to Math.random. */
   rand?: () => number;
+  /**
+   * Solid-aware point contents for the P_WorldEffects sampler. Defaults to
+   * the hooks installed by SV_SetPmoveWorldFromBsp; tests pass a synthetic
+   * pool directly (no map needed).
+   */
+  contents?: PointContentsFn;
 }
 
 const ZERO_HULL: Vec3 = v3(0, 0, 0);
@@ -2253,11 +2293,17 @@ export function barrelOfClip(st: ServerState, entityNum: number): ServerBarrel |
 }
 
 /**
- * T_Damage on a barrel (g_misc.c barrel_delay): the first lethal hit frees
- * the edict (takedamage NO) + arms a 0.2s fuse (think = barrel_explode at
- * level.time + 2 frames), then the fuse runs T_RadiusDamage + BecomeExplosion.
+ * T_Damage on a barrel (g_misc.c barrel_delay): the first lethal hit latches
+ * the fuse (takedamage NO + think = barrel_explode at level.time + 2 frames)
+ * and arms the 0.2s fuse; the fuse then runs T_RadiusDamage + BecomeExplosion.
  * Chained hits (damageRadius chains) re-enter through the same fuse; hits
- * during the fuse are immune.
+ * during the fuse are immune via the fused latch.
+ *
+ * C ordering (barrel_delay / func_explosive_explode): the edict stays live
+ * AND solid for the 0.2s — mesh rendered, clip blocking — then frees and
+ * opens atomically at explode time. Freeing at damage time instead leaves a
+ * 2-tick invisible wall (mesh hidden, clip still stopping bodies); the free
+ * therefore happens at fuse blow, next to SV_RemoveBrushClip.
  */
 export function SV_DamageBarrel(
   st: ServerState,
@@ -2268,7 +2314,6 @@ export function SV_DamageBarrel(
   b.edict.health -= dmg;
   if (b.edict.health > 0) return false;
   b.fused = true;
-  b.edict.freed = true;
   st.fuses.push({
     pos: v3(b.origin[0], b.origin[1], b.origin[2]),
     dmg: b.edict.dmg,
@@ -2842,6 +2887,32 @@ function stepChunks(
 }
 
 /**
+ * P_WorldEffects drowning + sizzle (game/p_view.c) for the player pool:
+ * samples the water at the player hull through the installed solid-aware
+ * contents, applies the escalating drown / lava / slime damage through the
+ * existing player-damage path, and emits the enter/exit/gasp/burn/drown
+ * hooks through the existing positional-sound events. Skips when no map is
+ * wired (devroom/asset-free paths have no water; air stays at grace).
+ * The HUD air indicator reads st.playerAirLeft (no HUD files touched).
+ */
+function stepWorldEffects(st: ServerState, game: SVGameTick, rand: () => number): void {
+  const contents = game.contents ?? SV_WorldContents;
+  if (!contents) return;
+  const p = game.player;
+  const sample = sampleWaterLevel(p.pos, p.mins, p.view, contents);
+  const res = updateWorldEffects(
+    st.playerWorld,
+    { time: st.time, waterlevel: sample.level, watertype: sample.type, health: st.playerHealth },
+    rand,
+  );
+  st.playerAirLeft = res.airLeft;
+  if (res.damage > 0) SV_DamagePlayer(st, res.damage);
+  for (const name of res.sounds) {
+    st.sounds.push({ name, pos: v3(p.pos[0], p.pos[1], p.pos[2]), born: st.time });
+  }
+}
+
+/**
  * Phase 0 gameplay phase of SV_Tick: monster think with C cadence fire
  * resolution, monster door touches, bolt flight + touch, barrel fuses,
  * debris/gibs and explosion pruning (all at 10Hz on server time).
@@ -2869,6 +2940,10 @@ function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
     st.fuses.splice(i, 1);
     if (f.barrel) {
       spawnBarrelDebris(st, f.barrel, rand);
+      // C BecomeExplosion1/G_FreeEdict: the brush frees the same tick its
+      // clip drops, so the vanished mesh and the opened hole stay atomic —
+      // no freed-but-solid window for bodies to collide with.
+      f.barrel.edict.freed = true;
       // The brush is gone (func_explosive_explode / BecomeExplosion free the
       // edict either way): open the clip so the hole stays open.
       if (f.barrel.isFunc) SV_RemoveBrushClip(st, f.barrel.edict);
@@ -2876,6 +2951,8 @@ function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
     SV_SpawnExplosion(st, f.pos, f.dmg, { trace: game.trace, rand });
     SV_RadiusDamage(st, f.pos, f.dmg, game.player, game.trace, rand);
   }
+  // P_WorldEffects drowning + sizzle (game/p_view.c).
+  stepWorldEffects(st, game, rand);
   // Tossed chunks fall and rest; visuals live their full frame life.
   stepChunks(st, st.debris, game.trace, dt, 1.5);
   stepChunks(st, st.gibs, game.trace, dt, 1.0);

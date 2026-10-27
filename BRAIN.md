@@ -943,6 +943,28 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - position-test special case), so an exact-plane teleport can't stand back
 - up — real falls rest at +1/32 and stand fine. Gate (l) settles from above
 - to play it the way the engine does.
+- CLOSED 2026-10-26 (movement/physics lane: walkable debris, crawlspace
+- clip, water jump, drowning): blown brushes free + drop their clip on the
+- SAME fuse tick (C `BecomeExplosion1` atomicity — the old damage-time free
+- left a 2-tick invisible wall); `PM_CheckDuck` eye is the C `-2`
+- (feet+22, not +12 — the old height parked the camera inside crawlspace
+- ceilings: see-through + items-above + void orange; renderer untouched,
+- diagnosis only) with the C `!allsolid` stand-up check; the out-of-water
+- vault probe was inverted (vaulted in open water, never at a wall) — now
+- C-exact via a solid-aware contents hook (dry-land traces bit-identical),
+- vault branch runs C gravity + fall-cancel, and `pm_time` expiry clears
+- WATERJUMP/LAND/TELEPORT (a hard landing previously latched TIME_LAND
+- forever — jumping never worked again); `P_WorldEffects` drowning ported
+- (air grace, 4,6,8…15 ramp at 1/s, gasp/watr/burn/drown/gurp hooks via
+- existing damage/sound events, `playerAirLeft` exposed for the HUD lane).
+- Headless pins: blown-*20 walk-through standing + crouched + sprint/16ms
+- + soldier pursuit (`debris-water.test.ts`), waterjump single-impulse +
+- vault-needs-wall (`water.test.ts`), crawlspace eye under the roof,
+- drowning ramp. Gate (l) viewheight pin updated -2, 17/17 green.
+- Follow-ups (other lanes): web driver still installs the legacy
+- solid-less contents (one-line `bspPointContentsFor` switch when that lane
+- touches `play.ts`, until then the vault stays inert in the browser);
+- breather/envirosuit have no items (air runs on schedule).
 - CLOSED 2026-10-26 (HUD lane): fps is a top-right DOM overlay (`#q2-fps`, `cl_showfps`; in-canvas fps deleted so the counter never touches renderer output) and player coords are a top-left DOM overlay (`#q2-pos`, `pos x y z yaw <yaw>` 1-decimal per frame, `cl_showpos` default ON with a menu checkbox; menu clicks stay input-free under canvas pointer-lock).
 - CLOSED 2026-10-26 (window/corpse content lane): the spawn-room "third
 - barrel" is func_explosive *20 (lump: 2 misc_explobox at (136,40,0) +

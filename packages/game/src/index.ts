@@ -368,3 +368,14 @@ export {
   BSP_CONTENTS_LADDER,
   MASK_PLAYERSOLID,
 } from './collision.js';
+export {
+  bspPointContentsFor,
+  mapWaterContents,
+  sampleWaterLevel,
+  makeWorldEffectsState,
+  updateWorldEffects,
+  DROWN_DAMAGE_CAP,
+  AIR_GRACE,
+  BSP_CONTENTS_SOLID,
+} from './water.js';
+export type { WorldEffectsState, WorldEffectsInput, WorldEffectsResult } from './water.js';

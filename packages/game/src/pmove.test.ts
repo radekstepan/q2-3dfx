@@ -272,12 +272,12 @@ describe('pmove determinism (M5.1)', () => {
     st.pmFlags |= PMF_ON_GROUND;
     pmove(st, { msec: 50, angles: v3(), forwardmove: 0, sidemove: 0, upmove: -400, buttons: 0 });
     expect(st.maxs[2]).toBe(4);
-    expect(st.viewheight).toBe(12);
+    expect(st.viewheight).toBe(-2);
     const st2 = makePmoveState();
     st2.pmFlags |= PMF_ON_GROUND;
     pmove(st2, { msec: 50, angles: v3(), forwardmove: 0, sidemove: 0, upmove: 0, buttons: 8 });
     expect(st2.maxs[2]).toBe(4);
-    expect(st2.viewheight).toBe(12);
+    expect(st2.viewheight).toBe(-2);
   });
 
   it('detects water levels and ladders', () => {

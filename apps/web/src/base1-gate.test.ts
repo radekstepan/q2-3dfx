@@ -658,7 +658,8 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     }
     expect(driver.pm.pmFlags & PMF_DUCKED).toBe(PMF_DUCKED);
     expect(driver.pm.maxs[2]).toBe(4);
-    expect(driver.pm.viewheight).toBe(12);
+    // C PM_CheckDuck: the ducked eye sits 2 below the origin (feet+22).
+    expect(driver.pm.viewheight).toBe(-2);
     expectInWorld(driver.pm.origin, map);
     // Release: headroom is free (corridor ceiling 112), so the hull grows
     // back instead of wedging ducked.
