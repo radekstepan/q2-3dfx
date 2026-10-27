@@ -86,9 +86,10 @@ export interface MonsterDef {
 // fire callbacks — soldier_fire6 (flash 5) at 0-based frame index 21 and
 // soldier_fire7 (flash 6) at index 24, both aimed straight along the facing
 // (no enemy tracking) and skin-gunned by soldier_fire (blaster/shotgun/
-// machinegun). Gunner (m_gunner.c gunner_frames_death, all NULL) and
-// infantry (m_infantry.c death1-3, all NULL) deaths never fire, so their
-// tables stay all-'move'.
+// machinegun). Gunner deaths never fire (m_gunner.c gunner_frames_death,
+// all NULL), so the gunner table stays all-'move'; infantry death2 DOES
+// fire (m_infantry.c death211-222 spray) and is tagged in the INFANTRY
+// table below (infantry death1/death3 frames are all NULL).
 function soldierAttackFrames(count: number, fireIdx: number): MonsterFrame[] {
   const frames: MonsterFrame[] = [];
   for (let f = 0; f < count; f++) frames.push({ dist: 0, action: f === fireIdx ? 'fire' : 'move' });
@@ -406,12 +407,34 @@ function taggedMove(
 // the per-frame ai_stand/ai_walk/ai_run/ai_charge/ai_move values from
 // m_infantry.c (MD2 has 206 frames: gun02=0 … attak208=206).
 //
-// Attack fire tags: attack1 (FRAME_attak101-115, the machinegun) fires via
-// infantry_fire at its 11th frame (attak111 = InfantryMachineGun single
-// bullet; the C AI_HOLD_FRAME re-fire across pausetime collapses to this
-// one lite event); attack2 (FRAME_attak201-208, the melee) swings at frame
-// 3 (infantry_swing) and smacks at frame 6 (infantry_smack 5+(rand%5)
-// kick 50 — the 'melee' tag is what resolveMonsterFire keys off).
+// Combat catalogue (m_infantry.c; 0-based lite indices in brackets):
+// - attack1 (FRAME_attak101-115 = md2 184-198, the standing machinegun):
+//   infantry_cock_gun at the 4th frame (attak104 = md2 187) — the chaingun
+//   spin/crank: plays sound_weapon_cock (infantry/infatck3.wav, the
+//   INFANTRY_COCK_SOUND hook) and arms the burst, pausetime = level.time +
+//   ((rand&15)+3+7) * FRAMETIME (1.0-2.5s); infantry_fire at the 11th frame
+//   (attak111 = md2 194) — InfantryMachineGun single bullet
+//   (monster_fire_bullet dmg 3 kick 4 spread 300/500, infatck1.wav) plus
+//   AI_HOLD_FRAME, which re-fires the frame every 0.1s until the cock
+//   pausetime expires (a 3-18 round burst). The lite table tags both frames
+//   ('cock' + 'fire') but the live event gate only routes 'fire'/'melee',
+//   so each pass resolves one bullet — the hold-repeat needs a tick hook
+//   (carry the cock pausetime, freeze the fire frame); documented
+//   deviation, not silence.
+// - attack2 (FRAME_attak201-208 = md2 199-206, the melee): infantry_swing
+//   at the 3rd frame (attak203 = md2 201, infatck2.wav, no damage) and
+//   infantry_smack at the 6th (attak206 = md2 204: fire_hit 5+(rand%5)
+//   kick 50, infantry/melee2.wav on connect — the 'melee' tag is what
+//   resolveMonsterFire keys off). The 'swing' tag documents the wind-up;
+//   like 'cock' it has no sound hook yet (same collapse as the smack
+//   comment in resolveMonsterFire).
+// - death2 (FRAME_death201-225 = md2 145-169, "Off with his head"): C arms
+//   InfantryMachineGun on frames death211-222 (md2 155-166, lite indices
+//   10-21) — a blind 12-round spray through aimangles[] with flashes
+//   MZ2_INFANTRY_MACHINEGUN_2..13 (q_shared.h 27-38). Tagged 'fire' like
+//   the soldier last-ditch frames; monster-ai deathFireEvent synthesizes
+//   the skin-gun event (death1/death3 stay all-'move': their C frames are
+//   all NULL, hence the untouched dist rows).
 export const INFANTRY: MonsterDef = {
   classname: 'monster_infantry',
   health: INFANTRY_HP,
@@ -425,10 +448,10 @@ export const INFANTRY: MonsterDef = {
     pain2: mv('pain2', 110, [-3, -3, 0, -1, -2, 0, 0, 2, 5, 2], 'run'),
     duck: mv('duck', 120, [-2, -5, 3, 4, 0], 'run'),
     death1: mv('death1', 125, [-4, 0, 0, -1, -4, 0, 0, 0, -1, 3, 1, 1, -2, 2, 2, 9, 9, 5, -3, -3], 'dead'),
-    death2: mv('death2', 145, [0, 1, 5, -1, 0, 1, 1, 4, 3, 0, -2, -2, -3, -1, -2, 0, 2, 2, 3, -10, -7, -8, -6, 4, 0], 'dead'),
+    death2: taggedMove('death2', 145, [0, 1, 5, -1, 0, 1, 1, 4, 3, 0, -2, -2, -3, -1, -2, 0, 2, 2, 3, -10, -7, -8, -6, 4, 0], 'dead', { 10: 'fire', 11: 'fire', 12: 'fire', 13: 'fire', 14: 'fire', 15: 'fire', 16: 'fire', 17: 'fire', 18: 'fire', 19: 'fire', 20: 'fire', 21: 'fire' }),
     death3: mv('death3', 170, [0, 0, 0, -6, -11, -3, -11, 0, 0], 'dead'),
-    attack1: taggedMove('attack1', 184, [4, -1, -1, 0, -1, 1, 1, 2, -2, -3, 1, 5, -1, -2, -3], 'run', { 10: 'fire' }),
-    attack2: taggedMove('attack2', 199, [3, 6, 0, 8, 5, 8, 6, 3], 'run', { 5: 'melee' }),
+    attack1: taggedMove('attack1', 184, [4, -1, -1, 0, -1, 1, 1, 2, -2, -3, 1, 5, -1, -2, -3], 'run', { 3: 'cock', 10: 'fire' }),
+    attack2: taggedMove('attack2', 199, [3, 6, 0, 8, 5, 8, 6, 3], 'run', { 2: 'swing', 5: 'melee' }),
   },
 };
 

@@ -370,7 +370,9 @@ describe('soldier last-ditch death fire (m_soldier.c death1)', () => {
   it('death frames 21/24 emit skin-gun events; corpse stays hittable/gibbable', () => {
     // C soldier_move_death1 (FRAME_death101-136): soldier_fire6 (flash 5)
     // at 0-based index 21, soldier_fire7 (flash 6) at index 24. Gunner
-    // and infantry death frames are all NULL — only the soldier shoots.
+    // death frames are all NULL; infantry death2 sprays (death211-222 —
+    // see the infantry spin/cock test in infantry.test.ts). This pin
+    // covers the soldier only.
     resetEdictNums();
     const st = SV_Init();
     const trace = floorTrace();

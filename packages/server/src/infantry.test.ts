@@ -4,12 +4,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   GUNNER_GRENADE_SOUND,
+  INFANTRY_C,
   INFANTRY_GUN_SOUND,
   INFANTRY_MELEE_SOUND,
   MONSTER_HULL_MAXS,
   MONSTER_HULL_MINS,
   MONSTER_MELEE_SOUND_ALIAS,
   SURF_SKY,
+  monsterPain,
   mulberry32,
   resetEdictNums,
 } from '@q2/game';
@@ -355,6 +357,90 @@ describe('machinegun kick walk in SV_PlayerFire (p_weapon.c)', () => {
     expect(shell.fired).toBe(true);
     expect(shell.machinegunShots).toBe(0);
     expect(shell.kickOrigin).toBeUndefined();
+  });
+});
+
+describe('infantry spin/cock combat loop (m_infantry.c cock_gun + fire + death2)', () => {
+  it('attack1 pass: one machinegun event on the C fire frame (attak111), none on the cock frame', () => {
+    // C order: infantry_cock_gun at attak104 (spin/crank, infatck3.wav,
+    // arms the burst) then infantry_fire at attak111 (single aimed bullet).
+    // The lite sim resolves the fire frame; the cock frame emits nothing
+    // (no fabricated bullet — the sound/hold-repeat needs a tick hook).
+    resetEdictNums();
+    const st = SV_Init();
+    const m = SV_SpawnMonster(st, 'monster_infantry', v3(0, 0, 24));
+    m.state.yaw = 0;
+    m.state.move = 'attack1';
+    m.state.frame = 0;
+    const trace = openTrace();
+    const fired: number[] = [];
+    for (let i = 0; i < 15; i++) {
+      st.time += 0.1; // direct ticks advance the 10Hz clock (SV_Tick live)
+      for (const ev of SV_MonsterTick(st, playerAt(300).pos, trace, null, () => 0.99)) {
+        if (ev.move === 'attack1') {
+          expect(ev.attack).toBe('machinegun');
+          fired.push(ev.frame);
+        }
+      }
+    }
+    expect(fired).toEqual([10]); // exactly FRAME_attak111 (md2 194)
+    // The resolved volley carries the C ballistics: muzzle + tracer +
+    // infatck1.wav through the skin-gun pipeline.
+    resetEdictNums();
+    const st2 = SV_Init();
+    const m2 = SV_SpawnMonster(st2, 'monster_infantry', v3(0, 0, 24));
+    m2.state.yaw = 0;
+    m2.state.move = 'attack1';
+    m2.state.frame = 10;
+    SV_Tick(st2, 0.1, { player: playerAt(300), trace, rand: () => 0.99 });
+    expect(st2.muzzles.filter((z) => z.foe)).toHaveLength(1);
+    expect(st2.tracers).toHaveLength(1);
+    expect(st2.sounds.map((s) => s.name)).toContain(INFANTRY_GUN_SOUND);
+    expect(st2.playerHealth).toBe(100); // 0.99 never beats pHit: no damage
+  });
+
+  it('death2 spray: InfantryMachineGun on death211-222 (md2 155-166)', () => {
+    // "Off with his head" (m_infantry.c death211-222): the corpse sprays 12
+    // blind rounds. death1/death3 frames are all NULL and stay silent.
+    resetEdictNums();
+    const st = SV_Init();
+    const m = SV_SpawnMonster(st, 'monster_infantry', v3(200, 0, 24));
+    expect(monsterPain(m.state, 120, mulberry32(3))).toBe('dead');
+    expect(m.state.dead).toBe(true);
+    expect(m.state.gibbed).toBe(false);
+    m.state.move = 'death2';
+    m.state.frame = 0;
+    const trace = openTrace();
+    const fired: number[] = [];
+    for (let t = 0; t < 30; t++) {
+      st.time += 0.1;
+      for (const ev of SV_MonsterTick(st, playerAt(0).pos, trace, null, mulberry32(t))) {
+        expect(ev.attack).toBe('machinegun');
+        expect(ev.move).toBe('death2');
+        fired.push(ev.frame);
+      }
+    }
+    expect(fired).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+  });
+
+  it('death spray resolves to foe tracers + muzzles + infatck1 + C damage', () => {
+    resetEdictNums();
+    const st = SV_Init();
+    const m = SV_SpawnMonster(st, 'monster_infantry', v3(200, 0, 24));
+    expect(monsterPain(m.state, 120, mulberry32(3))).toBe('dead');
+    m.state.move = 'death2';
+    m.state.frame = 0;
+    const before = st.playerHealth;
+    for (let t = 0; t < 30; t++) {
+      SV_Tick(st, 0.1, { player: playerAt(0), trace: openTrace(), rand: () => 0 });
+    }
+    // Unconditional like C (no LOS gate): all 12 rounds leave the gun.
+    expect(st.muzzles.filter((z) => z.foe)).toHaveLength(12);
+    expect(st.tracers).toHaveLength(12);
+    expect(st.sounds.filter((s) => s.name === INFANTRY_GUN_SOUND)).toHaveLength(12);
+    // rand 0 always beats pHit: 12 hits x INFANTRY_C.bulletDamage (3).
+    expect(st.playerHealth).toBe(before - 12 * INFANTRY_C.bulletDamage);
+    expect(st.playerHealth).toBe(before - 36);
   });
 });
 

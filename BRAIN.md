@@ -1014,6 +1014,22 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - +1/32. Bias ported from CM_ClipBoxToBrush, landings +1/32 grounded).
 - Gate (r)/(s) pin it (19/19 green); west of the spot the world rock face
 - at x=-412 holds per the C trace rule (stays).
+- CLOSED 2026-10-26 (infantry spin/cock lane): the spin is real
+- (m_infantry.c `infantry_cock_gun`, attack1 frame 4 = attak104/md2 187:
+- chaingun spin/crank, infatck3.wav, arms the 1.0–2.5s burst pausetime —
+- NOT an attack2 wind-down). Full C combat catalogue audited against the
+- lite tables: attack1 cock@3 + aimed fire@10 (attak111/md2 194) with the
+- AI_HOLD_FRAME burst, attack2 swing@2 (infatck2, no damage) + smack@5,
+- death2 "Off with his head" 12-round spray on death211–222 (md2 155–166,
+- flashes 27–38 via aimangles[]). Implemented in-lock: tables tag all of
+- the above (C frames cited), `deathFireEvent` synthesizes the death2
+- spray through the live resolver (12 foe muzzles/tracers/sounds, 36
+- damage, unconditional like C); the old "infantry deaths never fire"
+- comment corrected (death1/death3 stay silent). Headless pins: attack1
+- pass fires exactly once on frame 10, cock frame emits nothing (no
+- fabricated bullet). Honest gap for the server owner: cock sound +
+- hold-repeat burst need a tick call-site in `packages/server/src/index.ts`
+- (out of this lane's lock) — proposed, not implemented.
 - OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
 - (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
 - `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`

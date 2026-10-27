@@ -99,21 +99,75 @@ describe('INFANTRY lite def (m_infantry.c)', () => {
     expect(dists('death2')).toEqual([0, 1, 5, -1, 0, 1, 1, 4, 3, 0, -2, -2, -3, -1, -2, 0, 2, 2, 3, -10, -7, -8, -6, 4, 0]);
     expect(firstLast('death3')).toEqual([170, 178]);
     expect(dists('death3')).toEqual([0, 0, 0, -6, -11, -3, -11, 0, 0]);
-    // attack1 (machinegun): cock at frame 4, single InfantryMachineGun
-    // fire at frame 11 (attak111); attack2 (melee): swing frame 3, smack
-    // frame 6 (infantry_smack).
+    // attack1 (machinegun): cock at frame 4 (attak104 = md2 187,
+    // infantry_cock_gun spin + sound_weapon_cock), single InfantryMachineGun
+    // fire at frame 11 (attak111 = md2 194); attack2 (melee): swing at
+    // frame 3 (attak203 = md2 201, infatck2.wav, no damage), smack at
+    // frame 6 (attak206 = md2 204, infantry_smack).
     expect(firstLast('attack1')).toEqual([184, 198]);
     expect(dists('attack1')).toEqual([4, -1, -1, 0, -1, 1, 1, 2, -2, -3, 1, 5, -1, -2, -3]);
     const a1 = INFANTRY.moves['attack1']!.frames;
     expect(a1.filter((f) => f.action === 'fire')).toHaveLength(1);
+    expect(a1[3]!.action).toBe('cock');
     expect(a1[10]!.action).toBe('fire');
     expect(firstLast('attack2')).toEqual([199, 206]);
     expect(dists('attack2')).toEqual([3, 6, 0, 8, 5, 8, 6, 3]);
-    expect(INFANTRY.moves['attack2']!.frames[5]!.action).toBe('melee');
+    const a2 = INFANTRY.moves['attack2']!.frames;
+    expect(a2[2]!.action).toBe('swing');
+    expect(a2[5]!.action).toBe('melee');
+    // death2 (md2 145-169, "Off with his head"): C arms InfantryMachineGun
+    // on death211-222 (md2 155-166 = lite indices 10-21); death1/death3 are
+    // all NULL in C and stay all-'move'.
+    const d2 = INFANTRY.moves['death2']!.frames;
+    expect(d2.filter((f) => f.action === 'fire')).toHaveLength(12);
+    for (let i = 0; i < 25; i++) {
+      expect(d2[i]!.action).toBe(i >= 10 && i <= 21 ? 'fire' : 'move');
+    }
+    for (const name of ['death1', 'death3']) {
+      expect(INFANTRY.moves[name]!.frames.every((f) => f.action === 'move')).toBe(true);
+    }
     // ends chain back to run/stand (lite: no AI_HOLD_FRAME re-fire loop).
     for (const [name, end] of [['stand', 'stand'], ['walk', 'walk'], ['run', 'run'], ['attack1', 'run'], ['attack2', 'run'], ['pain1', 'run'], ['pain2', 'run'], ['duck', 'run']] as Array<[string, string]>) {
       expect(INFANTRY.moves[name]!.end).toBe(end);
     }
+  });
+
+  it('attack1 walks cock (md2 187) then fire (md2 194); death2 sprays md2 155-166', () => {
+    // Full attack1 pass through monsterThink: the spin/crank precedes the
+    // shot, exactly like the C frame order (cock_gun attak104, fire
+    // attak111). monsterFrameNumber reports the rendered MD2 frame.
+    const ms = spawnMonster('infantry');
+    ms.move = 'attack1';
+    ms.frame = 0;
+    const actions: string[] = [];
+    for (let i = 0; i < 15; i++) actions.push(monsterThink(ms));
+    expect(actions[3]).toBe('cock');
+    expect(actions[10]).toBe('fire');
+    expect(actions.filter((a) => a === 'fire')).toHaveLength(1);
+    expect(actions.filter((a) => a === 'cock')).toHaveLength(1);
+    const cock = spawnMonster('infantry');
+    cock.move = 'attack1';
+    cock.frame = 3;
+    expect(monsterFrameNumber(cock)).toBe(187); // FRAME_attak104
+    const fire = spawnMonster('infantry');
+    fire.move = 'attack1';
+    fire.frame = 10;
+    expect(monsterFrameNumber(fire)).toBe(194); // FRAME_attak111
+    // Melee wind-up order: swing (attak203) before smack (attak206).
+    const sw = spawnMonster('infantry');
+    sw.move = 'attack2';
+    sw.frame = 0;
+    const melee: string[] = [];
+    for (let i = 0; i < 8; i++) melee.push(monsterThink(sw));
+    expect(melee[2]).toBe('swing');
+    expect(melee[5]).toBe('melee');
+    // Death-spray window: md2 155-166 = FRAME_death211-222.
+    const d2 = spawnMonster('infantry');
+    d2.move = 'death2';
+    d2.frame = 10;
+    expect(monsterFrameNumber(d2)).toBe(155); // FRAME_death211
+    d2.frame = 21;
+    expect(monsterFrameNumber(d2)).toBe(166); // FRAME_death222
   });
 
   it('every move fits inside the infantry MD2 (206 frames)', () => {

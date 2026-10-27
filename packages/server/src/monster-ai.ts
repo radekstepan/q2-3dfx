@@ -497,14 +497,17 @@ export function duckShootEvent(
 }
 
 /**
- * Last-ditch shot (m_soldier.c soldier_move_death1): the falling soldier
- * fires soldier_fire6 (flash 5) at death-frame index 21 and soldier_fire7
- * (flash 6) at index 24 — the only death move in the game with fire
- * callbacks (gunner/infantry deaths are all NULL). Synthesized as a
- * skin-gun event like duck-and-shoot (resolveMonsterFire keys the skin,
- * never the label); the rendered move stays 'death1'. Null unless a dead
- * (non-gibbed) soldier just played a 'fire'-tagged death frame. Fires
- * unconditionally like C (no LOS gate — the flash 5/6 shot aims forward
+ * Last-ditch shots (m_soldier.c soldier_move_death1; m_infantry.c
+ * infantry_move_death2): the falling soldier fires soldier_fire6 (flash 5)
+ * at death-frame index 21 and soldier_fire7 (flash 6) at index 24; the
+ * beheaded infantry sprays InfantryMachineGun at death2 indices 10-21
+ * (FRAME_death211-222 = md2 155-166, flashes MZ2_INFANTRY_MACHINEGUN_2..13
+ * through aimangles[]) — the only armed death moves in the game (soldier
+ * death2-6, gunner death, infantry death1/3 frames are all NULL).
+ * Synthesized as skin-gun events like duck-and-shoot (resolveMonsterFire
+ * keys the skin, never the label); the rendered move stays on the death
+ * move. Null unless a dead (non-gibbed) body just played a 'fire'-tagged
+ * death frame. Fires unconditionally like C (no LOS gate — the shots spray
  * blindly; the lite resolver aims at the eye, and the ballistic bolt
  * detonates on cover instead of phasing, so an unsighted shot reads as
  * fire into the wall, never a wall-phase).
@@ -514,20 +517,36 @@ export function deathFireEvent(
   action: string,
   dmgScale: number,
 ): MonsterEvent | null {
-  if (m.kind !== 'soldier' || !m.state.dead || m.state.gibbed) return null;
-  if (m.state.move !== 'death1' || action !== 'fire') return null;
-  const skin = skinOf(m);
-  const weapon = soldierWeaponForSkin(skin);
-  const attack: AttackChoice =
-    weapon === 'blaster' ? 'blaster' : weapon === 'machinegun' ? 'machinegun' : 'shotgun';
-  return {
-    num: m.edict.num,
-    classname: m.edict.classname,
-    attack,
-    move: 'death1',
-    dmgScale,
-    frame: m.state.frame,
-  };
+  if (!m.state.dead || m.state.gibbed) return null;
+  if (action !== 'fire') return null;
+  if (m.kind === 'soldier' && m.state.move === 'death1') {
+    const skin = skinOf(m);
+    const weapon = soldierWeaponForSkin(skin);
+    const attack: AttackChoice =
+      weapon === 'blaster' ? 'blaster' : weapon === 'machinegun' ? 'machinegun' : 'shotgun';
+    return {
+      num: m.edict.num,
+      classname: m.edict.classname,
+      attack,
+      move: 'death1',
+      dmgScale,
+      frame: m.state.frame,
+    };
+  }
+  // Infantry "Off with his head" spray (m_infantry.c death211-222): always
+  // the machinegun — infantry has no skins — resolved through the live
+  // infantry bullet table (dmg 3, infatck1.wav) exactly like attack1 fire.
+  if (m.kind === 'infantry' && m.state.move === 'death2') {
+    return {
+      num: m.edict.num,
+      classname: m.edict.classname,
+      attack: 'machinegun',
+      move: 'death2',
+      dmgScale,
+      frame: m.state.frame,
+    };
+  }
+  return null;
 }
 
 /**
