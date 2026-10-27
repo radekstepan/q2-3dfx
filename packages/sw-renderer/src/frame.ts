@@ -288,6 +288,8 @@ export class SoftwareRenderer implements Refresh {
   };
   private alphaDeferredSi: Int32Array = new Int32Array(0);
   private alphaDeferredOrd: Int32Array = new Int32Array(0);
+  /** Per-recorded-surface dlight bits (resolved at deferral; read post-kick). */
+  private alphaDeferredBits: Int32Array = new Int32Array(0);
   private frame = 0;
   private fallbackMesh = createBoxMesh(20);
   /** Procedural gun fallback (registerModel md2 without real data). Lazy. */
@@ -344,13 +346,17 @@ export class SoftwareRenderer implements Refresh {
    * deferred pool kick), then draws the entity foreground after the kick
    * completes. The kick's lazy per-band clear would otherwise wipe direct
    * plane writes (alias/entities incl. the depthHack viewmodel, sprites,
-   * particles, tracer beams). Sync path unaffected (flag defaults false).
-   * `fgCam`/`fgWorld` are the phase-1 refs (no allocation, never read
-   * across frames; the path is non-reentrant by contract).
+   * particles, tracer beams, translucent alpha). Sync path unaffected (flag
+   * defaults false). `fgCam`/`fgWorld`/`fgDyn`/`fgTMode`/`fgAlphaCount` are
+   * the phase-1 refs (no allocation, never read across frames; the path is
+   * non-reentrant by contract).
    */
   private skipForeground = false;
   private fgCam: Camera | null = null;
   private fgWorld: MiniWorld | null = null;
+  private fgDyn: DynamicLight[] | null = null;
+  private fgTMode = 0;
+  private fgAlphaCount = 0;
   /**
    * Overdraw-attribution counters (M3.3 option b). Null unless a diagnostic
    * measurement is armed via testMeasureOverdraw(); the per-surface loop only
@@ -806,6 +812,9 @@ export class SoftwareRenderer implements Refresh {
       pooled.beginFrame();
       pooled.stagePalette(this.palette);
       this.bandBackend.batchesDrawn = 0;
+      // A new frame stages from empty regions: the deferred inline-rest
+      // latch from any previous frame must not leak into this one.
+      this.bandBackend.deferredInlineRest = false;
     } else {
       this.idx.fill(0);
       this.zb.fill(0);
@@ -948,6 +957,7 @@ export class SoftwareRenderer implements Refresh {
     if (this.alphaDeferredSi.length < nvis) {
       this.alphaDeferredSi = new Int32Array(Math.max(16, nvis));
       this.alphaDeferredOrd = new Int32Array(Math.max(16, nvis));
+      this.alphaDeferredBits = new Int32Array(Math.max(16, nvis));
     }
     let nAlpha = 0;
     for (let i = 0; i < nvis; i++) {
@@ -982,6 +992,9 @@ export class SoftwareRenderer implements Refresh {
         if (d) d.emitted++;
         this.alphaDeferredSi[nAlpha] = si;
         this.alphaDeferredOrd[nAlpha] = order;
+        // Resolve dlight bits now (the closure reads phase-1 light state);
+        // the alpha loop runs post-kick in drawForeground.
+        this.alphaDeferredBits[nAlpha] = dlightFrameBits(surf.id);
         nAlpha++;
         continue;
       }
@@ -1141,18 +1154,71 @@ export class SoftwareRenderer implements Refresh {
         if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
       }
     }
-    // Deferred alpha draw (R_DrawAlphaSurfaces): the recorded translucent
-    // surfaces draw here in reverse traversal order (back-to-front), blended
-    // through the classic TS backend into the live planes, so the
-    // pooled/wasm paths need no TRANS plumbing. Counters merge into the
-    // active backend, keeping frameStats and the M3.3 attribution exact
-    // (buckets were counted at deferral time; only maxBatchSpans updates
-    // here). Tables build lazily on the first translucent frame, so
-    // translucent-free worlds (devroom golden) never pay for them. The alpha
-    // loop bypasses fused emission (flat undefined): the fused copy would sit
-    // unstaged in the SAB (the pool kick runs after this loop), so alpha
-    // batches always tag objects and draw classic.
-    for (let a = nAlpha - 1; a >= 0; a--) {
+
+    // Frame accumulation (M8.1 async-render step 1): geometry captured every
+    // batch above; complete the frame with ONE pool kick here, before any
+    // direct plane writes (alias/sprites/particles depth-test against the
+    // world). Unpooled / accum-disabled: no-op, batches already drew inline.
+    // candidatePixels finalises from the backend counters either way (the
+    // per-batch deltas telescoped to the same total).
+    if (this.backend === this.bandBackend && this.bandBackend.dispatcher &&
+      this.bandBackend.accumEnabled && !this.bandBackend.flushDeferred) {
+      if (ph) pt = phaseNow();
+      this.bandBackend.flushAccum();
+      if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
+    }
+    candidatePixels = this.backend.pixelsDrawn - pixelsBase;
+
+    // Stash the foreground inputs for the async path (refs only): the
+    // deferred world kick must complete before any direct plane writes
+    // (its lazy per-band clear would wipe them — see drawForeground).
+    this.fgCam = cam;
+    this.fgWorld = worldData;
+    this.fgDyn = dyn;
+    this.fgTMode = tMode;
+    this.fgAlphaCount = nAlpha;
+    if (!this.skipForeground) spansEmitted += this.drawForeground(cam, worldData, view, dyn, entities);
+    // Foreground draws (alpha) tally into the backend counters: finalise
+    // the candidate count after them so it reconciles with finishStats.
+    candidatePixels = this.backend.pixelsDrawn - pixelsBase;
+    if (d) d.candidatePixels = candidatePixels;
+    // Stash the stats partials: finishStats() reads the backend counters,
+    // which are only complete after the (possibly async) frame kick.
+    // The sync path's counters are already complete, so its stats are
+    // unchanged; the async path re-runs finishStats() after the kick.
+    this.stSpansEmitted = spansEmitted;
+    this.stPixelsBase = pixelsBase;
+    this.stT0 = t0;
+    return this.finishStats();
+  }
+
+  /**
+   * Entity foreground: deferred translucent alpha (R_DrawAlphaSurfaces)
+   * first — it must land after the pool kick (the kick would wipe these
+   * direct plane writes), then world-placed alias / sprites / particles
+   * (M3.4), game entities (MD2 alias incl. the depthHack viewmodel,
+   * sprites, tracer beams) and renderer-owned tracer beams, then dlight
+   * aging. Alpha stays ahead of entities exactly like the old pre-kick
+   * order (relative compositing unchanged); only its position vs the kick
+   * moved. Bit-identical either way: world-first, foreground-second, all
+   * writes depth-guarded. Zero allocation (phase timing uses the armed
+   * scratch). Returns the alpha spans emitted (feeds the stats stash).
+   */
+  private drawForeground(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[], entities: Entity[]): number {
+    const ph = this.phaseArmed ? this.phaseAcc : null;
+    let pt = ph ? phaseNow() : 0;
+    const d = this.diagArmed ? this.diagAcc : null;
+    let alphaSpans = 0;
+    // Translucent alpha draw (R_DrawAlphaSurfaces): the recorded surfaces
+    // draw here in reverse traversal order (back-to-front), blended through
+    // the classic TS backend into the live planes, so the pooled/wasm paths
+    // need no TRANS plumbing. Runs FIRST in the foreground (after the pool
+    // kick): the kick would wipe these direct plane writes. Counters merge
+    // into the active backend, keeping frameStats and the M3.3 attribution
+    // exact (buckets were counted at deferral time; only maxBatchSpans is
+    // updated here). Tables build lazily on the first translucent frame, so
+    // translucent-free worlds never pay for them.
+    for (let a = this.fgAlphaCount - 1; a >= 0; a--) {
       const si = this.alphaDeferredSi[a]!;
       const order = this.alphaDeferredOrd[a]!;
       const surf = worldData.surfaces[si]!;
@@ -1184,7 +1250,7 @@ export class SoftwareRenderer implements Refresh {
         const scalesCopy: number[] = [];
         for (let k = 0; k < nValid; k++) scalesCopy.push(this.styleScratch[k]!);
         if (scalesCopy.length === 0) scalesCopy.push(1);
-        block = this.buildSurfaceBlock(worldData, surf, mip, scalesCopy, dyn, dlightFrameBits(surf.id));
+        block = this.buildSurfaceBlock(worldData, surf, mip, scalesCopy, dyn, this.alphaDeferredBits[a]!);
         this.cache.put(surf.id, stylesHash, mip, block);
       }
       const tex = texView;
@@ -1223,7 +1289,7 @@ export class SoftwareRenderer implements Refresh {
       if (this.backend !== tb) tb.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
       const t = drawSpansTranslucent(this.idx, this.zb, this.fbW, this.fbH, this.spanList,
         tex, lb, this.colormap, this.alpha33, this.alpha66,
-        surf.turbulent ? tb.turbTable : null, view.time, tMode === 2);
+        surf.turbulent ? tb.turbTable : null, view.time, this.fgTMode === 2);
       this.transSpans += t.spans;
       if (this.backend === tb) {
         tb.spansDrawn += t.spans;
@@ -1234,58 +1300,13 @@ export class SoftwareRenderer implements Refresh {
       }
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
-      spansEmitted += endCount - start;
+      alphaSpans += endCount - start;
       if (d) {
         const batchSpans = endCount - start;
         if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
       }
     }
 
-    // Frame accumulation (M8.1 async-render step 1): geometry captured every
-    // batch above; complete the frame with ONE pool kick here, before any
-    // direct plane writes (alias/sprites/particles depth-test against the
-    // world). Unpooled / accum-disabled: no-op, batches already drew inline.
-    // candidatePixels finalises from the backend counters either way (the
-    // per-batch deltas telescoped to the same total).
-    if (this.backend === this.bandBackend && this.bandBackend.dispatcher &&
-      this.bandBackend.accumEnabled && !this.bandBackend.flushDeferred) {
-      if (ph) pt = phaseNow();
-      this.bandBackend.flushAccum();
-      if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
-    }
-    candidatePixels = this.backend.pixelsDrawn - pixelsBase;
-
-    // Stash the foreground inputs for the async path (refs only): the
-    // deferred world kick must complete before any direct plane writes
-    // (its lazy per-band clear would wipe them — see drawForeground).
-    this.fgCam = cam;
-    this.fgWorld = worldData;
-    if (!this.skipForeground) this.drawForeground(cam, worldData, entities);
-    if (d) d.candidatePixels = candidatePixels;
-    // Stash the stats partials: finishStats() reads the backend counters,
-    // which are only complete after the (possibly async) frame kick.
-    // The sync path's counters are already complete, so its stats are
-    // unchanged; the async path re-runs finishStats() after the kick.
-    this.stSpansEmitted = spansEmitted;
-    this.stPixelsBase = pixelsBase;
-    this.stT0 = t0;
-    return this.finishStats();
-  }
-
-  /**
-   * Entity foreground: world-placed alias / sprites / particles (M3.4)
-   * plus game entities (MD2 alias incl. the depthHack viewmodel, sprites,
-   * tracer beams) and renderer-owned tracer beams, then dlight aging.
-   * Direct index/depth-plane writes — must run AFTER the world span kick
-   * on pooled paths (the kick lazily clears every band it touches, which
-   * would wipe these draws). The sync path calls this inline right after
-   * its kick; renderViewAsync calls it after the deferred kick completes.
-   * Bit-identical either way: world-first, foreground-second, all writes
-   * depth-guarded. Zero allocation (phase timing uses the armed scratch).
-   */
-  private drawForeground(cam: Camera, worldData: MiniWorld, entities: Entity[]): void {
-    const ph = this.phaseArmed ? this.phaseAcc : null;
-    let pt = ph ? phaseNow() : 0;
     // world-placed alias / sprites / particles (M3.4 in the devroom)
     // Pooled path with zero span batches (degenerate frame): planes were
     // never cleared lazily, so fill once before direct plane writes.
@@ -1407,6 +1428,7 @@ export class SoftwareRenderer implements Refresh {
     // re-added expires after DEFAULT_DLIGHT_TTL_FRAMES renders (swept at the
     // top of the next renderView, with one serial bump / one cache rebuild).
     this.dlights.ageFrame();
+    return alphaSpans;
   }
 
   /**
@@ -1463,7 +1485,13 @@ export class SoftwareRenderer implements Refresh {
     // World kick complete (planes valid) — now the direct plane writes.
     const fgCam = this.fgCam;
     const fgWorld = this.fgWorld;
-    if (fgCam && fgWorld) this.drawForeground(fgCam, fgWorld, entities);
+    const fgDyn = this.fgDyn;
+    if (fgCam && fgWorld && fgDyn) {
+      this.stSpansEmitted += this.drawForeground(fgCam, fgWorld, view, fgDyn, entities);
+      // The foreground (alpha) tallies into the backend counters after the
+      // phase-1 stash: refresh the diag candidate count to match finishStats.
+      if (this.diagArmed) this.diagAcc.candidatePixels = this.backend.pixelsDrawn - this.stPixelsBase;
+    }
     return this.finishStats();
   }
 

@@ -273,4 +273,93 @@ describe('async foreground (pooled kick ordering, dist-gated)', () => {
     console.log(`foreground gun sync=${sync} async=${async}`);
     expect(async).toBe(sync);
   });
+
+  it('pooled sync/async keep TRANS66 water like the classic path (base1 pool)', async () => {
+    if (!process.env.Q2_PAK) {
+      console.log('SKIP water test: Q2_PAK not set');
+      return;
+    }
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP water test: dist not built (run yarn build first)');
+      return;
+    }
+    const { resetCVars, setCVar } = await import('@q2/config');
+    const { loadBsp } = await import('@q2/bsp');
+    const { parsePCX, parseWAL } = await import('@q2/formats');
+    const pakPath = process.env.Q2_PAK as string;
+    const data = readFileSync(pakPath);
+    const dirofs = data.readUInt32LE(4);
+    const dirlen = data.readUInt32LE(8);
+    const entry = (name: string): ArrayBuffer => {
+      for (let o = dirofs; o < dirofs + dirlen; o += 64) {
+        if (data.subarray(o, o + 56).toString().replace(/\0.*$/, '') === name) {
+          const off = data.readUInt32LE(o + 56);
+          const len = data.readUInt32LE(o + 60);
+          return data.buffer.slice(data.byteOffset + off, data.byteOffset + off + len) as ArrayBuffer;
+        }
+      }
+      throw new Error(`pak entry missing: ${name}`);
+    };
+    const bsp = loadBsp(entry('maps/base1.bsp'));
+    const walCache = new Map<string, BspTexelSource | null>();
+    const texelFor = (walName: string): BspTexelSource | null => {
+      if (walCache.has(walName)) return walCache.get(walName)!;
+      let src: BspTexelSource | null = null;
+      try {
+        const wal = parseWAL(entry(`textures/${walName}.wal`));
+        src = { texels: wal.mips[0] as Uint8Array, width: wal.width, height: wal.height };
+      } catch { src = null; }
+      walCache.set(walName, src);
+      return src;
+    };
+    const world = { name: 'base1', data: bspToMiniWorld(bsp, { texelFor }) };
+    const pcx = parsePCX(entry('pics/colormap.pcx'));
+    // Low-road pool from above (testkit glass golden view): full-screen water.
+    const view = {
+      origin: new Float32Array([430, 620, -150]),
+      angles: new Float32Array([90, 0, 0]),
+      fovX: 90, time: 1.5,
+      lightStyles: new Float32Array(256).fill(1),
+    };
+    const W = 320, H = 240;
+    const renderMode = async (pooled: boolean, useAsync: boolean): Promise<string> => {
+      resetCVars();
+      const fb = createFramebuffer(W, H, true);
+      const r = new SoftwareRenderer();
+      r.init(fb);
+      r.setPalette(pcx.palette);
+      let pool: BandWorkerPool | null = null;
+      if (pooled) {
+        setCVar(SW_WORKERS_CVAR, 4);
+        setCVar(SW_ACCUM_CVAR, 1);
+        if (!r.syncWorkersFromCvar()) throw new Error('banded path unavailable');
+        pool = BandWorkerPool.create(3, W, H, { indexJsPath: distUrl.pathname });
+        if (!pool) throw new Error('pool unavailable');
+        r.attachWorkerPool(pool);
+      }
+      try {
+        r.beginFrame();
+        if (useAsync) {
+          await r.renderViewAsync(view, world, []);
+          await r.endFrameAsync();
+        } else {
+          r.renderView(view, world, []);
+          r.endFrame();
+        }
+        const tspans = r.testTranslucentSpans();
+        if (tspans === 0) throw new Error('water view engaged no translucent spans');
+        return hashIdx(r.getFramebuffer().index!);
+      } finally {
+        if (pool) await pool.dispose();
+        resetCVars();
+      }
+    };
+    const classic = await renderMode(false, false);
+    const pooledSync = await renderMode(true, false);
+    const pooledAsync = await renderMode(true, true);
+    console.log(`water classic=${classic} pooledSync=${pooledSync} pooledAsync=${pooledAsync}`);
+    expect(pooledSync).toBe(classic);
+    expect(pooledAsync).toBe(classic);
+  });
 });

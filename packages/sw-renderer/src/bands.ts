@@ -657,14 +657,19 @@ export function bandWorkerLoop(
     if (s === seq) continue; // spurious wakeup
     seq = s;
     const frame = Atomics.load(ctl, CTL_FRAME);
-    if (frame !== lastFrame) {
+    const fbWNow = Atomics.load(ctl, CTL_FBW);
+    const fbHNow = Atomics.load(ctl, CTL_FBH);
+    const job = Atomics.load(ctl, CTL_JOB);
+    // Resolve kicks must never clear: they only read the planes (palette
+    // expand), and on all-inline / zero-batch frames no raster kick ran this
+    // generation — clearing here would wipe the finished frame (the browser
+    // doll-house: black world + surviving foreground). Freshness is owned by
+    // raster kicks and main-thread full clears, never by the resolve.
+    if (frame !== lastFrame && job !== JOB_RESOLVE) {
       views.idx.fill(0, y0 * fbW, y1 * fbW);
       views.zb.fill(0, y0 * fbW, y1 * fbW);
       lastFrame = frame;
     }
-    const fbWNow = Atomics.load(ctl, CTL_FBW);
-    const fbHNow = Atomics.load(ctl, CTL_FBH);
-    const job = Atomics.load(ctl, CTL_JOB);
     let r: { pixels: number; spans: number };
     if (job === JOB_RESOLVE) {
       // Resolve kick (M8.1 parallel resolve): expand the final index plane
@@ -782,6 +787,15 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
    */
   flushDeferred = false;
   /**
+   * Deferred inline rest-of-frame (async-break rule): once an inline plane
+   * write happened inside a deferred frame (break replay, unsuitable batch),
+   * the deferred final kick must never run — its lazy worker clear would
+   * wipe the inline work. Set by the drawSpans funnel, reset per frame in
+   * beginFrame-adjacent staging reset (see frame.ts beginFrame), read by the
+   * funnel and by flushAccumAsync's early-out (pending stays empty).
+   */
+  deferredInlineRest = false;
+  /**
    * Fused-emission staging for the CURRENT batch (M8.1): the renderer sets
    * this from the pool's flatCursor() before emitSpansForPoly runs, so
    * drawSpans can record the descriptor without re-packing. base < 0 means
@@ -816,6 +830,15 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
       return;
     }
     if (this.dispatcher && this.accumEnabled) {
+      // Deferred inline rest-of-frame (async-break rule): once an inline
+      // plane write happened in a deferred frame, the deferred kick must
+      // never run (its lazy worker clear would wipe the inline work), so
+      // every later batch also goes inline and the final kick finds nothing
+      // pending. All writes stay depth-guarded: identical output.
+      if (this.flushDeferred && this.deferredInlineRest) {
+        this.runInline(list, tex, light);
+        return;
+      }
       // Fused path: spans were packed during emission (pendingFlat); record
       // the descriptor. Anything off (no fused data, sequencing break,
       // exhausted regions) flushes pending work first (preserving global
@@ -833,9 +856,12 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
       if (this.flushDeferred) {
         // Async frame: a sync kick would block the calling thread, so
         // replay staged batches inline now (ordering preserved) and run
-        // this batch inline after them. The later async kick finds nothing
-        // pending and no-ops. Depth-guarded convergence: identical output.
+        // this batch inline after them. Latch inline-rest: the deferred
+        // final kick must not run afterwards (it would clear these inline
+        // writes), so the rest of the frame stays inline and the kick
+        // finds nothing pending. Depth-guarded convergence: identical output.
         this.flushAccumInline();
+        this.deferredInlineRest = true;
       } else {
         this.flushAccum();
       }
@@ -843,6 +869,13 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
       return;
     }
     if (this.dispatcher) {
+      // Deferred inline rest-of-frame (same rule as the accum path): an
+      // inline batch followed by a per-batch kick would be wiped by the
+      // kick's lazy clear, so once inline in a deferred frame, stay inline.
+      if (this.flushDeferred && this.deferredInlineRest) {
+        this.runInline(list, tex, light);
+        return;
+      }
       const r = this.dispatcher.dispatch(
         list, tex, light, this.colormap, this.time,
         this.fbW, this.fbH, this.idx, this.zb,
@@ -865,6 +898,7 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
         this.zb.fill(0);
         this.clearedFrame = f;
       }
+      if (this.flushDeferred) this.deferredInlineRest = true;
     }
     this.runInline(list, tex, light);
   }

@@ -1248,6 +1248,21 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - combat.test.ts ss-burst in devroom — touches none of this lane's paths:
 - devroom spawns no movers (TouchButtons/carry/clip loops all no-op) and
 - the test never sets BUTTON_USE, so it cannot execute this lane's code).
+- CLOSED 2026-10-27 (pooled ordering — the "doll-house" black frame): the
+- deferred async kick's lazy per-band clear wiped everything drawn before
+- it, so staging-exhausting views (whole map visible) lost the world in the
+- live browser loop, and the translucent alpha loop (drawn pre-kick) vanished
+- nondeterministically on pooled paths. Fixed in-lock: foreground draws
+- after the kick (`drawForeground` split out of `renderView`, sync order
+- unchanged), deferred breaks replay inline and latch inline-rest (no
+- trailing kick to wipe them), alpha runs first in the foreground, and the
+- parallel resolve never clears (freshness owned by raster kicks). Pins:
+- pooled async vs sync with world alias and depthHack gun (both fail
+- pre-fix), pooled sync/async vs classic on TRANS66 pool water (fails
+- pre-fix on both pooled paths); 135-view base1 corner sweep async-identical
+- to sync with classic walk hashes unchanged. Browser workers run
+- `render-worker.ts` from source (vite), so no dist rebuild is needed for
+- the live loop; headless pool tests run the rebuilt `dist` bundle.
 - CLOSED 2026-10-27 (async foreground wipe — the missing hand gun):
 - `renderViewAsync` drew the entity foreground BEFORE the deferred pooled
 - world kick, whose lazy per-band clear wiped every direct plane write
