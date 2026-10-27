@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MONSTER_HULL_MAXS,
   MONSTER_HULL_MAXS_DUCKED,
+  monsterPain,
   mulberry32,
   resetEdictNums,
 } from '@q2/game';
@@ -24,6 +25,7 @@ import {
 } from './index.js';
 import {
   arriveCombatPoint,
+  deathFireEvent,
   duckHoldFrozen,
   monsterHullMaxs,
   monsterSeesPoint,
@@ -361,5 +363,84 @@ describe('sight delay + burst refire at the tick level', () => {
     st.time += 0.1;
     SV_MonsterTick(st, player, trace, null, () => 0, { sightTrace: trace });
     expect(m.state.move === 'attack1' || m.state.move === 'attack2').toBe(true);
+  });
+});
+
+describe('soldier last-ditch death fire (m_soldier.c death1)', () => {
+  it('death frames 21/24 emit skin-gun events; corpse stays hittable/gibbable', () => {
+    // C soldier_move_death1 (FRAME_death101-136): soldier_fire6 (flash 5)
+    // at 0-based index 21, soldier_fire7 (flash 6) at index 24. Gunner
+    // and infantry death frames are all NULL — only the soldier shoots.
+    resetEdictNums();
+    const st = SV_Init();
+    const trace = floorTrace();
+    const m = SV_SpawnMonster(st, 'monster_soldier_light', v3(200, 0, 24)); // skin 0: blaster
+    expect(monsterPain(m.state, 25, () => 0.5)).toBe('dead'); // 20hp - 25: dead, past gib (-30)
+    expect(m.state.dead).toBe(true);
+    expect(m.state.gibbed).toBe(false);
+    expect(m.state.move).toBe('death1');
+    const playerPos = v3(0, 0, 24);
+    const firedFrames: number[] = [];
+    for (let t = 0; t < 40; t++) {
+      st.time += 0.1;
+      const evs = SV_MonsterTick(st, playerPos, trace, null, mulberry32(t), { sightTrace: trace });
+      for (const ev of evs) {
+        expect(ev.attack).toBe('blaster'); // skin-keyed, never the move label
+        expect(ev.move).toBe('death1');
+        firedFrames.push(ev.frame);
+      }
+    }
+    expect(firedFrames).toEqual([21, 24]); // exactly the two C armed frames
+    // The helper's own gates (table-driven: the action tag rules, keyed to
+    // the armed death1 move — not a hardcoded frame or a spent body; C
+    // fires blindly, so there is no LOS gate).
+    m.state.frame = 21;
+    const unit = deathFireEvent(m, 'fire', 1);
+    expect(unit).not.toBeNull();
+    expect(unit!.frame).toBe(21);
+    expect(unit!.attack).toBe('blaster');
+    expect(deathFireEvent(m, 'move', 1)).toBeNull();
+    m.state.move = 'run';
+    expect(deathFireEvent(m, 'fire', 1)).toBeNull();
+    m.state.move = 'death1';
+    // Corpse re-hits hold until overkill minces (gib-first ordering).
+    expect(monsterPain(m.state, 20, () => 0.5)).toBe('dead');
+    expect(m.state.gibbed).toBe(false);
+    expect(monsterPain(m.state, 10, () => 0.5)).toBe('gib');
+    expect(m.state.gibbed).toBe(true);
+    // Gibbed bodies are gone: unhittable, silent, skipped by the tick.
+    expect(monsterPain(m.state, 100, () => 0.5)).toBe('none');
+    const after: number[] = [];
+    for (let t = 0; t < 10; t++) {
+      st.time += 0.1;
+      const evs = SV_MonsterTick(st, playerPos, trace, null, mulberry32(100 + t), { sightTrace: trace });
+      for (const ev of evs) after.push(ev.frame);
+    }
+    expect(after).toEqual([]);
+  });
+
+  it('the death-fire event resolves to a live foe bolt + muzzle + damage', () => {
+    resetEdictNums();
+    const st = SV_Init();
+    const trace = floorTrace();
+    const m = SV_SpawnMonster(st, 'monster_soldier_light', v3(200, 0, 24));
+    expect(monsterPain(m.state, 25, () => 0.5)).toBe('dead');
+    const player = {
+      pos: v3(0, 0, 24),
+      mins: v3(-16, -16, -24),
+      maxs: v3(16, 16, 32),
+      view: 22,
+    };
+    const rand = mulberry32(7);
+    let sawBolt = false;
+    for (let t = 0; t < 40; t++) {
+      SV_Tick(st, 0.1, { player, trace, rand });
+      if (st.bolts.length > 0) sawBolt = true;
+    }
+    // Both armed frames spawned real foe bolts (blaster skin): at least one
+    // was in flight when sampled, both muzzles persist, both bolts connected.
+    expect(sawBolt).toBe(true);
+    expect(st.muzzles.filter((z) => z.foe)).toHaveLength(2);
+    expect(st.playerHealth).toBe(100 - 2 * 5);
   });
 });

@@ -1484,6 +1484,79 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(train.arrived).toBe(true);
   });
 
+  it('exit door opens without starting the lift (door *31 vs train t88-t90)', { timeout: 180000 }, () => {
+    // C wiring (g_func.c): doors fire targets when they START opening
+    // (door_go_up -> G_UseTargets, never at top arrival), and named trains
+    // wait for a use (func_train_find only auto-starts targetname-less
+    // trains). Base1's exit plug *31 (targetname t4) carries NO target of
+    // its own, so no door cascade can reach the lift's t91 — only the *13
+    // button (target t91) runs it. Opening the door must leave the train
+    // parked; using t91 must still run the full ride.
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    spawnWith(st, map, 1, true);
+    const train = st.trains.find((t) => !t.ship)!;
+    const door31 = st.movers.find((m) => m.ent.extra['model'] === '*31')!;
+    expect(door31.ent.targetname).toBe('t4');
+    expect(door31.ent.target ?? '').toBe('');
+    const parked: [number, number, number] = [train.ent.origin[0]!, train.ent.origin[1]!, train.ent.origin[2]!];
+    expect(train.started).toBe(false);
+    // The door button's use: open the plug the C way, full open-hold-close
+    // cycle. The verdict samples every tick so a transient open counts.
+    SV_UseTargetname(st, 't4');
+    let opened = false;
+    for (let i = 0; i < 100; i++) {
+      SV_Tick(st, 0.1);
+      const dx = door31.ent.origin[0]! - door31.pos1[0]!;
+      const dy = door31.ent.origin[1]! - door31.pos1[1]!;
+      const dz = door31.ent.origin[2]! - door31.pos1[2]!;
+      if (Math.hypot(dx, dy, dz) > 10) opened = true;
+    }
+    expect(opened).toBe(true); // the plug genuinely travelled (non-vacuous)
+    expect(train.started).toBe(false);
+    expect([train.ent.origin[0]!, train.ent.origin[1]!, train.ent.origin[2]!]).toEqual(parked);
+    // Touch-open (Touch_DoorTrigger volume at the plug mouth) is equally
+    // clean: camp the volume, the door cycles at the top, the lift sits.
+    SV_TouchDoorsAt(
+      st,
+      { origin: v3(-1774, 1536, 104), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) },
+      'player',
+    );
+    for (let i = 0; i < 30; i++) SV_Tick(st, 0.1);
+    expect(train.started).toBe(false);
+    expect([train.ent.origin[0]!, train.ent.origin[1]!, train.ent.origin[2]!]).toEqual(parked);
+    // And the lift itself still runs when its button's target fires.
+    SV_UseTargetname(st, 't91');
+    expect(train.started).toBe(true);
+    for (let i = 0; i < 30; i++) SV_Tick(st, 0.1);
+    expect(train.ent.origin[0]!).toBeCloseTo(-16, 3);
+    expect(train.ent.origin[2]!).toBeCloseTo(40, 3);
+    expect(train.arrived).toBe(true);
+  });
+
+  it('no door/relay/button use in the lump can start the exit lift except t91', { timeout: 300000 }, () => {
+    // Relay audit on real data (same pattern as the t37 exit-chain audit):
+    // fire every distinct targetname in the lump; only the lift button's
+    // t91 may start the exit train. Catches cascade fan-out (a door target
+    // wrongly wired to a train, a relay chain leaking into t91).
+    const { map } = loadBase1();
+    const dicts = parseEntities(map.entities);
+    const names = [...new Set(dicts.map((d) => d['targetname']).filter((t): t is string => !!t))].sort();
+    expect(names.length).toBeGreaterThan(100);
+    const starters: string[] = [];
+    for (const tn of names) {
+      resetEdictNums();
+      const st = SV_Init();
+      spawnWith(st, map, 1, true);
+      const train = st.trains.find((t) => !t.ship)!;
+      SV_UseTargetname(st, tn);
+      for (let i = 0; i < 5; i++) SV_Tick(st, 0.1);
+      if (train.started) starters.push(tn);
+    }
+    expect(starters).toEqual(['t91']);
+  });
+
   it('ships: teleport-closed loops wrap forever, never stall after one pass', { timeout: 120000 }, () => {
     // All three base1 ship loops close through a TELEPORT path_corner
     // (t147->t143, t141->t137, t130->t131). C train_next chains via

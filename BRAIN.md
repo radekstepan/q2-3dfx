@@ -958,6 +958,17 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - SP-only) and render the deadbod dude MD2 at lump origin + yaw with the C
 - pose frame (spawnflags bits first-match-wins → 1..5, else 0), persisting.
 - Gate (o)/(p) pin it (16/16 green); (g) 232 → 332, (n) 11 → 9.
+- CLOSED 2026-10-26 (combat/movers feedback lane): soldier last-ditch
+- death fire renders (C m_soldier.c death1 frames 21/24 = soldier_fire6/7,
+- the only armed death move; gunner/infantry deaths all NULL): lite death1
+- table tags 21/24 'fire', deathFireEvent emits a skin-gun event through
+- the live resolver (foe bolt + muzzle + tracer + damage, unconditional
+- like C), corpse stays hittable/gibbable (re-hit holds, overkill minces).
+- Exit lift never starts from its door (C door_go_up fires on open-start,
+- named trains wait for use; base1 plug *31 carries no target so no
+- cascade reaches t91 — real-data audit proves only t91 starts it):
+- door-open pins + 120-targetname no-fan-out audit. Gate (q) pins the
+- rendered death bolt + muzzle in the death-frame 21/24 window (17/17).
 - OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
 - (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
 - `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`

@@ -41,6 +41,9 @@
 //   (p) dead soldiers render: the lump holds 12 misc_deadsoldier and every
 //       one submits the deadbod dude MD2 at its lump origin + C pose frame
 //       (spawnflags bits, first match wins), persisting (never freed).
+//   (q) a dying soldier fires its last-ditch shot (death1 frames 21/24):
+//       the foe bolt renders in flight out of the corpse's muzzle, aimed
+//       back at the player, plus the muzzle-flash drain.
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { resetCVars, setCVar } from '@q2/config';
 import { BUTTON_DUCK } from '@q2/input';
@@ -940,5 +943,61 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     // snapshot corpse path) after ticks advance.
     stepDriver(driver, neutralCmd(), 10);
     expect(driver.extraEntities()!.filter((x) => x.model === boot.models!.corpse)).toHaveLength(12);
+  });
+
+  it('(q) a dying soldier fires its last-ditch shot: foe bolt + muzzle render', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    // Courtyard light soldier #341 (skin 0 -> blaster -> a real foe bolt on
+    // death, m_soldier.c soldier_move_death1 frames 21/24). The ambush
+    // latches once the player overlooks the courtyard (gate (b) proves the
+    // lane), so the body is hittable and stays in the open.
+    const A = driver.server.monsters.find((m) => m.edict.num === 341)!;
+    expect(A.edict.extra['skinnum']).toBe('0');
+    driver.pm.origin = v3(-904, 1326, -24);
+    driver.pm.velocity = v3();
+    // Kill it with aimed blaster fire (20hp light = 2 hits), strafing the
+    // return fire the way (b) does. The tick the corpse lands is K.
+    let killedAt = -1;
+    let strafe = 1;
+    for (let t = 0; t < 200 && killedAt < 0 && driver.playerHealth > 0; t++) {
+      if (t % 40 === 0) strafe = -strafe as 1 | -1;
+      const yaw = yawAt([driver.pm.origin[0]!, driver.pm.origin[1]!], [A.edict.origin[0]!, A.edict.origin[1]!]);
+      driver.step(attackCmd([0, yaw, 0]), 0.1);
+      if (A.state.dead) killedAt = t;
+    }
+    expect(killedAt).toBeGreaterThanOrEqual(0);
+    expect(driver.playerHealth).toBeGreaterThan(0);
+    const corpse: [number, number] = [A.edict.origin[0]!, A.edict.origin[1]!];
+    const monshotsBefore = driver.events.filter((e) => e === 'monshot').length;
+    // Watch the 36-frame death move: the C armed frames (21/24, ~2.1s/2.4s
+    // after death) must submit a foe bolt in flight out of the corpse's
+    // muzzle, aimed back at the player — plus the muzzle flash drain.
+    let boltSeenAt = -1;
+    let monshotTick = -1;
+    let s2 = 1;
+    for (let k = 1; k <= 45 && driver.playerHealth > 0; k++) {
+      if (k % 40 === 0) s2 = -s2 as 1 | -1;
+      const yaw = yawAt([driver.pm.origin[0]!, driver.pm.origin[1]!], [corpse[0], corpse[1]]);
+      driver.step({ msec: 100, angles: [0, yaw, 0], forwardmove: 0, sidemove: 400 * s2, upmove: 0, buttons: 0 }, 0.1);
+      const wantYaw = yawAt(corpse, [driver.pm.origin[0]!, driver.pm.origin[1]!]);
+      for (const x of driver.extraEntities() ?? []) {
+        if (x.model !== boot.models!.bolt) continue;
+        // Out of the corpse's muzzle, flying at us: near the corpse→player
+        // lane (a 600u/s bolt covers ~60u/tick, so the spawn tick reads
+        // close and later ticks read downrange) and on the corpse→player
+        // bearing. Live fire from elsewhere fails the bearing pin; the
+        // spawn-tick position fails the lane pin for cross-traffic.
+        if (Math.hypot(x.origin![0]! - corpse[0]!, x.origin![1]! - corpse[1]!) > 400) continue;
+        let dy = Math.abs(x.angles![1]! - wantYaw) % 360;
+        if (dy > 180) dy = 360 - dy;
+        if (dy < 20 && boltSeenAt < 0) boltSeenAt = k;
+      }
+      if (driver.events.filter((e) => e === 'monshot').length > monshotsBefore && monshotTick < 0) monshotTick = k;
+    }
+    expect(boltSeenAt).toBeGreaterThanOrEqual(16);
+    expect(boltSeenAt).toBeLessThanOrEqual(36);
+    expect(monshotTick).toBeGreaterThanOrEqual(16);
+    expect(monshotTick).toBeLessThanOrEqual(36);
   });
 });

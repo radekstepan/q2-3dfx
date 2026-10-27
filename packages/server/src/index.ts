@@ -91,6 +91,7 @@ import type {
 import {
   arriveCombatPoint,
   checkDodges,
+  deathFireEvent,
   duckHoldFrozen,
   duckShootEvent,
   maybeBurstRefire,
@@ -1595,7 +1596,13 @@ export function SV_MonsterTick(
     const ms: MonsterState = m.state;
     if (ms.gibbed) continue;
     if (ms.dead) {
-      monsterThink(ms); // corpses hold their last death frame
+      // Corpses hold their last death frame — except the soldier's
+      // last-ditch shot (monster-ai deathFireEvent: death1 'fire' frames
+      // 21/24 emit a skin-gun event through the live resolver, exactly
+      // like duck-and-shoot). Unconditional like C (no LOS gate).
+      const deadAction = monsterThink(ms);
+      const lastDitch = deathFireEvent(m, deadAction, skillMultiplier(st.skill));
+      if (lastDitch) events.push(lastDitch);
       continue;
     }
     // Woken bodies stamp their sight delay against the clock (SV_UseMonster

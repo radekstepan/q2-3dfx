@@ -497,6 +497,40 @@ export function duckShootEvent(
 }
 
 /**
+ * Last-ditch shot (m_soldier.c soldier_move_death1): the falling soldier
+ * fires soldier_fire6 (flash 5) at death-frame index 21 and soldier_fire7
+ * (flash 6) at index 24 — the only death move in the game with fire
+ * callbacks (gunner/infantry deaths are all NULL). Synthesized as a
+ * skin-gun event like duck-and-shoot (resolveMonsterFire keys the skin,
+ * never the label); the rendered move stays 'death1'. Null unless a dead
+ * (non-gibbed) soldier just played a 'fire'-tagged death frame. Fires
+ * unconditionally like C (no LOS gate — the flash 5/6 shot aims forward
+ * blindly; the lite resolver aims at the eye, and the ballistic bolt
+ * detonates on cover instead of phasing, so an unsighted shot reads as
+ * fire into the wall, never a wall-phase).
+ */
+export function deathFireEvent(
+  m: ServerMonster,
+  action: string,
+  dmgScale: number,
+): MonsterEvent | null {
+  if (m.kind !== 'soldier' || !m.state.dead || m.state.gibbed) return null;
+  if (m.state.move !== 'death1' || action !== 'fire') return null;
+  const skin = skinOf(m);
+  const weapon = soldierWeaponForSkin(skin);
+  const attack: AttackChoice =
+    weapon === 'blaster' ? 'blaster' : weapon === 'machinegun' ? 'machinegun' : 'shotgun';
+  return {
+    num: m.edict.num,
+    classname: m.edict.classname,
+    attack,
+    move: 'death1',
+    dmgScale,
+    frame: m.state.frame,
+  };
+}
+
+/**
  * Skill-3 burst refire (attack4/attack6 nextframe): when an attack move
  * runs to completion with the enemy still visible, half the time re-enter
  * it immediately instead of cooling down. Soldier ss skin only (the
