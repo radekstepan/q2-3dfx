@@ -3,5 +3,11 @@
 declare const process: {
   argv: string[];
   version: string;
+  env: Record<string, string | undefined>;
+  cwd(): string;
+  hrtime: {
+    (time?: [number, number]): [number, number];
+    bigint(): bigint;
+  };
   exit(code?: number): never;
 };

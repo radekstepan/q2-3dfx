@@ -11,6 +11,12 @@ export interface BenchOptions {
   notes?: string;
 }
 
+export {
+  runFrameBench, loadBase1World, attributeView, poolCompareView,
+  swRendererEsmPath, BASE1_VIEWS,
+  type AttribView, type FrameWorld, type PhaseRow, type PoolRow,
+} from './frame.js';
+
 export async function runBenchTool(opts: BenchOptions = {}): Promise<string> {
   const width = opts.width ?? 640;
   const height = opts.height ?? 480;
@@ -37,6 +43,6 @@ async function gitCommit(): Promise<string> {
 }
 
 const invoked = typeof process !== 'undefined' && process.argv[1] != null;
-if (invoked && /bench/.test(process.argv[1]!)) {
+if (invoked && /bench\/dist\/index\.(js|mjs|cjs)$/.test(process.argv[1]!)) {
   void runBenchTool();
 }

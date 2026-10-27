@@ -23,6 +23,43 @@
 // - Opt-in only: TS remains the default. Enable via the `sw_wasm` cvar (read
 //   through @q2/config, registered lazily so no cross-package change) or
 //   `SoftwareRenderer.setWasmEnabled(true)` after `initWasm()`.
+//
+// M9.1 SIMD v128 spike — outcome (2026-10-26): V8 scalar is at ceiling
+// for this loop shape, so no v128 path lands. Evidence and reasoning,
+// kept here so the next attempt starts from measurements, not guesses:
+//
+// 1. Locality probe (synth, 640×480 full-screen perspective spans):
+//    TS 87–103 Mpixel/s vs wasm scalar 92–116 Mpixel/s (1.2–1.3x) across
+//    8×8–256×256 texels — all L3-resident, so the loop is NOT cache-bound
+//    at these working sets. The wasm gap is bounds-check elimination +
+//    exact typing, which V8 already does well; little headroom remains.
+// 2. f64 1/z stepping cannot vectorise bit-identically: f64 addition is
+//    not associative, and parallel prefix changes rounding. Golden-exact
+//    output forbids it. (Same trap as the f32-rounding that setupCameraInto
+//    had to replicate op-for-op — see camera.ts.)
+// 3. The zb compare must stay f64: f32-demote-compare flips near-tie
+//    coplanar decisions, and M3.3 showed 45–58% of candidate pixels are
+//    z-rejected with BSP-order tie-breaking. v128 has no f32x2→f64x2
+//    promotion, so the compare + zb loads stay scalar regardless.
+// 4. The loop is gather/store-bound: 2 dependent gathers (texel, colormap)
+//    + 2 stores per taken pixel, and v128 has no gather. What vectorises
+//    bit-identically (i32 tu/tv stepping + texel-index math — modular
+//    arithmetic is exact) costs per-subdivision v128 setup (splat +
+//    3×replace_lane per 16px) plus per-pixel lane extracts: ~60 extra ops
+//    to save ~90, i.e. a predicted ~1.1–1.2x over wasm scalar for
+//    significant implementation risk. Not worth landing.
+// 5. Opcode facts verified on V8 via WebAssembly.validate + instantiation
+//    probes (for the record): i32x4.splat=0x11, extract_lane=0x1B,
+//    replace_lane=0x1C, add=0xAE, and=0x4E, mul=0xB5, shl=0xAB,
+//    shr_s=0xAC, shr_u=0xAD (all semantically confirmed, not textbook).
+// 6. The ≥2x needs thread parallelism (M8.1 frame-accum composition —
+//    landed: spanfill parallelises ~3x, frame 19→15ms) or algorithmic
+//    change (out of scope). A future worker-side SIMD would stage the pool
+//    SAB as shared WebAssembly.Memory and run a band-filtered v128 kernel
+//    per kick — same i32-only vectorisation, same ~1.1x ceiling estimate;
+//    revisit only with a gather-capable ISA or a loop-shape change.
+// Scalar wasm stays behind `sw_wasm` (TS default); this note is the spike.
+
 
 import { Com_Error, featureEnabled, getCVarNumber, registerCVar } from '@q2/config';
 import {

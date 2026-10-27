@@ -4,15 +4,18 @@ import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'fs';
 import { createFramebuffer } from '@q2/renderer-api';
 import {
-  SPAN_OPAQUE, SPAN_TURBULENT,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT,
+  F_PER_SPAN, I_PER_SPAN,
   createSpan, drawSpansSoftware, drawSpansTurbulent,
+  emitSpansForPoly, packFrameSpans,
   SoftwareBackend, BandedSoftwareBackend,
-  type LightBlock, type Span, type SpanList, type Texture,
+  type EmitFlat, type LightBlock, type ProjectedVert, type Span, type SpanList, type Texture,
 } from './index.js';
 import {
-  SW_WORKERS_CVAR, MAX_WORKERS, MIN_BAND_PIXELS,
-  attachBandShared, bandTotal, packBandSpans, processBandJob,
+  SW_WORKERS_CVAR, SW_ACCUM_CVAR, MAX_WORKERS, MIN_BAND_PIXELS,
+  attachBandShared, bandTotal, packBandSpans, processBandJob, resolveBand,
   sabAvailable, splitBands, syncWaitAllowed, workersRequestedByCvar,
+  accumRequestedByCvar,
 } from './index.js';
 import { BandWorkerPool } from './index.js';
 import { SKY_SIDE_IMAGE } from './index.js';
@@ -24,6 +27,32 @@ import { loadBsp } from '@q2/bsp';
 import { parsePCX, parseWAL } from '@q2/formats';
 import { bspToMiniWorld, type BspTexelSource } from './index.js';
 import { v3 } from '@q2/math';
+
+function hashColor(color: Uint32Array): string {
+  let h = 2166136261;
+  for (let i = 0; i < color.length; i++) {
+    h ^= color[i]! & 0xff;
+    h = Math.imul(h, 16777619);
+    h ^= (color[i]! >>> 8) & 0xff;
+    h = Math.imul(h, 16777619);
+    h ^= (color[i]! >>> 16) & 0xff;
+    h = Math.imul(h, 16777619);
+    h ^= (color[i]! >>> 24) & 0xff;
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+/** Deterministic 768-byte test palette. */
+function testPalette(): Uint8Array {
+  const pal = new Uint8Array(768);
+  for (let i = 0; i < 256; i++) {
+    pal[i * 3] = (i * 5) & 255;
+    pal[i * 3 + 1] = (i * 3 + 40) & 255;
+    pal[i * 3 + 2] = (i * 2 + 80) & 255;
+  }
+  return pal;
+}
 
 /** Deterministic PRNG (mulberry32) so fuzz is reproducible. */
 function rng(seed: number): () => number {
@@ -336,6 +365,56 @@ describe('renderer banded mode (cvar opt-in, SAB, golden-identical)', () => {
       resetCVars();
     }
   });
+
+  it('devroom golden is identical pooled with accum on and off', { timeout: 120000 }, async () => {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP pooled golden test: dist not built (run yarn build first)');
+      return;
+    }
+    const { resetCVars, setCVar } = await import('@q2/config');
+    try {
+      const renderPooled = async (accum: boolean): Promise<{ idx: string; color: string }> => {
+        resetCVars();
+        const W = 320, H = 240;
+        const fb = createFramebuffer(W, H, true);
+        const r = new SoftwareRenderer();
+        r.init(fb);
+        const pal = testPalette();
+        r.setPalette(pal);
+        const styles = new Float32Array(256).fill(1);
+        styles[1] = 0.6;
+        setCVar(SW_WORKERS_CVAR, 4);
+        setCVar(SW_ACCUM_CVAR, accum ? 1 : 0);
+        expect(r.syncWorkersFromCvar()).toBe(true);
+        const pool = BandWorkerPool.create(3, W, H, { indexJsPath: distUrl.pathname });
+        expect(pool).not.toBeNull();
+        try {
+          r.attachWorkerPool(pool);
+          r.beginFrame();
+          r.renderView(
+            { origin: DEVROOM_CAMERA.origin, angles: DEVROOM_CAMERA.angles, fovX: DEVROOM_CAMERA.fovX, time: 1.5, lightStyles: styles },
+            { name: 'devroom', data: createDevroom() },
+            [],
+          );
+          r.endFrame();
+          const g = r.getFramebuffer();
+          return { idx: hashIdx(g.index!), color: hashColor(g.color) };
+        } finally {
+          await pool!.dispose();
+        }
+      };
+      // both pooled modes converge to the pinned single-threaded golden
+      // (index) and to each other (worker-resolved color plane)
+      const withAccum = await renderPooled(true);
+      const perBatch = await renderPooled(false);
+      expect(withAccum.idx).toBe('8f61c755');
+      expect(perBatch.idx).toBe('8f61c755');
+      expect(perBatch.color).toBe(withAccum.color);
+    } finally {
+      resetCVars();
+    }
+  });
 });
 
 describe('BandWorkerPool (real threads, dist-gated)', () => {
@@ -391,6 +470,319 @@ describe('BandWorkerPool (real threads, dist-gated)', () => {
     expect(BandWorkerPool.create(0, 64, 48, { indexJsPath: 'x' })).toBeNull();
     expect(BandWorkerPool.create(2, 64, 48, { indexJsPath: '/no/such/file.mjs' })).toBeNull();
     expect(BandWorkerPool.create(-3, 64, 48, { indexJsPath: 'x' })).toBeNull();
+  });
+});
+
+describe('sw_accum cvar (frame-level accumulation, default on)', () => {
+  it('defaults to 1 and follows the cvar', async () => {
+    const { getCVarNumber, resetCVars, setCVar } = await import('@q2/config');
+    try {
+      resetCVars();
+      expect(getCVarNumber(SW_ACCUM_CVAR)).toBe(0); // lazily registered on first read
+      expect(accumRequestedByCvar()).toBe(true);
+      expect(getCVarNumber(SW_ACCUM_CVAR)).toBe(1);
+      setCVar(SW_ACCUM_CVAR, 0);
+      expect(accumRequestedByCvar()).toBe(false);
+      setCVar(SW_ACCUM_CVAR, 2);
+      expect(accumRequestedByCvar()).toBe(true);
+    } finally {
+      resetCVars();
+    }
+  });
+});
+
+describe('fused emission (emitSpansForPoly flat copy == pack loop)', () => {
+  it('matches packFrameSpans exactly on fuzzed convex polys', () => {
+    const rand = rng(0xF1A7);
+    for (let iter = 0; iter < 60; iter++) {
+      // random convex ngons (projected-vert shape, like the renderer feeds emit)
+      const cx = 20 + rand() * 200, cy = 20 + rand() * 120;
+      const rx = 8 + rand() * 90, ry = 6 + rand() * 60;
+      const n = 3 + ((rand() * 6) | 0);
+      const poly: ProjectedVert[] = [];
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * Math.PI * 2 + rand() * 0.5;
+        poly.push({
+          x: cx + Math.cos(a) * rx, y: cy + Math.sin(a) * ry,
+          iz: 0.01 + rand() * 0.2, uz: rand() * 4, vz: rand() * 4,
+          lu: rand() * 4, lv: rand() < 0.5 ? -1 : rand() * 6,
+        });
+      }
+      const pool: Span[] = [];
+      for (let i = 0; i < 512; i++) pool.push(createSpan());
+      const F = new Float64Array(512 * F_PER_SPAN);
+      const I = new Int32Array(512 * I_PER_SPAN);
+      const kind = [SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT][(rand() * 3) | 0]!;
+      const ord = (rand() * 8) | 0;
+      // mirror the renderer's tagging contract: sky/flat batches ride a flat
+      // color + dlight 0, skybox batches are unlit grade 63, world batches
+      // keep the emit light/dlight/lux.
+      const overrides = kind === SPAN_FLAT
+        ? { light: 41, dlight: 0, lv: null as number | null }
+        : kind === SPAN_OPAQUE && rand() < 0.3
+          ? { light: 63, dlight: 0, lv: -1 as number | null }
+          : { light: null as number | null, dlight: null as number | null, lv: null as number | null };
+      const flat: EmitFlat = {
+        F, I, base: 0, cap: 512, kind, ord,
+        light: overrides.light, dlight: overrides.dlight, lv: overrides.lv,
+        written: -1,
+      };
+      const endCount = emitSpansForPoly(poly, n, ord, pool, 0, 512, 63, 0, 240, flat);
+      expect(flat.written).toBe(endCount);
+      // apply the same tagging the renderer runs when unfused
+      for (let i = 0; i < endCount; i++) {
+        const sp = pool[i]!;
+        sp.kind = kind;
+        sp.ord = ord;
+        if (overrides.light !== null) sp.light = overrides.light;
+        if (overrides.dlight !== null) sp.dlight = overrides.dlight;
+        if (overrides.lv !== null) sp.lv = overrides.lv;
+      }
+      // the flat copy must equal a post-sort pack of the tagged objects
+      const PF = new Float64Array(512 * F_PER_SPAN);
+      const PI = new Int32Array(512 * I_PER_SPAN);
+      const pk = packFrameSpans({ spans: pool, count: endCount }, PF, PI, 0, 0, 512);
+      expect(pk).not.toBeNull();
+      expect(pk!.count).toBe(endCount);
+      expect([...F.slice(0, endCount * F_PER_SPAN)]).toEqual([...PF.slice(0, endCount * F_PER_SPAN)]);
+      expect([...I.slice(0, endCount * I_PER_SPAN)]).toEqual([...PI.slice(0, endCount * I_PER_SPAN)]);
+    }
+  });
+});
+
+describe('BandWorkerPool frame accumulation (M8.1 single-kick)', () => {
+  function wideBatch(rand: () => number, W: number, H: number, y0: number, y1: number): Span[] {
+    const spans: Span[] = [];
+    for (let y = y0; y < y1; y += 1 + ((rand() * 3) | 0)) {
+      const s = createSpan();
+      const r = rand();
+      s.kind = r < 0.7 ? SPAN_OPAQUE : r < 0.9 ? SPAN_TURBULENT : SPAN_FLAT;
+      s.y = y;
+      s.x0 = (rand() * W * 0.4) | 0;
+      s.x1 = s.x0 + 4 + ((rand() * W * 0.6) | 0);
+      s.iz = 0.01 + rand() * 0.2;
+      s.diz = (rand() - 0.5) * 0.001;
+      s.uz = rand() * 2; s.duz = s.iz * (0.5 + rand() * 2);
+      s.vz = rand() * 2; s.dvz = (rand() - 0.5) * s.iz;
+      s.light = 20 + rand() * 20;
+      s.dlight = (rand() - 0.5) * 0.5;
+      s.lu = rand() * 8; s.lv = rand() < 0.5 ? -1 : rand() * 6; s.dlu = (rand() - 0.5) * 0.3;
+      s.turb = (rand() * 64) | 0;
+      s.ord = (rand() * 4) | 0;
+      spans.push(s);
+    }
+    return spans;
+  }
+
+  function multiBatchFrame(rand: () => number, W: number, H: number): {
+    batches: { list: SpanList; tex: Texture; light: LightBlock }[];
+  } {
+    const batches: { list: SpanList; tex: Texture; light: LightBlock }[] = [];
+    const n = 6 + ((rand() * 6) | 0);
+    for (let k = 0; k < n; k++) {
+      const spans = wideBatch(rand, W, H, (rand() * H) | 0, H);
+      const texW = 1 << (3 + ((rand() * 3) | 0));
+      const texH = 1 << (3 + ((rand() * 3) | 0));
+      const texels = new Uint8Array(texW * texH);
+      for (let i = 0; i < texels.length; i++) texels[i] = (rand() * 256) | 0;
+      const lw = 1 + ((rand() * 6) | 0), lh = 1 + ((rand() * 4) | 0);
+      const values = new Uint8Array(lw * lh);
+      for (let i = 0; i < values.length; i++) values[i] = (rand() * 64) | 0;
+      batches.push({
+        list: { spans, count: spans.length },
+        tex: { width: texW, height: texH, texels },
+        light: { width: lw, height: lh, values },
+      });
+    }
+    return { batches };
+  }
+
+  it('flushFrame matches sequential per-batch draws exactly', { timeout: 60000 }, async () => {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP accum test: dist not built (run yarn build first)');
+      return;
+    }
+    const rand = rng(0xACC001);
+    const W = 320, H = 240;
+    const colormap = gradeColormap();
+    const { batches } = multiBatchFrame(rand, W, H);
+    // reference: sequential draws, one batch at a time
+    const refIdx = new Uint8Array(W * H);
+    const refZb = new Float32Array(W * H);
+    const be = new SoftwareBackend();
+    be.attach(refIdx, refZb, W, H, colormap);
+    for (const b of batches) be.drawSpans(b.list, b.tex, b.light);
+    // accumulated: pack every batch through the pool cursor, one kick
+    const pool = BandWorkerPool.create(2, W, H, { indexJsPath: distUrl.pathname });
+    expect(pool).not.toBeNull();
+    try {
+      pool!.beginFrame();
+      for (const b of batches) {
+        const cur = pool!.flatCursor();
+        expect(cur).not.toBeNull();
+        const pk = packFrameSpans(b.list, cur!.F, cur!.I, cur!.base, cur!.base, cur!.cap);
+        expect(pk).not.toBeNull();
+        const ok = pool!.packBatched(cur!.base, pk!.count, b.tex, b.light, colormap, 1.5);
+        expect(ok).toBe(true);
+      }
+      const r = pool!.flushFrame();
+      expect(r).not.toBeNull();
+      expect(r!.pixels).toBe(be.pixelsDrawn);
+      expect(r!.spans).toBe(be.spansDrawn);
+      expect([...pool!.idx]).toEqual([...refIdx]);
+      expect([...pool!.zb]).toEqual([...refZb]);
+    } finally {
+      await pool!.dispose();
+    }
+  });
+
+  it('flushFrameAsync converges identically (message-driven completion)', { timeout: 60000 }, async () => {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP accum-async test: dist not built (run yarn build first)');
+      return;
+    }
+    const rand = rng(0xA57C);
+    const W = 320, H = 240;
+    const colormap = gradeColormap();
+    const { batches } = multiBatchFrame(rand, W, H);
+    const refIdx = new Uint8Array(W * H);
+    const refZb = new Float32Array(W * H);
+    const be = new SoftwareBackend();
+    be.attach(refIdx, refZb, W, H, colormap);
+    for (const b of batches) be.drawSpans(b.list, b.tex, b.light);
+    const pool = BandWorkerPool.create(2, W, H, { indexJsPath: distUrl.pathname });
+    expect(pool).not.toBeNull();
+    try {
+      pool!.beginFrame();
+      for (const b of batches) {
+        const cur = pool!.flatCursor();
+        expect(cur).not.toBeNull();
+        const pk = packFrameSpans(b.list, cur!.F, cur!.I, cur!.base, cur!.base, cur!.cap);
+        expect(pk).not.toBeNull();
+        expect(pool!.packBatched(cur!.base, pk!.count, b.tex, b.light, colormap, 1.5)).toBe(true);
+      }
+      const r = await pool!.flushFrameAsync();
+      expect(r).not.toBeNull();
+      expect(r!.pixels).toBe(be.pixelsDrawn);
+      expect([...pool!.idx]).toEqual([...refIdx]);
+      expect([...pool!.zb]).toEqual([...refZb]);
+    } finally {
+      await pool!.dispose();
+    }
+  });
+
+  it('drawInlineAll replays the accumulated batches identically', { timeout: 60000 }, async () => {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP replay test: dist not built (run yarn build first)');
+      return;
+    }
+    const rand = rng(0x9E91A4);
+    const W = 320, H = 240;
+    const colormap = gradeColormap();
+    const { batches } = multiBatchFrame(rand, W, H);
+    const refIdx = new Uint8Array(W * H);
+    const refZb = new Float32Array(W * H);
+    const be = new SoftwareBackend();
+    be.attach(refIdx, refZb, W, H, colormap);
+    for (const b of batches) be.drawSpans(b.list, b.tex, b.light);
+    const pool = BandWorkerPool.create(2, W, H, { indexJsPath: distUrl.pathname });
+    expect(pool).not.toBeNull();
+    try {
+      pool!.beginFrame();
+      for (const b of batches) {
+        const cur = pool!.flatCursor();
+        expect(cur).not.toBeNull();
+        const pk = packFrameSpans(b.list, cur!.F, cur!.I, cur!.base, cur!.base, cur!.cap);
+        expect(pk).not.toBeNull();
+        expect(pool!.packBatched(cur!.base, pk!.count, b.tex, b.light, colormap, 1.5)).toBe(true);
+      }
+      // no kick: replay everything inline on the calling thread
+      const r = pool!.drawInlineAll();
+      expect(r.pixels).toBe(be.pixelsDrawn);
+      expect(r.spans).toBe(be.spansDrawn);
+      expect([...pool!.idx]).toEqual([...refIdx]);
+      expect([...pool!.zb]).toEqual([...refZb]);
+    } finally {
+      await pool!.dispose();
+    }
+  });
+
+  it('resolveFrame matches the serial expand exactly (sync + async)', { timeout: 60000 }, async () => {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP resolve test: dist not built (run yarn build first)');
+      return;
+    }
+    const rand = rng(0xE5014E);
+    const W = 320, H = 240;
+    const colormap = gradeColormap();
+    const pal = testPalette();
+    const { batches } = multiBatchFrame(rand, W, H);
+    // reference: serial draws + serial expand
+    const refIdx = new Uint8Array(W * H);
+    const refZb = new Float32Array(W * H);
+    const refColor = new Uint32Array(W * H);
+    const be = new SoftwareBackend();
+    be.attach(refIdx, refZb, W, H, colormap);
+    for (const b of batches) be.drawSpans(b.list, b.tex, b.light);
+    resolveBand(refColor, pal, refIdx, 0, H, W, H);
+    for (const useAsync of [false, true]) {
+      const pool = BandWorkerPool.create(2, W, H, { indexJsPath: distUrl.pathname });
+      expect(pool).not.toBeNull();
+      try {
+        pool!.beginFrame();
+        pool!.stagePalette(pal);
+        for (const b of batches) {
+          const cur = pool!.flatCursor();
+          expect(cur).not.toBeNull();
+          const pk = packFrameSpans(b.list, cur!.F, cur!.I, cur!.base, cur!.base, cur!.cap);
+          expect(pk).not.toBeNull();
+          expect(pool!.packBatched(cur!.base, pk!.count, b.tex, b.light, colormap, 1.5)).toBe(true);
+        }
+        const flushed = useAsync ? await pool!.flushFrameAsync() : pool!.flushFrame();
+        expect(flushed).not.toBeNull();
+        const ok = useAsync ? await pool!.resolveFrameAsync() : pool!.resolveFrame();
+        expect(ok).toBe(true);
+        expect([...pool!.idx]).toEqual([...refIdx]);
+        expect([...pool!.planes.color]).toEqual([...refColor]);
+        expect(hashColor(pool!.planes.color)).toBe(hashColor(refColor));
+      } finally {
+        await pool!.dispose();
+      }
+    }
+  });
+
+  it('rejects sequencing breaks and dead-pool use without diverging', { timeout: 60000 }, async () => {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP sequencing test: dist not built (run yarn build first)');
+      return;
+    }
+    const W = 160, H = 120;
+    const colormap = gradeColormap();
+    const pool = BandWorkerPool.create(1, W, H, { indexJsPath: distUrl.pathname });
+    expect(pool).not.toBeNull();
+    try {
+      pool!.beginFrame();
+      const tex = { width: 8, height: 8, texels: new Uint8Array(64).fill(5) };
+      const light = { width: 1, height: 1, values: new Uint8Array([40]) };
+      // wrong base (not the current bump) -> rejected
+      expect(pool!.packBatched(999999, 4, tex, light, colormap, 0)).toBe(false);
+      // empty batch -> accepted as a no-op
+      expect(pool!.packBatched(0, 0, tex, light, colormap, 0)).toBe(true);
+      expect(pool!.accumPending()).toBe(0);
+      await pool!.dispose();
+      // dead pool: cursor null, packs rejected, flush null
+      expect(pool!.flatCursor()).toBeNull();
+      expect(pool!.packBatched(0, 4, tex, light, colormap, 0)).toBe(false);
+      expect(pool!.flushFrame()).toBeNull();
+      expect(await pool!.flushFrameAsync()).toBeNull();
+    } finally {
+      await pool!.dispose();
+    }
   });
 });
 
@@ -460,6 +852,83 @@ describe.runIf(!!process.env.Q2_PAK)('banded vs single on real base1 (Q2_PAK)', 
         }
         expect(hashes.get(2)).toBe(hashes.get(1));
         expect(hashes.get(4)).toBe(hashes.get(1));
+      }
+    } finally {
+      resetCVars();
+    }
+  });
+
+  it('pooled per-batch and frame-accum match classic on 4 real-map views', { timeout: 300000 }, async () => {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP pooled base1 test: dist not built (run yarn build first)');
+      return;
+    }
+    const { resetCVars, setCVar } = await import('@q2/config');
+    try {
+      resetCVars();
+      const pakPath = process.env.Q2_PAK as string;
+      const bsp = loadBsp(pakReadFile(pakPath, 'maps/base1.bsp'));
+      const walCache = new Map<string, BspTexelSource | null>();
+      const texelFor = (walName: string): BspTexelSource | null => {
+        if (walCache.has(walName)) return walCache.get(walName)!;
+        let src: BspTexelSource | null = null;
+        try {
+          const wal = parseWAL(pakReadFile(pakPath, `textures/${walName}.wal`));
+          src = { texels: wal.mips[0]!, width: wal.width, height: wal.height };
+        } catch { src = null; }
+        walCache.set(walName, src);
+        return src;
+      };
+      const world = bspToMiniWorld(bsp, { texelFor });
+      const pcx = parsePCX(pakReadFile(pakPath, 'pics/colormap.pcx'));
+      const W = 640, H = 480;
+      const views = [
+        { origin: v3(128, -320, 54), angles: v3(0, 90, 0), label: 'spawn-north' },
+        { origin: v3(128, -320, 54), angles: v3(0, 180, 0), label: 'spawn-west' },
+        { origin: v3(-944, 1552, 0), angles: v3(0, 180, 0), label: 'lowroad-west' },
+        { origin: v3(-1648, 1544, 16), angles: v3(0, 0, 0), label: 'trench-east' },
+      ];
+      for (const v of views) {
+        const refdef = {
+          origin: v.origin, angles: v.angles, fovX: 90, time: 1.5,
+          lightStyles: new Float32Array(256).fill(1),
+        };
+        const renderMode = async (accum: boolean | null): Promise<{ idx: string; color: string }> => {
+          resetCVars();
+          const fb = createFramebuffer(W, H, true);
+          const r = new SoftwareRenderer();
+          r.init(fb);
+          r.setPalette(pcx.palette);
+          let pool: BandWorkerPool | null = null;
+          if (accum !== null) {
+            setCVar(SW_WORKERS_CVAR, 4);
+            setCVar(SW_ACCUM_CVAR, accum ? 1 : 0);
+            expect(r.syncWorkersFromCvar()).toBe(true);
+            pool = BandWorkerPool.create(3, W, H, { indexJsPath: distUrl.pathname });
+            expect(pool).not.toBeNull();
+            r.attachWorkerPool(pool);
+          }
+          try {
+            r.beginFrame();
+            r.renderView(refdef, { name: 'base1', data: world }, []);
+            r.endFrame();
+            const g = r.getFramebuffer();
+            return { idx: hashIdx(g.index!), color: hashColor(g.color) };
+          } finally {
+            if (pool) await pool.dispose();
+          }
+        };
+        const classic = await renderMode(null);
+        const perBatch = await renderMode(false);
+        const frameAccum = await renderMode(true);
+        console.log(`base1 ${v.label} classic=${classic.idx}/${classic.color} pool-batch=${perBatch.idx}/${perBatch.color} pool-accum=${frameAccum.idx}/${frameAccum.color}`);
+        // per-batch pool divergence is fixed (clearedFrame after kick); both
+        // pooled modes must converge to the classic golden (index + color).
+        expect(perBatch.idx).toBe(classic.idx);
+        expect(perBatch.color).toBe(classic.color);
+        expect(frameAccum.idx).toBe(classic.idx);
+        expect(frameAccum.color).toBe(classic.color);
       }
     } finally {
       resetCVars();

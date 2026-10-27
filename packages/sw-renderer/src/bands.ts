@@ -23,6 +23,13 @@ import { COLORMAP_SIZE } from './colormap.js';
 
 /** Cvar gating the banded path. 0 = classic single buffer (default); N > 0 = N bands. */
 export const SW_WORKERS_CVAR = 'sw_workers';
+/**
+ * Cvar gating frame-level batch accumulation (M8.1 async-render step 1):
+ * 1 (default) coalesces a frame's ~10^3 per-surface batches into ONE pool
+ * kick; 0 keeps the legacy per-batch dispatch. Output is identical either
+ * way (same spans, same order, depth-guarded convergence).
+ */
+export const SW_ACCUM_CVAR = 'sw_accum';
 /** Hard cap on bands/workers (control slots are preallocated for this many). */
 export const MAX_WORKERS = 8;
 /** Max packed spans per pool dispatch; larger batches use the inline path. */
@@ -34,10 +41,10 @@ export const MAX_BAND_SPANS = 4096;
  */
 export const MIN_BAND_PIXELS = 256;
 
-/** Doubles packed per span: iz diz uz duz vz dvz light dlight lu lv dlu. */
-export const F_PER_SPAN = 11;
-/** Ints packed per span: kind y x0 x1 turb. */
-export const I_PER_SPAN = 5;
+// Flat-span field counts live in spans.ts (shared with edges.ts emission);
+// re-exported here so pool callers keep a single import path.
+import { F_PER_SPAN, I_PER_SPAN } from './spans.js';
+export { F_PER_SPAN, I_PER_SPAN };
 
 /** Surface texel / light-block staging caps (bytes) inside shared memory. */
 export const TEX_CAP = 65536; // 256x256, matches vd_maxtexsize
@@ -62,8 +69,14 @@ export const CTL_DONE = 12; // workers completed for the current seq
 export const CTL_PIXELS = 13; // base; +MAX_WORKERS per-worker pixel counts
 export const CTL_SPANS = CTL_PIXELS + MAX_WORKERS; // base; +MAX_WORKERS span counts
 export const CTL_READY = CTL_SPANS + MAX_WORKERS; // workers entered the wait loop
-export const CTL_FRAME = CTL_READY + 1; // frame generation (lazy per-band clear)
+export const CTL_FCOUNT = CTL_READY + 1; // frame-accum descriptors for the current kick (0 = single-batch job)
+export const CTL_JOB = CTL_FCOUNT + 1; // kick type: 0 = rasterise, 1 = resolve (palette expand)
+export const CTL_FRAME = CTL_JOB + 1; // frame generation (lazy per-band clear)
 export const CTL_LEN = CTL_FRAME + 1;
+
+/** Kick types for CTL_JOB ( rasterise spans vs resolve the color plane). */
+export const JOB_RASTER = 0;
+export const JOB_RESOLVE = 1;
 
 /** Clamped worker/band count requested by the operator (0 = classic path). */
 export function workersRequestedByCvar(): number {
@@ -74,6 +87,16 @@ export function workersRequestedByCvar(): number {
     return Math.min(n, MAX_WORKERS);
   } catch {
     return 0;
+  }
+}
+
+/** True when per-surface batches should coalesce into one frame kick. */
+export function accumRequestedByCvar(): boolean {
+  try {
+    registerCVar(SW_ACCUM_CVAR, 1, 'coalesce frame span batches into one pool kick (M8.1, default 1 = on)');
+    return getCVarNumber(SW_ACCUM_CVAR) !== 0;
+  } catch {
+    return true;
   }
 }
 
@@ -211,9 +234,130 @@ export function createBandBuffers(
   };
 }
 
+// --- frame-level accumulation (M8.1 async-render step 1) ---
+//
+// Per-surface batches (~10^3/frame, most below MIN_BAND_PIXELS) Amdahl-bound
+// the pool: 1806 kicks x (pack + notify + wait) with no single batch big
+// enough to matter. The frame path packs every batch into bump-allocated
+// regions of ONE SAB during geometry, then kicks ONCE; each worker drains
+// the whole descriptor table for its band. Order is preserved (descriptors
+// are sequential; bands are disjoint row ranges), so output is
+// bit-identical to the per-batch path.
+
+/** Max flat-packed spans per frame (measured worst base1 frame ~31K). */
+export const MAX_FRAME_SPANS = 65536;
+/** Bump-region caps for per-frame staged surface data (measured worst
+ *  base1 frame ~1.9MB texels + 64KB light; the textured sky strip adds
+ *  ~384KB and fits comfortably). */
+export const FRAME_TEX_CAP = 4 * 1024 * 1024;
+export const FRAME_LIGHT_CAP = 256 * 1024;
+/** Max batch descriptors per frame kick (measured worst ~2K batches). */
+export const MAX_FRAME_BATCHES = 2048;
+
+/** Int32 fields per batch descriptor in the SAB table. */
+export const D_SPAN_BASE = 0;
+export const D_SPAN_COUNT = 1;
+export const D_TEX_OFF = 2;
+export const D_TEX_W = 3;
+export const D_TEX_H = 4;
+export const D_LIGHT_OFF = 5;
+export const D_LIGHT_W = 6;
+export const D_LIGHT_H = 7;
+export const D_WSHIFT = 8;
+export const D_WMASK = 9;
+export const D_HMASK = 10;
+export const D_TURBPHASE = 11;
+export const D_PER_BATCH = 12;
+
+/** Palette bytes staged for worker-side resolve (8-bit RGB palette). */
+export const PALETTE_BYTES = 768;
+
+export interface FrameAccumLayout {
+  total: number;
+  spansFOff: number;
+  spansIOff: number;
+  texOff: number;
+  lightOff: number;
+  descOff: number;
+  colorOff: number;
+  palOff: number;
+}
+
+/** Byte layout of the frame-accum regions appended after a bandLayout SAB. */
+export function frameAccumLayout(w: number, h: number): FrameAccumLayout {
+  const n = Math.max(1, Math.floor(w) * Math.floor(h));
+  const base = (bandLayout(w, h).total + 7) & ~7;
+  const spansFOff = base;
+  const spansIOff = spansFOff + MAX_FRAME_SPANS * F_PER_SPAN * 8;
+  const texOff = spansIOff + MAX_FRAME_SPANS * I_PER_SPAN * 4;
+  const lightOff = texOff + FRAME_TEX_CAP;
+  const descOff = lightOff + FRAME_LIGHT_CAP;
+  const colorOff = (descOff + MAX_FRAME_BATCHES * D_PER_BATCH * 4 + 3) & ~3;
+  const palOff = colorOff + n * 4;
+  const total = palOff + PALETTE_BYTES;
+  return { total, spansFOff, spansIOff, texOff, lightOff, descOff, colorOff, palOff };
+}
+
+/** Total SAB bytes for a pool backing planes + frame-accum regions. */
+export function frameAccumTotal(w: number, h: number): number {
+  return frameAccumLayout(w, h).total;
+}
+
+export interface FrameAccumViews {
+  base: BandViews;
+  ctl: Int32Array;
+  fSpansF: Float64Array;
+  fSpansI: Int32Array;
+  fTex: Uint8Array;
+  fLight: Uint8Array;
+  desc: Int32Array;
+  /** Shared 0xAABBGGRR color plane (worker-resolved, adopted by the renderer). */
+  fColor: Uint32Array;
+  /** Staged palette (768 RGB bytes) for worker-side resolve. */
+  fPal: Uint8Array;
+}
+
+/** Attach frame-accum views to a SAB sized by frameAccumTotal(w, h). */
+export function attachFrameAccum(
+  sab: SharedArrayBuffer, w: number, h: number,
+): { views: FrameAccumViews; ctl: Int32Array } {
+  const n = Math.max(1, Math.floor(w) * Math.floor(h));
+  const layout = frameAccumLayout(w, h);
+  if (sab.byteLength < layout.total) {
+    Com_Error('drop', `attachFrameAccum: SAB ${sab.byteLength} < ${layout.total} for ${w}x${h}`);
+  }
+  const { views, ctl } = attachBandShared(sab, w, h);
+  return {
+    views: {
+      base: views,
+      ctl,
+      fSpansF: new Float64Array(sab, layout.spansFOff, MAX_FRAME_SPANS * F_PER_SPAN),
+      fSpansI: new Int32Array(sab, layout.spansIOff, MAX_FRAME_SPANS * I_PER_SPAN),
+      fTex: new Uint8Array(sab, layout.texOff, FRAME_TEX_CAP),
+      fLight: new Uint8Array(sab, layout.lightOff, FRAME_LIGHT_CAP),
+      desc: new Int32Array(sab, layout.descOff, MAX_FRAME_BATCHES * D_PER_BATCH),
+      fColor: new Uint32Array(sab, layout.colorOff, n),
+      fPal: new Uint8Array(sab, layout.palOff, PALETTE_BYTES),
+    },
+    ctl,
+  };
+}
+
 /** Serialize the raster-relevant spans of a batch into flat SAB staging. */
 export function packBandSpans(
   list: SpanList, F: Float64Array, I: Int32Array,
+): { count: number; est: number } | null {
+  return packFrameSpans(list, F, I, 0, 0, MAX_BAND_SPANS);
+}
+
+/**
+ * Offset-capable packer (single-batch and frame-accum share this loop, so
+ * both pack paths produce identical flat data). Appends at (fBase, iBase),
+ * refuses when the batch would exceed cap spans past the base.
+ */
+export function packFrameSpans(
+  list: SpanList, F: Float64Array, I: Int32Array,
+  fBase: number, iBase: number, cap: number,
 ): { count: number; est: number } | null {
   const spans = list.spans;
   const total = list.count < spans.length ? list.count : spans.length;
@@ -222,12 +366,12 @@ export function packBandSpans(
   for (let i = 0; i < total; i++) {
     const s = spans[i]!;
     if (s.kind !== SPAN_OPAQUE && s.kind !== SPAN_TURBULENT && s.kind !== SPAN_FLAT) continue;
-    if (p >= MAX_BAND_SPANS) return null; // oversize -> inline fallback
-    const o = p * F_PER_SPAN;
+    if (p >= cap) return null; // oversize -> inline fallback
+    const o = (fBase + p) * F_PER_SPAN;
     F[o] = s.iz; F[o + 1] = s.diz; F[o + 2] = s.uz; F[o + 3] = s.duz;
     F[o + 4] = s.vz; F[o + 5] = s.dvz; F[o + 6] = s.light;
     F[o + 7] = s.dlight; F[o + 8] = s.lu; F[o + 9] = s.lv; F[o + 10] = s.dlu;
-    const q = p * I_PER_SPAN;
+    const q = (iBase + p) * I_PER_SPAN;
     I[q] = s.kind; I[q + 1] = s.y; I[q + 2] = s.x0; I[q + 3] = s.x1; I[q + 4] = s.turb | 0;
     est += s.x1 - s.x0;
     p++;
@@ -278,23 +422,25 @@ const jobTex: Texture = { width: 0, height: 0, texels: new Uint8Array(0) };
 const jobLight: LightBlock = { width: 1, height: 1, values: new Uint8Array(0) };
 
 /**
- * Rasterise one band's share of a packed batch. Setup math mirrors
+ * Shared packed-span raster core: draws flat spans [start, start+count) of
+ * one (tex, light) setup into the [y0, y1) band. Setup math mirrors
  * drawSpansSoftware/drawSpansTurbulent op-for-op (same imports, same order);
  * the y-range filter is the only addition, so output is bit-identical to
- * the single-threaded path restricted to [y0, y1).
+ * the single-threaded path restricted to the band. Used by processBandJob
+ * (one packed batch) and processFrameJob (one descriptor of a frame kick).
  */
-export function processBandJob(v: BandViews, job: BandJob): { pixels: number; spans: number } {
-  const { idx, zb, spansF, spansI } = v;
-  const { fbW, fbH, count } = job;
-  jobTex.width = job.texW; jobTex.height = job.texH; jobTex.texels = v.texels;
-  jobLight.width = job.lightW; jobLight.height = job.lightH; jobLight.values = v.light;
-  const { wshift, wmask, hmask } = job;
-  const colormap = v.colormap;
-  const turbTable = v.turb;
+export function rasterizePackedRange(
+  idx: Uint8Array, zb: Float32Array, fbW: number, fbH: number,
+  spansF: Float64Array, spansI: Int32Array, start: number, count: number,
+  tex: Texture, light: LightBlock,
+  wshift: number, wmask: number, hmask: number,
+  colormap: Uint8Array, turbTable: Uint8Array, turbPhase: number,
+  y0: number, y1: number,
+): { pixels: number; spans: number } {
   const tmask = turbTable.length - 1;
   let pixels = 0;
   let drawn = 0;
-  for (let i = 0; i < count; i++) {
+  for (let i = start; i < start + count; i++) {
     const q = i * I_PER_SPAN;
     const kind = spansI[q]!;
     const y = spansI[q + 1]!;
@@ -302,7 +448,7 @@ export function processBandJob(v: BandViews, job: BandJob): { pixels: number; sp
     const origX1 = spansI[q + 3]!;
     const turb = spansI[q + 4]!;
     if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT && kind !== SPAN_FLAT) continue;
-    if (y < job.y0 || y >= job.y1) continue;
+    if (y < y0 || y >= y1) continue;
     if (y < 0 || y >= fbH) continue;
     let x0 = origX0, x1 = origX1;
     if (x0 < 0) x0 = 0;
@@ -333,8 +479,8 @@ export function processBandJob(v: BandViews, job: BandJob): { pixels: number; sp
       let lz = spansF[o + 6]!;
       let dlz = dlight;
       if (lv >= 0) {
-        const l0 = sampleLightBlock(jobLight, lu, lv);
-        const l1 = sampleLightBlock(jobLight, lu + dlu * n, lv);
+        const l0 = sampleLightBlock(light, lu, lv);
+        const l1 = sampleLightBlock(light, lu + dlu * n, lv);
         lz = l0;
         dlz = (l1 - l0) / n;
       }
@@ -344,7 +490,7 @@ export function processBandJob(v: BandViews, job: BandJob): { pixels: number; sp
       while (remaining > 0) {
         const m = remaining >= 16 ? 16 : remaining;
         const r = runSubdiv16(idx, zb, oo, m, iz, diz, uz, duz, vz, dvz,
-          u0, v0, lz, dlz, jobTex.texels, wshift, wmask, hmask, colormap);
+          u0, v0, lz, dlz, tex.texels, wshift, wmask, hmask, colormap);
         iz = r.iz; lz = r.light;
         uz += duz * m; vz += dvz * m;
         u0 = r.u1; v0 = r.v1;
@@ -355,11 +501,11 @@ export function processBandJob(v: BandViews, job: BandJob): { pixels: number; sp
       let u0 = uz / iz, v0 = vz / iz;
       let oo = y * fbW + x0;
       let remaining = n;
-      const phase = (job.turbPhase + turb) & tmask;
+      const phase = (turbPhase + turb) & tmask;
       while (remaining > 0) {
         const m = remaining >= 16 ? 16 : remaining;
         const r = runSubdivTurbulent(idx, zb, oo, m, iz, diz, uz, duz, vz, dvz,
-          u0, v0, lz, dlight, jobTex.texels, wshift, wmask, hmask,
+          u0, v0, lz, dlight, tex.texels, wshift, wmask, hmask,
           colormap, turbTable, phase);
         iz = r.iz; lz = r.light;
         uz += duz * m; vz += dvz * m;
@@ -371,6 +517,97 @@ export function processBandJob(v: BandViews, job: BandJob): { pixels: number; sp
     drawn++;
   }
   return { pixels, spans: drawn };
+}
+
+/**
+ * Rasterise one band's share of a packed batch. Setup math mirrors
+ * drawSpansSoftware/drawSpansTurbulent op-for-op (same imports, same order);
+ * the y-range filter is the only addition, so output is bit-identical to
+ * the single-threaded path restricted to [y0, y1).
+ */
+export function processBandJob(v: BandViews, job: BandJob): { pixels: number; spans: number } {
+  const { idx, zb, spansF, spansI } = v;
+  const { fbW, fbH, count } = job;
+  jobTex.width = job.texW; jobTex.height = job.texH; jobTex.texels = v.texels;
+  jobLight.width = job.lightW; jobLight.height = job.lightH; jobLight.values = v.light;
+  const { wshift, wmask, hmask } = job;
+  return rasterizePackedRange(
+    idx, zb, fbW, fbH, spansF, spansI, 0, count,
+    jobTex, jobLight, wshift, wmask, hmask,
+    v.colormap, v.turb, job.turbPhase, job.y0, job.y1,
+  );
+}
+
+/**
+ * Rasterise one band's share of a frame kick: every descriptor in order,
+ * each with its own staged (tex, light) setup. Bands are disjoint row
+ * ranges so cross-band order cannot affect any pixel; within a band the
+ * descriptors run sequentially in pack order, exactly like the equivalent
+ * per-batch kicks. Bit-identical to the single-threaded path.
+ */
+export function processFrameJob(
+  fv: FrameAccumViews, fbW: number, fbH: number, descCount: number,
+  y0: number, y1: number,
+): { pixels: number; spans: number } {
+  const { base, fSpansF, fSpansI, fTex, fLight, desc } = fv;
+  const colormap = base.colormap;
+  const turbTable = base.turb;
+  let pixels = 0;
+  let drawn = 0;
+  for (let b = 0; b < descCount; b++) {
+    const d = b * D_PER_BATCH;
+    const spanBase = desc[d + D_SPAN_BASE]!;
+    const spanCount = desc[d + D_SPAN_COUNT]!;
+    if (spanCount <= 0) continue;
+    const texOff = desc[d + D_TEX_OFF]!;
+    const texW = desc[d + D_TEX_W]!;
+    const texH = desc[d + D_TEX_H]!;
+    const lightOff = desc[d + D_LIGHT_OFF]!;
+    const lightW = desc[d + D_LIGHT_W]!;
+    const lightH = desc[d + D_LIGHT_H]!;
+    jobTex.width = texW; jobTex.height = texH;
+    // NOTE: subarray views are per-descriptor (not per-pixel) short-lived
+    // objects — the pixel loop itself allocates nothing. The alternative
+    // (copying each staged block into a scratch slot) costs a memcpy per
+    // descriptor per worker; views keep the zero-copy SAB design. The main
+    // thread's geometry path stages offsets only, no views.
+    jobTex.texels = fTex.subarray(texOff, texOff + texW * texH);
+    jobLight.width = lightW; jobLight.height = lightH;
+    jobLight.values = fLight.subarray(lightOff, lightOff + lightW * lightH);
+    const r = rasterizePackedRange(
+      base.idx, base.zb, fbW, fbH, fSpansF, fSpansI, spanBase, spanCount,
+      jobTex, jobLight,
+      desc[d + D_WSHIFT]!, desc[d + D_WMASK]!, desc[d + D_HMASK]!,
+      colormap, turbTable, desc[d + D_TURBPHASE]!,
+      y0, y1,
+    );
+    pixels += r.pixels;
+    drawn += r.spans;
+  }
+  return { pixels, spans: drawn };
+}
+
+/**
+ * Palette-expand rows [y0, y1) into the shared color plane (M8.1 parallel
+ * resolve): identical math to SoftwareRenderer.endFrame
+ * (0xAABBGGRR from the 8-bit palette), partitioned by band so the pool
+ * drains it in the resolve kick. No allocation, no branches in the loop.
+ */
+export function resolveBand(
+  color: Uint32Array, pal: Uint8Array, idx: Uint8Array,
+  y0: number, y1: number, fbW: number, fbH: number,
+): void {
+  if (y0 < 0) y0 = 0;
+  if (y1 > fbH) y1 = fbH;
+  for (let y = y0; y < y1; y++) {
+    const row = y * fbW;
+    const end = row + fbW;
+    for (let o = row; o < end; o++) {
+      const c = idx[o]! * 3;
+      const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
+      color[o] = (0xff << 24) | (b << 16) | (g << 8) | r;
+    }
+  }
 }
 
 /** Minimal sink for worker completion posts (worker_threads / Web Worker). */
@@ -386,11 +623,12 @@ export interface BandPort {
  * Atomics.wait (Node) and waitAsync/message-driven (browser) dispatch.
  */
 export function bandWorkerLoop(
-  views: BandViews, ctl: Int32Array,
+  fav: FrameAccumViews, ctl: Int32Array,
   y0: number, y1: number, band: number, fbW: number,
   waitSeq: (seq: number) => void,
   port: BandPort,
 ): void {
+  const views = fav.base;
   // NOTE: seq is sampled BEFORE announcing readiness. The dispatcher only
   // publishes job 1 after every worker is ready, so SEQ is still 0 here by
   // construction — a worker can never miss its first wakeup (missed wakeups
@@ -424,8 +662,23 @@ export function bandWorkerLoop(
       views.zb.fill(0, y0 * fbW, y1 * fbW);
       lastFrame = frame;
     }
-    const job = readBandJob(ctl, y0, y1);
-    const r = processBandJob(views, job);
+    const fbWNow = Atomics.load(ctl, CTL_FBW);
+    const fbHNow = Atomics.load(ctl, CTL_FBH);
+    const job = Atomics.load(ctl, CTL_JOB);
+    let r: { pixels: number; spans: number };
+    if (job === JOB_RESOLVE) {
+      // Resolve kick (M8.1 parallel resolve): expand the final index plane
+      // into the shared color plane. No tally contribution by construction
+      // (spans/pixels count spanfill, which this kick does not do).
+      const pal = fav.fPal;
+      resolveBand(fav.fColor, pal, views.idx, y0, y1, fbWNow, fbHNow);
+      r = { pixels: 0, spans: 0 };
+    } else {
+      const fcount = Atomics.load(ctl, CTL_FCOUNT);
+      r = fcount > 0
+        ? processFrameJob(fav, fbWNow, fbHNow, fcount, y0, y1)
+        : processBandJob(views, readBandJob(ctl, y0, y1));
+    }
     Atomics.store(ctl, CTL_PIXELS + band, r.pixels);
     Atomics.store(ctl, CTL_SPANS + band, r.spans);
     Atomics.add(ctl, CTL_DONE, 1);
@@ -450,7 +703,7 @@ export function bandWorkerLoop(
 export interface BandDispatcher {
   readonly bandCount: number;
   /** Live shared planes (adopted by the renderer when this pool is attached). */
-  readonly planes: { idx: Uint8Array; zb: Float32Array } | null;
+  readonly planes: { idx: Uint8Array; zb: Float32Array; color: Uint32Array } | null;
   /** Current frame generation (lazy per-band clear coordination). */
   frame(): number;
   /** Bump the frame generation (lazy per-band clear on the next batch). */
@@ -460,6 +713,35 @@ export interface BandDispatcher {
     colormap: Uint8Array, time: number,
     fbW: number, fbH: number, idx: Uint8Array, zb: Float32Array,
   ): { pixels: number; spans: number } | null;
+  /**
+   * Frame-accumulation surface (M8.1 async-render step 1): capture one
+   * batch into the frame kick (true) or demand an immediate inline run
+   * (false — caller flushes first so batch order is preserved).
+   */
+  flatCursor(): { F: Float64Array; I: Int32Array; base: number; cap: number } | null;
+  packBatched(
+    spanBase: number, spanCount: number,
+    tex: Texture, light: LightBlock,
+    colormap: Uint8Array, time: number,
+  ): boolean;
+  /** Pending accumulated batches. */
+  accumPending(): number;
+  /** Kick one frame covering every accumulated batch (blocking). */
+  flushFrame(): { pixels: number; spans: number } | null;
+  /** Same as flushFrame but message-driven (browser async completion). */
+  flushFrameAsync(): Promise<{ pixels: number; spans: number } | null>;
+  /** Full-frame inline replay of the accumulated batches (fallback). */
+  drawInlineAll(): { pixels: number; spans: number };
+  /** Stage the palette for worker-side resolve (once per frame). */
+  stagePalette(palette: Uint8Array): void;
+  /**
+   * Resolve kick (M8.1 parallel resolve): palette-expand the final index
+   * plane into the shared color plane across the pool (blocking). True
+   * unless the pool is dead or the wait times out (caller expands inline).
+   */
+  resolveFrame(): boolean;
+  /** Same as resolveFrame but message-driven (browser async completion). */
+  resolveFrameAsync(): Promise<boolean>;
 }
 
 const BAND_CHUNK = 4096;
@@ -484,6 +766,20 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
   bandCount = 1;
   bands: Band[] = [{ y0: 0, y1: 0 }];
   dispatcher: BandDispatcher | null = null;
+  /**
+   * Frame accumulation (M8.1 async-render step 1): when true and pooled,
+   * drawSpans captures the batch into the frame kick instead of dispatching
+   * per batch. Set from the sw_accum cvar; identical output either way.
+   */
+  accumEnabled = true;
+  /**
+   * Fused-emission staging for the CURRENT batch (M8.1): the renderer sets
+   * this from the pool's flatCursor() before emitSpansForPoly runs, so
+   * drawSpans can record the descriptor without re-packing. base < 0 means
+   * no fused data — drawSpans falls back to the legacy per-batch path.
+   * Backend-owned (mutated in place, never reallocated).
+   */
+  readonly pendingFlat: { base: number; count: number } = { base: -1, count: 0 };
   /** drawSpans calls this frame (renderer resets per frame when banded). */
   batchesDrawn = 0;
   private clearedFrame = -1;
@@ -510,6 +806,25 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
       super.drawSpans(list, tex, light);
       return;
     }
+    if (this.dispatcher && this.accumEnabled) {
+      // Fused path: spans were packed during emission (pendingFlat); record
+      // the descriptor. Anything off (no fused data, sequencing break,
+      // exhausted regions) flushes pending work first (preserving global
+      // batch order) and runs this batch inline.
+      const pfBase = this.pendingFlat.base;
+      const pfCount = this.pendingFlat.count;
+      this.pendingFlat.base = -1;
+      this.pendingFlat.count = 0;
+      if (pfBase >= 0 && pfCount >= 0 &&
+        this.dispatcher.packBatched(
+          pfBase, pfCount, tex, light, this.colormap, this.time,
+        )) {
+        return;
+      }
+      this.flushAccum();
+      this.runInline(list, tex, light);
+      return;
+    }
     if (this.dispatcher) {
       const r = this.dispatcher.dispatch(
         list, tex, light, this.colormap, this.time,
@@ -518,11 +833,94 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
       if (r) {
         this.spansDrawn += r.spans;
         this.pixelsDrawn += r.pixels;
+        // The kick lazily cleared every band, so the planes are fully
+        // valid: a later inline batch must NOT wipe them (M8.1 real-frame
+        // divergence fix — per-batch pool output is golden-identical now).
+        this.clearedFrame = this.dispatcher.frame();
         return;
       }
       // Dispatched path unavailable for this batch: make sure the planes
       // are clear for the inline run (workers clear lazily per band, but
       // inline batches never reach them).
+      const f = this.dispatcher.frame();
+      if (f !== this.clearedFrame) {
+        this.idx.fill(0);
+        this.zb.fill(0);
+        this.clearedFrame = f;
+      }
+    }
+    this.runInline(list, tex, light);
+  }
+
+  /**
+   * Complete the frame kick (blocking): one kick for every accumulated
+   * batch, tallied into the backend counters. No-op without accumulation.
+   * Timeout/pool failure replays inline via the dispatcher (identical).
+   * On success the planes are fully drawn, so the lazy-clear guard is
+   * marked satisfied (a later inline batch must NOT wipe the kick).
+   */
+  flushAccum(): void {    const d = this.dispatcher;
+    if (!d || !this.accumEnabled || d.accumPending() === 0) return;
+    const r = d.flushFrame();
+    if (r) {
+      this.spansDrawn += r.spans;
+      this.pixelsDrawn += r.pixels;
+      this.clearedFrame = d.frame();
+      return;
+    }
+    const q = d.drawInlineAll();
+    this.spansDrawn += q.spans;
+    this.pixelsDrawn += q.pixels;
+    this.clearedFrame = d.frame();
+  }
+
+  /**
+   * Same as flushAccum but message-driven (browser async-render completion:
+   * no Atomics.wait on the calling thread). Falls back to inline replay.
+   */
+  async flushAccumAsync(): Promise<void> {
+    const d = this.dispatcher;
+    if (!d || !this.accumEnabled || d.accumPending() === 0) return;
+    const r = await d.flushFrameAsync();
+    if (r) {
+      this.spansDrawn += r.spans;
+      this.pixelsDrawn += r.pixels;
+      this.clearedFrame = d.frame();
+      return;
+    }
+    const q = d.drawInlineAll();
+    this.spansDrawn += q.spans;
+    this.pixelsDrawn += q.pixels;
+    this.clearedFrame = d.frame();
+  }
+
+  /**
+   * Complete the resolve kick (M8.1 parallel resolve): the pool expands
+   * the final index plane into the shared color plane. Falls back to an
+   * identical serial expand on timeout/dead pool. `color` is the destination
+   * plane (pool-adopted when pooled), `palette` the 768-byte RGB palette.
+   * No-op without a dispatcher (caller expands serially instead).
+   */
+  resolveAccum(palette: Uint8Array, color: Uint32Array): void {
+    const d = this.dispatcher;
+    if (d && d.resolveFrame()) return;
+    if (!d) return;
+    resolveBand(color, palette, this.idx, 0, this.fbH, this.fbW, this.fbH);
+  }
+
+  /**
+   * Same as resolveAccum but message-driven (browser async completion).
+   */
+  async resolveAccumAsync(palette: Uint8Array, color: Uint32Array): Promise<void> {
+    const d = this.dispatcher;
+    if (d && await d.resolveFrameAsync()) return;
+    if (!d) return;
+    resolveBand(color, palette, this.idx, 0, this.fbH, this.fbW, this.fbH);
+  }
+
+  /** Inline chunked spanfill with the lazy-clear guard (shared fallback). */
+  private runInline(list: SpanList, tex: Texture, light: LightBlock): void {
+    if (this.dispatcher) {
       const f = this.dispatcher.frame();
       if (f !== this.clearedFrame) {
         this.idx.fill(0);

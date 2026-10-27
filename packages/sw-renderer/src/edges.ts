@@ -7,7 +7,7 @@
 // coplanar faces resolve by traversal order with the strict `>` depth test.
 
 import type { Camera } from './camera.js';
-import { SPAN_OPAQUE, createSpan, type Span } from './spans.js';
+import { SPAN_OPAQUE, F_PER_SPAN, I_PER_SPAN, createSpan, type Span } from './spans.js';
 
 export interface ProjectedVert {
   x: number; y: number;
@@ -150,6 +150,30 @@ function clipNearPlane(
 }
 
 /**
+ * Optional flat-span output for frame-level accumulation (M8.1): when
+ * present, every emitted span is ALSO packed into the flat (F64/I32)
+ * staging arrays at [base, base+cap) with the batch's kind/ord (objects
+ * are tagged identically, so the post-emit tagging loop can be skipped).
+ * `lightOverride` replaces s.light in the flat copy (flat sky fills ride
+ * the palette color, set after emission for the object path). `written`
+ * is an in-out count of flat spans actually stored (cap guard); the caller
+ * falls back to the object path when it disagrees with the object count.
+ */
+export interface EmitFlat {
+  F: Float64Array;
+  I: Int32Array;
+  base: number;
+  cap: number;
+  kind: number;
+  ord: number;
+  /** Null = keep the emitted value; set = the batch's post-tagging value. */
+  light: number | null;
+  dlight: number | null;
+  lv: number | null;
+  written: number;
+}
+
+/**
  * Scan-convert a convex projected polygon into spans appended to `pool`
  * starting at poolCount. Returns the new pool count. Caller clamps pool
  * growth (drops overflow spans, counted in stats).
@@ -164,9 +188,15 @@ export function emitSpansForPoly(
   light: number,
   dlight: number,
   clipH: number,
+  flat?: EmitFlat,
 ): number {
   void surfOrder;
-  if (count < 3) return poolCount;
+  if (count < 3) {
+    if (flat) flat.written = 0;
+    return poolCount;
+  }
+  const fw = flat;
+  let fcount = 0;
   // find y range
   let minY = Infinity, maxY = -Infinity;
   for (let i = 0; i < count; i++) {
@@ -199,11 +229,14 @@ export function emitSpansForPoly(
     if (!(xr > xl)) continue;
     const xa = Math.ceil(xl - 0.5), xb = Math.floor(xr - 0.5);
     if (xb < xa) continue;
-    if (poolCount >= maxSpans) return poolCount;
+    if (poolCount >= maxSpans) {
+      if (fw) fw.written = fcount;
+      return poolCount;
+    }
     while (pool.length <= poolCount) pool.push(createSpan());
     const s = pool[poolCount++]!;
     const dx = xr - xl || 1;
-    s.kind = SPAN_OPAQUE;
+    s.kind = fw ? fw.kind : SPAN_OPAQUE;
     s.y = y;
     s.x0 = xa;
     s.x1 = xb + 1;
@@ -219,8 +252,35 @@ export function emitSpansForPoly(
     s.lv = llv;
     s.dlu = (rlu - llu) / dx;
     s.turb = 0;
+    if (fw) {
+      // Batch tagging, fused: the caller passes the post-emit tag values
+      // (kind/ord/light for sky fills), so objects AND the flat copy carry
+      // the final state and the post-emit tagging loop can be skipped.
+      s.kind = fw.kind;
+      s.ord = fw.ord;
+      if (fw.light !== null) s.light = fw.light;
+      if (fw.dlight !== null) s.dlight = fw.dlight;
+      if (fw.lv !== null) s.lv = fw.lv;
+    }
+    // Fused flat pack (M8.1): same values the pack loop would copy, written
+    // while the span fields are L1-hot. Emission order is strictly
+    // increasing y with one span per row, which is exactly the order the
+    // row z-sort establishes — so the flat copy matches a post-sort pack.
+    if (fw && fcount < fw.cap) {
+      const o = (fw.base + fcount) * F_PER_SPAN;
+      fw.F[o] = s.iz; fw.F[o + 1] = s.diz; fw.F[o + 2] = s.uz;
+      fw.F[o + 3] = s.duz; fw.F[o + 4] = s.vz; fw.F[o + 5] = s.dvz;
+      fw.F[o + 6] = s.light;
+      fw.F[o + 7] = s.dlight; fw.F[o + 8] = s.lu; fw.F[o + 9] = s.lv;
+      fw.F[o + 10] = s.dlu;
+      const q = (fw.base + fcount) * I_PER_SPAN;
+      fw.I[q] = s.kind; fw.I[q + 1] = s.y; fw.I[q + 2] = s.x0;
+      fw.I[q + 3] = s.x1; fw.I[q + 4] = s.turb;
+      fcount++;
+    }
     void rlv;
   }
+  if (fw) fw.written = fcount;
   return poolCount;
 }
 

@@ -16,6 +16,11 @@ export const SPAN_OPAQUE = 0;
 export const SPAN_TURBULENT = 1;
 export const SPAN_FLAT = 2;
 
+/** Doubles packed per span: iz diz uz duz vz dvz light dlight lu lv dlu. */
+export const F_PER_SPAN = 11;
+/** Ints packed per span: kind y x0 x1 turb. */
+export const I_PER_SPAN = 5;
+
 export interface Span {
   kind: number;
   /** scanline + [x0, x1) in pixels */

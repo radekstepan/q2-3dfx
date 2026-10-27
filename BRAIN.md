@@ -544,7 +544,7 @@ done-when:
 ### M8.1 — Workers + SharedArrayBuffer banding
 owns: `packages/sw-renderer`, `apps/web`
 depends: M7.1
-status: review (kernel scales, full frames Amdahl-bound — see note)
+status: done (budget closes pooled headless; browser async loop is follow-up — see note)
 done-when:
 - [x] framebuffer split into N bands; linear scaling to 4 workers ±15%
 - [x] identical golden frames to the single-threaded path
@@ -560,6 +560,23 @@ done-when:
 > frame-level batch accumulation. M8.1 bench section lives in the
 > gitignored `bench.mjs`; gates are pinned in `bands.test.ts`.
 > (60 fps @640×480 tracked in the §15 consolidated list.)
+> M8.1 follow-up DONE 2026-10-26 (async frame accumulation + parallel resolve):
+> per-surface batches fuse-pack during emission (`EmitFlat`, no pack pass)
+> into bump SAB regions, drain in ONE pool kick/frame (`sw_accum` default 1;
+> `packBatched`/`flushFrame`/`flushFrameAsync` + `drawInlineAll` fallback);
+> the palette expand resolves in a second parallel kick (`resolveFrame`,
+> color plane adopted from the pool SAB). Base1 spawn-north 640×480:
+> classic ~19ms → 15.1ms @7 workers (1.25x frame; spanfill kernel ~3x;
+> index + color hashes identical on all 4 views). The legacy per-batch
+> pooled path's real-frame divergence is fixed too (clearedFrame after
+> kick). Plus: sortBatchByRow range fast path, SurfaceCache frame-stamp
+> LRU, reusable scratch camera, cached surfBounds mirror, `sw_accum` cvar,
+> `testMeasurePhases` attribution, committed `tools/bench` frame bench.
+> Browser rAF async integration still needs the `apps/web` lane
+> (`play.ts` owns the loop — out of this lane's ownership); the pool
+> exposes the message-driven primitives (`flushFrameAsync`,
+> `resolveFrameAsync`) and the renderer stays sync. M7.1's fps box stays
+> with the web lane (browser sign-off).
 
 ### M7.2 — Playable base1 (NEXT STEP — pick this card first)
 owns: `apps/web` (+ `packages/game` data tables only, no contract changes)
@@ -627,6 +644,18 @@ done-when:
 > ~1.3–1.45× synth / parity on real frames (V8 already compiles the loop
 > near-optimally; 25% of base1 batches take the wasm path, rest correctly
 > fall back). True 2× needs SIMD v128 or M8.1 worker composition.
+> M9.1 SIMD v128 spike outcome 2026-10-26 (documented, no v128 path lands):
+> V8 scalar is at ceiling for this loop shape — 2 dependent gathers/px
+> (texel+colormap, v128 has no gather), f64 1/z stepping is
+> non-associative (can't parallelise bit-identically), zb compare must stay
+> f64 (f32-demote flips coplanar ties; 45–58% z-rejected). Only the i32
+> tu/tv/index math vectorises exactly, and per-subdivision v128 setup +
+> lane extracts eat the saving (predicted ~1.1–1.2x for real risk).
+> Opcodes verified on V8 in the spike (i32x4 splat=0x11, extract=0x1B,
+> replace=0x1C, add=0xAE, and=0x4E, mul=0xB5, shl=0xAB, shr_s=0xAC,
+> shr_u=0xAD). The ≥2× came from the M8.1 composition instead (spanfill
+> ~3x pooled); scalar wasm stays opt-in behind `sw_wasm`, TS default.
+> Full analysis lives in the `wasmSpans.ts` module header.
 done-when:
 - [ ] `RasterBackend` implemented in AssemblyScript/Zig, byte-identical output, ≥2× faster
 
@@ -705,6 +734,8 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-25 | worker | software spanfill kernel, 4-worker SAB banding | 640×480 synth | — | 243.8 (4w) vs 69.7 (1w) = 3.49× | — | full-screen batch best-of, in ±15%-of-linear band; byte-identical, devroom `8f61c755` preserved |
 | 2026-10-25 | worker | software base1 spawn-north, banded-inline / pool4 | 640×480 | ~45 | — | 2.36 | medians ≈21.9 / 21.5 / 22.7 ms (no full-frame win: 1802 batches/frame Amdahl-bound); hashes ≡ single-threaded |
 | 2026-10-25 | overdraw | software base1 4-view attribution, ceiling proof | 640×480 | — | — | 1.81–2.36 | north 2.362 / west 1.810 / lowroad 2.186 / trench 1.936; written+zRejected≡candidate, 44.8–57.7% depth-rejected; budget recalibrated 1.15× → 2.5× |
+| 2026-10-26 | async+simd | software base1 spawn-north, frame-attribution (classic) | 640×480 | ~36 | — | 2.38 | renderView 28.3 = GEO 13.4 (setup 0.05 mark 0.0 trav 1.0 cull 4.3 cache 0.9 proj 1.8 emit 3.8 sort 1.0) + DRAW 11.5 + resolve 1.2; 1806 batches, 30337 spans; committed `tools/bench` frame bench |
+| 2026-10-26 | async+simd | software base1 spawn-north, pooled frame-accum + parallel resolve | 640×480 | 66 | — | 2.38 | classic 19.1 → 15.1 ms/frame @7 workers (1.25x; spanfill ~3x, fused pack saves ~1ms, resolve kick ~0.7ms); index + color hashes ≡ classic on all 4 views; devroom `8f61c755`; closes the 16ms budget headless |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.

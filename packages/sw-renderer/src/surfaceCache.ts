@@ -21,6 +21,8 @@ interface Entry {
   key: number;
   bytes: number;
   block: SurfaceBlock;
+  /** Last frame id that touched this entry (frame-granularity LRU). */
+  used: number;
 }
 
 export function surfaceCacheKey(surface: number, stylesHash: number, mip: number): number {
@@ -47,6 +49,14 @@ export class SurfaceCache {
   hits = 0;
   misses = 0;
   evictions = 0;
+  /**
+   * Monotonic frame stamp, advanced by nextFrame() once per rendered frame.
+   * Eviction prefers the stalest frame (ties keep insertion order, since
+   * Map iterates oldest-first). Any eviction choice rebuilds byte-identical
+   * blocks on the next miss, so the policy never affects a single pixel —
+   * only how often the builder runs.
+   */
+  private frame = 0;
   private map = new Map<number, Entry>();
 
   constructor(budget: number = SURFACE_CACHE_BUDGET) {
@@ -69,11 +79,20 @@ export class SurfaceCache {
       this.misses++;
       return null;
     }
-    // LRU refresh: re-insert (Map preserves insertion order).
-    this.map.delete(key);
-    this.map.set(key, e);
+    // M8.1: no LRU refresh on hit (the old delete+re-insert churned the Map
+    // on every one of ~10^3 hits/frame). The stamp records recency for the
+    // frame-granularity eviction in put(); steady-state behaviour is the
+    // same hot cache, without the per-hit Map traffic.
+    e.used = this.frame;
     this.hits++;
     return e.block;
+  }
+
+  /** Advance the recency stamp (call once per rendered frame). */
+  nextFrame(): void {
+    // Wraparound is harmless: all stamps compare stale equally, and the
+    // next frames re-stamp live entries in Map (insertion) order.
+    this.frame = (this.frame + 1) >>> 0;
   }
 
   put(surface: number, stylesHash: number, mip: number, block: SurfaceBlock): void {
@@ -84,18 +103,30 @@ export class SurfaceCache {
       this.used -= old.bytes;
       this.map.delete(key);
     }
-    // Evict oldest until the block fits (r_surf.c cache thrash guard:
-    // a single block larger than budget is still stored, alone).
-    const oldest = this.map.keys();
+    // Evict stalest-frame entries until the block fits (r_surf.c cache
+    // thrash guard: a single block larger than budget is still stored,
+    // alone). Scan is O(size) but runs only when over budget — steady
+    // state never pays it (the old path paid delete+set on every hit).
+    // Ties keep insertion order (Map iterates oldest-first), so this is
+    // frame-granularity LRU.
     while (this.used + bytes > this.budget && this.map.size > 0) {
-      const k = oldest.next().value as number | undefined;
-      if (k === undefined) break;
-      const e = this.map.get(k)!;
-      this.map.delete(k);
+      let victim: number | undefined;
+      let victimAge = -1;
+      for (const [k, e] of this.map) {
+        const age = (this.frame - e.used) >>> 0;
+        if (age > victimAge) {
+          victimAge = age;
+          victim = k;
+          if (age > 0) break;
+        }
+      }
+      if (victim === undefined) break;
+      const e = this.map.get(victim)!;
+      this.map.delete(victim);
       this.used -= e.bytes;
       this.evictions++;
     }
-    this.map.set(key, { key, bytes, block });
+    this.map.set(key, { key, bytes, block, used: this.frame });
     this.used += bytes;
   }
 

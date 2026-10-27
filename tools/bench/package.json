@@ -11,10 +11,15 @@
     "lint": "eslint src --no-warn-ignored || true",
     "test": "vitest run --passWithNoTests",
     "golden": "echo golden-ok",
-    "bench": "echo bench-ok"
+    "bench": "echo bench-ok",
+    "bench:frame": "node ./frame-bench.mjs"
   },
   "dependencies": {
+    "@q2/bsp": "workspace:*",
     "@q2/config": "workspace:*",
+    "@q2/formats": "workspace:*",
+    "@q2/renderer-api": "workspace:*",
+    "@q2/sw-renderer": "workspace:*",
     "@q2/testkit": "workspace:*"
   },
   "devDependencies": {

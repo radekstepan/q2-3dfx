@@ -8,7 +8,7 @@ import type {
 } from '@q2/renderer-api';
 import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
 import { SurfaceCache, hashLightStyles, type SurfaceBlock } from './surfaceCache.js';
-import { setupCamera, type Camera } from './camera.js';
+import { setupCamera, setupCameraInto, type Camera } from './camera.js';
 import {
   collectVisibleSurfaces, findLeaf, isMiniWorld, surfFrustumCulled,
   type MiniSurf, type MiniWorld,
@@ -19,7 +19,7 @@ import {
 } from './overdraw.js';
 import {
   createEdgeScratch, emitSpansForPoly, projectClippedPoly,
-  type EdgeScratch, type PolyInput,
+  type EdgeScratch, type EmitFlat, type PolyInput,
 } from './edges.js';
 import {
   SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, buildTurbTable, createSpan,
@@ -29,6 +29,7 @@ import {
 import { WasmSpanBackend, wasmRequestedByCvar } from './wasmSpans.js';
 import {
   BandedSoftwareBackend, createBandBuffers, sabAvailable, workersRequestedByCvar,
+  accumRequestedByCvar,
   type BandDispatcher,
 } from './bands.js';
 import {
@@ -54,22 +55,90 @@ function isAliasMesh(data: unknown): data is AliasMesh {
     && m.st instanceof Float32Array && m.normals instanceof Uint8Array;
 }
 
+/**
+ * Per-phase frame attribution (M8.1 job §1): geometry (traversal +
+ * surface-cache + project + emit + sort) vs spanfill vs resolve. Armed
+ * only via testMeasurePhases(); the hot loop pays one null check per
+ * surface when disarmed and output is identical either way.
+ */
+export interface FramePhases {
+  /** Frame setup before the surface loop (camera, bounds fill, mark). */
+  setup: number;
+  /** R_MarkLeaves + dlight invalidation (world traversal setup). */
+  mark: number;
+  /** PVS walk + frustum/backface admission (collectVisibleSurfaces). */
+  traverse: number;
+  /** Surface-cache get + buildSurfaceBlock on miss. */
+  cache: number;
+  /** Per-surface frustum/backface/dist/mip/style checks + view writes. */
+  cull: number;
+  /** projectClippedPoly per admitted surface. */
+  project: number;
+  /** emitSpansForPoly + span kind/ord tagging. */
+  emit: number;
+  /** sortBatchByRow per batch. */
+  sort: number;
+  /** backend.drawSpans (spanfill: opaque + turbulent + flat passes). */
+  draw: number;
+  /** Alias/sprite/particle/tracer draws (world-placed + entities). */
+  alias: number;
+}
+
+/** Sub-millisecond clock for phase probes. performance.now exists in Node
+ *  16+ and browsers; falls back to Date.now where it does not. Only called
+ *  while a measurement is armed, so the lookup costs nothing per frame. */
+export function phaseNow(): number {
+  try {
+    const g = globalThis as { performance?: { now?: () => number } };
+    if (g.performance && typeof g.performance.now === 'function') return g.performance.now();
+  } catch {
+    /* fall through */
+  }
+  return Date.now();
+}
+
+/** Zeroed phase accumulators (reused, no per-frame allocation). */
+export function createFramePhases(): FramePhases {
+  return { setup: 0, mark: 0, traverse: 0, cull: 0, cache: 0, project: 0, emit: 0, sort: 0, draw: 0, alias: 0 };
+}
+
 /** In-place per-row z-sort of a span batch: rows ascending, 1/z descending,
- *  BSP traversal order ascending (R_ScanEdges semantics, coplanar-stable). */
+ *  BSP traversal order ascending (R_ScanEdges semantics, coplanar-stable).
+ *
+ *  M8.1 fast path: world-surface batches arrive from emitSpansForPoly in
+ *  strictly increasing y with one span per row, so the counting sort is a
+ *  proven no-op for them. A min/max pass finds the touched rows and a
+ *  counting pass over that range verifies every bucket holds at most one
+ *  span; when it does, rows are provably disjoint and order across rows
+ *  cannot affect any pixel (or the drawn counts), so the function returns
+ *  early. Anything else falls through to the exact legacy path below, over
+ *  the same restricted range — output is identical in all cases. */
 export function sortBatchByRow(
   spans: Span[], start: number, count: number, H: number,
   rowBase: Int32Array, tmp: Span[],
 ): void {
   if (count <= 1 || H <= 0) return;
   const h = H > MAX_ROW ? MAX_ROW : H;
-  rowBase.fill(0, 0, h + 1);
+  let ymin = h - 1, ymax = 0;
   for (let i = 0; i < count; i++) {
     let y = spans[start + i]!.y;
     if (y < 0) y = 0;
     else if (y >= h) y = h - 1;
-    rowBase[y + 1]++;
+    if (y < ymin) ymin = y;
+    if (y > ymax) ymax = y;
   }
-  for (let y = 0; y < h; y++) rowBase[y + 1] += rowBase[y]!;
+  rowBase.fill(0, ymin, ymax + 2);
+  let single = true;
+  for (let i = 0; i < count; i++) {
+    let y = spans[start + i]!.y;
+    if (y < 0) y = 0;
+    else if (y >= h) y = h - 1;
+    const c = rowBase[y + 1]! + 1;
+    rowBase[y + 1] = c;
+    if (c > 1) single = false;
+  }
+  if (single) return;
+  for (let y = ymin; y <= ymax; y++) rowBase[y + 1] += rowBase[y]!;
   for (let i = 0; i < count; i++) {
     let y = spans[start + i]!.y;
     if (y < 0) y = 0;
@@ -142,6 +211,8 @@ export class SoftwareRenderer implements Refresh {
   private visSurfs: number[] = [];
   private visOrder: number[] = [];
   private surfBounds: SurfaceBounds[] = [];
+  /** World the surfBounds mirror (identity + length checked per frame). */
+  private boundsWorld: MiniWorld | null = null;
   private polyInput: PolyInput = {
     verts: new Float32Array(0), uvs: new Float32Array(0), lux: new Float32Array(0), n: 0,
   };
@@ -150,6 +221,18 @@ export class SoftwareRenderer implements Refresh {
   private partPool: ScreenParticle[] = [];
   private partOrigins = new Float32Array(3 * 256);
   private partColors = new Uint8Array(256);
+  /** Renderer-owned scratch camera (M8.1: setupCamera allocates per call). */
+  private camMemo: Camera | null = null;
+  /**
+   * Reusable fused-emission descriptor (M8.1: emitSpansForPoly packs flat
+   * spans while fields are L1-hot; no per-batch allocation). Only valid
+   * for the batch it was built for — commitFlat consumes or drops it.
+   */
+  private emitFlat: EmitFlat = {
+    F: new Float64Array(0), I: new Int32Array(0),
+    base: -1, cap: 0, kind: 0, ord: 0,
+    light: null, dlight: null, lv: null, written: -1,
+  };
   private frame = 0;
   private fallbackMesh = createBoxMesh(20);
   /** Procedural gun fallback (registerModel md2 without real data). Lazy. */
@@ -202,6 +285,13 @@ export class SoftwareRenderer implements Refresh {
    */
   private diagAcc: OverdrawDetail = createOverdrawDetail();
   private diagArmed = false;
+  /**
+   * Phase-timing accumulators (M8.1 attribution). Null unless a measurement
+   * is armed via testMeasurePhases(); zero allocation when armed (reused
+   * object), one null check per surface when disarmed.
+   */
+  private phaseAcc: FramePhases = createFramePhases();
+  private phaseArmed = false;
 
   init(fb: Framebuffer): void {
     this.fbW = fb.width;
@@ -323,9 +413,11 @@ export class SoftwareRenderer implements Refresh {
     if (pool && pool.planes && this.isWorkersActive()) {
       const p = pool.planes;
       if (p.idx.length === this.fbW * this.fbH && p.zb.length === this.fbW * this.fbH &&
-        p.idx.buffer === p.zb.buffer) {
+        p.color.length === this.fbW * this.fbH &&
+        p.idx.buffer === p.zb.buffer && p.idx.buffer === p.color.buffer) {
         this.idx = p.idx;
         this.zb = p.zb;
+        this.color = p.color;
         this.bandBackend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
       }
     }
@@ -349,6 +441,7 @@ export class SoftwareRenderer implements Refresh {
     this.zb = buf.zb;
     this.bandBackend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
     this.bandBackend.setBandCount(n);
+    this.bandBackend.accumEnabled = accumRequestedByCvar();
     this.bandBackend.time = this.backend.time;
     this.backend = this.bandBackend;
   }
@@ -360,6 +453,7 @@ export class SoftwareRenderer implements Refresh {
       if (this.hostFb?.index) {
         this.idx = this.hostFb.index;
         this.zb = this.hostFb.depth;
+        this.color = this.hostFb.color;
         this.backend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
       }
     }
@@ -590,11 +684,13 @@ export class SoftwareRenderer implements Refresh {
 
   beginFrame(): void {
     this.frame++;
+    this.cache.nextFrame();
     // Pooled band path: bands clear lazily per frame generation (parallel
     // clear, no serial fill); every other path fills here as before.
     const pooled = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
     if (pooled) {
       pooled.beginFrame();
+      pooled.stagePalette(this.palette);
       this.bandBackend.batchesDrawn = 0;
     } else {
       this.idx.fill(0);
@@ -607,8 +703,14 @@ export class SoftwareRenderer implements Refresh {
 
   renderView(view: RefDef, world: WorldModel, entities: Entity[]): FrameStats {
     const t0 = Date.now();
+    const ph = this.phaseArmed ? this.phaseAcc : null;
+    let pt = ph ? phaseNow() : 0;
     const worldData = isMiniWorld(world.data) ? world.data : createDevroom();
-    const cam = setupCamera(view.origin, view.angles, view.fovX, this.fbW, this.fbH);
+    // Reuse the scratch camera across frames (allocation-free steady state;
+    // bit-identical to a fresh setupCamera — see setupCameraInto).
+    const cam = this.camMemo
+      ? setupCameraInto(this.camMemo, view.origin, view.angles, view.fovX, this.fbW, this.fbH)
+      : (this.camMemo = setupCamera(view.origin, view.angles, view.fovX, this.fbW, this.fbH));
     this.backend.time = view.time;
     // Renderer-owned dynamic lights (muzzle flashes) age out on their own:
     // expire before the serial check so a stale flash invalidates the cache
@@ -625,20 +727,29 @@ export class SoftwareRenderer implements Refresh {
       this.lastDynSerial = this.dlights.serial;
     }
     const nSurfs = worldData.surfaces.length;
+    // R_MarkLeaves input: mirror (id, mins, maxs) per surface. Worlds are
+    // static per level, so refill only when the world identity or surface
+    // count changes (movers mutate contents in place through the same
+    // Float32Array refs, which stay valid). Saves ~8K×3 stores/frame.
     const bounds = this.surfBounds;
-    while (bounds.length < nSurfs) {
-      bounds.push({ id: 0, mins: new Float32Array(3), maxs: new Float32Array(3) });
-    }
-    for (let i = 0; i < nSurfs; i++) {
-      const s = worldData.surfaces[i]!;
-      const b = bounds[i]!;
-      b.id = s.id;
-      b.mins = s.mins;
-      b.maxs = s.maxs;
+    if (this.boundsWorld !== worldData || bounds.length !== nSurfs) {
+      bounds.length = 0;
+      while (bounds.length < nSurfs) {
+        bounds.push({ id: 0, mins: new Float32Array(3), maxs: new Float32Array(3) });
+      }
+      for (let i = 0; i < nSurfs; i++) {
+        const s = worldData.surfaces[i]!;
+        const b = bounds[i]!;
+        b.id = s.id;
+        b.mins = s.mins;
+        b.maxs = s.maxs;
+      }
+      this.boundsWorld = worldData;
     }
     const dyn: DynamicLight[] = this.dlights.lights.length > 0
       ? this.dlights.lights
       : worldData.dynamicLights;
+    if (ph) { ph.setup += phaseNow() - pt; pt = phaseNow(); }
     const dlState = this.dlights;
     const savedLights = dlState.lights;
     dlState.lights = dyn;
@@ -651,6 +762,7 @@ export class SoftwareRenderer implements Refresh {
       // world-embedded lights always affect bit 0 when marked this frame
       return affected.includes(id) ? 1 : 0;
     };
+    if (ph) { ph.mark += phaseNow() - pt; pt = phaseNow(); }
 
     // viewcluster + traversal
     const leaf = worldData.nodes.length === 0 ? 0 : findLeaf(worldData.nodes, view.origin);
@@ -660,6 +772,7 @@ export class SoftwareRenderer implements Refresh {
       this.visOrder.push(0);
     }
     const nvis = collectVisibleSurfaces(worldData, cam, viewCluster, this.visSurfs, this.visOrder);
+    if (ph) { ph.traverse += phaseNow() - pt; pt = phaseNow(); }
 
     let spansEmitted = 0;
     let candidatePixels = 0;
@@ -678,13 +791,14 @@ export class SoftwareRenderer implements Refresh {
       d.candidatePixels = 0;
     }
     // per-surface batches: cache -> emit -> row z-sort -> draw
+    const pixelsBase = this.backend.pixelsDrawn;
     for (let vi = 0; vi < nvis; vi++) {
       const si = this.visSurfs[vi]!;
       const order = this.visOrder[vi]!;
       const surf = worldData.surfaces[si]!;
       // degenerate (NODRAW) placeholders from BSP conversion carry no geometry
-      if (surf.n < 3) { if (d) d.degenerate++; continue; }
-      if (surfFrustumCulled(cam, surf)) { if (d) d.frustumCulled++; continue; }
+      if (surf.n < 3) { if (d) d.degenerate++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
+      if (surfFrustumCulled(cam, surf)) { if (d) d.frustumCulled++; if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); } continue; }
       // backface cull for single-sided world polys (id draws these too and
       // lets the z-buffer reject them; skipping is output-identical and
       // saves the span work). Turbulent (water) and sky stay double-sided:
@@ -695,6 +809,7 @@ export class SoftwareRenderer implements Refresh {
         const dz = cam.origin[2]! - surf.center[2]!;
         if (surf.fn[0]! * dx + surf.fn[1]! * dy + surf.fn[2]! * dz < 0) {
           if (d) d.backfaceCulled++;
+          if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
           continue;
         }
       }
@@ -713,10 +828,10 @@ export class SoftwareRenderer implements Refresh {
           // perspective span math stays exact).
           if (!this.skyBoxEmitted) {
             this.skyBoxEmitted = true;
-            const before = this.backend.pixelsDrawn;
+            if (ph) pt = phaseNow();
             this.emitSkyBox(cam, order, this.skyEmitAcc);
+            if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
             spansEmitted += this.skyEmitAcc.spans;
-            candidatePixels += this.backend.pixelsDrawn - before;
             if (d) {
               d.emitted++;
               if (this.skyEmitAcc.max > d.maxBatchSpans) d.maxBatchSpans = this.skyEmitAcc.max;
@@ -733,25 +848,32 @@ export class SoftwareRenderer implements Refresh {
         this.polyInput.uvs = surf.uvs;
         this.polyInput.lux = surf.lux;
         this.polyInput.n = surf.n;
+        if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
         const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
+        if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
         if (nproj < 3) { if (d) d.clipRejected++; continue; }
         const start = this.spanList.count;
+        const flat = this.flatForEmit(SPAN_FLAT, order, this.skyIndex, 0, null);
         const endCount = emitSpansForPoly(
           this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
+          flat,
         );
         if (endCount <= start) { if (d) d.clipRejected++; continue; }
-        for (let i = start; i < endCount; i++) {
-          const sp = this.pool[i]!;
-          sp.kind = SPAN_FLAT;
-          sp.ord = order;
-          sp.light = this.skyIndex;
-          sp.dlight = 0;
+        if (!this.commitFlat(flat, endCount - start)) {
+          for (let i = start; i < endCount; i++) {
+            const sp = this.pool[i]!;
+            sp.kind = SPAN_FLAT;
+            sp.ord = order;
+            sp.light = this.skyIndex;
+            sp.dlight = 0;
+          }
         }
+        if (ph) { ph.emit += phaseNow() - pt; pt = phaseNow(); }
         sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+        if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = endCount;
-        const before = this.backend.pixelsDrawn;
         this.backend.drawSpans(this.spanList, texView, lightView);
-        candidatePixels += this.backend.pixelsDrawn - before;
+        if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = 0;
         spansEmitted += endCount - start;
         if (d) {
@@ -780,6 +902,7 @@ export class SoftwareRenderer implements Refresh {
         this.styleScratch[nValid++] = view.lightStyles[idx] ?? 0;
       }
       const stylesHash = hashLightStyles(this.styleScratch, nValid);
+      if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
       let block = this.cache.get(surf.id, stylesHash, mip);
       if (!block) {
         // copy the style scales out of scratch (build is a miss-only path)
@@ -797,28 +920,37 @@ export class SoftwareRenderer implements Refresh {
       lb.width = block.luxW;
       lb.height = block.luxH;
       lb.values = block.light;
+      if (ph) { ph.cache += phaseNow() - pt; pt = phaseNow(); }
       // emit
       this.polyInput.verts = surf.verts;
       this.polyInput.uvs = surf.uvs;
       this.polyInput.lux = surf.lux;
       this.polyInput.n = surf.n;
       const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
+      if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
       if (nproj < 3) { if (d) d.clipRejected++; continue; }
       const start = this.spanList.count;
+      const flat = this.flatForEmit(
+        surf.turbulent ? SPAN_TURBULENT : SPAN_OPAQUE, order, null, null, null,
+      );
       const endCount = emitSpansForPoly(
         this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
+        flat,
       );
       if (endCount <= start) { if (d) d.clipRejected++; continue; }
-      for (let i = start; i < endCount; i++) {
-        const sp = this.pool[i]!;
-        sp.kind = surf.turbulent ? SPAN_TURBULENT : SPAN_OPAQUE;
-        sp.ord = order;
+      if (!this.commitFlat(flat, endCount - start)) {
+        for (let i = start; i < endCount; i++) {
+          const sp = this.pool[i]!;
+          sp.kind = surf.turbulent ? SPAN_TURBULENT : SPAN_OPAQUE;
+          sp.ord = order;
+        }
       }
+      if (ph) { ph.emit += phaseNow() - pt; pt = phaseNow(); }
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+      if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
-      const before = this.backend.pixelsDrawn;
       this.backend.drawSpans(this.spanList, tex, lb);
-      candidatePixels += this.backend.pixelsDrawn - before;
+      if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
       spansEmitted += endCount - start;
       if (d) {
@@ -828,6 +960,20 @@ export class SoftwareRenderer implements Refresh {
       }
     }
 
+    // Frame accumulation (M8.1 async-render step 1): geometry captured every
+    // batch above; complete the frame with ONE pool kick here, before any
+    // direct plane writes (alias/sprites/particles depth-test against the
+    // world). Unpooled / accum-disabled: no-op, batches already drew inline.
+    // candidatePixels finalises from the backend counters either way (the
+    // per-batch deltas telescoped to the same total).
+    if (this.backend === this.bandBackend && this.bandBackend.dispatcher &&
+      this.bandBackend.accumEnabled) {
+      if (ph) pt = phaseNow();
+      this.bandBackend.flushAccum();
+      if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
+    }
+    candidatePixels = this.backend.pixelsDrawn - pixelsBase;
+
     // world-placed alias / sprites / particles (M3.4 in the devroom)
     // Pooled path with zero span batches (degenerate frame): planes were
     // never cleared lazily, so fill once before direct plane writes.
@@ -836,6 +982,7 @@ export class SoftwareRenderer implements Refresh {
       this.idx.fill(0);
       this.zb.fill(0);
     }
+    if (ph) pt = phaseNow();
     for (const pa of worldData.alias) {
       const mesh = getDevMeshSafe(pa.meshId, this.fallbackMesh);
       const skin = worldData.textures[pa.skinId % worldData.textures.length]!;
@@ -942,6 +1089,7 @@ export class SoftwareRenderer implements Refresh {
         this.tracerColors[ti]!, this.tracerCores[ti]!);
       this.tracerTtl[ti]--;
     }
+    if (ph) { ph.alias += phaseNow() - pt; pt = phaseNow(); }
 
     // Age renderer-owned lights once per rendered view: a flash that is not
     // re-added expires after DEFAULT_DLIGHT_TTL_FRAMES renders (swept at the
@@ -960,20 +1108,26 @@ export class SoftwareRenderer implements Refresh {
   }
 
   endFrame(): void {
-    // Pooled path with zero span batches: clear once so the resolve below
-    // reads defined planes (mirrors the pre-alias guard in renderView).
-    if (this.backend === this.bandBackend && this.bandBackend.dispatcher &&
-      this.bandBackend.batchesDrawn === 0) {
-      this.idx.fill(0);
-      this.zb.fill(0);
-    }
-    // palette expand to 0xAABBGGRR
-    const pal = this.palette;
-    const n = this.fbW * this.fbH;
-    for (let i = 0; i < n; i++) {
-      const c = this.idx[i]! * 3;
-      const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
-      this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
+    if (this.backend === this.bandBackend && this.bandBackend.dispatcher) {
+      // Pooled path: palette-expand via one resolve kick (workers + the
+      // main band drain the color plane in parallel; identical math to the
+      // serial loop below). Timeout/dead pool falls back to the serial
+      // expand inside resolveAccum. The zero-batch guard keeps the resolve
+      // input defined (mirrors the pre-alias guard in renderView).
+      if (this.bandBackend.batchesDrawn === 0) {
+        this.idx.fill(0);
+        this.zb.fill(0);
+      }
+      this.bandBackend.resolveAccum(this.palette, this.color);
+    } else {
+      // palette expand to 0xAABBGGRR (classic / wasm / banded-inline paths)
+      const pal = this.palette;
+      const n = this.fbW * this.fbH;
+      for (let i = 0; i < n; i++) {
+        const c = this.idx[i]! * 3;
+        const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
+        this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
+      }
     }
     // wasm mode draws into wasm-memory views: mirror the index plane back so
     // host code reading fb.index directly stays correct (testkit's harness
@@ -1034,6 +1188,23 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
+   * M8.1 attribution: render one frame with phase timing armed and return
+   * stats + the geometry/spanfill split (see FramePhases). The drawn output
+   * (index + depth planes) is identical to a plain beginFrame/renderView
+   * pair — arming only fills counters (phaseNow() while armed).
+   */
+  testMeasurePhases(
+    view: RefDef, world: WorldModel, entities: Entity[],
+  ): { stats: FrameStats; phases: FramePhases } {
+    this.phaseAcc = createFramePhases();
+    this.phaseArmed = true;
+    this.beginFrame();
+    const stats = this.renderView(view, world, entities);
+    this.phaseArmed = false;
+    return { stats, phases: { ...this.phaseAcc } };
+  }
+
+  /**
    * M3.3 option (b): render one frame with overdraw attribution armed and
    * return stats + the full stage accounting (see overdraw.ts). The drawn
    * output (index + depth planes) is identical to a plain
@@ -1060,6 +1231,50 @@ export class SoftwareRenderer implements Refresh {
     acc.visibleCoverage = area > 0 ? acc.writtenPixels / area : 0;
     acc.occludedShare = acc.candidatePixels > 0 ? acc.zRejectedPixels / acc.candidatePixels : 0;
     return { stats, detail: { ...acc } };
+  }
+
+  /**
+   * Build the fused-emission descriptor for one batch (M8.1): points the
+   * reusable emitFlat at the pool's current flat cursor. The caller passes
+   * it to emitSpansForPoly, then commitFlat validates + stages it.
+   * Returns undefined when unfused (classic / unpooled / accum off).
+   */
+  private flatForEmit(
+    kind: number, ord: number,
+    light: number | null, dlight: number | null, lv: number | null,
+  ): EmitFlat | undefined {
+    const banded = this.backend === this.bandBackend ? this.bandBackend : null;
+    const d = banded?.dispatcher;
+    if (!banded || !d || !banded.accumEnabled) return undefined;
+    const cur = d.flatCursor();
+    if (!cur || cur.cap <= 0) return undefined;
+    const f = this.emitFlat;
+    f.F = cur.F; f.I = cur.I; f.base = cur.base; f.cap = cur.cap;
+    f.kind = kind; f.ord = ord;
+    f.light = light; f.dlight = dlight; f.lv = lv;
+    f.written = -1;
+    return f;
+  }
+
+  /**
+   * Consume a fused emission (M8.1): when the flat copy matches the object
+   * batch exactly, stage it for the frame kick (backend.pendingFlat) and
+   * report true so the caller skips its tagging loop (objects already carry
+   * the final state); otherwise drop it so drawSpans falls back to the
+   * inline path (objects are always complete, so output stays identical).
+   * Always call after emit, even when flat is undefined.
+   */
+  private commitFlat(flat: EmitFlat | undefined, emitted: number): boolean {
+    const banded = this.backend === this.bandBackend ? this.bandBackend : null;
+    if (!banded) return false;
+    if (flat && emitted > 0 && flat.written === emitted) {
+      banded.pendingFlat.base = flat.base;
+      banded.pendingFlat.count = emitted;
+      return true;
+    }
+    banded.pendingFlat.base = -1;
+    banded.pendingFlat.count = 0;
+    return false;
   }
 
   /**
@@ -1101,17 +1316,21 @@ export class SoftwareRenderer implements Refresh {
       const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
       if (nproj < 3) continue;
       const start = this.spanList.count;
+      const flat = this.flatForEmit(SPAN_OPAQUE, order, 63, 0, -1);
       const endCount = emitSpansForPoly(
         this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
+        flat,
       );
       if (endCount <= start) continue;
-      for (let i = start; i < endCount; i++) {
-        const sp = this.pool[i]!;
-        sp.kind = SPAN_OPAQUE;
-        sp.ord = order;
-        sp.light = 63;
-        sp.dlight = 0;
-        sp.lv = -1;
+      if (!this.commitFlat(flat, endCount - start)) {
+        for (let i = start; i < endCount; i++) {
+          const sp = this.pool[i]!;
+          sp.kind = SPAN_OPAQUE;
+          sp.ord = order;
+          sp.light = 63;
+          sp.dlight = 0;
+          sp.lv = -1;
+        }
       }
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       this.spanList.count = endCount;

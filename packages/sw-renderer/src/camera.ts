@@ -116,3 +116,78 @@ export function culledByFrustum(cam: Camera, mins: Float32Array, maxs: Float32Ar
   }
   return false;
 }
+
+/**
+ * Refill a renderer-owned Camera in place (M8.1: setupCamera allocates ~20
+ * small objects per frame — vectors, corner rays, plane records. Reusing one
+ * Camera keeps the frame loop allocation-free). Bit-identical to
+ * setupCamera: same angles, focals, plane normals (normalised the same way)
+ * and distances. Never retains the caller's arrays (copies components).
+ */
+export function setupCameraInto(
+  cam: Camera,
+  origin: Float32Array,
+  angles: Float32Array,
+  fovX: number,
+  width: number,
+  height: number,
+  near = 4,
+): Camera {
+  AngleVectors(angles, cam.forward, cam.right, cam.up);
+  const halfFovX = ((fovX * Math.PI) / 180) / 2;
+  const tanX = Math.tan(halfFovX);
+  const tanY = tanX * (height / width);
+  cam.origin[0] = origin[0]!; cam.origin[1] = origin[1]!; cam.origin[2] = origin[2]!;
+  cam.xCenter = width / 2 - 0.5;
+  cam.yCenter = height / 2 - 0.5;
+  cam.focalX = width / 2 / tanX;
+  cam.focalY = height / 2 / tanY;
+  cam.near = near;
+  const tx = (cam.xCenter + 0.5) / cam.focalX;
+  const ty = (cam.yCenter + 0.5) / cam.focalY;
+  const f = cam.forward, r = cam.right, u = cam.up, o = cam.origin;
+  // Corner rays at distance 1 in view space (matches buildFrustum order).
+  // Components are f32-rounded exactly like buildFrustum's ray(), which
+  // returns a Float32Array: Math.fround is bit-identical to that store.
+  const F = Math.fround;
+  const tlx = F(f[0]! + r[0]! * -tx + u[0]! * ty);
+  const tly = F(f[1]! + r[1]! * -tx + u[1]! * ty);
+  const tlz = F(f[2]! + r[2]! * -tx + u[2]! * ty);
+  const trx = F(f[0]! + r[0]! * tx + u[0]! * ty);
+  const try_ = F(f[1]! + r[1]! * tx + u[1]! * ty);
+  const trz = F(f[2]! + r[2]! * tx + u[2]! * ty);
+  const blx = F(f[0]! + r[0]! * -tx + u[0]! * -ty);
+  const bly = F(f[1]! + r[1]! * -tx + u[1]! * -ty);
+  const blz = F(f[2]! + r[2]! * -tx + u[2]! * -ty);
+  const brx = F(f[0]! + r[0]! * tx + u[0]! * -ty);
+  const bry = F(f[1]! + r[1]! * tx + u[1]! * -ty);
+  const brz = F(f[2]! + r[2]! * tx + u[2]! * -ty);
+  // Inward normals: same cross products as buildFrustum, written in place
+  // (top = tl x tr, bottom = br x bl, left = bl x tl, right = tr x br).
+  // Cross results are f32-rounded like buildFrustum's cross() output array.
+  while (cam.frustum.length < 5) cam.frustum.push({ normal: new Float32Array(3), dist: 0 });
+  setPlane(cam.frustum[0]!,
+    F(tly * trz - tlz * try_), F(tlz * trx - tlx * trz), F(tlx * try_ - tly * trx), o);
+  setPlane(cam.frustum[1]!,
+    F(bry * blz - brz * bly), F(brz * blx - brx * blz), F(brx * bly - bry * blx), o);
+  setPlane(cam.frustum[2]!,
+    F(bly * tlz - blz * tly), F(blz * tlx - blx * tlz), F(blx * tly - bly * tlx), o);
+  setPlane(cam.frustum[3]!,
+    F(try_ * brz - trz * bry), F(trz * brx - trx * brz), F(trx * bry - try_ * brx), o);
+  const nn = cam.frustum[4]!;
+  nn.normal[0] = f[0]!; nn.normal[1] = f[1]!; nn.normal[2] = f[2]!;
+  nn.dist = f[0]! * o[0]! + f[1]! * o[1]! + f[2]! * o[2]! + near;
+  return cam;
+}
+
+/** Normalise (x, y, z) into a plane record through the camera origin.
+ *  Matches planeFromPoints exactly: the normal is f32-rounded on store and
+ *  the distance is computed from the STORED normal, not the f64 quotient. */
+function setPlane(
+  p: { normal: Float32Array; dist: number },
+  x: number, y: number, z: number, o: Float32Array,
+): void {
+  const l = Math.hypot(x, y, z) || 1;
+  p.normal[0] = x / l; p.normal[1] = y / l; p.normal[2] = z / l;
+  p.dist = p.normal[0]! * o[0]! + p.normal[1]! * o[1]! + p.normal[2]! * o[2]!;
+}

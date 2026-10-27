@@ -8,11 +8,7 @@ Entry point: `src/index.ts`.
 
 - `BenchOptions` (`src/index.ts:6`) — `{ width?, height?, iterations?, path?, notes? }` (defaults 640×480, 60 iterations, `'software'` path).
 - `runBenchTool(opts?)` (`:14`) — creates a framebuffer, runs a `syntheticFill` loop via `@q2/testkit`'s `runBench`, resolves the git commit, prints a `formatLedgerRow` line plus `{ machine, msPerFrame }` JSON, and returns the row string.
-- Direct execution: if `process.argv[1]` matches `/bench/`, the module runs `runBenchTool()` with defaults (`:39`).
-
-## How it is used
-
-Standalone tool (`private: true`); nothing imports it. Invoked via turbo (`yarn bench`) or directly; output is pasted into the perf ledger and PR bodies.
+- Direct execution: if `process.argv[1]` matches the built entry, the module runs `runBenchTool()` with defaults (`:39`).
 
 ```ts
 import { runBenchTool } from 'bench';
@@ -20,11 +16,27 @@ const row = await runBenchTool({ width: 640, height: 480, iterations: 60, path: 
 // | date | commit | path | res | fps | Mpixel/s | overdraw | notes |
 ```
 
+## Frame attribution bench (M8.1)
+
+Methodology recreated from the gitignored `bench.mjs` era (M8.1/M9.1 job §1):
+real-base1 frame split into geometry (setup/mark/traverse/cull/cache/
+project/emit/sort) vs spanfill vs resolve, plus pooled A/B with
+byte-identity hashes. Committed here so any agent can re-run it.
+
+- `src/frame.ts` — `runFrameBench(pakPath, workers?)`, `attributeView`,
+  `poolCompareView`, `loadBase1World`, `BASE1_VIEWS` (4 fixed cameras).
+  Q2_PAK-gated: throws without a pak path.
+- Runner: `frame-bench.mjs` (uses the built `dist/`): 
+  `Q2_PAK=.../pak0.pak SW_BENCH_WORKERS=5 yarn bench:frame`.
+- Gates live in `packages/sw-renderer/src/bands.test.ts` (golden hashes
+  across classic / per-batch pool / frame-accum pool); this bench reports
+  medians for the §11 ledger and PR bodies.
+
 ## Testing
 
 `yarn workspace bench test` (vitest, `--passWithNoTests`). No test files, fixtures, or goldens — verification is the ledger row itself plus `machineJson()` output.
 
 ## Constraints
 
-- Dependency direction: `tools/*` are leaves — nothing depends on them. May depend on `@q2/config` and `@q2/testkit` (per `package.json`).
+- Dependency direction: `tools/*` are leaves — nothing depends on them. May depend on engine packages for measurement only (`@q2/sw-renderer`, `@q2/bsp`, `@q2/formats`, `@q2/renderer-api`, `@q2/config`, `@q2/testkit`).
 - Platform: Node-only (`process.argv`, `child_process.execSync` for the commit hash, `process.version` fallback in `machineJson`).

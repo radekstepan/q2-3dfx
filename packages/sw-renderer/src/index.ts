@@ -22,18 +22,25 @@ export {
 } from './wasmSpans.js';
 
 export {
-  SW_WORKERS_CVAR, MAX_WORKERS, MAX_BAND_SPANS, MIN_BAND_PIXELS,
+  SW_WORKERS_CVAR, SW_ACCUM_CVAR, MAX_WORKERS, MAX_BAND_SPANS, MIN_BAND_PIXELS,
   TEX_CAP, LIGHT_CAP,
   F_PER_SPAN, I_PER_SPAN,
   CTL_SEQ, CTL_COUNT, CTL_TEXW, CTL_TEXH, CTL_LIGHTW, CTL_LIGHTH,
   CTL_WSHIFT, CTL_WMASK, CTL_HMASK, CTL_TURBPHASE, CTL_FBW, CTL_FBH,
-  CTL_DONE, CTL_PIXELS, CTL_SPANS, CTL_READY, CTL_FRAME, CTL_LEN,
-  workersRequestedByCvar, sabAvailable, syncWaitAllowed,
+  CTL_DONE, CTL_PIXELS, CTL_SPANS, CTL_READY, CTL_FCOUNT, CTL_JOB, CTL_FRAME, CTL_LEN,
+  JOB_RASTER, JOB_RESOLVE,
+  workersRequestedByCvar, accumRequestedByCvar, sabAvailable, syncWaitAllowed,
   splitBands, bandLayout, bandTotal, attachBandShared, createBandBuffers,
-  packBandSpans, readBandJob, writeBandJob, processBandJob, bandWorkerLoop,
+  packBandSpans, packFrameSpans, readBandJob, writeBandJob,
+  processBandJob, rasterizePackedRange, processFrameJob, resolveBand, bandWorkerLoop,
+  MAX_FRAME_SPANS, FRAME_TEX_CAP, FRAME_LIGHT_CAP, MAX_FRAME_BATCHES, PALETTE_BYTES,
+  D_SPAN_BASE, D_SPAN_COUNT, D_TEX_OFF, D_TEX_W, D_TEX_H,
+  D_LIGHT_OFF, D_LIGHT_W, D_LIGHT_H, D_WSHIFT, D_WMASK, D_HMASK,
+  D_TURBPHASE, D_PER_BATCH,
+  frameAccumLayout, frameAccumTotal, attachFrameAccum,
   BandedSoftwareBackend,
   type Band, type BandLayout, type BandViews, type BandJob, type BandPort,
-  type BandDispatcher,
+  type BandDispatcher, type FrameAccumLayout, type FrameAccumViews,
 } from './bands.js';
 
 export { BandWorkerPool, type PoolOptions } from './bandPool.js';
@@ -56,12 +63,12 @@ export {
   type DynamicLight, type SurfaceBounds,
 } from './light.js';
 
-export { setupCamera, buildFrustum, boxOnFrustumSide, culledByFrustum, type Camera } from './camera.js';
+export { setupCamera, setupCameraInto, buildFrustum, boxOnFrustumSide, culledByFrustum, type Camera } from './camera.js';
 
 export {
   createEdgeScratch, projectClippedPoly,
   emitSpansForPoly, sortRowSpans,
-  type EdgeScratch, type PolyInput, type ProjectedVert, type RowSpan,
+  type EdgeScratch, type EmitFlat, type PolyInput, type ProjectedVert, type RowSpan,
 } from './edges.js';
 
 export {
@@ -102,6 +109,10 @@ export {
 } from './bspWorld.js';
 
 export { SoftwareRenderer, sortBatchByRow, nextPot, MAX_SPANS } from './frame.js';
+export {
+  createFramePhases, phaseNow,
+  type FramePhases,
+} from './frame.js';
 
 export {
   SKY_TILE_SUFFIXES, SKY_SIDE_IMAGE, SKY_BOX_HALF, SKY_BOX_CORNERS,

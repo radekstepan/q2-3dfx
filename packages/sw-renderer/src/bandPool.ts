@@ -16,13 +16,18 @@
 
 import { Com_Warn } from '@q2/config';
 import {
-  CTL_COUNT, CTL_DONE, CTL_FBH, CTL_FBW, CTL_FRAME, CTL_HMASK, CTL_LIGHTH, CTL_LIGHTW,
+  CTL_COUNT, CTL_DONE, CTL_FBH, CTL_FBW, CTL_FCOUNT, CTL_FRAME, CTL_HMASK, CTL_JOB, CTL_LIGHTH, CTL_LIGHTW,
   CTL_PIXELS, CTL_READY, CTL_SEQ, CTL_SPANS, CTL_TEXH, CTL_TEXW, CTL_TURBPHASE,
-  CTL_WMASK, CTL_WSHIFT, LIGHT_CAP, MAX_WORKERS, MIN_BAND_PIXELS, TEX_CAP,
-  attachBandShared, bandTotal, packBandSpans, processBandJob, readBandJob,
+  CTL_WMASK, CTL_WSHIFT, D_HMASK, D_LIGHT_H, D_LIGHT_OFF, D_LIGHT_W,
+  D_PER_BATCH, D_SPAN_BASE, D_SPAN_COUNT, D_TEX_H, D_TEX_OFF, D_TEX_W,
+  D_TURBPHASE, D_WMASK, D_WSHIFT, FRAME_LIGHT_CAP, FRAME_TEX_CAP,
+  JOB_RASTER, JOB_RESOLVE,
+  LIGHT_CAP, MAX_FRAME_BATCHES, MAX_FRAME_SPANS, MAX_WORKERS, MIN_BAND_PIXELS, TEX_CAP,
+  attachFrameAccum, frameAccumTotal, packBandSpans,
+  processBandJob, processFrameJob, readBandJob, resolveBand,
   sabAvailable, splitBands, syncWaitAllowed, writeBandJob,
   type Band,
-  type BandDispatcher, type BandViews,
+  type BandDispatcher, type BandViews, type FrameAccumViews,
 } from './bands.js';
 import { textureMasks, type LightBlock, type SpanList, type Texture } from './spans.js';
 
@@ -111,30 +116,43 @@ export interface PoolOptions {
 export class BandWorkerPool implements BandDispatcher {
   readonly bandCount: number;
   private readonly workers: WorkerLike[] = [];
-  private readonly views: BandViews;
+  private readonly views: FrameAccumViews;
+  private readonly base: BandViews;
   private readonly ctl: Int32Array;
   private readonly bands: Band[];
   private readonly timeoutMs: number;
+  private readonly fbW: number;
+  private readonly fbH: number;
   private seq = 0;
   private lastTexels: Uint8Array | null = null;
   private lastLight: Uint8Array | null = null;
   private lastColormap: Uint8Array | null = null;
+  private lastPalette: Uint8Array | null = null;
   private readonly pending = new Map<number, () => void>();
   private readyCount = 0;
   private frameGen = 0;
   private mainLastGen = 0;
   private disposed = false;
+  /** Frame-accum bump offsets (reset by beginFrame/flush): packed spans,
+   *  staged texels/light, descriptor count. Main thread only. */
+  private spansUsed = 0;
+  private texUsed = 0;
+  private lightUsed = 0;
+  private descCount = 0;
 
   private constructor(
-    bandCount: number, views: BandViews, ctl: Int32Array,
+    bandCount: number, views: FrameAccumViews, ctl: Int32Array,
     bands: Band[],
-    workers: WorkerLike[], timeoutMs: number,
+    workers: WorkerLike[], timeoutMs: number, fbW: number, fbH: number,
   ) {
     this.bandCount = bandCount;
     this.views = views;
+    this.base = views.base;
     this.ctl = ctl;
     this.bands = bands;
     this.timeoutMs = timeoutMs;
+    this.fbW = fbW;
+    this.fbH = fbH;
     for (const w of workers) {
       this.workers.push(w);
       try {
@@ -168,7 +186,7 @@ export class BandWorkerPool implements BandDispatcher {
       if (!opts || typeof opts.indexJsPath !== 'string' || !pathExists(opts.indexJsPath)) return null;
       const wt = loadWorkerThreads();
       if (!wt) return null;
-      const { views, ctl } = attachBandShared(new SharedArrayBuffer(bandTotal(w, h)), w, h);
+      const { views, ctl } = attachFrameAccum(new SharedArrayBuffer(frameAccumTotal(w, h)), w, h);
       // The calling thread owns the last band; workers take the rest.
       const bands = splitBands(h, workers + 1);
       const bootstrap = poolBootstrapSource();
@@ -201,7 +219,7 @@ export class BandWorkerPool implements BandDispatcher {
         }
         return null;
       }
-      return new BandWorkerPool(workers + 1, views, ctl, bands, spawned, opts.timeoutMs ?? 30000);
+      return new BandWorkerPool(workers + 1, views, ctl, bands, spawned, opts.timeoutMs ?? 30000, w, h);
     } catch {
       return null;
     }
@@ -209,15 +227,15 @@ export class BandWorkerPool implements BandDispatcher {
 
   /** Live shared planes (the renderer adopts these when banded + attached). */
   get idx(): Uint8Array {
-    return this.views.idx;
+    return this.base.idx;
   }
 
   get zb(): Float32Array {
-    return this.views.zb;
+    return this.base.zb;
   }
 
-  get planes(): { idx: Uint8Array; zb: Float32Array } {
-    return { idx: this.views.idx, zb: this.views.zb };
+  get planes(): { idx: Uint8Array; zb: Float32Array; color: Uint32Array } {
+    return { idx: this.base.idx, zb: this.base.zb, color: this.views.fColor };
   }
 
   frame(): number {
@@ -228,6 +246,7 @@ export class BandWorkerPool implements BandDispatcher {
   beginFrame(): void {
     if (this.disposed) return;
     this.frameGen += 1;
+    this.resetAccum();
     try {
       Atomics.store(this.ctl, CTL_FRAME, this.frameGen);
     } catch {
@@ -265,7 +284,7 @@ export class BandWorkerPool implements BandDispatcher {
     fbW: number, fbH: number, idx: Uint8Array, zb: Float32Array,
   ): { pixels: number; spans: number } | null {
     if (this.disposed || this.workers.length === 0) return null;
-    if (idx !== this.views.idx || zb !== this.views.zb) return null;
+    if (idx !== this.base.idx || zb !== this.base.zb) return null;
     const packed = this.pack(list);
     if (!packed) return null;
     if (packed.count === 0) return { pixels: 0, spans: 0 };
@@ -283,7 +302,7 @@ export class BandWorkerPool implements BandDispatcher {
     // workers run theirs, then collect. Same math, golden-identical.
     const mainBand = this.bands[this.bands.length - 1]!;
     this.clearMainBand(mainBand, fbW);
-    const main = processBandJob(this.views, readBandJob(this.ctl, mainBand.y0, mainBand.y1));
+    const main = processBandJob(this.base, readBandJob(this.ctl, mainBand.y0, mainBand.y1));
     const deadline = Date.now() + this.timeoutMs;
     let done = Atomics.load(this.ctl, CTL_DONE);
     while (done < this.workers.length) {
@@ -316,7 +335,7 @@ export class BandWorkerPool implements BandDispatcher {
     fbW: number, fbH: number, idx: Uint8Array, zb: Float32Array,
   ): Promise<{ pixels: number; spans: number } | null> {
     if (this.disposed || this.workers.length === 0) return null;
-    if (idx !== this.views.idx || zb !== this.views.zb) return null;
+    if (idx !== this.base.idx || zb !== this.base.zb) return null;
     const packed = this.pack(list);
     if (!packed) return null;
     if (packed.count === 0) return Promise.resolve({ pixels: 0, spans: 0 });
@@ -328,22 +347,7 @@ export class BandWorkerPool implements BandDispatcher {
     }
     this.publish(tex, light, colormap, time, fbW, fbH, packed.count);
     const seq = this.seq;
-    const need = this.workers.length;
-    let seen = 0;
-    const finished = new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(seq);
-        resolve(false);
-      }, this.timeoutMs);
-      this.pending.set(seq, () => {
-        seen += 1;
-        if (seen >= need) {
-          this.pending.delete(seq);
-          clearTimeout(timer);
-          resolve(true);
-        }
-      });
-    });
+    const finished = this.awaitWorkerMessages(seq, this.workers.length);
     if (!this.kick(seq)) {
       this.pending.delete(seq);
       return null;
@@ -351,7 +355,7 @@ export class BandWorkerPool implements BandDispatcher {
     // Main-thread band first (sync), then await the workers.
     const mainBand = this.bands[this.bands.length - 1]!;
     this.clearMainBand(mainBand, fbW);
-    const main = processBandJob(this.views, readBandJob(this.ctl, mainBand.y0, mainBand.y1));
+    const main = processBandJob(this.base, readBandJob(this.ctl, mainBand.y0, mainBand.y1));
     const ok = await finished;
     if (!ok) {
       Com_Warn(`bandPool: async batch timeout after ${this.timeoutMs}ms, redrawing inline`);
@@ -438,14 +442,310 @@ export class BandWorkerPool implements BandDispatcher {
 
   /** Pack spans straight into the shared staging views. */
   private pack(list: SpanList): { count: number; est: number } | null {
-    return packBandSpans(list, this.views.spansF, this.views.spansI);
+    return packBandSpans(list, this.base.spansF, this.base.spansI);
+  }
+
+  /**
+   * Flat-span staging cursor for fused emission (M8.1): the current bump
+   * base + remaining cap. The renderer emits one batch into it, then calls
+   * packBatched — same-thread sequencing guarantees the base still matches.
+   * Null when the pool is dead. Never advances (packBatched owns that).
+   */
+  flatCursor(): { F: Float64Array; I: Int32Array; base: number; cap: number } | null {
+    if (this.disposed || this.workers.length === 0) return null;
+    const fv = this.views;
+    return {
+      F: fv.fSpansF, I: fv.fSpansI,
+      base: this.spansUsed, cap: MAX_FRAME_SPANS - this.spansUsed,
+    };
+  }
+
+  /**
+   * Capture one fused-emitted batch into the frame kick (M8.1): the spans
+   * were packed during emission (see EmitFlat), so this only stages
+   * (tex, light) and records a descriptor. Returns false when the batch
+   * must run inline immediately (sequencing break, exhausted regions, or
+   * unsuitable input) — the caller flushes pending batches first, so
+   * global batch order (and hence every pixel) is preserved. Never throws.
+   */
+  packBatched(
+    spanBase: number, spanCount: number,
+    tex: Texture, light: LightBlock,
+    colormap: Uint8Array, time: number,
+  ): boolean {
+    if (this.disposed || this.workers.length === 0) return false;
+    if (this.descCount >= MAX_FRAME_BATCHES) return false;
+    if (!(spanCount >= 0) || spanBase !== this.spansUsed) return false;
+    if (spanBase + spanCount > MAX_FRAME_SPANS) return false;
+    if (spanCount === 0) return true; // nothing rasterisable; handled
+    const tw = tex.width | 0, th = tex.height | 0;
+    const lw = light.width | 0, lh = light.height | 0;
+    if (!(tw > 0 && th > 0 && lw > 0 && lh > 0)) return false;
+    const texBytes = tw * th, lightBytes = lw * lh;
+    if (tex.texels.length < texBytes || light.values.length < lightBytes) return false;
+    if (texBytes > FRAME_TEX_CAP - this.texUsed) return false;
+    if (lightBytes > FRAME_LIGHT_CAP - this.lightUsed) return false;
+    const fv = this.views;
+    // Stage surface data (exact-size .set copies, no view allocation on the
+    // hot path; oversized carriers fall back to a bounded subarray copy).
+    if (tex.texels.length === texBytes) fv.fTex.set(tex.texels, this.texUsed);
+    else fv.fTex.set(tex.texels.subarray(0, texBytes), this.texUsed);
+    if (light.values.length === lightBytes) fv.fLight.set(light.values, this.lightUsed);
+    else fv.fLight.set(light.values.subarray(0, lightBytes), this.lightUsed);
+    this.stageColormap(colormap);
+    const masks = textureMasks(tex);
+    const phase = ((time * 64) | 0) & (this.base.turb.length - 1);
+    const d = this.descCount * D_PER_BATCH;
+    fv.desc[d + D_SPAN_BASE] = spanBase;
+    fv.desc[d + D_SPAN_COUNT] = spanCount;
+    fv.desc[d + D_TEX_OFF] = this.texUsed;
+    fv.desc[d + D_TEX_W] = tw;
+    fv.desc[d + D_TEX_H] = th;
+    fv.desc[d + D_LIGHT_OFF] = this.lightUsed;
+    fv.desc[d + D_LIGHT_W] = lw;
+    fv.desc[d + D_LIGHT_H] = lh;
+    fv.desc[d + D_WSHIFT] = masks.wshift;
+    fv.desc[d + D_WMASK] = masks.wmask;
+    fv.desc[d + D_HMASK] = masks.hmask;
+    fv.desc[d + D_TURBPHASE] = phase;
+    this.spansUsed += spanCount;
+    this.texUsed += texBytes;
+    this.lightUsed += lightBytes;
+    this.descCount += 1;
+    return true;
+  }
+
+  /** Pending accumulated batches (observability for the renderer/tests). */
+  accumPending(): number {
+    return this.descCount;
+  }
+
+  /**
+   * Kick ONE frame covering every accumulated batch and block for the
+   * workers (the async-render completion primitive; the browser path uses
+   * flushFrameAsync instead). Resolves null when the pool is dead or the
+   * wait times out — the caller replays inline via drawInlineAll, which
+   * converges to the identical planes (all writes depth-guarded).
+   */
+  flushFrame(): { pixels: number; spans: number } | null {
+    if (this.disposed || this.workers.length === 0) return null;
+    if (this.descCount === 0) return { pixels: 0, spans: 0 };
+    if (!this.awaitReadySync()) {
+      Com_Warn('bandPool: workers never became ready, redrawing inline');
+      return null;
+    }
+    this.publishFrame();
+    const seq = this.seq;
+    if (!this.kick(seq)) return null;
+    // The calling thread owns the last band: drain it inline while the
+    // workers drain theirs, then collect. Same math, golden-identical.
+    const mainBand = this.bands[this.bands.length - 1]!;
+    this.clearMainBand(mainBand, this.fbW);
+    const main = processFrameJob(
+      this.views, this.fbW, this.fbH, this.descCount, mainBand.y0, mainBand.y1,
+    );
+    const ok = this.awaitDoneSync();
+    if (!ok) {
+      Com_Warn(`bandPool: frame timeout after ${this.timeoutMs}ms, redrawing inline`);
+      return null;
+    }
+    const tally = this.tally();
+    tally.pixels += main.pixels;
+    tally.spans += main.spans;
+    this.resetAccum();
+    return tally;
+  }
+
+  /**
+   * Same as flushFrame but awaits worker completion messages instead of
+   * blocking (for threads that forbid Atomics.wait — the browser
+   * async-render completion path). Resolves null on timeout or dead pool.
+   */
+  async flushFrameAsync(): Promise<{ pixels: number; spans: number } | null> {
+    if (this.disposed || this.workers.length === 0) return null;
+    if (this.descCount === 0) return { pixels: 0, spans: 0 };
+    if (!(await this.awaitReadyAsync())) {
+      Com_Warn('bandPool: workers never became ready, redrawing inline');
+      return null;
+    }
+    this.publishFrame();
+    const seq = this.seq;
+    const finished = this.awaitWorkerMessages(seq, this.workers.length);
+    if (!this.kick(seq)) {
+      this.pending.delete(seq);
+      return null;
+    }
+    // Main-thread band first (sync), then await the workers.
+    const mainBand = this.bands[this.bands.length - 1]!;
+    this.clearMainBand(mainBand, this.fbW);
+    const main = processFrameJob(
+      this.views, this.fbW, this.fbH, this.descCount, mainBand.y0, mainBand.y1,
+    );
+    const ok = await finished;
+    if (!ok) {
+      Com_Warn(`bandPool: async frame timeout after ${this.timeoutMs}ms, redrawing inline`);
+      return null;
+    }
+    const tally = this.tally();
+    tally.pixels += main.pixels;
+    tally.spans += main.spans;
+    this.resetAccum();
+    return tally;
+  }
+
+  /**
+   * Full-frame inline replay of the accumulated batches on the calling
+   * thread (timeout fallback). Clears both planes first: a timed-out kick
+   * may have left bands partially drawn/cleared, and only a full clear +
+   * ordered replay converges back to the identical planes.
+   */
+  drawInlineAll(): { pixels: number; spans: number } {
+    this.base.idx.fill(0);
+    this.base.zb.fill(0);
+    const r = processFrameJob(this.views, this.fbW, this.fbH, this.descCount, 0, this.fbH);
+    resolveBand(this.views.fColor, this.views.fPal, this.base.idx, 0, this.fbH, this.fbW, this.fbH);
+    this.resetAccum();
+    return r;
+  }
+
+  /**
+   * Resolve kick (M8.1 parallel resolve): palette-expand the final index
+   * plane into the shared color plane across the pool (blocking). True
+   * unless the pool is dead, a worker never became ready, or the wait times
+   * out — the caller expands inline instead (identical).
+   */
+  resolveFrame(): boolean {
+    if (this.disposed || this.workers.length === 0) return false;
+    if (!this.awaitReadySync()) {
+      Com_Warn('bandPool: workers never became ready, resolving inline');
+      return false;
+    }
+    this.publishResolve();
+    const seq = this.seq;
+    if (!this.kick(seq)) return false;
+    const mainBand = this.bands[this.bands.length - 1]!;
+    resolveBand(this.views.fColor, this.views.fPal, this.base.idx, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
+    return this.awaitDoneSync();
+  }
+
+  /**
+   * Same as resolveFrame but message-driven (browser async completion).
+   */
+  async resolveFrameAsync(): Promise<boolean> {
+    if (this.disposed || this.workers.length === 0) return false;
+    if (!(await this.awaitReadyAsync())) {
+      Com_Warn('bandPool: workers never became ready, resolving inline');
+      return false;
+    }
+    this.publishResolve();
+    const seq = this.seq;
+    const finished = this.awaitWorkerMessages(seq, this.workers.length);
+    if (!this.kick(seq)) {
+      this.pending.delete(seq);
+      return false;
+    }
+    const mainBand = this.bands[this.bands.length - 1]!;
+    resolveBand(this.views.fColor, this.views.fPal, this.base.idx, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
+    return finished;
+  }
+
+  /** Drop accumulated batches (beginFrame + post-kick reset). */
+  private resetAccum(): void {
+    this.spansUsed = 0;
+    this.texUsed = 0;
+    this.lightUsed = 0;
+    this.descCount = 0;
+    try {
+      Atomics.store(this.ctl, CTL_FCOUNT, 0);
+      Atomics.store(this.ctl, CTL_JOB, JOB_RASTER);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Stage the colormap once per backing store (surface blocks change, it does not). */
+  private stageColormap(colormap: Uint8Array): void {
+    if (this.lastColormap !== colormap) {
+      this.base.colormap.set(colormap.subarray(0, this.base.colormap.length));
+      this.lastColormap = colormap;
+    }
+  }
+
+  /** Stage the palette for worker-side resolve (change-detected, 768B). */
+  stagePalette(palette: Uint8Array): void {
+    if (this.disposed) return;
+    if (this.lastPalette !== palette) {
+      this.views.fPal.set(palette.subarray(0, this.views.fPal.length));
+      this.lastPalette = palette;
+    }
+  }
+
+  /** Publish the frame-kick descriptor (main side, pre-notify). */
+  private publishFrame(): void {
+    try {
+      Atomics.store(this.ctl, CTL_FBW, this.fbW);
+      Atomics.store(this.ctl, CTL_FBH, this.fbH);
+      Atomics.store(this.ctl, CTL_JOB, JOB_RASTER);
+      Atomics.store(this.ctl, CTL_FCOUNT, this.descCount);
+    } catch {
+      /* ignore */
+    }
+    this.seq += 1;
+  }
+
+  /** Publish a resolve kick (main side, pre-notify). */
+  private publishResolve(): void {
+    try {
+      Atomics.store(this.ctl, CTL_FBW, this.fbW);
+      Atomics.store(this.ctl, CTL_FBH, this.fbH);
+      Atomics.store(this.ctl, CTL_JOB, JOB_RESOLVE);
+    } catch {
+      /* ignore */
+    }
+    this.seq += 1;
+  }
+
+  /** Block for every worker's DONE (shared by dispatch + flushFrame). */
+  private awaitDoneSync(): boolean {
+    const deadline = Date.now() + this.timeoutMs;
+    let done = Atomics.load(this.ctl, CTL_DONE);
+    while (done < this.workers.length) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      try {
+        Atomics.wait(this.ctl, CTL_DONE, done, Math.min(remaining, 1000));
+      } catch {
+        return false; // wait unavailable after all -> inline
+      }
+      done = Atomics.load(this.ctl, CTL_DONE);
+    }
+    return true;
+  }
+
+  /** Await every worker's completion message for one kick (async path). */
+  private awaitWorkerMessages(seq: number, need: number): Promise<boolean> {
+    let seen = 0;
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(seq);
+        resolve(false);
+      }, this.timeoutMs);
+      this.pending.set(seq, () => {
+        seen += 1;
+        if (seen >= need) {
+          this.pending.delete(seq);
+          clearTimeout(timer);
+          resolve(true);
+        }
+      });
+    });
   }
 
   /** Lazily clear the calling thread's band once per frame generation. */
   private clearMainBand(mainBand: Band, fbW: number): void {
     if (this.mainLastGen !== this.frameGen) {
-      this.views.idx.fill(0, mainBand.y0 * fbW, mainBand.y1 * fbW);
-      this.views.zb.fill(0, mainBand.y0 * fbW, mainBand.y1 * fbW);
+      this.base.idx.fill(0, mainBand.y0 * fbW, mainBand.y1 * fbW);
+      this.base.zb.fill(0, mainBand.y0 * fbW, mainBand.y1 * fbW);
       this.mainLastGen = this.frameGen;
     }
   }
@@ -456,12 +756,17 @@ export class BandWorkerPool implements BandDispatcher {
   ): void {
     this.stage(tex, light, colormap);
     const masks = textureMasks(tex);
-    const phase = ((time * 64) | 0) & (this.views.turb.length - 1);
+    const phase = ((time * 64) | 0) & (this.base.turb.length - 1);
     writeBandJob(
       this.ctl, count, fbW, fbH,
       tex.width | 0, tex.height | 0, light.width | 0, light.height | 0,
       masks.wshift, masks.wmask, masks.hmask, phase,
     );
+    try {
+      Atomics.store(this.ctl, CTL_JOB, JOB_RASTER);
+    } catch {
+      /* ignore */
+    }
     this.seq += 1;
   }
 
@@ -496,15 +801,15 @@ export class BandWorkerPool implements BandDispatcher {
 
   private stage(tex: Texture, light: LightBlock, colormap: Uint8Array): void {
     if (this.lastTexels !== tex.texels) {
-      this.views.texels.set(tex.texels.subarray(0, Math.min(tex.texels.length, this.views.texels.length)));
+      this.base.texels.set(tex.texels.subarray(0, Math.min(tex.texels.length, this.base.texels.length)));
       this.lastTexels = tex.texels;
     }
     if (this.lastLight !== light.values) {
-      this.views.light.set(light.values.subarray(0, Math.min(light.values.length, this.views.light.length)));
+      this.base.light.set(light.values.subarray(0, Math.min(light.values.length, this.base.light.length)));
       this.lastLight = light.values;
     }
     if (this.lastColormap !== colormap) {
-      this.views.colormap.set(colormap.subarray(0, this.views.colormap.length));
+      this.base.colormap.set(colormap.subarray(0, this.base.colormap.length));
       this.lastColormap = colormap;
     }
   }
@@ -520,7 +825,7 @@ function poolBootstrapSource(): string {
   return [
     'const { parentPort, workerData } = await import("node:worker_threads");',
     'const m = await import(workerData.indexJsUrl);',
-    'const shared = m.attachBandShared(workerData.sab, workerData.w, workerData.h);',
+    'const shared = m.attachFrameAccum(workerData.sab, workerData.w, workerData.h);',
     'm.bandWorkerLoop(shared.views, shared.ctl,',
     '  workerData.y0, workerData.y1, workerData.band, workerData.w,',
     '  function (s) { Atomics.wait(shared.ctl, m.CTL_SEQ, s); },',

@@ -1,6 +1,6 @@
 // M3.3 tests: PVS + frustum reject, edge emit, z-sorted spans, coplanar order.
 import { describe, expect, it } from 'vitest';
-import { setupCamera, culledByFrustum } from './camera.js';
+import { setupCamera, setupCameraInto, culledByFrustum } from './camera.js';
 import {
   collectVisibleSurfaces, findLeaf, clusterVisible, surfFrustumCulled,
   type MiniWorld,
@@ -170,5 +170,41 @@ describe('devroom world', () => {
     expect(world.alias.length).toBe(1);
     expect(world.sprites.length).toBe(1);
     expect(world.particles.length).toBe(8);
+  });
+});
+
+describe('setupCameraInto (M8.1 scratch-camera reuse)', () => {
+  it('matches setupCamera exactly (same fov) and never aliases inputs', () => {
+    let seed = 1234567;
+    const rnd = (): number => {
+      seed = (Math.imul(seed, 1103515245) + 12345) & 0x7fffffff;
+      return seed / 0x7fffffff;
+    };
+    const memo = setupCamera(new Float32Array([1, 2, 3]), new Float32Array([10, 20, 0]), 90, 320, 240);
+    for (let i = 0; i < 60; i++) {
+      const origin = new Float32Array([(rnd() - 0.5) * 2000, (rnd() - 0.5) * 2000, (rnd() - 0.5) * 500]);
+      const angles = new Float32Array([(rnd() - 0.5) * 180, rnd() * 360, (rnd() - 0.5) * 20]);
+      const fovX = 60 + rnd() * 60;
+      const w = 160 + ((rnd() * 480) | 0), h = 120 + ((rnd() * 360) | 0);
+      const fresh = setupCamera(origin, angles, fovX, w, h);
+      const reused = setupCameraInto(memo, origin, angles, fovX, w, h);
+      expect([...reused.origin]).toEqual([...fresh.origin]);
+      expect([...reused.forward]).toEqual([...fresh.forward]);
+      expect([...reused.right]).toEqual([...fresh.right]);
+      expect([...reused.up]).toEqual([...fresh.up]);
+      expect(reused.xCenter).toBe(fresh.xCenter);
+      expect(reused.yCenter).toBe(fresh.yCenter);
+      expect(reused.focalX).toBe(fresh.focalX);
+      expect(reused.focalY).toBe(fresh.focalY);
+      expect(reused.near).toBe(fresh.near);
+      expect(reused.frustum.length).toBe(fresh.frustum.length);
+      for (let p = 0; p < fresh.frustum.length; p++) {
+        expect([...reused.frustum[p]!.normal]).toEqual([...fresh.frustum[p]!.normal]);
+        expect(reused.frustum[p]!.dist).toBe(fresh.frustum[p]!.dist);
+      }
+      // inputs never retained: mutating the caller's arrays cannot move the camera
+      origin[0] = 99999;
+      expect(reused.origin[0]).not.toBe(99999);
+    }
   });
 });
