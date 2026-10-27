@@ -6,6 +6,7 @@ import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import type { UserCmdT } from '@q2/input';
 import { bootPlay } from './play.js';
+import { SV_AddBarrel } from '@q2/server';
 import { readPakEntry } from './pak.js';
 
 function neutralCmd(angles: [number, number, number] = [0, 0, 0]): UserCmdT {
@@ -240,15 +241,7 @@ describe('barrel render origin (view-side audit)', () => {
   it('extras mirror barrel origins 1:1 (no half-bbox lift)', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
-    driver.barrels.push({
-      origin: v3(10, 20, 0),
-      health: 10,
-      dmg: 150,
-      mass: 400,
-      size: v3(32, 32, 40),
-      isFunc: false,
-      dead: false,
-    });
+    SV_AddBarrel(driver.server, v3(10, 20, 0));
     const extras = driver.extraEntities()!;
     const found = extras.find((x) => x.origin[0] === 10 && x.origin[1] === 20);
     expect(found).toBeDefined();

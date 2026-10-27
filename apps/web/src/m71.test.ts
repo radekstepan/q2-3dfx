@@ -270,12 +270,16 @@ describe.runIf(!!WEB_Q2_PAK)('M7.1 base1 view (real pak, Q2_PAK)', () => {
       (b) => Math.hypot(b.origin[0]! - 128, b.origin[1]! + 320) < 400,
     );
     expect(near.length).toBe(2);
-    expect(near.map((b) => [...b.origin])).toContainEqual([136, 40, 0]);
-    expect(near.map((b) => [...b.origin])).toContainEqual([184, -24, 0]);
+    // C M_droptofloor outcome (server-spawned, MASK_MONSTERSOLID): the lump
+    // origins rest on the floor with the +1/32 contact epsilon — the server
+    // barrel test pins the same rounding, so compare rounded here.
+    const rounded = near.map((x) => [Math.round(x.origin[0]!), Math.round(x.origin[1]!), Math.round(x.origin[2]!)]);
+    expect(rounded).toContainEqual([136, 40, 0]);
+    expect(rounded).toContainEqual([184, -24, 0]);
     const extras = driver.extraEntities()!;
     const barrelX = extras.filter((x) => x.model === boot.models!.barrel);
     expect(barrelX.length).toBe(driver.barrels.length);
-    const origins = barrelX.map((x) => [...x.origin!].join(','));
+    const origins = barrelX.map((x) => [Math.round(x.origin![0]!), Math.round(x.origin![1]!), Math.round(x.origin![2]!)].join(','));
     expect(new Set(origins).size).toBe(origins.length);
     expect(origins).toContain('136,40,0');
     expect(origins).toContain('184,-24,0');

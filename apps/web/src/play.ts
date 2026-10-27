@@ -35,25 +35,13 @@ import {
   pmoveFull,
   PMF_DUCKED,
   setPmoveWorld,
-  bspTraceFor,
-  setPmoveWorldFromBsp,
+  bspContentsFor,
   findWeapon,
-  fireWeapon,
   mulberry32,
-  BOLT_SPEED,
   WEAPON_BLASTER,
-  spawnMonster,
-  monsterChaseMove,
-  monsterLocomotion,
-  MONSTER_HULL_MINS,
-  MONSTER_HULL_MAXS,
   monsterMoveOf,
-  monsterThink,
-  monsterPain,
   makePlayerState,
   pickupItem,
-  triggerTouch,
-  moverUse,
   modelForMonster,
   skinForMonster,
   viewModelForWeapon,
@@ -61,15 +49,6 @@ import {
   modelForBolt,
   skinForBolt,
   skinForWeaponModel,
-  spawnExplosive,
-  soldierWeaponForSkin,
-  monsterFlashOffset,
-  projectSource,
-  MZ2_SOLDIER_SHOTGUN_1,
-  MZ2_SOLDIER_BLASTER_1,
-  MZ2_SOLDIER_MACHINEGUN_1,
-  MZ2_GUNNER_MACHINEGUN_1,
-  MZ2_GUNNER_GRENADE_1,
   HITSCAN_TRACER_COLOR,
 } from '@q2/game';
 import type {
@@ -77,14 +56,31 @@ import type {
   UserCmd,
   Edict,
   Mover,
-  MonsterState,
   Trigger,
   WeaponDef,
   TraceResult,
   PlayerState,
 } from '@q2/game';
-import { SV_Init, SV_SetSkill, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, fireTargets, SV_DropTraceFor } from '@q2/server';
-import type { ServerState } from '@q2/server';
+import {
+  SV_Init,
+  SV_SetSkill,
+  SV_SpawnEntities,
+  SV_Tick,
+  SV_TouchTriggersAt,
+  SV_TouchDoorsAt,
+  SV_DropTraceFor,
+  SV_TraceFor,
+  SV_ClipTrace,
+  SV_PlayerFire,
+  SV_DamagePlayer,
+  SV_SetPlayerHealth,
+  SV_DrainMuzzles,
+  SV_DrainTracers,
+  SV_DrainSparks,
+  SV_DrainSounds,
+  MASK_OPAQUE_C,
+} from '@q2/server';
+import type { ServerState, ServerMonster, ServerBarrel, ServerBolt, ServerExplosion, ServerDebris, ServerGib } from '@q2/server';
 import { ATTN_NORM, Mixer } from '@q2/sound';
 import { parseMD2, parseWAL, parsePCX } from '@q2/formats';
 import type { Pcx } from '@q2/formats';
@@ -348,9 +344,6 @@ const PLAYER_ID = 1;
 /** Eye height above the pm origin (matches PmoveState.viewheight). */
 const EYE = 22;
 /** id pellet spread basis: r/u are world units at 8192 range. */
-const PELLET_RANGE = 8192;
-const MONSTER_MINS: [number, number, number] = [-16, -16, -24];
-const MONSTER_MAXS: [number, number, number] = [16, 16, 32];
 
 const REFIRE: Record<string, number> = {
   weapon_blaster: 0.25,
@@ -532,21 +525,13 @@ function devroomTrace(start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3): TraceResu
 }
 
 // --- driver ---
-
-export interface PlacedMonster {
-  id: number;
-  origin: [number, number, number];
-  state: MonsterState;
-  /**
-   * id skinnum (m_soldier.c SP_ funcs): 0 = light (blaster), 2 = shotgun,
-   * 4 = ss (machinegun); odd = pain flash of the even base. Drives the
-   * per-skin mesh skin, fire sound, and weapon (skin-determined per
-   * soldierWeaponForSkin, never random). Gunners ignore this (skin 0).
-   */
-  skin: number;
-  /** last server time this monster attacked (id rate-limits to ~1/s). */
-  lastAttack: number;
-}
+//
+// Phase 0 single sim (BRAIN.md §15): the driver owns NO gameplay state.
+// Monsters, barrels, bolts, explosions, debris, gibs, fuses and the player
+// health pool live in `packages/server`; this driver renders from server
+// state (snapshot/extraEntities) and forwards input (SV_PlayerFire). The
+// old private sim (PlacedMonster[], parseExplosives/barrels, bolts,
+// monsterFire, damageBarrel, stepBolts, driver door touch) is deleted.
 
 /**
  * One queued beam for the renderer's `spawnTracer` pool: origin + direction
@@ -625,116 +610,37 @@ function gunBoundsFor(classname: string): { activate: number; fire: number; idle
   return GUN_BOUNDS[classname] ?? { activate: 4, fire: 8, idle: 52, deactivate: 55 };
 }
 
-/** Authentic blaster projectile (g_weapon.c fire_blaster): 1000 u/s, 2s life. */
-export interface Bolt {
-  pos: Vec3;
-  dir: Vec3; // normalized
-  life: number;
-  damage: number;
-  /** Units/second (1000 player blaster, 600 soldier monster blaster). */
-  speed: number;
-  /** True for monster return fire (damages the player, never its owner). */
-  foe: boolean;
-  /** Server time the bolt was spawned (life expires on server time, not frame dt). */
-  born: number;
-}
-
-/**
- * Trail/impact spark lifetime in server seconds. id's CL_BlasterParticles
- * fade in a fraction of a second; the old path never expired them (cap-only
- * ring), so every bolt left a permanent spark line. The sweep in step()
- * keeps world-seeded particles (devroom torch flame, born +Infinity) forever.
- */
-export const SPARK_TTL = 0.4;
-
-/**
- * Impact-flash dlight window in server seconds. TE_BLASTER / TE_EXPLOSION1
- * are brief flashes (id adds a short yellow light on touch); the old 0.3s
- * drain window lit the whole tile noticeably longer than the authentic
- * impact. The renderer's own light ttl still bounds each add to ~2 renders.
- */
-export const EXPLOSION_LIGHT_WINDOW = 0.1;
-
-/** Pak lump for shootable barrels (g_misc.c SP_misc_explobox, origin at the box bottom). */
-export const BARREL_MODEL = 'models/objects/barrels/tris.md2';
-export const BARREL_SKIN = 'models/objects/barrels/skin.pcx';
-/** Authentic explobox hull (g_misc.c: mins -16,-16,0 / maxs 16,16,40). */
-export const BARREL_MINS: [number, number, number] = [-16, -16, 0];
-export const BARREL_MAXS: [number, number, number] = [16, 16, 40];
-
-/** Shootable explosive (misc_explobox / func_explosive-lite). */
-export interface Barrel {
-  origin: Vec3;
-  health: number;
-  dmg: number;
-  /** Debris mass class (400 explobox, 75 func_explosive default). */
-  mass: number;
-  /** Hull size for debris corners (explobox 32,32,40; brush otherwise). */
-  size: Vec3;
-  /** True for brush func_explosive (mass-formula debris), false for explobox. */
-  isFunc: boolean;
-  dead: boolean;
-}
-
 /** Explosion kind (cl_tent.c): big barrel/func/target blast, grounded blast,
  * or the 4-frame blaster touch flash (ex_misc, smoke model). */
 export type ExplosionKind = 'explosion1' | 'explosion2' | 'blaster';
-
-/** Explosion flash (TE_EXPLOSION1/2, TE_BLASTER): particles + dlight + sound.
- * Visual frame steps as baseframe + elapsed/100ms (cl_tent.c CL_AddExplosions):
- * explosion1 15f (base 15 or 0 by rand), explosion2 19f grounded (base 30),
- * blaster 4f ex_misc. yaw is the random facing (rand % 360). */
-export interface Explosion {
-  pos: Vec3;
-  born: number;
-  kind: ExplosionKind;
-  baseframe: number;
-  yaw: number;
-}
 
 /** Frames an explosion visual lives (100ms each, cl_tent.c frac stepping). */
 export function explosionFrames(kind: ExplosionKind): number {
   return kind === 'blaster' ? 4 : kind === 'explosion2' ? 19 : 15;
 }
 
-/** Thrown chunk (g_misc.c ThrowDebris: MOVETYPE_BOUNCE, backoff 1.5). */
-export interface Debris {
-  origin: Vec3;
-  vel: Vec3;
-  avel: Vec3;
-  born: number;
-  life: number;
-  kind: 'debris1' | 'debris2' | 'debris3';
-  /** Resting on the floor (SV_Physics_Toss floor rule): no further motion. */
-  rest: boolean;
-}
+/**
+ * Trail/impact spark lifetime in server seconds. id's CL_BlasterParticles
+ * fade in a fraction of a second; world-seeded particles (devroom torch
+ * flame, born +Infinity) never expire.
+ */
+export const SPARK_TTL = 0.4;
 
-/** Gib chunk (g_misc.c ThrowGib/ThrowHead: MOVETYPE_TOSS, backoff 1.0,
- * 10-20s life, EF_GIB). No permanent scorch (Q2 has none). */
-export interface Gib {
-  origin: Vec3;
-  vel: Vec3;
-  avel: Vec3;
-  born: number;
-  life: number;
-  kind: 'meat' | 'chest' | 'bone' | 'head';
-  rest: boolean;
-}
+/**
+ * Impact-flash dlight window in server seconds. TE_BLASTER / TE_EXPLOSION1
+ * are brief flashes (id adds a short yellow light on touch). The renderer's
+ * own light ttl still bounds each add to ~2 renders.
+ */
+export const EXPLOSION_LIGHT_WINDOW = 0.1;
 
-/** Pending 0.2s barrel fuse / target_explosion delay (barrel_delay,
- * use_target_explosion), stepped on server time. Barrel fuses carry the
- * debris recipe so the burst matches the exploded kind. */
-interface Fuse {
-  pos: Vec3;
-  dmg: number;
-  at: number;
-  barrel?: { origin: Vec3; size: Vec3; mass: number; dmg: number; isFunc: boolean };
-}
+/** Pak lump for shootable barrels (g_misc.c SP_misc_explobox, origin at the box bottom). */
+export const BARREL_MODEL = 'models/objects/barrels/tris.md2';
+export const BARREL_SKIN = 'models/objects/barrels/skin.pcx';
 
 /** id PARTICLE_GRAVITY (client/cl_fx.c): ballistic spark falloff. */
 const SPARK_GRAVITY = 40;
-/** id sv_gravity default for tossed debris/gibs (g_phys.c SV_AddGravity). */
-const TOSS_GRAVITY = 800;
+
+export type { ServerBolt as Bolt, ServerBarrel as Barrel, ServerGib as Gib, ServerDebris as Debris };
 
 interface DoorSync {
   ent: Edict;
@@ -772,7 +678,6 @@ export class LocalDriver implements HostDriver {
   readonly mini: MiniWorld;
   readonly map: BspMap | null;
   readonly playerEdict: Edict;
-  readonly monsters: PlacedMonster[] = [];
   readonly events: string[] = [];
   readonly changeTargets = new Set<string>();
   message = '';
@@ -785,7 +690,16 @@ export class LocalDriver implements HostDriver {
   private doors: DoorSync[] = [];
   /** Live submodel face indices the graft appended (unique, for the test hook). */
   private graftedFaces: number[] = [];
-  private bspTrace: ((start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => TraceResult) | null = null;
+  /**
+   * World trace for gameplay queries (pmove, shots, drops): the server
+   * C-mask helper (SV_TraceFor, MASK_PLAYERSOLID_C) wrapped with the solid
+   * brush clips (SV_ClipTrace) so func_explosive/func_wall block until
+   * SV_RemoveBrushClip opens them. Phase 1 fold: no game-side mask-1
+   * hookup remains in the driver path (setPmoveWorldFromBsp/bspTraceFor).
+   */
+  private worldTrace: (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => TraceResult;
+  /** C MASK_OPAQUE sight trace for monster visible() (ignores WINDOW glass). */
+  private sightTrace: ((start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => TraceResult) | null = null;
   /** Muzzle flash expiry (server time) + world pos for the dlight/HUD flash. */
   private flashUntil = -10;
   private flashPos: Vec3 = v3();
@@ -795,22 +709,17 @@ export class LocalDriver implements HostDriver {
   private flashPending = false;
   /** Queued tracer beams (see TracerBeam): drained by pumpTracers(). */
   private tracerQueue: TracerBeam[] = [];
-  /** Flying blaster bolts (authentic fire_blaster projectiles, not hitscan). */
-  readonly bolts: Bolt[] = [];
-  /** Shootable explosive barrels (misc_explobox) + breakables. */
-  readonly barrels: Barrel[] = [];
-  /** Thrown debris chunks (barrel/func_explosive, SV_Physics_Toss-lite). */
-  readonly debris: Debris[] = [];
-  /** Gib chunks (minced monsters, MOVETYPE_TOSS-lite, 10-20s life). */
-  readonly gibs: Gib[] = [];
-  /** Scripted explosion targets (target_explosion) by targetname. */
-  private explosionTargets = new Map<string, { origin: Vec3; dmg: number; delay: number }>();
-  /** Pending barrel fuses / target_explosion delays (server-time stepped). */
-  private fuses: Fuse[] = [];
-  /** Recent explosion flashes (TE_EXPLOSION1/2, TE_BLASTER visuals). */
-  readonly explosions: Explosion[] = [];
   /** Enemy muzzle flashes (200+(rand&31) yellow, drained via the dlight pump). */
   private enemyFlashes: Array<{ pos: Vec3; intensity: number }> = [];
+  /** Last-tick monster health by edict num (drives kill/gib/hit synthesis). */
+  private monHealth = new Map<number, number>();
+  /** Monster edicts already reported gibbed/dead (id DEAD_DEAD is terminal). */
+  private gibSeen = new Set<number>();
+  private deadSeen = new Set<number>();
+  /** Last-tick live explosion count (drives the 'explosion' event). */
+  private lastExplosions = 0;
+  /** Last-tick freed-barrel count (drives the 'barrel' event). */
+  private lastBarrelsDead = 0;
   /**
    * Per-particle birth (server time), parallel to `mini.particles`.
    * World-seeded particles (devroom torch flame) start at +Infinity and
@@ -864,25 +773,32 @@ export class LocalDriver implements HostDriver {
       this.source = 'pak';
       this.map = built.map;
       this.mini = built.mini;
-      setPmoveWorldFromBsp(built.map);
-      this.bspTrace = bspTraceFor(built.map);
+      // Phase 1 fold (BRAIN.md §15): every driver trace goes through the
+      // server C-mask helpers — SV_TraceFor (MASK_PLAYERSOLID_C, the mask
+      // base1's clip decks and glass need) wrapped with the brush clips, and
+      // SV_DropTraceFor (MASK_MONSTERSOLID) for spawn grounding. The
+      // game-side mask-1 hookup (setPmoveWorldFromBsp/bspTraceFor) is gone
+      // from the driver path (it dropped through clip floors into the void).
+      this.worldTrace = SV_ClipTrace(this.server, SV_TraceFor(built.map));
+      this.sightTrace = SV_TraceFor(built.map, MASK_OPAQUE_C);
+      setPmoveWorld(this.worldTrace, bspContentsFor(built.map));
       // Skill latch (id CVAR_LATCH, g_spawn.c): the server filters spawns,
       // damage scale, and the roster from st.skill — set it before spawning.
       SV_SetSkill(this.server, getSkill());
-      SV_SpawnEntities(this.server, built.map.entities, (model) => modelBounds(built.map, model));
+      SV_SpawnEntities(
+        this.server,
+        built.map.entities,
+        (model) => modelBounds(built.map, model),
+        SV_DropTraceFor(built.map),
+      );
       this.playerEdict = spawnEdict({ classname: 'player' });
       this.spawnFromLump(built.map);
-      this.placeMonsters(built.map);
-      this.parseExplosives(built.map);
       this.snapshotDoorBases();
       // Brush faces are invisible to the stock traversal (submodel faces sit
       // in no node range or leaf list): graft movers/trains/func_walls into
       // the leaves they intersect so doors render CLOSED at spawn and glass
       // renders at all. Must run after snapshotDoorBases (same faces).
       this.graftBrushModels();
-      // id SP_trigger_always: fire at spawn (level-start flybys/relays).
-      // Flyby visuals are out of scope; explosion targets fire for real.
-      this.fireTriggerAlways(built.map);
       for (const e of this.server.entities) {
         if (e.classname === 'target_changelevel' && e.targetname) this.changeTargets.add(e.targetname);
       }
@@ -890,6 +806,7 @@ export class LocalDriver implements HostDriver {
       this.source = 'devroom';
       this.map = null;
       this.mini = createDevroom();
+      this.worldTrace = devroomTrace;
       setPmoveWorld(devroomTrace, () => 0);
       this.playerEdict = spawnEdict({ classname: 'player' });
       this.pm.origin = v3(-168, 0, 32);
@@ -897,9 +814,7 @@ export class LocalDriver implements HostDriver {
       this.spawnPoints = [{ origin: v3(-168, 0, 32), yaw: 0 }];
     }
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
-    // World-seeded particles predate the driver: they never expire. Prepend
-    // (not overwrite): fireTriggerAlways may already have pushed spawn
-    // sparks with real births above.
+    // World-seeded particles predate the driver: they never expire.
     while (this.particleBorn.length < this.mini.particles.length) this.particleBorn.unshift(Infinity);
     while (this.particleVel.length < this.mini.particles.length) this.particleVel.unshift(null);
     while (this.particleTtl.length < this.mini.particles.length) this.particleTtl.unshift(Infinity);
@@ -907,6 +822,9 @@ export class LocalDriver implements HostDriver {
     this.gunframe = gunBoundsFor(this.weapon.classname).fire + 1;
     this.syncAmmo();
     this.updateMixerListener();
+    this.monHealth = new Map(this.server.monsters.map((m) => [m.edict.num, m.state.health]));
+    this.lastExplosions = this.server.explosions.length;
+    this.lastBarrelsDead = this.server.barrels.filter((b) => b.edict.freed).length;
   }
 
   spawn(): { origin: [number, number, number]; angles?: [number, number, number] } {
@@ -949,66 +867,34 @@ export class LocalDriver implements HostDriver {
     }
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
     for (const m of this.server.movers) this.moverStates.set(m, m.state);
-    SV_Tick(this.server, dt);
+    // Phase 0 single sim: the server owns ALL gameplay state at 10Hz —
+    // monster think (C cadence fire resolution), bolts, fuses, debris/gibs,
+    // explosions, monster door touches. The driver only moves its own body
+    // (above) and renders server state below.
+    SV_Tick(this.server, dt, {
+      player: {
+        pos: v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]),
+        mins: v3(this.pm.mins[0], this.pm.mins[1], this.pm.mins[2]),
+        maxs: v3(this.pm.maxs[0], this.pm.maxs[1], this.pm.maxs[2]),
+        view: this.pm.viewheight,
+      },
+      trace: this.worldTrace,
+      sightTrace: this.sightTrace ?? this.worldTrace,
+      nav: null,
+      rand: this.rand,
+    });
     SV_TouchTriggersAt(this.server, 'player', this.playerEdict);
+    // Door touch is server-owned (id Touch_DoorTrigger): the driver's
+    // competing checkDoorTouch is deleted; this call opens doors the same
+    // way the WIRE bot does (expanded 60in x/y volume, NOMONSTER gated).
+    SV_TouchDoorsAt(this.server, {
+      origin: v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]),
+      mins: v3(this.pm.mins[0], this.pm.mins[1], this.pm.mins[2]),
+      maxs: v3(this.pm.maxs[0], this.pm.maxs[1], this.pm.maxs[2]),
+    }, 'player');
     this.syncDoors();
     this.updateBob();
     this.stepGunframe();
-    for (const m of this.monsters) {
-      if (m.state.dead) {
-        if (m.state.gibbed) continue;
-        // Corpses persist: keep advancing the death move to its last frame
-        // (monsterThink holds it there) so the snapshot keeps rendering the
-        // fallen body instead of freezing on frame 0.
-        monsterThink(m.state);
-        continue;
-      }
-      // Steering (id walkmonster_start/run logic): chase the player along a
-      // trivial 2-node graph (self -> player) with line-of-sight, so idle
-      // stand flips to run/attack and locomotion has a nonzero dist to play.
-      // Uses the tested monsterChaseMove selector; pathfinding on the real
-      // node graph arrives with M5.3 full AI.
-      const eyeForSee = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + EYE);
-      const chestSee = v3(m.origin[0]!, m.origin[1]!, m.origin[2]! + 8);
-      const seen = this.traceShot(chestSee, eyeForSee).fraction >= 1;
-      try {
-        monsterChaseMove(
-          m.state,
-          v3(m.origin[0], m.origin[1], m.origin[2]),
-          v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]),
-          {
-            graph: new Map([[0, [1]], [1, [0]]]),
-            positions: new Map([[0, v3(m.origin[0], m.origin[1], m.origin[2])], [1, v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2])]]),
-          },
-          seen,
-          this.rand,
-        );
-      } catch {
-        // Unknown move names from older saves stay put; locomotion still runs.
-      }
-      // Locomotion BEFORE think (id ai_move runs inside the frame): yaw
-      // toward the player, advance by the current frame's dist,
-      // collision-clamped + gravity-settled by the helper. `think` then
-      // steps the frame counter.
-      const body = v3(m.origin[0], m.origin[1], m.origin[2]);
-      monsterLocomotion(m.state, body, this.pm.origin, (start, end) =>
-        this.bspTrace
-          ? this.bspTrace(start, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, end)
-          : devroomTrace(start, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, end),
-      );
-      m.origin[0] = body[0]!;
-      m.origin[1] = body[1]!;
-      m.origin[2] = body[2]!;
-      // Fire gating (m_soldier.c/m_gunner.c fire-tagged frames): return-fire
-      // damage resolves when the move plays its 'fire' frame (the muzzle
-      // flash), never on a wall-clock timer. The old ~1/s timer drift is
-      // gone; attack anims set their own cadence.
-      const playedIdx = m.state.frame;
-      const action = monsterThink(m.state);
-      if (action === 'fire' && !m.state.dead && !m.state.gibbed) this.monsterFire(m, playedIdx);
-    }
-    this.checkDoorTouch();
-    this.checkBrushTriggers();
     this.emitDoorSounds();
     // Exit scan runs after every firing path (point + brush triggers):
     // each pushes the relay targetname into firedThisTick.
@@ -1019,18 +905,121 @@ export class LocalDriver implements HostDriver {
         this.events.push('exit');
       }
     }
-    this.checkScriptedExplosions();
-    this.stepFuses();
     this.stepSparks(dt);
-    this.stepTossed(dt);
-    this.stepBolts(dt);
     this.checkPickups();
     this.handleAttack(cmd);
+    // Single drain point: server event queues from the tick AND the fire
+    // above (muzzles, tracers, sparks, sounds) become driver cosmetics here.
+    this.drainServerEvents();
     this.expireSounds();
     this.updateMixerListener();
     if (this.ps.health <= 0 && this.deadUntil > 0 && this.server.time >= this.deadUntil) {
       this.respawn();
     }
+  }
+
+  /**
+   * Mirror the authoritative server health pool into HUD state, synthesizing
+   * the pain/death edges the old driver-side damage path used to emit
+   * (pain event + sound, death event + message + 2s respawn timer).
+   */
+  private syncHealthFromServer(): void {
+    const h = this.server.playerHealth;
+    if (h < this.ps.health) {
+      this.ps.health = h;
+      if (!this.exited) {
+        this.events.push('pain');
+        this.emitSound('player/pain.wav', v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
+      }
+    } else if (h > this.ps.health) {
+      this.ps.health = h;
+    }
+    if (this.ps.health <= 0 && this.deadUntil <= 0) {
+      this.ps.health = 0;
+      this.message = 'YOU DIED — respawning…';
+      this.events.push('death');
+      this.emitSound('player/death.wav', v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
+      this.deadUntil = this.server.time + 2;
+    }
+  }
+
+  /**
+   * Consume the server's visual/audio event queues into driver cosmetics:
+   * muzzle dlights (player flash window + enemy flashes), tracer beams,
+   * particle bursts, positional sounds — plus kill/gib/hit/explosion/barrel
+   * event synthesis from server state transitions (tests assert these).
+   */
+  private drainServerEvents(): void {
+    // Monster state transitions → kill/gib/hit (replaces painMonster).
+    for (const m of this.server.monsters) {
+      const prev = this.monHealth.get(m.edict.num) ?? m.state.health;
+      if (m.state.gibbed) {
+        if (!this.gibSeen.has(m.edict.num)) {
+          this.gibSeen.add(m.edict.num);
+          this.events.push('gib');
+          this.message = `${m.state.kind} minced`;
+        }
+      } else if (m.state.dead) {
+        if (!this.deadSeen.has(m.edict.num)) {
+          this.deadSeen.add(m.edict.num);
+          this.events.push('kill');
+          this.message = `${m.state.kind} down`;
+        }
+      } else if (m.state.health < prev) {
+        this.events.push('hit');
+      }
+      this.monHealth.set(m.edict.num, m.state.health);
+    }
+    // New explosions → 'explosion' (spawnExplosion + TE_BLASTER both land here).
+    if (this.server.explosions.length > this.lastExplosions) this.events.push('explosion');
+    this.lastExplosions = this.server.explosions.length;
+    // Newly freed barrels → 'barrel' (barrel_delay fuse latched).
+    const barrelsDead = this.server.barrels.filter((b) => b.edict.freed).length;
+    if (barrelsDead > this.lastBarrelsDead) this.events.push('barrel');
+    this.lastBarrelsDead = barrelsDead;
+    // Player damage dealt by the server tick/fire → pain/death edges.
+    this.syncHealthFromServer();
+    // Muzzles: player flash window + enemy flashes (one-shot dlight pump).
+    for (const mz of SV_DrainMuzzles(this.server)) {
+      if (mz.foe) {
+        this.enemyFlashes.push({ pos: v3(mz.pos[0], mz.pos[1], mz.pos[2]), intensity: mz.intensity });
+      } else {
+        this.flashUntil = mz.born + 0.09;
+        this.flashPos = v3(mz.pos[0], mz.pos[1], mz.pos[2]);
+        this.flashIntensity = mz.intensity;
+        this.flashPending = true;
+      }
+    }
+    // Tracers: short muzzle streaks into the renderer queue.
+    for (const t of SV_DrainTracers(this.server)) {
+      this.queueTracer(
+        v3(t.origin[0], t.origin[1], t.origin[2]),
+        v3(t.dir[0], t.dir[1], t.dir[2]),
+        t.color,
+        t.length,
+      );
+    }
+    // Sparks: impact/trail/boom bursts into the particle pool.
+    for (const s of SV_DrainSparks(this.server)) {
+      if (s.vel) this.pushBallisticSpark(v3(s.pos[0], s.pos[1], s.pos[2]), v3(s.vel[0], s.vel[1], s.vel[2]), s.color, s.ttl);
+      else this.pushColoredSpark(v3(s.pos[0], s.pos[1], s.pos[2]), s.color, s.ttl);
+    }
+    // Sounds: positional shots, impacts, gibs, booms.
+    let monshot = false;
+    for (const s of SV_DrainSounds(this.server)) {
+      this.emitSound(s.name, v3(s.pos[0], s.pos[1], s.pos[2]));
+      if (
+        s.name === 'soldier/solatck1.wav' ||
+        s.name === 'soldier/solatck2.wav' ||
+        s.name === 'soldier/solatck3.wav' ||
+        s.name === 'gunner/gunatck2.wav' ||
+        s.name === 'gunner/gunatck3.wav' ||
+        s.name === 'monster/melee.wav'
+      ) {
+        monshot = true;
+      }
+    }
+    if (monshot) this.events.push('monshot');
   }
 
   snapshot(serverTime: number): Snapshot {
@@ -1041,14 +1030,14 @@ export class LocalDriver implements HostDriver {
         velocity: [this.pm.velocity[0]!, this.pm.velocity[1]!, this.pm.velocity[2]!],
       },
     ];
-    for (const m of this.monsters) {
+    // Server-authoritative monsters (Phase 0 single sim): corpses persist
+    // (id keeps the dead edict rendering its last death frame); gibbed
+    // bodies (DEAD_DEAD) leave the snapshot.
+    for (const m of this.server.monsters) {
       if (m.state.gibbed) continue;
-      // Corpses persist in the snapshot (id keeps the dead edict rendering
-      // its last death frame); the host draws them via entityFrame, which
-      // clamps to the held final frame of the death move.
       entities.push({
-        id: m.id,
-        origin: [m.origin[0]!, m.origin[1]!, m.origin[2]!],
+        id: m.edict.num,
+        origin: [m.edict.origin[0]!, m.edict.origin[1]!, m.edict.origin[2]!],
         velocity: [0, 0, 0],
       });
     }
@@ -1068,16 +1057,12 @@ export class LocalDriver implements HostDriver {
    */
   extraEntities(): ExtraRenderable[] | null {
     const out: ExtraRenderable[] = [];
-    for (const b of this.barrels) {
-      if (b.dead) continue;
-      // Render base sits at the hull bottom: misc_explobox origins already
-      // are the box bottom (the barrel MD2 pivot is the box bottom too —
-      // frame min-z ≈ 0 on every frame — so origin renders flush on the
-      // floor, no view-side lift). func_explosive origins are the brush bbox
-      // CENTER (a wall/slab middle, e.g. *20 at z=64): rendering the barrel
-      // MD2 there floats it mid-air, so funcs render at the bbox bottom
-      // (origin − size/2) instead. Damage math keeps using the center
-      // (damageRadius/barrelAT read Barrel.origin untouched).
+    // Server-owned barrels (live only): render base sits at the hull
+    // bottom — misc_explobox origins already are the box bottom (the barrel
+    // MD2 pivot is the box bottom too), func_explosive origins are the brush
+    // bbox CENTER, so funcs render at the bbox bottom (origin − size/2).
+    for (const b of this.server.barrels) {
+      if (b.edict.freed) continue;
       const baseZ = b.isFunc ? b.origin[2]! - b.size[2]! / 2 : b.origin[2]!;
       out.push({
         origin: [b.origin[0]!, b.origin[1]!, baseZ],
@@ -1087,7 +1072,9 @@ export class LocalDriver implements HostDriver {
         frame: 0,
       });
     }
-    for (const bolt of this.bolts) {
+    // Server-owned bolts (player + foe): flight orientation rides along as
+    // yaw/pitch (id convention pitch positive = down).
+    for (const bolt of this.server.bolts) {
       const yaw = (Math.atan2(bolt.dir[1]!, bolt.dir[0]!) * 180) / Math.PI;
       const z = Math.max(-1, Math.min(1, bolt.dir[2]!));
       const pitch = -(Math.asin(z) * 180) / Math.PI;
@@ -1100,7 +1087,8 @@ export class LocalDriver implements HostDriver {
       });
     }
     if (this.models) {
-      for (const e of this.explosions) {
+      // Server-owned explosion visuals (pruned server-side by frame life).
+      for (const e of this.server.explosions) {
         const age = this.server.time - e.born;
         const frames = explosionFrames(e.kind);
         if (age < 0 || age >= frames * 0.1) continue;
@@ -1116,7 +1104,8 @@ export class LocalDriver implements HostDriver {
           frame: e.baseframe + f,
         });
       }
-      for (const d of this.debris) {
+      // Server-owned debris/gibs (SV_Physics_Toss-lite, stepped in SV_Tick).
+      for (const d of this.server.debris) {
         const model = d.kind === 'debris1' ? this.models.debris1 : d.kind === 'debris2' ? this.models.debris2 : this.models.debris3;
         const skin = d.kind === 'debris1' ? this.models.debris1Skin : d.kind === 'debris2' ? this.models.debris2Skin : this.models.debris3Skin;
         out.push({
@@ -1127,7 +1116,7 @@ export class LocalDriver implements HostDriver {
           frame: 0,
         });
       }
-      for (const g of this.gibs) {
+      for (const g of this.server.gibs) {
         const model = g.kind === 'meat' ? this.models.gibMeat : g.kind === 'chest' ? this.models.gibChest : g.kind === 'bone' ? this.models.gibBone : this.models.gibHead;
         const skin = g.kind === 'meat' ? this.models.gibMeatSkin : g.kind === 'chest' ? this.models.gibChestSkin : g.kind === 'bone' ? this.models.gibBoneSkin : this.models.gibHeadSkin;
         out.push({
@@ -1237,7 +1226,49 @@ export class LocalDriver implements HostDriver {
   }
 
   get aliveMonsters(): number {
-    return this.monsters.filter((m) => !m.state.dead).length;
+    return this.server.monsters.filter((m) => !m.state.dead).length;
+  }
+
+  /** Test hook: live server monsters (replaces the old PlacedMonster[] sim). */
+  get monsters(): ServerMonster[] {
+    return this.server.monsters;
+  }
+
+  /** Test hook: live server bolts (replaces the old driver bolt sim). */
+  get bolts(): ServerBolt[] {
+    return this.server.bolts;
+  }
+
+  /** Test hook: live server barrels (replaces parseExplosives/barrels). */
+  get barrels(): ServerBarrel[] {
+    return this.server.barrels;
+  }
+
+  /** Test hook: live server explosions (replaces the driver flash list). */
+  get explosions(): ServerExplosion[] {
+    return this.server.explosions;
+  }
+
+  /** Test hook: server debris chunks (replaces the driver toss sim). */
+  get debris(): ServerDebris[] {
+    return this.server.debris;
+  }
+
+  /** Test hook: server gib chunks (replaces the driver mince sim). */
+  get gibs(): ServerGib[] {
+    return this.server.gibs;
+  }
+
+  /** Live fuse count (server-owned barrel fuses / target_explosion delays). */
+  get pendingFuses(): number {
+    return this.server.fuses.length;
+  }
+
+  /** Skinnum stashed on a server monster edict (m_soldier.c SP_ funcs). */
+  monsterSkin(m: ServerMonster): number {
+    const raw = m.edict.extra['skinnum'] ?? '2';
+    const v = Number.parseInt(raw, 10);
+    return Number.isFinite(v) ? v : 2;
   }
 
   get playerHealth(): number {
@@ -1360,7 +1391,7 @@ export class LocalDriver implements HostDriver {
    * state's frame offset. Unknown ids map to 0; the renderer wraps.
    */
   entityFrame(id: number): number {
-    const m = this.monsters.find((m) => m.id === id);
+    const m = this.server.monsters.find((m) => m.edict.num === id);
     if (!m) return 0;
     try {
       const mv = monsterMoveOf(m.state);
@@ -1384,10 +1415,10 @@ export class LocalDriver implements HostDriver {
    * soldiers read differently from shotgun/light at a glance.
    */
   entityModel(id: number): { model: number; skin: number } | null {
-    const m = this.monsters.find((m) => m.id === id);
+    const m = this.server.monsters.find((m) => m.edict.num === id);
     if (!m || !this.models) return null;
     if (m.state.kind === 'gunner') return { model: this.models.gunner, skin: this.models.gunnerSkin };
-    return { model: this.models.monster, skin: this.soldierSkinFor(m.skin) };
+    return { model: this.models.monster, skin: this.soldierSkinFor(this.monsterSkin(m)) };
   }
 
   /**
@@ -1416,7 +1447,7 @@ export class LocalDriver implements HostDriver {
    * §6), so yaw/frames still step at 10Hz for now.
    */
   entityAngles(id: number): [number, number, number] | null {
-    const m = this.monsters.find((m) => m.id === id);
+    const m = this.server.monsters.find((m) => m.edict.num === id);
     if (!m) return null;
     return [0, ((m.state.yaw % 360) + 360) % 360, 0];
   }
@@ -1441,6 +1472,14 @@ export class LocalDriver implements HostDriver {
    */
   peekFlashIntensity(): number {
     return this.flashIntensity;
+  }
+
+  /** Drain pending enemy muzzle flashes (pumped as yellow dlights). */
+  drainEnemyMuzzle(): Array<{ pos: Vec3; intensity: number }> {
+    if (this.enemyFlashes.length === 0) return [];
+    const out = this.enemyFlashes;
+    this.enemyFlashes = [];
+    return out;
   }
 
   /**
@@ -1530,243 +1569,14 @@ export class LocalDriver implements HostDriver {
     }
   }
 
-  private playerBox(): { mins: Vec3; maxs: Vec3 } {
-    return { mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) };
-  }
-
-  /**
-   * Door touch (Touch_DoorTrigger, id g_func.c): walking into a door's
-   * expanded volume uses it. The web driver can't rely on the C brush-touch
-   * path, so the 60-unit expanded AABB check from the WIRE bot is the play
-   * path here too — this is what actually opens doors in the browser.
-   */
-  private checkDoorTouch(): void {
-    if (!this.map || this.playerDead) return;
-    const { mins, maxs } = this.playerBox();
-    for (const m of this.server.movers) {
-      if (m.ent.classname !== 'func_door') continue;
-      const b = modelBounds(this.map, m.ent.model);
-      if (!b) continue;
-      const ox = m.ent.origin[0]! - m.pos1[0]!;
-      const oy = m.ent.origin[1]! - m.pos1[1]!;
-      const oz = m.ent.origin[2]! - m.pos1[2]!;
-      const tmins = new Float32Array([b.mins[0]! + ox - 60, b.mins[1]! + oy - 60, b.mins[2]! + oz]);
-      const tmaxs = new Float32Array([b.maxs[0]! + ox + 60, b.maxs[1]! + oy + 60, b.maxs[2]! + oz]);
-      if (!boxOverlap(this.pm.origin, mins, maxs, tmins, tmaxs)) continue;
-      if (m.state === 'bottom' || m.state === 'waiting') {
-        moverUse(m, this.server.time);
-      }
-    }
-  }
-
-  /**
-   * Brush trigger volumes (trigger_once/multiple on model *N): real AABB
-   * overlap — the point-proximity hook in SV_TouchTriggersAt can't see brush
-   * models (their edict origin is 0,0,0). This is the exit path: the *27 pit
-   * volume fires t37 -> target_changelevel when the player body arrives.
-   */
-  private checkBrushTriggers(): void {
-    if (!this.map || this.playerDead) return;
-    const { mins, maxs } = this.playerBox();
-    for (const t of this.server.triggers) {
-      const n = brushModelNum(t.ent.model);
-      if (n === null) continue;
-      const b = modelBounds(this.map, t.ent.model);
-      if (!b) continue;
-      if (!boxOverlap(this.pm.origin, mins, maxs, b.mins, b.maxs)) continue;
-      const pseudo: Edict = { ...t.ent };
-      triggerTouch(t, this.server.time, 'player', () => fireTargets(this.server, pseudo));
-    }
-  }
-
-  /**
-   * Return fire gated on the move's fire-tagged frame (m_soldier.c
-   * soldier_fire / m_gunner.c GunnerFire+GunnerGrenade): the step loop calls
-   * this only when monsterThink returns 'fire', so shots land on the muzzle
-   * flash. `playedIdx` is the move-frame index that just played (grenades
-   * only leave the tube on the C frames 105/108/111/114 → idx 4/7/10/13).
-   *
-   * The soldier weapon is skin-determined (m_soldier.c soldier_fire via
-   * soldierWeaponForSkin, never random): blaster skins (0) spawn a real foe
-   * Bolt (600 u/s, reused stepBolts/blasterImpact path), shotgun skins (2)
-   * draw one yellow tracer muzzle→eye and roll id's pHit, machinegun skins
-   * (4+) burst three fanned yellow tracers (id monster_fire_bullet × the
-   * HOLD_FRAME repeat). Every shot adds an enemy muzzle dlight
-   * (200+(rand&31) yellow) and impact sparks at the eye on hit.
-   * TODO(melee-sound): 'monster/melee.wav' is a placeholder (no in-pak
-   * match); TODO(grenade-sound): C plays no explicit fire sound here,
-   * 'gunner/gunatck3.wav' is the closest in-pak family match.
-   */
-  private monsterFire(m: PlacedMonster, playedIdx: number): void {
-    if (this.playerDead) return;
-    const eye = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + EYE);
-    const dx = eye[0]! - m.origin[0]!;
-    const dy = eye[1]! - m.origin[1]!;
-    const dz = eye[2]! - m.origin[2]!;
-    const dist = Math.hypot(dx, dy, dz);
-    if (dist > 1000) return;
-    const chest = v3(m.origin[0]!, m.origin[1]!, m.origin[2]! + 32);
-    if (this.traceShot(chest, eye).fraction < 1) return;
-    // Skin-determined soldier weapon (m_soldier.c soldier_fire): blaster /
-    // shotgun / machinegun by skinnum. Gunners keep their move-based table.
-    const skinWeapon = m.state.kind === 'soldier' ? soldierWeaponForSkin(m.skin) : null;
-    // Muzzle via G_ProjectSource (soldier_fire/GunnerFire): monster origin +
-    // fwd*offset + right*offset from the m_flash table, yaw-facing.
-    const fwd = v3();
-    const right = v3();
-    AngleVectors(v3(0, m.state.yaw, 0), fwd, right, v3());
-    const move = m.state.move;
-    let flashId = MZ2_SOLDIER_SHOTGUN_1;
-    if (m.state.kind === 'soldier') {
-      if (skinWeapon === 'blaster') flashId = MZ2_SOLDIER_BLASTER_1;
-      else if (skinWeapon === 'machinegun') flashId = MZ2_SOLDIER_MACHINEGUN_1 + (playedIdx % 2);
-      else flashId = MZ2_SOLDIER_SHOTGUN_1;
-    } else if (move === 'attack_grenade') flashId = MZ2_GUNNER_GRENADE_1 + (playedIdx % 4);
-    else if (m.state.kind === 'gunner') flashId = MZ2_GUNNER_MACHINEGUN_1 + (playedIdx % 8);
-    const muzzle = projectSource(
-      v3(m.origin[0]!, m.origin[1]!, m.origin[2]!),
-      monsterFlashOffset(flashId),
-      fwd,
-      right,
-    );
-    this.enemyFlashes.push({ pos: muzzle, intensity: 200 + ((this.rand() * 32) | 0) });
-    const dirToEye = v3(eye[0]! - muzzle[0]!, eye[1]! - muzzle[1]!, eye[2]! - muzzle[2]!);
-    const dirLen = Math.hypot(dirToEye[0]!, dirToEye[1]!, dirToEye[2]!) || 1;
-    // Soldier blaster skin: a real projectile, not a damage roll.
-    if (skinWeapon === 'blaster') {
-      this.bolts.push({
-        pos: muzzle,
-        dir: v3(dirToEye[0]! / dirLen, dirToEye[1]! / dirLen, dirToEye[2]! / dirLen),
-        life: 2,
-        damage: 5,
-        speed: 600,
-        foe: true,
-        born: this.server.time,
-      });
-      this.emitSound('soldier/solatck2.wav', v3(m.origin[0]!, m.origin[1]!, m.origin[2]! + 32));
-      this.events.push('monshot');
-      return;
-    }
-    // Grenade leaves the tube only on its C frames.
-    if (move === 'attack_grenade' && playedIdx !== 4 && playedIdx !== 7 && playedIdx !== 10 && playedIdx !== 13) {
-      this.enemyFlashes.pop();
-      return;
-    }
-    // Melee commits at close range through the attack move (attack1 for the
-    // soldier, attack_chain for the gunner).
-    if (dist < 96 && (move === 'attack1' || move === 'attack_chain')) {
-      this.damagePlayer(m.state.kind === 'gunner' ? 15 : 10, m.origin);
-      this.emitSound('monster/melee.wav', v3(m.origin[0]!, m.origin[1]!, m.origin[2]!));
-      this.events.push('monshot');
-      return;
-    }
-    const pHit = dist < 500 ? 0.6 : 0.25;
-    // Soldier machinegun skin: 3-round burst (id monster_fire_bullet dmg 2
-    // × the HOLD_FRAME repeat), fanned ±40u at 8192 like the pellet spread
-    // basis; each round rolls pHit independently and draws its own SHORT
-    // muzzle streak (ENEMY_TRACER_LENGTH, never a muzzle→eye beam — the old
-    // full-length beam filled the screen at close range).
-    if (skinWeapon === 'machinegun') {
-      for (let b = -1; b <= 1; b++) {
-        const fan = v3(dirToEye[0]! + b * 40, dirToEye[1]! - b * 40, dirToEye[2]!);
-        this.queueTracer(muzzle, fan, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH);
-        if (this.rand() < pHit) {
-          this.damagePlayer(2, m.origin);
-          this.pushSpark(eye);
-        }
-      }
-      this.emitSound('soldier/solatck3.wav', v3(m.origin[0]!, m.origin[1]!, m.origin[2]! + 32));
-      this.events.push('monshot');
-      return;
-    }
-    let dmg = 5;
-    let sound = 'soldier/solatck1.wav';
-    if (m.state.kind === 'gunner') {
-      dmg = move === 'attack_grenade' ? 12 : 6;
-      sound = move === 'attack_grenade' ? 'gunner/gunatck3.wav' : 'gunner/gunatck2.wav';
-    }
-    this.queueTracer(muzzle, dirToEye, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH);
-    this.emitSound(sound, v3(m.origin[0]!, m.origin[1]!, m.origin[2]! + 32));
-    this.events.push('monshot');
-    if (this.rand() < pHit) {
-      this.damagePlayer(dmg, m.origin);
-      this.pushSpark(eye);
-    }
-  }
-
-  /** Drain pending enemy muzzle flashes (pumped as yellow dlights). */
-  drainEnemyMuzzle(): Array<{ pos: Vec3; intensity: number }> {
-    if (this.enemyFlashes.length === 0) return [];
-    const out = this.enemyFlashes;
-    this.enemyFlashes = [];
-    return out;
-  }
-
-  /** T_Damage on a monster (g_combat.c gib-first ordering via monsterPain).
-   * Corpses re-hit short of gibbing stay corpses; gibbing spawns meat/chest/
-   * head extras + misc/udeath and marks DEAD_DEAD (unhittable from then on).
-   */
-  private painMonster(m: PlacedMonster, damage: number): void {
-    const res = monsterPain(m.state, damage, this.rand);
-    if (res === 'none') return;
-    if (res === 'gib') {
-      this.events.push('gib');
-      this.message = `${m.state.kind} minced`;
-      this.emitSound('misc/udeath.wav', v3(m.origin[0]!, m.origin[1]!, m.origin[2]!));
-      this.spawnGibs(v3(m.origin[0]!, m.origin[1]!, m.origin[2]!), damage);
-      return;
-    }
-    this.events.push(m.state.dead ? 'kill' : 'hit');
-    if (m.state.dead) this.message = `${m.state.kind} down`;
-  }
-
-  /**
-   * Mince a monster (m_soldier.c soldier_die gib branch: 3×sm_meat, chest,
-   * head2, GIB_ORGANIC). Velocities mirror ThrowGib: self vel (0 here) +
-   * 0.5×VelocityForDamage, clipped to [-300,300]×[200,500] up.
-   */
-  private spawnGibs(pos: Vec3, damage: number): void {
-    const kinds: Gib['kind'][] = ['meat', 'meat', 'meat', 'chest', 'head'];
-    for (const kind of kinds) {
-      const scale = damage < 50 ? 0.7 : 1.2;
-      const v = v3(
-        100 * (this.rand() * 2 - 1) * scale * 0.5,
-        100 * (this.rand() * 2 - 1) * scale * 0.5,
-        (200 + 100 * this.rand()) * scale * 0.5,
-      );
-      v[0] = Math.max(-300, Math.min(300, v[0]!));
-      v[1] = Math.max(-300, Math.min(300, v[1]!));
-      v[2] = Math.max(200, Math.min(500, v[2]!));
-      this.gibs.push({
-        origin: v3(
-          pos[0]! + (this.rand() * 2 - 1) * 16,
-          pos[1]! + (this.rand() * 2 - 1) * 16,
-          pos[2]! + (this.rand() * 2 - 1) * 16,
-        ),
-        vel: v,
-        avel: v3(this.rand() * 600, this.rand() * 600, this.rand() * 600),
-        born: this.server.time,
-        life: 10 + this.rand() * 10,
-        kind,
-        rest: false,
-      });
-    }
-  }
-
   /** Apply damage to the player; death parks a 2s respawn timer. */
   damagePlayer(dmg: number, from?: Vec3 | [number, number, number]): void {
     if (this.playerDead || this.exited) return;
     void from;
-    this.ps.health -= dmg;
-    this.events.push('pain');
-    this.emitSound('player/pain.wav', v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
-    if (this.ps.health <= 0) {
-      this.ps.health = 0;
-      this.message = 'YOU DIED — respawning…';
-      this.events.push('death');
-      this.emitSound('player/death.wav', v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
-      this.deadUntil = this.server.time + 2;
-    }
+    // Authoritative pool lives server-side (skill-scaled there); the driver
+    // only mirrors it and synthesizes the pain/death edges.
+    SV_DamagePlayer(this.server, dmg);
+    this.syncHealthFromServer();
   }
 
   private respawn(): void {
@@ -1779,6 +1589,7 @@ export class LocalDriver implements HostDriver {
       this.pm.viewAngles = v3();
     }
     this.pm.velocity = v3();
+    SV_SetPlayerHealth(this.server, this.ps.maxHealth);
     this.ps.health = this.ps.maxHealth;
     this.deadUntil = -1;
     // A new life is vulnerable again: without this, a completed level left
@@ -1796,6 +1607,7 @@ export class LocalDriver implements HostDriver {
     const px = this.pm.origin[0]!;
     const py = this.pm.origin[1]!;
     const pz = this.pm.origin[2]!;
+    let healed = false;
     for (const e of this.server.entities) {
       if (e.freed) continue;
       const c = e.classname;
@@ -1807,6 +1619,7 @@ export class LocalDriver implements HostDriver {
       const res = pickupItem(this.ps, c);
       if (!res.picked) continue;
       e.freed = true;
+      healed = true;
       this.syncAmmo();
       this.events.push('pickup');
       this.message = c.replace(/_/g, ' ');
@@ -1819,6 +1632,9 @@ export class LocalDriver implements HostDriver {
         }
       }
     }
+    // Pickups (health) write through the authoritative pool so the next
+    // server tick doesn't clobber the grant.
+    if (healed) SV_SetPlayerHealth(this.server, this.ps.health);
   }
 
   private spawnFromLump(map: BspMap): void {
@@ -1847,46 +1663,6 @@ export class LocalDriver implements HostDriver {
       this.pm.viewAngles = v3(0, 0, 0);
     }
     this.pm.velocity = v3();
-  }
-
-  private placeMonsters(map: BspMap): void {
-    let id = 2;
-    const skill = getSkill();
-    for (const d of parseEntities(map.entities)) {
-      if (skillInhibits(parseSpawnflags(d), skill)) continue;
-      const cls = d['classname'];
-      if (cls !== 'monster_soldier' && cls !== 'monster_soldier_light' && cls !== 'monster_soldier_ss' && cls !== 'monster_gunner') continue;
-      // base1 ships 14 soldiers (8 plain + 6 light); keep every placed
-      // monster instead of silently dropping the tail.
-      if (this.monsters.length >= 16) break;
-      // id skinnum per SP_ func (m_soldier.c): light 0 (blaster), plain 2
-      // (shotgun), ss 4 (machinegun). Unknown/DM classnames default to the
-      // plain shotgun skin. Gunner ignores this (skin 0).
-      const skin = cls === 'monster_soldier_light' ? 0 : cls === 'monster_soldier_ss' ? 4 : cls === 'monster_gunner' ? 0 : 2;
-      const o = (d['origin'] ?? '0 0 0').trim().split(/\s+/).map(Number);
-      let origin: [number, number, number] = [o[0] ?? 0, o[1] ?? 0, o[2] ?? 0];
-      // id walkmonster_start_go + M_droptofloor (game/g_monster.c): the lump
-      // origin is the entity origin 24 above the feet; drop with C's
-      // MASK_MONSTERSOLID (SV_DropTraceFor) so clip-sealed decks hold.
-      const drop = SV_DropTraceFor(map);
-      {
-        const start = v3(origin[0], origin[1], origin[2] + 1);
-        const end = v3(origin[0], origin[1], origin[2] - 256);
-        try {
-          const tr = drop(start, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, end);
-          if (!tr.allsolid) origin = [tr.endpos[0]!, tr.endpos[1]!, tr.endpos[2]!];
-        } catch {
-          // Keep the lump origin on trace failure (devroom-style fallback).
-        }
-      }
-      this.monsters.push({
-        id: id++,
-        origin,
-        state: spawnMonster(cls === 'monster_gunner' ? 'gunner' : 'soldier'),
-        skin,
-        lastAttack: -10,
-      });
-    }
   }
 
   private snapshotDoorBases(): void {
@@ -2077,18 +1853,35 @@ export class LocalDriver implements HostDriver {
     }
   }
 
+  /**
+   * Fire the selected weapon (Phase 0 single sim): the driver computes the
+   * shot (eye/feet/angles from input) but the server applies it via
+   * SV_PlayerFire — ammo, muzzle dlight, bolts, hitscan pellet traces,
+   * pain/gib/barrel damage, impact sparks and sounds are all server-owned.
+   * Muzzle/tracer visuals reach the pump through drainServerEvents (end of
+   * step). Weapon_Generic-lite gunframe + view kick stay driver-side
+   * (viewmodel cosmetics).
+   */
   private handleAttack(cmd: UserCmdT): void {
     if (!(cmd.buttons & BUTTON_ATTACK)) return;
     if (this.playerDead) return;
     const t = this.server.time;
     const refire = REFIRE[this.weapon.classname] ?? 0.25;
     if (t - this.lastShotAt < refire) return;
-    const ammo = this.weapon.ammoKind === 'shells' ? this.shells : this.bullets;
-    const res = fireWeapon(this.weapon, ammo, this.rand, false);
+    const viewheight = this.pm.viewheight;
+    const eye = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + viewheight);
+    const res = SV_PlayerFire(this.server, this.weapon.classname, {
+      eye,
+      feet: v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]),
+      angles: new Float32Array(cmd.angles) as Vec3,
+      viewheight,
+      ammo: this.weapon.ammoKind === 'shells' ? this.shells : this.bullets,
+      trace: this.worldTrace,
+      rand: this.rand,
+    });
     if (!res.fired) {
       this.message = 'NO AMMO';
       this.events.push('empty');
-      this.emitSound('weapons/noammo.wav', v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
       this.lastShotAt = t;
       return;
     }
@@ -2098,40 +1891,19 @@ export class LocalDriver implements HostDriver {
     this.lastShotAt = t;
     this.message = '';
     this.events.push('shot');
+    if (res.bolt) this.events.push('bolt');
     // Weapon_Generic-lite: firing starts at FIRE_FIRST (activate+1); the
     // per-tick stepper walks it to IDLE_FIRST+1 (READY). viewModel() reports
     // this live gunframe; muzzleLit stays dlight/HUD-only.
     this.gunframe = gunBoundsFor(this.weapon.classname).activate + 1;
     this.firing = true;
-    const eye = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + EYE);
-    this.emitSound(
-      this.weapon.classname === 'weapon_shotgun'
-        ? 'weapons/shotgf1b.wav'
-        : this.weapon.classname === 'weapon_machinegun'
-          ? 'weapons/machgf1b.wav'
-          : 'weapons/blastf1a.wav',
-      eye,
-    );
-    // Muzzle flash: HUD glow + a real dlight the renderer understands.
-    // id CL_MuzzleFlash: origin = feet + fwd*18 + right*16 (full 3D fwd/
-    // right via G_ProjectSource, no up vector), radius 200+(rand&31),
-    // pure yellow, single frame.
-    this.flashUntil = t + 0.09;
-    this.flashPending = true;
-    this.flashIntensity = 200 + ((this.rand() * 32) | 0);
+    // Firing kick (p_weapon.c Blaster_Fire/weapon_shotgun_fire): origin
+    // -2*fwd, pitch -1 (blaster) / -2 (shotgun). Machinegun has its own
+    // per-shot crandom walk (TODO) and sets no kick here.
     const fwd0 = v3();
     const right0 = v3();
     const up0 = v3();
     AngleVectors(new Float32Array(cmd.angles) as Vec3, fwd0, right0, up0);
-    const feet0 = this.pm.origin;
-    this.flashPos = v3(
-      feet0[0]! + fwd0[0]! * 18 + right0[0]! * 16,
-      feet0[1]! + fwd0[1]! * 18 + right0[1]! * 16,
-      feet0[2]! + fwd0[2]! * 18 + right0[2]! * 16,
-    );
-    // Firing kick (p_weapon.c Blaster_Fire/weapon_shotgun_fire): origin
-    // -2*fwd, pitch -1 (blaster) / -2 (shotgun). Machinegun has its own
-    // per-shot crandom walk (TODO) and sets no kick here.
     if (this.weapon.classname === 'weapon_blaster') {
       this.kickOrigin = v3(-2 * fwd0[0]!, -2 * fwd0[1]!, -2 * fwd0[2]!);
       this.kickAngles = v3(-1, 0, 0);
@@ -2141,581 +1913,21 @@ export class LocalDriver implements HostDriver {
       this.kickAngles = v3(-2, 0, 0);
       this.kickPending = true;
     }
-    const fwd = v3();
-    const right = v3();
-    const up = v3();
-    AngleVectors(new Float32Array(cmd.angles) as Vec3, fwd, right, up);
-    // Authentic split (g_weapon.c): the blaster is a PROJECTILE weapon
-    // (fire_blaster bolt edict, 1000 u/s, 2s life, EF_BLASTER trail) — never
-    // hitscan, never a muzzle->impact beam. Hitscan weapons (shotgun /
-    // machinegun, fire_lead) are instant traces with impact sparks only;
-    // only the railgun draws a beam (TE_RAILTRAIL, not in v1).
-    if (this.weapon.classname === 'weapon_blaster' && res.bolt) {
-      // G_ProjectSource (g_utils.c) from the feet origin: start = feet +
-      // fwd*24 + right*8 (full 3D fwd/right), then start.z += viewheight-8
-      // (22-8 = 14). No up vector. The bolt leaves the gun muzzle, not the eye.
-      const feet = this.pm.origin;
-      const start = v3(
-        feet[0]! + fwd[0]! * 24 + right[0]! * 8,
-        feet[1]! + fwd[1]! * 24 + right[1]! * 8,
-        feet[2]! + fwd[2]! * 24 + right[2]! * 8 + (EYE - 8),
-      );
-      const dir = v3(fwd[0]!, fwd[1]!, fwd[2]!);
-      const dl = Math.hypot(dir[0]!, dir[1]!, dir[2]!) || 1;
-      this.bolts.push({
-        pos: start,
-        dir: v3(dir[0]! / dl, dir[1]! / dl, dir[2]! / dl),
-        life: res.bolt.life,
-        damage: res.bolt.damage,
-        speed: BOLT_SPEED,
-        foe: false,
-        born: this.server.time,
-      });
-      this.events.push('bolt');
-      return;
-    }
-    for (const pl of res.pellets) {
-      const dir = v3(
-        fwd[0]! * PELLET_RANGE + right[0]! * pl.r + up[0]! * pl.u,
-        fwd[1]! * PELLET_RANGE + right[1]! * pl.r + up[1]! * pl.u,
-        fwd[2]! * PELLET_RANGE + right[2]! * pl.r + up[2]! * pl.u,
-      );
-      const len = Math.hypot(dir[0]!, dir[1]!, dir[2]!) || 1;
-      // Pellet spread basis: r/u are world units at PELLET_RANGE (id convention).
-      const far = v3(
-        eye[0]! + ((dir[0]! / len) * PELLET_RANGE),
-        eye[1]! + ((dir[1]! / len) * PELLET_RANGE),
-        eye[2]! + ((dir[2]! / len) * PELLET_RANGE),
-      );
-      const wall = this.traceShot(eye, far);
-      let bestT = wall.fraction;
-      let hitMonster: PlacedMonster | null = null;
-      const seg = v3(far[0]! - eye[0]!, far[1]! - eye[1]!, far[2]! - eye[2]!);
-      for (const m of this.monsters) {
-        if (m.state.gibbed) continue;
-        // No dead-skip: corpses stay hittable (takedamage YES) so re-hitting
-        // them minces (g_combat.c T_Damage gib-first ordering in painMonster).
-        const mmins: [number, number, number] = [
-          m.origin[0]! + MONSTER_MINS[0],
-          m.origin[1]! + MONSTER_MINS[1],
-          m.origin[2]! + MONSTER_MINS[2],
-        ];
-        const mmaxs: [number, number, number] = [
-          m.origin[0]! + MONSTER_MAXS[0],
-          m.origin[1]! + MONSTER_MAXS[1],
-          m.origin[2]! + MONSTER_MAXS[2],
-        ];
-        const tHit = segmentAabb(eye, seg, mmins, mmaxs);
-        if (tHit !== null && tHit < bestT) {
-          bestT = tHit;
-          hitMonster = m;
-        }
-      }
-      const hitPos = v3(
-        eye[0]! + seg[0]! * bestT,
-        eye[1]! + seg[1]! * bestT,
-        eye[2]! + seg[2]! * bestT,
-      );
-      // Barrels are shootable (misc_explobox takes T_Damage): test the bolt
-      // path against live barrels before resolving the wall/monster hit.
-      const hitBarrel = this.barrelAT(eye, seg, bestT);
-      if (hitBarrel && !hitBarrel.dead) {
-        this.damageBarrel(hitBarrel, pl.damage);
-      } else if (hitMonster) {
-        this.painMonster(hitMonster, pl.damage);
-      } else if (bestT < 1) {
-        // TE_GUNSHOT / TE_SHOTGUN impact: gray sparks + smoke, no beam.
-        this.pushSpark(hitPos);
-      }
-    }
-  }
-
-  /** Parse shootable/scripted explosives from the entities lump (base1).
-   *
-   * Canonical id defaults come from @q2/game spawnExplosive (g_misc.c /
-   * g_target.c): misc_explobox health 10 / dmg 150 / mass 400, func_explosive
-   * health 100 / dmg 0 / mass 75, target_explosion dmg 0 / delay 0.
-   * misc_explobox origins are kept as the mapper placed them (verified
-   * against real base1.bsp: the lump origins already rest on the floor — a
-   * hull drop moves them by exactly CONTACT_EPS — matching id's
-   * M_droptofloor outcome, since the origin is the box bottom). No drop.
-   */
-  private parseExplosives(map: BspMap): void {
-    const skill = getSkill();
-    for (const d of parseEntities(map.entities)) {
-      if (skillInhibits(parseSpawnflags(d), skill)) continue;
-      const ex = spawnExplosive(d);
-      if (!ex) continue;
-      if (ex.kind === 'misc_explobox') {
-        this.barrels.push({
-          origin: v3(ex.origin[0], ex.origin[1], ex.origin[2]),
-          health: ex.health,
-          dmg: ex.dmg,
-          mass: ex.mass,
-          size: v3(32, 32, 40),
-          isFunc: false,
-          dead: false,
-        });
-      } else if (ex.kind === 'func_explosive') {
-        const b = ex.model ? modelBounds(map, ex.model) : null;
-        if (!b) continue;
-        const cx = (b.mins[0]! + b.maxs[0]!) / 2;
-        const cy = (b.mins[1]! + b.maxs[1]!) / 2;
-        const cz = (b.mins[2]! + b.maxs[2]!) / 2;
-        this.barrels.push({
-          origin: v3(cx, cy, cz),
-          health: ex.health,
-          dmg: ex.dmg,
-          mass: ex.mass,
-          size: v3(b.maxs[0]! - b.mins[0]!, b.maxs[1]! - b.mins[1]!, b.maxs[2]! - b.mins[2]!),
-          isFunc: true,
-          dead: false,
-        });
-      } else if (ex.targetname) {
-        this.explosionTargets.set(ex.targetname, {
-          origin: v3(ex.origin[0], ex.origin[1], ex.origin[2]),
-          dmg: ex.dmg,
-          delay: ex.delay,
-        });
-      }
-    }
-  }
-
-  /** id SP_trigger_always: fire at spawn (base1 level-start relays). */
-  private fireTriggerAlways(map: BspMap): void {
-    const skill = getSkill();
-    for (const d of parseEntities(map.entities)) {
-      if (d['classname'] !== 'trigger_always' || !d['target']) continue;
-      if (skillInhibits(parseSpawnflags(d), skill)) continue;
-      // Explosion targets only: ships/trains/relays already fired server-side
-      // (SV_SpawnEntities runs its own trigger_always pass and starts them).
-      for (const t of d['target']!.trim().split(/\s+/)) this.fireExplosionTarget(t);
-    }
-  }
-
-  /** Scripted corridor blasts: trigger_once/relay chains fire target_explosion. */
-  private checkScriptedExplosions(): void {
-    for (const t of this.server.firedThisTick) this.fireExplosionTarget(t);
-  }
-
-  /** Fire one target_explosion: immediate, or delayed via the fuse list
-   * (use_target_explosion: think = explode at level.time + delay). */
-  private fireExplosionTarget(targetname: string): void {
-    const ex = this.explosionTargets.get(targetname);
-    if (!ex) return;
-    if (ex.delay > 0) {
-      this.fuses.push({ pos: v3(ex.origin[0], ex.origin[1], ex.origin[2]), dmg: ex.dmg, at: this.server.time + ex.delay });
-      return;
-    }
-    this.spawnExplosion(ex.origin, ex.dmg);
-  }
-
-  /** Step pending barrel fuses / target_explosion delays on server time. */
-  private stepFuses(): void {
-    for (let i = this.fuses.length - 1; i >= 0; i--) {
-      const f = this.fuses[i]!;
-      if (this.server.time < f.at) continue;
-      this.fuses.splice(i, 1);
-      if (f.barrel) {
-        this.spawnBarrelDebris(f.barrel);
-      }
-      this.spawnExplosion(f.pos, f.dmg);
-    }
-  }
-
-  /**
-   * Explosion visual + sound + radius damage (TE_EXPLOSION1 barrel/func/
-   * target, TE_BLASTER touch flash). Big booms emit the 256-count ballistic
-   * burst (CL_ExplosionParticles, gravity + 0.625-1.0s ttl); the blaster
-   * flash keeps its 40-spark burst (added by blasterImpact, not here).
-   * Grounded booms render as explosion2 (BecomeExplosion2), airborne as
-   * explosion1 (BecomeExplosion1). Keeps world/explod1.wav as the documented
-   * pak fallback (the authentic rocklx1a/grenlx1a lumps are absent from
-   * pak0.pak) and lashit for blaster.
-   */
-  private spawnExplosion(pos: Vec3, dmg: number, kind: ExplosionKind = 'explosion1'): void {
-    let baseframe = 0;
-    if (kind === 'explosion1') {
-      // Grounded barrels burst against the floor (BecomeExplosion2),
-      // airborne ones hang (BecomeExplosion1).
-      const grounded = this.traceShot(v3(pos[0], pos[1], pos[2] + 1), v3(pos[0], pos[1], pos[2] - 8)).fraction < 1;
-      if (grounded) kind = 'explosion2';
-      if (kind === 'explosion2') baseframe = 30;
-      else if (this.rand() < 0.5) baseframe = 15;
-    } else if (kind === 'explosion2') {
-      baseframe = 30;
-    }
-    this.explosions.push({
-      pos: v3(pos[0], pos[1], pos[2]),
-      born: this.server.time,
-      kind,
-      baseframe,
-      yaw: (this.rand() * 360) | 0,
-    });
-    if (kind === 'blaster') return;
-    for (let i = 0; i < 256; i++) {
-      const ox = (this.rand() * 32 - 16) | 0;
-      const oy = (this.rand() * 32 - 16) | 0;
-      const oz = (this.rand() * 32 - 16) | 0;
-      this.pushBallisticSpark(
-        v3(pos[0]! + ox, pos[1]! + oy, pos[2]! + oz),
-        v3((this.rand() * 384 - 192) | 0, (this.rand() * 384 - 192) | 0, (this.rand() * 384 - 192) | 0),
-        0xe0 + ((this.rand() * 8) | 0),
-      );
-    }
-    this.emitSound('world/explod1.wav', v3(pos[0], pos[1], pos[2]));
-    this.events.push('explosion');
-    if (dmg > 0) this.damageRadius(pos, dmg);
-  }
-
-  /**
-   * id T_RadiusDamage (g_combat.c): distance is measured from the entity's
-   * bbox CENTER (mins+maxs)/2, points = dmg - 0.5*len, the attacker takes
-   * half, and CanDamage (LOS) must pass or the entity is skipped. Barrels
-   * chain through the 0.2s fuse (damageBarrel). Corpses keep their skip
-   * (radius never minces — only direct fire does).
-   */
-  private damageRadius(pos: Vec3, dmg: number): void {
-    const radius = dmg + 40;
-    if (!(radius > 0)) return;
-    for (const m of this.monsters) {
-      if (m.state.dead) continue;
-      const center = v3(
-        m.origin[0]! + (MONSTER_MINS[0]! + MONSTER_MAXS[0]!) / 2,
-        m.origin[1]! + (MONSTER_MINS[1]! + MONSTER_MAXS[1]!) / 2,
-        m.origin[2]! + (MONSTER_MINS[2]! + MONSTER_MAXS[2]!) / 2,
-      );
-      const len = Math.hypot(center[0]! - pos[0]!, center[1]! - pos[1]!, center[2]! - pos[2]!);
-      if (len >= radius) continue;
-      if (!this.canDamage(center, pos)) continue;
-      this.painMonster(m, Math.max(1, Math.round(dmg - 0.5 * len)));
-    }
-    const pcenter = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + 4);
-    const pd = Math.hypot(pcenter[0]! - pos[0]!, pcenter[1]! - pos[1]!, pcenter[2]! - pos[2]!);
-    if (pd < radius && this.canDamage(pcenter, pos)) {
-      // The attacker (us, who shot the barrel) takes half damage.
-      this.damagePlayer(Math.max(1, Math.round((dmg - 0.5 * pd) * 0.5)), [pos[0]!, pos[1]!, pos[2]!]);
-    }
-    for (const b of this.barrels) {
-      if (b.dead) continue;
-      const bcenter = v3(b.origin[0]! + b.size[0]! / 2, b.origin[1]! + b.size[1]! / 2, b.origin[2]! + b.size[2]! / 2);
-      const bd = Math.hypot(bcenter[0]! - pos[0]!, bcenter[1]! - pos[1]!, bcenter[2]! - pos[2]!);
-      if (bd >= radius) continue;
-      if (!this.canDamage(bcenter, pos)) continue;
-      this.damageBarrel(b, Math.max(1, Math.round(dmg - 0.5 * bd)));
-    }
-  }
-
-  /** id CanDamage (g_combat.c): point-trace LOS from inflictor to target. */
-  private canDamage(target: Vec3, from: Vec3): boolean {
-    return this.traceShot(from, target).fraction >= 1;
-  }
-
-  /** Step flying blaster bolts (player 1000 u/s, soldier monster 600 u/s, 2s life).
-   *
-   * Life expires on SERVER time (`server.time - born >= life`, id's
-   * `G_FreeEdict at level.time + 2`): the old `life -= dt` tied the 2s fuse
-   * to whatever dt the step happened to carry, so a non-tick dt stretched
-   * or shrank the bolt's life. Movement still integrates the passed tick
-   * quantum (always SERVER_DT from Host.serverTick).
-   *
-   * Foe bolts (soldier return fire) test the player box and damage the
-   * player; player bolts test monsters. Gibbed monsters are skipped, but
-   * corpses are NOT (takedamage YES — re-hit minces via painMonster).
-   */
-  private stepBolts(dt: number): void {
-    if (this.bolts.length === 0) return;
-    for (let i = this.bolts.length - 1; i >= 0; i--) {
-      const bolt = this.bolts[i]!;
-      const stepLen = bolt.speed * dt;
-      const next = v3(
-        bolt.pos[0]! + bolt.dir[0]! * stepLen,
-        bolt.pos[1]! + bolt.dir[1]! * stepLen,
-        bolt.pos[2]! + bolt.dir[2]! * stepLen,
-      );
-      // EF_BLASTER trail (cl_fx.c CL_BlasterTrail): yellow puffs every ~5
-      // units at the fixed palette color 0xe0 (no jitter — the impact
-      // burst below is where the 0xe0+(rand&7) spread lives).
-      const trailSteps = Math.min(8, Math.max(1, Math.round(stepLen / 5)));
-      for (let k = 1; k <= trailSteps; k++) {
-        const f = k / (trailSteps + 1);
-        this.pushColoredSpark(
-          v3(
-            bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * f,
-            bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * f,
-            bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * f,
-          ),
-          0xe0,
-        );
-      }
-      let dead = this.server.time - bolt.born >= bolt.life;
-      if (!dead) {
-        // Wall touch (blaster_touch: sky frees silently, wall explodes).
-        // TODO(sky): TraceResult exposes no SURF_SKY flag, so sky hits
-        // explode here; free the bolt silently once the trace carries the
-        // surface flag (id blaster_touch).
-        const wall = this.traceShot(bolt.pos, next);
-        if (wall.fraction < 1) {
-          const hitPos = v3(
-            bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * wall.fraction,
-            bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * wall.fraction,
-            bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * wall.fraction,
-          );
-          this.blasterImpact(hitPos, bolt.damage, null);
-          dead = true;
-        } else if (bolt.foe) {
-          // Soldier return fire: test the player box (feet + viewheight eye
-          // band, same hull the world collides with).
-          const seg = v3(next[0]! - bolt.pos[0]!, next[1]! - bolt.pos[1]!, next[2]! - bolt.pos[2]!);
-          const { mins, maxs } = this.playerBox();
-          const pmins: [number, number, number] = [
-            this.pm.origin[0]! + mins[0]!,
-            this.pm.origin[1]! + mins[1]!,
-            this.pm.origin[2]! + mins[2]!,
-          ];
-          const pmaxs: [number, number, number] = [
-            this.pm.origin[0]! + maxs[0]!,
-            this.pm.origin[1]! + maxs[1]!,
-            this.pm.origin[2]! + maxs[2]!,
-          ];
-          const tHit = segmentAabb(bolt.pos, seg, pmins, pmaxs);
-          if (tHit !== null) {
-            const hitPos = v3(bolt.pos[0]! + seg[0]! * tHit, bolt.pos[1]! + seg[1]! * tHit, bolt.pos[2]! + seg[2]! * tHit);
-            this.blasterImpact(hitPos, bolt.damage, null);
-            if (!this.playerDead) {
-              this.damagePlayer(bolt.damage, [hitPos[0]!, hitPos[1]!, hitPos[2]!]);
-              this.pushSpark(v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + EYE));
-            }
-            dead = true;
-          }
-        } else {
-          // Flesh touch: monsters first (T_Damage ENERGY), then barrels.
-          const seg = v3(next[0]! - bolt.pos[0]!, next[1]! - bolt.pos[1]!, next[2]! - bolt.pos[2]!);
-          let hitMonster: PlacedMonster | null = null;
-          let bestT = 1;
-          for (const m of this.monsters) {
-            if (m.state.gibbed) continue;
-            const tHit = segmentAabb(
-              bolt.pos, seg,
-              [m.origin[0]! + MONSTER_MINS[0], m.origin[1]! + MONSTER_MINS[1], m.origin[2]! + MONSTER_MINS[2]],
-              [m.origin[0]! + MONSTER_MAXS[0], m.origin[1]! + MONSTER_MAXS[1], m.origin[2]! + MONSTER_MAXS[2]],
-            );
-            if (tHit !== null && tHit < bestT) {
-              bestT = tHit;
-              hitMonster = m;
-            }
-          }
-          if (hitMonster) {
-            const hitPos = v3(
-              bolt.pos[0]! + seg[0]! * bestT,
-              bolt.pos[1]! + seg[1]! * bestT,
-              bolt.pos[2]! + seg[2]! * bestT,
-            );
-            this.blasterImpact(hitPos, bolt.damage, hitMonster);
-            dead = true;
-          } else {
-            const hb = this.barrelSegmentAT(bolt.pos, seg);
-            if (hb && !hb.dead) {
-              this.damageBarrel(hb, bolt.damage);
-              this.blasterImpact(v3(hb.origin[0], hb.origin[1], hb.origin[2]), bolt.damage, null);
-              dead = true;
-            }
-          }
-        }
-      }
-      if (dead) this.bolts.splice(i, 1);
-      else bolt.pos = next;
-    }
-  }
-
-  /** TE_BLASTER impact: sparks + explosion flash + lashit + flesh damage. */
-  private blasterImpact(pos: Vec3, damage: number, hitMonster: PlacedMonster | null): void {
-    for (let i = 0; i < 40; i++) {
-      const ox = (this.rand() * 16 - 8) | 0;
-      const oy = (this.rand() * 16 - 8) | 0;
-      const oz = (this.rand() * 16 - 8) | 0;
-      this.pushColoredSpark(v3(pos[0]! + ox, pos[1]! + oy, pos[2]! + oz), 0xe0 + ((this.rand() * 8) | 0));
-    }
-    this.spawnExplosion(pos, 0, 'blaster');
-    this.events.push('explosion');
-    this.emitSound('weapons/lashit.wav', v3(pos[0], pos[1], pos[2]));
-    if (hitMonster) this.painMonster(hitMonster, damage);
-  }
-
-  /** Live barrels whose authentic hull the hitscan segment reaches first. */
-  private barrelAT(eye: Vec3, seg: Vec3, bestT: number): Barrel | null {
-    let best: Barrel | null = null;
-    let bt = bestT;
-    for (const b of this.barrels) {
-      if (b.dead) continue;
-      const tHit = segmentAabb(
-        eye, seg,
-        [b.origin[0]! + BARREL_MINS[0], b.origin[1]! + BARREL_MINS[1], b.origin[2]! + BARREL_MINS[2]],
-        [b.origin[0]! + BARREL_MAXS[0], b.origin[1]! + BARREL_MAXS[1], b.origin[2]! + BARREL_MAXS[2]],
-      );
-      if (tHit !== null && tHit < bt) {
-        bt = tHit;
-        best = b;
-      }
-    }
-    return best;
-  }
-
-  /** Live barrel along a bolt step segment (point-box test). */
-  private barrelSegmentAT(start: Vec3, seg: Vec3): Barrel | null {
-    return this.barrelAT(start, seg, 1);
-  }
-
-  /**
-   * T_Damage on a barrel (g_misc.c barrel_delay): the first lethal hit sets
-   * takedamage NO + a 0.2s fuse (think = barrel_explode at level.time + 2
-   * frames), then barrel_explode runs T_RadiusDamage + BecomeExplosion.
-   * Chained hits (damageRadius chains) re-enter through the same fuse.
-   */
-  private damageBarrel(b: Barrel, dmg: number): void {
-    if (b.dead) return;
-    b.health -= dmg;
-    if (b.health > 0) return;
-    b.dead = true;
-    this.events.push('barrel');
-    this.fuses.push({
-      pos: v3(b.origin[0], b.origin[1], b.origin[2]),
-      dmg: b.dmg,
-      at: this.server.time + 0.2,
-      barrel: { origin: v3(b.origin[0], b.origin[1], b.origin[2]), size: v3(b.size[0], b.size[1], b.size[2]), mass: b.mass, dmg: b.dmg, isFunc: b.isFunc },
-    });
-  }
-
-  /** Live fuse count (test hook). */
-  get pendingFuses(): number {
-    return this.fuses.length;
-  }
-
-  /**
-   * Debris for one exploded barrel (g_misc.c barrel_explode): 2 big
-   * (debris1, spd 1.5*dmg/200 at the center), 4 bottom corners (debris3,
-   * spd 1.75*dmg/200 at the absmin corners), 8 small (debris2, spd
-   * 2*dmg/200 at the center). func_explosive instead uses its mass class
-   * (mass/100 cap 8 big + mass/25 cap 16 small).
-   */
-  private spawnBarrelDebris(b: { origin: Vec3; size: Vec3; mass: number; dmg: number; isFunc: boolean }): void {
-    const center = v3(b.origin[0]! + b.size[0]! / 2, b.origin[1]! + b.size[1]! / 2, b.origin[2]! + b.size[2]! / 2);
-    if (b.isFunc) {
-      const big = Math.min(8, Math.floor(b.mass / 100));
-      for (let i = 0; i < big; i++) {
-        this.pushDebris('debris1', this.jitterVec(center, b.size), 1);
-      }
-      const small = Math.min(16, Math.floor(b.mass / 25));
-      for (let i = 0; i < small; i++) {
-        this.pushDebris('debris2', this.jitterVec(center, b.size), 2);
-      }
-      return;
-    }
-    const spd = b.dmg / 200;
-    for (let i = 0; i < 2; i++) this.pushDebris('debris1', this.jitterVec(center, b.size), 1.5 * spd);
-    for (let cx = 0; cx < 2; cx++) {
-      for (let cy = 0; cy < 2; cy++) {
-        this.pushDebris(
-          'debris3',
-          v3(b.origin[0]! + cx * b.size[0]!, b.origin[1]! + cy * b.size[1]!, b.origin[2]!),
-          1.75 * spd,
-        );
-      }
-    }
-    for (let i = 0; i < 8; i++) this.pushDebris('debris2', this.jitterVec(center, b.size), 2 * spd);
-  }
-
-  private jitterVec(center: Vec3, size: Vec3): Vec3 {
-    return v3(
-      center[0]! + (this.rand() * 2 - 1) * size[0]!,
-      center[1]! + (this.rand() * 2 - 1) * size[1]!,
-      center[2]! + (this.rand() * 2 - 1) * size[2]!,
-    );
-  }
-
-  /** One ThrowDebris chunk (g_misc.c): 100*crandom planar, 100+100*rand up,
-   * scaled by speed, random spin, 5+rand*5s life. Deterministic via rand. */
-  private pushDebris(kind: Debris['kind'], origin: Vec3, speed: number): void {
-    this.debris.push({
-      origin: v3(origin[0], origin[1], origin[2]),
-      vel: v3(
-        100 * (this.rand() * 2 - 1) * speed,
-        100 * (this.rand() * 2 - 1) * speed,
-        (100 + 100 * this.rand()) * speed,
-      ),
-      avel: v3(this.rand() * 600, this.rand() * 600, this.rand() * 600),
-      born: this.server.time,
-      life: 5 + this.rand() * 5,
-      kind,
-      rest: false,
-    });
-  }
-
-  /**
-   * Step debris + gibs (g_phys.c SV_Physics_Toss-lite): gravity, point-trace
-   * move, ClipVelocity backoff (1.5 bounce debris / 1.0 toss gibs), floor rest
-   * when vz < 60 and the plane normal is floor-like (> 0.7), life expiry
-   * (5+rand*5 debris, 10+rand*10 gibs). Headless-deterministic (driver rand
-   * only for spawns; stepping is pure math).
-   */
-  private stepTossed(dt: number): void {
-    this.stepChunks(this.debris, dt, 1.5);
-    this.stepChunks(this.gibs, dt, 1.0);
-  }
-
-  private stepChunks(items: Array<Debris | Gib>, dt: number, backoff: number): void {
-    for (let i = items.length - 1; i >= 0; i--) {
-      const c = items[i]!;
-      if (this.server.time - c.born >= c.life) {
-        items.splice(i, 1);
-        continue;
-      }
-      if (c.rest) continue;
-      c.vel[2] = c.vel[2]! - TOSS_GRAVITY * dt;
-      const next = v3(
-        c.origin[0]! + c.vel[0]! * dt,
-        c.origin[1]! + c.vel[1]! * dt,
-        c.origin[2]! + c.vel[2]! * dt,
-      );
-      const hit = this.traceShot(c.origin, next);
-      if (hit.fraction >= 1) {
-        c.origin = next;
-        continue;
-      }
-      c.origin = v3(
-        c.origin[0]! + (next[0]! - c.origin[0]!) * hit.fraction,
-        c.origin[1]! + (next[1]! - c.origin[1]!) * hit.fraction,
-        c.origin[2]! + (next[2]! - c.origin[2]!) * hit.fraction,
-      );
-      // TraceResult carries the hit plane normal (bsp trace or analytic).
-      const n = (hit as { planeNormal?: Vec3 }).planeNormal ?? v3(0, 0, 1);
-      const d = (c.vel[0]! * n[0]! + c.vel[1]! * n[1]! + c.vel[2]! * n[2]!) * backoff;
-      c.vel = v3(c.vel[0]! - n[0]! * d, c.vel[1]! - n[1]! * d, c.vel[2]! - n[2]! * d);
-      if (n[2]! > 0.7 && (backoff < 1.5 || c.vel[2]! < 60)) {
-        c.vel = v3();
-        c.rest = true;
-      }
-    }
   }
 
   /**
    * Drain live explosion flashes for the dlight pump. Blaster flashes are
    * brief (EXPLOSION_LIGHT_WINDOW); big booms burn over their frame life
    * with alpha fade (ex_poly 16-frame alpha, ex_misc linear). Returns pos +
-   * kind + alpha so the pump can pick the authentic light per kind.
+   * kind + alpha so the pump can pick the authentic light per kind. Backed
+   * by the server explosion list (pruned server-side by frame life).
    */
   drainExplosions(): Array<{ pos: Vec3; kind: ExplosionKind; alpha: number }> {
     const out: Array<{ pos: Vec3; kind: ExplosionKind; alpha: number }> = [];
-    for (let i = this.explosions.length - 1; i >= 0; i--) {
-      const e = this.explosions[i]!;
+    for (const e of this.server.explosions) {
       const age = this.server.time - e.born;
       const frames = explosionFrames(e.kind);
-      // Visuals live their full frame life (baseframe + f at 100ms); the
-      // light dies earlier for blaster (brief TE_BLASTER window).
-      if (age < 0 || age >= frames * 0.1) {
-        this.explosions.splice(i, 1);
-        continue;
-      }
+      if (age < 0 || age >= frames * 0.1) continue;
       const lit = e.kind === 'blaster' ? age < EXPLOSION_LIGHT_WINDOW : age < (frames - 1) * 0.1;
       if (!lit) continue;
       const f = Math.floor(age / 0.1);
@@ -2725,37 +1937,26 @@ export class LocalDriver implements HostDriver {
     return out;
   }
 
-  private traceShot(eye: Vec3, far: Vec3): { fraction: number } {
-    const zero = v3();
-    if (this.bspTrace) return this.bspTrace(eye, zero, zero, far);
-    return devroomTrace(eye, zero, zero, far);
-  }
-
-  private pushSpark(pos: Vec3): void {
-    this.pushColoredSpark(pos, 200 + ((this.rand() * 55) | 0));
-  }
-
-  private pushColoredSpark(pos: Vec3, color: number): void {
+  private pushColoredSpark(pos: Vec3, color: number, ttl: number = SPARK_TTL, born?: number): void {
     const parts = this.mini.particles as { origin: Vec3; color: number }[];
     parts.push({ origin: v3(pos[0], pos[1], pos[2]), color });
-    this.particleBorn.push(this.server.time);
+    this.particleBorn.push(born ?? this.server.time);
     this.particleVel.push(null);
-    this.particleTtl.push(SPARK_TTL);
+    this.particleTtl.push(ttl);
     this.capParticles(parts);
   }
 
   /**
    * One ballistic boom spark (cl_fx.c CL_ExplosionParticles): fixed palette
-   * color, random velocity, PARTICLE_GRAVITY falloff, ttl from alphavel
-   * (-0.8/(0.5+rand*0.3) → 0.625-1.0s). Blaster puffs stay static with
-   * SPARK_TTL.
+   * color, server-stepped velocity, PARTICLE_GRAVITY falloff, server-owned
+   * ttl (alphavel -0.8/(0.5+rand*0.3) → 0.625-1.0s).
    */
-  private pushBallisticSpark(pos: Vec3, vel: Vec3, color: number): void {
+  private pushBallisticSpark(pos: Vec3, vel: Vec3, color: number, ttl: number): void {
     const parts = this.mini.particles as { origin: Vec3; color: number }[];
     parts.push({ origin: v3(pos[0], pos[1], pos[2]), color });
     this.particleBorn.push(this.server.time);
     this.particleVel.push(vel);
-    this.particleTtl.push(0.625 + this.rand() * 0.375);
+    this.particleTtl.push(ttl);
     this.capParticles(parts);
   }
 
@@ -2804,36 +2005,6 @@ export class LocalDriver implements HostDriver {
   }
 }
 
-function segmentAabb(
-  origin: Vec3,
-  delta: Vec3,
-  mins: [number, number, number],
-  maxs: [number, number, number],
-): number | null {
-  let tEnter = 0;
-  let tExit = 1;
-  for (let k = 0; k < 3; k++) {
-    const o = origin[k]!;
-    const d = delta[k]!;
-    if (d === 0) {
-      if (o < mins[k]! || o > maxs[k]!) return null;
-      continue;
-    }
-    let t0 = (mins[k]! - o) / d;
-    let t1 = (maxs[k]! - o) / d;
-    if (t0 > t1) {
-      const t = t0;
-      t0 = t1;
-      t1 = t;
-    }
-    if (t0 > tEnter) tEnter = t0;
-    if (t1 < tExit) tExit = t1;
-    if (tEnter > tExit) return null;
-  }
-  if (tEnter > 1 || tExit < 0) return null;
-  return tEnter;
-}
-
 function modelBounds(
   map: BspMap,
   model: string,
@@ -2856,17 +2027,6 @@ function brushModelNum(model: string): number | null {
 }
 
 /** Inclusive AABB overlap of the player box with brush bounds (C G_TouchTriggers). */
-function boxOverlap(
-  o: Vec3,
-  mins: Vec3, maxs: Vec3,
-  bmins: Float32Array, bmaxs: Float32Array,
-): boolean {
-  for (let i = 0; i < 3; i++) {
-    if (o[i]! + mins[i]! > bmaxs[i]! || o[i]! + maxs[i]! < bmins[i]!) return false;
-  }
-  return true;
-}
-
 function buildBase1(pak: WebPak): { map: BspMap; mini: MiniWorld } {
   const bspBytes = readPakEntry(pak, 'maps/base1.bsp');
   const map = loadBsp(bspBytes);

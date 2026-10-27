@@ -15,23 +15,53 @@ import {
   MOVER_TOP,
   MOVER_WAITING,
   SetRespawn,
+  barrelDebrisSpeeds,
+  barrelFuseAt,
+  blasterMuzzle,
+  blasterSpawn,
   doorTravel,
+  explosionBaseframe,
+  explosionFrames,
+  findWeapon,
+  fireWeapon,
+  funcExplosiveDebris,
   monsterChaseMove,
+  monsterFlashOffset,
   monsterLocomotion,
+  monsterPain,
   monsterThink,
   moverThink,
   moverUse,
+  muzzleRadius,
   parseEntities,
   parseFloat,
+  projectSource,
+  radiusDamageAttackerPoints,
+  radiusDamagePoints,
+  radiusDamageRadius,
   respawnDelayFor,
   resetEdictNums,
+  soldierWeaponForSkin,
   spawnButton,
   spawnDoor,
   spawnEdict,
+  spawnExplosive,
   spawnMonster,
   spawnPlat,
   spawnTrigger,
+  targetExplosionFuseAt,
   triggerTouch,
+  BOLT_LIFE,
+  BOLT_SPEED,
+  BLASTER_TRAIL_COLOR,
+  GIB_SOUND,
+  HITSCAN_TRACER_COLOR,
+  SOLDIER_WEAPON_STATS,
+  MZ2_GUNNER_GRENADE_1,
+  MZ2_GUNNER_MACHINEGUN_1,
+  MZ2_SOLDIER_BLASTER_1,
+  MZ2_SOLDIER_MACHINEGUN_1,
+  MZ2_SOLDIER_SHOTGUN_1,
 } from '@q2/game';
 import type {
   AttackChoice,
@@ -49,6 +79,7 @@ import {
 } from '@q2/game';
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
+import { AngleVectors } from '@q2/math';
 import { traceBox } from '@q2/bsp';
 import type { BspMap } from '@q2/bsp';
 
@@ -93,10 +124,44 @@ export interface ServerState {
    * SV_ClipTrace so walls block before detonation and open after.
    */
   brushClips: Map<number, { mins: Float32Array; maxs: Float32Array }>;
+  // --- Phase 0 single sim: server-owned gameplay state --------------------
+  //
+  // The browser used to run a private driver sim alongside the server tick
+  // and rendered only the driver sim, so server fixes never reached the
+  // screen (BRAIN.md §15). Phase 0 inverts this: the server owns barrels,
+  // bolts, explosions + muzzle/tracer/spark/sound events, debris/gibs and
+  // the player health pool. The driver renders from this state and forwards
+  // input via SV_PlayerFire. Drained/consumed by the driver every tick;
+  // SV_Tick prunes the time-lived ones.
+  /** Flying blaster bolts (player + foe edicts: move, wall/flesh touch). */
+  bolts: ServerBolt[];
+  /** Shootable barrels (misc_explobox bottom-origin + func_explosive center). */
+  barrels: ServerBarrel[];
+  /** Live explosion visuals (TE_EXPLOSION1/2, TE_BLASTER touch flashes). */
+  explosions: ServerExplosion[];
+  /** Pending muzzle-flash dlight requests (player + enemy, one-shot). */
+  muzzles: ServerMuzzle[];
+  /** Pending hitscan tracer beams (short muzzle streaks, never eye-ending). */
+  tracers: ServerTracer[];
+  /** Pending particle-burst requests (impacts, trails, booms). */
+  sparks: ServerSpark[];
+  /** Pending positional-sound requests (shots, impacts). */
+  sounds: ServerSound[];
+  /** Thrown debris chunks (barrel/func_explosive, SV_Physics_Toss-lite). */
+  debris: ServerDebris[];
+  /** Gib chunks (minced monsters, MOVETYPE_TOSS-lite). */
+  gibs: ServerGib[];
+  /** Pending 0.2s barrel fuses / target_explosion delays (server time). */
+  fuses: ServerFuse[];
+  /** Scripted explosion targets (target_explosion) by targetname. */
+  explosionTargets: Map<string, { origin: Vec3; dmg: number; delay: number }>;
+  /** Authoritative player health (the driver mirrors it into HUD state). */
+  playerHealth: number;
+  playerMaxHealth: number;
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map() };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100 };
 }
 
 /** Link an edict into the world (SV_LinkEdict: register + solid bookkeeping). */
@@ -393,6 +458,7 @@ export interface ServerMonster {
  */
 export function monsterKindOf(classname: string): MonsterKind | null {
   if (classname === 'monster_soldier' || classname === 'monster_soldier_light') return 'soldier';
+  if (classname === 'monster_soldier_ss') return 'soldier';
   if (classname === 'monster_gunner') return 'gunner';
   return null;
 }
@@ -681,12 +747,30 @@ export function SV_SpawnEntities(
         break;
       }
       case 'misc_explobox': {
-        // SP_misc_explobox thinks M_droptofloor on spawn.
+        // SP_misc_explobox thinks M_droptofloor on spawn. The edict doubles
+        // as the server barrel record (health/dmg from the game tables,
+        // origin = box bottom = hull origin; Phase 0 single sim).
         if (dropTrace) {
           const g = droptofloor(e.origin, EXPLOBOX_MINS, EXPLOBOX_MAXS, dropTrace);
           e.origin[0] = g[0]!;
           e.origin[1] = g[1]!;
           e.origin[2] = g[2]!;
+        }
+        {
+          const ex = spawnExplosive(dict);
+          if (ex) {
+            e.health = ex.health;
+            e.maxHealth = ex.health;
+            e.dmg = ex.dmg;
+            st.barrels.push({
+              edict: e,
+              origin: v3(e.origin[0], e.origin[1], e.origin[2]),
+              size: v3(EXPLOBOX_MAXS[0]! - EXPLOBOX_MINS[0]!, EXPLOBOX_MAXS[1]! - EXPLOBOX_MINS[1]!, EXPLOBOX_MAXS[2]! - EXPLOBOX_MINS[2]!),
+              mass: ex.mass,
+              isFunc: false,
+              fused: false,
+            });
+          }
         }
         break;
       }
@@ -700,6 +784,32 @@ export function SV_SpawnEntities(
         if (modelSizes && model) {
           const bounds = modelSizes(model);
           if (bounds) st.brushClips.set(e.num, { mins: bounds.mins, maxs: bounds.maxs });
+        }
+        // func_explosive is a shootable barrel too (barrel_delay fuse +
+        // T_RadiusDamage + mass-formula debris): record the center + size so
+        // SV_DamageBarrel and the driver render path share one record.
+        if (e.classname === 'func_explosive') {
+          const ex = spawnExplosive(dict);
+          if (ex) {
+            e.health = ex.health;
+            e.maxHealth = ex.health;
+            e.dmg = ex.dmg;
+            const model = dict['model'];
+            const bounds = model && modelSizes ? modelSizes(model) : null;
+            if (bounds) {
+              const cx = (bounds.mins[0]! + bounds.maxs[0]!) / 2;
+              const cy = (bounds.mins[1]! + bounds.maxs[1]!) / 2;
+              const cz = (bounds.mins[2]! + bounds.maxs[2]!) / 2;
+              st.barrels.push({
+                edict: e,
+                origin: v3(cx, cy, cz),
+                size: v3(bounds.maxs[0]! - bounds.mins[0]!, bounds.maxs[1]! - bounds.mins[1]!, bounds.maxs[2]! - bounds.mins[2]!),
+                mass: ex.mass,
+                isFunc: true,
+                fused: false,
+              });
+            }
+          }
         }
         break;
       }
@@ -734,8 +844,21 @@ export function SV_SpawnEntities(
       default:
         break;
     }
-    if (e.classname.startsWith('monster_')) {
-      // id skin assignment (m_soldier.c SP_monster_soldier_*): light troops
+    // Scripted explosion targets (target_explosion, g_target.c
+    // use_target_explosion): recorded by targetname so SV_Tick can fire
+    // them when the relay chain reaches them (Phase 0 single sim — the
+    // driver used to own this table).
+    if (e.classname === 'target_explosion' && e.targetname) {
+      const ex = spawnExplosive(dict);
+      if (ex) {
+        st.explosionTargets.set(e.targetname, {
+          origin: v3(ex.origin[0], ex.origin[1], ex.origin[2]),
+          dmg: ex.dmg,
+          delay: ex.delay,
+        });
+      }
+    }
+    if (e.classname.startsWith('monster_')) {      // id skin assignment (m_soldier.c SP_monster_soldier_*): light troops
       // wear skin 0 (blaster), normals skin 2 (shotgun), supershots skin 4
       // (machinegun). Stashed on the edict so the render lane can pick a
       // distinct skin per kind (selectSoldierAttack keys off the same skins).
@@ -786,10 +909,13 @@ export function SV_SpawnEntities(
   }
   // SP_trigger_always: fire at spawn (starts base1's ships; the exit train's
   // own trigger_always is skill-inhibited in SP, so the train waits for *13).
+  // Explosion targets fire for real too (none in base1, but the path is the
+  // same use_target_explosion fuse the tick runs for relay chains).
   for (const e of out) {
     if (!e.freed && e.classname === 'trigger_always' && e.target) {
       const pseudo: Edict = { ...e };
       fireTargets(st, pseudo);
+      fireExplosionTarget(st, e.target);
     }
   }
   return out;
@@ -965,6 +1091,9 @@ export interface MonsterEvent {
   move: string;
   /** damage-to-player scale at this skill (g_combat.c easy half) */
   dmgScale: number;
+  /** move-frame index that just played (fire-tagged; grenades leave the tube
+   * only on the C frames — the resolver gates on this, like monsterFire). */
+  frame: number;
 }
 
 const POINT_HULL: Vec3 = v3(0, 0, 0);
@@ -1136,6 +1265,7 @@ export function SV_MonsterTick(
       const h = stepHullTrace(trace, s, e);
       return { fraction: h.fraction, endpos: h.endpos };
     });
+    const playedIdx = ms.frame;
     const action = monsterThink(ms);
     if (action === 'fire' && canSee) {
       events.push({
@@ -1144,6 +1274,7 @@ export function SV_MonsterTick(
         attack: dist < 80 ? 'melee' : attackOfMove(m.kind, ms.move),
         move: ms.move,
         dmgScale: skillMultiplier(st.skill),
+        frame: playedIdx,
       });
     }
   }
@@ -1154,8 +1285,15 @@ export function SV_MonsterTick(
  * Advance the world by dt seconds (default SERVER_DT = 0.1, 10Hz).
  * Runs movers and trains to completion legs, records per-mover displacement
  * for rider carrying, respawns due pickups, and clears per-tick diagnostics.
+ *
+ * Phase 0 single sim: `game` carries the live player body + world trace so
+ * the tick also runs the gameplay phase — monster think with C cadence
+ * fire resolution (melee/hitscan/foe-bolt damage, tracers, muzzles,
+ * sounds), bolt flight + touch, barrel fuses, scripted explosions,
+ * debris/gibs and explosion pruning, plus monster door touches. Absent
+ * (headless/unit use), the tick stays movers+trains+respawn only.
  */
-export function SV_Tick(st: ServerState, dt: number = SERVER_DT): void {
+export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTick): void {
   st.firedThisTick = [];
   st.time += dt;
   const now = st.time;
@@ -1218,6 +1356,13 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT): void {
       DoRespawn(e, now);
     }
   }
+  // Scripted corridor blasts (trigger_once/relay chains fire
+  // target_explosion): every firing path pushes the relay targetname into
+  // firedThisTick, so the tick resolves them here — immediate or delayed
+  // via the fuse list (use_target_explosion think at level.time + delay).
+  for (const t of st.firedThisTick) fireExplosionTarget(st, t);
+  // Phase 0 gameplay: monsters, bolts, fuses, debris/gibs, explosions.
+  if (game) SV_GameTick(st, game, dt);
 }
 
 /**
@@ -1258,4 +1403,1050 @@ export function SV_CarryRiders(st: ServerState, bodies: RiderBody[]): void {
     b.origin[1] = b.origin[1]! + d[1]!;
     b.origin[2] = b.origin[2]! + d[2]!;
   }
+}
+// --- Phase 0: single authoritative sim (BRAIN.md §15) -------------------------
+//
+// The browser used to run a private driver sim (PlacedMonster[], barrels,
+// bolts, monsterFire, stepBolts, driver door touch) and rendered only it, so
+// server fixes never reached the screen. This section is the inversion:
+// the server owns ALL gameplay state at 10Hz in SV_Tick — monsters (via the
+// existing SV_MonsterTick path, resolved here with C cadence), barrels
+// (misc_explobox + func_explosive), bolts (player + foe blaster edicts),
+// explosions + muzzle/tracer/spark/sound events (visual feed for the
+// driver), debris/gibs, scripted target_explosions and the player health
+// pool. The driver (apps/web) renders from this state and forwards input
+// via SV_PlayerFire, which owns damage. Pure data + the game tables; no
+// rendering, no DOM.
+
+/** Enemy hitscan tracer streak length (short muzzle streak, never eye-ending). */
+export const SERVER_ENEMY_TRACER_LENGTH = 48;
+/** id pellet spread basis: r/u are world units at this range (fire_lead). */
+export const SV_PELLET_RANGE = 8192;
+/** Static impact-puff lifetime in server seconds (driver spark sweep). */
+export const SV_SPARK_TTL = 0.4;
+/** id PARTICLE_GRAVITY (cl_fx.c ballistic spark falloff). */
+export const SV_SPARK_GRAVITY = 40;
+/** id sv_gravity default for tossed debris/gibs (g_phys.c SV_AddGravity). */
+export const SV_TOSS_GRAVITY = 800;
+
+/** Flying blaster bolt (g_weapon.c fire_blaster / monster_fire_blaster). */
+export interface ServerBolt {
+  pos: Vec3;
+  dir: Vec3; // normalized
+  life: number;
+  damage: number;
+  /** Units/second (1000 player blaster, 600 soldier monster blaster). */
+  speed: number;
+  /** True for monster return fire (damages the player, never its owner). */
+  foe: boolean;
+  /** Server time the bolt was spawned (life expires on server time). */
+  born: number;
+}
+
+/** Shootable explosive (g_misc.c barrel_delay / func_explosive_explode). */
+export interface ServerBarrel {
+  edict: Edict;
+  /**
+   * Damage origin: box bottom for misc_explobox (hull origin), bbox center
+   * for func_explosive (a wall/slab middle). Matches the old driver layout
+   * so radius math and the render base agree.
+   */
+  origin: Vec3;
+  /** Hull size (explobox 32,32,40; brush bbox otherwise). */
+  size: Vec3;
+  /** Debris mass class (400 explobox, 75 func_explosive default). */
+  mass: number;
+  /** True for brush func_explosive (mass-formula debris), else explobox. */
+  isFunc: boolean;
+  /**
+   * Lethal hit latched (takedamage NO + 0.2s fuse, barrel_delay). Further
+   * hits are immune until the fuse blows.
+   */
+  fused: boolean;
+}
+
+/** Explosion visual kind (cl_tent.c TE_ paths). */
+export type ServerExplosionKind = 'explosion1' | 'explosion2' | 'blaster';
+
+/** Live explosion flash (TE_EXPLOSION1/2 big boom, TE_BLASTER touch). */
+export interface ServerExplosion {
+  pos: Vec3;
+  born: number;
+  kind: ServerExplosionKind;
+  baseframe: number;
+  yaw: number;
+}
+
+/** One-shot muzzle-flash dlight request (id CL_MuzzleFlash). */
+export interface ServerMuzzle {
+  pos: Vec3;
+  intensity: number;
+  born: number;
+  foe: boolean;
+}
+
+/** One queued hitscan tracer beam (origin + dir + color + length). */
+export interface ServerTracer {
+  origin: Vec3;
+  dir: Vec3;
+  color: number;
+  length: number;
+  born: number;
+}
+
+/** One queued particle-burst request (impact, trail, boom). */
+export interface ServerSpark {
+  pos: Vec3;
+  color: number;
+  /** Ballistic velocity (boom sparks) or null (static puffs). */
+  vel: Vec3 | null;
+  ttl: number;
+  born: number;
+}
+
+/** One queued positional-sound request (shots, impacts). */
+export interface ServerSound {
+  name: string;
+  pos: Vec3;
+  born: number;
+}
+
+/** Thrown chunk (g_misc.c ThrowDebris: MOVETYPE_BOUNCE, backoff 1.5). */
+export interface ServerDebris {
+  origin: Vec3;
+  vel: Vec3;
+  avel: Vec3;
+  born: number;
+  life: number;
+  kind: 'debris1' | 'debris2' | 'debris3';
+  rest: boolean;
+}
+
+/** Gib chunk (g_misc.c ThrowGib/ThrowHead: MOVETYPE_TOSS, backoff 1.0). */
+export interface ServerGib {
+  origin: Vec3;
+  vel: Vec3;
+  avel: Vec3;
+  born: number;
+  life: number;
+  kind: 'meat' | 'chest' | 'bone' | 'head';
+  rest: boolean;
+}
+
+/** Pending barrel fuse / target_explosion delay (server-time stepped). */
+export interface ServerFuse {
+  pos: Vec3;
+  dmg: number;
+  at: number;
+  barrel?: { edict: Edict; origin: Vec3; size: Vec3; mass: number; dmg: number; isFunc: boolean };
+}
+
+/** Live player body for the gameplay phase (touch, LOS, bolt flesh). */
+export interface SVPlayerBody {
+  pos: Vec3;
+  mins: Vec3;
+  maxs: Vec3;
+  /** Eye height above the origin (22 standing, 12 ducked, pmove.c). */
+  view: number;
+}
+
+/** Gameplay-phase inputs for SV_Tick (absent = movers/trains/respawn only). */
+export interface SVGameTick {
+  player: SVPlayerBody;
+  /** World trace (C-mask via SV_TraceFor; wrap in SV_ClipTrace for clips). */
+  trace: TraceFn;
+  /** Sight trace for visible() (C MASK_OPAQUE, ignores WINDOW/glass). */
+  sightTrace?: TraceFn;
+  /** Monster nav graph; null builds the trivial two-node chase graph. */
+  nav?: MonsterNav | null;
+  /** Caller-seeded RNG (deterministic tests); defaults to Math.random. */
+  rand?: () => number;
+}
+
+const ZERO_HULL: Vec3 = v3(0, 0, 0);
+
+/** Slab segment-vs-AABB (hitscan flesh tests: monsters, barrels, player). */
+function segmentAabbSeg(
+  origin: Vec3,
+  delta: Vec3,
+  mins: Vec3,
+  maxs: Vec3,
+): number | null {
+  let tEnter = 0;
+  let tExit = 1;
+  for (let k = 0; k < 3; k++) {
+    const o = origin[k]!;
+    const d = delta[k]!;
+    if (d === 0) {
+      if (o < mins[k]! || o > maxs[k]!) return null;
+      continue;
+    }
+    let t0 = (mins[k]! - o) / d;
+    let t1 = (maxs[k]! - o) / d;
+    if (t0 > t1) {
+      const t = t0;
+      t0 = t1;
+      t1 = t;
+    }
+    if (t0 > tEnter) tEnter = t0;
+    if (t1 < tExit) tExit = t1;
+    if (tEnter > tExit) return null;
+  }
+  if (tEnter > 1 || tExit < 0) return null;
+  return tEnter;
+}
+
+/** Skinnum stashed on a monster edict (m_soldier.c SP_ funcs). */
+function skinOf(m: ServerMonster): number {
+  const raw = m.edict.extra['skinnum'] ?? '2';
+  const v = Number.parseInt(raw, 10);
+  return Number.isFinite(v) ? v : 2;
+}
+
+/**
+ * Spawn a synthetic monster (test hook + devroom synthetics): creates and
+ * links the edict, maps the classname onto the lite defs (unmapped kinds
+ * stay present but dormant, like the lump path), faces yaw. Seen latches
+ * immediately so synthetic bodies act without an acquire walk.
+ */
+export function SV_SpawnMonster(
+  st: ServerState,
+  classname: string,
+  origin: Vec3,
+  yaw = 0,
+): ServerMonster {
+  const e = spawnEdict({ classname, origin: `${origin[0]} ${origin[1]} ${origin[2]}` });
+  SV_LinkEdict(st, e);
+  const kind = monsterKindOf(classname);
+  // id skin assignment parity with the lump path (m_soldier.c SP_ funcs):
+  // light troops wear skin 0 (blaster), normals skin 2 (shotgun),
+  // supershots skin 4 (machinegun). selectSoldierAttack keys the weapon off
+  // the same skins, so synthetics must carry them too.
+  if (classname === 'monster_soldier_light') e.extra['skinnum'] = '0';
+  else if (classname === 'monster_soldier') e.extra['skinnum'] = '2';
+  else if (classname === 'monster_soldier_ss') e.extra['skinnum'] = '4';
+  const m: ServerMonster = {
+    edict: e,
+    state: kind ? spawnMonster(kind) : spawnMonster('soldier'),
+    kind,
+    ambush: false,
+    triggered: false,
+    seen: true,
+  };
+  m.state.yaw = ((yaw % 360) + 360) % 360;
+  st.monsters.push(m);
+  return m;
+}
+
+/**
+ * Add a synthetic shootable barrel (test hook): links an explobox edict and
+ * records it. Defaults are the id SP_misc_explobox table values.
+ */
+export function SV_AddBarrel(
+  st: ServerState,
+  origin: Vec3,
+  opts?: { health?: number; dmg?: number; mass?: number; size?: Vec3; isFunc?: boolean },
+): ServerBarrel {
+  const e = spawnEdict({ classname: 'misc_explobox', origin: `${origin[0]} ${origin[1]} ${origin[2]}` });
+  e.health = opts?.health ?? 10;
+  e.maxHealth = e.health;
+  e.dmg = opts?.dmg ?? 150;
+  SV_LinkEdict(st, e);
+  const b: ServerBarrel = {
+    edict: e,
+    origin: v3(origin[0], origin[1], origin[2]),
+    size: opts?.size ?? v3(32, 32, 40),
+    mass: opts?.mass ?? 400,
+    isFunc: opts?.isFunc ?? false,
+    fused: false,
+  };
+  st.barrels.push(b);
+  return b;
+}
+
+/** T_Damage on the player pool (g_combat.c easy-half scaling owned here). */
+export function SV_DamagePlayer(st: ServerState, dmg: number): number {
+  if (st.playerHealth <= 0) return 0;
+  const applied = Math.max(1, Math.round(dmg * skillMultiplier(st.skill)));
+  st.playerHealth = Math.max(0, st.playerHealth - applied);
+  return applied;
+}
+
+/** Heal (pickup path writes back through here; clamped to the max pool). */
+export function SV_HealPlayer(st: ServerState, amount: number): number {
+  st.playerHealth = Math.min(st.playerMaxHealth, Math.max(0, st.playerHealth + amount));
+  return st.playerHealth;
+}
+
+/** Set the pool directly (respawn path; clamped to 0..max). */
+export function SV_SetPlayerHealth(st: ServerState, hp: number): number {
+  st.playerHealth = Math.min(st.playerMaxHealth, Math.max(0, hp));
+  return st.playerHealth;
+}
+
+/**
+ * T_Damage on a monster (g_combat.c gib-first ordering via monsterPain).
+ * Gibbing spawns meat/chest/head extras + the udeath sound and marks
+ * DEAD_DEAD (unhittable from then on). Returns the pain result.
+ */
+export function SV_DamageMonster(
+  st: ServerState,
+  m: ServerMonster,
+  damage: number,
+  rand: () => number,
+): 'gib' | 'dead' | 'pain' | 'none' {
+  const res = monsterPain(m.state, damage, rand);
+  if (res === 'gib') {
+    st.sounds.push({ name: GIB_SOUND, pos: v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]), born: st.time });
+    const kinds: ServerGib['kind'][] = ['meat', 'meat', 'meat', 'chest', 'head'];
+    for (const kind of kinds) {
+      const scale = damage < 50 ? 0.7 : 1.2;
+      const vx = Math.max(-300, Math.min(300, 100 * (rand() * 2 - 1) * scale * 0.5));
+      const vy = Math.max(-300, Math.min(300, 100 * (rand() * 2 - 1) * scale * 0.5));
+      const vz = Math.max(200, Math.min(500, (200 + 100 * rand()) * scale * 0.5));
+      st.gibs.push({
+        origin: v3(
+          m.edict.origin[0]! + (rand() * 2 - 1) * 16,
+          m.edict.origin[1]! + (rand() * 2 - 1) * 16,
+          m.edict.origin[2]! + (rand() * 2 - 1) * 16,
+        ),
+        vel: v3(vx, vy, vz),
+        avel: v3(rand() * 600, rand() * 600, rand() * 600),
+        born: st.time,
+        life: 10 + rand() * 10,
+        kind,
+        rest: false,
+      });
+    }
+  }
+  return res;
+}
+
+/**
+ * T_Damage on a barrel (g_misc.c barrel_delay): the first lethal hit frees
+ * the edict (takedamage NO) + arms a 0.2s fuse (think = barrel_explode at
+ * level.time + 2 frames), then the fuse runs T_RadiusDamage + BecomeExplosion.
+ * Chained hits (damageRadius chains) re-enter through the same fuse; hits
+ * during the fuse are immune.
+ */
+export function SV_DamageBarrel(
+  st: ServerState,
+  b: ServerBarrel,
+  dmg: number,
+): boolean {
+  if (b.edict.freed || b.fused) return false;
+  b.edict.health -= dmg;
+  if (b.edict.health > 0) return false;
+  b.fused = true;
+  b.edict.freed = true;
+  st.fuses.push({
+    pos: v3(b.origin[0], b.origin[1], b.origin[2]),
+    dmg: b.edict.dmg,
+    at: barrelFuseAt(st.time),
+    barrel: {
+      edict: b.edict,
+      origin: v3(b.origin[0], b.origin[1], b.origin[2]),
+      size: v3(b.size[0], b.size[1], b.size[2]),
+      mass: b.mass,
+      dmg: b.edict.dmg,
+      isFunc: b.isFunc,
+    },
+  });
+  return true;
+}
+
+/**
+ * Explosion visual + sound + radius damage (TE_EXPLOSION1/2 barrel/func/
+ * target, TE_BLASTER touch flash). Big booms emit the 256-count ballistic
+ * burst (CL_ExplosionParticles) and the explod1 fallback sound; the blaster
+ * flash keeps its 40-spark burst (added by SV_BlasterImpact, not here).
+ * Grounded booms render as explosion2 (BecomeExplosion2), airborne as
+ * explosion1 (BecomeExplosion1). No scorch (Q2 has none).
+ */
+export function SV_SpawnExplosion(
+  st: ServerState,
+  pos: Vec3,
+  dmg: number,
+  opts?: { kind?: ServerExplosionKind; trace?: TraceFn; rand?: () => number },
+): void {
+  const rand = opts?.rand ?? Math.random;
+  let kind = opts?.kind ?? 'explosion1';
+  let baseframe = 0;
+  if (opts?.kind === 'blaster') {
+    baseframe = 0;
+  } else if (opts?.kind === 'explosion2') {
+    kind = 'explosion2';
+    baseframe = 30;
+  } else if (opts?.trace) {
+    const grounded =
+      opts.trace(v3(pos[0], pos[1], pos[2]! + 1), ZERO_HULL, ZERO_HULL, v3(pos[0], pos[1], pos[2]! - 8)).fraction < 1;
+    if (grounded) {
+      kind = 'explosion2';
+      baseframe = 30;
+    } else {
+      baseframe = explosionBaseframe('explosion1', rand);
+    }
+  } else {
+    baseframe = explosionBaseframe('explosion1', rand);
+  }
+  st.explosions.push({
+    pos: v3(pos[0], pos[1], pos[2]),
+    born: st.time,
+    kind,
+    baseframe,
+    yaw: (rand() * 360) | 0,
+  });
+  if (kind === 'blaster') return;
+  for (let i = 0; i < 256; i++) {
+    st.sparks.push({
+      pos: v3(pos[0]! + ((rand() * 32 - 16) | 0), pos[1]! + ((rand() * 32 - 16) | 0), pos[2]! + ((rand() * 32 - 16) | 0)),
+      color: 0xe0 + ((rand() * 8) | 0),
+      vel: v3((rand() * 384 - 192) | 0, (rand() * 384 - 192) | 0, (rand() * 384 - 192) | 0),
+      ttl: 0.625 + rand() * 0.375,
+      born: st.time,
+    });
+  }
+  st.sounds.push({ name: 'world/explod1.wav', pos: v3(pos[0], pos[1], pos[2]), born: st.time });
+  void dmg;
+}
+
+/**
+ * id T_RadiusDamage (g_combat.c): distance is measured from the entity's
+ * bbox CENTER (mins+maxs)/2, points = dmg - 0.5*len, the attacker takes
+ * half, and CanDamage (LOS) must pass or the entity is skipped. Barrels
+ * chain through the 0.2s fuse (SV_DamageBarrel). Corpses keep their skip
+ * (radius never minces — only direct fire does).
+ */
+export function SV_RadiusDamage(
+  st: ServerState,
+  pos: Vec3,
+  dmg: number,
+  player: SVPlayerBody,
+  trace: TraceFn,
+  rand: () => number,
+): void {
+  const radius = radiusDamageRadius(dmg);
+  if (!(radius > 0)) return;
+  const canDamage = (target: Vec3): boolean => trace(pos, ZERO_HULL, ZERO_HULL, target).fraction >= 1;
+  for (const m of st.monsters) {
+    if (m.state.dead || m.state.gibbed) continue;
+    const cx = m.edict.origin[0]! + (MONSTER_HULL_MINS[0]! + MONSTER_HULL_MAXS[0]!) / 2;
+    const cy = m.edict.origin[1]! + (MONSTER_HULL_MINS[1]! + MONSTER_HULL_MAXS[1]!) / 2;
+    const cz = m.edict.origin[2]! + (MONSTER_HULL_MINS[2]! + MONSTER_HULL_MAXS[2]!) / 2;
+    const center = v3(cx, cy, cz);
+    const len = Math.hypot(center[0]! - pos[0]!, center[1]! - pos[1]!, center[2]! - pos[2]!);
+    if (len >= radius) continue;
+    if (!canDamage(center)) continue;
+    SV_DamageMonster(st, m, Math.max(1, Math.round(radiusDamagePoints(dmg, len))), rand);
+  }
+  const pcenter = v3(player.pos[0], player.pos[1], player.pos[2]! + 4);
+  const pd = Math.hypot(pcenter[0]! - pos[0]!, pcenter[1]! - pos[1]!, pcenter[2]! - pos[2]!);
+  if (pd < radius && canDamage(pcenter)) {
+    // The attacker (us, who shot the barrel) takes half damage.
+    SV_DamagePlayer(st, Math.max(1, Math.round(radiusDamageAttackerPoints(radiusDamagePoints(dmg, pd)))));
+  }
+  for (const b of st.barrels) {
+    if (b.edict.freed) continue;
+    const bx = b.isFunc ? b.origin[0]! : b.origin[0]! + b.size[0]! / 2;
+    const by = b.isFunc ? b.origin[1]! : b.origin[1]! + b.size[1]! / 2;
+    const bz = b.isFunc ? b.origin[2]! : b.origin[2]! + b.size[2]! / 2;
+    const bcenter = v3(bx, by, bz);
+    const bd = Math.hypot(bcenter[0]! - pos[0]!, bcenter[1]! - pos[1]!, bcenter[2]! - pos[2]!);
+    if (bd >= radius) continue;
+    if (!canDamage(bcenter)) continue;
+    SV_DamageBarrel(st, b, Math.max(1, Math.round(radiusDamagePoints(dmg, bd))));
+  }
+}
+
+/** TE_BLASTER impact: sparks + explosion flash + lashit + flesh damage. */
+export function SV_BlasterImpact(
+  st: ServerState,
+  pos: Vec3,
+  damage: number,
+  hitMonster: ServerMonster | null,
+  rand: () => number,
+): void {
+  for (let i = 0; i < 40; i++) {
+    st.sparks.push({
+      pos: v3(pos[0]! + ((rand() * 16 - 8) | 0), pos[1]! + ((rand() * 16 - 8) | 0), pos[2]! + ((rand() * 16 - 8) | 0)),
+      color: 0xe0 + ((rand() * 8) | 0),
+      vel: null,
+      ttl: SV_SPARK_TTL,
+      born: st.time,
+    });
+  }
+  SV_SpawnExplosion(st, pos, 0, { kind: 'blaster', rand });
+  st.sounds.push({ name: 'weapons/lashit.wav', pos: v3(pos[0], pos[1], pos[2]), born: st.time });
+  if (hitMonster) SV_DamageMonster(st, hitMonster, damage, rand);
+}
+
+/** Fire one target_explosion: immediate, or delayed via the fuse list. */
+export function fireExplosionTarget(st: ServerState, targetname: string): void {
+  const ex = st.explosionTargets.get(targetname);
+  if (!ex) return;
+  if (ex.delay > 0) {
+    st.fuses.push({ pos: v3(ex.origin[0], ex.origin[1], ex.origin[2]), dmg: ex.dmg, at: targetExplosionFuseAt(st.time, ex.delay) });
+    return;
+  }
+  SV_SpawnExplosion(st, ex.origin, 0);
+}
+
+/**
+ * Debris for one exploded barrel (g_misc.c barrel_explode: 2 big (debris1)
+ * + 4 bottom corners (debris3) + 8 small (debris2)). func_explosive instead
+ * uses its mass class (mass/100 cap 8 big + mass/25 cap 16 small).
+ */
+function spawnBarrelDebris(
+  st: ServerState,
+  b: { origin: Vec3; size: Vec3; mass: number; dmg: number; isFunc: boolean },
+  rand: () => number,
+): void {
+  const pushDebris = (kind: ServerDebris['kind'], origin: Vec3, speed: number): void => {
+    st.debris.push({
+      origin: v3(origin[0], origin[1], origin[2]),
+      vel: v3(
+        100 * (rand() * 2 - 1) * speed,
+        100 * (rand() * 2 - 1) * speed,
+        (100 + 100 * rand()) * speed,
+      ),
+      avel: v3(rand() * 600, rand() * 600, rand() * 600),
+      born: st.time,
+      life: 5 + rand() * 5,
+      kind,
+      rest: false,
+    });
+  };
+  const jitter = (center: Vec3, size: Vec3): Vec3 =>
+    v3(
+      center[0]! + (rand() * 2 - 1) * size[0]!,
+      center[1]! + (rand() * 2 - 1) * size[1]!,
+      center[2]! + (rand() * 2 - 1) * size[2]!,
+    );
+  const center = v3(b.origin[0]! + b.size[0]! / 2, b.origin[1]! + b.size[1]! / 2, b.origin[2]! + b.size[2]! / 2);
+  if (b.isFunc) {
+    const { big, small } = funcExplosiveDebris(b.mass);
+    for (let i = 0; i < big; i++) pushDebris('debris1', jitter(center, b.size), 1);
+    for (let i = 0; i < small; i++) pushDebris('debris2', jitter(center, b.size), 2);
+    return;
+  }
+  const spd = barrelDebrisSpeeds(b.dmg);
+  for (let i = 0; i < 2; i++) pushDebris('debris1', jitter(center, b.size), spd.big);
+  for (let cx = 0; cx < 2; cx++) {
+    for (let cy = 0; cy < 2; cy++) {
+      pushDebris('debris3', v3(b.origin[0]! + cx * b.size[0]!, b.origin[1]! + cy * b.size[1]!, b.origin[2]!), spd.corner);
+    }
+  }
+  for (let i = 0; i < 8; i++) pushDebris('debris2', jitter(center, b.size), spd.small);
+}
+
+/**
+ * Resolve one monster 'fire' frame (m_soldier.c soldier_fire / m_gunner.c
+ * GunnerFire+GunnerGrenade): the soldier weapon is skin-determined (never
+ * random); blaster skins spawn a real foe bolt, shotgun/machinegun skins
+ * draw short yellow muzzle streaks and roll id's pHit, grenades leave the
+ * tube only on the C frames, melee commits at close range through the
+ * attack move. Every shot carries its enemy muzzle dlight.
+ */
+function resolveMonsterFire(
+  st: ServerState,
+  m: ServerMonster,
+  ev: MonsterEvent,
+  player: SVPlayerBody,
+  rand: () => number,
+): void {
+  if (st.playerHealth <= 0) return;
+  const eye = v3(player.pos[0], player.pos[1], player.pos[2]! + player.view);
+  const dx = eye[0]! - m.edict.origin[0]!;
+  const dy = eye[1]! - m.edict.origin[1]!;
+  const dz = eye[2]! - m.edict.origin[2]!;
+  const dist = Math.hypot(dx, dy, dz);
+  if (dist > 1000) return;
+  const fwd = v3();
+  const right = v3();
+  const up = v3();
+  AngleVectors(v3(0, m.state.yaw, 0), fwd, right, up);
+  const move = ev.move;
+  const skinWeapon = m.kind === 'soldier' ? soldierWeaponForSkin(skinOf(m)) : null;
+  let flashId = MZ2_SOLDIER_SHOTGUN_1;
+  if (m.kind === 'soldier') {
+    if (skinWeapon === 'blaster') flashId = MZ2_SOLDIER_BLASTER_1;
+    else if (skinWeapon === 'machinegun') flashId = MZ2_SOLDIER_MACHINEGUN_1 + (ev.frame % 2);
+    else flashId = MZ2_SOLDIER_SHOTGUN_1;
+  } else if (move === 'attack_grenade') flashId = MZ2_GUNNER_GRENADE_1 + (ev.frame % 4);
+  else if (m.kind === 'gunner') flashId = MZ2_GUNNER_MACHINEGUN_1 + (ev.frame % 8);
+  const muzzle = projectSource(
+    v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]),
+    monsterFlashOffset(flashId),
+    fwd,
+    right,
+  );
+  const flashIdx = st.muzzles.length;
+  st.muzzles.push({ pos: muzzle, intensity: 200 + ((rand() * 32) | 0), born: st.time, foe: true });
+  const dirToEye = v3(eye[0]! - muzzle[0]!, eye[1]! - muzzle[1]!, eye[2]! - muzzle[2]!);
+  const dirLen = Math.hypot(dirToEye[0]!, dirToEye[1]!, dirToEye[2]!) || 1;
+  const chest = v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]! + 32);
+  // Soldier blaster skin: a real projectile, not a damage roll.
+  if (skinWeapon === 'blaster') {
+    st.bolts.push({
+      pos: v3(muzzle[0], muzzle[1], muzzle[2]),
+      dir: v3(dirToEye[0]! / dirLen, dirToEye[1]! / dirLen, dirToEye[2]! / dirLen),
+      life: 2,
+      damage: SOLDIER_WEAPON_STATS.blaster.damage,
+      speed: SOLDIER_WEAPON_STATS.blaster.boltSpeed,
+      foe: true,
+      born: st.time,
+    });
+    st.sounds.push({ name: SOLDIER_WEAPON_STATS.blaster.sound, pos: chest, born: st.time });
+    return;
+  }
+  // Grenades leave the tube only on their C frames (105/108/111/114).
+  if (move === 'attack_grenade' && ev.frame !== 4 && ev.frame !== 7 && ev.frame !== 10 && ev.frame !== 13) {
+    st.muzzles.splice(flashIdx, 1);
+    return;
+  }
+  // Melee commits at close range through the attack move.
+  if (dist < 96 && (move === 'attack1' || move === 'attack_chain')) {
+    SV_DamagePlayer(st, m.kind === 'gunner' ? 15 : 10);
+    st.sounds.push({ name: 'monster/melee.wav', pos: chest, born: st.time });
+    return;
+  }
+  const pHit = dist < 500 ? 0.6 : 0.25;
+  // Soldier machinegun skin: 3-round burst (id monster_fire_bullet dmg 2 ×
+  // the HOLD_FRAME repeat), fanned ±40u at 8192 like the pellet spread
+  // basis; each round rolls pHit independently and draws its own SHORT
+  // muzzle streak (never a muzzle→eye beam).
+  if (skinWeapon === 'machinegun') {
+    for (let bb = -1; bb <= 1; bb++) {
+      const fan = v3(dirToEye[0]! + bb * 40, dirToEye[1]! - bb * 40, dirToEye[2]!);
+      st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: fan, color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
+      if (rand() < pHit) {
+        SV_DamagePlayer(st, SOLDIER_WEAPON_STATS.machinegun.damage);
+        st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
+      }
+    }
+    st.sounds.push({ name: SOLDIER_WEAPON_STATS.machinegun.sound, pos: chest, born: st.time });
+    return;
+  }
+  let dmg = SOLDIER_WEAPON_STATS.shotgun.damage;
+  let sound = SOLDIER_WEAPON_STATS.shotgun.sound;
+  if (m.kind === 'gunner') {
+    dmg = move === 'attack_grenade' ? 12 : 6;
+    sound = move === 'attack_grenade' ? 'gunner/gunatck3.wav' : 'gunner/gunatck2.wav';
+  }
+  st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
+  st.sounds.push({ name: sound, pos: chest, born: st.time });
+  if (rand() < pHit) {
+    SV_DamagePlayer(st, dmg);
+    st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
+  }
+}
+
+/**
+ * Step flying blaster bolts. Life expires on SERVER time (G_FreeEdict at
+ * level.time + 2); movement integrates the tick quantum. Foe bolts test the
+ * player box and damage the player; player bolts test monsters first, then
+ * barrels. Gibbed monsters are skipped, but corpses are NOT (takedamage YES
+ * — re-hit minces via SV_DamageMonster).
+ */
+function stepBoltFlight(
+  st: ServerState,
+  player: SVPlayerBody,
+  trace: TraceFn,
+  rand: () => number,
+  dt: number,
+): void {
+  if (st.bolts.length === 0) return;
+  for (let i = st.bolts.length - 1; i >= 0; i--) {
+    const bolt = st.bolts[i]!;
+    const stepLen = bolt.speed * dt;
+    const next = v3(
+      bolt.pos[0]! + bolt.dir[0]! * stepLen,
+      bolt.pos[1]! + bolt.dir[1]! * stepLen,
+      bolt.pos[2]! + bolt.dir[2]! * stepLen,
+    );
+    // EF_BLASTER trail (cl_fx.c CL_BlasterTrail): yellow puffs every ~5u.
+    const trailSteps = Math.min(8, Math.max(1, Math.round(stepLen / 5)));
+    for (let k = 1; k <= trailSteps; k++) {
+      const f = k / (trailSteps + 1);
+      st.sparks.push({
+        pos: v3(
+          bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * f,
+          bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * f,
+          bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * f,
+        ),
+        color: BLASTER_TRAIL_COLOR,
+        vel: null,
+        ttl: SV_SPARK_TTL,
+        born: st.time,
+      });
+    }
+    let dead = st.time - bolt.born >= bolt.life;
+    if (!dead) {
+      // Wall touch (blaster_touch: sky frees silently, wall explodes).
+      // TODO(sky): the trace carries no SURF_SKY flag, so sky hits explode
+      // here; free the bolt silently once the trace carries the surface flag.
+      const wall = trace(bolt.pos, ZERO_HULL, ZERO_HULL, next);
+      if (wall.fraction < 1) {
+        const hitPos = v3(
+          bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * wall.fraction,
+          bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * wall.fraction,
+          bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * wall.fraction,
+        );
+        SV_BlasterImpact(st, hitPos, bolt.damage, null, rand);
+        dead = true;
+      } else if (bolt.foe) {
+        // Soldier return fire: test the player box.
+        const seg = v3(next[0]! - bolt.pos[0]!, next[1]! - bolt.pos[1]!, next[2]! - bolt.pos[2]!);
+        const pmins = v3(player.pos[0]! + player.mins[0]!, player.pos[1]! + player.mins[1]!, player.pos[2]! + player.mins[2]!);
+        const pmaxs = v3(player.pos[0]! + player.maxs[0]!, player.pos[1]! + player.maxs[1]!, player.pos[2]! + player.maxs[2]!);
+        const tHit = segmentAabbSeg(bolt.pos, seg, pmins, pmaxs);
+        if (tHit !== null) {
+          const hitPos = v3(bolt.pos[0]! + seg[0]! * tHit, bolt.pos[1]! + seg[1]! * tHit, bolt.pos[2]! + seg[2]! * tHit);
+          SV_BlasterImpact(st, hitPos, bolt.damage, null, rand);
+          if (st.playerHealth > 0) {
+            SV_DamagePlayer(st, bolt.damage);
+            st.sparks.push({
+              pos: v3(player.pos[0], player.pos[1], player.pos[2]! + player.view),
+              color: 200 + ((rand() * 55) | 0),
+              vel: null,
+              ttl: SV_SPARK_TTL,
+              born: st.time,
+            });
+          }
+          dead = true;
+        }
+      } else {
+        // Flesh touch: monsters first (T_Damage ENERGY), then barrels.
+        const seg = v3(next[0]! - bolt.pos[0]!, next[1]! - bolt.pos[1]!, next[2]! - bolt.pos[2]!);
+        let hitMonster: ServerMonster | null = null;
+        let bestT = 1;
+        for (const m of st.monsters) {
+          if (m.state.gibbed) continue;
+          const tHit = segmentAabbSeg(
+            bolt.pos, seg,
+            v3(m.edict.origin[0]! + MONSTER_HULL_MINS[0]!, m.edict.origin[1]! + MONSTER_HULL_MINS[1]!, m.edict.origin[2]! + MONSTER_HULL_MINS[2]!),
+            v3(m.edict.origin[0]! + MONSTER_HULL_MAXS[0]!, m.edict.origin[1]! + MONSTER_HULL_MAXS[1]!, m.edict.origin[2]! + MONSTER_HULL_MAXS[2]!),
+          );
+          if (tHit !== null && tHit < bestT) {
+            bestT = tHit;
+            hitMonster = m;
+          }
+        }
+        if (hitMonster) {
+          const hitPos = v3(
+            bolt.pos[0]! + seg[0]! * bestT,
+            bolt.pos[1]! + seg[1]! * bestT,
+            bolt.pos[2]! + seg[2]! * bestT,
+          );
+          SV_BlasterImpact(st, hitPos, bolt.damage, hitMonster, rand);
+          dead = true;
+        } else {
+          let hb: ServerBarrel | null = null;
+          let bt = 1;
+          for (const b of st.barrels) {
+            if (b.edict.freed) continue;
+            const tHit = b.isFunc
+              ? segmentAabbSeg(bolt.pos, seg, v3(b.origin[0]! - b.size[0]! / 2, b.origin[1]! - b.size[1]! / 2, b.origin[2]! - b.size[2]! / 2), v3(b.origin[0]! + b.size[0]! / 2, b.origin[1]! + b.size[1]! / 2, b.origin[2]! + b.size[2]! / 2))
+              : segmentAabbSeg(bolt.pos, seg, v3(b.origin[0]! + EXPLOBOX_MINS[0]!, b.origin[1]! + EXPLOBOX_MINS[1]!, b.origin[2]! + EXPLOBOX_MINS[2]!), v3(b.origin[0]! + EXPLOBOX_MAXS[0]!, b.origin[1]! + EXPLOBOX_MAXS[1]!, b.origin[2] + EXPLOBOX_MAXS[2]!));
+            if (tHit !== null && tHit < bt) {
+              bt = tHit;
+              hb = b;
+            }
+          }
+          if (hb && !hb.edict.freed) {
+            SV_DamageBarrel(st, hb, bolt.damage);
+            SV_BlasterImpact(st, v3(hb.origin[0], hb.origin[1], hb.origin[2]), bolt.damage, null, rand);
+            dead = true;
+          }
+        }
+      }
+    }
+    if (dead) st.bolts.splice(i, 1);
+    else bolt.pos = next;
+  }
+}
+
+/**
+ * Step debris + gibs (g_phys.c SV_Physics_Toss-lite): gravity, point-trace
+ * move, ClipVelocity backoff (1.5 bounce debris / 1.0 toss gibs), floor rest
+ * when vz < 60 and the plane normal is floor-like (> 0.7), life expiry
+ * (5+rand*5 debris, 10+rand*10 gibs).
+ */
+function stepChunks(
+  st: ServerState,
+  items: Array<ServerDebris | ServerGib>,
+  trace: TraceFn,
+  dt: number,
+  backoff: number,
+): void {
+  for (let i = items.length - 1; i >= 0; i--) {
+    const c = items[i]!;
+    if (st.time - c.born >= c.life) {
+      items.splice(i, 1);
+      continue;
+    }
+    if (c.rest) continue;
+    c.vel[2] = c.vel[2]! - SV_TOSS_GRAVITY * dt;
+    const next = v3(
+      c.origin[0]! + c.vel[0]! * dt,
+      c.origin[1]! + c.vel[1]! * dt,
+      c.origin[2]! + c.vel[2]! * dt,
+    );
+    const hit = trace(c.origin, ZERO_HULL, ZERO_HULL, next);
+    if (hit.fraction >= 1) {
+      c.origin = next;
+      continue;
+    }
+    c.origin = v3(
+      c.origin[0]! + (next[0]! - c.origin[0]!) * hit.fraction,
+      c.origin[1]! + (next[1]! - c.origin[1]!) * hit.fraction,
+      c.origin[2]! + (next[2]! - c.origin[2]!) * hit.fraction,
+    );
+    const n = hit.planeNormal ?? v3(0, 0, 1);
+    const d = (c.vel[0]! * n[0]! + c.vel[1]! * n[1]! + c.vel[2]! * n[2]!) * backoff;
+    c.vel = v3(c.vel[0]! - n[0]! * d, c.vel[1]! - n[1]! * d, c.vel[2]! - n[2]! * d);
+    if (n[2]! > 0.7 && (backoff < 1.5 || c.vel[2]! < 60)) {
+      c.vel = v3();
+      c.rest = true;
+    }
+  }
+}
+
+/**
+ * Phase 0 gameplay phase of SV_Tick: monster think with C cadence fire
+ * resolution, monster door touches, bolt flight + touch, barrel fuses,
+ * debris/gibs and explosion pruning (all at 10Hz on server time).
+ */
+function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
+  const rand = game.rand ?? Math.random;
+  // Monsters use doors (Touch_DoorTrigger; NOMONSTER sliders ignore them).
+  for (const m of st.monsters) {
+    if (m.state.dead || m.state.gibbed || m.triggered || m.kind === null) continue;
+    SV_TouchDoorsAt(st, { origin: m.edict.origin, mins: MONSTER_HULL_MINS, maxs: MONSTER_HULL_MAXS }, 'monster');
+  }
+  // Think + C-cadence return fire (damage, bolts, tracers, muzzles, sounds).
+  const sightTrace = game.sightTrace ?? game.trace;
+  for (const ev of SV_MonsterTick(st, game.player.pos, game.trace, game.nav ?? null, rand, { sightTrace, playerViewheight: game.player.view })) {
+    const m = st.monsters.find((mm) => mm.edict.num === ev.num);
+    if (!m) continue;
+    resolveMonsterFire(st, m, ev, game.player, rand);
+  }
+  // Bolts fly and touch.
+  stepBoltFlight(st, game.player, game.trace, rand, dt);
+  // Barrel fuses / target_explosion delays blow on server time.
+  for (let i = st.fuses.length - 1; i >= 0; i--) {
+    const f = st.fuses[i]!;
+    if (st.time < f.at) continue;
+    st.fuses.splice(i, 1);
+    if (f.barrel) {
+      spawnBarrelDebris(st, f.barrel, rand);
+      // The brush is gone (func_explosive_explode / BecomeExplosion free the
+      // edict either way): open the clip so the hole stays open.
+      if (f.barrel.isFunc) SV_RemoveBrushClip(st, f.barrel.edict);
+    }
+    SV_SpawnExplosion(st, f.pos, f.dmg, { trace: game.trace, rand });
+    SV_RadiusDamage(st, f.pos, f.dmg, game.player, game.trace, rand);
+  }
+  // Tossed chunks fall and rest; visuals live their full frame life.
+  stepChunks(st, st.debris, game.trace, dt, 1.5);
+  stepChunks(st, st.gibs, game.trace, dt, 1.0);
+  for (let i = st.explosions.length - 1; i >= 0; i--) {
+    const e = st.explosions[i]!;
+    const frames = explosionFrames(e.kind);
+    if (st.time - e.born >= frames * 0.1) st.explosions.splice(i, 1);
+  }
+  // Safety prune: undrained one-shot queues never grow across frames.
+  const wipe = (q: Array<{ born: number }>): void => {
+    for (let i = q.length - 1; i >= 0; i--) {
+      if (st.time - q[i]!.born > 5) q.splice(i, 1);
+    }
+  };
+  wipe(st.muzzles);
+  wipe(st.tracers);
+  wipe(st.sparks);
+  wipe(st.sounds);
+}
+
+/** Drain the pending muzzle flashes (one-shot dlight pump). */
+export function SV_DrainMuzzles(st: ServerState): ServerMuzzle[] {
+  if (st.muzzles.length === 0) return [];
+  const out = st.muzzles.slice();
+  st.muzzles.length = 0;
+  return out;
+}
+
+/** Drain the pending tracer beams (short muzzle streaks). */
+export function SV_DrainTracers(st: ServerState): ServerTracer[] {
+  if (st.tracers.length === 0) return [];
+  const out = st.tracers.slice();
+  st.tracers.length = 0;
+  return out;
+}
+
+/** Drain the pending particle-burst requests (impacts, trails, booms). */
+export function SV_DrainSparks(st: ServerState): ServerSpark[] {
+  if (st.sparks.length === 0) return [];
+  const out = st.sparks.slice();
+  st.sparks.length = 0;
+  return out;
+}
+
+/** Drain the pending positional-sound requests. */
+export function SV_DrainSounds(st: ServerState): ServerSound[] {
+  if (st.sounds.length === 0) return [];
+  const out = st.sounds.slice();
+  st.sounds.length = 0;
+  return out;
+}
+
+/** Player fire inputs (computed by the driver from its input state). */
+export interface SVFireOpts {
+  eye: Vec3;
+  feet: Vec3;
+  angles: Vec3;
+  /** Standing eye height (22; the bolt spawn offset keys off it). */
+  viewheight: number;
+  /** Current reserve for the weapon's ammo kind (ignored for blaster). */
+  ammo: number;
+  /** World trace (C-mask via SV_TraceFor; wrap in SV_ClipTrace for clips). */
+  trace: TraceFn;
+  /** Caller-seeded RNG (spread, muzzle radius, gibs). */
+  rand: () => number;
+}
+
+/** Player fire outcome (ammo sync for the driver's HUD state). */
+export interface SVFireResult {
+  fired: boolean;
+  reason: string;
+  ammoLeft: number;
+  /** True when a player bolt was spawned (authentic fire_blaster). */
+  bolt: boolean;
+}
+
+/**
+ * SV_PlayerFire: the driver computes the shot (eye/feet/angles from input)
+ * but the server applies it — ammo, muzzle dlight, foe/player bolts,
+ * hitscan pellet traces vs wall/monsters/barrels, pain/gib/barrel damage,
+ * impact sparks and sounds. Returns the ammo sync for the driver.
+ *
+ * Authentic split (g_weapon.c): the blaster is a PROJECTILE weapon
+ * (fire_blaster bolt edict, 1000 u/s, 2s life, EF_BLASTER trail) — never
+ * hitscan, never a muzzle->impact beam. Hitscan weapons (shotgun /
+ * machinegun, fire_lead) are instant traces with impact sparks only.
+ */
+export function SV_PlayerFire(
+  st: ServerState,
+  weaponKind: string,
+  opts: SVFireOpts,
+): SVFireResult {
+  const def = findWeapon(weaponKind);
+  if (!def) return { fired: false, reason: 'no weapon', ammoLeft: opts.ammo, bolt: false };
+  const res = fireWeapon(def, opts.ammo, opts.rand, false);
+  if (!res.fired) {
+    st.sounds.push({ name: 'weapons/noammo.wav', pos: v3(opts.eye[0], opts.eye[1], opts.eye[2]), born: st.time });
+    return { fired: false, reason: res.reason, ammoLeft: res.ammoLeft, bolt: false };
+  }
+  const fwd = v3();
+  const right = v3();
+  const up = v3();
+  AngleVectors(opts.angles, fwd, right, up);
+  st.sounds.push({
+    name:
+      weaponKind === 'weapon_shotgun'
+        ? 'weapons/shotgf1b.wav'
+        : weaponKind === 'weapon_machinegun'
+          ? 'weapons/machgf1b.wav'
+          : 'weapons/blastf1a.wav',
+    pos: v3(opts.eye[0], opts.eye[1], opts.eye[2]),
+    born: st.time,
+  });
+  // Muzzle flash: HUD glow + a real dlight (id CL_MuzzleFlash: origin =
+  // feet + fwd*18 + right*16, radius 200+(rand&31), pure yellow).
+  st.muzzles.push({
+    pos: blasterMuzzle(opts.feet, fwd, right),
+    intensity: muzzleRadius(opts.rand),
+    born: st.time,
+    foe: false,
+  });
+  // Authentic blaster: G_ProjectSource from the feet (start = feet +
+  // fwd*24 + right*8, z += viewheight-8). The bolt leaves the gun muzzle.
+  if (weaponKind === 'weapon_blaster' && res.bolt) {
+    const start = blasterSpawn(opts.feet, fwd, right, opts.viewheight);
+    const dl = Math.hypot(fwd[0]!, fwd[1]!, fwd[2]!) || 1;
+    st.bolts.push({
+      pos: start,
+      dir: v3(fwd[0]! / dl, fwd[1]! / dl, fwd[2]! / dl),
+      life: res.bolt.life,
+      damage: res.bolt.damage,
+      speed: BOLT_SPEED,
+      foe: false,
+      born: st.time,
+    });
+    return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: true };
+  }
+  for (const pl of res.pellets) {
+    const dir = v3(
+      fwd[0]! * SV_PELLET_RANGE + right[0]! * pl.r + up[0]! * pl.u,
+      fwd[1]! * SV_PELLET_RANGE + right[1]! * pl.r + up[1]! * pl.u,
+      fwd[2]! * SV_PELLET_RANGE + right[2]! * pl.r + up[2]! * pl.u,
+    );
+    const len = Math.hypot(dir[0]!, dir[1]!, dir[2]!) || 1;
+    const far = v3(
+      opts.eye[0]! + ((dir[0]! / len) * SV_PELLET_RANGE),
+      opts.eye[1]! + ((dir[1]! / len) * SV_PELLET_RANGE),
+      opts.eye[2]! + ((dir[2]! / len) * SV_PELLET_RANGE),
+    );
+    const wall = opts.trace(opts.eye, ZERO_HULL, ZERO_HULL, far);
+    let bestT = wall.fraction;
+    let hitMonster: ServerMonster | null = null;
+    const seg = v3(far[0]! - opts.eye[0]!, far[1]! - opts.eye[1]!, far[2]! - opts.eye[2]!);
+    for (const m of st.monsters) {
+      if (m.state.gibbed) continue;
+      // No dead-skip: corpses stay hittable (takedamage YES) so re-hitting
+      // them minces (g_combat.c T_Damage gib-first ordering).
+      const tHit = segmentAabbSeg(
+        opts.eye, seg,
+        v3(m.edict.origin[0]! + MONSTER_HULL_MINS[0]!, m.edict.origin[1]! + MONSTER_HULL_MINS[1]!, m.edict.origin[2]! + MONSTER_HULL_MINS[2]!),
+        v3(m.edict.origin[0]! + MONSTER_HULL_MAXS[0]!, m.edict.origin[1]! + MONSTER_HULL_MAXS[1]!, m.edict.origin[2]! + MONSTER_HULL_MAXS[2]!),
+      );
+      if (tHit !== null && tHit < bestT) {
+        bestT = tHit;
+        hitMonster = m;
+      }
+    }
+    const hitPos = v3(
+      opts.eye[0]! + seg[0]! * bestT,
+      opts.eye[1]! + seg[1]! * bestT,
+      opts.eye[2]! + seg[2]! * bestT,
+    );
+    // Barrels are shootable (misc_explobox takes T_Damage): test the shot
+    // path against live barrels before resolving the wall/monster hit.
+    let hitBarrel: ServerBarrel | null = null;
+    let barrelT = bestT;
+    for (const b of st.barrels) {
+      if (b.edict.freed) continue;
+      const tHit = b.isFunc
+        ? segmentAabbSeg(opts.eye, seg, v3(b.origin[0]! - b.size[0]! / 2, b.origin[1]! - b.size[1]! / 2, b.origin[2]! - b.size[2]! / 2), v3(b.origin[0]! + b.size[0]! / 2, b.origin[1]! + b.size[1]! / 2, b.origin[2]! + b.size[2]! / 2))
+        : segmentAabbSeg(opts.eye, seg, v3(b.origin[0]! + EXPLOBOX_MINS[0]!, b.origin[1]! + EXPLOBOX_MINS[1]!, b.origin[2]! + EXPLOBOX_MINS[2]!), v3(b.origin[0]! + EXPLOBOX_MAXS[0]!, b.origin[1]! + EXPLOBOX_MAXS[1]!, b.origin[2]! + EXPLOBOX_MAXS[2]!));
+      if (tHit !== null && tHit < barrelT) {
+        barrelT = tHit;
+        hitBarrel = b;
+      }
+    }
+    if (hitBarrel && !hitBarrel.edict.freed) {
+      SV_DamageBarrel(st, hitBarrel, pl.damage);
+    } else if (hitMonster) {
+      SV_DamageMonster(st, hitMonster, pl.damage, opts.rand);
+    } else if (bestT < 1) {
+      // TE_GUNSHOT / TE_SHOTGUN impact: gray sparks + smoke, no beam.
+      st.sparks.push({
+        pos: hitPos,
+        color: 200 + ((opts.rand() * 55) | 0),
+        vel: null,
+        ttl: SV_SPARK_TTL,
+        born: st.time,
+      });
+    }
+  }
+  return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: false };
 }

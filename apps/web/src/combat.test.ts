@@ -1,6 +1,7 @@
 import { describe, expect, it, afterEach } from 'vitest';
 import { resetCVars } from '@q2/config';
-import { isGreenBoltColor, soldierWeaponForSkin, spawnMonster } from '@q2/game';
+import { isGreenBoltColor, soldierWeaponForSkin } from '@q2/game';
+import { SV_SpawnMonster } from '@q2/server';
 import type { UserCmdT } from '@q2/input';
 import { v3 } from '@q2/math';
 import { bootPlay, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
@@ -33,7 +34,7 @@ describe('hitscan tracer color (no green lasers)', () => {
   it('shotgun-skin return fire queues yellow tracers only, never bolts', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
-    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), skin: 2, lastAttack: -10 });
+    SV_SpawnMonster(driver.server, 'monster_soldier', v3(32, 100, 24));
     let sawTracer = false;
     for (let i = 0; i < 120 && !sawTracer; i++) {
       driver.step(neutralCmd(), 0.1);
@@ -55,7 +56,7 @@ describe('hitscan tracer color (no green lasers)', () => {
   it('light-skin soldiers fire foe blaster bolts, never hitscan tracers', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
-    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), skin: 0, lastAttack: -10 });
+    SV_SpawnMonster(driver.server, 'monster_soldier_light', v3(32, 100, 24));
     let sawBolt = false;
     for (let i = 0; i < 120 && !sawBolt; i++) {
       driver.step(neutralCmd(), 0.1);
@@ -75,7 +76,7 @@ describe('hitscan tracer color (no green lasers)', () => {
     for (const skin of [2, 4]) {
       const boot = bootPlay({ width: 64, height: 48 });
       const { driver } = boot;
-      driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), skin, lastAttack: -10 });
+      SV_SpawnMonster(driver.server, skin <= 1 ? 'monster_soldier_light' : skin <= 3 ? 'monster_soldier' : 'monster_soldier_ss', v3(32, 100, 24));
       let beams = 0;
       for (let i = 0; i < 200 && beams === 0; i++) {
         driver.step(neutralCmd(), 0.1);
@@ -114,7 +115,7 @@ describe('hitscan tracer color (no green lasers)', () => {
     // Gunner chain fire obeys the same cap.
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
-    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('gunner'), skin: 0, lastAttack: -10 });
+    SV_SpawnMonster(driver.server, 'monster_gunner', v3(32, 100, 24));
     let gbeams = 0;
     for (let i = 0; i < 200 && gbeams === 0; i++) {
       driver.step(neutralCmd(), 0.1);
@@ -132,7 +133,7 @@ describe('hitscan tracer color (no green lasers)', () => {
   it('machinegun-skin soldiers burst yellow tracers with the ss attack sound', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
-    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), skin: 4, lastAttack: -10 });
+    SV_SpawnMonster(driver.server, 'monster_soldier_ss', v3(32, 100, 24));
     let sawBurst = false;
     for (let i = 0; i < 200 && !sawBurst; i++) {
       driver.step(neutralCmd(), 0.1);
@@ -180,15 +181,15 @@ describe.runIf(!!WEB_Q2_PAK)('per-skin soldier rendering (real pak, Q2_PAK)', ()
     expect(models.monster).toBe(0);
     expect(models.skins[0]).toBe(0);
     // base1 ships 6 lights + 8 plains, and the raised cap keeps all 14.
-    expect(driver.monsters.filter((m) => m.skin === 0).length).toBe(6);
-    expect(driver.monsters.filter((m) => m.skin === 2).length).toBe(8);
-    const light = driver.monsters.find((m) => m.skin === 0)!;
-    const plain = driver.monsters.find((m) => m.skin === 2)!;
-    expect(driver.entityModel(light.id)).toEqual({ model: models.monster, skin: models.soldierLightSkin });
-    expect(driver.entityModel(plain.id)).toEqual({ model: models.monster, skin: models.monsterSkin });
+    expect(driver.monsters.filter((m) => m.edict.extra['skinnum'] === '0').length).toBe(6);
+    expect(driver.monsters.filter((m) => m.edict.extra['skinnum'] === '2').length).toBe(8);
+    const light = driver.monsters.find((m) => m.edict.extra['skinnum'] === '0')!;
+    const plain = driver.monsters.find((m) => m.edict.extra['skinnum'] === '2')!;
+    expect(driver.entityModel(light.edict.num)).toEqual({ model: models.monster, skin: models.soldierLightSkin });
+    expect(driver.entityModel(plain.edict.num)).toEqual({ model: models.monster, skin: models.monsterSkin });
     // Synthetic ss (no base1 ss): distinct machinegun skin, same mesh.
-    driver.monsters.push({ id: 999, origin: [0, 0, 32], state: spawnMonster('soldier'), skin: 4, lastAttack: -10 });
-    expect(driver.entityModel(999)).toEqual({ model: models.monster, skin: models.soldierSsSkin });
+    const ss = SV_SpawnMonster(driver.server, 'monster_soldier_ss', v3(0, 0, 32));
+    expect(driver.entityModel(ss.edict.num)).toEqual({ model: models.monster, skin: models.soldierSsSkin });
     // Odd pain skins fall back to their even base.
     expect(driver.soldierSkinFor(1)).toBe(models.soldierLightSkin);
     expect(driver.soldierSkinFor(5)).toBe(models.soldierSsSkin);
@@ -198,14 +199,14 @@ describe.runIf(!!WEB_Q2_PAK)('per-skin soldier rendering (real pak, Q2_PAK)', ()
   it('monsters render with their per-skin handles (light ≠ shotgun)', { timeout: 180000 }, async () => {
     const boot = await bootPak();
     const { driver, host } = boot;
-    const light = driver.monsters.find((m) => m.skin === 0)!;
-    const plain = driver.monsters.find((m) => m.skin === 2)!;
+    const light = driver.monsters.find((m) => m.edict.extra['skinnum'] === '0')!;
+    const plain = driver.monsters.find((m) => m.edict.extra['skinnum'] === '2')!;
     expect(light).toBeDefined();
     expect(plain).toBeDefined();
     // Exercise the snapshot→Host path (frames + origins flow as before).
     const snap = driver.snapshot(driver.server.time);
-    expect(snap.entities.some((e) => e.id === light.id)).toBe(true);
-    expect(snap.entities.some((e) => e.id === plain.id)).toBe(true);
+    expect(snap.entities.some((e) => e.id === light.edict.num)).toBe(true);
+    expect(snap.entities.some((e) => e.id === plain.edict.num)).toBe(true);
     const stats = host.frame(100);
     expect(stats.pixels).toBeGreaterThan(0);
   });

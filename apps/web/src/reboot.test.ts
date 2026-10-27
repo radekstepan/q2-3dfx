@@ -230,7 +230,7 @@ describe.runIf(!!WEB_Q2_PAK)('menu reboot on base1 (real pak, Q2_PAK)', () => {
     const demo = rebootPlay(game);
     expect(demo.source).toBe('devroom');
     expect(demo.pak).toBeNull();
-    expect(demo.driver.monsters.length).toBe(0);
+    expect(demo.driver.server.monsters.length).toBe(0);
     const stats = demo.host.frame(100);
     expect(stats.pixels).toBeGreaterThan(0);
   });

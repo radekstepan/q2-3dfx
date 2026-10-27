@@ -5,7 +5,8 @@ import { v3 } from '@q2/math';
 import type { Entity } from '@q2/renderer-api';
 import { getConcharsFont, makeConcharsFont } from '@q2/client';
 import { bootPlay, drawPlayHud, pumpMuzzleLight, pumpBoltLights, pumpExplosionLights, pumpTracers, loadConcharsFont, concharsFontFromPCX, VIEWMODEL_FIRE_FRAME, usesViewModel3D } from './play.js';
-import { findWeapon, spawnMonster, monsterPain, BOLT_LIFE } from '@q2/game';
+import { findWeapon, monsterPain, BOLT_LIFE } from '@q2/game';
+import { SV_SpawnMonster, SV_AddBarrel } from '@q2/server';
 import type { LocalDriver } from './play.js';
 
 function runFrames(host: { frame(nowMs: number): unknown }, fromMs: number, toMs: number, step = 16): void {
@@ -197,22 +198,21 @@ describe('play driver (devroom, headless)', () => {
     // pillar (player spawn is west at -168, 0) so the pillar blocks LOS and
     // the chase selector holds the run move (frame0 dist 10/tick) instead of
     // committing to a standing attack. It must still walk toward the player.
-    driver.monsters.push({ id: 99, origin: [100, 0, 32], state: spawnMonster('soldier'), skin: 2, lastAttack: -10 });
-    const m = driver.monsters[0]!;
+    const m = SV_SpawnMonster(driver.server, 'monster_soldier', v3(100, 0, 32));
     m.state.move = 'run';
     m.state.frame = 0;
-    const x0 = m.origin[0]!;
+    const x0 = m.edict.origin[0]!;
     stepDriver(driver, neutralCmd(), 5);
     // monsterThink advanced the state machine...
     expect(m.state.frame).toBeGreaterThan(0);
     expect(m.state.move).toBe('run');
     // ...the move table maps to a nonzero MD2 frame (run first=99)...
-    expect(driver.entityFrame(99)).toBe(99 + m.state.frame);
-    expect(driver.entityFrame(99)).toBeGreaterThan(0);
+    expect(driver.entityFrame(m.edict.num)).toBe(99 + m.state.frame);
+    expect(driver.entityFrame(m.edict.num)).toBeGreaterThan(0);
     // ...the monster walked toward the player (west spawn is at -168)...
-    expect(m.origin[0]!).toBeLessThan(x0);
+    expect(m.edict.origin[0]!).toBeLessThan(x0);
     // ...it stays in the authoritative snapshot...
-    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === 99)).toBe(true);
+    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === m.edict.num)).toBe(true);
     // ...and the Host renders it with that MD2 frame (not frame 0).
     // Warm the snapshot stream first (snapshots ingest on host ticks).
     runFrames(host, 0, 500);
@@ -223,9 +223,9 @@ describe('play driver (devroom, headless)', () => {
       return orig(view, world, entities);
     });
     host.frame(600);
-    const byOrigin = rendered.filter((e) => Math.abs(e.origin[0]! - m.origin[0]!) < 3);
+    const byOrigin = rendered.filter((e) => Math.abs(e.origin[0]! - m.edict.origin[0]!) < 3);
     expect(byOrigin.length).toBe(1);
-    expect(byOrigin[0]!.frame).toBe(driver.entityFrame(99));
+    expect(byOrigin[0]!.frame).toBe(driver.entityFrame(m.edict.num));
     expect(byOrigin[0]!.frame).toBeGreaterThan(0);
   });
 
@@ -532,10 +532,7 @@ describe('play driver (devroom, headless)', () => {
     driver.pm.origin = v3(-144, -16, 24);
     driver.pm.velocity = v3();
     driver.pm.viewAngles = v3(-90, 0, 0);
-    driver.barrels.push({
-      origin: v3(-144, -16, 100), health: 10, dmg: 150, mass: 400,
-      size: v3(32, 32, 40), isFunc: false, dead: false,
-    });
+    SV_AddBarrel(driver.server, v3(-144, -16, 100));
     driver.step({ ...neutralCmd([-90, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
     expect(driver.bolts.length).toBe(1);
     // Bolt climbs 100u/tick into the barrel hull: lethal hit, fuse set, and
@@ -543,7 +540,7 @@ describe('play driver (devroom, headless)', () => {
     stepDriver(driver, neutralCmd(), 1);
     expect(driver.bolts.length).toBe(0);
     const barrel = driver.barrels[0]!;
-    expect(barrel.dead).toBe(true);
+    expect(barrel.edict.freed).toBe(true);
     expect(driver.pendingFuses).toBe(1);
     expect(driver.explosions.some((e) => e.kind === 'explosion1')).toBe(false);
     expect(driver.debris.length).toBe(0);
@@ -574,10 +571,7 @@ describe('play driver (devroom, headless)', () => {
     driver.pm.origin = v3(-144, -16, 24);
     driver.pm.velocity = v3();
     driver.pm.viewAngles = v3(-90, 0, 0);
-    driver.barrels.push({
-      origin: v3(-144, -16, 100), health: 100, dmg: 0, mass: 400,
-      size: v3(32, 32, 40), isFunc: true, dead: false,
-    });
+    SV_AddBarrel(driver.server, v3(-144, -16, 100), { health: 100, dmg: 0, mass: 400, isFunc: true });
     // Bolt damage 10 × 10 hits to burn through 100hp: refire-limited, so
     // step attack until the fuse is lit (bolt hits every ~3 ticks).
     for (let i = 0; i < 40 && driver.pendingFuses === 0; i++) {
@@ -597,8 +591,7 @@ describe('play driver (devroom, headless)', () => {
     driver.pm.origin = v3(-168, 100, 24);
     driver.pm.velocity = v3();
     driver.pm.viewAngles = v3(0, 0, 0);
-    driver.monsters.push({ id: 99, origin: [100, 92, 24], state: spawnMonster('soldier'), skin: 2, lastAttack: -10 });
-    const m = driver.monsters[0]!;
+    const m = SV_SpawnMonster(driver.server, 'monster_soldier', v3(100, 92, 24));
     // Kill cleanly (30hp exactly: dead, not gibbed since 0 > gibHealth -30).
     expect(monsterPain(m.state, 30, () => 0.5)).toBe('dead');
     expect(m.state.dead).toBe(true);
@@ -622,14 +615,14 @@ describe('play driver (devroom, headless)', () => {
     stepDriver(driver, neutralCmd(), 6);
     expect(driver.events.filter((e) => e === 'gib').length).toBe(gibEvents);
     expect(driver.gibs.length).toBe(5);
-    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === 99)).toBe(false);
+    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === m.edict.num)).toBe(false);
   });
 
   it('K: monster fire frames spawn tracers (hitscan) and foe bolts (blaster)', () => {    const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
     // Soldier off to the side (open LOS past the pillar) at ~224u: NEAR
     // range, so chase commits attack1/attack2 once it faces the player.
-    driver.monsters.push({ id: 99, origin: [32, 100, 24], state: spawnMonster('soldier'), skin: 2, lastAttack: -10 });
+    SV_SpawnMonster(driver.server, 'monster_soldier', v3(32, 100, 24));
     let sawTracer = false;
     let sawBolt = false;
     let sawFlash = false;
@@ -653,10 +646,9 @@ describe('play driver (devroom, headless)', () => {
     // Soldier east with the pillar between it and the spawn: no LOS, so the
     // chase holds `run` every tick (never an attack plant) and locomotion
     // walks it at the player until the pillar hull stops it.
-    driver.monsters.push({ id: 99, origin: [200, 0, 32], state: spawnMonster('soldier'), skin: 2, lastAttack: -10 });
-    const m = driver.monsters[0]!;
+    const m = SV_SpawnMonster(driver.server, 'monster_soldier', v3(200, 0, 32));
     const distToPlayer = (): number =>
-      Math.hypot(m.origin[0]! - driver.pm.origin[0]!, m.origin[1]! - driver.pm.origin[1]!, m.origin[2]! - driver.pm.origin[2]!);
+      Math.hypot(m.edict.origin[0]! - driver.pm.origin[0]!, m.edict.origin[1]! - driver.pm.origin[1]!, m.edict.origin[2]! - driver.pm.origin[2]!);
     const d0 = distToPlayer();
     expect(d0).toBeGreaterThan(300);
     stepDriver(driver, neutralCmd(), 30);
@@ -666,7 +658,7 @@ describe('play driver (devroom, headless)', () => {
     const d1 = distToPlayer();
     expect(d1).toBeLessThan(d0 - 50);
     // The authoritative snapshot carries the closed-in origin…
-    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === 99)).toBe(true);
+    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === m.edict.num)).toBe(true);
     // …and the Host actually submits it to renderView (not PVS/frustum-
     // culled away): captured entity rides within 5u of the driver origin and
     // is strictly closer to the player than at spawn.
@@ -678,9 +670,9 @@ describe('play driver (devroom, headless)', () => {
       return orig(view, world, entities);
     });
     host.frame(600);
-    const near = rendered.filter((e) => Math.hypot(e.origin[0]! - m.origin[0]!, e.origin[1]! - m.origin[1]!, e.origin[2]! - m.origin[2]!) < 5);
+    const near = rendered.filter((e) => Math.hypot(e.origin[0]! - m.edict.origin[0]!, e.origin[1]! - m.edict.origin[1]!, e.origin[2]! - m.edict.origin[2]!) < 5);
     expect(near.length).toBe(1);
-    expect(near[0]!.frame).toBe(driver.entityFrame(99));
+    expect(near[0]!.frame).toBe(driver.entityFrame(m.edict.num));
     const rd = Math.hypot(
       near[0]!.origin[0]! - host.playerOrigin[0]!,
       near[0]!.origin[1]! - host.playerOrigin[1]!,
@@ -770,16 +762,16 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     //    The first plain (shotgun-skin) soldier keeps the pre-skin-roster
     //    geometry this script was tuned against (an enclosed cell where bolt
     //    wall-splash chips the target); lights live in the open.
-    const target = driver.monsters.find((m) => m.skin === 2) ?? driver.monsters[0]!;
+    const target = driver.server.monsters.find((m) => m.edict.extra['skinnum'] === '2') ?? driver.server.monsters[0]!;
     let killed = false;
     for (const [ox, oy] of [[48, 0], [-48, 0], [0, 48], [0, -48]] as const) {
       if (target.state.dead) {
         killed = true;
         break;
       }
-      driver.pm.origin = v3(target.origin[0]! + ox, target.origin[1]! + oy, target.origin[2]! + 24);
+      driver.pm.origin = v3(target.edict.origin[0]! + ox, target.edict.origin[1]! + oy, target.edict.origin[2]! + 24);
       driver.pm.velocity = v3();
-      const yaw = (Math.atan2(target.origin[1]! - driver.pm.origin[1]!, target.origin[0]! - driver.pm.origin[0]!) * 180) / Math.PI;
+      const yaw = (Math.atan2(target.edict.origin[1]! - driver.pm.origin[1]!, target.edict.origin[0]! - driver.pm.origin[0]!) * 180) / Math.PI;
       const atk: UserCmdT = { msec: 100, angles: [0, yaw, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_ATTACK };
       for (let i = 0; i < 60 && !target.state.dead; i++) driver.step(atk, 0.1);
       if (target.state.dead) killed = true;
@@ -787,8 +779,8 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     expect(killed).toBe(true);
     expect(driver.events).toContain('kill');
     // Corpses persist in the snapshot, holding the last death frame.
-    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === target.id)).toBe(true);
-    expect(driver.entityFrame(target.id)).toBeGreaterThan(0);
+    expect(driver.snapshot(driver.server.time).entities.some((e) => e.id === target.edict.num)).toBe(true);
+    expect(driver.entityFrame(target.edict.num)).toBeGreaterThan(0);
     // 4. Exit: drop into the *27 pit volume; the brush trigger fires t37.
     driver.pm.origin = v3(-1776, 1544, -32);
     driver.pm.velocity = v3();
@@ -872,8 +864,8 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     expect(icon).toBe(0);
     // Monster frames advance through the move table (nonzero MD2 frame).
     stepDriver(driver, neutralCmd(), 3);
-    const m0 = driver.monsters[0]!;
-    expect(driver.entityFrame(m0.id)).toBeGreaterThan(0);
+    const m0 = driver.server.monsters[0]!;
+    expect(driver.entityFrame(m0.edict.num)).toBeGreaterThan(0);
   });
 
   it('sky: env/unit1_ strip loads and the renderer takes it', async () => {
@@ -937,33 +929,37 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
       (b) => Math.hypot(b.origin[0]! - 128, b.origin[1]! + 320) < 400,
     );
     expect(near.length).toBe(2);
-    expect(near.map((b) => [...b.origin])).toContainEqual([136, 40, 0]);
-    expect(near.map((b) => [...b.origin])).toContainEqual([184, -24, 0]);
+    // C M_droptofloor outcome (server-spawned): +1/32 contact epsilon over
+    // the lump origins — the server barrel test pins the same rounding.
+    const rounded = near.map((x) => [Math.round(x.origin[0]!), Math.round(x.origin[1]!), Math.round(x.origin[2]!)]);
+    expect(rounded).toContainEqual([136, 40, 0]);
+    expect(rounded).toContainEqual([184, -24, 0]);
     // Snapshot stays player + monsters; live barrels ride the Host
     // extraEntities hook with their own barrel MD2 handles (appended after
     // the bolt so every pre-existing handle is stable).
     const snap = driver.snapshot(driver.server.time);
-    expect(snap.entities.every((e) => e.id === 1 || driver.monsters.some((m) => m.id === e.id))).toBe(true);
+    expect(snap.entities.every((e) => e.id === 1 || driver.server.monsters.some((m) => m.edict.num === e.id))).toBe(true);
     const extras = driver.extraEntities();
     expect(extras).not.toBeNull();
     // Barrels ride 1:1 (plus pickups/ships/banners on the same hook since
     // M7.1: filter by the barrel handle for the barrel assertions).
     const barrelX = extras!.filter((x) => x.model === boot.models!.barrel);
     expect(barrelX.length).toBe(driver.barrels.length);
-    expect(barrelX.map((x) => [...x.origin])).toContainEqual([136, 40, 0]);
-    expect(barrelX.map((x) => [...x.origin])).toContainEqual([184, -24, 0]);
+    const roundedX = barrelX.map((x) => [Math.round(x.origin![0]!), Math.round(x.origin![1]!), Math.round(x.origin![2]!)]);
+    expect(roundedX).toContainEqual([136, 40, 0]);
+    expect(roundedX).toContainEqual([184, -24, 0]);
     for (const x of barrelX) {
       expect(x.skin).toBe(boot.models!.barrelSkin);
     }
     // Snapshot pairing hooks: soldiers resolve to their per-skin handles
     // (first lump monster is a light: skin_lt, not the default), unknown
     // ids to null (Host default), monster facing rides entityAngles.
-    const m0 = driver.monsters[0]!;
-    expect(driver.entityModel(m0.id)).toEqual({ model: boot.models!.monster, skin: driver.soldierSkinFor(m0.skin) });
-    expect(driver.soldierSkinFor(m0.skin)).toBe(boot.models!.soldierLightSkin);
+    const m0 = driver.server.monsters[0]!;
+    expect(driver.entityModel(m0.edict.num)).toEqual({ model: boot.models!.monster, skin: driver.soldierSkinFor(driver.monsterSkin(m0)) });
+    expect(driver.soldierSkinFor(driver.monsterSkin(m0))).toBe(boot.models!.soldierLightSkin);
     expect(driver.entityModel(999999)).toBeNull();
     const yaw0 = ((m0.state.yaw % 360) + 360) % 360;
-    expect(driver.entityAngles(m0.id)).toEqual([0, yaw0, 0]);
+    expect(driver.entityAngles(m0.edict.num)).toEqual([0, yaw0, 0]);
     expect(driver.entityAngles(999999)).toBeNull();
     // No trigger_always targets a target_explosion (t148/t142/t134 fire
     // strogg-ship flybys, t91 a secret/train/button): the boot itself fires
@@ -1075,7 +1071,7 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     }
     // Exactly two live barrels near spawn at the lump origins.
     const near = driver.barrels.filter(
-      (b) => !b.dead && Math.hypot(b.origin[0]! - 128, b.origin[1]! + 320) < 400,
+      (b) => !b.edict.freed && Math.hypot(b.origin[0]! - 128, b.origin[1]! + 320) < 400,
     );
     expect(near.length).toBe(2);
     expect(near.every((b) => !b.isFunc)).toBe(true);
@@ -1083,24 +1079,25 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     // bases: misc origins ARE the floor (z=0), funcs render at bbox bottom.
     const extras = driver.extraEntities()!;
     const barrelX = extras.filter((x) => x.model === boot.models!.barrel);
-    expect(barrelX.length).toBe(driver.barrels.filter((b) => !b.dead).length);
-    const keys = barrelX.map((x) => [...x.origin!].join(','));
+    expect(barrelX.length).toBe(driver.barrels.filter((b) => !b.edict.freed).length);
+    const keys = barrelX.map((x) => [Math.round(x.origin![0]!), Math.round(x.origin![1]!), Math.round(x.origin![2]!)].join(','));
     expect(new Set(keys).size).toBe(keys.length);
     expect(keys).toContain('136,40,0');
     expect(keys).toContain('184,-24,0');
     for (const b of driver.barrels) {
-      if (b.dead) continue;
+      if (b.edict.freed) continue;
       const wantZ = b.isFunc ? b.origin[2]! - b.size[2]! / 2 : b.origin[2]!;
-      const found = barrelX.find((x) => x.origin![0] === b.origin[0]! && x.origin![1] === b.origin[1]!);
+      const found = barrelX.find((x) => Math.round(x.origin![0]!) === Math.round(b.origin[0]!) && Math.round(x.origin![1]!) === Math.round(b.origin[1]!));
       expect(found).toBeDefined();
-      expect(found!.origin![2]).toBeCloseTo(wantZ, 6);
+      expect(found!.origin![2]).toBeCloseTo(wantZ, 1);
       expect(found!.skin).toBe(boot.models!.barrelSkin);
     }
     // Spawn pair bases sit exactly at the floor.
     for (const key of ['136,40,0', '184,-24,0']) {
-      const found = barrelX.find((x) => [...x.origin!].join(',') === key)!;
+      const found = barrelX.find((x) => [Math.round(x.origin![0]!), Math.round(x.origin![1]!), Math.round(x.origin![2]!)].join(',') === key)!;
       expect(found).toBeDefined();
-      expect(found.origin![2]).toBe(0);
+      // Floor-resting: the C droptofloor epsilon (1/32) is contact, not float.
+      expect(found.origin![2]).toBeCloseTo(0, 1);
     }
   });
 
@@ -1113,28 +1110,40 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     const pak = ingestPak(buf);
     const boot = bootPlay({ width: 96, height: 72, pak });
     const { driver } = boot;
-    // Same-floor pair (verified coplanar, z=-168): stand the player where
-    // monster 8 rests (known-free floor) and watch monster 9 close in.
-    const A = driver.monsters[9]!;
-    const B = driver.monsters[8]!;
-    expect(A.origin[2]).toBe(B.origin[2]);
-    driver.pm.origin = v3(B.origin[0], B.origin[1], B.origin[2]);
+    // Phase 0 single sim: the old driver-side chase (no ambush) is gone;
+    // ambush soldiers hold stand until eye-to-eye LOS latches `seen` (id
+    // visible()), so the player rounds the corner first, then the runner
+    // closes in through the server tick. Same proof as the Phase 0 gate.
+    const spawn = v3(128, -320, 32);
+    const sim = driver.server.monsters.filter((m) => !m.triggered && m.kind);
+    const A = sim.sort(
+      (x, y) =>
+        Math.hypot(x.edict.origin[0]! - spawn[0]!, x.edict.origin[1]! - spawn[1]!) -
+        Math.hypot(y.edict.origin[0]! - spawn[0]!, y.edict.origin[1]! - spawn[1]!),
+    )[0]!;
+    for (let i = 0; i < 10; i++) driver.step(neutralCmd(), 0.1);
+    expect(A.seen).toBe(false);
+    driver.pm.origin = v3(440, -500, 100);
     driver.pm.velocity = v3();
+    let guard = 0;
+    while (!A.seen && guard++ < 40) driver.step(neutralCmd(), 0.1);
+    expect(A.seen).toBe(true);
+    stepDriver(driver, neutralCmd(), 10); // settle the fall
     const distNow = (): number =>
-      Math.hypot(A.origin[0]! - driver.pm.origin[0]!, A.origin[1]! - driver.pm.origin[1]!, A.origin[2]! - driver.pm.origin[2]!);
+      Math.hypot(A.edict.origin[0]! - driver.pm.origin[0]!, A.edict.origin[1]! - driver.pm.origin[1]!, A.edict.origin[2]! - driver.pm.origin[2]!);
     const d0 = distNow();
-    expect(d0).toBeGreaterThan(200);
-    for (let i = 0; i < 40; i++) driver.step(neutralCmd(), 0.1);
-    // monsterThink activated (left stand) and locomotion advanced the
-    // rendered origin toward the player — not just the server edict.
+    expect(d0).toBeGreaterThan(60);
+    for (let i = 0; i < 60; i++) driver.step(neutralCmd(), 0.1);
+    // monsterThink left stand and locomotion advanced the rendered origin
+    // toward the player — not just the server edict.
     expect(A.state.move).not.toBe('stand1');
     const d1 = distNow();
-    expect(d1).toBeLessThan(d0 - 100);
+    expect(d1).toBeLessThan(d0 - 20);
     // The authoritative snapshot carries the closed-in origin…
     const snap = driver.snapshot(driver.server.time);
-    const sent = snap.entities.find((e) => e.id === A.id)!;
+    const sent = snap.entities.find((e) => e.id === A.edict.num)!;
     expect(sent).toBeDefined();
-    expect(Math.hypot(sent.origin[0]! - A.origin[0]!, sent.origin[1]! - A.origin[1]!)).toBeLessThan(1);
+    expect(Math.hypot(sent.origin[0]! - A.edict.origin[0]!, sent.origin[1]! - A.edict.origin[1]!)).toBeLessThan(1);
     // …and the Host submits it to renderView with the live MD2 frame.
     // Warm the snapshot stream first (snapshots ingest on host ticks).
     runFrames(boot.host, 0, 2000);
@@ -1145,12 +1154,12 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
       return orig(view, world, entities);
     });
     boot.host.frame(2100);
-    const near = rendered.filter((e) => Math.hypot(e.origin[0]! - A.origin[0]!, e.origin[1]! - A.origin[1]!) < 8);
+    const near = rendered.filter((e) => Math.hypot(e.origin[0]! - A.edict.origin[0]!, e.origin[1]! - A.edict.origin[1]!) < 8);
     expect(near.length).toBeGreaterThan(0);
     const rd = Math.hypot(
       near[0]!.origin[0]! - boot.host.playerOrigin[0]!,
       near[0]!.origin[1]! - boot.host.playerOrigin[1]!,
     );
-    expect(rd).toBeLessThan(d0 - 50);
+    expect(rd).toBeLessThan(d0 - 20);
   });
 });

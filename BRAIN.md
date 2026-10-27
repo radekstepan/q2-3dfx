@@ -1016,3 +1016,25 @@ bad lanes. Evidence, all in `apps/web/src/play.ts`:
   just package unit tests.
 - No more symptom lanes on God-object `play.ts` without first checking which
   sim owns the behavior.
+
+### Unification plan — base1 actually works (batch #8+; scope = first map)
+
+Target: ONE simulation (`packages/server` authoritative, 10Hz tick, C-ported);
+`apps/web` owns rendering + input + prediction + cosmetics only. JS port
+(`../external/quake-2-JS`, `g_ai.ts`/`g_monster.ts`/`m_soldier.ts`) is the
+behavior template; C source (`../external/quake-2-source`) is ground truth.
+
+- [x] Phase 0 — kill the dual sim: delete driver's `PlacedMonster[]`/
+- `monsterChaseMove` block/`parseExplosives`/`barrels`/`bolts`/driver door
+- touch; server owns monsters (full think: ai_run-lite, M_CheckAttack-lite,
+- fire events), barrels (damage/delay/`damageRadius`), bolts (edicts + touch),
+- explosions + muzzle events; driver renders from server state, fires via
+- server `SV_PlayerFire`. (Folds Phase 1: driver uses `SV_*` trace helpers.)
+- [ ] Phase 2 — combat numbers: hull-swept bolt spawn (no muzzle detonations),
+- C damage/skill tables, crosshair-vs-view audit, TTK bot (≤4 point-blank
+- blaster hits, soldier 30hp, medium skill).
+- [ ] Phase 3 — feedback correctness: `m_flash` muzzle offsets only, no
+- eye-ending streaks, single duck state transition (hull/eye/predictor).
+- [ ] Phase 4 — play-verified gate: base1 driver-level bot asserting rendered
+- outcomes (barrels die, monster closes 300→100u, door re-closes, secret
+- holds, TTK). No gameplay card closes without it.
