@@ -62,7 +62,7 @@ export {
   MOVETYPE_PUSH,
 } from './entities.js';
 export type { EntDict, Edict } from './entities.js';
-export { findItem, makePlayerState, pickupItem, MAX_HEALTH } from './items.js';
+export { findItem, makePlayerState, pickupItem, MAX_HEALTH, SUIT_SECONDS, SUIT_AIR_SECONDS, SUIT_BREATH_PERIOD, SUIT_BREATH_SOUNDS, SUIT_WARN_SECONDS, SUIT_WARN_SOUND, suitSizzleDamage } from './items.js';
 export {
   respawnDelayFor,
   SetRespawn,
@@ -74,6 +74,15 @@ export {
   RESPAWN_DELAY_ARMOR,
 } from './items.js';
 export type { ItemDef, PlayerState, PickupResult } from './items.js';
+export {
+  damageDeadsoldier,
+  DEADSOLDIER_GIB_HEALTH,
+  DEADSOLDIER_GIB_MODELS,
+  DEADSOLDIER_GIB_SOUND,
+  DEADSOLDIER_MINS,
+  DEADSOLDIER_MAXS,
+} from './corpses.js';
+export type { DeadsoldierHit } from './corpses.js';
 export {
   spawnDoor,
   spawnPlat,

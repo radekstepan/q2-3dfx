@@ -8,6 +8,7 @@ import {
   CL_PredictPmove,
   extrapolateOrigin,
   interpFraction,
+  lerpAngle,
   lerpOrigin,
   Predictor,
 } from './prediction.js';
@@ -669,6 +670,53 @@ describe('stop settle (10Hz server, sub-tick renders)', () => {
     } finally {
       setCVar('cl_predict', 1);
       resetPmoveWorld();
+    }
+  });
+});
+
+describe('lerpAngle (C q_shared.c LerpAngle, yaw interp between 10Hz snapshots)', () => {
+  it('midpoints straight runs exactly', () => {
+    expect(lerpAngle(0, 90, 0.5)).toBeCloseTo(45, 9);
+    expect(lerpAngle(90, 0, 0.5)).toBeCloseTo(45, 9);
+  });
+
+  it('endpoints hold (frac 0 = prev, frac 1 = next mod 360 — C normalizes nothing)', () => {
+    expect(lerpAngle(10, 350, 0)).toBeCloseTo(10, 9);
+    // 10 -> 350 lerps the short arc (-20): raw output -10 ≡ 350.
+    expect(((lerpAngle(10, 350, 1) % 360) + 360) % 360).toBeCloseTo(350, 9);
+  });
+
+  it('takes the short arc through 0/360 (never spins the long way)', () => {
+    // 350 -> 10 is +20 through 0, not -340.
+    expect(lerpAngle(350, 10, 0.5)).toBeCloseTo(360, 9);
+    // 10 -> 350 is -20 through 0, not +340.
+    expect(lerpAngle(10, 350, 0.5)).toBeCloseTo(0, 9);
+  });
+
+  it('monotonic: successive fracs never step backwards along the arc', () => {
+    const runs: Array<[number, number]> = [
+      [0, 90],
+      [90, 0],
+      [350, 10],
+      [10, 350],
+      [170, -170],
+    ];
+    for (const [prev, next] of runs) {
+      const end = lerpAngle(prev, next, 1);
+      // Shortest-arc signed delta (matches the lerp's own wrap fixup).
+      let delta = end - prev;
+      if (delta > 180) delta -= 360;
+      if (delta < -180) delta += 360;
+      let last = prev;
+      for (let i = 1; i <= 10; i++) {
+        const v = lerpAngle(prev, next, i / 10);
+        if (delta >= 0) expect(v).toBeGreaterThanOrEqual(last - 1e-9);
+        else expect(v).toBeLessThanOrEqual(last + 1e-9);
+        // Bounded by the arc endpoints (no overshoot past next).
+        if (delta >= 0) expect(v).toBeLessThanOrEqual(Math.max(prev, end) + 1e-9);
+        else expect(v).toBeGreaterThanOrEqual(Math.min(prev, end) - 1e-9);
+        last = v;
+      }
     }
   });
 });

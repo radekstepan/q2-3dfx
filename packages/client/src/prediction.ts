@@ -72,6 +72,20 @@ export function clamp01(x: number): number {
 }
 
 /**
+ * C `LerpAngle` (game/q_shared.c, used by client/cl_ents.c for entity
+ * angles): shortest-arc interpolation between two yaw/pitch/roll samples.
+ * `prev` is the older snapshot's angle, `next` the newer, `frac` 0..1.
+ * The wrap fixup (±360) keeps turns monotonic through 0/360 instead of
+ * spinning the long way around.
+ */
+export function lerpAngle(prev: number, next: number, frac: number): number {
+  let a = next;
+  if (a - prev > 180) a -= 360;
+  if (a - prev < -180) a += 360;
+  return prev + frac * (a - prev);
+}
+
+/**
  * Interpolation fraction for `renderTime` between two snapshots.
  * Degenerate (equal timestamps) yields 0. Result is clamped 0..1 so
  * render times outside the window hold the nearest sample (no jitter,

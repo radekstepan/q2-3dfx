@@ -64,6 +64,13 @@ const ITEMS: Record<string, ItemDef> = {
   weapon_shotgun: { classname: 'weapon_shotgun', kind: 'weapon', amount: 1, ammoKind: 'shells', maxCarry: 1 },
   weapon_machinegun: { classname: 'weapon_machinegun', kind: 'weapon', amount: 1, ammoKind: 'bullets', maxCarry: 1 },
   weapon_blaster: { classname: 'weapon_blaster', kind: 'weapon', amount: 1, ammoKind: '', maxCarry: 1 },
+  // Timed suits (C g_items.c item_breather / item_enviro): Pickup_Powerup
+  // with 30s effects (Use_Breather/Use_Envirosuit set framenum +300 @10Hz,
+  // stacking). C arms them from the inventory via Use_*; this sim has no
+  // inventory UI, so pickup arms the timer directly (documented deviation).
+  // amount carries the C `quantity` (60) for the DM respawn table.
+  item_breather: { classname: 'item_breather', kind: 'powerup', amount: 60, ammoKind: '', maxCarry: 0 },
+  item_enviro: { classname: 'item_enviro', kind: 'powerup', amount: 60, ammoKind: '', maxCarry: 0 },
 };
 
 export function findItem(classname: string): ItemDef | null {
@@ -77,10 +84,14 @@ export interface PlayerState {
   maxArmor: number;
   ammo: Record<string, number>;
   weapons: string[];
+  /** Server-time seconds until which the rebreather supplies air (0 = none). */
+  breatherUntil: number;
+  /** Server-time seconds until which the envirosuit protects (0 = none). */
+  enviroUntil: number;
 }
 
 export function makePlayerState(): PlayerState {
-  return { health: 100, maxHealth: MAX_HEALTH, armor: 0, maxArmor: 100, ammo: {}, weapons: ['weapon_blaster'] };
+  return { health: 100, maxHealth: MAX_HEALTH, armor: 0, maxArmor: 100, ammo: {}, weapons: ['weapon_blaster'], breatherUntil: 0, enviroUntil: 0 };
 }
 
 export interface PickupResult {
@@ -90,13 +101,28 @@ export interface PickupResult {
 }
 
 /**
- * Pickup_Health / Pickup_Ammo / weapon pickup semantics.
- * Megahealth may exceed maxHealth up to its own cap (rot handled by game logic).
+ * Pickup_Health / Pickup_Ammo / weapon pickup semantics, plus the timed
+ * suits. Megahealth may exceed maxHealth up to its own cap (rot handled by
+ * game logic). `now` is level.time in seconds (server-time domain) — only
+ * the suits read it (Use_Breather/Use_Envirosuit framenum arithmetic).
  */
-export function pickupItem(ps: PlayerState, classname: string): PickupResult {
+export function pickupItem(ps: PlayerState, classname: string, now = 0): PickupResult {
   const def = findItem(classname);
   if (!def) return { picked: false, applied: 0, reason: 'unknown item' };
   switch (def.kind) {
+    case 'powerup': {
+      // C Use_Breather/Use_Envirosuit: active timers extend (+300 frames),
+      // expired ones restart at framenum+300 — 30s at the 10Hz tick.
+      if (classname === 'item_breather') {
+        ps.breatherUntil = Math.max(now, ps.breatherUntil) + SUIT_SECONDS;
+        return { picked: true, applied: SUIT_SECONDS, reason: 'breather' };
+      }
+      if (classname === 'item_enviro') {
+        ps.enviroUntil = Math.max(now, ps.enviroUntil) + SUIT_SECONDS;
+        return { picked: true, applied: SUIT_SECONDS, reason: 'enviro' };
+      }
+      return { picked: false, applied: 0, reason: 'unhandled kind' };
+    }
     case 'health': {
       const cap = classname === 'item_health_mega' ? def.maxCarry : ps.maxHealth;
       if (ps.health >= cap) return { picked: false, applied: 0, reason: 'already full' };
@@ -129,6 +155,44 @@ export function pickupItem(ps: PlayerState, classname: string): PickupResult {
     default:
       return { picked: false, applied: 0, reason: 'unhandled kind' };
   }
+}
+
+// --- Timed suits (rebreather + envirosuit, game/p_view.c P_WorldEffects) ---
+//
+// C state: client->breather_framenum / enviro_framenum (level.framenum
+// domain, 10 ticks/s). Use_Breather/Use_Envirosuit arm +300 frames (30s),
+// extending an active timer. Per-tick P_WorldEffects branches ported here
+// as pure helpers so the server tick hunk stays thin:
+// - air: breather||enviro && waterlevel==3 refreshes air_finished to
+//   level.time + 10 (SUIT_AIR_SECONDS), so drowning never starts;
+// - breath: every 25 frames (2.5s) submerged+protected alternates
+//   player/u_breath1.wav / u_breath2.wav (client->breather_sound ^= 1);
+// - sizzle: lava deals 3*waterlevel (1*waterlevel suited), slime deals
+//   1*waterlevel (immune suited);
+// - fade: items/airout.wav once at 30 frames (3s) remaining (p_view.c blend).
+
+/** C Use_Breather/Use_Envirosuit effect: +300 framenums @10Hz per pickup. */
+export const SUIT_SECONDS = 30;
+/** C protected air supply while the head is under (level.time + 10). */
+export const SUIT_AIR_SECONDS = 10;
+/** C breath-sound cadence: every 25 frames = 2.5s, alternating pair. */
+export const SUIT_BREATH_PERIOD = 2.5;
+export const SUIT_BREATH_SOUNDS: readonly [string, string] = ['player/u_breath1.wav', 'player/u_breath2.wav'];
+/** C fade warning: items/airout.wav at 30 frames (3s) remaining. */
+export const SUIT_WARN_SECONDS = 3;
+export const SUIT_WARN_SOUND = 'items/airout.wav';
+
+/**
+ * C P_WorldEffects sizzle block (game/p_view.c): lava/slime damage for one
+ * tick at the given waterlevel, with the envirosuit immunity applied.
+ * Bit-free inputs (the caller maps its contents bits); pure and headless.
+ */
+export function suitSizzleDamage(waterlevel: number, inLava: boolean, inSlime: boolean, enviro: boolean): number {
+  if (waterlevel <= 0) return 0;
+  let dmg = 0;
+  if (inLava) dmg += (enviro ? 1 : 3) * waterlevel;
+  if (inSlime && !enviro) dmg += waterlevel;
+  return dmg;
 }
 
 /**

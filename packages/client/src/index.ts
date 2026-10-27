@@ -3,6 +3,7 @@ export {
   extrapolateOrigin,
   lerpOrigin,
   clamp01,
+  lerpAngle,
   interpFraction,
   renderTimeFor,
   CL_Interpolate,

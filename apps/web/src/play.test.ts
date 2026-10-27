@@ -763,7 +763,8 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     expect(driver.playerHealth).toBe(hpBefore - 30);
     expect(driver.events).toContain('pain');
     const mixedPain = driver.mixer.mix();
-    expect(mixedPain.some((c) => c.name === 'player/pain.wav' && c.left === 1)).toBe(true);
+    // Real pak pain sound (C P_DamageFeedback band: 70hp -> pain75_*).
+    expect(mixedPain.some((c) => c.name.startsWith('player/male/pain75_') && c.left === 1)).toBe(true);
     // 2. Shotgun pickup: base1's weapon_shotgun sits at (800,-96,-168).
     expect(driver.hasWeapon('weapon_shotgun')).toBe(false);
     driver.pm.origin = v3(800, -96, -144);
@@ -774,7 +775,7 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     driver.selectWeapon('weapon_shotgun');
     expect(driver.weapon.classname).toBe('weapon_shotgun');
     const mixedPickup = driver.mixer.mix().map((c) => c.name);
-    expect(mixedPickup).toContain('items/pickup.wav');
+    expect(mixedPickup).toContain('items/pkup.wav');
     // 3. Monster kill: stand next to a soldier in its own cell (same room,
     //    clear line of sight), aim dead-on, fire the blaster until it dies.
     //    The soldier melees back every ~1s, proving fight-back damage.
@@ -1203,5 +1204,223 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
       near[0]!.origin[1]! - boot.host.playerOrigin[1]!,
     );
     expect(rd).toBeLessThan(dSeen - 20);
+  });
+});
+
+describe.runIf(!!WEB_Q2_PAK)('sweep gameplay: emitted channel names resolve to decodable pak lumps', () => {
+  // Feedback item 1: every channel name the driver/server can start must
+  // name a real pak lump whose wav header parses (no silent synth fallback).
+  // The curated list below is the full emission surface (play.ts emitSound
+  // call sites + server st.sounds pushes, C-cited in the sweep changeset);
+  // the session tail then asserts the M7.2 bot run's heardSounds all
+  // resolve too, so a new emission without a lump fails here.
+  const EMITTED = [
+    // doors/buttons (C g_func.c SP_func_door/SP_func_button sounds)
+    'doors/dr1_strt.wav',
+    'doors/dr1_end.wav',
+    'switches/butn2.wav',
+    // pickups + suit fade (C g_items.c pickup_sound, p_view.c blend)
+    'items/pkup.wav',
+    'items/airout.wav',
+    // weapons (C g_weapon.c fire_* names)
+    'weapons/blastf1a.wav',
+    'weapons/shotgf1b.wav',
+    'weapons/machgf1b.wav',
+    'weapons/noammo.wav',
+    'weapons/lashit.wav',
+    // explosions (C cl_tent.c TE_ paths)
+    'world/explod1.wav',
+    // gibs (C g_misc.c ThrowGib/ThrowHead over misc/udeath.wav)
+    'misc/udeath.wav',
+    // monster fire (C m_soldier.c/m_gunner.c/m_infantry.c sound_* names)
+    'soldier/solatck1.wav',
+    'soldier/solatck2.wav',
+    'soldier/solatck3.wav',
+    'gunner/gunatck2.wav',
+    'gunner/gunatck3.wav',
+    'infantry/infatck1.wav',
+    'infantry/melee2.wav',
+    // player pain bands + death (C p_view.c P_DamageFeedback, p_client.c
+    // player_die — `*` sexed prefix resolved to the default male lumps)
+    'player/male/pain25_1.wav',
+    'player/male/pain25_2.wav',
+    'player/male/pain50_1.wav',
+    'player/male/pain50_2.wav',
+    'player/male/pain75_1.wav',
+    'player/male/pain75_2.wav',
+    'player/male/pain100_1.wav',
+    'player/male/pain100_2.wav',
+    'player/male/death1.wav',
+    'player/male/death2.wav',
+    'player/male/death3.wav',
+    'player/male/death4.wav',
+    // drown gurps (C `*gurpN` → S_RegisterSexedSound male fallback)
+    'player/male/gurp1.wav',
+    'player/male/gurp2.wav',
+    // water hooks (C p_view.c P_WorldEffects)
+    'player/watr_in.wav',
+    'player/watr_out.wav',
+    'player/watr_un.wav',
+    'player/gasp1.wav',
+    'player/gasp2.wav',
+    'player/drown1.wav',
+    'player/lava_in.wav',
+    'player/burn1.wav',
+    'player/burn2.wav',
+    // suit breath (C P_WorldEffects breather block)
+    'player/u_breath1.wav',
+    'player/u_breath2.wav',
+  ];
+
+  it('every curated emission resolves + decodes', { timeout: 60000 }, async () => {
+    const { readFileSync } = await import('fs');
+    const { parseWavHeader } = await import('@q2/formats');
+    const { ingestPak, findPakSoundEntry, readPakEntry } = await import('./pak.js');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const pak = ingestPak(buf);
+    for (const name of EMITTED) {
+      const entry = findPakSoundEntry(pak, name);
+      expect(entry, name).not.toBeNull();
+      const wav = readPakEntry(pak, entry!.name);
+      expect(() => parseWavHeader(wav), name).not.toThrow();
+      expect(parseWavHeader(wav).rate).toBeGreaterThan(0);
+    }
+  });
+
+  it('the M7.2 bot session emits nothing outside the resolvable set', { timeout: 180000 }, async () => {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak, findPakSoundEntry } = await import('./pak.js');
+    const pak = ingestPak(buf);
+    const boot = bootPlay({ width: 96, height: 72, pak });
+    expect(boot.source).toBe('pak');
+    const { driver } = boot;
+    // Damage (pain), shotgun pickup, a kill, exit — the same beats as M7.2.
+    driver.damagePlayer(30);
+    driver.pm.origin = v3(800, -96, -144);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 5);
+    const target = driver.server.monsters.find((m) => m.edict.extra['skinnum'] === '2') ?? driver.server.monsters[0]!;
+    for (let i = 0; i < 60 && !target.state.dead; i++) {
+      driver.pm.origin = v3(target.edict.origin[0]! + 48, target.edict.origin[1]!, target.edict.origin[2]! + 24);
+      driver.pm.velocity = v3();
+      const yaw = (Math.atan2(target.edict.origin[1]! - driver.pm.origin[1]!, target.edict.origin[0]! - driver.pm.origin[0]!) * 180) / Math.PI;
+      driver.step({ msec: 100, angles: [0, yaw, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_ATTACK }, 0.1);
+    }
+    expect(driver.heardSounds.length).toBeGreaterThan(0);
+    for (const name of new Set(driver.heardSounds)) {
+      expect(findPakSoundEntry(pak, name), name).not.toBeNull();
+    }
+  });
+});
+
+describe('sweep gameplay: yaw-lerp between 10Hz ticks (devroom, headless)', () => {
+  it('entityAngles walks the short arc monotonically, then converges', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    const m = SV_SpawnMonster(driver.server, 'monster_soldier', v3(0, 0, 24));
+    // Tick with the body held at 0: prev snapshot pins 0.
+    m.state.yaw = 0;
+    driver.step(neutralCmd(), 0.1);
+    m.state.yaw = 0;
+    driver.step(neutralCmd(), 0.1);
+    // Live jumps 0 -> 90 after the tick (as if the tick turned it).
+    m.state.yaw = 90;
+    const got: number[] = [];
+    for (let i = 0; i < 6; i++) got.push(driver.entityAngles(m.edict.num)![1]);
+    for (let i = 1; i < got.length; i++) expect(got[i]!).toBeGreaterThan(got[i - 1]!);
+    expect(got[0]!).toBeGreaterThan(0);
+    expect(got[5]!).toBeCloseTo(90, 9);
+    // Wrap: 350 -> 10 steps +20 through 360, never backwards.
+    m.state.yaw = 350;
+    driver.step(neutralCmd(), 0.1);
+    m.state.yaw = 350;
+    driver.step(neutralCmd(), 0.1);
+    m.state.yaw = 10;
+    const wrap: number[] = [];
+    for (let i = 0; i < 6; i++) wrap.push(driver.entityAngles(m.edict.num)![1]);
+    for (let i = 1; i < wrap.length; i++) expect(wrap[i]!).toBeGreaterThan(wrap[i - 1]!);
+    for (const w of wrap) {
+      expect(w).toBeGreaterThan(350);
+      expect(w).toBeLessThanOrEqual(370);
+    }
+    expect(((wrap[5]! % 360) + 360) % 360).toBeCloseTo(10, 9);
+    // Converged: the next tick pins prev = live, renders hold it exactly.
+    driver.step(neutralCmd(), 0.1);
+    m.state.yaw = 10;
+    expect(driver.entityAngles(m.edict.num)).toEqual([0, 10, 0]);
+    expect(driver.entityAngles(999999)).toBeNull();
+  });
+});
+
+describe.runIf(!!WEB_Q2_PAK)('sweep gameplay: corpse overkill mince (base1, Q2_PAK)', () => {
+  it('re-hitting a deadsoldier past -80 minces it: gibs + udeath, corpse persists', { timeout: 180000 }, async () => {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const boot = bootPlay({ width: 96, height: 72, pak: ingestPak(buf) });
+    expect(boot.source).toBe('pak');
+    const { driver } = boot;
+    expect(boot.models!.corpse).toBeGreaterThanOrEqual(0);
+    // Pick a corpse with no live monster nearby so the gib attribution
+    // below (gibs within 40u of the corpse) is unambiguous.
+    const corpses = driver.server.entities.filter((e) => !e.freed && e.classname === 'misc_deadsoldier');
+    expect(corpses.length).toBe(12);
+    const target = corpses.find(
+      (c) =>
+        !driver.server.monsters.some(
+          (m) =>
+            !m.state.gibbed &&
+            Math.hypot(m.edict.origin[0]! - c.origin[0]!, m.edict.origin[1]! - c.origin[1]!) < 150,
+        ),
+    )!;
+    expect(target).toBeDefined();
+    const gibsNear = (): number =>
+      driver.server.gibs.filter(
+        (g) => Math.hypot(g.origin[0]! - target!.origin[0]!, g.origin[1]! - target!.origin[1]!) < 40,
+      ).length;
+    expect(gibsNear()).toBe(0);
+    // Park 80u off at corpse height + 24 and drill it with aimed blaster
+    // fire (3D aim: pitch positive = down). ~6 connecting bolts (15dmg)
+    // cross the C -80 threshold.
+    const eye = (): [number, number, number] => [
+      driver.pm.origin[0]!,
+      driver.pm.origin[1]!,
+      driver.pm.origin[2]! + driver.pm.viewheight,
+    ];
+    const aimAt = (to: [number, number, number]): [number, number, number] => {
+      const e = eye();
+      const dx = to[0] - e[0];
+      const dy = to[1] - e[1];
+      const dz = to[2] - e[2];
+      return [
+        (-Math.atan2(dz, Math.hypot(dx, dy)) * 180) / Math.PI,
+        (Math.atan2(dy, dx) * 180) / Math.PI,
+        0,
+      ];
+    };
+    const heart: [number, number, number] = [target!.origin[0]!, target!.origin[1]!, target!.origin[2]! + 8];
+    const side: [number, number, number] = [target!.origin[0]! + 80, target!.origin[1]!, target!.origin[2]! + 24];
+    for (let i = 0; i < 120 && gibsNear() < 5; i++) {
+      driver.pm.origin = v3(side[0], side[1], side[2]);
+      driver.pm.velocity = v3();
+      driver.step({ msec: 100, angles: aimAt(heart), forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_ATTACK }, 0.1);
+    }
+    // Overkill minced: 4x meat + head near the corpse, udeath heard, the
+    // driver 'gib' event fired — and C keeps the corpse (no G_FreeEdict):
+    // still standing in the roster and in the render extras.
+    expect(gibsNear()).toBeGreaterThanOrEqual(5);
+    expect(driver.heardSounds).toContain('misc/udeath.wav');
+    expect(driver.events).toContain('gib');
+    expect(target!.freed).toBe(false);
+    expect(target!.health).toBeLessThanOrEqual(-80);
+    const rendered = driver.extraEntities()!.filter((x) => x.model === boot.models!.corpse);
+    expect(rendered.length).toBe(12);
   });
 });

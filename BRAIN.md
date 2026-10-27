@@ -968,8 +968,10 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - `SV_WorldContents` before and early-returned — the browser never drowned).
 - Play-verified in the driver loop (`drowning.test.ts`, real low-road pool:
 - waterlevel 3, airLeft 12s grace, 4,6,8…15 ramp at 1/s, watr_in/gurp/gasp
-- hooks, resurface recovery; vault engages at a real wall). Remaining tail:
-- breather/envirosuit have no items (air runs on schedule).
+- hooks, resurface recovery; vault engages at a real wall). Breather/
+- envirosuit tail CLOSED by the sweep gameplay lane (see consolidated
+- list): suits are items with 30s stacking timers, full P_WorldEffects
+- immunity, breath/airout hooks and HUD-exposed seconds.
 - CLOSED 2026-10-26 (HUD lane, reverses 105ff90): `fps N` (gated by
 - `cl_showfps`) renders top-right INSIDE the framebuffer and `pos x y z yaw
 - <yaw>` (gated by `cl_showpos`, default ON) top-left INSIDE the framebuffer,
@@ -1072,13 +1074,31 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - slot, devtools review doc, `CAPTURE-M4.1.md`, voodoo `captureCVarTable()`)
 - but NO real Voodoo3 capture yet — human review pending; the M4.1
 - done-when box stays unchecked until sign-off is recorded here.
-- OPEN (swept 2026-10-26): driver channel names still placeholders
-- (`doors/door.wav` vs `doors/dr1_strt.wav`, `items/pickup.wav` vs
-- `items/pkup.wav`) — rename to real pak names + update the M7.2 bot-test
-- assertion; snapshot LerpAngle (`client/cl_ents.c`) yaw interp between
-- 10Hz snapshots (entity-frame RF_FRAMELERP landed; `play.ts`
-- TODO(interp) still open); surface-cache hit-rate ledger number on a
-- base1/demo1 flythrough (`testCacheStats` exposed, devroom 100% measured).
+- OPEN (surface-cache ledger): hit-rate number on a base1/demo1 flythrough
+- (`testCacheStats` exposed, devroom 100% measured).
+- CLOSED 2026-10-26 (sweep gameplay lane, this card): (1) driver channel
+- names are the real pak lumps (doors/dr1_strt.wav, switches/butn2.wav,
+- items/pkup.wav, banded player/male/painN_M.wav + deathN.wav with the
+- health<-40 udeath gib branch, C `*gurpN` resolved to the male fallback
+- at emit) — M7.2 bot-test assertions updated, and a Q2_PAK test asserts
+- every emitted name resolves + its wav header decodes; (2) corpse
+- overkill-mince wired (bolt/pellet sweeps hit misc_deadsoldier hulls
+- nearest-wins; SV_DamageDeadsoldier minces past -80 through the shared
+- gib pipeline, corpse persists and re-gibs — C has no G_FreeEdict;
+- play-verified gib-overkill bot test); (3) breather/envirosuit are items
+- (30s stacking Use_* timers, pickup arms directly — no inventory UI),
+- with P_WorldEffects immunity (protected air, alternating breath pair,
+- enviro lava 3->1x + slime immunity, airout fade warning) and
+- HUD-exposed seconds (expose only); play-verified breather bot test;
+- (4) yaw (only yaw) interpolates between 10Hz ticks (C LerpAngle in
+- @q2/client; driver prev-tick yaw + render-cadence frac, monotonic and
+- bounded by the live yaw; position stays predictor-owned; no §6
+- contract change; `play.ts` TODO(interp) closed).
+- NOTE (cross-lane, for the rider/button lane): gate (t) currently fails
+- with that lane's in-progress SV_CarryRiders hunk in the tree (exit *33
+- never opens in the 400-tick camp); with HEAD play.ts + this sweep's
+- changes (t) is green — evidence in the sweep report. Not touched here
+- (out of this lane's lock).
 - CLOSED 2026-10-26 (menu/HUD lane, checkboxes + pos readout): every
 - boolean cvar in the config panel is a checkbox (15 in `CHECKBOX_CVARS`:
 - `cl_showfps`/`cl_showpos`, all eight 0/1 `vd_*` fidelity switches,

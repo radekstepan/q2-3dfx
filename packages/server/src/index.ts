@@ -64,6 +64,17 @@ import {
   BOLT_SPEED,
   BLASTER_TRAIL_COLOR,
   GIB_SOUND,
+  DEADSOLDIER_GIB_MODELS,
+  DEADSOLDIER_GIB_SOUND,
+  damageDeadsoldier,
+  SUIT_AIR_SECONDS,
+  SUIT_BREATH_PERIOD,
+  SUIT_BREATH_SOUNDS,
+  SUIT_WARN_SECONDS,
+  SUIT_WARN_SOUND,
+  suitSizzleDamage,
+  CONTENTS_LAVA as PMOVE_CONTENTS_LAVA,
+  CONTENTS_SLIME as PMOVE_CONTENTS_SLIME,
   HITSCAN_TRACER_COLOR,
   SOLDIER_WEAPON_STATS,
   machinegunKick,
@@ -139,6 +150,14 @@ import {
   spawnSecretDoor,
 } from './doors.js';
 import type { RotMover, SecretMover } from './doors.js';
+import {
+  BUTTON_USE_DOT,
+  BUTTON_USE_REACH,
+  buttonCanFire,
+  displacedCenter,
+  isButtonTouchable,
+  selectUseButton,
+} from './buttons.js';
 
 export interface ServerState {
   /** level.time in seconds (float). Never wall-clock. */
@@ -232,6 +251,24 @@ export interface ServerState {
    * rendering; this field is the cross-lane value (no HUD files touched).
    */
   playerAirLeft: number;
+  /**
+   * Timed-suit state (rebreather / envirosuit, game/g_items.c Use_* +
+   * p_view.c P_WorldEffects). Until-times are level.time seconds (0 = no
+   * effect — C compares breather/enviro_framenum > level.framenum); the
+   * Left fields are HUD-exposed seconds remaining (expose only — the HUD
+   * lane owns rendering). breathToggle alternates the u_breath pair
+   * (C client->breather_sound ^= 1); nextBreathAt schedules it every
+   * SUIT_BREATH_PERIOD while submerged+protected; the Warned flags fire
+   * the items/airout.wav fade warning once per arming at <=3s remaining.
+   */
+  playerBreatherUntil: number;
+  playerEnviroUntil: number;
+  playerBreatherLeft: number;
+  playerEnviroLeft: number;
+  breathToggle: boolean;
+  nextBreathAt: number;
+  breatherWarned: boolean;
+  enviroWarned: boolean;
   /** Player-trail ring (p_trail.c): pursuit memory when LOS breaks. */
   trail: PlayerTrail;
   /** point_combat firing positions (g_misc.c SP_point_combat). */
@@ -239,7 +276,7 @@ export interface ServerState {
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, trail: trailInit(false), combatPoints: [] };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [] };
 }
 
 /** Link an edict into the world (SV_LinkEdict: register + solid bookkeeping). */
@@ -520,6 +557,52 @@ export function sweepBrushBox(
 }
 
 /**
+ * Current world-space clip box of a slider/button mover: the rest brush
+ * bounds shifted by the travelled offset (ent.origin - pos1). C links every
+ * SOLID_BSP mover brush, so standing, shots and sight all collide with the
+ * slab where it IS, not where it rested (the parked-lift fall-through was
+ * the mover missing from this trace entirely).
+ */
+export function SV_MoverClipBox(
+  st: ServerState,
+  m: Mover,
+): { mins: Float32Array; maxs: Float32Array } | null {
+  const b = st.moverBounds.get(m.ent.num);
+  if (!b || m.ent.freed) return null;
+  const dx = m.ent.origin[0]! - m.pos1[0]!;
+  const dy = m.ent.origin[1]! - m.pos1[1]!;
+  const dz = m.ent.origin[2]! - m.pos1[2]!;
+  if (dx === 0 && dy === 0 && dz === 0) return b;
+  return {
+    mins: new Float32Array([b.mins[0]! + dx, b.mins[1]! + dy, b.mins[2]! + dz]),
+    maxs: new Float32Array([b.maxs[0]! + dx, b.maxs[1]! + dy, b.maxs[2]! + dz]),
+  };
+}
+
+/**
+ * Current world-space clip box of a brush func_train: the rest brush bounds
+ * shifted by the train origin (brush-model origins are 0 in base1, so rest
+ * is the mapper bounds and the live offset is ent.origin itself). Point
+ * ships (misc_strogg_ship) have no brush and never clip.
+ */
+export function SV_TrainClipBox(
+  st: ServerState,
+  tr: Train,
+): { mins: Float32Array; maxs: Float32Array } | null {
+  if (tr.ship) return null;
+  const b = st.moverBounds.get(tr.ent.num);
+  if (!b || tr.ent.freed) return null;
+  const dx = tr.ent.origin[0]!;
+  const dy = tr.ent.origin[1]!;
+  const dz = tr.ent.origin[2]!;
+  if (dx === 0 && dy === 0 && dz === 0) return b;
+  return {
+    mins: new Float32Array([b.mins[0]! + dx, b.mins[1]! + dy, b.mins[2]! + dz]),
+    maxs: new Float32Array([b.maxs[0]! + dx, b.maxs[1]! + dy, b.maxs[2]! + dz]),
+  };
+}
+
+/**
  * World trace plus the solid brush clips (func_explosive / func_wall while
  * standing). Drivers that move bodies (pmove, monster locomotion) should run
  * against this instead of the bare world trace so walls block until
@@ -537,7 +620,14 @@ export function SV_ClipTrace(st: ServerState, worldTrace: TraceFn): TraceFn {
   return (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => {
     let best = worldTrace(start, mins, maxs, end);
     let clipEnt = -1;
-    for (const [num, b] of st.brushClips) {
+    // One shared nearest-wins pass over every SOLID_BSP clip: static brush
+    // clips first, then the live mover/train boxes (doors/buttons/plats at
+    // their travelled offset, brush trains at their corner offset). Like C
+    // (SV_ClipMoveToEntities), the clip that stops the move owns the hit, so
+    // pmove's groundEntity links riders to the pusher they stand on
+    // (groundentity == pusher rides in SV_Push).
+    const consider = (num: number, b: { mins: Float32Array; maxs: Float32Array } | null): void => {
+      if (!b) return;
       const hit = sweepBrushBox(start, end, mins, maxs, b.mins, b.maxs);
       if (hit.fraction < best.fraction || hit.allsolid) {
         const f = hit.fraction;
@@ -557,7 +647,13 @@ export function SV_ClipTrace(st: ServerState, worldTrace: TraceFn): TraceFn {
         };
         clipEnt = num;
       }
+    };
+    for (const [num, b] of st.brushClips) consider(num, b);
+    for (const m of st.movers) {
+      if (m.ent.classname !== 'func_door' && m.ent.classname !== 'func_button' && m.ent.classname !== 'func_plat') continue;
+      consider(m.ent.num, SV_MoverClipBox(st, m));
     }
+    for (const tr of st.trains) consider(tr.ent.num, SV_TrainClipBox(st, tr));
     if (clipEnt >= 0) best.entityNum = clipEnt;
     return best;
   };
@@ -980,9 +1076,18 @@ export function SV_SpawnEntities(
         }
         break;
       }
-      case 'func_plat':
-        SV_SpawnMover(st, spawnPlat(e, parseFloat(dict['height'], 160)));
+      case 'func_plat': {
+        // C SOLID_BSP while standing: plats carry riders (SV_Push), so the
+        // driver trace must see the brush — record bounds like doors.
+        const m = spawnPlat(e, parseFloat(dict['height'], 160));
+        SV_SpawnMover(st, m);
+        const model = dict['model'];
+        if (modelSizes && model) {
+          const bounds = modelSizes(model);
+          if (bounds) st.moverBounds.set(e.num, { mins: bounds.mins, maxs: bounds.maxs });
+        }
         break;
+      }
       case 'func_button': {
         const m = spawnButton(e, angle);
         SV_SpawnMover(st, m);
@@ -1501,6 +1606,91 @@ export function SV_TouchDoorsAt(
     if (res !== null) used.push(rm);
   }
   return used;
+}
+
+/**
+ * Touch func_button brushes (id button_touch, g_func.c): a live player body
+ * overlapping the button's CURRENT brush box (it travels a few units when
+ * pressed) presses it — C button_fire, which is a no-op while the button
+ * is already UP or holding TOP. Only touchable buttons answer touch
+ * (SP_func_button installs touch solely when the button carries no
+ * targetname and no health — remote/health buttons answer use only), only
+ * clients press (monsters never trip buttons), and dead players press
+ * nothing. Buttons without registered brush bounds are skipped.
+ *
+ * Returns the buttons that started moving.
+ */
+export function SV_TouchButtonsAt(
+  st: ServerState,
+  body: { origin: Vec3; mins: Vec3; maxs: Vec3 },
+  toucherClass: 'player' | 'monster' = 'player',
+): Mover[] {
+  const used: Mover[] = [];
+  if (toucherClass !== 'player') return used;
+  if (st.playerHealth <= 0) return used;
+  for (const m of st.movers) {
+    if (m.ent.classname !== 'func_button' || m.ent.freed) continue;
+    if (!isButtonTouchable(m.ent)) continue;
+    const box = SV_MoverClipBox(st, m);
+    if (!box) continue;
+    if (!bodyOverlapsBounds(body.origin, body.mins, body.maxs, box.mins, box.maxs)) continue;
+    // C button_fire: UP/TOP presses are no-ops (no leg restart, and — unlike
+    // doors — no target re-fire until the button returns to BOTTOM).
+    if (!buttonCanFire(m)) continue;
+    SV_UseMover(st, m);
+    used.push(m);
+  }
+  return used;
+}
+
+/**
+ * E-use a func_button (driver `use` key): press the AIMED button within
+ * reach inside the facing cone — C button_use semantics (button_fire gate:
+ * UP/TOP no-op, wait/-1 holds TOP) with the button's own touch rules for
+ * health/targetname untouched (use answers any live button, like C).
+ * A zero-hull eye→center trace rejects presses through walls (the button's
+ * own brush reports the button's edict num and passes); without a trace
+ * hook the reach+facing gates alone decide. Only the aimed (nearest)
+ * button fires — firing one button never fans out to other targetnames.
+ *
+ * Returns the pressed button, or null when nothing was in reach/aim (or a
+ * wall stood between, or the aimed button was already UP/TOP).
+ */
+export function SV_UseButton(
+  st: ServerState,
+  eye: Vec3,
+  fwd: Vec3,
+  opts?: { trace?: TraceFn; reach?: number; dot?: number },
+): Mover | null {
+  const centers: Array<{ m: Mover; center: Vec3 }> = [];
+  for (const m of st.movers) {
+    if (m.ent.classname !== 'func_button' || m.ent.freed) continue;
+    // SV_MoverClipBox already returns the CURRENT (travelled) box, so the
+    // center needs no extra offset.
+    const box = SV_MoverClipBox(st, m);
+    if (!box) continue;
+    centers.push({ m, center: displacedCenter(box, v3(0, 0, 0)) });
+  }
+  const m = selectUseButton(
+    centers,
+    eye,
+    fwd,
+    opts?.reach ?? BUTTON_USE_REACH,
+    opts?.dot ?? BUTTON_USE_DOT,
+  );
+  if (!m) return null;
+  if (opts?.trace) {
+    const box = SV_MoverClipBox(st, m);
+    if (!box) return null;
+    const center = displacedCenter(box, v3(0, 0, 0));
+    const t = opts.trace(eye, ZERO_HULL, ZERO_HULL, center);
+    // The button's own brush owns the trace end (the trace runs inside it);
+    // any other stop short of the center is a wall between eye and button.
+    if (t.entityNum !== m.ent.num && t.fraction < 1) return null;
+  }
+  if (!buttonCanFire(m)) return null;
+  SV_UseMover(st, m);
+  return m;
 }
 
 // --- monster tick (game/g_ai.c M_CheckAttack + m_move.c locomotion) -----------
@@ -2349,6 +2539,17 @@ export function SV_SetPlayerHealth(st: ServerState, hp: number): number {
 }
 
 /**
+ * Set the timed-suit timers (pickup/respawn path; level.time seconds, the
+ * C breather/enviro_framenum domain). The driver mirrors its PlayerState
+ * timers here after a suit grant (like SV_SetPlayerHealth for pickups) and
+ * clears them on respawn (C p_client.c zeroes both framenums on respawn).
+ */
+export function SV_SetPlayerSuit(st: ServerState, breatherUntil: number, enviroUntil: number): void {
+  st.playerBreatherUntil = Math.max(0, breatherUntil);
+  st.playerEnviroUntil = Math.max(0, enviroUntil);
+}
+
+/**
  * T_Damage on a monster (g_combat.c gib-first ordering via monsterPain).
  * Gibbing spawns meat/chest/head extras + the udeath sound and marks
  * DEAD_DEAD (unhittable from then on). Returns the pain result.
@@ -2393,6 +2594,51 @@ export function SV_DamageMonster(
     }
   }
   return res;
+}
+
+/**
+ * T_Damage on a misc_deadsoldier corpse (C g_misc.c misc_deadsoldier_die):
+ * hits accumulate on the edict health (0 at spawn); at/below -80 the hit
+ * minces — 4x sm_meat + head2 gibs through the shared gib pipeline plus
+ * the udeath sound. The corpse is NOT freed (C has no G_FreeEdict here),
+ * so it keeps taking damage and re-gibs on every qualifying hit.
+ * Returns true exactly when this hit minced (caller synthesizes the
+ * driver 'gib' event from the per-edict gib counter in extra).
+ */
+export function SV_DamageDeadsoldier(
+  st: ServerState,
+  e: Edict,
+  damage: number,
+  rand: () => number,
+): boolean {
+  const hit = damageDeadsoldier(e.health, damage);
+  e.health = hit.health;
+  if (!hit.gibbed) return false;
+  st.sounds.push({ name: DEADSOLDIER_GIB_SOUND, pos: v3(e.origin[0], e.origin[1], e.origin[2]), born: st.time });
+  for (const kind of DEADSOLDIER_GIB_MODELS) {
+    const gkind: ServerGib['kind'] = kind === 'head2' ? 'head' : 'meat';
+    const scale = damage < 50 ? 0.7 : 1.2;
+    st.gibs.push({
+      origin: v3(
+        e.origin[0]! + (rand() * 2 - 1) * 16,
+        e.origin[1]! + (rand() * 2 - 1) * 16,
+        e.origin[2]! + (rand() * 2 - 1) * 16,
+      ),
+      vel: v3(
+        Math.max(-300, Math.min(300, 100 * (rand() * 2 - 1) * scale * 0.5)),
+        Math.max(-300, Math.min(300, 100 * (rand() * 2 - 1) * scale * 0.5)),
+        Math.max(200, Math.min(500, (200 + 100 * rand()) * scale * 0.5)),
+      ),
+      avel: v3(rand() * 600, rand() * 600, rand() * 600),
+      born: st.time,
+      life: 10 + rand() * 10,
+      kind: gkind,
+      rest: false,
+    });
+  }
+  const seen = Number.parseInt(e.extra['gibHits'] ?? '0', 10);
+  e.extra['gibHits'] = String((Number.isFinite(seen) ? seen : 0) + 1);
+  return true;
 }
 
 /**
@@ -2786,6 +3032,9 @@ interface BoltSweep {
   hitMonster: ServerMonster | null;
   tBarrel: number | null;
   hb: ServerBarrel | null;
+  /** Nearest misc_deadsoldier corpse (re-hit past -80 minces, g_misc.c). */
+  tCorpse: number | null;
+  hitCorpse: Edict | null;
 }
 
 /**
@@ -2793,6 +3042,8 @@ interface BoltSweep {
  * the C touch): nearest player-box hit for foe bolts, nearest monster +
  * barrel for player bolts. Dormant TRIGGER_SPAWN monsters are SOLID_NOT in
  * C and skip until woken; gibbed bodies are gone; corpses stay hittable.
+ * misc_deadsoldier corpses (SOLID_BBOX 32x32x16, takedamage YES) join the
+ * sweep so re-hitting them past -80 minces via SV_DamageDeadsoldier.
  */
 function sweepBoltEntities(st: ServerState, bolt: ServerBolt, player: SVPlayerBody, seg: Vec3): BoltSweep {
   let tPlayer: number | null = null;
@@ -2833,7 +3084,27 @@ function sweepBoltEntities(st: ServerState, bolt: ServerBolt, player: SVPlayerBo
       }
     }
   }
-  return { tPlayer, tMonster, hitMonster, tBarrel, hb };
+  // Dead-soldier corpses (g_misc.c SP_misc_deadsoldier: SOLID_BBOX
+  // 32x32x16 at the lump origin, takedamage YES at DEAD_DEAD): hittable
+  // scenery, never freed. Only live edicts sweep (freed = picked-up item
+  // edicts share the roster, never corpses).
+  let hitCorpse: Edict | null = null;
+  let tCorpse: number | null = null;
+  if (!bolt.foe) {
+    for (const e of st.entities) {
+      if (e.freed || e.classname !== 'misc_deadsoldier') continue;
+      const tHit = segmentAabbSeg(
+        bolt.pos, seg,
+        v3(e.origin[0]! - 16, e.origin[1]! - 16, e.origin[2]!),
+        v3(e.origin[0]! + 16, e.origin[1]! + 16, e.origin[2]! + 16),
+      );
+      if (tHit !== null && (tCorpse === null || tHit < tCorpse)) {
+        tCorpse = tHit;
+        hitCorpse = e;
+      }
+    }
+  }
+  return { tPlayer, tMonster, hitMonster, tBarrel, hb, tCorpse, hitCorpse };
 }
 
 /**
@@ -2905,7 +3176,7 @@ function stepBoltFlight(
       // Nearest wins; ties fall through to the wall (the bolt face-plants
       // rather than phasing into the edict), matching the C trace bias.
       const tWall = wall!.fraction;
-      const { tPlayer, tMonster, hitMonster, tBarrel, hb } = sweep;
+      const { tPlayer, tMonster, hitMonster, tBarrel, hb, tCorpse, hitCorpse } = sweep;
       const eps = TOUCH_EPS;
       if (tPlayer !== null && tPlayer < tWall - eps && (tMonster === null || tPlayer <= tMonster) && (tBarrel === null || tPlayer <= tBarrel)) {
         const hitPos = v3(bolt.pos[0]! + seg[0]! * tPlayer, bolt.pos[1]! + seg[1]! * tPlayer, bolt.pos[2]! + seg[2]! * tPlayer);
@@ -2921,7 +3192,7 @@ function stepBoltFlight(
           });
         }
         dead = true;
-      } else if (hitMonster !== null && tMonster !== null && tMonster < tWall - eps && (tBarrel === null || tMonster <= tBarrel)) {
+      } else if (hitMonster !== null && tMonster !== null && tMonster < tWall - eps && (tBarrel === null || tMonster <= tBarrel) && (tCorpse === null || tMonster <= tCorpse)) {
         const hitPos = v3(
           bolt.pos[0]! + seg[0]! * tMonster,
           bolt.pos[1]! + seg[1]! * tMonster,
@@ -2929,9 +3200,21 @@ function stepBoltFlight(
         );
         SV_BlasterImpact(st, hitPos, bolt.damage, hitMonster, rand);
         dead = true;
-      } else if (hb !== null && tBarrel !== null && tBarrel < tWall - eps) {
+      } else if (hb !== null && tBarrel !== null && tBarrel < tWall - eps && (tCorpse === null || tBarrel <= tCorpse)) {
         SV_DamageBarrel(st, hb, bolt.damage);
         SV_BlasterImpact(st, v3(hb.origin[0], hb.origin[1], hb.origin[2]), bolt.damage, null, rand);
+        dead = true;
+      } else if (hitCorpse !== null && tCorpse !== null && tCorpse < tWall - eps) {
+        // Corpse touch (g_misc.c misc_deadsoldier_die via T_Damage): the
+        // bolt minces past -80 (gibs + udeath) and dies either way — live
+        // edicts win ties above, so scenery never shields a firefight.
+        const hitPos = v3(
+          bolt.pos[0]! + seg[0]! * tCorpse,
+          bolt.pos[1]! + seg[1]! * tCorpse,
+          bolt.pos[2]! + seg[2]! * tCorpse,
+        );
+        SV_DamageDeadsoldier(st, hitCorpse, bolt.damage, rand);
+        SV_BlasterImpact(st, hitPos, bolt.damage, null, rand);
         dead = true;
       } else if (tWall < 1) {
         // Wall touch (g_weapon.c blaster_touch): everything non-sky
@@ -3012,21 +3295,78 @@ function stepChunks(
  * hooks through the existing positional-sound events. Skips when no map is
  * wired (devroom/asset-free paths have no water; air stays at grace).
  * The HUD air indicator reads st.playerAirLeft (no HUD files touched).
+ * Timed suits (rebreather/envirosuit): C P_WorldEffects branches — active
+ * while the Until timer exceeds level.time; protected air (air_finished =
+ * time+10 while the head is under), breath sounds every 2.5s submerged,
+ * envirosuit lava 3->1x + slime immunity, airout fade warning at <=3s.
+ * HUD-exposed suit seconds land in playerBreatherLeft/playerEnviroLeft.
  */
 function stepWorldEffects(st: ServerState, game: SVGameTick, rand: () => number): void {
   const contents = game.contents ?? SV_WorldContents;
   if (!contents) return;
   const p = game.player;
   const sample = sampleWaterLevel(p.pos, p.mins, p.view, contents);
+  // C breather/enviro_framenum > level.framenum (level.time seconds here).
+  const breather = st.time < st.playerBreatherUntil;
+  const enviro = st.time < st.playerEnviroUntil;
+  st.playerBreatherLeft = Math.max(0, st.playerBreatherUntil - st.time);
+  st.playerEnviroLeft = Math.max(0, st.playerEnviroUntil - st.time);
+  if ((breather || enviro) && sample.level === 3) {
+    // C: breather || envirosuit give air — air_finished = level.time + 10.
+    st.playerWorld.airFinished = Math.max(st.playerWorld.airFinished, st.time + SUIT_AIR_SECONDS);
+  }
   const res = updateWorldEffects(
     st.playerWorld,
     { time: st.time, waterlevel: sample.level, watertype: sample.type, health: st.playerHealth },
     rand,
   );
   st.playerAirLeft = res.airLeft;
-  if (res.damage > 0) SV_DamagePlayer(st, res.damage);
+  // C sizzle with the envirosuit (lava 3->1x, slime immune): the pure helper
+  // computes both, so subtract the suited difference. sample.type is the
+  // pmove bit space (SLIME 4 / LAVA 8) — not the server q_shared consts.
+  // (Drown damage is zero here — protected air never runs out — so
+  // res.damage is pure sizzle and the adjustment is exact.)
+  let damage = res.damage;
+  if (enviro && sample.level > 0) {
+    const inLava = (sample.type & PMOVE_CONTENTS_LAVA) !== 0;
+    const inSlime = (sample.type & PMOVE_CONTENTS_SLIME) !== 0;
+    damage = Math.max(
+      0,
+      damage - suitSizzleDamage(sample.level, inLava, inSlime, false) + suitSizzleDamage(sample.level, inLava, inSlime, true),
+    );
+  }
+  if (damage > 0) SV_DamagePlayer(st, damage);
+  // C P_WorldEffects hooks first (enter/exit/gasp/gurp, in C order), then
+  // the suit extras below (breath lives in the drown block, airout in the
+  // later blend pass).
   for (const name of res.sounds) {
-    st.sounds.push({ name, pos: v3(p.pos[0], p.pos[1], p.pos[2]), born: st.time });
+    // C S_RegisterSexedSound (client/snd_dma.c): `*gurpN` resolves through
+    // the player model, defaulting to male (player/male/gurpN.wav) — the
+    // `*` never names a pak lump, so emit the resolved concrete name.
+    const resolved =
+      name === '*gurp1.wav' ? 'player/male/gurp1.wav' : name === '*gurp2.wav' ? 'player/male/gurp2.wav' : name;
+    st.sounds.push({ name: resolved, pos: v3(p.pos[0], p.pos[1], p.pos[2]), born: st.time });
+  }
+  // C breath sounds while submerged+protected: every 25 frames, alternating
+  // u_breath1/2 (C client->breather_sound ^= 1; anchored to remaining
+  // framenums there, to a 2.5s schedule here — same audible cadence).
+  if ((breather || enviro) && sample.level === 3 && st.time >= st.nextBreathAt) {
+    const snd = st.breathToggle ? SUIT_BREATH_SOUNDS[1]! : SUIT_BREATH_SOUNDS[0]!;
+    st.sounds.push({ name: snd, pos: v3(p.pos[0], p.pos[1], p.pos[2]), born: st.time });
+    st.breathToggle = !st.breathToggle;
+    st.nextBreathAt = st.time + SUIT_BREATH_PERIOD;
+  }
+  // C fade warning (p_view.c blend block): items/airout.wav once per arming
+  // at 30 frames (3s) remaining.
+  if (st.playerBreatherLeft > SUIT_WARN_SECONDS) st.breatherWarned = false;
+  else if (breather && !st.breatherWarned) {
+    st.sounds.push({ name: SUIT_WARN_SOUND, pos: v3(p.pos[0], p.pos[1], p.pos[2]), born: st.time });
+    st.breatherWarned = true;
+  }
+  if (st.playerEnviroLeft > SUIT_WARN_SECONDS) st.enviroWarned = false;
+  else if (enviro && !st.enviroWarned) {
+    st.sounds.push({ name: SUIT_WARN_SOUND, pos: v3(p.pos[0], p.pos[1], p.pos[2]), born: st.time });
+    st.enviroWarned = true;
   }
 }
 
@@ -3303,10 +3643,43 @@ export function SV_PlayerFire(
         hitBarrel = b;
       }
     }
-    if (hitBarrel && !hitBarrel.edict.freed) {
+    // Dead-soldier corpses (g_misc.c SP_misc_deadsoldier: SOLID_BBOX
+    // 32x32x16 at the lump origin, takedamage YES): hittable scenery, same
+    // nearest-wins rule as the bolt path (live edicts win ties).
+    let hitCorpse: Edict | null = null;
+    let corpseT = bestT;
+    for (const e of st.entities) {
+      if (e.freed || e.classname !== 'misc_deadsoldier') continue;
+      const tHit = segmentAabbSeg(
+        opts.eye, seg,
+        v3(e.origin[0]! - 16, e.origin[1]! - 16, e.origin[2]!),
+        v3(e.origin[0]! + 16, e.origin[1]! + 16, e.origin[2]! + 16),
+      );
+      if (tHit !== null && tHit < corpseT) {
+        corpseT = tHit;
+        hitCorpse = e;
+      }
+    }
+    if (hitBarrel && !hitBarrel.edict.freed && barrelT <= corpseT) {
       SV_DamageBarrel(st, hitBarrel, pl.damage);
-    } else if (hitMonster) {
+    } else if (hitMonster && bestT <= corpseT) {
       SV_DamageMonster(st, hitMonster, pl.damage, opts.rand);
+    } else if (hitCorpse) {
+      // Corpse touch (g_misc.c misc_deadsoldier_die via T_Damage): minces
+      // past -80 (gibs + udeath). Impact sparks draw at the corpse hit
+      // point (corpseT < bestT: the shared hitPos sits past the corpse).
+      SV_DamageDeadsoldier(st, hitCorpse, pl.damage, opts.rand);
+      st.sparks.push({
+        pos: v3(
+          opts.eye[0]! + seg[0]! * corpseT,
+          opts.eye[1]! + seg[1]! * corpseT,
+          opts.eye[2]! + seg[2]! * corpseT,
+        ),
+        color: 200 + ((opts.rand() * 55) | 0),
+        vel: null,
+        ttl: SV_SPARK_TTL,
+        born: st.time,
+      });
     } else if (bestT < 1) {
       // TE_GUNSHOT / TE_SHOTGUN impact: gray sparks + smoke, no beam.
       // Same SOLID_BSP touch rule as the bolt path: a pellet stopping on a

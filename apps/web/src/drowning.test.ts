@@ -95,9 +95,11 @@ describe.runIf(!!WEB_Q2_PAK)('driver water: browser drowning (t1+t2)', () => {
       expect(drops[k]! - drops[k - 1]!).toBeLessThanOrEqual(2);
       expect(drops[k]!).toBeLessThanOrEqual(15);
     }
-    // Per-second drown hooks fired while under (gurp on non-lethal ticks).
+    // Per-second drown hooks fired while under (gurp on non-lethal ticks —
+    // C `*gurpN` sexed sounds resolve to the default male lumps, which is
+    // what the mixer actually decodes: no `*` name ships in the pak).
     expect(
-      driver.heardSounds.some((n) => n === '*gurp1.wav' || n === '*gurp2.wav'),
+      driver.heardSounds.some((n) => n === 'player/male/gurp1.wav' || n === 'player/male/gurp2.wav'),
     ).toBe(true);
     // Air drained while under.
     expect(driver.playerAirLeft).toBeLessThan(6);
@@ -135,5 +137,60 @@ describe.runIf(!!WEB_Q2_PAK)('driver water: browser drowning (t1+t2)', () => {
     expect(driver.pm.pmFlags & PMF_TIME_WATERJUMP).toBe(PMF_TIME_WATERJUMP);
     expect(driver.pm.pmTime).toBeGreaterThan(0);
     expect(driver.pm.velocity[2]!).toBeCloseTo(270, 0);
+  });
+});
+
+describe.runIf(!!WEB_Q2_PAK)('driver suits: rebreather pickup + timed immunity (t3)', () => {
+  it('(t3) pickup arms 30s of C air: no drown damage, breath hooks, clean expiry', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    for (let i = 0; i < 5; i++) driver.step(neutralCmd(), 0.1);
+    // base1 ships no suit items (C parity: Use_* exist, the edicts don't),
+    // so the grant rides a synthetic item_breather at the player feet —
+    // the pickup/timer/sync path is the production one (checkPickups →
+    // pickupItem → SV_SetPlayerSuit).
+    const { spawnEdict } = await import('@q2/game');
+    const suit = spawnEdict({
+      classname: 'item_breather',
+      origin: `${driver.pm.origin[0]} ${driver.pm.origin[1]} ${driver.pm.origin[2]}`,
+    });
+    driver.server.entities.push(suit);
+    const t0 = driver.server.time;
+    driver.step(neutralCmd(), 0.1);
+    expect(suit.freed).toBe(true);
+    expect(driver.events).toContain('pickup');
+    expect(driver.heardSounds).toContain('items/pkup.wav');
+    // C Use_Breather: framenum + 300 @10Hz = 30s from the pickup tick.
+    expect(driver.ps.breatherUntil).toBeCloseTo(t0 + 0.1 + 30, 5);
+    expect(driver.server.playerBreatherUntil).toBeCloseTo(t0 + 0.1 + 30, 5);
+    // The HUD-left value ticks on server time: one more tick exposes it.
+    driver.step(neutralCmd(), 0.1);
+    expect(driver.playerBreatherLeft).toBeGreaterThan(29);
+    // Suit world model registered from the real pak lump.
+    expect(boot.models!.items['item_breather']).toBeDefined();
+    // Into the deep pool: head under, air holds at the C +10s supply.
+    driver.pm.origin = v3(430, 620, -280);
+    driver.pm.velocity = v3();
+    driver.step(neutralCmd(), 0.1);
+    expect(driver.pm.waterlevel).toBe(3);
+    for (let i = 0; i < 150; i++) driver.step(neutralCmd(), 0.1);
+    expect(driver.playerHealth).toBe(100);
+    expect(driver.playerAirLeft).toBeGreaterThan(9);
+    expect(driver.playerBreatherLeft).toBeGreaterThan(10);
+    expect(driver.playerBreatherLeft).toBeLessThan(16);
+    // Alternating breath hooks while submerged+protected (C cadence).
+    const breaths = driver.heardSounds.filter((n) => n.startsWith('player/u_breath'));
+    expect(breaths.length).toBeGreaterThanOrEqual(2);
+    expect(breaths[0]).toBe('player/u_breath1.wav');
+    expect(breaths[1]).toBe('player/u_breath2.wav');
+    // Past the 30s arming the suit expires and the C ramp resumes (after
+    // the residual +10s protected air supply drains, exactly like C).
+    let hurtAt = -1;
+    for (let i = 0; i < 400 && hurtAt < 0; i++) {
+      driver.step(neutralCmd(), 0.1);
+      if (driver.playerHealth < 100) hurtAt = i;
+    }
+    expect(driver.playerBreatherLeft).toBe(0);
+    expect(hurtAt).toBeGreaterThanOrEqual(0);
   });
 });

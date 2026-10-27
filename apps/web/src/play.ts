@@ -12,6 +12,7 @@ import type { Snapshot } from '@q2/client';
 import {
   drawString,
   fillRect,
+  lerpAngle,
   makeConcharsFont,
   setConcharsFont,
   stringWidth,
@@ -77,6 +78,7 @@ import {
   SV_UseTargetname,
   SV_DamagePlayer,
   SV_SetPlayerHealth,
+  SV_SetPlayerSuit,
   SV_DrainMuzzles,
   SV_DrainTracers,
   SV_DrainSparks,
@@ -597,6 +599,12 @@ export const BLASTER_TRACER_COLOR = 225;
  * from the play module.
  */
 export { HITSCAN_TRACER_COLOR };
+/**
+ * Renders per 10Hz tick at the 60fps target: the yaw-lerp frac cadence
+ * (entityAngles advances 1/6 of the prev→live arc per render, converging
+ * by the next tick — monotonic, bounded, deterministic in tests).
+ */
+export const YAW_LERP_RENDERS_PER_TICK = 6;
 /** Hot yellow pellet streak for shotgun/machinegun + monster return fire. */
 export const PELLET_TRACER_COLOR = HITSCAN_TRACER_COLOR;
 /**
@@ -764,6 +772,15 @@ export class LocalDriver implements HostDriver {
   /** Monster edicts already reported gibbed/dead (id DEAD_DEAD is terminal). */
   private gibSeen = new Set<number>();
   private deadSeen = new Set<number>();
+  /** misc_deadsoldier gib hits already surfaced (per-edict extra counter). */
+  private corpseGibSeen = new Map<number, number>();
+  /**
+   * Tick-start monster yaw per edict (yaw-lerp prev snapshot) + renders
+   * consumed this tick (frac numerator). Reset per step(), advanced per
+   * entityAngles() render.
+   */
+  private yawPrev = new Map<number, number>();
+  private yawRenders = new Map<number, number>();
   /** Last-tick live explosion count (drives the 'explosion' event). */
   private lastExplosions = 0;
   /** Last-tick freed-barrel count (drives the 'barrel' event). */
@@ -879,6 +896,7 @@ export class LocalDriver implements HostDriver {
     this.syncAmmo();
     this.updateMixerListener();
     this.monHealth = new Map(this.server.monsters.map((m) => [m.edict.num, m.state.health]));
+    this.yawPrev = new Map(this.server.monsters.map((m) => [m.edict.num, ((m.state.yaw % 360) + 360) % 360]));
     this.lastExplosions = this.server.explosions.length;
     this.lastBarrelsDead = this.server.barrels.filter((b) => b.edict.freed).length;
   }
@@ -926,6 +944,12 @@ export class LocalDriver implements HostDriver {
     }
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
     for (const m of this.server.movers) this.moverStates.set(m, m.state);
+    // Yaw-lerp prev snapshot: tick-start yaws + zeroed render counts (the
+    // entityAngles frac runs 1/6..6/6 across this tick's renders).
+    for (const m of this.server.monsters) {
+      this.yawPrev.set(m.edict.num, ((m.state.yaw % 360) + 360) % 360);
+      this.yawRenders.set(m.edict.num, 0);
+    }
     // Phase 0 single sim: the server owns ALL gameplay state at 10Hz —
     // monster think (C cadence fire resolution), bolts, fuses, debris/gibs,
     // explosions, monster door touches. The driver only moves its own body
@@ -947,6 +971,8 @@ export class LocalDriver implements HostDriver {
       nav: null,
       rand: this.rand,
     });
+
+    this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
     SV_TouchTriggersAt(this.server, 'player', this.playerEdict);
     // Door touch is server-owned (id Touch_DoorTrigger): the driver's
     // competing checkDoorTouch is deleted; this call opens doors the same
@@ -956,6 +982,7 @@ export class LocalDriver implements HostDriver {
       mins: v3(this.pm.mins[0], this.pm.mins[1], this.pm.mins[2]),
       maxs: v3(this.pm.maxs[0], this.pm.maxs[1], this.pm.maxs[2]),
     }, 'player');
+
     this.syncDoors();
     this.hideFreedBrushes();
     this.updateBob();
@@ -994,7 +1021,12 @@ export class LocalDriver implements HostDriver {
       this.ps.health = h;
       if (!this.exited) {
         this.events.push('pain');
-        this.emitSound('player/pain.wav', v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
+        // C P_DamageFeedback pain band (p_view.c): health<25→25, <50→50,
+        // <75→75 else 100; r = 1+(rand&1); the `*` is the C client
+        // sexed-sound prefix, resolved here to the default male lump.
+        const l = h < 25 ? 25 : h < 50 ? 50 : h < 75 ? 75 : 100;
+        const r = 1 + ((this.rand() * 2) | 0);
+        this.emitSound(`player/male/pain${l}_${r}.wav`, v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
       }
     } else if (h > this.ps.health) {
       this.ps.health = h;
@@ -1003,7 +1035,10 @@ export class LocalDriver implements HostDriver {
       this.ps.health = 0;
       this.message = 'YOU DIED — respawning…';
       this.events.push('death');
-      this.emitSound('player/death.wav', v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
+      // C player_die (p_client.c): gibbed past -40hp (udeath only), else
+      // the sexed *deathN (rand()%4+1) — resolved to the male lump here.
+      const snd = h < -40 ? 'misc/udeath.wav' : `player/male/death${1 + ((this.rand() * 4) | 0)}.wav`;
+      this.emitSound(snd, v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
       this.deadUntil = this.server.time + 2;
     }
   }
@@ -1042,6 +1077,21 @@ export class LocalDriver implements HostDriver {
     const barrelsDead = this.server.barrels.filter((b) => b.edict.freed).length;
     if (barrelsDead > this.lastBarrelsDead) this.events.push('barrel');
     this.lastBarrelsDead = barrelsDead;
+    // misc_deadsoldier overkill mince (C misc_deadsoldier_die): the server
+    // counts gib hits per edict (the corpse persists and re-gibs — no
+    // G_FreeEdict). Surface each new mince as a 'gib' event like the
+    // monster path above, so driver tests pin it without reading the gib
+    // roster directly.
+    for (const e of this.server.entities) {
+      if (e.classname !== 'misc_deadsoldier') continue;
+      const hits = Number.parseInt(e.extra['gibHits'] ?? '0', 10);
+      const seen = this.corpseGibSeen.get(e.num) ?? 0;
+      if (Number.isFinite(hits) && hits > seen) {
+        this.corpseGibSeen.set(e.num, hits);
+        this.events.push('gib');
+        this.message = 'corpse minced';
+      }
+    }
     // Player damage dealt by the server tick/fire → pain/death edges.
     this.syncHealthFromServer();
     // Muzzles: player flash window + enemy flashes (one-shot dlight pump).
@@ -1398,6 +1448,19 @@ export class LocalDriver implements HostDriver {
   }
 
   /**
+   * HUD-exposed suit seconds (rebreather / envirosuit, game/g_items.c +
+   * p_view.c): server-authoritative remaining time, expose only — the HUD
+   * lane owns rendering, exactly like playerAirLeft above.
+   */
+  get playerBreatherLeft(): number {
+    return this.server.playerBreatherLeft;
+  }
+
+  get playerEnviroLeft(): number {
+    return this.server.playerEnviroLeft;
+  }
+
+  /**
    * Positional sound names emitted this session, in order (test hook):
    * the P_WorldEffects enter/exit/gasp/burn/drown hooks land here via the
    * server sound drain, so driver-loop tests can pin them without touching
@@ -1575,15 +1638,23 @@ export class LocalDriver implements HostDriver {
    * the legacy yaw-0 snap. Bolt flight orientation rides on the extras
    * themselves (see extraEntities). Headless-safe pure math. Unknown ids
    * return null for the Host default.
-   * TODO(interp): LerpAngle between snapshots (client/cl_ents.c) + frame
-   * vertex lerp via oldframe/backlerp (RF_FRAMELERP) keyed off
-   * serverAcc/SERVER_DT. Needs an Entity contract change (frozen BRAIN.md
-   * §6), so yaw/frames still step at 10Hz for now.
+   *
+   * Yaw interpolates between the last two 10Hz ticks (client/cl_ents.c
+   * LerpAngle, q_shared.c): prev-tick yaw → live yaw over the renders of
+   * the current tick (YAW_LERP_RENDERS_PER_TICK renders at the 60fps
+   * target), monotonic and bounded by the live yaw. Position stays
+   * predictor-owned (Host Predictor); frame vertex lerp rides the
+   * explosion oldframe/backlerp path (RF_FRAMELERP, frozen §6 Entity —
+   * no contract change).
    */
   entityAngles(id: number): [number, number, number] | null {
-    const m = this.server.monsters.find((m) => m.edict.num === id);
+    const m = this.server.monsters.find((mm) => mm.edict.num === id);
     if (!m) return null;
-    return [0, ((m.state.yaw % 360) + 360) % 360, 0];
+    const curr = ((m.state.yaw % 360) + 360) % 360;
+    const prev = this.yawPrev.get(id) ?? curr;
+    const n = (this.yawRenders.get(id) ?? 0) + 1;
+    this.yawRenders.set(id, n);
+    return [0, lerpAngle(prev, curr, Math.min(1, n / YAW_LERP_RENDERS_PER_TICK)), 0];
   }
 
   /** Drain the one-shot muzzle-flash dlight request (dom tick pumps it). */
@@ -1695,8 +1766,10 @@ export class LocalDriver implements HostDriver {
     for (const m of this.server.movers) {
       const prev = this.moverStates.get(m);
       if (prev !== undefined && prev !== m.state && (m.state === 'going_up' || m.state === 'going_down')) {
+        // Real pak names (C g_func.c): sliders/rotators/secret doors all
+        // default to doors/dr1_strt.wav; buttons to switches/butn2.wav.
         this.emitSound(
-          m.ent.classname === 'func_button' ? 'buttons/button.wav' : 'doors/door.wav',
+          m.ent.classname === 'func_button' ? 'switches/butn2.wav' : 'doors/dr1_strt.wav',
           m.ent.origin,
         );
         this.events.push('door');
@@ -1726,6 +1799,10 @@ export class LocalDriver implements HostDriver {
     this.pm.velocity = v3();
     SV_SetPlayerHealth(this.server, this.ps.maxHealth);
     this.ps.health = this.ps.maxHealth;
+    // C p_client.c respawn: breather/enviro framenums clear with the rest.
+    this.ps.breatherUntil = 0;
+    this.ps.enviroUntil = 0;
+    SV_SetPlayerSuit(this.server, 0, 0);
     this.deadUntil = -1;
     // A new life is vulnerable again: without this, a completed level left
     // `exited` set forever (spurious or real), and damagePlayer's
@@ -1756,7 +1833,7 @@ export class LocalDriver implements HostDriver {
       const dy = Math.abs(py - e.origin[1]!);
       const dz = pz - e.origin[2]!;
       if (dx > 40 || dy > 40 || dz < -24 || dz > 64) continue;
-      const res = pickupItem(this.ps, c);
+      const res = pickupItem(this.ps, c, this.server.time);
       if (!res.picked) continue;
       e.freed = true;
       healed = true;
@@ -1771,7 +1848,8 @@ export class LocalDriver implements HostDriver {
       this.syncAmmo();
       this.events.push('pickup');
       this.message = c.replace(/_/g, ' ');
-      this.emitSound('items/pickup.wav', v3(px, py, pz));
+      // Real pak pickup sound (C g_items.c pickup_sound, incl. the suits).
+      this.emitSound('items/pkup.wav', v3(px, py, pz));
       if (res.reason === 'weapon' && (c === 'weapon_shotgun' || c === 'weapon_machinegun')) {
         const def = findWeapon(c);
         if (def) {
@@ -1781,8 +1859,12 @@ export class LocalDriver implements HostDriver {
       }
     }
     // Pickups (health) write through the authoritative pool so the next
-    // server tick doesn't clobber the grant.
-    if (healed) SV_SetPlayerHealth(this.server, this.ps.health);
+    // server tick doesn't clobber the grant. Suit timers ride along (the
+    // tick owns the immunity, the driver owns the grant — same split).
+    if (healed) {
+      SV_SetPlayerHealth(this.server, this.ps.health);
+      SV_SetPlayerSuit(this.server, this.ps.breatherUntil, this.ps.enviroUntil);
+    }
   }
 
   private spawnFromLump(map: BspMap): void {
@@ -2158,17 +2240,7 @@ export class LocalDriver implements HostDriver {
     }
   }
 
-  /**
-   * Fire the selected weapon (Phase 0 single sim): the driver computes the
-   * shot (eye/feet/angles from input) but the server applies it via
-   * SV_PlayerFire — ammo, muzzle dlight, bolts, hitscan pellet traces,
-   * pain/gib/barrel damage, impact sparks and sounds are all server-owned.
-   * Muzzle/tracer visuals reach the pump through drainServerEvents (end of
-   * step). Weapon_Generic-lite gunframe + view kick stay driver-side
-   * (viewmodel cosmetics).
-   */
-  private handleAttack(cmd: UserCmdT): void {
-    if (!(cmd.buttons & BUTTON_ATTACK)) return;
+  private handleAttack(cmd: UserCmdT): void {    if (!(cmd.buttons & BUTTON_ATTACK)) return;
     if (this.playerDead) return;
     const t = this.server.time;
     const refire = REFIRE[this.weapon.classname] ?? 0.25;
