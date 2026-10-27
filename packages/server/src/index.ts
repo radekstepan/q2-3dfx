@@ -151,6 +151,7 @@ import {
 } from './doors.js';
 import type { RotMover, SecretMover } from './doors.js';
 import {
+  BUTTON_TOUCH_SLOP,
   BUTTON_USE_DOT,
   BUTTON_USE_REACH,
   buttonCanFire,
@@ -1633,7 +1634,13 @@ export function SV_TouchButtonsAt(
     if (!isButtonTouchable(m.ent)) continue;
     const box = SV_MoverClipBox(st, m);
     if (!box) continue;
-    if (!bodyOverlapsBounds(body.origin, body.mins, body.maxs, box.mins, box.maxs)) continue;
+    // Contact presses (C G_TouchTriggers fires on the blocking clip): the
+    // lean rest sits 1/32 off the face, so test the box grown by
+    // BUTTON_TOUCH_SLOP instead of the exact brush.
+    const s = BUTTON_TOUCH_SLOP;
+    const tmins = new Float32Array([box.mins[0]! - s, box.mins[1]! - s, box.mins[2]! - s]);
+    const tmaxs = new Float32Array([box.maxs[0]! + s, box.maxs[1]! + s, box.maxs[2]! + s]);
+    if (!bodyOverlapsBounds(body.origin, body.mins, body.maxs, tmins, tmaxs)) continue;
     // C button_fire: UP/TOP presses are no-ops (no leg restart, and — unlike
     // doors — no target re-fire until the button returns to BOTTOM).
     if (!buttonCanFire(m)) continue;
@@ -2228,20 +2235,57 @@ export interface RiderBody {
 
 /**
  * SV_Push rider pass: carry bodies standing on movers that displaced this
- * tick (id g_phys.c: riders move with the pusher). Matches C semantics
- * exactly — only groundEntity == pusher links ride; world-grounded and
- * airborne bodies are untouched. Must run after SV_Tick (reads
- * moverDeltas) and before the bodies' own movement for the tick.
+ * tick (id g_phys.c: riders move with the pusher). Matches C semantics —
+ * only groundEntity == pusher links ride; world-grounded and airborne
+ * bodies are untouched. Must run after SV_Tick (reads moverDeltas) and
+ * before the bodies' own movement for the tick.
+ *
+ * Ride-only-what-you-stand-on gate: the carry applies solely when the
+ * rider's feet rest at the pusher's PRE-move top (1u tolerance for the
+ * +1/32 contact rest). C links side-embedded bodies too (startsolid rule),
+ * then leaves them behind or blocks on them; our ground link latches the
+ * same way, so without the gate the exit-hall camper — leaning 5u inside
+ * the *32 slab with its feet at the slab's base, not its top — would ride
+ * the opening door south and strand outside the *33 volume (gate (t)).
+ * Feet-on-top riders (lift/plug tops, the only physical carries) pass.
+ * The top is read pre-move (current top minus this tick's dz): after the
+ * platform rises the rider still sits at the old top, and testing against
+ * the new top would strand every upward ride one tick behind.
  */
 export function SV_CarryRiders(st: ServerState, bodies: RiderBody[]): void {
   for (const b of bodies) {
     if (!b.onGround || b.groundEntity < 0) continue;
     const d = st.moverDeltas.get(b.groundEntity);
     if (!d) continue;
+    const top = pusherTopAt(st, b.groundEntity);
+    if (top !== null) {
+      const feet = b.origin[2]! + b.mins[2]!;
+      if (Math.abs(feet - (top - d[2]!)) > 1) continue;
+    }
     b.origin[0] = b.origin[0]! + d[0]!;
     b.origin[1] = b.origin[1]! + d[1]!;
     b.origin[2] = b.origin[2]! + d[2]!;
   }
+}
+
+/**
+ * Current top face height of the pusher with this edict num (displaced
+ * mover/train clip box), or null when it has no registered brush bounds
+ * (secret doors displace riders without recorded bounds — carry those
+ * unconditionally, as before).
+ */
+function pusherTopAt(st: ServerState, num: number): number | null {
+  const m = st.movers.find((mm) => mm.ent.num === num);
+  if (m) {
+    const box = SV_MoverClipBox(st, m);
+    return box ? box.maxs[2]! : null;
+  }
+  const tr = st.trains.find((tt) => tt.ent.num === num);
+  if (tr) {
+    const box = SV_TrainClipBox(st, tr);
+    return box ? box.maxs[2]! : null;
+  }
+  return null;
 }
 // --- Phase 0: single authoritative sim (BRAIN.md §15) -------------------------
 //

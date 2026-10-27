@@ -56,7 +56,7 @@
 //       spot reaches the player. No jump anywhere.
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { resetCVars, setCVar } from '@q2/config';
-import { BUTTON_DUCK } from '@q2/input';
+import { BUTTON_DUCK, BUTTON_USE } from '@q2/input';
 import type { UserCmdT } from '@q2/input';
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
@@ -1258,5 +1258,256 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect(maxAy).toBeGreaterThan(33.8);
     expect(minGap).toBeLessThan(100);
     expectInWorld(driver.pm.origin, map);
+  });
+
+  it('(u) board the parked lift and ride it: feet on top, grounded, no fall-through', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    // The exit lift (*12 func_train, t91): parked with its top at z=0 under
+    // a sealed rock shaft mouth (world rock fills x<-2048 z 0..96 over the
+    // whole platform — verified by point-hull rays hitting the east face at
+    // x=-2048 and the ceiling flush at z=0, and by an exhaustive placement
+    // sweep: no 32-wide hull rests on the top without embedding). So the
+    // boarding below is placement setup exactly like gate (t)'s footprint
+    // parking — and every verdict (feet, ground, carry, render) is a real
+    // driver-loop outcome that fails without the mover clip + carry wiring.
+    const train = driver.server.trains.find((t) => t.ent.model === '*12')!;
+    expect(train.started).toBe(false);
+    expect([...train.ent.origin]).toEqual([0, 0, 0]);
+    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
+    // Part 1 — walk-boarding on the complex's walkable parked platform (the
+    // DOWN plug top: camp the hall first so touch parks it down, reached by
+    // falling in from the deck the way the engine does so the rest is the
+    // C +1/32 contact, never an exact teleport): feet rest on the top,
+    // grounded, linked to the plug, no fall-through walking its length.
+    driver.pm.origin = v3(-1669, 1514, 120);
+    driver.pm.velocity = v3();
+    for (let i = 0; i < 120; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+    }
+    expect(driver.server.movers.find((m) => m.ent.model === '*31')!.ent.origin[2]!).toBeCloseTo(-156, 0);
+    driver.pm.origin = v3(-1800, 1536, 120);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    const plugTop = 88;
+    expect(driver.pm.onGround).toBe(true);
+    expect(driver.pm.origin[2]! - 24).toBeCloseTo(plugTop, 0);
+    expect(driver.pm.groundEntity).toBe(plug.ent.num);
+    const walkFrom = driver.pm.origin[0]!;
+    // Walk east along the plug top (away from the *34 button): every tick
+    // the feet rest on the top, grounded, linked to the plug — the
+    // fall-through the user reported is gone. (3 ticks stay well clear of
+    // the plug's east edge step-up.)
+    for (let i = 0; i < 3; i++) {
+      driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+      expect(driver.pm.origin[2]! - 24).toBeGreaterThan(plugTop - 1);
+      expect(driver.pm.onGround).toBe(true);
+      expect(driver.pm.groundEntity).toBe(plug.ent.num);
+    }
+    expect(driver.pm.origin[0]! - walkFrom).toBeGreaterThan(20);
+    // Part 2 — the train ride: place the rider on the parked top (feet
+    // +1/32 above it), settle, E-call the lift, ride the full leg. The
+    // carry keeps feet==top every tick; the render tracks the sim exactly.
+    driver.pm.origin = v3(-2056, 1500, 24.03);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    expect(driver.pm.onGround).toBe(true);
+    expect(driver.pm.groundEntity).toBe(train.ent.num);
+    expect(driver.pm.origin[2]! - 24).toBeCloseTo(0, 1);
+    expect(driver.doorRenderOffset('*12')).toEqual([0, 0, 0]);
+    // E-call: aim at the *13 button center (reach + facing, wall-checked).
+    const eye0 = v3(driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + 22);
+    const ctr: [number, number, number] = [-2016, 1536, 80];
+    const dx0 = ctr[0]! - eye0[0]!, dy0 = ctr[1]! - eye0[1]!, dz0 = ctr[2]! - eye0[2]!;
+    const l0 = Math.hypot(dx0, dy0) || 1;
+    const aim0: [number, number, number] = [
+      (Math.atan2(-dz0, l0) * 180) / Math.PI,
+      (Math.atan2(dy0, dx0) * 180) / Math.PI,
+      0,
+    ];
+    driver.step({ msec: 100, angles: aim0, forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_USE }, 0.1);
+    expect(driver.events).toContain('use');
+    // The button fires its target on reaching the TOP (id button_wait, one
+    // tick later at 200u/s over 4u); the train then runs its leg.
+    stepDriver(driver, neutralCmd(), 3);
+    expect(train.started).toBe(true);
+    // Full leg: grounded on the pusher every tick, feet glued to the top,
+    // rendered mesh tracking the sim origin bit-exactly.
+    let peak = 0;
+    for (let i = 0; i < 60 && !train.arrived; i++) {
+      driver.step(neutralCmd(), 0.1);
+      const top = train.ent.origin[2]!;
+      const feet = driver.pm.origin[2]! - 24;
+      expect(driver.pm.onGround).toBe(true);
+      expect(driver.pm.groundEntity).toBe(train.ent.num);
+      expect(feet).toBeCloseTo(top, 0);
+      const off = driver.doorRenderOffset('*12')!;
+      expect(off[0]!).toBeCloseTo(train.ent.origin[0]!, 6);
+      expect(off[1]!).toBeCloseTo(train.ent.origin[1]!, 6);
+      expect(off[2]!).toBeCloseTo(train.ent.origin[2]!, 6);
+      peak = Math.max(peak, Math.abs(train.ent.origin[0]!) + Math.abs(train.ent.origin[2]!));
+      expectInWorld(driver.pm.origin, driver.map!);
+    }
+    expect(train.arrived).toBe(true);
+    expect(peak).toBeGreaterThan(10);
+    // Arrival: the t90 corner (-2080,1472,-8) minus the brush-mins base
+    // (-2064,1472,-48) = (-16, 0, 40), rendered and simulated identically.
+    expect(train.ent.origin[0]!).toBeCloseTo(-16, 6);
+    expect(train.ent.origin[1]!).toBeCloseTo(0, 6);
+    expect(train.ent.origin[2]!).toBeCloseTo(40, 6);
+    expect(driver.pm.origin[2]! - 24).toBeCloseTo(40, 0);
+    expect(driver.pm.groundEntity).toBe(train.ent.num);
+    // Parks with the rider aboard: 150 ticks, zero further motion.
+    const endOff = driver.doorRenderOffset('*12')!;
+    for (let i = 0; i < 150; i++) {
+      driver.step(neutralCmd(), 0.1);
+      expect(driver.doorRenderOffset('*12')).toEqual(endOff);
+      expect(driver.pm.groundEntity).toBe(train.ent.num);
+    }
+    expect(train.arrived).toBe(true);
+    expectInWorld(driver.pm.origin, driver.map!);
+  });
+
+  it('(v) E-use and touch press the lift buttons: reach, facing, no fan-out', { timeout: 180000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    const train = driver.server.trains.find((t) => t.ent.model === '*12')!;
+    const btn13 = driver.server.movers.find((m) => m.ent.model === '*13')!;
+    const btn34 = driver.server.movers.find((m) => m.ent.model === '*34')!;
+    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
+    // Per-window target collection for the no-fan-out audit: ship
+    // pathtargets (t143-t147 loops: 'brittany', 'speakc', 'speakd') fire
+    // ambiently every few ticks, so the audit asserts per press-window
+    // (only the aimed button's own target fires there), not globally.
+    let window: Set<string> | null = null;
+    const collectTargets = (): void => {
+      if (!window) return;
+      for (const t of driver.server.firedThisTick) window.add(t);
+    };
+    const aimAt = (tx: number, ty: number, tz: number): [number, number, number] => {
+      const e = [driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + 22];
+      const dx = tx - e[0]!, dy = ty - e[1]!, dz = tz - e[2]!;
+      const l = Math.hypot(dx, dy) || 1;
+      return [(Math.atan2(-dz, l) * 180) / Math.PI, (Math.atan2(dy, dx) * 180) / Math.PI, 0];
+    };
+    const press = (aim: [number, number, number]): boolean => {
+      const n = driver.events.length;
+      driver.step({ msec: 100, angles: aim, forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_USE }, 0.1);
+      collectTargets();
+      return driver.events.length > n && driver.events[driver.events.length - 1] === 'use';
+    };
+    // Reach gate: the camp is ~350u from *13 — aiming at it presses nothing.
+    driver.pm.origin = v3(-1669, 1514, 120);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 5);
+    window = new Set<string>();
+    expect(press(aimAt(-2016, 1536, 80))).toBe(false);
+    expect(window.size).toBe(0);
+    expect(train.started).toBe(false);
+    expect(btn13.state).toBe('bottom');
+    // Facing gate: at the shaft in range but aimed away — nothing fires.
+    driver.pm.origin = v3(-2030, 1536, -24);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    const good = aimAt(-2016, 1536, 80);
+    // Level gaze the opposite way: truly facing away in 3D (at steep pitch
+    // yaw alone barely moves the ray, so pitch must go level too).
+    const away: [number, number, number] = [0, good[1]! + 180, 0];
+    window = new Set<string>();
+    expect(press(away)).toBe(false);
+    expect(window.size).toBe(0);
+    expect(train.started).toBe(false);
+    // Aimed *13 press within reach: the button fires t91 (and NOT t4 — only
+    // the aimed button fires) and the train runs its full leg to arrival
+    // (wait -1 holds the button TOP: no return).
+    window = new Set<string>();
+    const w13 = window;
+    expect(press(good)).toBe(true);
+    expect(btn13.state).toBe('going_up');
+    let peak = 0;
+    for (let i = 0; i < 60 && !train.arrived; i++) {
+      driver.step(neutralCmd(), 0.1);
+      collectTargets();
+      peak = Math.max(peak, Math.abs(train.ent.origin[0]!) + Math.abs(train.ent.origin[2]!));
+    }
+    expect(train.arrived).toBe(true);
+    expect(peak).toBeGreaterThan(10);
+    expect(w13.has('t91')).toBe(true);
+    expect(w13.has('t4')).toBe(false);
+    expect(train.ent.origin[0]!).toBeCloseTo(-16, 6);
+    expect(train.ent.origin[2]!).toBeCloseTo(40, 6);
+    expect(btn13.state).toBe('top');
+    for (let i = 0; i < 50; i++) {
+      driver.step(neutralCmd(), 0.1);
+      collectTargets();
+    }
+    expect(btn13.state).toBe('top');
+    expect(driver.doorRenderOffset('*13')).toEqual([0, 0, 4]);
+    // Camp the exit hall so the plug parks DOWN (touch opens it, TOP wait
+    // holds it while camped): the *34 touch walk needs the plug top down.
+    // (The camper leans inside the *32 slab but its feet sit at the slab's
+    // base, not its top, so the feet-on-top carry gate leaves it parked —
+    // and the touch walk teleports in fresh afterwards.)
+    // Ambient ship relays are not collected here (see the audit note above).
+    window = null;
+    driver.pm.origin = v3(-1669, 1514, 120);
+    driver.pm.velocity = v3();
+    for (let i = 0; i < 120; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+    }
+    expect(driver.server.movers.find((m) => m.ent.model === '*31')!.ent.origin[2]!).toBeCloseTo(-156, 0);
+    // Touch path: walk into *34 on the plug top (the lean presses it — C
+    // button_touch via the blocking clip, 1u slop over the 1/32 rest) and
+    // it fires t4 (and NOT t91 — only the touched button fires), cycles,
+    // and returns to BOTTOM (wait default semantics).
+    driver.pm.origin = v3(-1800, 1536, 120);
+    driver.pm.velocity = v3();
+    stepDriver(driver, neutralCmd(), 10);
+    const plugNum = plug.ent.num;
+    expect(driver.pm.groundEntity).toBe(plugNum);
+    // Lean west into *34: the contact press fires t4 and the button starts
+    // its cycle (C wait/return semantics: UP, 1s hold, DOWN, BOTTOM).
+    window = new Set<string>();
+    const w34 = window;
+    let saw34 = false;
+    let sawOffset = false;
+    for (let i = 0; i < 60 && !saw34; i++) {
+      driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+      collectTargets();
+      if (driver.server.firedThisTick.includes('t4')) saw34 = true;
+      const off = driver.doorRenderOffset('*34')!;
+      if (Math.abs(off[0]!) + Math.abs(off[1]!) + Math.abs(off[2]!) > 1) sawOffset = true;
+    }
+    expect(saw34).toBe(true);
+    expect(sawOffset).toBe(true);
+    expect(btn34.state).not.toBe('bottom');
+    // Clear the lean due east (out of touch + slop range), then the button
+    // finishes its wait and returns to BOTTOM on its own — offset back to 0.
+    for (let i = 0; i < 5; i++) {
+      driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+      collectTargets();
+    }
+    let back = false;
+    for (let i = 0; i < 40 && !back; i++) {
+      driver.step(neutralCmd(), 0.1);
+      collectTargets();
+      back = btn34.state === 'bottom';
+    }
+    expect(back).toBe(true);
+    expect(btn34.state).toBe('bottom');
+    expect(driver.doorRenderOffset('*34')).toEqual([0, 0, 0]);
+    // No-fan-out audit, per press-window: *13 fired t91 but never t4, *34
+    // fired t4 but never t91 — only the aimed/touched button fires. (The
+    // ship pathtarget relays fire ambiently throughout and are excluded by
+    // the windowed collection; the level never exits from a press.)
+    expect(w13.has('t91')).toBe(true);
+    expect(w13.has('t4')).toBe(false);
+    expect(w34.has('t4')).toBe(true);
+    expect(w34.has('t91')).toBe(false);
+    expect(train.started).toBe(true);
+    expect(driver.events).not.toContain('exit');
+    expectInWorld(driver.pm.origin, driver.map!);
   });
 });

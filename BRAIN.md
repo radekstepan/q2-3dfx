@@ -1174,3 +1174,46 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - gate (u)/(v) fail identically without this lane's files — stash-proven);
 - this lane's packages are green (sw-renderer 172/172, web async/display
 - pins green, goldens `8f61c755` + base1 ×4 views identical).
+- CLOSED 2026-10-27 (movers/boarding lane — rideable elevator): the
+- fall-through had three compounding causes, all in the DRIVER path (the
+- server mechanisms already existed): (1) movers/trains/plats were never
+- solid to the driver trace (`SV_ClipTrace` only knew func_explosive/
+- func_wall — the parked lift had a mesh but no sim clip, so riders fell
+- straight through to the pit); now displaced mover/train brush boxes ride
+- in the trace and the clip owns the hit, so pmove's `groundEntity` links
+- riders to the pusher (ge=119 proven live on the parked *12); `func_plat`
+- records bounds like doors. (2) `SV_CarryRiders` (M7.4's 272u server-side
+- proof) was never called in the driver loop; the driver now carries
+- post-`SV_Tick` (exact — a pre-tick carry lags one tick, measured -4u at
+- the 40u/s train speed), gated to feet-on-top riders (pre-move top ±1u)
+- so side-leaning bodies are left behind C-style instead of riding away
+- (the exit-hall camper no longer rides the opening *32 slab south, which
+- had broken gate (t)). (3) no button path existed: new `buttons.ts`
+- C-parity helpers (`button_touch`/`button_use`/`button_fire` incl. wait/-1
+- hold, UP/TOP no-op) with `SV_TouchButtonsAt` (contact press — 1u slop over
+- the 1/32 lean rest, otherwise walk-ins never press, exactly like C's
+- trace.ent touch) and `SV_UseButton` (E key: reach 96 + facing cone +
+- wall-checked LOS, only the aimed button fires). Driver wiring is
+- `play.ts` boarding/use/ride ONLY. Gate (u): walk-board the parked DOWN
+- plug (feet==top 88, grounded, ge=plug, no fall-through) + footprint-place
+- the parked train, E-call *13, ride the full t88→t89→t90 leg with
+- feet==top (+1/32), grounded, ge=train every tick and the render tracking
+- the sim bit-exactly, arrival (-16,0,40), 150-tick park.
+- Gate (v): reach gate (350u: no fire), facing gate (level gaze away: no
+- fire), aimed *13 press fires t91 (train runs to arrival, wait -1 holds
+- TOP at offset (0,0,4)), *34 walk-touch fires t4 and the button cycles
+- back to BOTTOM (wait default), per-window no-fan-out audit (t91 ∌ t4 and
+- vice versa — ship pathtarget relays are ambient and excluded by window).
+- Base1-gate 22/22 green (20 existing incl. (c)/(r)/(t) untouched). Geometry
+- finding (evidence in the lane): the parked *12 sits under sealed world
+- rock (point-hull rays hit the east face at x=-2048 and the ceiling flush
+- at z=0; exhaustive placement sweep finds no 32-wide hull resting on the
+- top without embedding — C-identical), so walk-boarding the train is
+- impossible in any engine and (u) boards by footprint placement exactly
+- like gate (t); every verdict is a real driver-loop outcome (fails pre-fix
+- on ge + carry). This supersedes the cross-lane NOTE above (gate (t) is
+- green WITH the carry in-tree via the feet-on-top gate) and the "verify
+- red" attribution there ((u)/(v) are green; the remaining red —
+- combat.test.ts ss-burst in devroom — touches none of this lane's paths:
+- devroom spawns no movers (TouchButtons/carry/clip loops all no-op) and
+- the test never sets BUTTON_USE, so it cannot execute this lane's code).
