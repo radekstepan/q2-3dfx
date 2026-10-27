@@ -52,6 +52,16 @@ describe('Phase 3: enemy muzzle flash renders at the m_flash offset only', () =>
       SV_SetPlayerHealth(driver.server, 10000);
       driver.ps.health = 10000;
       const m = SV_SpawnMonster(driver.server, cls, v3(32, 100, 24));
+      // C-correct engagement cadence (g_ai.c HuntTarget 1s hold +
+      // M_CheckAttack NEAR 0.1/frame against a ~122u/s close): the monster
+      // closes from its 200u spawn to NEAR/melee before the first volley —
+      // the old ">100u away" pin described the pre-depth instant opener.
+      const d0 = Math.hypot(
+        32 - driver.pm.origin[0]!,
+        100 - driver.pm.origin[1]!,
+        24 - driver.pm.origin[2]!,
+      );
+      expect(d0).toBeGreaterThan(200);
       let tracers = 0;
       let flashes = 0;
       for (let i = 0; i < 150; i++) {
@@ -65,6 +75,14 @@ describe('Phase 3: enemy muzzle flash renders at the m_flash offset only', () =>
         expect(gotFlashes.length).toBeGreaterThan(0);
         const eye = playerEye(driver);
         const shooter = m.edict.origin;
+        // Closes-then-engages: the first volley fires well inside the
+        // spawn range, never from afar.
+        const dFire = Math.hypot(
+          shooter[0]! - driver.pm.origin[0]!,
+          shooter[1]! - driver.pm.origin[1]!,
+          shooter[2]! - driver.pm.origin[2]!,
+        );
+        expect(dFire).toBeLessThan(d0 - 50);
         for (const t of got) {
           tracers++;
           expect(t.color).toBe(HITSCAN_TRACER_COLOR);
@@ -73,7 +91,7 @@ describe('Phase 3: enemy muzzle flash renders at the m_flash offset only', () =>
           expect(t.length).toBe(ENEMY_TRACER_LENGTH);
           expect(t.length).toBeLessThanOrEqual(48);
           // Origin is the muzzle flash point (m_flash offset, small: near
-          // the shooter, far from the eye at sane ranges).
+          // the shooter, near the eye only because the body closed first).
           const paired = gotFlashes.some(
             (f) =>
               Math.hypot(f.pos[0]! - t.origin[0]!, f.pos[1]! - t.origin[1]!, f.pos[2]! - t.origin[2]!) < 0.001,
@@ -86,7 +104,9 @@ describe('Phase 3: enemy muzzle flash renders at the m_flash offset only', () =>
           const gap0 = Math.hypot(
             t.origin[0]! - eye[0]!, t.origin[1]! - eye[1]!, t.origin[2]! - eye[2]!,
           );
-          expect(gap0).toBeGreaterThan(100);
+          // The muzzle closed with the body (the old pin demanded the
+          // pre-depth opener geometry here).
+          expect(gap0).toBeLessThan(100);
           // Endpoint: the streak never overshoots toward the eye, and at
           // sane engagement ranges it stays a full 2m clear of the eye.
           const dl = Math.hypot(t.dir[0]!, t.dir[1]!, t.dir[2]!) || 1;

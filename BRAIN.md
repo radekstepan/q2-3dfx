@@ -918,6 +918,13 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - Esc/unlock clears held fire via `pointerlockchange` (no stuck attack),
 - mouseup stays document-global, keyboard flow unchanged. Regression test
 - `apps/web/src/canvas-lock.test.ts` (panel vs canvas synthetic events).
+- CLOSED 2026-10-26 (monster attack-timing reconciliation): the 5 red
+- devroom engagement pins + the pak-only M7.1 follow predated single-sim
+- (red since Phase 0/3); behavior proven C-correct (HuntTarget 1s hold,
+- M_CheckAttack NEAR 0.1/frame vs 122u/s run, melee plant, same-frame bolt
+- move per g_main.c/G_RunFrame), so the pins now assert closes-then-engages
+- (blind legs hold run with no shot; sighted bodies close 50u+ then volley
+- at melee; streaks stay short/muzzle-origin/never eye-ending).
 - CLOSED 2026-10-26 (explosive damageability): func_explosive takes direct
 - fire (clip-attributed SOLID_BSP touch: `SV_ClipTrace` reports the winning
 - clip's edict as `entityNum`, bolts/pellets damage that brush instead of

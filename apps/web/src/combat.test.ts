@@ -54,17 +54,61 @@ describe('hitscan tracer color (no green lasers)', () => {
   });
 
   it('light-skin soldiers fire foe blaster bolts, never hitscan tracers', () => {
+    // C-correct engagement cadence (g_ai.c): HuntTarget holds the first
+    // attack for 1s (AttackFinished(self, 1)) while the soldier closes at
+    // ~122u/s (m_soldier.c run dists), and M_CheckAttack's NEAR 0.1/frame
+    // rarely commits in the ~2-frame window before melee — so the opener
+    // lands at MELEE range (<80), where C fires the skin gun point-blank
+    // (soldier melee is NULL: the MELEE branch sets AS_MISSILE, g_ai.c).
+    // At that range the foe bolt crosses the ~50u muzzle→eye gap within its
+    // 60u first step (G_RunFrame moves spawned edicts the same frame,
+    // g_main.c), so the volley reads as muzzle + blaster sound + impact —
+    // a live cross-tick bolt only exists for longer-range volleys.
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
-    SV_SpawnMonster(driver.server, 'monster_soldier_light', v3(32, 100, 24));
+    const m = SV_SpawnMonster(driver.server, 'monster_soldier_light', v3(32, 100, 24));
+    const d0 = Math.hypot(
+      32 - driver.pm.origin[0]!,
+      100 - driver.pm.origin[1]!,
+      24 - driver.pm.origin[2]!,
+    );
+    expect(d0).toBeGreaterThan(200); // C RANGE_NEAR spawn, like the old pin
+    const hp0 = driver.playerHealth;
     let sawBolt = false;
-    for (let i = 0; i < 120 && !sawBolt; i++) {
+    let sawMuzzle = false;
+    let dFire: number | null = null;
+    for (let i = 0; i < 120; i++) {
       driver.step(neutralCmd(), 0.1);
+      // Never hitscan: every queued beam must avoid the 208–214 green band
+      // — here, no beam is ever queued at all.
       expect(driver.drainTracers()).toEqual([]);
+      if (driver.drainEnemyMuzzle().length > 0) sawMuzzle = true;
       if (driver.bolts.length > 0) sawBolt = true;
+      if (dFire === null && driver.events.includes('monshot')) {
+        dFire = Math.hypot(
+          m.edict.origin[0]! - driver.pm.origin[0]!,
+          m.edict.origin[1]! - driver.pm.origin[1]!,
+          m.edict.origin[2]! - driver.pm.origin[2]!,
+        );
+      }
     }
     expect(driver.events).toContain('monshot');
-    expect(sawBolt).toBe(true);
+    // Closes-then-engages: the first volley fires from MELEE range, not
+    // from the 200u spawn.
+    expect(dFire).not.toBeNull();
+    expect(dFire!).toBeLessThan(80);
+    expect(dFire!).toBeLessThan(d0 - 50);
+    // The volley is blaster gunfire: muzzle flash + the blaster sound
+    // (solatck2 — shotgun would be solatck1, machinegun solatck3), and the
+    // foe bolt either flies (live this tick) or already impacted (bolt
+    // explosion + player damage on the fire tick).
+    expect(sawMuzzle).toBe(true);
+    const names = driver.mixer.mix().map((c) => c.name);
+    expect(names).toContain('soldier/solatck2.wav');
+    expect(names).not.toContain('soldier/solatck1.wav');
+    expect(names).not.toContain('soldier/solatck3.wav');
+    const impacted = driver.events.includes('explosion') && driver.playerHealth < hp0;
+    expect(sawBolt || impacted).toBe(true);
   });
 
   it('enemy hitscan is a short muzzle streak, never a beam ending at the eye', () => {
@@ -72,27 +116,53 @@ describe('hitscan tracer color (no green lasers)', () => {
     // railgun draws TE_RAILTRAIL) — the old full muzzle→eye beam filled the
     // screen at close range. Every enemy hitscan round is now a short
     // muzzle-origin streak (ENEMY_TRACER_LENGTH, same 225 yellow) whose
-    // endpoint stays far from the eye, plus the small muzzle dlight.
+    // endpoint stays well clear of the eye, plus the small muzzle dlight.
+    //
+    // Engagement timing is the C cadence (g_ai.c HuntTarget 1s hold +
+    // M_CheckAttack NEAR 0.1/frame against a ~122u/s close): the monster
+    // closes from its 200u spawn to NEAR/melee before the first volley, so
+    // the streak starts near the eye — the old ">100u away" pin described
+    // the pre-depth flat-0.7 instant opener, not C. What stays invariant:
+    // the streak is SHORT (its length, not the muzzle→eye gap) and stops
+    // short of the eye by exactly its un-flown remainder.
     for (const skin of [2, 4]) {
       const boot = bootPlay({ width: 64, height: 48 });
       const { driver } = boot;
-      SV_SpawnMonster(driver.server, skin <= 1 ? 'monster_soldier_light' : skin <= 3 ? 'monster_soldier' : 'monster_soldier_ss', v3(32, 100, 24));
+      const m = SV_SpawnMonster(driver.server, skin <= 1 ? 'monster_soldier_light' : skin <= 3 ? 'monster_soldier' : 'monster_soldier_ss', v3(32, 100, 24));
+      const d0 = Math.hypot(
+        32 - driver.pm.origin[0]!,
+        100 - driver.pm.origin[1]!,
+        24 - driver.pm.origin[2]!,
+      );
+      expect(d0).toBeGreaterThan(200);
       let beams = 0;
       for (let i = 0; i < 200 && beams === 0; i++) {
         driver.step(neutralCmd(), 0.1);
         const got = driver.drainTracers();
         if (got.length === 0) continue;
+        const dFire = Math.hypot(
+          m.edict.origin[0]! - driver.pm.origin[0]!,
+          m.edict.origin[1]! - driver.pm.origin[1]!,
+          m.edict.origin[2]! - driver.pm.origin[2]!,
+        );
+        // Closes-then-engages: the first volley fires well inside the
+        // spawn range (C reaction + chance cadence), never from afar.
+        expect(dFire).toBeLessThan(d0 - 50);
         const eye = v3(driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + 22);
         const eyeDist0 = Math.hypot(eye[0]! - got[0]!.origin[0]!, eye[1]! - got[0]!.origin[1]!, eye[2]! - got[0]!.origin[2]!);
-        // Engagement is mid-range: a full muzzle→eye beam would reach the eye.
-        expect(eyeDist0).toBeGreaterThan(100);
+        // The muzzle closed with the body: the gap is now short (the old
+        // pin demanded >100u — the pre-depth opener geometry).
+        expect(eyeDist0).toBeLessThan(100);
         for (const t of got) {
           beams++;
           expect(t.color).toBe(HITSCAN_TRACER_COLOR);
           expect(isGreenBoltColor(t.color)).toBe(false);
-          // Short muzzle streak, never a beam to the eye.
+          // Short muzzle streak, never a beam to the eye: the streak is
+          // far shorter than the muzzle→eye gap (a full beam would span
+          // the whole gap and end AT the eye).
           expect(t.length).toBe(ENEMY_TRACER_LENGTH);
           expect(t.length).toBeLessThanOrEqual(64);
+          expect(t.length).toBeLessThan(eyeDist0);
           const dl = Math.hypot(t.dir[0]!, t.dir[1]!, t.dir[2]!) || 1;
           const end = v3(
             t.origin[0]! + (t.dir[0]! / dl) * t.length,
@@ -100,13 +170,21 @@ describe('hitscan tracer color (no green lasers)', () => {
             t.origin[2]! + (t.dir[2]! / dl) * t.length,
           );
           const endDist = Math.hypot(end[0]! - eye[0]!, end[1]! - eye[1]!, end[2]! - eye[2]!);
-          // The closing monster drifts while aiming, so pin the invariant
-          // relatively: the endpoint stays well clear of the eye and the
-          // beam shortened the muzzle→eye gap by ~its own length (a full
-          // muzzle→eye beam would end AT the eye, gap ≈ 0).
-          expect(endDist).toBeGreaterThan(30);
-          expect(eyeDist0 - endDist).toBeGreaterThan(20);
-          expect(eyeDist0 - endDist).toBeLessThan(60);
+          // The streak flies at the eye and stops short by exactly its
+          // un-flown remainder — never overshooting onto the eye. (The
+          // ss machinegun fires a 3-round ±40 fan, so the exact pin only
+          // holds for the aimed shotgun round; the fan rounds still
+          // shorten the gap substantially and stop well clear.)
+          if (skin === 2) expect(endDist).toBeCloseTo(eyeDist0 - t.length, 0);
+          else expect(endDist).toBeLessThan(eyeDist0);
+          expect(endDist).toBeGreaterThan(10);
+          // The aimed round shortens the gap by about its own streak (a
+          // full muzzle→eye beam would end AT the eye, gap ≈ 0); fan
+          // rounds shorten it strictly but less.
+          if (skin === 2) {
+            expect(eyeDist0 - endDist).toBeGreaterThan(20);
+            expect(eyeDist0 - endDist).toBeLessThan(60);
+          }
         }
       }
       expect(driver.events).toContain('monshot');

@@ -644,17 +644,32 @@ describe('play driver (devroom, headless)', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { host, driver } = boot;
     // Soldier east with the pillar between it and the spawn: no LOS, so the
-    // chase holds `run` every tick (never an attack plant) and locomotion
-    // walks it at the player until the pillar hull stops it.
+    // first leg is a blind chase — C ai_checkattack refuses without
+    // enemy_vis (g_ai.c `if (!enemy_vis) return false`), so the chase holds
+    // `run` every tick (never an attack plant) while locomotion walks it at
+    // the last sighting. The sweep (C SV_NewChaseDir-lite) then rounds the
+    // pillar end, LOS latches, and M_CheckAttack commits to an attack move:
+    // closes-then-engages, exactly the C ai_run narrative.
     const m = SV_SpawnMonster(driver.server, 'monster_soldier', v3(200, 0, 32));
     const distToPlayer = (): number =>
       Math.hypot(m.edict.origin[0]! - driver.pm.origin[0]!, m.edict.origin[1]! - driver.pm.origin[1]!, m.edict.origin[2]! - driver.pm.origin[2]!);
     const d0 = distToPlayer();
     expect(d0).toBeGreaterThan(300);
-    stepDriver(driver, neutralCmd(), 30);
-    // monsterThink stepped the state machine and locomotion advanced the
-    // RENDERED origin (the snapshot below) toward the player.
+    stepDriver(driver, neutralCmd(), 15);
+    // Still blind (pressing the pillar face): running, closing, no shot.
     expect(m.state.move).toBe('run');
+    const dMid = distToPlayer();
+    expect(dMid).toBeLessThan(d0 - 50);
+    expect(driver.events).not.toContain('monshot');
+    stepDriver(driver, neutralCmd(), 25);
+    // Rounded the pillar and engaged: an attack move is playing (attack1 vs
+    // attack2 is the C soldier_attack coin flip at NEAR — accept either).
+    expect(['attack1', 'attack2']).toContain(m.state.move);
+    expect(driver.events).toContain('monshot');
+    // The volley left fire evidence (tracer and/or enemy muzzle queued).
+    const tracers = driver.drainTracers();
+    const flashes = driver.drainEnemyMuzzle();
+    expect(tracers.length + flashes.length).toBeGreaterThan(0);
     const d1 = distToPlayer();
     expect(d1).toBeLessThan(d0 - 50);
     // The authoritative snapshot carries the closed-in origin…
@@ -1112,8 +1127,13 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     const { driver } = boot;
     // Phase 0 single sim: the old driver-side chase (no ambush) is gone;
     // ambush soldiers hold stand until eye-to-eye LOS latches `seen` (id
-    // visible()), so the player rounds the corner first, then the runner
-    // closes in through the server tick. Same proof as the Phase 0 gate.
+    // visible()), then chase through the server tick. The chase obeys the
+    // C cadence (HuntTarget 1s hold, M_CheckAttack chance table): the
+    // runner closes from sight-latch range, then PLANTS volleys at melee —
+    // M_CheckAttack's MELEE branch commits every frame (no roll, no
+    // cooldown), so a soldier with LOS at <80 fires its skin gun instead
+    // of walking (soldier melee is NULL in C). Closes-then-engages, the
+    // same narrative as the devroom L test, on the real BSP.
     const spawn = v3(128, -320, 32);
     const sim = driver.server.monsters.filter((m) => !m.triggered && m.kind);
     const A = sim.sort(
@@ -1125,20 +1145,25 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     expect(A.seen).toBe(false);
     driver.pm.origin = v3(440, -500, 100);
     driver.pm.velocity = v3();
+    const distNow = (): number =>
+      Math.hypot(A.edict.origin[0]! - driver.pm.origin[0]!, A.edict.origin[1]! - driver.pm.origin[1]!, A.edict.origin[2]! - driver.pm.origin[2]!);
     let guard = 0;
     while (!A.seen && guard++ < 40) driver.step(neutralCmd(), 0.1);
     expect(A.seen).toBe(true);
+    const dSeen = distNow(); // sight-latch range: the chase starts here
     stepDriver(driver, neutralCmd(), 10); // settle the fall
-    const distNow = (): number =>
-      Math.hypot(A.edict.origin[0]! - driver.pm.origin[0]!, A.edict.origin[1]! - driver.pm.origin[1]!, A.edict.origin[2]! - driver.pm.origin[2]!);
     const d0 = distNow();
     expect(d0).toBeGreaterThan(60);
     for (let i = 0; i < 60; i++) driver.step(neutralCmd(), 0.1);
-    // monsterThink left stand and locomotion advanced the rendered origin
-    // toward the player — not just the server edict.
-    expect(A.state.move).not.toBe('stand1');
+    // Engaged at melee: an attack move is playing (attack1 vs attack2 is
+    // the C soldier_attack coin flip — accept either) and the volley
+    // fired, instead of the body walking past gun range.
+    expect(['attack1', 'attack2']).toContain(A.state.move);
+    expect(driver.events).toContain('monshot');
     const d1 = distNow();
-    expect(d1).toBeLessThan(d0 - 20);
+    // Closed in from the sight latch, then planted at melee range.
+    expect(d1).toBeLessThan(dSeen - 20);
+    expect(d1).toBeLessThan(80);
     // The authoritative snapshot carries the closed-in origin…
     const snap = driver.snapshot(driver.server.time);
     const sent = snap.entities.find((e) => e.id === A.edict.num)!;
@@ -1160,6 +1185,6 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
       near[0]!.origin[0]! - boot.host.playerOrigin[0]!,
       near[0]!.origin[1]! - boot.host.playerOrigin[1]!,
     );
-    expect(rd).toBeLessThan(d0 - 20);
+    expect(rd).toBeLessThan(dSeen - 20);
   });
 });
