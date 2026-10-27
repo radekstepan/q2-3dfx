@@ -14,6 +14,7 @@ import {
   bspToMiniWorld,
   createDevroom,
   DEVROOM_CAMERA,
+  getDevMesh,
   type BspTexelSource,
 } from './index.js';
 import { loadBsp } from '@q2/bsp';
@@ -197,5 +198,79 @@ describe.runIf(!!process.env.Q2_PAK)('async pooled render on real base1 (Q2_PAK)
       expect(async.pixels).toBe(sync.pixels);
     }
     resetCVars();
+  });
+});
+
+describe('async foreground (pooled kick ordering, dist-gated)', () => {
+  // The deferred world kick lazily clears every band it touches, so the
+  // entity foreground (world alias, entities incl. the depthHack viewmodel)
+  // must draw AFTER the kick — drawing before it wipes the gun/monsters in
+  // the live browser loop (which runs renderViewAsync). Asset-free devroom
+  // pins run everywhere a dist build exists.
+  async function pooledMode(useAsync: boolean, withGun: boolean): Promise<string> {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP pooled foreground test: dist not built (run yarn build first)');
+      return 'skip';
+    }
+    const { resetCVars, setCVar } = await import('@q2/config');
+    resetCVars();
+    const W = 320, H = 240;
+    const fb = createFramebuffer(W, H, true);
+    const r = new SoftwareRenderer();
+    r.init(fb);
+    r.setPalette(devPalette());
+    // Gun entity handle must come from THIS renderer (handles are per-renderer).
+    let entities: {
+      model: number; origin: Float32Array; angles: Float32Array;
+      frame: number; skin: number; depthHack?: boolean;
+    }[] = [];
+    if (withGun) {
+      const gun = r.registerModel({ name: 'gun', kind: 'md2', data: getDevMesh(0) });
+      entities = [{
+        model: gun,
+        origin: new Float32Array([...DEVROOM_CAMERA.origin]),
+        angles: new Float32Array([...DEVROOM_CAMERA.angles]),
+        frame: 0, skin: 0, depthHack: true,
+      }];
+    }
+    setCVar(SW_WORKERS_CVAR, 4);
+    setCVar(SW_ACCUM_CVAR, 1);
+    if (!r.syncWorkersFromCvar()) throw new Error('banded path unavailable');
+    const pool = BandWorkerPool.create(3, W, H, { indexJsPath: distUrl.pathname });
+    if (!pool) throw new Error('pool unavailable (need worker_threads + SAB + Atomics.wait)');
+    try {
+      r.attachWorkerPool(pool);
+      r.beginFrame();
+      if (useAsync) {
+        await r.renderViewAsync(devView(), { name: 'devroom', data: createDevroom() }, entities);
+        await r.endFrameAsync();
+      } else {
+        r.renderView(devView(), { name: 'devroom', data: createDevroom() }, entities);
+        r.endFrame();
+      }
+      return hashIdx(r.getFramebuffer().index!);
+    } finally {
+      await pool.dispose();
+      resetCVars();
+    }
+  }
+
+  it('pooled async keeps world-placed alias like pooled sync', async () => {
+    const world = createDevroom();
+    expect(world.alias.length).toBeGreaterThan(0);
+    const sync = await pooledMode(false, false);
+    if (sync === 'skip') return;
+    const async = await pooledMode(true, false);
+    console.log(`foreground alias sync=${sync} async=${async}`);
+    expect(async).toBe(sync);
+  });
+
+  it('pooled async keeps a depthHack gun entity like pooled sync', async () => {
+    const sync = await pooledMode(false, true);
+    if (sync === 'skip') return;
+    const async = await pooledMode(true, true);
+    console.log(`foreground gun sync=${sync} async=${async}`);
+    expect(async).toBe(sync);
   });
 });

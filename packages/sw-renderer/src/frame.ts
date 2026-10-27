@@ -339,6 +339,19 @@ export class SoftwareRenderer implements Refresh {
   private stPixelsBase = 0;
   private stT0 = 0;
   /**
+   * Async-render foreground deferral (browser lane): renderViewAsync runs
+   * the world pass with `skipForeground` set (planes still owned by the
+   * deferred pool kick), then draws the entity foreground after the kick
+   * completes. The kick's lazy per-band clear would otherwise wipe direct
+   * plane writes (alias/entities incl. the depthHack viewmodel, sprites,
+   * particles, tracer beams). Sync path unaffected (flag defaults false).
+   * `fgCam`/`fgWorld` are the phase-1 refs (no allocation, never read
+   * across frames; the path is non-reentrant by contract).
+   */
+  private skipForeground = false;
+  private fgCam: Camera | null = null;
+  private fgWorld: MiniWorld | null = null;
+  /**
    * Overdraw-attribution counters (M3.3 option b). Null unless a diagnostic
    * measurement is armed via testMeasureOverdraw(); the per-surface loop only
    * pays one null check per surface when disarmed, and output is identical
@@ -1242,6 +1255,37 @@ export class SoftwareRenderer implements Refresh {
     }
     candidatePixels = this.backend.pixelsDrawn - pixelsBase;
 
+    // Stash the foreground inputs for the async path (refs only): the
+    // deferred world kick must complete before any direct plane writes
+    // (its lazy per-band clear would wipe them — see drawForeground).
+    this.fgCam = cam;
+    this.fgWorld = worldData;
+    if (!this.skipForeground) this.drawForeground(cam, worldData, entities);
+    if (d) d.candidatePixels = candidatePixels;
+    // Stash the stats partials: finishStats() reads the backend counters,
+    // which are only complete after the (possibly async) frame kick.
+    // The sync path's counters are already complete, so its stats are
+    // unchanged; the async path re-runs finishStats() after the kick.
+    this.stSpansEmitted = spansEmitted;
+    this.stPixelsBase = pixelsBase;
+    this.stT0 = t0;
+    return this.finishStats();
+  }
+
+  /**
+   * Entity foreground: world-placed alias / sprites / particles (M3.4)
+   * plus game entities (MD2 alias incl. the depthHack viewmodel, sprites,
+   * tracer beams) and renderer-owned tracer beams, then dlight aging.
+   * Direct index/depth-plane writes — must run AFTER the world span kick
+   * on pooled paths (the kick lazily clears every band it touches, which
+   * would wipe these draws). The sync path calls this inline right after
+   * its kick; renderViewAsync calls it after the deferred kick completes.
+   * Bit-identical either way: world-first, foreground-second, all writes
+   * depth-guarded. Zero allocation (phase timing uses the armed scratch).
+   */
+  private drawForeground(cam: Camera, worldData: MiniWorld, entities: Entity[]): void {
+    const ph = this.phaseArmed ? this.phaseAcc : null;
+    let pt = ph ? phaseNow() : 0;
     // world-placed alias / sprites / particles (M3.4 in the devroom)
     // Pooled path with zero span batches (degenerate frame): planes were
     // never cleared lazily, so fill once before direct plane writes.
@@ -1363,15 +1407,6 @@ export class SoftwareRenderer implements Refresh {
     // re-added expires after DEFAULT_DLIGHT_TTL_FRAMES renders (swept at the
     // top of the next renderView, with one serial bump / one cache rebuild).
     this.dlights.ageFrame();
-    if (d) d.candidatePixels = candidatePixels;
-    // Stash the stats partials: finishStats() reads the backend counters,
-    // which are only complete after the (possibly async) frame kick.
-    // The sync path's counters are already complete, so its stats are
-    // unchanged; the async path re-runs finishStats() after the kick.
-    this.stSpansEmitted = spansEmitted;
-    this.stPixelsBase = pixelsBase;
-    this.stT0 = t0;
-    return this.finishStats();
   }
 
   /**
@@ -1395,32 +1430,40 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
-   * Async render (M8.1 browser lane): geometry + entity foreground run
-   * synchronously exactly like renderView (deferring only the pooled frame
-   * kick), then the single frame kick completes without blocking the
-   * calling thread (message-driven worker completion). Output is
-   * bit-identical to renderView on opaque worlds: every plane write stays
-   * depth-guarded, so the deferred world kick converges to the same planes
-   * regardless of the foreground having drawn first, and the stats
-   * recompute from the same counters. (Translucent + pooled/deferred
-   * ordering follows the pooled sync path — the translucency lane's open
-   * item, identical in both.) Non-reentrant (uses the stats stash); await
-   * the result before starting the next frame. Falls back to the sync path
+   * Async render (M8.1 browser lane): the world span pass runs synchronously
+   * exactly like renderView (deferring only the pooled frame kick), then the
+   * single frame kick completes without blocking the calling thread
+   * (message-driven worker completion), and the entity foreground draws
+   * AFTER the kick — the kick lazily clears every band it touches, so
+   * foreground drawn before it (alias/entities incl. the depthHack
+   * viewmodel, sprites, particles, tracer beams) would be wiped. This is
+   * exactly the sync order (kick, then foreground), hence bit-identical to
+   * renderView; the old "draw first, converge by depth test" claim was wrong
+   * on pooled paths (the clear is not depth-guarded). Stats recompute from
+   * the same counters. Non-reentrant (uses the stats stash); await the
+   * result before starting the next frame. Falls back to the sync path
    * with no pool.
    */
   async renderViewAsync(view: RefDef, world: WorldModel, entities: Entity[]): Promise<FrameStats> {
     const banded = this.backend === this.bandBackend ? this.bandBackend : null;
     const prevDefer = banded ? banded.flushDeferred : false;
+    const prevSkip = this.skipForeground;
     if (banded) banded.flushDeferred = true;
+    this.skipForeground = true;
     try {
       // Premature stats discarded; partials stashed for finishStats().
       this.renderView(view, world, entities);
     } finally {
+      this.skipForeground = prevSkip;
       if (banded) banded.flushDeferred = prevDefer;
     }
     if (banded && banded.dispatcher && banded.accumEnabled) {
       await banded.flushAccumAsync();
     }
+    // World kick complete (planes valid) — now the direct plane writes.
+    const fgCam = this.fgCam;
+    const fgWorld = this.fgWorld;
+    if (fgCam && fgWorld) this.drawForeground(fgCam, fgWorld, entities);
     return this.finishStats();
   }
 

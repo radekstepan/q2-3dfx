@@ -1248,3 +1248,14 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - combat.test.ts ss-burst in devroom — touches none of this lane's paths:
 - devroom spawns no movers (TouchButtons/carry/clip loops all no-op) and
 - the test never sets BUTTON_USE, so it cannot execute this lane's code).
+- CLOSED 2026-10-27 (async foreground wipe — the missing hand gun):
+- `renderViewAsync` drew the entity foreground BEFORE the deferred pooled
+- world kick, whose lazy per-band clear wiped every direct plane write
+- (world alias, entities incl. the depthHack viewmodel gun, sprites,
+- particles, tracer beams). Latent since the async primitives landed (all
+- async goldens ran entity-free: `renderAsync.test.ts` passed `[]`), live
+- since the browser rAF tick adopted `frameAsync`. `renderView` is split
+- into world pass + `drawForeground` (sync: inline, bit-identical; async:
+- after `flushAccumAsync`). Regression pins: pooled async vs pooled sync
+- with world alias and with a depthHack gun entity (both fail pre-fix with
+- the foreground wiped, green post-fix). Web base1-gate 23/23 green.
