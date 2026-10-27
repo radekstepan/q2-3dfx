@@ -896,6 +896,12 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - CLOSED 2026-10-26 (doors/paths C-parity): func_door_secret / rotating
 - doors, Think_CalcMoveSpeed, func_train_find path corners (synthetic unit
 - tests in `packages/server`; base1 ships none — C-parity for other maps).
+- CLOSED 2026-10-26 (stop-jitter residual): sub-tick prefix replays
+- overshoot the 100ms friction step they prefix (front-loaded decay) and
+- snap back ~0.5u at the stop boundary — `CL_Predict` now blends linearly
+- to the server-exact tick end (one `SERVER_DT` step with the latest staged
+- cmd); production-faithful stop shows 0 backward steps and 0.0 post-settle
+- displacement (was 4 snap-backs, max 0.54u); base1-gate 11/11 green.
 - CLOSED 2026-10-26 (canvas pointer-lock): config-menu clicks no longer
 - fire the weapon. `attachToCanvas` (`packages/input/src/dom.ts`) listened
 - for `mousedown` on `document`, so any UI click (cvar panel, dropdowns,

@@ -579,4 +579,96 @@ describe('stop settle (10Hz server, sub-tick renders)', () => {
       resetPmoveWorld();
     }
   });
+
+  it('production staging settles with no oscillation past 0.5u (stop jitter)', () => {
+    // Production-faithful stop: the host stages owned cmds incrementally
+    // (one per 16ms frame, cleared per tick) and renders at the continuous
+    // serverTime + serverAcc clock — unlike settleRun above, which stages
+    // the full 100ms tick upfront. Replaying that staged prefix used to
+    // expose the partial-step friction overshoot (a short pmove step keeps
+    // more velocity, so it travels FARTHER than the full tick it prefixes)
+    // as a forward pop + snap-back of up to ~0.54u per release tick.
+    // The render now blends linearly to the server-exact tick end instead.
+    resetPmoveWorld();
+    setPmoveWorld(floorTrace);
+    setCVar('cl_predict', 1);
+    try {
+      const server = makePmoveState();
+      server.origin[0] = 0;
+      server.origin[1] = 0;
+      server.origin[2] = 24; // feet resting on the floor
+      const ucmd = (msec: number, fwd: number): UserCmd => ({
+        msec,
+        angles: new Float32Array(ANGLES) as UserCmd['angles'],
+        forwardmove: fwd,
+        sidemove: 0,
+        upmove: 0,
+        buttons: 0,
+      });
+      let time = 0;
+      for (let t = 0; t < 9; t++) {
+        pmove(server, ucmd(100, 400));
+        time += 0.1;
+      }
+      const takeSnap = (): Snapshot => ({
+        serverTime: time,
+        entities: [
+          {
+            id: 1,
+            origin: [server.origin[0]!, server.origin[1]!, server.origin[2]!] as [number, number, number],
+            velocity: [server.velocity[0]!, server.velocity[1]!, server.velocity[2]!] as [number, number, number],
+            pmFlags: server.pmFlags,
+            grounded: server.groundEntity !== -1,
+          },
+        ],
+      });
+      const p = new Predictor();
+      p.pushSnapshot(takeSnap());
+      // Warmup tick so the predictor holds a snapshot pair (production
+      // always has prev+next past the first 100ms).
+      pmove(server, ucmd(100, 400));
+      time += 0.1;
+      p.pushSnapshot(takeSnap());
+      // Release phase: Host-style 16ms frames, cmd-first, incremental
+      // staging, continuous render clock.
+      let serverAcc = 0;
+      let owned: PredictCmd[] = [];
+      const xs: number[] = [];
+      for (let i = 0; i < 30; i++) {
+        serverAcc += 0.016;
+        while (serverAcc >= 0.1) {
+          serverAcc -= 0.1;
+          pmove(server, ucmd(100, 0));
+          time += 0.1;
+          const s = takeSnap();
+          p.pushSnapshot(s);
+          owned = [];
+          p.clearPendingCmds();
+        }
+        owned.push({
+          msec: 16,
+          angles: [0, 0, 0],
+          forwardmove: 0,
+          sidemove: 0,
+          upmove: 0,
+          buttons: 0,
+        });
+        p.setPendingCmds(owned);
+        xs.push(p.renderEntities(time + serverAcc, 1).find((e) => e.id === 1)!.origin[0]);
+      }
+      // Monotonic settle: never steps backwards (no oscillation/pop).
+      for (let i = 1; i < xs.length; i++) {
+        expect(xs[i]!).toBeGreaterThanOrEqual(xs[i - 1]!);
+      }
+      // Post-settle displacement is exactly zero (the zero-velocity snap
+      // pins the settled tail to the frozen tick, no drift or tremor).
+      const final = xs[xs.length - 1]!;
+      for (const x of xs.slice(-10)) expect(x).toBe(final);
+      // The tail sits exactly on the authoritative frozen tick.
+      expect(final).toBe(server.origin[0]!);
+    } finally {
+      setCVar('cl_predict', 1);
+      resetPmoveWorld();
+    }
+  });
 });

@@ -13,7 +13,7 @@
 // the legacy constant-velocity extrapolation so the two modes can be A/B'd.
 // Interpolation of remote entities is untouched by the pmove hookup.
 
-import { getCVarNumber } from '@q2/config';
+import { getCVarNumber, SERVER_DT } from '@q2/config';
 import { makePmoveState, pmoveFull, PMF_ON_GROUND } from '@q2/game';
 
 export type Origin3 = [number, number, number];
@@ -121,16 +121,16 @@ export function CL_Interpolate(prev: Snapshot, next: Snapshot, renderTime: numbe
  * origin, or null for unknown ids / empty streams.
  *
  * `horizonMs` bounds how much of the stream is replayed (default: all of
- * it). The caller (`CL_Predict`) passes the sub-tick render debt
- * `(now - newest.serverTime) * 1000`, so a render exactly on a tick
- * replays nothing and returns the snapshot origin exactly, a mid-interval
- * render replays only the elapsed prefix, and the end-of-interval render
- * replays exactly one 100ms server step. Replaying the whole staged stream
- * regardless of render time (the old behaviour) runs a full frame ahead of
- * the snapshot at tick instants and snaps back when the next snapshot
- * lands — the stop jitter. Runs of identical inputs are still coalesced
- * (msec is a delivery artifact), with the final run truncated to the
- * horizon instead of overshooting it.
+ * it). `CL_Predict` uses this for past-the-tick catch-up replays; inside the
+ * current tick it instead replays a single `SERVER_DT` step with the latest
+ * staged cmd (the server-exact tick end — see `CL_Predict`), so a render
+ * exactly on a tick returns the snapshot origin exactly and the
+ * end-of-interval render replays exactly one 100ms server step. Replaying
+ * the whole staged stream regardless of render time (the old behaviour) runs
+ * a full frame ahead of the snapshot at tick instants and snaps back when
+ * the next snapshot lands — the stop jitter. Runs of identical inputs are
+ * still coalesced (msec is a delivery artifact), with the final run
+ * truncated to the horizon instead of overshooting it.
  */
 export function CL_PredictPmove(
   base: Snapshot,
@@ -235,36 +235,51 @@ export function CL_PredictPmove(
 /**
  * `CL_Predict`: predict the local player from the newest snapshot.
  *
- * When owned cmds are supplied AND `cl_predict` is nonzero, the full staged
- * stream is replayed through the real pmove step (the tick-end target —
- * friction-exact vs the server's 100ms step) and the render blends from the
- * snapshot origin toward that target by the sub-tick debt
- * `dt / stagedTotal`, clamped 0..1. `dt <= 0` returns the snapshot origin
- * exactly, so tick-aligned renders never lead the server and never snap
- * back; the end-of-interval render equals the tick target, so constant
- * streams land bit-identically on the next snapshot. Blending (rather than
- * replaying only the elapsed prefix) keeps the settle monotonic: a prefix
- * replay overshoots the full friction step it prefixes (friction decay is
- * front-loaded in a single pmove step — shorter dt keeps more velocity),
- * which read as a forward pop + snap-back every tick (the stop jitter).
- * Otherwise (no cmds, `cl_predict` 0, or unknown id) it falls back to
- * constant-velocity extrapolation `origin + velocity * dt` (legacy A/B
- * baseline). Returns null only for unknown ids.
+ * When owned cmds are supplied AND `cl_predict` is nonzero, the render
+ * blends linearly from the snapshot origin toward the server-exact tick end
+ * by the sub-tick debt `dt / SERVER_DT`, clamped 0..1. `dt <= 0` returns the
+ * snapshot origin exactly, so tick-aligned renders never lead the server and
+ * never snap back; the end-of-interval render equals the tick target, so
+ * constant streams land bit-identically on the next snapshot.
+ *
+ * The tick end is ONE `SERVER_DT` pmove step run with the latest staged cmd
+ * — exactly what the closing server tick will run (the host ticks with the
+ * current frame's cmd, so mid-interval history never reaches the server).
+ * Replaying the staged prefix instead overshoots the full friction step it
+ * prefixes (ground friction decay is front-loaded in a single pmove step —
+ * shorter dt keeps more velocity, so a partial step travels farther than the
+ * whole tick), which read as a forward pop + snap-back every tick while
+ * stopping. The linear blend to the tick end is monotonic by construction.
+ * Past the current tick (`dt > SERVER_DT`, catch-up/tests only — production
+ * render debt is always sub-tick) the whole staged stream is replayed
+ * friction-exactly as before. Otherwise (no cmds, `cl_predict` 0, or unknown
+ * id) it falls back to constant-velocity extrapolation
+ * `origin + velocity * dt` (legacy A/B baseline). Returns null only for
+ * unknown ids.
  */
 export function CL_Predict(newest: Snapshot, localId: number, dt: number, cmds?: PredictCmd[]): Origin3 | null {
   const ent = newest.entities.find((e) => e.id === localId);
   if (!ent) return null;
   if (cmds && cmds.length > 0 && getCVarNumber('cl_predict') !== 0) {
     const horizonMs = Math.max(0, dt * 1000);
-    let total = 0;
-    for (const c of cmds) total += c.msec;
-    // Tick-end target: the whole staged stream (friction-exact). Horizon
-    // trimming inside still applies, with total as the budget it replays
-    // fully — including the zero-velocity snap for settled streams.
-    const end = CL_PredictPmove(newest, localId, cmds, total);
-    if (end) {
-      if (!(total > 0)) return end;
-      return lerpOrigin(ent.origin, end, clamp01(horizonMs / total));
+    if (!(horizonMs > 0)) return [...ent.origin] as Origin3;
+    const tickMs = SERVER_DT * 1000;
+    if (horizonMs <= tickMs) {
+      // Inside the current tick interval: blend snapshot -> server-exact
+      // tick end (latest staged cmd held for the whole 100ms quantum).
+      const last = cmds[cmds.length - 1]!;
+      const end = CL_PredictPmove(newest, localId, [{ ...last, msec: tickMs }]);
+      if (end) return lerpOrigin(ent.origin, end, clamp01(horizonMs / tickMs));
+    } else {
+      // Past the current tick: replay the whole staged stream (multi-step,
+      // friction-exact) and hold the end target past the staged duration.
+      let total = 0;
+      for (const c of cmds) total += c.msec;
+      const end = CL_PredictPmove(newest, localId, cmds, total);
+      if (end) {
+        if (!(total > 0)) return end;
+        return lerpOrigin(ent.origin, end, clamp01(horizonMs / total));
+      }
     }
   }
   return extrapolateOrigin(ent.origin, ent.velocity, dt);
