@@ -6,22 +6,42 @@
 // Fixed-point 8-bit fractional weights, clamp-to-edge, zero-alloc.
 
 import { BAYER4 } from './bayer.js';
+import { wrapTap, type TextureAddress } from './upload.js';
+
+/**
+ * Map any texel coordinate into [0, size) for repeat addressing. Exact
+ * multiples of size land on 0 (fp guard). See upload.ts for the convention.
+ */
+function wrapCentre(coord: number, size: number): number {
+  const c = coord - Math.floor(coord / size) * size;
+  return c >= size ? 0 : c;
+}
 
 // --- Bilinear ------------------------------------------------------------
 
 /**
  * 4-tap bilinear on a byte texture. u/v are texel coordinates (integer =
- * texel centre), clamp-to-edge. Fractional parts use 8-bit fixed-point
- * weights: acc = w00*a + w01*b + w10*c + w11*d, result (acc + 32768) >> 16
- * with the 16-bit weight products summed exactly.
+ * texel centre — see TEXEL-CENTRE CONVENTION in upload.ts). Fractional parts
+ * use 8-bit fixed-point weights: acc = w00*a + w01*b + w10*c + w11*d,
+ * result (acc + 32768) >> 16 with the 16-bit weight products summed exactly.
+ * Addressing is per-axis (repeat wraps EACH tap via wrapTap; clamp pins to
+ * the edge texel); default clamp preserves the historical behaviour.
  */
-export function sampleBilinear(tex: Uint8Array, w: number, h: number, u: number, v: number): number {
-  const uc = u < 0 ? 0 : u > w - 1 ? w - 1 : u;
-  const vc = v < 0 ? 0 : v > h - 1 ? h - 1 : v;
+export function sampleBilinear(
+  tex: Uint8Array,
+  w: number,
+  h: number,
+  u: number,
+  v: number,
+  addressS: TextureAddress = 'clamp',
+  addressT: TextureAddress = 'clamp',
+): number {
+  const uc = addressS === 'repeat' ? wrapCentre(u, w) : u < 0 ? 0 : u > w - 1 ? w - 1 : u;
+  const vc = addressT === 'repeat' ? wrapCentre(v, h) : v < 0 ? 0 : v > h - 1 ? h - 1 : v;
   const x0 = uc | 0;
   const y0 = vc | 0;
-  const x1 = x0 + 1 < w ? x0 + 1 : x0;
-  const y1 = y0 + 1 < h ? y0 + 1 : y0;
+  const x1 = wrapTap(x0 + 1, w, addressS);
+  const y1 = wrapTap(y0 + 1, h, addressT);
   const fu = Math.round((uc - x0) * 256);
   const fv = Math.round((vc - y0) * 256);
   const w00 = (256 - fu) * (256 - fv);
@@ -36,12 +56,20 @@ export function sampleBilinear(tex: Uint8Array, w: number, h: number, u: number,
   return (acc + 32768) >> 16;
 }
 
-/** Nearest texel (point sample), clamp-to-edge. */
-export function sampleNearest(tex: Uint8Array, w: number, h: number, u: number, v: number): number {
-  let x = Math.round(u);
-  let y = Math.round(v);
-  x = x < 0 ? 0 : x > w - 1 ? w - 1 : x;
-  y = y < 0 ? 0 : y > h - 1 ? h - 1 : y;
+/** Nearest texel (point sample). Addressing per-axis; default clamp-to-edge. */
+export function sampleNearest(
+  tex: Uint8Array,
+  w: number,
+  h: number,
+  u: number,
+  v: number,
+  addressS: TextureAddress = 'clamp',
+  addressT: TextureAddress = 'clamp',
+): number {
+  const cu = addressS === 'repeat' ? wrapCentre(u, w) : u < 0 ? 0 : u > w - 1 ? w - 1 : u;
+  const cv = addressT === 'repeat' ? wrapCentre(v, h) : v < 0 ? 0 : v > h - 1 ? h - 1 : v;
+  const x = wrapTap(Math.round(cu), w, addressS);
+  const y = wrapTap(Math.round(cv), h, addressT);
   return tex[y * w + x]!;
 }
 
@@ -76,7 +104,9 @@ function expandInto(index: number, palette: Uint8Array, tmp: Uint8Array): void {
  * Sample a palettised texture, expanding through the palette at sample time.
  * bilinear=true filters AFTER expansion (what the Voodoo does with
  * GL_EXT_shared_texture_palette); false = point sample. Writes RGB to
- * out[off..off+2]. Module scratch only (no per-call allocation).
+ * out[off..off+2]. Module scratch only (no per-call allocation). Addressing
+ * is per-axis (repeat wraps EACH of the 4 taps); default clamp preserves the
+ * historical behaviour. u/v are texel coordinates (see upload.ts convention).
  */
 export function samplePalette(
   indices: Uint8Array,
@@ -88,22 +118,22 @@ export function samplePalette(
   out: Uint8Array,
   off: number,
   bilinear = true,
+  addressS: TextureAddress = 'clamp',
+  addressT: TextureAddress = 'clamp',
 ): void {
-  const uc = u < 0 ? 0 : u > w - 1 ? w - 1 : u;
-  const vc = v < 0 ? 0 : v > h - 1 ? h - 1 : v;
+  const uc = addressS === 'repeat' ? wrapCentre(u, w) : u < 0 ? 0 : u > w - 1 ? w - 1 : u;
+  const vc = addressT === 'repeat' ? wrapCentre(v, h) : v < 0 ? 0 : v > h - 1 ? h - 1 : v;
   const x0 = uc | 0;
   const y0 = vc | 0;
   if (!bilinear) {
     // Point sample: round to nearest texel centre (matches sampleNearest).
-    let nx = Math.round(uc);
-    let ny = Math.round(vc);
-    nx = nx < 0 ? 0 : nx > w - 1 ? w - 1 : nx;
-    ny = ny < 0 ? 0 : ny > h - 1 ? h - 1 : ny;
+    const nx = wrapTap(Math.round(uc), w, addressS);
+    const ny = wrapTap(Math.round(vc), h, addressT);
     expandPalette(indices[ny * w + nx]!, palette, out, off);
     return;
   }
-  const x1 = x0 + 1 < w ? x0 + 1 : x0;
-  const y1 = y0 + 1 < h ? y0 + 1 : y0;
+  const x1 = wrapTap(x0 + 1, w, addressS);
+  const y1 = wrapTap(y0 + 1, h, addressT);
   const fu = Math.round((uc - x0) * 256);
   const fv = Math.round((vc - y0) * 256);
   expandInto(indices[y0 * w + x0]!, palette, _svA);
@@ -133,7 +163,9 @@ export function samplePalette(
  * Representation note (astra §2.3): vd_palettetex selects the UPLOAD
  * policy (paletted vs expanded storage), never the filter. Both this and
  * samplePalette obey the same vd_bilinear switch; on identical colours
- * they must produce identical output (see sampler.test.ts).
+ * they must produce identical output (see sampler.test.ts). Addressing is
+ * per-axis (repeat wraps EACH of the 4 taps); default clamp preserves the
+ * historical behaviour. u/v are texel coordinates (see upload.ts convention).
  */
 export function sampleRGBTexture(
   tex: Uint8Array,
@@ -144,25 +176,25 @@ export function sampleRGBTexture(
   out: Uint8Array,
   off: number,
   bilinear = true,
+  addressS: TextureAddress = 'clamp',
+  addressT: TextureAddress = 'clamp',
 ): void {
-  const uc = u < 0 ? 0 : u > w - 1 ? w - 1 : u;
-  const vc = v < 0 ? 0 : v > h - 1 ? h - 1 : v;
+  const uc = addressS === 'repeat' ? wrapCentre(u, w) : u < 0 ? 0 : u > w - 1 ? w - 1 : u;
+  const vc = addressT === 'repeat' ? wrapCentre(v, h) : v < 0 ? 0 : v > h - 1 ? h - 1 : v;
   const x0 = uc | 0;
   const y0 = vc | 0;
   if (!bilinear) {
     // Point sample: round to nearest texel centre (matches sampleNearest).
-    let nx = Math.round(uc);
-    let ny = Math.round(vc);
-    nx = nx < 0 ? 0 : nx > w - 1 ? w - 1 : nx;
-    ny = ny < 0 ? 0 : ny > h - 1 ? h - 1 : ny;
+    const nx = wrapTap(Math.round(uc), w, addressS);
+    const ny = wrapTap(Math.round(vc), h, addressT);
     const p = (ny * w + nx) * 3;
     out[off] = tex[p]!;
     out[off + 1] = tex[p + 1]!;
     out[off + 2] = tex[p + 2]!;
     return;
   }
-  const x1 = x0 + 1 < w ? x0 + 1 : x0;
-  const y1 = y0 + 1 < h ? y0 + 1 : y0;
+  const x1 = wrapTap(x0 + 1, w, addressS);
+  const y1 = wrapTap(y0 + 1, h, addressT);
   const fu = Math.round((uc - x0) * 256);
   const fv = Math.round((vc - y0) * 256);
   const pa = (y0 * w + x0) * 3;
@@ -184,8 +216,12 @@ export function sampleRGBTexture(
 
 /**
  * Screen-space footprint of a texel: max column/row gradient length.
- * rho = max(|dudx| + |dvdx|... ) — Voodoo uses per-pixel LOD; the Glide
- * form is rho = max(sqrt(dudx^2+dvdx^2), sqrt(dudy^2+dvdy^2)).
+ * rho = max(sqrt(dudx^2+dvdx^2), sqrt(dudy^2+dvdy^2)).
+ *
+ * Never throws and never returns NaN for finite inputs: constant UVs or
+ * magnification (zero gradients) yield rho = 0, which mipLevel clamps to
+ * epsilon internally (LOD 0). Non-finite gradients propagate as NaN, which
+ * mipLevel rejects loudly — a NaN gradient is a geometry bug, not a level.
  */
 export function mipRho(dudx: number, dvdx: number, dudy: number, dvdy: number): number {
   const rx = Math.sqrt(dudx * dudx + dvdx * dvdx);
@@ -194,7 +230,26 @@ export function mipRho(dudx: number, dvdx: number, dudy: number, dvdy: number): 
 }
 
 /**
- * Mipmap LOD: lod = log2(rho) + bias, clamped to [0, maxLevel].
+ * LOD bias compensation for textureMode.tloddither (prog guide §tLOD).
+ *
+ * When the hardware dithers LOD selection between adjacent levels it adds an
+ * AVERAGE of +0.375 to the level; a single-level software pick (which is what
+ * mipLevel + pickMipLevel(mipDither=true) emulates per-pixel) must add the
+ * same +0.375 to match the hardware's average level, or mipped content renders
+ * systematically one-third level too sharp. When LOD dithering is OFF, no
+ * compensation applies. Pairing rule: mipLevel(..., tlodDither) and
+ * pickMipLevel(..., mipDither) must agree — both true (hardware tloddither
+ * profile) or both false (crisp single-level profile). This is a documented
+ * average-match, NOT smooth trilinear filtering and NOT anisotropy (both are
+ * explicitly out of scope: the game profile is GL_LINEAR_MIPMAP_NEAREST).
+ */
+export function lodBiasCompensation(tlodDither: boolean): number {
+  return tlodDither ? 0.375 : 0;
+}
+
+/**
+ * Mipmap LOD: lod = log2(rho) + bias [+ 0.375 when tlodDither], clamped to
+ * [0, maxLevel].
  *
  * Sign convention follows the Voodoo tLOD.lodbias register (prog guide
  * §textureMode/tLOD): the bias is ADDED to log2(rho), so a NEGATIVE bias
@@ -207,7 +262,12 @@ export function mipRho(dudx: number, dvdx: number, dudy: number, dvdy: number): 
  * non-finite rho/bias (NaN, ±Infinity) throw. maxLevel defaults to
  * +Infinity (no upper clamp); pass the mip chain length - 1 to bound it.
  */
-export function mipLevel(rho: number, bias: number, maxLevel = Number.POSITIVE_INFINITY): number {
+export function mipLevel(
+  rho: number,
+  bias: number,
+  maxLevel = Number.POSITIVE_INFINITY,
+  tlodDither = false,
+): number {
   if (!Number.isFinite(rho) || !Number.isFinite(bias)) {
     throw new Error(`[voodoo] mipLevel: rho and bias must be finite, got ${rho}, ${bias}`);
   }
@@ -215,7 +275,7 @@ export function mipLevel(rho: number, bias: number, maxLevel = Number.POSITIVE_I
     throw new Error(`[voodoo] mipLevel: maxLevel must not be NaN`);
   }
   const r = rho <= 0 ? 1e-6 : rho;
-  const lod = Math.log2(r) + bias;
+  const lod = Math.log2(r) + bias + lodBiasCompensation(tlodDither);
   if (!(lod > 0)) return 0;
   const cap = maxLevel < 0 ? 0 : maxLevel;
   return lod > cap ? cap : lod;
@@ -272,6 +332,21 @@ export function buildFogTable(density = 3.0): Uint8Array {
   cachedDensity = density;
   cachedFog = t;
   return t;
+}
+
+/**
+ * Fog contribution for the capability gate (vd_fog).
+ *
+ * vd_fog enables the fog STATE; it must NOT invent fog where the scene has
+ * none. Quake II base1 ships no scene/material fog, so with nothing explicitly
+ * enabled this returns 0 and shadePixel yields the lit colour untouched. Pass
+ * the resolved 0..255 table factor only when a scene/material/profile stage
+ * explicitly enables fog; values outside [0, 255] are clamped.
+ */
+export function fogContribution(fogEnabled: boolean, factor: number): number {
+  if (!fogEnabled || !(factor > 0)) return 0;
+  if (factor >= 255) return 255;
+  return factor;
 }
 
 /**

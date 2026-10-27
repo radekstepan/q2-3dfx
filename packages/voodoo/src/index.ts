@@ -14,6 +14,7 @@ export * from './bayer.js';
 export * from './capture.js';
 export * from './resolve.js';
 export * from './sampler.js';
+export * from './upload.js';
 
 import { applyPostFilter, expandRGB565, quantiseDepth, resolveRGB565, resolveRGB888 } from './resolve.js';
 import { applyFog, capTextureSize, modulateLightmap, samplePalette, sampleRGBTexture } from './sampler.js';

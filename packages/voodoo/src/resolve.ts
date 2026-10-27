@@ -269,12 +269,13 @@ export function applyPostFilter(src565: Uint16Array, dst32: Uint32Array, w: numb
  * q = round(v * (2^bits - 1)) / (2^bits - 1). In-place, zero-alloc.
  * bits >= 24 is a no-op (Float32 mantissa); bits <= 0 is a no-op.
  *
- * DISPLAY/BANDING APPROXIMATION ONLY — NOT a depth-buffer emulation
+ * COMPAT ONLY — DISPLAY/BANDING APPROXIMATION, NOT a depth-buffer emulation
  * (astra §2.5). This runs post-hoc on already-resolved depth and therefore
- * cannot affect visibility: no depth test consults its output. A faithful
- * W/Z emulation must quantise to 0..65535 BEFORE each depth test/write
- * (with a defined clear value, compare op and tie rule derived from the
- * projection near/far planes), against a future internal quantized plane.
+ * cannot affect visibility: no depth test consults its output. For TRUE
+ * pre-test depth policy see quantiseDepthBeforeTest + depthTestLess below,
+ * which quantise to 0..2^bits-1 BEFORE each depth test/write (with a defined
+ * clear value, compare op and tie rule derived from the projection near/far
+ * planes), against a future internal quantized plane.
  * Framebuffer.depth keeps its documented 1/z semantics (frozen contract —
  * this helper never changes its meaning, only its banding).
  */
@@ -285,4 +286,108 @@ export function quantiseDepth(depth: Float32Array, bits = 16): void {
   for (let i = 0; i < depth.length; i++) {
     depth[i] = Math.round(depth[i]! * scale) * inv;
   }
+}
+
+// --- Pre-test Z-buffer policy (true depth emulation) -------------------------
+
+/**
+ * Normalized-depth clear value: the far plane (1.0) clears the quantized
+ * plane to all-ones (0xFFFF at 16 bits). New geometry must be strictly
+ * nearer to win (see depthTestLess).
+ */
+export const DEPTH_CLEAR_01 = 1.0;
+
+/**
+ * Quantise NORMALIZED depth to an integer depth-buffer value BEFORE the depth
+ * test/write (guide §4 "Alpha, depth, fog and HUD"). depth01 is derived from
+ * the SAME projection near/far planes used for clipping (0 = near, 1 = far),
+ * clamped into range; bits is the vd_zbits profile (16 on hardware).
+ * Returns round(depth01 * (2^bits - 1)) in [0, 2^bits - 1] (0..65535 at 16).
+ * Pure (no allocation, no in-place mutation) — the rasterizer keeps a separate
+ * internal quantized plane; Framebuffer.depth's 1/z semantics are untouched.
+ * Throws on non-finite depth or non-integer bits outside 1..24.
+ */
+export function quantiseDepthBeforeTest(depth01: number, bits = 16): number {
+  if (!Number.isFinite(depth01)) {
+    throw new Error(`[voodoo] quantiseDepthBeforeTest: depth must be finite, got ${depth01}`);
+  }
+  if (!Number.isInteger(bits) || bits < 1 || bits > 24) {
+    throw new Error(`[voodoo] quantiseDepthBeforeTest: bits must be an int 1..24, got ${bits}`);
+  }
+  const clamped = depth01 < 0 ? 0 : depth01 > 1 ? 1 : depth01;
+  return Math.round(clamped * ((1 << bits) - 1));
+}
+
+/**
+ * Z-buffer compare: LESS wins, ties keep the stored value.
+ *
+ * A new fragment writes iff quantNew < quantStored; coplanar/equal depths
+ * keep the FIRST writer (stable, no z-fighting churn — coplanar surfaces
+ * resolve deterministically in draw order). The plane clears to the quantized
+ * DEPTH_CLEAR_01 (far), so any fragment nearer than far passes on a fresh
+ * buffer. Pure.
+ */
+export function depthTestLess(quantNew: number, quantStored: number): boolean {
+  return quantNew < quantStored;
+}
+
+// --- Scanout reconstruction thresholds (vidProcCfg/rgbMaxDelta) --------------
+
+/**
+ * Per-component rejection thresholds for scanout reconstruction, mirroring
+ * the rgbMaxDelta register (prog guide §vidProcCfg): when the 2x2 display
+ * taps differ by more than the threshold in any channel, the block holds an
+ * edge and must NOT be box-averaged away.
+ *
+ * APPROXIMATION UNTIL HW CAPTURE: the Quake II MiniGL programming of this
+ * register is not yet established from a hardware capture, so the defaults
+ * below are a placeholder (smooth gradients pass, hard edges reject) and the
+ * current applyPostFilter path stays unconditional. Wire passes through
+ * passesReconstructionThreshold only behind an explicit comparison profile.
+ */
+export interface RgbMaxDelta {
+  r: number;
+  g: number;
+  b: number;
+}
+
+/** Placeholder defaults (see RgbMaxDelta): smooth gradients pass, hard edges reject. */
+export function defaultRgbMaxDelta(): RgbMaxDelta {
+  return { r: 8, g: 8, b: 8 };
+}
+
+/**
+ * Edge-rejection gate for scanout reconstruction (STUB — documented
+ * approximation until HW capture, NOT yet wired into applyPostFilter).
+ * Returns true when the 2x2 block of packed 0xFFBBGGRR taps is smooth enough
+ * to box-filter (per-channel spread <= the matching maxDelta component) and
+ * false when any channel spread exceeds it (one-pixel edge: keep sharp, do
+ * not blur the dither/edge away). Pure, zero-alloc.
+ */
+export function passesReconstructionThreshold(
+  p00: number,
+  p10: number,
+  p01: number,
+  p11: number,
+  maxDelta: RgbMaxDelta,
+): boolean {
+  const r0 = p00 & 255;
+  const r1 = p10 & 255;
+  const r2 = p01 & 255;
+  const r3 = p11 & 255;
+  const g0 = (p00 >> 8) & 255;
+  const g1 = (p10 >> 8) & 255;
+  const g2 = (p01 >> 8) & 255;
+  const g3 = (p11 >> 8) & 255;
+  const b0 = (p00 >> 16) & 255;
+  const b1 = (p10 >> 16) & 255;
+  const b2 = (p01 >> 16) & 255;
+  const b3 = (p11 >> 16) & 255;
+  const rs = Math.max(r0, r1, r2, r3) - Math.min(r0, r1, r2, r3);
+  if (rs > maxDelta.r) return false;
+  const gs = Math.max(g0, g1, g2, g3) - Math.min(g0, g1, g2, g3);
+  if (gs > maxDelta.g) return false;
+  const bs = Math.max(b0, b1, b2, b3) - Math.min(b0, b1, b2, b3);
+  if (bs > maxDelta.b) return false;
+  return true;
 }
