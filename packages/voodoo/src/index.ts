@@ -11,6 +11,7 @@
 import { getCVarNumber } from '@q2/config';
 
 export * from './bayer.js';
+export * from './capture.js';
 export * from './resolve.js';
 export * from './sampler.js';
 

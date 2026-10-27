@@ -1,6 +1,9 @@
 // @q2/testkit — golden-frame harness, differ, bench runner, fixtures.
 import type { Entity, Framebuffer, RefDef, Refresh, WorldModel } from '@q2/renderer-api';
 
+export * from './demo-fallback.js';
+export * from './sidebyside.js';
+
 export const GOLDEN_TOLERANCE_SOFTWARE = 0;
 export const GOLDEN_TOLERANCE_VOODOO_LSB = 1;
 

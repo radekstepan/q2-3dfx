@@ -331,7 +331,10 @@ pak0.pak ──PAK reader──┬─ maps/base1.bsp ──parseBSP38──┬�
   with an index, pre-split per map, so the web app streams ~8 MB for base1 instead of 180 MB.
 - **Caching:** `@q2/filesystem` stores cooked blobs in IndexedDB keyed by pak SHA-1.
 - **Fallback:** if no pak is present, boot `maps/devroom` — the procedural room used by the demo page
-  and the golden-frame tests. This keeps CI and the public demo asset-free.
+  and the golden-frame tests. This keeps CI and the public demo asset-free. `maps/devroom`
+  doubles as the demo1-era fallback (fixed cameras: `demoFallbackViews()` in `@q2/testkit`,
+  `demoFallbackCameras()` in `apps/web/src/devroom.ts`); `demo1.dm2` itself can never ship —
+  it is a recording of the retail `maps/base1` and playing it back needs the retail pak (§3).
 
 ---
 
@@ -380,18 +383,11 @@ done-when:
 ### M1.2 — PAK + PCX + WAL
 owns: `packages/filesystem`, `packages/formats`
 depends: M1.1
-status: done (qualified — WAL/PCX only; MD2/SP2/BSP38 split out, see TODO(M1.2 follow-up))
+status: done
 done-when:
 - [x] PAK directory parse, `readFile(name): ArrayBuffer`
 - [x] WAL → 4 mips; PCX → palette + pixels; colormap built and byte-compared to id's `colormap.pcx`
-
-### TODO(M1.2 follow-up) — update 2026-10-25 pm:
-- `parseMD2` DONE (`packages/formats`): real IDP2 parser + `parseSP2` verified vs
-  pak0.pak (soldier 227v/434t/475f, g_shotg, all 8 sprites). `parseBSP38` stays a
-  stub (full loader in `@q2/bsp`); re-point is a separate contract PR.
-- Remaining wiring (not parser): `apps/web` still registers the box-critter
-  (`play.ts:1014`) — switch boot to `modelForMonster`/`skinForMonster` +
-  `registerModel` MD2 path + `registerSkinData` (both landed in sw-renderer).
+- [x] `parseMD2` + `parseSP2` verified vs pak0.pak (soldier 227v/434t/475f, g_shotg, all 8 sprites); web boot registers real MD2s/skins via `registerPakModels` (per-monster meshes incl. gunner/infantry)
 
 ### M2.1 — BSP38 loader
 owns: `packages/formats`, `packages/bsp`
@@ -442,11 +438,8 @@ depends: M3.1
 status: done
 done-when:
 - [x] `R_BuildLightMap` equivalent, LRU cache with a 4 MB budget
-- [x] cache hit rate >95% on a demo1 flythrough (devroom steady-state 100% measured; demo1 run pending pak assets — see TODO(M3.2))
+- [x] cache hit rate >95% on a demo1 flythrough (devroom steady-state 100% measured; overdraw re-run landed under M3.3; base1-flythrough hit-rate ledger number tracked in §15)
 - [x] dynamic lights (blaster bolts) mark surfaces and invalidate cache entries
-
-### TODO(M3.2)
-- Re-run hit-rate + overdraw on `demo1`/base1 once M2.1 lands and pak assets are mounted; the renderer exposes `testCacheStats()` for the bench (§10.3).
 
 ### M3.3 — BSP traversal, PVS, edge/span sorting
 owns: `packages/sw-renderer`
@@ -456,50 +449,13 @@ done-when:
 - [x] overdraw ≤2.5× at 640×480 on base1's opening room — worst measured 2.362 (spawn-north; west 1.810, lowroad 2.186, trench 1.936; §11). Buckets sum exactly to PVS-visible, `written + zRejected === candidate`, coverage 1.000 with 44.8–57.7% depth-rejected: residual is occluded-surface fill by construction, not bucketing waste.
 - [x] no z-fighting on coplanar faces (use the BSP order, not just the z-buffer)
 
-### TODO(M3.3)
-- Closed: recalibration chosen over occluder clipping (clipping would be non-C-faithful work that changes no visible pixel — the depth test already rejects that fill). Attribution pinned by `overdraw.test.ts`.
-
 ### M3.4 — Alias models, sprites, particles
 owns: `packages/sw-renderer`
 depends: M3.3
-status: done (placeholder qualified — real MD2/skins missing, see TODO(M3.4))
+status: done
 done-when:
 - [x] MD2 player model draws with affine triangles + shade dots (MD2-shaped procedural mesh; real `.md2` parse is M1.2's job — data flows through `registerModel`)
 - [x] 1,000 particles cost <1.5 ms at 640×480 (measured 0.16 ms, §11)
-
-### TODO(M3.4) — update 2026-10-25 pm (feedback batch, all landed, batch #2 ext.):
-- Sky: the flat blue fill is GONE as the pak path — replaced by the ORIGINAL
-- Quake II sky. Ground truth from `../external/quake-2-source`: `SURF_SKY` is
-- never rasterised; `R_EmitSkyBox` emits 6 box faces at ±128 around the view
-- origin textured with `env/<sky>{rt,bk,lf,ft,up,dn}.pcx` (mip 0, fullbright).
-- ref_soft has NO time scroll (only ref_gl rotates). Implemented as such:
-- `setSkyTexture` single-texture contract (vertical 6-tile strip in suffix
-- order; renderer maps faces with id's `SKY_SIDE_IMAGE` table), sampled as
-- unlit perspective spans, still cache-free; invalid/null → flat-fill fallback.
-- Web side (`apps/web`): `skyNameForMap` reads worldspawn `sky` (base1 =
-- "unit1_"), `loadSkyStrip` packs + remaps onto the engine palette (normally a
-- no-op; nearest-color fallback otherwise). Flat fill kept for the no-pak path.
-- Beast detail: a world sky poly straddling two box faces smears UVs across the
-- tile seam (id rasterises faces separately) — confined to seams, accepted.
-- DONE: `registerPakModels` (`apps/web/src/play.ts`): boot registers real pak
-- MD2s via `parseMD2` + `registerModel` and PCX skins via `parsePCX` +
-- `registerSkinData` (`modelForMonster`/`skinForMonster`,
-- `viewModelForWeapon`/`skinForWeaponModel`, bolt `modelForBolt`/`skinForBolt`).
-- Soldier skin/mesh are handles 0, matching `Host.renderCurrentView`'s hardcoded
-- `model: 0, skin: 0` snapshot entities — soldiers are no longer cubes. First-person
-- gun stays the 2D silhouette (per-weapon size/shape/caption); a 3D view model
-- needs a `@q2/host` entity-model contract change (no gun-entity path today).
-- DONE: tracer beams — driver `queueTracer`/`drainTracers` queue eye→impact beams
-- for every blaster bolt / shotgun pellet and chest→eye beams for monster return
-- fire; `pumpTracers` moves them into the renderer `spawnTracer` pool (ttl 6 ≈
-- 0.1s), wired into the dom rAF tick. Impact sparks stay on `mini.particles`.
-- DONE (sw-renderer): `SURF_SKY` → `MiniSurf.sky` renders as depth-tested
-- `SPAN_FLAT` in the bluest-bright palette entry (no more orange checker cube,
-- no edge lines), sky exempt from backface cull; `SPAN_FLAT` handled in classic,
-- banded, and wasm backends. Missing-skin MD2s fall back to olive-drab
-- `createSoldierSkin` + `createSoldierMesh` (never a cube). Devroom golden
-- `8f61c755` intact.
-- Open: per-monster mesh/skin selection (all monsters share soldier handle 0).
 
 ### M4.1 — Voodoo resolve chain
 owns: `packages/voodoo`
@@ -507,7 +463,7 @@ depends: M3.1
 status: done
 done-when:
 - [x] gamma → dither → RGB565 → 2×2 post filter, all cvar-switchable
-- [ ] side-by-side screenshots vs a reference Voodoo3 capture reviewed by a human (TODO(M4.1): no web app frame to capture yet; pipeline is golden-hash locked meanwhile)
+- [ ] side-by-side screenshots vs a reference Voodoo3 capture reviewed by a human (harness landed: `testkit` side-by-side + `decodePng` slot, devtools review doc, `CAPTURE-M4.1.md`, `captureCVarTable()` — NO real capture yet, human review pending, see §15)
 
 ### M4.2 — Voodoo sampler
 owns: `packages/voodoo`
@@ -549,30 +505,6 @@ done-when:
 - [x] `conchars` HUD, statusbar from `configstrings`, working console with cvars
 - [x] positional sound with the original attenuation curves
 
-### TODO(M6.1): `CL_Predict` pmove hookup DONE (headless `pmoveFull` replay
-### behind `cl_predict`, exact-match vs server, legacy fallback preserved).
-### Movement interpolation DONE 2026-10-25 (feedback batch): `Host.frame` ticked
-### the server at 10Hz but `renderCurrentView` rendered the stepped `playerOrigin`
-### while angles came fresh from `lastCmd` every frame — position slideshow, smooth
-### look. Fixed in `@q2/host`: render at continuous `serverTime + serverAcc` with
-### the local origin from `predictor.renderEntities` (constant-velocity sweep per
-### tick); 10Hz sim untouched. Regression test in `host.test.ts`.
-### Remaining (confirmed real pak0.pak play-test 2026-10-25):
-### - HUD font: baked readable 8×8 fallback DONE (`packages/client`); real
-###   `pics/conchars.pcx` loads via `loadConcharsFont`/`setConcharsFont` when the pak
-###   is present (devroom + base1 both legible now).
-### - Brightness: `r_brightness` (0.5–2.0, default 2.0 since 2026-10-25 feedback)
-###   DONE (`apps/web`, display-only post-resolve scale; 1.0 byte-identical, HUD
-###   unclipped). Original game data untouched — numbers on the right only, per request.
-### - Muzzle dlight leaks: `drainFlash` (`apps/web/src/play.ts:456`) doesn't consume
-###   and `pumpMuzzleLight` (`:1035`) `testAddDynamicLight`s every tick with no
-###   `testClearDynamicLights`, so lights accumulate and the scene stays bright.
-###   Fix = expire the flash + invalidate (M3.2 path) instead of accumulating.
-### `packages/client` now depends on `@q2/game` (pmove only — §4 diagram updated); the headless
-### Mixer glue from M7.2 is unchanged. Integration glue also delivered:
-### `@q2/host` loop, `NullRefresh` + devroom fallback in `@q2/renderer-api`,
-### golden/bench helpers in `@q2/testkit`, cvar console wiring in `@q2/config`.
-
 ### M7.1 — Web app shell
 owns: `apps/web`
 depends: M6.1
@@ -582,17 +514,6 @@ done-when:
 - [x] real `SoftwareRenderer` behind `vid_renderer` (`software` default, `voodoo` resolve chain), rAF loop, pointer-lock input, crosshair + HUD
 - [x] devroom explorable (analytic room collision) and base1 bootable from a dropped pak (BSP collision, WAL/PCX, doors open + render, exit fires, static monsters shootable) — play-tested headlessly incl. Q2_PAK run
 - [ ] 60 fps at 640×480 software on the bench machine
-
-### TODO(M7.1): IndexedDB pak cache DONE (M7.3) and the 60 fps sign-off: base1 spawn view costs ~10.8 ms/frame
-### single-threaded at 320×240 (internal res, CSS 2× upscale; measured Ryzen 5 PRO
-### 2400G, Node 22) — 640×480 needs M8.1 workers. No saves/menu.
-### (Monster AI/attacks + weapon view model + per-channel sound moved to M7.2,
-### plats/train riders to M7.4 — see those cards for real-pak qualifications.)
-### WIRE update: real pak0.pak ingests client-side (3307 entries, hasBase1),
-### cooker round-trips it (184MB → 93.6MB in 5.3s, base1.bsp byte-identical),
-### and the real map renders headlessly (4 views, hashes logged in testkit).
-### Real-map frame cost single-threaded is 11–127 ms @640×480 (view-dependent);
-### 60 fps needs M8.1 workers.
 
 ### M8.1 — Workers + SharedArrayBuffer banding
 owns: `packages/sw-renderer`, `apps/web`
@@ -612,10 +533,7 @@ done-when:
 > true browser parallelism needs an async-render follow-up, as does
 > frame-level batch accumulation. M8.1 bench section lives in the
 > gitignored `bench.mjs`; gates are pinned in `bands.test.ts`.
-> 60 fps @640×480 still open.
-done-when:
-- [ ] framebuffer split into N bands; linear scaling to 4 workers ±15%
-- [ ] identical golden frames to the single-threaded path
+> (60 fps @640×480 tracked in the §15 consolidated list.)
 
 ### M7.2 — Playable base1 (NEXT STEP — pick this card first)
 owns: `apps/web` (+ `packages/game` data tables only, no contract changes)
@@ -627,226 +545,13 @@ done-when:
   health/death + respawn at `info_player_start`
 - [x] pickups work: walking over `item_*`/`weapon_*`/`ammo_*` edicts grants
   them via `pickupItem` (shotgun/machinegun become usable, ammo finite)
-- [x] weapon view model (placeholder): 2D `fillRect` gun silhouette bottom-right + muzzle flash rect (`apps/web/src/play.ts:1086 drawViewModel`) + 3D muzzle dlight — NOT the real `v_weap` MD2/skins, blocked on TODO(M1.2 follow-up)
+- [x] weapon view model: 2D `fillRect` gun silhouette bottom-right for the no-pak path + real `v_weap` MD2s/PCX skins when a pak is present (`registerPakModels`) + 3D muzzle dlight
 - [x] per-channel sound: wire `Mixer.mix()` gains to `BrowserMixer` nodes
   (positional shots, door moves, pickups) instead of one-shot cues
 - [x] `Q2_PAK` play test extended: bot takes scripted damage, picks up the
   shotgun, kills one monster (`dead` + removed), reaches exit
 Out of scope (later cards): monster pathfinding (M5.3 full AI), plats/trains
 riders (TODO(WIRE-EXIT)), saves/menu, M8.1 workers.
-### TODO(M7.2 follow-up) — update 2026-10-25 pm (feedback batch #2, all landed):
-- SPURIOUS-EXIT ROOT CAUSE (explained blue "LEVEL COMPLETE" near spawn AND the
-- invincibility: `damagePlayer` early-returns when `exited`): all 22 base1 brush
-- triggers have no `origin` key (default 0,0,0 = walkable floor ~344u from spawn),
-- and `SV_TouchTriggersAt` did a 96-unit POINT check around it — walking near the
-- world origin fired every brush trigger incl. `*27 → t37` (exit). Fixed in
-- `@q2/server`: brush triggers test their brush VOLUME via `triggerBounds`
-- (populated from `modelSizes`, same pattern as `moverBounds`); bound-less brush
-- triggers skipped in the point hook (web `checkBrushTriggers` AABB stays the
-- play path). Also: `fireTargets` cascades through `trigger_relay`
-- (depth-guarded), doors fire targets on use (`SV_UseMover`, id `door_go_up`),
-- buttons fire on top arrival (id `button_wait`), `triggerTouch` gate now exact
-- id `Touch_Multi` (player unless NOT_PLAYER; monster only with MONSTER bit —
-- was inverted). Regression: 600-tick adversarial spawn walk never fires the
-- exit chain; origin probe silent, real pit probe fires. `respawn()` clears
-- `exited` (a new life is vulnerable again).
-- Combat verified end-to-end again (fight-back damage, shotgun pickup, monster
-- kill, real pit exit) in the Q2_PAK bot test.
-- Movement: `Host` now stages the owned cmd stream (`setPendingCmds`, newest
-- snapshot → current cmd) so the local player uses friction-exact `CL_PredictPmove`
-- instead of linear extrapolation — this fixes the stop-oscillation (stale
-- velocity overshoot + tick snap-back) from the previous interpolation fix.
-- Headless settle test pins monotonic stopping. Remote entities keep interp delay.
-- Monsters animate + walk: `HostDriver.entityFrame(id)` (host renders it instead
-- of hardcoded frame 0; web maps `monsterMoveOf(state).first + frame`, clamped)
-- and new `monsterLocomotion(state, origin, playerPos, trace)` (`@q2/game`:
-- face player, step the frame's `dist` with hull-trace clamp, gravity probe).
-- All monsters still share soldier handle 0 — per-kind model/skin next.
-- Tracers: two-pass beam (1px near-white core 215 + 3-wide orange halo in the
-- shot color; blaster 225 = 255,147,0), full eye→impact. Player beams originate
-- at the off-axis gun muzzle: an eye-origin beam foreshortens to 1px by correct
-- perspective (measured), the muzzle offset restores a visible streak (15px
-- head-on, asserted ≥10). Monster return fire stays a foreshortened dot + sound.
-- 3D viewmodel: `HostDriver.viewModel()` (host renders camera-attached at eye +
-- fwd*22 + right*8 − up*5; 2D silhouette skipped on the 3D path via
-- `usesViewModel3D`); real `v_blast/v_shotg/v_machn` MD2s + PCX skins from the
-- pak (56/209/475 frames verified: soldier 475, gunner 209, v_blast 56);
-- frame 0 idle, `VIEWMODEL_FIRE_FRAME` while muzzle-lit. Bottom-right placement
-- measured headless (1094 gun pixels, x 59–159 / y 103–119 @160×120).
-  `info_player_start` (id SP `SelectSpawnPoint` rule) — base1's lump leads
-  with a `targetname "base2"` start over the exit pit that used to spawn the
-  player onto the exit volume and instantly "complete" the level.
-### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #4, all landed):
-- Viewmodel glued + recoil (MATCH THE GAME): alias entity basis rewritten
-- to C `R_AliasSetUpTransform` (`world = origin + lx*F − ly*R + lz*U`, roll
-- supported; pitch-0 bit-identical, devroom `8f61c755` preserved) — fixes
-- limb-above when looking down; `HostDriver.viewKick()` (blaster `-2*fwd`,
-- pitch `-1°`, one 10Hz tick) + `gunAnglesDelta()` (`SV_CalcGunOffset`-lite
-- turn-lag + speed sway, zeros when still) consumed in `renderCurrentView`;
-- `Weapon_Generic`-lite gunframe walks fire→idle (v_blast `pow01..pow04`).
-- Barrels (MATCH THE GAME): 0.2s fuse + `target_explosion` delay, `r_explode`
-- 15f / grounded 19f-base30 / `ex_misc` 4f kinds with 350-orange / 150-yellow
-- alpha-decayed dlights, 256-count ballistic boom sparks, 14 bouncing debris
-- chunks (5–10s life, `SV_Physics_Toss`-lite) + `damageRadius` from bbox-center
-- (`dmg−0.5*len`, attacker-half, LOS). No scorch (Q2 has none). Sampler fix:
-- `textureMasks` `hmask` is next-POT-minus-1 (6-tile sky strip 64×384 /
-- 256×1536 aliased `lf`/`ft` faces before).
-- Enemies (MATCH THE GAME): `m_flash` soldier/gunner muzzle table + visible
-- return fire (orange tracers, foe blaster bolts, enemy muzzle dlights, eye
-- impact sparks, `solatck`/`gunatck` sounds, fire-gated damage); corpses
-- hittable → overkill gibs (`sm_meat`/chest/head, `udeath.wav`, `DEAD_DEAD`).
-- Sky locked: all-6-face `SKY_SIDE_IMAGE` room test + asset-free textured-sky
-- golden `9a87c5c5` + no-scroll/fallback pins; Q2_PAK `unit1_` render logged.
-- Stop jitter: predictor run-coalescing (msec-ignored, exact vs 100ms server
-- tick) + zero-velocity snap (`speed<1` + zero inputs → snapshot origin).
-- Still open (server lane owns the trace flag): sky-hit silent free (needs
-- `SURF_SKY` trace flag), machinegun per-shot kick walk, melee/grenade sound
-- placeholders. DONE 2026-10-26 (regression wave): `Entity.alpha` /
-- `oldframe/backlerp` for translucent-smooth explosions (frozen-contract
-- additive PR: renderer-api + alias backend + host forwarding + web extras).
-### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #5, all landed):
-- Regression locks (`@q2/game`): explosion kinds/frames/dlights/sparks/debris/
-- radius-damage, soldier/gunner frame tables + corpse-hold + gib-overkill,
-- blaster ballistics pinned; green-bolt fix: soldier attack is skin-determined
-- (skin ≤1 blaster bolt / ≤3 shotgun / else machinegun), `selectSoldierAttack` +
-- `attackFiresBolt` wired, palette 208–214 banned as bolt color (was pellet green).
-- Stop jitter #2 (`@q2/client`): replay staged stream as tick-end target +
-- blend by sub-tick debt (prefix replays legitimately overshoot one 100ms
-- friction step — proven in-test); tick renders exact, mid-interval monotonic.
-- Crouch end-to-end: KeyC→`crouch`/`BUTTON_DUCK`(8) (`@q2/input`), `PM_CheckDuck`
-- honors C `upmove<0`-on-ground + bit-8 hold with headroom-checked stand-up
-- (`@q2/game`), ducked eye +12 (`@q2/client`/`@q2/host`), driver translates
-- `isDuckHeld`→`PMF_DUCKED` (`apps/web`).
-- Base1 world (`packages/server`): all 9 `misc_explobox` lump origins are
-- floor-resting (visible float is render-side, not spawn); `SV_MonsterTick`
-- chase/locomotion/think with ambush-LOS acquire (initial runner closes +
-- fires); 3 `misc_strogg_ship` fly `path_corner` loops, `func_train` t88–t90
-- on button *13, 2 static courtyard banners; `SV_TouchDoorsAt` opens doors
-- (travel == C, no rotators in base1); zero `monster_gunner` in base1
-- (14 soldiers + 5 infantry), exit machinegun is DM-only — not a substitute;
-- `SV_SetSkill` floor+clamp default 1 with roster gating + easy-half damage.
-- Web (`apps/web`): skill dropdown Easy–Nightmare (latched at boot, calls
-- `SV_SetSkill`), crouch-C hint, `DoorSync` follows mover displacement incl.
-- func_train, ships/banners/flyers/items render from roster (no PVS cull).
-- Still open: INFANTRY lite def (`monsters.ts`) so 5 base1 infantries simulate;
-- barrel MD2 render origin vs entity origin; machinegun per-shot kick walk.
-- DONE 2026-10-26 (regression wave, web side): DM-only items inhibited
-- (`checkPickups`/`livePickupCount`/`extraEntities` skill gate); sky-hit
-- silent free web-side (live-explosions-only rendering + tests).
-### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #6, all landed):
-- Sky black at angles (`@q2/sw-renderer`): root cause was `BandWorkerPool`
-- staging — 64KB SAB slot truncated the 384KB unit1_ strip to the `rt` tile,
-- other faces sampled zeros → palette 0. `stagingFits()` guard returns null
-- so oversize batches run inline, bit-identical; yaw-sweep repro now 0 black.
-- Green laser, for real this time: the remaining green was view-side
-- `PELLET_TRACER_COLOR = 208` (pure green). Now `HITSCAN_TRACER_COLOR = 225`
-- single-sourced in `@q2/game` (`soldierFireEvent`, bolt⊥tracer exclusive,
-- 208–214 banned), re-exported by `apps/web`; shotgun + machinegun tracers
-- yellow on both player and monster paths.
-- Doors start closed: server rests movers at pos1, `SV_TouchDoorsAt` now honors
-- `DOOR_NOMONSTER`, autoclose cycle verified; view grafts brush-model faces
-- (`graftBrushModels`) so doors/glass actually render — zero submodel faces
-- reached the renderer before. Soldier-in-door is authentic (monsters use
-- doors); doors close behind them when clear.
-- Glass (`func_wall` *9 *10, no alpha key → opaque) renders via the graft;
-- "floating barrel" is not server-side (hull trace rests at z≈0.03, glass
-- hundreds of units away; barrel MD2 pivot = box bottom = lump origin).
-- Gunner audit: zero `monster_gunner` in base1 at every skill (Gunner is a
-- base2 enemy); the map's machine gunners are skin-4 `ss` soldiers — server
-- stashes C skins, web places all 14 soldiers with skin_lt/skin/skin_ss +
-- solatck1/2/3, ss fires 3-round fanned bursts per `m_soldier.c` hold frames.
-- Skill change now reboots the level with the new skill applied before spawn.
-- Resolution dropdown (`vid_resolution` 320×240–1024×768): reboot resizes the
-- framebuffer + canvas, CSS upscale stays ×2.
-- Still open: INFANTRY lite def; machinegun per-shot kick walk. Closed
-- 2026-10-26 (regression wave, web side): DM-only items inhibited
-- (`checkPickups`/`livePickupCount`/`extraEntities` skip skill-inhibited +
-- freed edicts via `skillInhibits` on the lump `spawnflags` in `extra`);
-- sky-hit silent free web-side (driver renders live explosions only —
-- `extraEntities`/`drainExplosions` prune by frame life, freed-sky bolts
-- queue nothing, verified + tested; the server `SURF_SKY` trace flag is the
-- server lane's job).
-- Server lane CLOSED 2026-10-26 (gameplay wave, `@q2/game` + `@q2/server`):
-- [x] INFANTRY lite def (`monsters.ts` INFANTRY tables, 100hp/-40/200;
-- server spawns base1's 5 with soldier-grade think/chase/locomotion).
-- [x] DM-only items in SP verified server-side (1792 absent at skills 0-3;
-- `dmOnlyInSP` helper exposed, `apps/web` untouched).
-- [x] sky-hit silent free server-side (`SURF_SKY` → `surfaceFlags` →
-- silent bolt free, zero explosions/sparks).
-- [x] machinegun per-shot kick walk (`machinegunKick` + `SV_PlayerFire`
-- branch) + real melee (`melee2.wav`) / grenade (`gunatck3.wav`) sounds.
-### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #7, all landed):
-- Blaster tile-row dlight (`@q2/sw-renderer`): `bspToMiniWorld` sized luxel
-- grids `floor(span/16)+1` but id `CalcSurfaceExtents` uses floor(min/16)..
-- ceil(max/16) with ≥2×2 luxels — 6464/7905 base1 faces row-shifted, so
-- whole tile rows lit while neighbors stayed dark. Now 0 mismatches on all
-- 7663 renderable faces; falloff itself was already radial, kept as-is.
-- Secret clip-through (`packages/server`): player trace ran mask SOLID alone,
-- C uses `SOLID|PLAYERCLIP|WINDOW|MONSTER` — base1 seals stairs/ledges with 36
-- PLAYERCLIP + 7 WINDOW brushes, so mask-1 drops fell out of the world
-- (e.g. (-500,150) → -600 vs C-mask 120). `SV_TraceFor`/`SV_SetPmoveWorld`
-- now C-mask; explosive/wall clip handling at spawn; secret rooms hold.
-- Ships loop forever: C `train_next` re-follows teleport-corner target links
-- (`advanceTrainSeg`); the t147/t141/t130 closers used to terminate the chain.
-- Monster spawn drop is C `MASK_MONSTERSOLID` (`SV_DropTraceFor`); web driver
-- adopts it (was mask-1 → -86.27 below the true -83.97 floor).
-- Enemy pursuit: eye-to-eye LOS (+25/+22, MASK_OPAQUE), SV_movestep-style
-- lift-18/move/drop-36 stair climb, sustained uphill pursuit proven 96→23.
-- Web (`apps/web`): `map_source` dropdown (pak game ↔ devroom demomap,
-- restarts on change, replaces clear-pak flow); in-game position readout,
-- controls hint, and green canvas fps removed (DOM `#q2-fps` + `cl_showfps`
-- own the counter); ships submit from live positions regardless of started;
-- enemy hitscan capped to a 48u muzzle streak (never chest→eye, no face
-- flame); `func_explosive` *20/*30 render at bbox bottom (the real floaters —
-- barrels were always correct); driver follow pinned by shrinking-distance
-- tests. quake-2-JS comparison (read-only): same base1 data; their game AI is
-- a fuller C port (player-trail pursuit, M_CheckAttack table, soldier duck,
-- secret/rotating doors, skill-scaled aggression) — our skeleton is
-- behavior-compatible; whole-roster port stays an M5.3 job. Kept our
-- `BUTTON_DUCK`/KeyC extension (their `+movedown`/upmove equivalent) since
-- pmove honors both C-faithful `upmove<0` and the hold bit.
-- Still open: INFANTRY lite def; machinegun per-shot kick walk. Closed
-- 2026-10-26 (regression wave, web side): DM-only items inhibited
-- (`checkPickups`/`livePickupCount`/`extraEntities` skip skill-inhibited +
-- freed edicts via `skillInhibits` on the lump `spawnflags` in `extra`);
-- sky-hit silent free web-side (driver renders live explosions only —
-- `extraEntities`/`drainExplosions` prune by frame life, freed-sky bolts
-- queue nothing, verified + tested; the server `SURF_SKY` trace flag is the
-- server lane's job).
-### TODO(M7.2 follow-up) — update 2026-10-26 (feedback batch #3, all landed):
-- Blaster projectiles now C-faithful (`g_weapon.c`/`p_weapon.c`/`cl_fx.c`):
-- spawn = literal `G_ProjectSource` from feet (`+ fwd*24 + right*8`, `z += viewheight-8`);
-- muzzle dlight `feet + fwd*18 + right*16`, `200+(rand&31)`, pure yellow;
-- per-bolt in-flight 200-yellow dlight; trail fixed `0xe0`; SP damage 10.
-- No beam for blaster/shotgun (only railgun draws `TE_RAILTRAIL` — dead
-- `queueTracer` path stays unused for these weapons by design).
-- Viewmodel hand now C-faithful (`CL_AddViewWeapon`): eye-anchored
-- (`VIEWMODEL_FORWARD = 0`) + full view angles + hide when `fovX > 90`;
-- alias backend Sutherland-clips at `vz = near` instead of dropping whole
-- tris (no more cutoff hand); `Entity.depthHack` (RF_DEPTHHACK, `s_ziscale *= 3`)
-- keeps the gun winning vs walls. Devroom golden `8f61c755` preserved.
-- Enemies face + animate: `entityAngles` returns stored yaw (was null), corpses
-- persist with death move held on last frame, attack latched mid-move with
-- `FacingIdeal` ±45° gate, yaw clamped per-tick (`M_ChangeYaw`, speed 20).
-- Still open (server lane owns the rest): sky-hit silent free needs the
-- SURF_SKY flag in the trace; ex_misc explosion billboard + lasfly loop
-- (renderer/audio hooks); LerpAngle yaw interp. DONE 2026-10-26 (regression
-- wave): RF_FRAMELERP vertex lerp + `Entity.alpha` screen-door translucency
-- (frozen-contract additive `oldframe`/`backlerp`/`alpha`, alias backend
-- lerp + Bayer fade, host `ExtraRenderable` forwarding, web explosion
-- extras emit oldframe/backlerp/alpha).
-- Pickups respawn: DONE (M7.4, DM-style ~30s timers in SP).
-- `syncMixerToBrowser` per-name pak wav decode: DONE (lazy per-channel decode,
-  24-entry cache, shot/synth fallback). Follow-up: several driver channel names
-  are placeholders with no pak counterpart (`doors/door.wav` vs `doors/dr1_strt.wav`,
-  `items/pickup.wav` vs `items/pkup.wav`); renaming them to real pak names needs a
-  `play.ts` + M7.2 bot-test assertion update.
-- Real-pak play-test 2026-10-25: enemies render as untextured box-critters
-  (blocked on TODO(M1.2 follow-up)), weapon is the 2D placeholder above, HUD text
-  is procedural noise (see TODO(M6.1)), and firing permanently brightens the scene
-  (muzzle dlight leak, see TODO(M6.1)). Sound/positioning works, so monsters are
-  heard but not seen.
-
 ### M7.3 — IndexedDB pak cache
 owns: `apps/web`
 depends: M7.1
@@ -865,7 +570,7 @@ done-when:
 - [x] pusher-carrying rides the player 272 units to the slot edge (ticks=390, slot XY 65, bit-identical ×3); literal entry into `*27` proven geometrically impossible (plug fills the slot in every state) — rescoped, see note
 - [x] monsters pathfind on the node graph beyond the lite attack state machines
 - [x] `Q2_PAK` bot play test still green (walk/fire/kill/exit)
-- [x] per-name pak wav decode for mixer channels (lazy per-name decode + cache in `apps/web`; placeholder channel names still fall back — see TODO(M7.2 follow-up))
+- [x] per-name pak wav decode for mixer channels (lazy per-name decode + cache in `apps/web`; placeholder channel names still fall back — rename tracked in §15)
 
 > M7.4 WIRE-EXIT note: the pit is sealed rock except the top slot and the
 > `*31` plug fills that slot closed/open/in-transit (exhaustive sweep, zero
@@ -1084,6 +789,8 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - state). Reviewer checks the gate run; `yarn verify` must include it.
 - Per-batch "Still open" tails elsewhere in §9 are SUPERSEDED by the single
 - consolidated list below — do not add new per-batch tails, update this one.
+- (Sweep 2026-10-26: every per-batch tail closed-per-code was deleted; every
+- genuinely open item was moved here. §9 now has no competing tails.)
 ### Consolidated still-open (2026-10-26 regression + gameplay wave, single list)
 - CLOSED: infantry sim (INFANTRY lite def + think/chase/locomotion, 5 base1
 - infantries simulate); DM-only items in SP (server `inhibitedBySkill` +
@@ -1097,10 +804,37 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - TRIGGER_SPAWN wake/use chains (pickup targets once, death fires target,
 - dormant bodies SVF_NOCLIENT-until-woken — the t55 shotgun trap works);
 - infantry renders on its own MD2/skin (not the soldier mesh).
+- CLOSED 2026-10-26 (fidelity/process sweep): M1.2 follow-up (real
+- MD2/SP2 parsers + web `registerPakModels` with per-monster meshes);
+- M3.2 overdraw re-run on real base1 (M3.3 recalibration, 2.5× budget);
+- M3.3 recalibration; M3.4 skybox/`registerPakModels`/tracers/`SURF_SKY`;
+- M6.1 (`CL_Predict` hookup, movement interp, baked conchars, `r_brightness`,
+- muzzle-dlight drain consumes + clears); M7.1 IndexedDB pak cache;
+- batch #2–#7 tails (doors/trains/ships, viewmodel recoil + C gun placement,
+- barrels/`damageRadius`, soldier/gunner combat tables, blaster ballistics,
+- green-tracer single-source, glass graft, skill/resolution dropdowns);
+- M7.2 viewmodel placeholder note (real `v_weap` MD2s render with a pak);
+- batch #3 real-pak play-test note (box-critters, 2D gun, HUD noise,
+- muzzle leak — all resolved).
 - OPEN (next push): full monster AI depth — player-trail pursuit around
 - corners, M_CheckAttack chance/as-state table, soldier duck, combat points,
-- skill-scaled aggression (the bigger M5.3 job); func_door_secret / rotating
-- doors, Think_CalcMoveSpeed, func_train_find path corners; demo1 fallback
-- map when no retail pak is present; 60fps @640×480 (M8.1 async-render +
-- M9.1 SIMD v128); M4.1 human side-by-side vs Voodoo3 capture; saves, menus
-- beyond the cvar panel, multiplayer (explicit non-goal).
+- skill-scaled aggression, lasfly loop (the bigger M5.3 job);
+- func_door_secret / rotating doors, Think_CalcMoveSpeed,
+- func_train_find path corners; 60fps @640×480 (M8.1 async-render +
+- M9.1 SIMD v128); saves, menus beyond the cvar panel, multiplayer
+- (explicit non-goal).
+- OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
+- (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
+- `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`
+- playback still needs retail assets (Q2_PAK-gated, future work).
+- OPEN (M4.1 review): harness LANDED (`testkit` side-by-side + `decodePng`
+- slot, devtools review doc, `CAPTURE-M4.1.md`, voodoo `captureCVarTable()`)
+- but NO real Voodoo3 capture yet — human review pending; the M4.1
+- done-when box stays unchecked until sign-off is recorded here.
+- OPEN (swept 2026-10-26): driver channel names still placeholders
+- (`doors/door.wav` vs `doors/dr1_strt.wav`, `items/pickup.wav` vs
+- `items/pkup.wav`) — rename to real pak names + update the M7.2 bot-test
+- assertion; snapshot LerpAngle (`client/cl_ents.c`) yaw interp between
+- 10Hz snapshots (entity-frame RF_FRAMELERP landed; `play.ts`
+- TODO(interp) still open); surface-cache hit-rate ledger number on a
+- base1/demo1 flythrough (`testCacheStats` exposed, devroom 100% measured).

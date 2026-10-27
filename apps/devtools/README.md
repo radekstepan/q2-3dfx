@@ -9,6 +9,7 @@ Entry point: `src/index.ts`. Currently graceful stubs until the `@q2/bsp` + `@q2
 - `ProbeResult<T>` (`src/index.ts:4`) — `{ ok, reason?, value? }` envelope.
 - `probeBsp(buf)` (`:10`) — stub; reports `{ ok: false, reason: 'parseBSP38 not implemented yet (M2.1 owns it)' }`.
 - `diffFrames(a, b)` (`:15`) — byte-compare two frames, returns differing pixel count (length mismatch returns the larger length).
+- M4.1 human review (`src/sidebyside.ts`, dependency-free): `summarizeReview(name, actual, reference)` (§10.3 tolerance), `reviewLine`, `reviewReportHtml` (standalone verdict document), `captureChecklist()` (short form of `packages/testkit/CAPTURE-M4.1.md`).
 - `hexDump(bytes, max = 64)` (`:22`) — compact hex dump for lump inspection.
 
 ## How it is used
@@ -24,7 +25,9 @@ console.log('differing pixels:', diffFrames(frameA, frameB));
 
 ## Testing
 
-`yarn workspace devtools test` (vitest, `--passWithNoTests`). No test files, fixtures, or goldens exist yet.
+`yarn workspace devtools test` (vitest). `src/sidebyside.test.ts`: M4.1 review
+summaries (tolerance boundaries, missing-reference pending, HTML report,
+checklist). No test files, fixtures, or goldens exist yet for the BSP probes.
 
 ## Constraints
 

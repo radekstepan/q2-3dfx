@@ -4,8 +4,8 @@ Voodoo3/Glide emulation: per-frame post-process + texture-sampling policy (M4.1/
 Ports the `ref_gl` Voodoo path's resolve chain and sampler rules; not a second renderer —
 it reuses the software geometry front end and adjusts sampling/resolve (BRAIN.md §7.2).
 
-Entry point: `src/index.ts:1`. Re-exports `bayer.js`, `resolve.js`, `sampler.js`
-(`src/index.ts:13-15`) plus cvar-aware wrappers driven by `VoodooState`.
+Entry point: `src/index.ts:1`. Re-exports `bayer.js`, `capture.js`, `resolve.js`,
+`sampler.js` (`src/index.ts:13-16`) plus cvar-aware wrappers driven by `VoodooState`.
 
 ## Public API
 
@@ -18,6 +18,7 @@ Entry point: `src/index.ts:1`. Re-exports `bayer.js`, `resolve.js`, `sampler.js`
 - `quantiseDepthFrame(depth, st)` (`src/index.ts:91`) — 1/z banding to `vd_zbits` bits.
 - `capTextureSizeFrame(w, h, st)` (`src/index.ts:102`) — halve-until-fit for `vd_maxtexsize`.
 - Low level (`src/resolve.ts`, `src/sampler.ts`): `gammaLUT` (`:24`), `resolveRGB565` (`:77`), `applyPostFilter` (`:136`), `quantiseDepth` (`:192`), `sampleBilinear` (`sampler.ts:18`), `samplePalette` (`sampler.ts:81`), `pickMipLevel` (`sampler.ts:155`), `buildFogTable` (`sampler.ts:186`), `modulateLightmap` (`sampler.ts:240`), `capTextureSize` (`sampler.ts:265`); tables `BAYER4`, `DITHER_RB_POS` (`src/bayer.ts:9,27`).
+- `captureCVarTable()` (`src/capture.ts:16`) — the 12 `vd_*` cvars at capture values; single source for `packages/testkit/CAPTURE-M4.1.md`.
 
 ## How it is used
 

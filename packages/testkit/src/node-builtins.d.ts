@@ -5,6 +5,9 @@ declare module 'fs' {
   export function writeFileSync(path: string, data: Uint8Array | string): void;
   export function readFileSync(path: string): Uint8Array;
 }
+declare module 'zlib' {
+  export function inflateSync(data: Uint8Array): Uint8Array;
+}
 declare module 'path' {
   export function join(...parts: string[]): string;
 }
