@@ -896,6 +896,14 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - CLOSED 2026-10-26 (doors/paths C-parity): func_door_secret / rotating
 - doors, Think_CalcMoveSpeed, func_train_find path corners (synthetic unit
 - tests in `packages/server`; base1 ships none — C-parity for other maps).
+- CLOSED 2026-10-26 (canvas pointer-lock): config-menu clicks no longer
+- fire the weapon. `attachToCanvas` (`packages/input/src/dom.ts`) listened
+- for `mousedown` on `document`, so any UI click (cvar panel, dropdowns,
+- buttons) set `+attack`. Mouse fire/look are now gated on
+- pointer-lock-on-canvas; the lock-acquiring canvas click is swallowed,
+- Esc/unlock clears held fire via `pointerlockchange` (no stuck attack),
+- mouseup stays document-global, keyboard flow unchanged. Regression test
+- `apps/web/src/canvas-lock.test.ts` (panel vs canvas synthetic events).
 - OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
 - (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
 - `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`

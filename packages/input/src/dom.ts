@@ -37,6 +37,13 @@ export interface DomBindings {
  * Uses `target` when given (e.g. a shared Host input core), otherwise
  * creates a fresh InputCore. Returns the core in use.
  * Safe no-op outside a browser.
+ *
+ * Input gating (canvas-locked only): mouse fire/look engage solely while
+ * `document.pointerLockElement === canvas`. Mousedown on UI panels, the
+ * lock-acquiring canvas click, and mousemove while unlocked are all
+ * swallowed; lock loss (Esc) clears held fire/use via `pointerlockchange`.
+ * Mouseup stays document-global so a release anywhere always clears.
+ * Keyboard flow is unaffected (document-level, lock-independent).
  */
 export function attachToCanvas(canvas: unknown, target?: InputCore): DomBindings {
   const input = target ?? createInput();
@@ -44,6 +51,12 @@ export function attachToCanvas(canvas: unknown, target?: InputCore): DomBindings
     return { input, dispose(): void { /* noop */ } };
   }
   const el = canvas as HTMLElement;
+  // Pointer-lock gate: game mouse input (fire + look) engages ONLY while
+  // the pointer is locked ON THE CANVAS. Clicks on UI panels (the cvar
+  // config menu, dropdowns, buttons) never satisfy this, so they can never
+  // become game input — no stray +attack, no look jump, no lock disturbance.
+  const isLockedToCanvas = (): boolean =>
+    typeof document !== 'undefined' && document.pointerLockElement === el;
   const onKeyDown = (e: KeyboardEvent): void => {
     if (e.code === 'KeyM' && e.repeat) return;
     const k = CODE_TO_KEY[e.code];
@@ -58,18 +71,32 @@ export function attachToCanvas(canvas: unknown, target?: InputCore): DomBindings
     if (k) keyUp(input, k);
   };
   const onMouseMove = (e: MouseEvent): void => {
-    const locked =
-      typeof document !== 'undefined' && document.pointerLockElement === el;
-    if (!locked) return;
+    if (!isLockedToCanvas()) return;
     mouseMove(input, e.movementX, e.movementY);
   };
+  // Canvas-locked only: the acquire-lock click on the canvas is swallowed
+  // (it engages pointer lock via onClick, it must not also fire), and UI
+  // clicks never reach here as game input because the lock is never held
+  // on a panel element.
   const onMouseDown = (e: MouseEvent): void => {
+    if (!isLockedToCanvas()) return;
     if (e.button === 0) keyDown(input, 'attack');
     if (e.button === 2) keyDown(input, 'use');
   };
   const onMouseUp = (e: MouseEvent): void => {
+    // Ungated on purpose: release must always clear, wherever the button
+    // comes up (dragged off-canvas, lock lost mid-hold, Esc menu, ...).
     if (e.button === 0) keyUp(input, 'attack');
     if (e.button === 2) keyUp(input, 'use');
+  };
+  // Esc / lock loss must release fire cleanly: without this, a button held
+  // when the lock drops (Esc opens the config menu, focus moves to a panel)
+  // would stick +attack on until the next canvas mousedown.
+  const onLockChange = (): void => {
+    if (!isLockedToCanvas()) {
+      keyUp(input, 'attack');
+      keyUp(input, 'use');
+    }
   };
   const onClick = (): void => {
     if (el.requestPointerLock) {
@@ -85,6 +112,7 @@ export function attachToCanvas(canvas: unknown, target?: InputCore): DomBindings
   document.addEventListener('mousemove', onMouseMove);
   document.addEventListener('mousedown', onMouseDown);
   document.addEventListener('mouseup', onMouseUp);
+  document.addEventListener('pointerlockchange', onLockChange);
   el.addEventListener('click', onClick);
   el.addEventListener('contextmenu', (e) => e.preventDefault());
   return {
@@ -95,6 +123,7 @@ export function attachToCanvas(canvas: unknown, target?: InputCore): DomBindings
       document.removeEventListener('mousemove', onMouseMove);
       document.removeEventListener('mousedown', onMouseDown);
       document.removeEventListener('mouseup', onMouseUp);
+      document.removeEventListener('pointerlockchange', onLockChange);
       el.removeEventListener('click', onClick);
     },
   };
