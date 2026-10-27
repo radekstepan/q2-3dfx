@@ -94,7 +94,8 @@ import type { ServerState, ServerMonster, ServerBarrel, ServerBolt, ServerExplos
 import { ATTN_NORM, Mixer } from '@q2/sound';
 import { parseMD2, parseWAL, parsePCX } from '@q2/formats';
 import type { Pcx } from '@q2/formats';
-import { expandRGB565, gammaLUT, resolveFrame } from '@q2/voodoo';
+import { expandRGB565, gammaLUT, readVoodooState, resolveFrame } from '@q2/voodoo';
+import type { VoodooState } from '@q2/voodoo';
 import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import { SERVER_DT, getCVar, getCVarNumber, getCVarString, registerCVar } from '@q2/config';
@@ -102,8 +103,23 @@ import type { Entity, RefDef } from '@q2/renderer-api';
 import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
+import { selectVoodooBandPath } from './render-workers.js';
+import type { VoodooBandPath } from './render-workers.js';
 
 export type RendererKind = 'software' | 'voodoo';
+
+/**
+ * Which resolve path the last `resolveDisplay` took (observability for
+ * tests/debug; V2d). `strict-hud-first` = HUD composed into the emulated
+ * pre-scanout target before reconstruction; `legacy-hud-last` = current
+ * paint-HUD-after behaviour; `software-*` = direct engine buffer paths.
+ */
+export type ResolveOrder =
+  | 'none'
+  | 'strict-hud-first'
+  | 'legacy-hud-last'
+  | 'software-passthrough'
+  | 'software-lifted';
 
 /**
  * Rotate a baked brush-model vertex about a pivot by Quake delta angles
@@ -2645,6 +2661,22 @@ export interface PlayBoot {
   source: 'devroom' | 'pak';
   display: Uint32Array;
   fb565: Uint16Array;
+  /**
+   * Strict Voodoo presentation (V2d, default ON): HUD is composed into the
+   * emulated pre-scanout target BEFORE reconstruction + display gamma
+   * (astra §4 pipeline). When false the legacy path paints HUD after
+   * resolve (same as the software path). Flip per-boot in tests; the live
+   * loop keeps the default.
+   */
+  strictVoodoo: boolean;
+  /** Which resolve path the last `resolveDisplay` took (see ResolveOrder). */
+  lastResolveOrder: ResolveOrder;
+  /**
+   * Explicit raster-policy selection for the last voodoo resolve (V2d):
+   * `serial` = supported main-thread `resolveFrame` after all bands
+   * completed; never a silent software fallback (see selectVoodooBandPath).
+   */
+  lastVoodooPath: VoodooBandPath | 'none';
   /** Real-pak MD2/skin handles (null without a pak). */
   models: PakModelHandles | null;
   /** The pak this boot was built from (null = devroom): reboot reuses it. */
@@ -2930,7 +2962,16 @@ export function bootPlay(opts: {
     host.refresh.registerModel({ name: 'monster', kind: 'md2', data: getDevMesh(0) });
   }
   const n = width * height;
-  return { host, driver, refresh, renderer, source: driver.source, display: new Uint32Array(n), fb565: new Uint16Array(n), models, pak: opts.pak ?? null };
+  const boot: PlayBoot = {
+    host, driver, refresh, renderer, source: driver.source,
+    display: new Uint32Array(n), fb565: new Uint16Array(n),
+    strictVoodoo: true, lastResolveOrder: 'none', lastVoodooPath: 'none',
+    models, pak: opts.pak ?? null,
+  };
+  // Arm the raster policy the cvar selects (RGB path on for voodoo, off for
+  // software) so a voodoo boot never starts on the wrong backend.
+  armRasterPolicy(boot);
+  return boot;
 }
 
 /**
@@ -2957,11 +2998,145 @@ export function rebootPlay(prev: PlayBoot): PlayBoot {
  * Host/LocalDriver/server state is touched — player pos, health, ammo and
  * monsters survive the switch. Pure except for the boot.renderer write;
  * headless-safe.
+ *
+ * V2d raster policy: the switch also arms/disarms the sw-renderer RGB world
+ * path (voodoo ON, software OFF) via the optional hooks below, invalidates
+ * incompatible texture/light caches, and zeroes the shell-owned scratch
+ * planes so the next frame can never show previous-mode pixels.
  */
 export function applyRendererCvar(boot: PlayBoot): RendererKind {
   const next: RendererKind = getCVarString('vid_renderer') === 'voodoo' ? 'voodoo' : 'software';
   boot.renderer = next;
+  armRasterPolicy(boot);
   return next;
+}
+
+/* --- V2d raster-policy hooks (feature-detected, never imported) ---------
+ *
+ * A parallel sw-renderer agent is adding an internal RGB-world switch
+ * (`setRGBWorldEnabled(bool)` or a similarly named method) plus texture /
+ * light cache invalidation; a voodoo agent is adding upload/depth helpers.
+ * Their exact names are NOT depended on here: every hook below is probed
+ * with `as unknown as` and skipped when absent, so this file passes with
+ * or without those landings (fallback = current postfilter behaviour).
+ *
+ * ASSUMED hook names (tried in order; TODO(V2d): pin the final names once
+ * the sw-renderer/voodoo cards land and drop the aliases):
+ *   RGB arm/disarm: setRGBWorldEnabled(bool)
+ *   cache invalidate: invalidateCaches() | invalidateTextureCaches() |
+ *     clearTextureCache() | invalidateLightCaches() | clearCaches()
+ *   scanout-done flag: voodooScanoutDone() -> boolean (see resolveDisplay)
+ */
+const RGB_ENABLE_HOOKS = [
+  'setRGBWorldEnabled',
+  'setRGBWorld',
+  'enableRGBWorld',
+  'setVoodooRGBEnabled',
+] as const;
+
+const CACHE_INVALIDATE_HOOKS = [
+  'invalidateCaches',
+  'invalidateTextureCaches',
+  'clearTextureCache',
+  'invalidateLightCaches',
+  'clearCaches',
+] as const;
+
+/** Probe an optional no-arg/boolean hook set; call the first one present. */
+function callFirstHook(target: object, names: readonly string[], arg?: boolean): boolean {
+  const rec = target as unknown as Record<string, unknown>;
+  for (const name of names) {
+    const fn = rec[name];
+    if (typeof fn === 'function') {
+      try {
+        if (arg === undefined) (fn as () => void).call(target);
+        else (fn as (on: boolean) => void).call(target, arg);
+      } catch {
+        /* a throwing future hook must never break the hot-swap */
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Arm/disarm the raster policy for `boot.renderer` (shared by bootPlay and
+ * applyRendererCvar): voodoo arms the sw-renderer RGB world path, software
+ * disarms it. Invalidates incompatible texture/light caches when a hook is
+ * present (TODO(V2d): no public cache-invalidate hook exists on
+ * SoftwareRenderer yet — `surfaceCache.invalidateAll` is internal — so this
+ * currently documents the need; the scratch-plane zeroing below is what
+ * guarantees no stale frame today). Never throws.
+ */
+export function armRasterPolicy(boot: PlayBoot): void {
+  const voodoo = boot.renderer === 'voodoo';
+  callFirstHook(boot.refresh, RGB_ENABLE_HOOKS, voodoo);
+  // TODO(V2d): call the real texture/light cache invalidate hooks once the
+  // sw-renderer card publishes them; no public hook exists at this HEAD.
+  callFirstHook(boot.refresh, CACHE_INVALIDATE_HOOKS);
+  // Shell-owned scratch: zero so the next resolve can never show
+  // previous-mode pixels (engine planes are repainted by the next render).
+  boot.display.fill(0);
+  boot.fb565.fill(0);
+}
+
+/* --- V2d resolve ownership (astra §5) ------------------------------------
+ *
+ * SINGLE OWNER: the SHELL owns scanout. `SoftwareRenderer.endFrame` /
+ * `endFrameAsync` own only the palette-expand into the live `color` plane
+ * (the pre-scanout target for voodoo mode too — no @q2/voodoo call there);
+ * `resolveDisplay` below runs the ONE voodoo resolve (`resolveFrame`) per
+ * frame. If a future renderer-side voodoo backend ever performs its own
+ * scanout it must flag it via the optional `voodooScanoutDone() -> boolean`
+ * hook; when present and true the shell skips its resolve so exactly one
+ * resolve runs (double-resolve guard).
+ *
+ * Strict voodoo path (`boot.strictVoodoo`, default ON for voodoo mode):
+ * HUD is composed into the emulated target BEFORE scanout reconstruction
+ * + display gamma (astra §4 pipeline). Legacy/software path keeps the
+ * current paint-HUD-after + `r_brightness` behaviour. The legacy
+ * `r_brightness` lift is retained post-scanout in BOTH voodoo branches for
+ * compat (display-gamma calibration will revisit it); `vd_gamma` inside
+ * `resolveFrame` is the display-gamma stage in strict mode.
+ */
+
+/** Optional renderer-side scanout-done flag (see ownership note above). */
+function rendererDidScanout(boot: PlayBoot): boolean {
+  const rec = boot.refresh as unknown as Record<string, unknown>;
+  const fn = rec['voodooScanoutDone'];
+  if (typeof fn !== 'function') return false;
+  try {
+    return (fn as () => unknown).call(boot.refresh) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Compose HUD into the live pre-scanout target (strict voodoo only): the
+ * same `drawPlayHud` pass the legacy path runs post-resolve, but painted
+ * onto the engine `color` plane BEFORE `resolveFrame` so HUD pixels travel
+ * through dither/quantise/reconstruction/gamma like the scene. The next
+ * renderView repaints the plane, so no HUD ghost survives.
+ */
+export function paintHudPreScanout(boot: PlayBoot, hud: HudState): void {
+  const { host } = boot;
+  const live = boot.refresh.getFramebuffer().color;
+  drawPlayHud(
+    { width: host.fb.width, height: host.fb.height, color: live },
+    boot,
+    hud,
+  );
+}
+
+/**
+ * True when the shell composes HUD pre-scanout (strict voodoo): callers
+ * (dom finishFrame) must NOT paint HUD again post-resolve — that would
+ * double-paint and defeat the strict ordering.
+ */
+export function hudComposedPreScanout(boot: PlayBoot): boolean {
+  return getCVarString('vid_renderer') === 'voodoo' && boot.strictVoodoo;
 }
 
 /** Resolve the software framebuffer for display (voodoo post chain or direct).
@@ -2971,8 +3146,12 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
  * its full authored colour and is never dimmed or clipped by the lift.
  * At 1.0 the software path returns the engine buffer untouched
  * (byte-identical, same reference).
+ *
+ * V2d: `hud` enables the strict-voodoo pre-scanout HUD composition (painted
+ * into the emulated target before `resolveFrame`). Omit it (headless/tests)
+ * to resolve the scene alone; the legacy post-resolve HUD pass is unchanged.
  */
-export function resolveDisplay(boot: PlayBoot): Uint32Array {
+export function resolveDisplay(boot: PlayBoot, hud?: HudState): Uint32Array {
   const { host } = boot;
   const brightness = getBrightness();
   // Source the LIVE renderer color plane, not host.fb.color: with a worker
@@ -2984,32 +3163,62 @@ export function resolveDisplay(boot: PlayBoot): Uint32Array {
     const w = host.fb.width;
     const h = host.fb.height;
     const n = w * h;
-    // Canary for pre-fix `resolveFrame` (astra §2 defect #1): it only fills
-    // `display` when `vd_postfilter` is on, leaving last frame's
-    // (HUD-painted) pixels stale when off. The sentinel alpha (0x12) can
-    // never occur in real resolve output (always opaque 0xFF), so a
-    // surviving sentinel proves `display` was left untouched and the web
-    // side backfills the current frame below. Once the voodoo fix lands,
-    // `resolveFrame` overwrites the canary with real output (565 expand
-    // when `vd_16bit` is on, `resolveRGB888` when off) and the backfill
-    // never runs — robust to both behaviours with zero extra passes.
-    let canary = false;
-    if (getCVarNumber('vd_postfilter') === 0 && n > 0) {
-      boot.display[0] = VOODOO_STALE_SENTINEL;
-      canary = true;
-    }
-    resolveFrame(live, boot.fb565, boot.display, w, h);
-    if (canary && boot.display[0] === VOODOO_STALE_SENTINEL) {
-      if (getCVarNumber('vd_16bit') !== 0) {
-        for (let i = 0; i < n; i++) boot.display[i] = expandRGB565(boot.fb565[i]!);
+    // One VoodooState snapshot per frame, passed explicitly (astra §5): no
+    // per-pixel cvar reads inside the resolve, and the same object selects
+    // the band envelopes (see render-workers.ts).
+    const st: VoodooState = readVoodooState();
+    // Explicit raster-policy selection: until a worker/WASM voodoo backend
+    // exists the ONLY supported voodoo path is serial main-thread scanout
+    // after every band completes (selectVoodooBandPath documents this and
+    // never silently draws software). Recorded for tests/debug.
+    const pooled = boot.refresh.testWorkerStats().pooled;
+    boot.lastVoodooPath = selectVoodooBandPath(pooled);
+    // Double-resolve guard (see ownership note): a renderer-side scanout
+    // wins when flagged; the shell resolve below is then skipped.
+    if (!rendererDidScanout(boot)) {
+      if (boot.strictVoodoo) {
+        // STRICT: HUD into the emulated target BEFORE scanout so the
+        // reconstruction filter taps cross HUD/scene edges with absolute
+        // screen-coordinate dither phase (global frame, never per-band).
+        if (hud !== undefined) paintHudPreScanout(boot, hud);
+        boot.lastResolveOrder = 'strict-hud-first';
+        resolveFrame(live, boot.fb565, boot.display, w, h, st);
       } else {
-        backfillRGB888(live, boot.display, n);
+        // LEGACY: scanout first, HUD painted after by the caller.
+        boot.lastResolveOrder = 'legacy-hud-last';
+        // Canary for pre-fix `resolveFrame` (astra §2 defect #1): it only fills
+        // `display` when `vd_postfilter` is on, leaving last frame's
+        // (HUD-painted) pixels stale when off. The sentinel alpha (0x12) can
+        // never occur in real resolve output (always opaque 0xFF), so a
+        // surviving sentinel proves `display` was left untouched and the web
+        // side backfills the current frame below. Once the voodoo fix lands,
+        // `resolveFrame` overwrites the canary with real output (565 expand
+        // when `vd_16bit` is on, `resolveRGB888` when off) and the backfill
+        // never runs — robust to both behaviours with zero extra passes.
+        let canary = false;
+        if (getCVarNumber('vd_postfilter') === 0 && n > 0) {
+          boot.display[0] = VOODOO_STALE_SENTINEL;
+          canary = true;
+        }
+        resolveFrame(live, boot.fb565, boot.display, w, h, st);
+        if (canary && boot.display[0] === VOODOO_STALE_SENTINEL) {
+          if (getCVarNumber('vd_16bit') !== 0) {
+            for (let i = 0; i < n; i++) boot.display[i] = expandRGB565(boot.fb565[i]!);
+          } else {
+            backfillRGB888(live, boot.display, n);
+          }
+        }
       }
     }
     applyBrightness(boot.display, brightness);
     return boot.display;
   }
-  if (brightness === 1) return live;
+  boot.lastVoodooPath = 'none';
+  if (brightness === 1) {
+    boot.lastResolveOrder = 'software-passthrough';
+    return live;
+  }
+  boot.lastResolveOrder = 'software-lifted';
   boot.display.set(live);
   applyBrightness(boot.display, brightness);
   return boot.display;
@@ -3044,6 +3253,49 @@ function backfillRGB888(src: Uint32Array, dst: Uint32Array, n: number): void {
       b = lut[b]!;
     }
     dst[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+  }
+}
+
+/* --- V2d strict-voodoo presentation (astra §4) ---------------------------
+ *
+ * The emulated image presents fixed 640×480 4:3 (the first capture
+ * resolution) with a CONTROLLED upscale only: the canvas is blitted with
+ * putImageData (exact pixels, never filtered) and CSS-scaled with
+ * `image-rendering: pixelated`, so there is no second smoothing pass after
+ * the scanout reconstruction filter. Browser debug controls (the cvar
+ * panel, menus) are DOM elements OUTSIDE the canvas — never part of the
+ * emulated image. Strict mode expects a 4:3 framebuffer (the menu only
+ * offers 4:3 sizes); non-4:3 sizes keep the legacy CSS stretch and are
+ * reported by isVoodooAspect.
+ */
+
+/** Strict-voodoo capture resolution (fixed 4:3 emulated image). */
+export const VOODOO_FRAME_WIDTH = 640;
+/** Strict-voodoo capture resolution (fixed 4:3 emulated image). */
+export const VOODOO_FRAME_HEIGHT = 480;
+
+/**
+ * True when a framebuffer is 4:3 within rounding (the strict-voodoo
+ * presentation contract). Pure/headless-safe.
+ */
+export function isVoodooAspect(w: number, h: number): boolean {
+  if (!(w > 0) || !(h > 0)) return false;
+  return Math.abs((w / h) / (VOODOO_FRAME_WIDTH / VOODOO_FRAME_HEIGHT) - 1) < 0.01;
+}
+
+/**
+ * Apply the strict-voodoo canvas presentation (pixelated controlled
+ * upscale, no smoothing). Feature-detected no-op headless (unknown canvas
+ * shape); safe to call every frame (idempotent style writes). Browser
+ * debug controls stay DOM-side — this never touches them.
+ */
+export function applyVoodooPresentation(canvas: unknown): void {
+  try {
+    const el = canvas as { style?: Record<string, string> } | null;
+    if (!el || typeof el !== 'object' || !el.style) return;
+    el.style['imageRendering'] = 'pixelated';
+  } catch {
+    /* headless: presentation is a no-op without DOM */
   }
 }
 
@@ -3672,8 +3924,12 @@ export function buildAsyncView(host: Host, remainder = 0): { view: RefDef; rende
  * One async play-loop frame (the browser rAF body): pumps, sim, async
  * render, resolve. Returns the display buffer (same contract as
  * resolveDisplay). The dom tick keeps HUD + blit + sound after the await.
+ *
+ * V2d: `hud` threads through to `resolveDisplay` for the strict-voodoo
+ * pre-scanout HUD composition; omit it (or run legacy/software) and HUD is
+ * painted post-resolve by the caller as before.
  */
-export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: number): Promise<Uint32Array> {
+export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: number, hud?: HudState): Promise<Uint32Array> {
   pumpMuzzleLight(boot);
   pumpExplosionLights(boot);
   pumpTracers(boot);
@@ -3682,5 +3938,5 @@ export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: numb
   boot.refresh.beginFrame();
   await boot.refresh.renderViewAsync(view, boot.host.world, renderables);
   await boot.refresh.endFrameAsync();
-  return resolveDisplay(boot);
+  return resolveDisplay(boot, hud);
 }

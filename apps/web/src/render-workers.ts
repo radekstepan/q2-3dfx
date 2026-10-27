@@ -19,8 +19,7 @@
 import {
   CTL_DONE,
   CTL_FBH,
-  CTL_FBW,
-  CTL_FCOUNT,
+  CTL_FBW,  CTL_FCOUNT,
   CTL_FRAME,
   CTL_JOB,
   CTL_PIXELS,
@@ -62,6 +61,8 @@ import {
   type SpanList,
   type Texture,
 } from '@q2/sw-renderer';
+import { readVoodooState } from '@q2/voodoo';
+import type { VoodooState } from '@q2/voodoo';
 
 /** Per-batch wait budget in ms (mirrors the Node pool default). */
 export const BROWSER_POOL_TIMEOUT_MS = 30000;
@@ -542,4 +543,70 @@ export class BrowserBandPool implements BandDispatcher {
     }
     return { pixels, spans };
   }
+}
+
+/* --- V2d voodoo band contract (astra §5) ---------------------------------
+ *
+ * Worker bands rasterise software spans; the voodoo SCANOUT stays global:
+ * after flushFrameAsync drains EVERY band, the shell runs one serial
+ * `resolveFrame` over the full frame, so the 2×2 reconstruction filter
+ * taps cross band boundaries and the ordered dither uses absolute screen
+ * coordinates (never a per-band phase restart). Until a worker/WASM voodoo
+ * backend exists, the supported path is selected EXPLICITLY (serial) —
+ * never a silent software fallback (see selectVoodooBandPath).
+ */
+
+/** Supported voodoo scanout paths. `worker` is reserved for the future
+ * worker/WASM voodoo backend; nothing selects it at this HEAD. */
+export type VoodooBandPath = 'serial' | 'worker';
+
+/**
+ * Explicit voodoo path selection (V2d). Always `serial` until a
+ * worker/WASM voodoo backend exists — even when a raster pool is active,
+ * the pool drains first and scanout runs globally after. Callers record the
+ * result (PlayBoot.lastVoodooPath) instead of branching on backend
+ * folklore. Pure/headless-safe.
+ */
+export function selectVoodooBandPath(_poolActive: boolean): VoodooBandPath {
+  // No worker/WASM voodoo backend at this HEAD: serial main-thread
+  // `resolveFrame` after all bands complete. Revisit when the backend lands.
+  return 'serial';
+}
+
+/**
+ * Snapshot the frame's VoodooState ONCE per frame (V2d/astra §5): the same
+ * object is shared by every band envelope below and by the global resolve,
+ * so no band ever calls `readVoodooState()` per pixel/span.
+ */
+export function snapshotVoodooState(): VoodooState {
+  return readVoodooState();
+}
+
+/** Per-band voodoo envelope: the SHARED frame snapshot + the band's slice
+ * in ABSOLUTE screen coordinates (full-frame y0/y1), so dither phase and
+ * LOD stay stable across band boundaries and camera motion. */
+export interface VoodooBandEnvelope {
+  /** The frame's single shared snapshot (same reference for every band). */
+  state: VoodooState;
+  /** Band slice in absolute screen rows [y0, y1). */
+  y0: number;
+  y1: number;
+  /** Full-frame dimensions (dither/reconstruction address this space). */
+  width: number;
+  height: number;
+}
+
+/**
+ * Build one envelope per band sharing a single `st` snapshot (pure). The
+ * future worker-side voodoo backend consumes these; today they document +
+ * pin the transfer contract (same state, absolute coords) while scanout
+ * stays global-serial.
+ */
+export function voodooBandEnvelopes(
+  st: VoodooState,
+  bands: Band[],
+  width: number,
+  height: number,
+): VoodooBandEnvelope[] {
+  return bands.map((b) => ({ state: st, y0: b.y0, y1: b.y1, width, height }));
 }

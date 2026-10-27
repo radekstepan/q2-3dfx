@@ -518,10 +518,12 @@ export function setRendererChoice(kind: string): void {
 import type { Host } from '@q2/host';
 import type { LocalDriver, PlayBoot } from './play.js';
 import {
+  applyVoodooPresentation,
   attachBrowserPool,
   createAsyncLoopState,
   drawPlayHud,
   frameAsync,
+  hudComposedPreScanout,
   pumpExplosionLights,
   pumpMuzzleLight,
   pumpTracers,
@@ -751,12 +753,22 @@ export function startPlayLoop(
   };
 
   /** Shared post-render tail (HUD + blit + sound/event cues), both paths. */
-  const finishFrame = (target: Uint32Array): void => {
-    drawPlayHud(
-      { width: host.fb.width, height: host.fb.height, color: target },
-      boot,
-      { fps, frame: frame++ },
-    );
+  const finishFrame = (target: Uint32Array, hud: { fps: number; frame: number }): void => {
+    // V2d strict voodoo: HUD was already composed into the emulated target
+    // BEFORE scanout (paintHudPreScanout via resolveDisplay/frameAsync) —
+    // painting again here would double-paint and defeat the strict ordering.
+    // Legacy/software paths paint HUD after resolve as before.
+    if (!hudComposedPreScanout(boot)) {
+      drawPlayHud(
+        { width: host.fb.width, height: host.fb.height, color: target },
+        boot,
+        hud,
+      );
+    } else {
+      // Strict presentation: controlled upscale only (pixelated, no second
+      // smoothing pass); debug controls stay DOM-side, outside the image.
+      applyVoodooPresentation(el);
+    }
     blitFb.color = target;
     blitToCanvas(el, blitFb);
     // The fps (`cl_showfps`) and position (`cl_showpos`, default ON)
@@ -787,8 +799,11 @@ export function startPlayLoop(
     pumpExplosionLights(boot);
     pumpTracers(boot);
     host.frame(nowMs);
-    const target = resolveDisplay(boot);
-    finishFrame(target);
+    // V2d: hud threads into resolveDisplay so strict voodoo composes it
+    // pre-scanout; finishFrame skips the post pass in that case (no double).
+    const hud = { fps, frame: frame++ };
+    const target = resolveDisplay(boot, hud);
+    finishFrame(target, hud);
   };
 
   const tick = (nowMs: number): void => {
@@ -812,8 +827,9 @@ export function startPlayLoop(
             if (dt > 0) fps += (1000 / dt - fps) * 0.05;
           }
           lastT = nowMs;
-          const target = await frameAsync(boot, asyncSt, nowMs);
-          finishFrame(target);
+          const hud = { fps, frame: frame++ };
+          const target = await frameAsync(boot, asyncSt, nowMs, hud);
+          finishFrame(target, hud);
         } catch {
           // One bad frame (worker timeout, torn-down pool) falls back to the
           // classic sync path from the next tick — inline replay converges to
