@@ -943,6 +943,7 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - position-test special case), so an exact-plane teleport can't stand back
 - up — real falls rest at +1/32 and stand fine. Gate (l) settles from above
 - to play it the way the engine does.
+- CLOSED 2026-10-26 (HUD lane): fps is a top-right DOM overlay (`#q2-fps`, `cl_showfps`; in-canvas fps deleted so the counter never touches renderer output) and player coords are a top-left DOM overlay (`#q2-pos`, `pos x y z yaw <yaw>` 1-decimal per frame, `cl_showpos` default ON with a menu checkbox; menu clicks stay input-free under canvas pointer-lock).
 - OPEN (demo1 fallback): procedural fallback + fixed cameras WIRED
 - (`@q2/testkit` `demoFallbackViews`, `apps/web` `demoFallbackCameras`,
 - `CAPTURE` doc notes why `demo1.dm2` can't ship); real `demo1.dm2`

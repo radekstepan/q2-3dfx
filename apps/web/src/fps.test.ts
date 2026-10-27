@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { resetCVars, setCVar } from '@q2/config';
-import { stringWidth } from '@q2/client';
 import { bootPlay, drawPlayHud, fpsHudAnchor, fpsVisible, FPS_GREEN } from './play.js';
 import { formatFps, showFpsEnabled, updateFpsOverlay } from './dom.js';
 
@@ -19,7 +18,7 @@ describe('fps counter', () => {
   it('overlay helper is DOM-guarded (Node has no document)', () => {
     expect(typeof document).toBe('undefined');
     // Null / non-DOM input just returns the text, never throws.
-    // (Legacy helper: no longer wired — the in-canvas HUD owns the counter.)
+    // (The DOM #q2-fps overlay owns the counter; see index.html.)
     expect(updateFpsOverlay(null, 60)).toBe(formatFps(60));
     expect(updateFpsOverlay(undefined, 60)).toBe(formatFps(60));
   });
@@ -49,36 +48,26 @@ describe('fps counter', () => {
     resetCVars();
   });
 
-  it('fpsHudAnchor is top-left in-view (never over the controls panel)', () => {
+  it('fpsHudAnchor is a legacy top-left helper (DOM overlay owns the counter)', () => {
     expect(fpsHudAnchor(160, 'fps 60')).toEqual({ x: 8, y: 8 });
     expect(fpsHudAnchor(40, 'fps 60')).toEqual({ x: 8, y: 8 });
   });
 
-  it('drawPlayHud draws green `fps N` top-left when enabled, nothing when gated', () => {
+  it('drawPlayHud never paints fps pixels (DOM #q2-fps owns the counter)', () => {
     resetCVars();
     try {
       const boot = bootPlay({ width: 160, height: 120 });
-      // Enabled (default): fps text paints FPS_GREEN pixels top-left.
+      // Enabled or gated: the canvas stays fps-free either way.
+      for (const v of [1, 0]) {
+        setCVar('cl_showfps', v);
+        const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
+        drawPlayHud(target, boot, { fps: 60, frame: 1 });
+        expect(target.color.some((c) => c === FPS_GREEN)).toBe(false);
+      }
+      // Crosshair still draws (the HUD keeps world/crosshair/weapon/hp).
       const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
       drawPlayHud(target, boot, { fps: 60, frame: 1 });
-      const text = 'fps 60';
-      const { x, y } = fpsHudAnchor(target.width, text);
-      expect(x).toBe(8);
-      expect(y).toBe(8);
-      let green = 0;
-      for (let py = y; py < y + 8; py++) {
-        for (let px = x; px < x + stringWidth(text); px++) {
-          if (target.color[py * target.width + px] === FPS_GREEN) green++;
-        }
-      }
-      expect(green).toBeGreaterThan(0);
-      // Crosshair still draws (the HUD keeps world/crosshair/weapon/hp).
       expect(target.color[60 * 160 + 80]).toBe(0xffffffff);
-      // Gated: no green anywhere.
-      setCVar('cl_showfps', 0);
-      const off = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
-      drawPlayHud(off, boot, { fps: 60, frame: 1 });
-      expect(off.color.some((c) => c === FPS_GREEN)).toBe(false);
     } finally {
       resetCVars();
     }

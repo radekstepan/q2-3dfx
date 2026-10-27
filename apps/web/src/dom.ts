@@ -10,6 +10,11 @@ import { ingestPak } from './pak.js';
 import type { WebPak } from './pak.js';
 
 registerCVar('cl_showfps', 1, 'show DOM fps overlay (and in-canvas fps readout)');
+registerCVar('cl_showpos', 1, 'show DOM player-position overlay top-left (pos x y z yaw)');
+
+/** DOM overlay element ids (see index.html). FPS top-right, pos top-left. */
+export const FPS_OVERLAY_ID = 'q2-fps';
+export const POS_OVERLAY_ID = 'q2-pos';
 
 export interface ProgressState {
   fraction: number;
@@ -48,6 +53,13 @@ export function showFpsEnabled(): boolean {
   return getCVarNumber('cl_showfps') !== 0;
 }
 
+/** Cvar gate for the position readout (`cl_showpos`, default 1 = ON). */
+export function showPosEnabled(): boolean {
+  // Absent (e.g. after a reset in tests) means the default-on state.
+  if (getCVar('cl_showpos') === undefined) return true;
+  return getCVarNumber('cl_showpos') !== 0;
+}
+
 /**
  * Write the fps line into a DOM node. DOM-guarded: with no `document`
  * (Node/vitest) or a null element it just returns the text. Returns the
@@ -55,6 +67,28 @@ export function showFpsEnabled(): boolean {
  */
 export function updateFpsOverlay(el: unknown, fps: number, visible = true): string {
   const text = formatFps(fps);
+  const node = el as { textContent?: unknown; style?: { display?: string } } | null;
+  if (!node || typeof node !== 'object') return text;
+  try {
+    if (visible) {
+      if (typeof node.textContent === 'string' || node.textContent === undefined) {
+        (node as { textContent: string }).textContent = text;
+      }
+      if (node.style && typeof node.style === 'object') node.style.display = '';
+    } else if (node.style && typeof node.style === 'object') {
+      node.style.display = 'none';
+    }
+  } catch {
+    /* non-DOM stub */
+  }
+  return text;
+}
+
+/**
+ * Write the position line into a DOM node. DOM-guarded like
+ * `updateFpsOverlay`: null / non-DOM input just returns the text.
+ */
+export function updatePosOverlay(el: unknown, text: string, visible = true): string {
   const node = el as { textContent?: unknown; style?: { display?: string } } | null;
   if (!node || typeof node !== 'object') return text;
   try {
@@ -153,6 +187,29 @@ export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   cl_predict: ['0', '1'],
   cl_interp: ['0', '1'],
 };
+
+/** Re-register HUD overlay cvars if a test `resetCVars()` wiped them, so the
+ * menu panel keeps listing them and headless boots stay deterministic. */
+function ensureHudCvars(): void {
+  if (getCVar('cl_showfps') === undefined) {
+    registerCVar('cl_showfps', 1, 'show DOM fps overlay (and in-canvas fps readout)');
+  }
+  if (getCVar('cl_showpos') === undefined) {
+    registerCVar('cl_showpos', 1, 'show DOM player-position overlay top-left (pos x y z yaw)');
+  }
+}
+
+/**
+ * Boolean cvars rendered as checkboxes (element-local `change` listeners,
+ * never document-level mouse wiring — so toggling them can never produce
+ * game input under the canvas pointer-lock discipline).
+ */
+export const CHECKBOX_CVARS: ReadonlySet<string> = new Set(['cl_showpos']);
+
+/** True when this cvar renders as a checkbox (boolean 0/1 cvar). */
+export function cvarIsCheckbox(name: string): boolean {
+  return CHECKBOX_CVARS.has(name);
+}
 
 /**
  * Option list for a cvar, or null when it takes free-text input.
@@ -278,8 +335,9 @@ export function skillValueForLabel(label: string): number {
   return n >= 0 && n <= 3 ? n : 1;
 }
 
-/** Control kind for a cvar row: 'select' for known domains, else 'text'. */
-export function cvarControlKind(name: string): 'select' | 'text' {
+/** Control kind for a cvar row: 'checkbox' for booleans, 'select' for known domains, else 'text'. */
+export function cvarControlKind(name: string): 'select' | 'text' | 'checkbox' {
+  if (cvarIsCheckbox(name)) return 'checkbox';
   return cvarOptions(name) === null ? 'text' : 'select';
 }
 
@@ -288,7 +346,8 @@ export function renderCvarPanel(
   container: unknown,
   filter = '',
   onChange: (name: string, value: string) => void = () => undefined,
-): string[] {  const names = listCVars()
+): string[] {  ensureHudCvars();
+  const names = listCVars()
     .map((c) => c.name)
     .filter((n) => !filter || n.includes(filter));
   if (typeof document === 'undefined' || !container) return names;
@@ -301,7 +360,24 @@ export function renderCvarPanel(
     label.textContent = name;
     const options = cvarOptions(name);
     const current = getCVarString(name);
-    if (options !== null) {
+    if (cvarIsCheckbox(name)) {
+      // Boolean checkbox: element-local `change` only, no document-level
+      // mouse wiring, so toggling never produces game input (canvas
+      // pointer-lock discipline holds — UI clicks never fire).
+      const box = document.createElement('input') as HTMLInputElement;
+      box.type = 'checkbox';
+      box.checked = getCVarNumber(name) !== 0;
+      box.addEventListener('change', () => {
+        try {
+          setCVarFromString(name, box.checked ? '1' : '0');
+          onChange(name, box.checked ? '1' : '0');
+        } catch {
+          box.checked = getCVarNumber(name) !== 0;
+        }
+      });
+      row.appendChild(label);
+      row.appendChild(box);
+    } else if (options !== null) {
       const select = document.createElement('select');
       // Reflect out-of-list values (e.g. sw_workers=8, r_brightness=1.1)
       // instead of silently showing the wrong preset.
@@ -359,7 +435,7 @@ export function setRendererChoice(kind: string): void {
 
 import type { Host } from '@q2/host';
 import type { LocalDriver, PlayBoot } from './play.js';
-import { drawPlayHud, pumpExplosionLights, pumpMuzzleLight, pumpTracers, resolveDisplay } from './play.js';
+import { drawPlayHud, playerPosText, pumpExplosionLights, pumpMuzzleLight, pumpTracers, resolveDisplay } from './play.js';
 import { attachToCanvas } from '@q2/input/dom';
 import { readPakEntry, findPakSoundEntry } from './pak.js';
 import type { Mixer, MixedChannel } from '@q2/sound';
@@ -548,6 +624,10 @@ export function startPlayLoop(
   let lastT = -1;
   let fps = 60;
   let frame = 0;
+  // Display-only DOM readouts (never touch renderer output): fps top-right,
+  // player position top-left. Queried once; per-frame updates below.
+  const fpsEl = document.querySelector(`#${FPS_OVERLAY_ID}`);
+  const posEl = document.querySelector(`#${POS_OVERLAY_ID}`);
   const tick = (nowMs: number): void => {
     if (stopped) return;
     if (lastT >= 0) {
@@ -567,9 +647,11 @@ export function startPlayLoop(
       { fps, frame: frame++ },
     );
     blitToCanvas(el, { ...host.fb, color: target });
-    // No DOM fps overlay: the in-canvas HUD (drawPlayHud `fps N`, gated by
-    // cl_showfps) is the only counter, so nothing ever covers the controls
-    // panel.
+    // DOM overlays, post-resolve: the canvas pixels are already blitted, so
+    // these readouts can never alter renderer output. Gated by
+    // cl_showfps (fps) / cl_showpos (position, default ON).
+    updateFpsOverlay(fpsEl, fps, showFpsEnabled());
+    updatePosOverlay(posEl, playerPosText(driver), showPosEnabled());
     // Per-channel positional audio: Mixer.mix() gains drive real nodes.
     // The driver already set the listener + started channels in step().
     if (sound) syncMixerToBrowser(sound, driver.mixer);

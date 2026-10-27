@@ -28,7 +28,7 @@ function meanRGB(buf: Uint32Array): number {
 }
 
 describe('display path (fps anchor, brightness, cvar controls)', () => {
-  it('fpsHudAnchor is a pure top-left helper (never over the controls panel)', () => {
+  it('fpsHudAnchor is a legacy top-left helper (DOM overlay owns the counter)', () => {
     const text = 'fps 60';
     const a = fpsHudAnchor(160, text);
     expect(a).toEqual({ x: 8, y: 8 });
@@ -38,31 +38,22 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
     expect(fpsHudAnchor(160, text)).toEqual(a);
   });
 
-  it('FPS_GREEN is an opaque readable green in 0xAABBGGRR', () => {
+  it('FPS_GREEN is an opaque readable green in 0xAABBGGRR (legacy canvas colour)', () => {
     expect(FPS_GREEN).toBe(0xff00ff00);
   });
 
-  it('canvas draws the fps text top-left in-view when enabled (no DOM overlay)', () => {
+  it('canvas never draws fps text (DOM #q2-fps overlay owns the counter)', () => {
     const boot = bootPlay({ width: 160, height: 120 });
-    // Enabled: the in-canvas HUD owns the counter (top-left, FPS_GREEN).
-    for (const v of [1]) {
+    // Enabled or gated: the canvas stays fps-free either way.
+    for (const v of [1, 0]) {
       setCVar('cl_showfps', v);
       try {
         const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
         drawPlayHud(target, boot, { fps: 60, frame: 1 });
-        expect(target.color.some((c) => c === FPS_GREEN)).toBe(true);
+        expect(target.color.some((c) => c === FPS_GREEN)).toBe(false);
       } finally {
         setCVar('cl_showfps', 1);
       }
-    }
-    // Gated: the canvas stays fps-free.
-    setCVar('cl_showfps', 0);
-    try {
-      const target = { width: 160, height: 120, color: new Uint32Array(160 * 120) };
-      drawPlayHud(target, boot, { fps: 60, frame: 1 });
-      expect(target.color.some((c) => c === FPS_GREEN)).toBe(false);
-    } finally {
-      setCVar('cl_showfps', 1);
     }
   });
 
