@@ -128,3 +128,108 @@ function splat(
   }
   return 0;
 }
+
+/** Single depth-tested additive RGB write (beam glow over the RGB plane). */
+function splatRGB(
+  color: Uint32Array, cover: Uint8Array, zb: Float32Array, fbW: number, fbH: number,
+  x: number, y: number, iz: number, r: number, g: number, b: number,
+): number {
+  if (x < 0 || y < 0 || x >= fbW || y >= fbH) return 0;
+  const o = y * fbW + x;
+  if (iz > zb[o]!) {
+    zb[o] = iz;
+    const dst = color[o]!;
+    const ar = (dst & 255) + r > 255 ? 255 : (dst & 255) + r;
+    const ag = ((dst >> 8) & 255) + g > 255 ? 255 : ((dst >> 8) & 255) + g;
+    const ab = ((dst >> 16) & 255) + b > 255 ? 255 : ((dst >> 16) & 255) + b;
+    color[o] = (0xff000000 | (ab << 16) | (ag << 8) | ar) >>> 0;
+    cover[o] = 1;
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * RGB (voodoo-policy) twin of drawTracerBeam: the same clipped 1/z DDA,
+ * but palette indices expand through the palette and add onto the RGB
+ * plane (the ref_gl "additive" bolt read) instead of writing an index.
+ * Depth-tested and depth-writing into the RGB-owned depth plane, so
+ * occlusion matches the indexed path exactly. Writes only the RGB planes.
+ */
+export function drawTracerBeamRGB(
+  color: Uint32Array,
+  cover: Uint8Array,
+  zb: Float32Array,
+  fbW: number,
+  fbH: number,
+  cam: Camera,
+  ax: number, ay: number, az: number,
+  bx: number, by: number, bz: number,
+  colorIdx: number,
+  palette: Uint8Array,
+  coreIdx: number = TRACER_CORE_COLOR,
+): number {
+  const pax = ax - cam.origin[0]!, pay = ay - cam.origin[1]!, paz = az - cam.origin[2]!;
+  const pbx = bx - cam.origin[0]!, pby = by - cam.origin[1]!, pbz = bz - cam.origin[2]!;
+  const adx = pax * cam.right[0]! + pay * cam.right[1]! + paz * cam.right[2]!;
+  const ady = pax * cam.up[0]! + pay * cam.up[1]! + paz * cam.up[2]!;
+  const adz = pax * cam.forward[0]! + pay * cam.forward[1]! + paz * cam.forward[2]!;
+  const bdx = pbx * cam.right[0]! + pby * cam.right[1]! + pbz * cam.right[2]!;
+  const bdy = pby * cam.up[0]! + pby * cam.up[1]! + pbz * cam.up[2]!;
+  const bdz = pbx * cam.forward[0]! + pby * cam.forward[1]! + pbz * cam.forward[2]!;
+  const near = cam.near;
+  let t0 = 0, t1 = 1;
+  if (adz < near && bdz < near) return 0;
+  if (adz < near) t0 = (near - adz) / (bdz - adz);
+  else if (bdz < near) t1 = (near - adz) / (bdz - adz);
+  const s0x = adx + (bdx - adx) * t0;
+  const s0y = ady + (bdy - ady) * t0;
+  const s0z = adz + (bdz - adz) * t0;
+  const s1x = adx + (bdx - adx) * t1;
+  const s1y = ady + (bdy - ady) * t1;
+  const s1z = adz + (bdz - adz) * t1;
+  const x0 = cam.xCenter + s0x * cam.focalX / s0z;
+  const y0 = cam.yCenter - s0y * cam.focalY / s0z;
+  const x1 = cam.xCenter + s1x * cam.focalX / s1z;
+  const y1 = cam.yCenter - s1y * cam.focalY / s1z;
+  const iz0 = 1 / s0z, iz1 = 1 / s1z;
+  const dx = x1 - x0, dy = y1 - y0;
+  const steps = Math.min(TRACER_MAX_STEPS, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy))));
+  const go = (colorIdx & 255) * 3;
+  const gr = palette[go] ?? 0, gg = palette[go + 1] ?? 0, gb = palette[go + 2] ?? 0;
+  const co = (coreIdx & 255) * 3;
+  const cr = palette[co] ?? 0, cg = palette[co + 1] ?? 0, cb = palette[co + 2] ?? 0;
+  const horizontal = Math.abs(dx) >= Math.abs(dy);
+  if (steps <= 0) {
+    const x = Math.round(x0), y = Math.round(y0);
+    const iz = (iz0 + iz1) / 2;
+    let drawn = splatRGB(color, cover, zb, fbW, fbH, x, y, iz, cr, cg, cb);
+    if (horizontal) {
+      drawn += splatRGB(color, cover, zb, fbW, fbH, x, y - 1, iz, gr, gg, gb);
+      drawn += splatRGB(color, cover, zb, fbW, fbH, x, y + 1, iz, gr, gg, gb);
+    } else {
+      drawn += splatRGB(color, cover, zb, fbW, fbH, x - 1, y, iz, gr, gg, gb);
+      drawn += splatRGB(color, cover, zb, fbW, fbH, x + 1, y, iz, gr, gg, gb);
+    }
+    return drawn;
+  }
+  let drawn = 0;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    drawn += splatRGB(color, cover, zb, fbW, fbH,
+      Math.round(x0 + dx * t), Math.round(y0 + dy * t), iz0 + (iz1 - iz0) * t, cr, cg, cb);
+  }
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const x = Math.round(x0 + dx * t), y = Math.round(y0 + dy * t);
+    const iz = iz0 + (iz1 - iz0) * t;
+    if (horizontal) {
+      drawn += splatRGB(color, cover, zb, fbW, fbH, x, y - 1, iz, gr, gg, gb);
+      drawn += splatRGB(color, cover, zb, fbW, fbH, x, y + 1, iz, gr, gg, gb);
+    } else {
+      drawn += splatRGB(color, cover, zb, fbW, fbH, x - 1, y, iz, gr, gg, gb);
+      drawn += splatRGB(color, cover, zb, fbW, fbH, x + 1, y, iz, gr, gg, gb);
+    }
+  }
+  return drawn;
+}

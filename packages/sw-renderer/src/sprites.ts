@@ -3,7 +3,7 @@
 // optional scissor rect), rasterised with the shared perspective span path.
 
 import type { Camera } from './camera.js';
-import { SPAN_OPAQUE, createSpan, drawSpansSoftware, type SpanList, type Texture } from './spans.js';
+import { SPAN_OPAQUE, createSpan, drawSpansRGB, drawSpansSoftware, type RGBMaterial, type SpanList, type Texture } from './spans.js';
 import type { LightBlock } from './spans.js';
 
 export interface SpriteDef {
@@ -19,19 +19,18 @@ export interface Scissor {
 }
 
 /**
- * Rasterise a camera-facing sprite. Returns pixel count. Writes nothing
- * outside [scissor ∩ framebuffer]. `pool`/`list` are renderer-owned scratch.
+ * Project a camera-facing billboard into renderer-owned span scratch and
+ * return the emitted span count (pool.count is set; the caller draws then
+ * resets it). Shared by the indexed path (drawSprite) and the RGB path
+ * (drawSpriteRGB) so both rasterise the same quad through the same
+ * perspective span math. Returns 0 when fully off-screen/behind near.
  */
-export function drawSprite(
-  idx: Uint8Array,
-  zb: Float32Array,
-  fbW: number,
-  fbH: number,
+function emitSpriteSpans(
   sprite: SpriteDef,
   textures: Texture[],
-  light: LightBlock,
-  colormap: Uint8Array,
   cam: Camera,
+  fbW: number,
+  fbH: number,
   pool: SpanList,
   maxSpans: number,
   scissor?: Scissor,
@@ -113,7 +112,60 @@ export function drawSprite(
     s.turb = 0;
   }
   pool.count = cursor;
+  return cursor;
+}
+
+/**
+ * Rasterise a camera-facing sprite. Returns pixel count. Writes nothing
+ * outside [scissor ∩ framebuffer]. `pool`/`list` are renderer-owned scratch.
+ */
+export function drawSprite(
+  idx: Uint8Array,
+  zb: Float32Array,
+  fbW: number,
+  fbH: number,
+  sprite: SpriteDef,
+  textures: Texture[],
+  light: LightBlock,
+  colormap: Uint8Array,
+  cam: Camera,
+  pool: SpanList,
+  maxSpans: number,
+  scissor?: Scissor,
+): number {
+  const tex = textures[sprite.texId % textures.length]!;
+  const n = emitSpriteSpans(sprite, textures, cam, fbW, fbH, pool, maxSpans, scissor);
+  if (n === 0) return 0;
   const r = drawSpansSoftware(idx, zb, fbW, fbH, pool, tex, light, colormap);
+  pool.count = 0;
+  return r.pixels;
+}
+
+/**
+ * RGB (voodoo-policy) twin of drawSprite: the same emitted billboard spans
+ * go through drawSpansRGB with the caller's material (unlit sprite texture,
+ * transparent-255 holes skipped, per-material blend/depthWrite). Writes
+ * only the RGB planes + the handed (RGB-owned) depth plane, so the indexed
+ * path stays bit-identical. PORT-DIFF vs @q2/voodoo sampler.ts: same tap
+ * math via drawSpansRGB; the billboard emission above is reused verbatim.
+ */
+export function drawSpriteRGB(
+  color: Uint32Array,
+  cover: Uint8Array,
+  zb: Float32Array,
+  fbW: number,
+  fbH: number,
+  sprite: SpriteDef,
+  textures: Texture[],
+  mat: RGBMaterial,
+  cam: Camera,
+  pool: SpanList,
+  maxSpans: number,
+  scissor?: Scissor,
+): number {
+  const n = emitSpriteSpans(sprite, textures, cam, fbW, fbH, pool, maxSpans, scissor);
+  if (n === 0) return 0;
+  const r = drawSpansRGB(color, cover, zb, fbW, fbH, pool, mat);
   pool.count = 0;
   return r.pixels;
 }

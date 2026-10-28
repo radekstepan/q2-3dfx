@@ -16,7 +16,8 @@ export {
   buildTurbTable, spanListView,
   rgbMipLevel, rgbPickMipLevel, rgbSampleTexture, rgbSampleLightmap,
   rgbModulate, expandPaletteRGB, buildRGBMaterial,
-  runSubdivRGBRepeat, runSubdivRGBClamp,
+  rgbWrapCoord, rgbBlendPixel,
+  runSubdivRGBRepeat, runSubdivRGBClamp, runSubdivRGBGeneric, runSpanFlatRGB,
   drawSpansRGB, RGBWorldBackend,
   type Span, type SpanList, type Texture, type LightBlock, type RasterBackend,
   type RGBAddressMode, type RGBBlend, type RGBMipLevel, type RGBLightmap, type RGBMaterial,
@@ -96,18 +97,19 @@ export {
   isMd2Data, md2ToAliasMesh,
   MD2_CONVERT_MAX_TRIS, MD2_CONVERT_MAX_VERTS, MD2_CONVERT_MAX_FRAMES,
   drawAliasInstance, fillAffineTri, DEPTHHACK_SCALE,
+  drawAliasInstanceRGB, fillPerspTriRGB,
   clampBacklerp, aliasAlphaKeeps,
   type AliasMesh, type AliasInstance, type AliasSkin, type Md2Like,
 } from './alias.js';
 
-export { drawSprite, type SpriteDef, type Scissor } from './sprites.js';
+export { drawSprite, drawSpriteRGB, type SpriteDef, type Scissor } from './sprites.js';
 
 export {
-  drawTracerBeam,
+  drawTracerBeam, drawTracerBeamRGB,
   TRACER_DEFAULT_LENGTH, TRACER_DEFAULT_COLOR, TRACER_CORE_COLOR, TRACER_MAX_STEPS, TRACER_POOL_SIZE,
 } from './tracer.js';
 
-export { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
+export { drawParticles, drawParticlesRGB, projectParticles, type ScreenParticle } from './particles.js';
 
 export { createDevroom, createDevSkins, getDevMesh, DEVROOM_CAMERA } from './devroom.js';
 

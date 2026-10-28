@@ -76,3 +76,44 @@ export function projectParticles(
   }
   return count;
 }
+
+/**
+ * RGB (voodoo-policy) twin of drawParticles: one palette-expanded pixel
+ * each, depth-tested and depth-writing into the RGB-owned depth plane
+ * (matches the indexed path's occlusion, with full color depth instead of
+ * the colormap grade). Writes only the RGB planes, so the software path
+ * stays bit-identical. PORT-DIFF vs @q2/voodoo policy: point sprites have
+ * no filtered footprint; expansion is the upload-time palette applied per
+ * point (no voodoo import per the sw-renderer dep allowlist).
+ */
+export function drawParticlesRGB(
+  color: Uint32Array,
+  cover: Uint8Array,
+  zb: Float32Array,
+  fbW: number,
+  fbH: number,
+  parts: ScreenParticle[] | { list: ScreenParticle[]; count: number },
+  start: number,
+  end: number,
+  palette: Uint8Array,
+): number {
+  const list = Array.isArray(parts) ? parts : parts.list;
+  let drawn = 0;
+  const s = Math.max(0, start);
+  const e = Math.min(end, list.length);
+  for (let i = s; i < e; i++) {
+    const p = list[i]!;
+    const x = p.x | 0, y = p.y | 0;
+    if (x < 0 || y < 0 || x >= fbW || y >= fbH) continue;
+    const o = y * fbW + x;
+    if (p.iz > zb[o]) {
+      zb[o] = p.iz;
+      const c = (p.color & 255) * 3;
+      const r = palette[c] ?? 0, g = palette[c + 1] ?? 0, b = palette[c + 2] ?? 0;
+      color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      cover[o] = 1;
+      drawn++;
+    }
+  }
+  return drawn;
+}

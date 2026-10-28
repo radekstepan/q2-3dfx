@@ -785,17 +785,27 @@ export function drawSpansTranslucent(
 export type RGBAddressMode = 'repeat' | 'clamp';
 
 /**
- * RGB blend mode. V2 wires opaque world only; alpha/additive (sprites,
- * water, explosions) arrive with step-3 material coverage. Kept as a
- * field so call sites read like the final policy.
+ * RGB blend mode. Opaque world writes texel x light directly; alpha blends
+ * against the current RGB plane (translucent glass/water, fading alias
+ * explosions); additive adds and clamps (tracer beams, particles/glow).
+ * Invalid strings from JS callers Com_Error at draw time, never silently
+ * draw wrong pixels.
  */
-export type RGBBlend = 'opaque';
+export type RGBBlend = 'opaque' | 'alpha' | 'additive';
 
 /** One expanded-RGB mip level (w*h triplets, 8:8:8). */
 export interface RGBMipLevel {
   data: Uint8Array;
   width: number;
   height: number;
+  /**
+   * Per-texel opacity mask (w*h bytes, 1 = opaque). Base level marks index
+   * 255 texels as holes; each halve keeps a texel opaque only when ALL four
+   * sources are opaque, so filtered edges erode toward transparency instead
+   * of smearing opaque black fringes. Levels of an opaqueMask material are
+   * all-ones. The transparent-hole skip never writes depth.
+   */
+  mask: Uint8Array;
 }
 
 /** RGB light samples in luxel space (bilinear sampling like LightBlock). */
@@ -824,11 +834,35 @@ export interface RGBMaterial {
   lodBias: number;
   /** Per-pixel Bayer choice between level n / n+1 (single-TMU trilinear). */
   mipDither: boolean;
-  /** V2: opaque world only (step 3 adds alpha/additive materials). */
+  /**
+   * Blend policy for this material. 'opaque' replaces the plane pixel;
+   * 'alpha' blends with `alpha` (0..1, clamped; TRANS span kinds override
+   * with their 33/66 ratio); 'additive' adds and clamps. Depth-test always
+   * applies; depth writes follow `depthWrite` except TRANS kinds, which
+   * never write (R_DrawAlphaSurfaces semantics).
+   */
   blend: RGBBlend;
-  /** V2: null (masked/alpha-test surfaces arrive with step 3). */
+  /**
+   * Blend factor for blend:'alpha' on non-TRANS spans (alias fade, sprite
+   * fade). Clamped to [0,1]; NaN -> 0 (fully transparent, still covered).
+   */
+  alpha: number;
+  /** Warp texture coords through the turbulence table (water surfaces). */
+  warp: boolean;
+  /** Turbulence phase 0..1023 for this frame (time*64 & 1023). */
+  turbPhase: number;
+  /**
+   * Solid fill color for SPAN_FLAT (flat sky, 3 bytes RGB). Null with a FLAT
+   * span in the list is an unsupported combo and Com_Errors at draw time.
+   */
+  flatColor: Uint8Array | null;
+  /**
+   * Skip transparent texels (index 255 holes). Always on: the mask lives
+   * per mip level (see RGBMipLevel.mask). `opaqueMask` materials (skybox)
+   * carry all-ones masks so the check is a cheap constant.
+   */
   alphaTest: number | null;
-  /** V2: always true for the wired world pass (flag honored, not ignored). */
+  /** Write 1/z on a passed depth test (false for translucent surfaces). */
   depthWrite: boolean;
 }
 
@@ -1013,13 +1047,22 @@ export function expandPaletteRGB(
 }
 
 /** One box-filtered (2x2 average) halve step for the mip chain. */
-function halveRGBLevel(src: Uint8Array, sw: number, sh: number): RGBMipLevel {
+/** One box-filtered (2x2 average) halve step for the mip chain, with the
+ * opacity mask: a child texel stays opaque only when ALL four sources are
+ * opaque (edges erode toward transparency instead of fringing). */
+function halveRGBLevel(
+  src: Uint8Array, sw: number, sh: number, srcMask: Uint8Array,
+): RGBMipLevel {
   const w = Math.max(1, sw >> 1), h = Math.max(1, sh >> 1);
   const data = new Uint8Array(w * h * 3);
+  const mask = new Uint8Array(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const sx = Math.min(x * 2, sw - 1), sy = Math.min(y * 2, sh - 1);
       const x1 = Math.min(sx + 1, sw - 1), y1 = Math.min(sy + 1, sh - 1);
+      const opaque = srcMask[sy * sw + sx]! & srcMask[sy * sw + x1]! &
+        srcMask[y1 * sw + sx]! & srcMask[y1 * sw + x1]!;
+      mask[y * w + x] = opaque;
       for (let c = 0; c < 3; c++) {
         const a = src[(sy * sw + sx) * 3 + c]!;
         const b = src[(sy * sw + x1) * 3 + c]!;
@@ -1029,13 +1072,16 @@ function halveRGBLevel(src: Uint8Array, sw: number, sh: number): RGBMipLevel {
       }
     }
   }
-  return { data, width: w, height: h };
+  return { data, width: w, height: h, mask };
 }
 
 /**
  * Build an RGBMaterial from indexed texels + an optional RGB luxel block.
  * The mip chain is expanded once here (upload-time cost); the span loop
  * only reads. levels is never empty (invalid dims fall back to 1x1 black).
+ * The base opacity mask marks index-255 texels as holes, so transparent
+ * texels never write color or depth at any mip; `opaqueMask: true` (skybox,
+ * whose PCX art must sample verbatim) forces an all-opaque mask instead.
  */
 export function buildRGBMaterial(
   texels: Uint8Array,
@@ -1047,23 +1093,36 @@ export function buildRGBMaterial(
     addressS?: RGBAddressMode; addressT?: RGBAddressMode;
     overbright?: boolean; lodBias?: number; mipDither?: boolean;
     blend?: RGBBlend; alphaTest?: number | null; depthWrite?: boolean;
+    alpha?: number; warp?: boolean; turbPhase?: number;
+    flatColor?: Uint8Array | null; opaqueMask?: boolean;
   },
 ): RGBMaterial {
   const levels: RGBMipLevel[] = [];
   if (w >= 1 && h >= 1 && texels.length >= w * h) {
     const base = expandPaletteRGB(texels.subarray(0, w * h), w, h, palette);
-    levels.push({ data: base, width: w, height: h });
-    let cw = w, ch = h, cur = base;
+    const baseMask = new Uint8Array(w * h);
+    if (opts?.opaqueMask === true) {
+      baseMask.fill(1);
+    } else {
+      for (let i = 0; i < w * h; i++) baseMask[i] = texels[i]! === 255 ? 0 : 1;
+    }
+    levels.push({ data: base, width: w, height: h, mask: baseMask });
+    let cw = w, ch = h;
+    let cur: Uint8Array = base;
+    let curMask: Uint8Array = baseMask;
     while (cw > 1 || ch > 1) {
-      const next = halveRGBLevel(cur, cw, ch);
+      const next = halveRGBLevel(cur, cw, ch, curMask);
       levels.push(next);
       cur = next.data;
+      curMask = next.mask;
       cw = next.width;
       ch = next.height;
     }
   } else {
-    levels.push({ data: new Uint8Array(3), width: 1, height: 1 });
+    levels.push({ data: new Uint8Array(3), width: 1, height: 1, mask: new Uint8Array([1]) });
   }
+  const alphaRaw = opts?.alpha ?? 1;
+  const alpha = Number.isFinite(alphaRaw) ? (alphaRaw < 0 ? 0 : alphaRaw > 1 ? 1 : alphaRaw) : 1;
   return {
     levels,
     addressS: opts?.addressS ?? 'repeat',
@@ -1075,12 +1134,18 @@ export function buildRGBMaterial(
     blend: opts?.blend ?? 'opaque',
     alphaTest: opts?.alphaTest ?? null,
     depthWrite: opts?.depthWrite ?? true,
+    alpha,
+    warp: opts?.warp ?? false,
+    turbPhase: (opts?.turbPhase ?? 0) & 1023,
+    flatColor: opts?.flatColor ? opts.flatColor.slice(0, 3) : null,
   };
 }
 
 // Module scratch for the RGB pixel loop (serial path only, no allocation).
 const _rgbTex = new Uint8Array(3);
 const _rgbLit = new Uint8Array(3);
+/** Shared turbulence table for warped RGB spans (same table as software). */
+const _rgbTurb = buildTurbTable();
 
 /**
  * One 16-pixel RGB subdivision (repeat-addressed texture). Mirrors
@@ -1125,18 +1190,25 @@ export function runSubdivRGBRepeat(
     if (iz > zb[o]!) {
       const lvl = rgbPickMipLevel(spanLod, xAbs + i, yAbs, mipDither, maxLevel);
       const t = levels[lvl]!;
-      rgbSampleTexture(t.data, t.width, t.height, tu / 65536, tv / 65536, _rgbTex, 0, true, true);
-      let r = _rgbTex[0]!, g = _rgbTex[1]!, b = _rgbTex[2]!;
-      if (lb) {
-        rgbSampleLightmap(lb, lux, lv, _rgbLit, 0);
-        rgbModulate(r, g, b, _rgbLit[0]!, _rgbLit[1]!, _rgbLit[2]!, overbright, _rgbLit, 0);
-        r = _rgbLit[0]!;
-        g = _rgbLit[1]!;
-        b = _rgbLit[2]!;
+      // Nearest-tap opacity mask: index-255 holes never write color or
+      // depth (no opaque black fringes). Same wrap convention as the
+      // bilinear tap below so the hole test agrees with the sample.
+      const mxr = rgbWrapCoord(tu >> 16, t.width, true);
+      const myr = rgbWrapCoord(tv >> 16, t.height, true);
+      if (t.mask[myr * t.width + mxr]! !== 0) {
+        rgbSampleTexture(t.data, t.width, t.height, tu / 65536, tv / 65536, _rgbTex, 0, true, true);
+        let r = _rgbTex[0]!, g = _rgbTex[1]!, b = _rgbTex[2]!;
+        if (lb) {
+          rgbSampleLightmap(lb, lux, lv, _rgbLit, 0);
+          rgbModulate(r, g, b, _rgbLit[0]!, _rgbLit[1]!, _rgbLit[2]!, overbright, _rgbLit, 0);
+          r = _rgbLit[0]!;
+          g = _rgbLit[1]!;
+          b = _rgbLit[2]!;
+        }
+        zb[o] = iz;
+        color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+        cover[o] = 1;
       }
-      zb[o] = iz;
-      color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
-      cover[o] = 1;
     }
     tu += dtu; tv += dtv; iz += diz; lux += dlux;
   }
@@ -1184,18 +1256,22 @@ export function runSubdivRGBClamp(
     if (iz > zb[o]!) {
       const lvl = rgbPickMipLevel(spanLod, xAbs + i, yAbs, mipDither, maxLevel);
       const t = levels[lvl]!;
-      rgbSampleTexture(t.data, t.width, t.height, tu / 65536, tv / 65536, _rgbTex, 0, false, false);
-      let r = _rgbTex[0]!, g = _rgbTex[1]!, b = _rgbTex[2]!;
-      if (lb) {
-        rgbSampleLightmap(lb, lux, lv, _rgbLit, 0);
-        rgbModulate(r, g, b, _rgbLit[0]!, _rgbLit[1]!, _rgbLit[2]!, overbright, _rgbLit, 0);
-        r = _rgbLit[0]!;
-        g = _rgbLit[1]!;
-        b = _rgbLit[2]!;
+      const mxc = rgbWrapCoord(tu >> 16, t.width, false);
+      const myc = rgbWrapCoord(tv >> 16, t.height, false);
+      if (t.mask[myc * t.width + mxc]! !== 0) {
+        rgbSampleTexture(t.data, t.width, t.height, tu / 65536, tv / 65536, _rgbTex, 0, false, false);
+        let r = _rgbTex[0]!, g = _rgbTex[1]!, b = _rgbTex[2]!;
+        if (lb) {
+          rgbSampleLightmap(lb, lux, lv, _rgbLit, 0);
+          rgbModulate(r, g, b, _rgbLit[0]!, _rgbLit[1]!, _rgbLit[2]!, overbright, _rgbLit, 0);
+          r = _rgbLit[0]!;
+          g = _rgbLit[1]!;
+          b = _rgbLit[2]!;
+        }
+        zb[o] = iz;
+        color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+        cover[o] = 1;
       }
-      zb[o] = iz;
-      color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
-      cover[o] = 1;
     }
     tu += dtu; tv += dtv; iz += diz; lux += dlux;
   }
@@ -1203,14 +1279,179 @@ export function runSubdivRGBClamp(
 }
 
 /**
- * RGB span rasteriser for the opaque world pass (drawSpansSoftware twin).
- * Reuses traversal/clipping: perspective-correct UVs (uz/vz/iz), lightmap
- * bilinear in luxel space (lu + dlu*x at constant lv, exactly the software
- * gradient convention). Writes 0xAABBGGRR into `color`, 1/z into `zb`
- * (Framebuffer.depth semantics untouched), and marks `cover` per written
- * pixel so endFrame can composite over the indexed resolve. Zero
- * allocation; non-opaque span kinds are skipped (step-3 material coverage
- * draws those through the classic path for now).
+ * Nearest-tap coordinate fold for the opacity mask (integer texel units).
+ * Repeat wraps (negative-safe); clamp pins to the edge. Mirrors the float
+ * convention in rgbSampleTexture so the hole test agrees with the sample.
+ */
+export function rgbWrapCoord(c: number, size: number, wrap: boolean): number {
+  if (wrap) {
+    let m = c % size;
+    if (m < 0) m += size;
+    return m;
+  }
+  if (c < 0) return 0;
+  if (c > size - 1) return size - 1;
+  return c;
+}
+
+/**
+ * Composite one RGB source pixel over the plane (voodoo alpha/additive
+ * blend stages, integer math, no floats per channel). Opaque replaces;
+ * alpha blends src*a + dst*(1-a) with a = alphaQ/256; additive adds and
+ * clamps. `cover` is always marked by the caller on a passed depth test.
+ */
+export function rgbBlendPixel(
+  color: Uint32Array,
+  o: number,
+  r: number, g: number, b: number,
+  blend: RGBBlend,
+  alphaQ: number,
+): void {
+  if (blend === 'opaque') {
+    color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+    return;
+  }
+  const dst = color[o]!;
+  const dr = dst & 255, dg = (dst >> 8) & 255, db = (dst >> 16) & 255;
+  if (blend === 'additive') {
+    const ar = dr + r > 255 ? 255 : dr + r;
+    const ag = dg + g > 255 ? 255 : dg + g;
+    const ab = db + b > 255 ? 255 : db + b;
+    color[o] = (0xff000000 | (ab << 16) | (ag << 8) | ar) >>> 0;
+    return;
+  }
+  const a = alphaQ < 0 ? 0 : alphaQ > 256 ? 256 : alphaQ;
+  const ia = 256 - a;
+  color[o] = (0xff000000 |
+    (((db * ia + b * a + 128) >> 8) << 16) |
+    (((dg * ia + g * a + 128) >> 8) << 8) |
+    ((dr * ia + r * a + 128) >> 8)) >>> 0;
+}
+
+/**
+ * Generic RGB subdivision: optional turbulence warp, per-pixel mip pick,
+ * opacity-mask skip, then opaque/alpha/additive composite. Separate from
+ * the two hot opaque loops above (which stay monomorphic for the world
+ * pass); the per-pixel mode flags here serve turbulent water, glass and
+ * other effect spans where warp/blend vary per span, never in steady
+ * opaque world fill. PORT-DIFF vs voodoo sampler.ts: warp + mask + blend
+ * stages are renderer-side policy; the tap math (fixed-point weights) is
+ * the same integer formulation.
+ */
+export function runSubdivRGBGeneric(
+  color: Uint32Array,
+  cover: Uint8Array,
+  zb: Float32Array,
+  o0: number,
+  n: number,
+  xAbs: number,
+  yAbs: number,
+  iz: number,
+  diz: number,
+  uz: number,
+  duz: number,
+  vz: number,
+  dvz: number,
+  u0: number,
+  v0: number,
+  lux0: number,
+  dlux: number,
+  lv: number,
+  mat: RGBMaterial,
+  spanLod: number,
+  maxLevel: number,
+  blend: RGBBlend,
+  alphaQ: number,
+  turbTable: Uint8Array | null,
+  turbPhase: number,
+): { iz: number; lux: number; u1: number; v1: number } {
+  const levels = mat.levels;
+  const lb = mat.light;
+  const overbright = mat.overbright;
+  const mipDither = mat.mipDither;
+  const wrapS = mat.addressS === 'repeat';
+  const wrapT = mat.addressT === 'repeat';
+  const writeDepth = blend === 'opaque' ? mat.depthWrite : false;
+  const z1 = 1 / (iz + diz * n);
+  const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
+  let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
+  const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
+  const tmask = turbTable ? turbTable.length - 1 : 0;
+  let lux = lux0;
+  for (let i = 0, o = o0; i < n; i++, o++) {
+    if (iz > zb[o]!) {
+      let fu = tu, fv = tv;
+      if (turbTable) {
+        const wu = (tu + (turbTable[((tv >> 16) + turbPhase) & tmask]! << 16)) >> 16;
+        const wv = (tv + (turbTable[((tu >> 16) + turbPhase) & tmask]! << 16)) >> 16;
+        fu = wu << 16;
+        fv = wv << 16;
+      }
+      const lvl = rgbPickMipLevel(spanLod, xAbs + i, yAbs, mipDither, maxLevel);
+      const t = levels[lvl]!;
+      const mx = rgbWrapCoord(fu >> 16, t.width, wrapS);
+      const my = rgbWrapCoord(fv >> 16, t.height, wrapT);
+      if (t.mask[my * t.width + mx]! !== 0) {
+        rgbSampleTexture(t.data, t.width, t.height, fu / 65536, fv / 65536, _rgbTex, 0, wrapS, wrapT);
+        let r = _rgbTex[0]!, g = _rgbTex[1]!, b = _rgbTex[2]!;
+        if (lb) {
+          rgbSampleLightmap(lb, lux, lv, _rgbLit, 0);
+          rgbModulate(r, g, b, _rgbLit[0]!, _rgbLit[1]!, _rgbLit[2]!, overbright, _rgbLit, 0);
+          r = _rgbLit[0]!;
+          g = _rgbLit[1]!;
+          b = _rgbLit[2]!;
+        }
+        if (writeDepth) zb[o] = iz;
+        rgbBlendPixel(color, o, r, g, b, blend, alphaQ);
+        cover[o] = 1;
+      }
+    }
+    tu += dtu; tv += dtv; iz += diz; lux += dlux;
+  }
+  return { iz, lux, u1, v1 };
+}
+
+/** Flat RGB span fill (flat sky): depth-tested solid color, no texture. */
+export function runSpanFlatRGB(
+  color: Uint32Array,
+  cover: Uint8Array,
+  zb: Float32Array,
+  o0: number,
+  n: number,
+  iz: number,
+  diz: number,
+  r: number, g: number, b: number,
+  depthWrite: boolean,
+): number {
+  let z = iz;
+  for (let i = 0, o = o0; i < n; i++, o++) {
+    if (z > zb[o]!) {
+      if (depthWrite) zb[o] = z;
+      color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      cover[o] = 1;
+    }
+    z += diz;
+  }
+  return z;
+}
+
+/**
+ * RGB span rasteriser (drawSpansSoftware twin + effect coverage). Reuses
+ * traversal/clipping: perspective-correct UVs (uz/vz/iz), lightmap bilinear
+ * in luxel space (lu + dlu*x at constant lv, exactly the software gradient
+ * convention). Writes 0xAABBGGRR into `color`, 1/z into `zb` (the RGB
+ * path owns a separate depth plane; Framebuffer.depth semantics untouched),
+ * and marks `cover` per written pixel so endFrame can composite over the
+ * indexed resolve. Per-span-kind dispatch (branch on the span, never in
+ * the pixel loop):
+ * - SPAN_OPAQUE: textured, opaque/alpha/additive per material.
+ * - SPAN_TURBULENT: water-warped texture, blend per material.
+ * - SPAN_TRANS33/TRANS66: glass/water alpha (33/66 ratios, or additive
+ *   when the material selects it), never depth-writing.
+ * - SPAN_FLAT: solid fill from mat.flatColor (flat sky).
+ * Anything else (unknown kind, FLAT without flatColor, empty mip chain,
+ * unknown blend string) is an unsupported combo and Com_Errors — never
+ * silent wrong pixels. Zero allocation.
  */
 export function drawSpansRGB(
   color: Uint32Array,
@@ -1221,25 +1462,45 @@ export function drawSpansRGB(
   list: SpanList,
   mat: RGBMaterial,
 ): { pixels: number; spans: number } {
-  if (mat.blend !== 'opaque' || mat.alphaTest !== null || !mat.depthWrite) {
-    Com_Error('error', 'drawSpansRGB: unsupported material (step-3 coverage pending)');
+  const blend = mat.blend;
+  if (blend !== 'opaque' && blend !== 'alpha' && blend !== 'additive') {
+    Com_Error('error', 'drawSpansRGB: unsupported blend (step-3 coverage pending)');
+  }
+  if (mat.levels.length < 1) {
+    Com_Error('error', 'drawSpansRGB: material has no mip levels');
   }
   const repeat = mat.addressS === 'repeat' && mat.addressT === 'repeat';
   const levels = mat.levels;
   const maxLevel = levels.length - 1;
+  const alphaQ = Math.round(mat.alpha * 256);
   const spans = list.spans;
   const n = list.count < spans.length ? list.count : spans.length;
   let pixels = 0;
   let drawn = 0;
   for (let si = 0; si < n; si++) {
     const s = spans[si]!;
-    if (s.kind !== SPAN_OPAQUE) continue;
+    const kind = s.kind;
+    if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT &&
+      kind !== SPAN_TRANS33 && kind !== SPAN_TRANS66 && kind !== SPAN_FLAT) {
+      Com_Error('error', 'drawSpansRGB: unsupported span kind (step-3 coverage pending)');
+    }
     if (s.y < 0 || s.y >= fbH) continue;
     let x0 = s.x0, x1 = s.x1;
     if (x0 < 0) x0 = 0;
     if (x1 > fbW) x1 = fbW;
     const count = x1 - x0;
     if (count <= 0) continue;
+    if (kind === SPAN_FLAT) {
+      const fc = mat.flatColor;
+      if (!fc) {
+        Com_Error('error', 'drawSpansRGB: FLAT span without flatColor');
+      }
+      runSpanFlatRGB(color, cover, zb, s.y * fbW + x0, count,
+        s.iz + s.diz * (x0 - s.x0), s.diz, fc[0]!, fc[1]!, fc[2]!, mat.depthWrite);
+      pixels += count;
+      drawn++;
+      continue;
+    }
     // Clip-adjusted perspective start (same as the software path).
     const skip = x0 - s.x0;
     let iz = s.iz + s.diz * skip;
@@ -1255,30 +1516,60 @@ export function drawSpansRGB(
     const aud = dudx < 0 ? -dudx : dudx;
     const avd = dvdx < 0 ? -dvdx : dvdx;
     const spanLod = rgbMipLevel(aud > avd ? aud : avd, mat.lodBias, maxLevel);
+    const isTrans = kind === SPAN_TRANS33 || kind === SPAN_TRANS66;
+    const useWarp = kind === SPAN_TURBULENT || (isTrans && mat.warp);
+    const useBlend: RGBBlend = isTrans
+      ? (blend === 'additive' ? 'additive' : 'alpha')
+      : blend;
+    const useAlphaQ = isTrans && useBlend === 'alpha'
+      ? (kind === SPAN_TRANS66 ? 169 : 85)
+      : alphaQ;
     let o = s.y * fbW + x0;
     let remaining = count;
-    while (remaining > 0) {
-      const m = remaining >= SUBDIV ? SUBDIV : remaining;
-      let r: { iz: number; lux: number; u1: number; v1: number };
-      if (repeat) {
-        r = runSubdivRGBRepeat(
-          color, cover, zb, o, m, x0 + (count - remaining), s.y,
-          iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
-          mat, spanLod, maxLevel);
-      } else {
-        r = runSubdivRGBClamp(
-          color, cover, zb, o, m, x0 + (count - remaining), s.y,
-          iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
-          mat, spanLod, maxLevel);
+    if (!useWarp && useBlend === 'opaque' && mat.depthWrite) {
+      // Hot opaque path: monomorphic repeat/clamp loops (mask skip inside).
+      while (remaining > 0) {
+        const m = remaining >= SUBDIV ? SUBDIV : remaining;
+        let r: { iz: number; lux: number; u1: number; v1: number };
+        if (repeat) {
+          r = runSubdivRGBRepeat(
+            color, cover, zb, o, m, x0 + (count - remaining), s.y,
+            iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
+            mat, spanLod, maxLevel);
+        } else {
+          r = runSubdivRGBClamp(
+            color, cover, zb, o, m, x0 + (count - remaining), s.y,
+            iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
+            mat, spanLod, maxLevel);
+        }
+        iz = r.iz;
+        lux = r.lux;
+        uz += s.duz * m;
+        vz += s.dvz * m;
+        u0 = r.u1;
+        v0 = r.v1;
+        o += m;
+        remaining -= m;
       }
-      iz = r.iz;
-      lux = r.lux;
-      uz += s.duz * m;
-      vz += s.dvz * m;
-      u0 = r.u1;
-      v0 = r.v1;
-      o += m;
-      remaining -= m;
+    } else {
+      // Effect path: warped and/or blended spans (water, glass).
+      const turb = useWarp ? _rgbTurb : null;
+      while (remaining > 0) {
+        const m = remaining >= SUBDIV ? SUBDIV : remaining;
+        const r = runSubdivRGBGeneric(
+          color, cover, zb, o, m, x0 + (count - remaining), s.y,
+          iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
+          mat, spanLod, maxLevel, useBlend, useAlphaQ, turb,
+          turb ? (mat.turbPhase + s.turb) & (turb.length - 1) : 0);
+        iz = r.iz;
+        lux = r.lux;
+        uz += s.duz * m;
+        vz += s.dvz * m;
+        u0 = r.u1;
+        v0 = r.v1;
+        o += m;
+        remaining -= m;
+      }
     }
     pixels += count;
     drawn++;

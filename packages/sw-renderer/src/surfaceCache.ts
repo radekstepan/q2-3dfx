@@ -194,14 +194,18 @@ export interface RGBCachedBlock {
  * therefore misses (never serves stale color); the frame loop also drops
  * the whole RGB cache whenever it drops the scalar one. String keys keep
  * the 32-bit serial exact (a packed-number key would lose precision).
+ * `variant` separates the opaque main-loop binding (0) from the deferred
+ * alpha-loop binding (1, blended + non-depth-writing): the same glass
+ * surface must never serve the other loop's material across cvar flips.
  */
 export function rgbCacheKey(
   surface: number,
   stylesHash: number,
   mip: number,
   dlightSerial: number,
+  variant = 0,
 ): string {
-  return `${surface}:${stylesHash >>> 0}:${mip & 3}:${dlightSerial >>> 0}`;
+  return `${surface}:${stylesHash >>> 0}:${mip & 3}:${dlightSerial >>> 0}:${variant | 0}`;
 }
 
 /**
@@ -241,8 +245,8 @@ export class RGBLightCache {
     this.frame = (this.frame + 1) >>> 0;
   }
 
-  get(surface: number, stylesHash: number, mip: number, dlightSerial: number): RGBCachedBlock | null {
-    const e = this.map.get(rgbCacheKey(surface, stylesHash, mip, dlightSerial));
+  get(surface: number, stylesHash: number, mip: number, dlightSerial: number, variant = 0): RGBCachedBlock | null {
+    const e = this.map.get(rgbCacheKey(surface, stylesHash, mip, dlightSerial, variant));
     if (!e) {
       this.misses++;
       return null;
@@ -252,8 +256,8 @@ export class RGBLightCache {
     return e.entry;
   }
 
-  put(surface: number, stylesHash: number, mip: number, dlightSerial: number, entry: RGBCachedBlock): void {
-    const key = rgbCacheKey(surface, stylesHash, mip, dlightSerial);
+  put(surface: number, stylesHash: number, mip: number, dlightSerial: number, entry: RGBCachedBlock, variant = 0): void {
+    const key = rgbCacheKey(surface, stylesHash, mip, dlightSerial, variant);
     let chainBytes = 0;
     for (const lvl of entry.material.levels) chainBytes += lvl.data.length;
     const bytes = chainBytes + (entry.block.rgb ? entry.block.rgb.length : 0) + 64;

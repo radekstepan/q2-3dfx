@@ -34,14 +34,14 @@ import {
   type BandDispatcher,
 } from './bands.js';
 import {
-  buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, createSoldierMesh, createSoldierSkin, md2ToAliasMesh, DEPTHHACK_SCALE, type AliasMesh,
+  buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, createSoldierMesh, createSoldierSkin, md2ToAliasMesh, DEPTHHACK_SCALE, drawAliasInstanceRGB, type AliasMesh,
 } from './alias.js';
 import { drawAliasInstance } from './alias.js';
-import { drawTracerBeam, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE, TRACER_CORE_COLOR } from './tracer.js';
+import { drawTracerBeam, drawTracerBeamRGB, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE, TRACER_CORE_COLOR } from './tracer.js';
 import { isValidSkySize, SKY_BOX_CORNERS, SKY_BOX_HALF, skyUvOnFace } from './sky.js';
 import { AngleVectors } from '@q2/math';
-import { drawSprite } from './sprites.js';
-import { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
+import { drawSprite, drawSpriteRGB } from './sprites.js';
+import { drawParticles, drawParticlesRGB, projectParticles, type ScreenParticle } from './particles.js';
 import { buildColormap, buildAlphamapPair, defaultPalette, extractAlphamap33, extractAlphamap66, COLORMAP_PCX_PIXELS } from './colormap.js';
 import { createDevroom, getDevMesh } from './devroom.js';
 
@@ -49,14 +49,18 @@ export const MAX_SPANS = 16384;
 const MAX_ROW = 4096;
 
 /**
- * Serial RGB (voodoo-policy) world pass selector (astra V2a/V2c). Default
- * OFF: software output is bit-identical whether the RGB code exists or not
- * (the classic path pays one flag check per opaque surface when off, and
- * nothing else). ON routes opaque world batches through drawSpansRGB into
- * an RGB888 plane + coverage mask composited in endFrame; turbulent, sky,
- * translucent, alias, sprite and particle draws keep the classic indexed
- * planes either way. Serial classic backend only: pooled (banded) and wasm
- * backends ignore the flag and keep software output.
+ * Serial RGB (voodoo-policy) pass selector (astra V2a/V2c + step 3).
+ * Default OFF: software output is bit-identical whether the RGB code exists
+ * or not (the classic path pays one flag check per surface when off, and
+ * nothing else). ON routes the serial classic backend through BOTH the
+ * indexed path (always drawn, so `index` + the software depth plane stay
+ * bit-identical) and the RGB overlay (opaque world, turbulent water,
+ * sky/skybox, translucent glass/water, alias/MD2 incl. the depth-hack
+ * viewmodel, sprites, particles, tracer beams) into an RGB888 plane +
+ * coverage mask composited in endFrame. The RGB path owns a SEPARATE depth
+ * plane (rgbZb): sharing the software zb would perturb indexed draws after
+ * it (strict-greater tests). Pooled (banded) and wasm backends ignore the
+ * flag and keep software output.
  */
 let rgbWorldEnabled = false;
 
@@ -268,8 +272,26 @@ export class SoftwareRenderer implements Refresh {
   private readonly rgbBackend = new RGBWorldBackend();
   private rgbColor: Uint32Array = new Uint32Array(0);
   private rgbCover: Uint8Array = new Uint8Array(0);
+  /**
+   * RGB-owned depth plane (step 3): the RGB overlay depth-tests and writes
+   * here instead of the software zb, so the always-drawn classic path keeps
+   * bit-identical depth decisions whether the flag is on or off. 1/z
+   * semantics, same strict-greater test; 16-bit quantization is deferred
+   * to step 4 (target/depth).
+   */
+  private rgbZb: Float32Array = new Float32Array(0);
   private rgbCache = new RGBLightCache();
-  private rgbUsedThisFrame = false;  private models: RegisteredModel[] = [];
+  private rgbUsedThisFrame = false;
+  /**
+   * Skin/sky/flat RGB materials (step 3, serial RGB only): palette-baked
+   * mip chains, so every entry is dropped on setPalette (and sky entries
+   * on setSkyTexture). Keyed by the Texture object identity for skins
+   * (renderer-owned stable refs), single-slot for sky/flat.
+   */
+  private rgbSkinMats = new Map<Texture, RGBMaterial>();
+  private rgbSkyMat: { tex: { width: number; height: number; texels: Uint8Array }; mat: RGBMaterial } | null = null;
+  private rgbFlatSky: { index: number; mat: RGBMaterial } | null = null;
+  private models: RegisteredModel[] = [];
   private skins: Texture[] = [];
   private skinNames: string[] = [];
   private scratch: EdgeScratch = createEdgeScratch(64);
@@ -430,7 +452,8 @@ export class SoftwareRenderer implements Refresh {
     this.color = fb.color;
     this.rgbColor = new Uint32Array(fb.width * fb.height);
     this.rgbCover = new Uint8Array(fb.width * fb.height);
-    this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.zb, this.fbW, this.fbH);
+    this.rgbZb = new Float32Array(fb.width * fb.height);
+    this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH);
     this.pickSkyIndex();
     for (let i = 0; i < MAX_SPANS; i++) this.pool.push(createSpan());
     for (let i = 0; i < MAX_SPANS; i++) this.tmpSort.push(this.pool[i]!);
@@ -608,6 +631,9 @@ export class SoftwareRenderer implements Refresh {
     this.alpha33 = new Uint8Array(0);
     this.alpha66 = new Uint8Array(0);
     this.rgbCache.invalidateAll();
+    this.rgbSkinMats.clear();
+    this.rgbSkyMat = null;
+    this.rgbFlatSky = null;
   }
 
   /**
@@ -792,9 +818,90 @@ export class SoftwareRenderer implements Refresh {
     if (!tex || !isValidSkySize(tex.width, tex.height) ||
       tex.texels.length !== tex.width * tex.height) {
       this.skyTex = null;
+      this.rgbSkyMat = null;
       return;
     }
     this.skyTex = { width: tex.width, height: tex.height, texels: tex.texels.slice() };
+    this.rgbSkyMat = null;
+  }
+
+  /**
+   * True when this frame may take the RGB overlay path: the module flag is
+   * on AND the active backend is the serial classic one (pooled/banded and
+   * wasm backends ignore the flag and keep software output).
+   */
+  private rgbSerialActive(): boolean {
+    return rgbWorldEnabled && this.backend === this.tsBackend;
+  }
+
+  /**
+   * Seed the RGB plane from the indexed framebuffer (palette expand) before
+   * any RGB foreground/alpha draws. Alpha/additive RGB composites read the
+   * current plane pixel as their destination, so the seed gives them the
+   * exact software background (opaque world already drawn classically);
+   * opaque RGB writes overwrite it. Cover is NOT marked: uncovered pixels
+   * composite from the identical indexed expand in endFrame. Called once at
+   * the top of drawForeground (covers world + all foreground draws).
+   */
+  private seedRGBBackground(): void {
+    const pal = this.palette;
+    const src = this.idx;
+    const dst = this.rgbColor;
+    const n = this.fbW * this.fbH;
+    for (let i = 0; i < n; i++) {
+      const c = src[i]! * 3;
+      const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
+      dst[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+    }
+  }
+
+  /**
+   * Palette-baked RGB material for an entity/placed skin (unlit: alias and
+   * sprite lighting rides vertex colors / fullbright, not a lightmap).
+   * Cached by Texture identity; cleared on setPalette.
+   */
+  private rgbMaterialForSkin(skin: Texture): RGBMaterial {
+    let mat = this.rgbSkinMats.get(skin);
+    if (!mat) {
+      mat = buildRGBMaterial(skin.texels, skin.width, skin.height, this.palette, null, {
+        addressS: 'clamp', addressT: 'clamp',
+        overbright: true, lodBias: -0.35, mipDither: true,
+      });
+      this.rgbSkinMats.set(skin, mat);
+    }
+    return mat;
+  }
+
+  /** Palette-baked RGB material for the packed skybox strip (clamp, unlit). */
+  private rgbMaterialForSky(): RGBMaterial | null {
+    const sky = this.skyTex;
+    if (!sky) return null;
+    const cached = this.rgbSkyMat;
+    if (cached && cached.tex.width === sky.width && cached.tex.height === sky.height &&
+      cached.tex.texels.length === sky.texels.length) {
+      return cached.mat;
+    }
+    const mat = buildRGBMaterial(sky.texels, sky.width, sky.height, this.palette, null, {
+      addressS: 'clamp', addressT: 'clamp',
+      overbright: false, lodBias: 0, mipDither: false, opaqueMask: true,
+    });
+    this.rgbSkyMat = { tex: { width: sky.width, height: sky.height, texels: sky.texels }, mat };
+    return mat;
+  }
+
+  /** Palette-baked flat RGB material for untextured sky (solid sky color). */
+  private rgbMaterialForFlatSky(): RGBMaterial {
+    const cached = this.rgbFlatSky;
+    if (cached && cached.index === this.skyIndex) return cached.mat;
+    const c = this.skyIndex * 3;
+    const flat = new Uint8Array([
+      this.palette[c] ?? 0, this.palette[c + 1] ?? 0, this.palette[c + 2] ?? 0,
+    ]);
+    const mat = buildRGBMaterial(new Uint8Array([0]), 1, 1, this.palette, null, {
+      flatColor: flat, opaqueMask: true,
+    });
+    this.rgbFlatSky = { index: this.skyIndex, mat };
+    return mat;
   }
 
   /**
@@ -879,8 +986,9 @@ export class SoftwareRenderer implements Refresh {
     this.rgbBackend.pixelsDrawn = 0;
     this.rgbUsedThisFrame = false;
     if (rgbWorldEnabled) {
-      this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.zb, this.fbW, this.fbH);
+      this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH);
       this.rgbCover.fill(0);
+      this.rgbZb.fill(0);
     }
     this.rgbCache.nextFrame();
   }
@@ -1122,6 +1230,10 @@ export class SoftwareRenderer implements Refresh {
         if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = endCount;
         this.backend.drawSpans(this.spanList, texView, lightView);
+        if (this.rgbSerialActive()) {
+          this.rgbBackend.drawSpansRGB(this.spanList, this.rgbMaterialForFlatSky());
+          this.rgbUsedThisFrame = true;
+        }
         if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = 0;
         spansEmitted += endCount - start;
@@ -1180,22 +1292,28 @@ export class SoftwareRenderer implements Refresh {
       lb.height = block.luxH;
       lb.values = block.light;
       if (ph) { ph.cache += phaseNow() - pt; pt = phaseNow(); }
-      // RGB (voodoo-policy) binding for the opaque world pass. Resolved
-      // from the parallel RGB cache (keyed by surface/style/mip + dlight
-      // serial); a miss builds it from the scalar block's texels plus a
-      // fresh RGB luxel block and caches both. Null (non-classic backend,
-      // turbulent/sky surface, unusable lightmap) falls back to the scalar
-      // block/backend drawn below — output shape never changes, only the
-      // plane opaque pixels land in.
+      // RGB (voodoo-policy) binding for the world pass. Resolved from the
+      // parallel RGB cache (keyed by surface/style/mip + dlight serial); a
+      // miss builds it from the scalar block's texels plus a fresh RGB
+      // luxel block and caches both. Null (turbulent-free invalid
+      // lightmap, pooled/wasm backend, flag off) falls back to the scalar
+      // backend alone. The classic draw below ALWAYS runs (even when an
+      // RGB material exists): software planes stay bit-identical, and the
+      // RGB overlay composites over them in endFrame.
       let rgbMat: RGBMaterial | null = null;
-      if (rgbWorldEnabled && this.backend === this.tsBackend && !surf.turbulent && !surf.sky) {
-        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, this.dlights.serial);
+      if (this.rgbSerialActive() && !surf.sky) {
+        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, this.dlights.serial, 0);
         rgbMat = rgbHit
           ? rgbHit.material
           : this.buildRGBEntry(
             worldData, surf, block, stylesHash, mip,
             view.lightStyles, dyn, dlightFrameBits(surf.id),
+            { variant: 0 },
           );
+        // Warp phase is frame state, not cached state: refresh the shared
+        // material every frame so turbulent water scrolls instead of
+        // freezing on its build frame.
+        if (rgbMat && rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
       }
       // emit
       this.polyInput.verts = surf.verts;
@@ -1225,13 +1343,14 @@ export class SoftwareRenderer implements Refresh {
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
+      // Classic draw always (software planes bit-identical with the flag
+      // on or off); the RGB overlay composites over it in endFrame. Frame
+      // stats intentionally track the classic path only, so numbers stay
+      // comparable across the flag.
+      this.backend.drawSpans(this.spanList, tex, lb);
       if (rgbMat) {
-        const rr = this.rgbBackend.drawSpansRGB(this.spanList, rgbMat);
-        this.backend.spansDrawn += rr.spans;
-        this.backend.pixelsDrawn += rr.pixels;
+        this.rgbBackend.drawSpansRGB(this.spanList, rgbMat);
         this.rgbUsedThisFrame = true;
-      } else {
-        this.backend.drawSpans(this.spanList, tex, lb);
       }
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
@@ -1306,6 +1425,12 @@ export class SoftwareRenderer implements Refresh {
     // exact (buckets were counted at deferral time; only maxBatchSpans is
     // updated here). Tables build lazily on the first translucent frame, so
     // translucent-free worlds never pay for them.
+    // RGB background seed (step 3): alpha/additive RGB foreground draws
+    // composite against the current plane pixel, so seed the plane with the
+    // exact software background (opaque world, classically drawn above)
+    // before any RGB foreground write. Opaque RGB writes overwrite it.
+    const rgbActive = this.rgbSerialActive();
+    if (rgbActive) this.seedRGBBackground();
     for (let a = this.fgAlphaCount - 1; a >= 0; a--) {
       const si = this.alphaDeferredSi[a]!;
       const order = this.alphaDeferredOrd[a]!;
@@ -1378,6 +1503,25 @@ export class SoftwareRenderer implements Refresh {
       const t = drawSpansTranslucent(this.idx, this.zb, this.fbW, this.fbH, this.spanList,
         tex, lb, this.colormap, this.alpha33, this.alpha66,
         surf.turbulent ? tb.turbTable : null, view.time, this.fgTMode === 2);
+      // RGB overlay (step 3): same spans, true alpha blend (never the
+      // screen-door stipple — the RGB path has no stipple), warped when
+      // the surface is turbulent, never depth-writing. Reverse traversal
+      // order is preserved (back-to-front over-blend).
+      if (this.rgbSerialActive()) {
+        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, this.dlights.serial, 1);
+        let rgbMat = rgbHit
+          ? rgbHit.material
+          : this.buildRGBEntry(
+            worldData, surf, block, stylesHash, mip,
+            view.lightStyles, dyn, this.alphaDeferredBits[a]!,
+            { blend: 'alpha', depthWrite: false, variant: 1 },
+          );
+        if (rgbMat) {
+          if (rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
+          this.rgbBackend.drawSpansRGB(this.spanList, rgbMat);
+          this.rgbUsedThisFrame = true;
+        }
+      }
       this.transSpans += t.spans;
       if (this.backend === tb) {
         tb.spansDrawn += t.spans;
@@ -1412,6 +1556,15 @@ export class SoftwareRenderer implements Refresh {
         frameA: pa.frameA, frameB: pa.frameB, lerp: pa.lerp,
         lightAngle: ((pa.angles[1]! * 256) / 360) & 255,
       }, skin, cam, this.anorms, this.shadeDots, this.colormap);
+      if (rgbActive) {
+        this.rgbBackend.pixelsDrawn += drawAliasInstanceRGB(
+          this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, {
+            mesh, origin: pa.origin, angles: pa.angles,
+            frameA: pa.frameA, frameB: pa.frameB, lerp: pa.lerp,
+            lightAngle: ((pa.angles[1]! * 256) / 360) & 255,
+          }, this.rgbMaterialForSkin(skin), cam, this.anorms, this.shadeDots, dyn);
+        this.rgbUsedThisFrame = true;
+      }
     }
     for (const ps of worldData.sprites) {
       const tex = worldData.textures[ps.skinId % worldData.textures.length]!;
@@ -1419,6 +1572,13 @@ export class SoftwareRenderer implements Refresh {
         { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
         [{ width: tex.width, height: tex.height, texels: tex.texels }],
         emptyLight, this.colormap, cam, this.spriteScratch, 1024);
+      if (rgbActive) {
+        this.rgbBackend.pixelsDrawn += drawSpriteRGB(
+          this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH,
+          { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
+          [tex], this.rgbMaterialForSkin(tex), cam, this.spriteScratch, 1024);
+        this.rgbUsedThisFrame = true;
+      }
     }
     if (worldData.particles.length > 0) {
       const n = Math.min(worldData.particles.length, 256);
@@ -1436,6 +1596,12 @@ export class SoftwareRenderer implements Refresh {
         this.partPool,
       );
       drawParticles(this.idx, this.zb, this.fbW, this.fbH, this.partPool, 0, np);
+      if (rgbActive) {
+        this.rgbBackend.pixelsDrawn += drawParticlesRGB(
+          this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH,
+          this.partPool, 0, np, this.palette);
+        this.rgbUsedThisFrame = true;
+      }
     }
 
     // entities (game-driven; model kind selects the M3.4 path)
@@ -1476,11 +1642,32 @@ export class SoftwareRenderer implements Refresh {
           depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
           alpha: alpha >= 1 ? undefined : alpha,
         }, skin, cam, this.anorms, this.shadeDots, this.colormap);
+        // RGB overlay (step 3): perspective-correct twin — same traversal,
+        // frame lerp and depthHack scale, true alpha blend for fading
+        // explosions (no screen-door stipple in the RGB path).
+        if (rgbActive) {
+          this.rgbBackend.pixelsDrawn += drawAliasInstanceRGB(
+            this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, {
+              mesh: m.data, origin: e.origin, angles: e.angles,
+              frameA: frA, frameB: fr, lerp,
+              lightAngle: ((e.angles[1]! * 256) / 360) & 255,
+              depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
+              alpha: alpha >= 1 ? undefined : alpha,
+            }, this.rgbMaterialForSkin(skin), cam, this.anorms, this.shadeDots, dyn);
+          this.rgbUsedThisFrame = true;
+        }
       } else if (m.kind === 'sp2') {
         const skin = this.skins[e.skin] ?? devSkin0(worldData);
         drawSprite(this.idx, this.zb, this.fbW, this.fbH,
           { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
           [skin], emptyLight, this.colormap, cam, this.spriteScratch, 1024);
+        if (rgbActive) {
+          this.rgbBackend.pixelsDrawn += drawSpriteRGB(
+            this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH,
+            { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
+            [skin], this.rgbMaterialForSkin(skin), cam, this.spriteScratch, 1024);
+          this.rgbUsedThisFrame = true;
+        }
       } else if (m.kind === 'tracer') {
         // Contract-free beam convention (renderer-internal): origin is the
         // beam start, angles its direction, frame the length in world units
@@ -1496,6 +1683,16 @@ export class SoftwareRenderer implements Refresh {
           e.origin[1]! + this.tracerFwd[1]! * len,
           e.origin[2]! + this.tracerFwd[2]! * len,
           col);
+        if (rgbActive) {
+          this.rgbBackend.pixelsDrawn += drawTracerBeamRGB(
+            this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, cam,
+            e.origin[0]!, e.origin[1]!, e.origin[2]!,
+            e.origin[0]! + this.tracerFwd[0]! * len,
+            e.origin[1]! + this.tracerFwd[1]! * len,
+            e.origin[2]! + this.tracerFwd[2]! * len,
+            col, this.palette);
+          this.rgbUsedThisFrame = true;
+        }
       }
     }
 
@@ -1508,6 +1705,14 @@ export class SoftwareRenderer implements Refresh {
         this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
         this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
         this.tracerColors[ti]!, this.tracerCores[ti]!);
+      if (rgbActive) {
+        this.rgbBackend.pixelsDrawn += drawTracerBeamRGB(
+          this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, cam,
+          this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
+          this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
+          this.tracerColors[ti]!, this.palette, this.tracerCores[ti]!);
+        this.rgbUsedThisFrame = true;
+      }
       this.tracerTtl[ti]--;
     }
     if (ph) { ph.alias += phaseNow() - pt; pt = phaseNow(); }
@@ -1604,10 +1809,10 @@ export class SoftwareRenderer implements Refresh {
         const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
         this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
       }
-      // RGB world composite: pixels the RGB backend wrote this frame come
-      // from the RGB888 plane; everything else keeps the indexed resolve
-      // (entities, sky, turbulent water, translucent alpha). Skipped while
-      // disabled, so classic output is untouched.
+      // RGB composite (step 3): pixels any RGB draw wrote this frame come
+      // from the RGB888 plane (opaque world, water, sky, glass, alias,
+      // sprites, particles, beams); everything else keeps the indexed
+      // resolve. Skipped while disabled, so classic output is untouched.
       if (this.rgbUsedThisFrame) {
         const rgb = this.rgbColor, cover = this.rgbCover;
         for (let i = 0; i < n; i++) {
@@ -1690,11 +1895,11 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
-   * Observability for the RGB world pass (astra V2a/V2c test hook):
-   * whether the module flag is on, whether any opaque batch took the RGB
-   * backend this frame, RGB cache hit/miss/size, and how many framebuffer
-   * pixels the coverage mask marks for the RGB888 composite. Zero unless
-   * the flag was enabled for the last renderView.
+   * Observability for the RGB pass (astra V2a/V2c + step-3 test hook):
+   * whether the module flag is on, whether any draw took the RGB backend
+   * this frame, RGB cache hit/miss/size, and how many framebuffer pixels
+   * the coverage mask marks for the RGB888 composite. Zero unless the
+   * flag was enabled for the last renderView.
    */
   testRGBStats(): {
     enabled: boolean; used: boolean;
@@ -1720,6 +1925,24 @@ export class SoftwareRenderer implements Refresh {
   testRGBCacheStats(): { hits: number; misses: number; size: number; hitRate: number } {
     const c = this.rgbCache;
     return { hits: c.hits, misses: c.misses, size: c.size, hitRate: c.hitRate() };
+  }
+
+  /**
+   * RGB cover count inside a screen rect (step-3 test hook: dense-cover
+   * asserts for filtered explosions — stipple would leave holes). Clamped
+   * to the framebuffer. Zero unless the flag was enabled for the last
+   * renderView.
+   */
+  testRGBBoxCover(x0: number, y0: number, x1: number, y1: number): number {
+    let n = 0;
+    const xa = Math.max(0, Math.floor(x0)), xb = Math.min(this.fbW - 1, Math.ceil(x1));
+    const ya = Math.max(0, Math.floor(y0)), yb = Math.min(this.fbH - 1, Math.ceil(y1));
+    for (let y = ya; y <= yb; y++) {
+      for (let x = xa; x <= xb; x++) {
+        if (this.rgbCover[y * this.fbW + x] !== 0) n++;
+      }
+    }
+    return n;
   }
 
   /** WASM backend batch stats (M9.1): null unless initWasm() succeeded. */
@@ -1884,6 +2107,13 @@ export class SoftwareRenderer implements Refresh {
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       this.spanList.count = endCount;
       this.backend.drawSpans(this.spanList, texView, lightView);
+      if (this.rgbSerialActive()) {
+        const skyMat = this.rgbMaterialForSky();
+        if (skyMat) {
+          this.rgbBackend.drawSpansRGB(this.spanList, skyMat);
+          this.rgbUsedThisFrame = true;
+        }
+      }
       this.spanList.count = 0;
       const batch = endCount - start;
       acc.spans += batch;
@@ -1929,18 +2159,22 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
-   * RGB miss path: build the cached binding for one opaque surface from
-   * the scalar block's texels (shared by reference — no second mip pass)
+   * RGB miss path: build the cached binding for one surface from the
+   * scalar block's texels (shared by reference — no second mip pass)
    * plus a fresh per-channel luxel block (buildRGBLightMap). Returns null
    * when the lightmap is unusable; the caller then draws the scalar
    * block/backend instead, so output shape never changes. The entry shares
    * texels/grades with the scalar block and owns only the RGB luxels +
    * mip chain (palette-baked: setPalette drops the whole RGB cache).
+   * Turbulent surfaces get a warp material; `extra` lets the deferred
+   * alpha loop request the blended, non-depth-writing variant for
+   * TRANS33/66 (the main loop always draws opaque).
    */
   private buildRGBEntry(
     world: MiniWorld, surf: MiniSurf, block: SurfaceBlock,
     stylesHash: number, mip: number,
     lightStyles: Float32Array, dyn: DynamicLight[], dlightBits: number,
+    extra?: { blend?: 'opaque' | 'alpha' | 'additive'; depthWrite?: boolean; variant?: number },
   ): RGBMaterial | null {
     const lm = world.lightmaps[surf.lightId % world.lightmaps.length]!;
     if (!lm || lm.luxW < 1 || lm.luxH < 1) return null;
@@ -1969,7 +2203,14 @@ export class SoftwareRenderer implements Refresh {
     const material = buildRGBMaterial(
       block.texels, block.bw, block.bh, this.palette,
       { samples: rgb, luxW: lm.luxW, luxH: lm.luxH },
-      { addressS: 'repeat', addressT: 'repeat', overbright: true, lodBias: -0.35, mipDither: true },
+      {
+        addressS: 'repeat', addressT: 'repeat',
+        overbright: true, lodBias: -0.35, mipDither: true,
+        warp: surf.turbulent,
+        turbPhase: surf.turbulent ? (((this.backend.time * 64) | 0) & 1023) : 0,
+        blend: extra?.blend ?? 'opaque',
+        depthWrite: extra?.depthWrite ?? true,
+      },
     );
     const entry: RGBCachedBlock = {
       block: {
@@ -1978,7 +2219,7 @@ export class SoftwareRenderer implements Refresh {
       },
       material,
     };
-    this.rgbCache.put(surf.id, stylesHash, mip, this.dlights.serial, entry);
+    this.rgbCache.put(surf.id, stylesHash, mip, this.dlights.serial, entry, extra?.variant ?? 0);
     return material;
   }
 }

@@ -255,7 +255,7 @@ describe('drawSpansRGB vs indexed resolve', () => {
     }
   });
 
-  it('skips non-opaque spans (step-3 kinds stay on the classic path)', () => {
+  it('draws turbulent spans with warp (step-3 material coverage)', () => {
     const W = 4, H = 1;
     const pal = grayPalette();
     const t = redSpan();
@@ -266,8 +266,8 @@ describe('drawSpansRGB vs indexed resolve', () => {
     const zb = new Float32Array(W * H);
     const mat = buildRGBMaterial(new Uint8Array(16).fill(100), 4, 4, pal, null, {});
     const r = drawSpansRGB(color, cover, zb, W, H, list, mat);
-    expect(r.spans).toBe(0);
-    expect([...cover]).toEqual([0, 0, 0, 0]);
+    expect(r.spans).toBe(1);
+    expect([...cover]).toEqual([1, 1, 1, 1]);
   });
 });
 

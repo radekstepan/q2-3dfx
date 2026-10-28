@@ -3,6 +3,12 @@
 // with per-vertex lighting from shade dots (anorms table).
 
 import type { Camera } from './camera.js';
+import {
+  rgbBlendPixel, rgbMipLevel, rgbModulate, rgbPickMipLevel,
+  rgbSampleTexture, rgbWrapCoord,
+  type RGBBlend, type RGBMaterial,
+} from './spans.js';
+import type { DynamicLight } from './light.js';
 
 /** 162-entry averaged-normals table (anorms equivalent, fibonacci sphere). */
 export const ANORM_COUNT = 162;
@@ -686,5 +692,343 @@ export function fillAffineTri(
     }
   }
   void minY;
+  return pixels;
+}
+
+// --- RGB (voodoo-policy) alias path (astra step 3) ----------------------
+//
+// Same traversal/clipping as drawAliasInstance above (entity basis,
+// frame lerp, view-space near clip, DEPTHHACK depth scale), but the filler
+// is perspective-correct: u/z, v/z and 1/z interpolate linearly and u/v
+// are recovered per pixel (ref_gl gl_mesh.c), replacing the affine look
+// the software path keeps. Vertex lighting is per-vertex RGB (shade-dot
+// base + colored dynamic lights, ref_gl R_AddDynamicLights spirit) sampled
+// through the material mip chain with bilinear filtering, then modulated.
+// Entity.alpha blends truly (no screen-door stipple in the RGB path).
+// PORT-DIFF vs @q2/voodoo sampler.ts: same fixed-point tap math, reused
+// here (rgbSampleTexture/rgbModulate); the perspective setup + Gouraud
+// light interpolation are renderer-side (no voodoo import: dep allowlist
+// keeps sw-renderer on bsp/config/formats/math/renderer-api).
+
+interface PerspVert {
+  x: number; y: number;
+  iz: number; uiz: number; viz: number;
+  r: number; g: number; b: number;
+}
+
+const aliasPersp: PerspVert[] = [
+  { x: 0, y: 0, iz: 0, uiz: 0, viz: 0, r: 0, g: 0, b: 0 },
+  { x: 0, y: 0, iz: 0, uiz: 0, viz: 0, r: 0, g: 0, b: 0 },
+  { x: 0, y: 0, iz: 0, uiz: 0, viz: 0, r: 0, g: 0, b: 0 },
+  { x: 0, y: 0, iz: 0, uiz: 0, viz: 0, r: 0, g: 0, b: 0 },
+];
+
+/** Scratch for per-vertex RGB light (grows with the mesh, like aliasScratch). */
+let aliasLightR = new Float32Array(4096);
+let aliasLightG = new Float32Array(4096);
+let aliasLightB = new Float32Array(4096);
+
+function ensureAliasLightScratch(nv: number): void {
+  if (nv <= aliasLightR.length) return;
+  aliasLightR = new Float32Array(nv);
+  aliasLightG = new Float32Array(nv);
+  aliasLightB = new Float32Array(nv);
+}
+
+/**
+ * View-space near-plane clip that also carries per-vertex RGB light (RGB
+ * alias twin of clipPolyNear). Cut verts interpolate light with the same
+ * crossing parameter as position, so straddling tris shade exactly.
+ */
+const clipILR = new Float64Array(4);
+const clipILG = new Float64Array(4);
+const clipILB = new Float64Array(4);
+const clipOLR = new Float64Array(4);
+const clipOLG = new Float64Array(4);
+const clipOLB = new Float64Array(4);
+
+const _aliasTex = new Uint8Array(3);
+const _aliasLit = new Uint8Array(3);
+
+function clipPolyNearLight(near: number): number {
+  let m = 0;
+  for (let i = 0; i < 3; i++) {
+    const j = (i + 1) % 3;
+    const zin = clipIZ[i]! >= near;
+    const zjn = clipIZ[j]! >= near;
+    if (zin && zjn) {
+      clipOX[m] = clipIX[j]!; clipOY[m] = clipIY[j]!; clipOZ[m] = clipIZ[j]!;
+      clipOU[m] = clipIU[j]!; clipOV[m] = clipIV[j]!;
+      clipOLR[m] = clipILR[j]!; clipOLG[m] = clipILG[j]!; clipOLB[m] = clipILB[j]!;
+      m++;
+    } else if (zin !== zjn) {
+      const tt = (near - clipIZ[i]!) / (clipIZ[j]! - clipIZ[i]!);
+      clipOX[m] = clipIX[i]! + (clipIX[j]! - clipIX[i]!) * tt;
+      clipOY[m] = clipIY[i]! + (clipIY[j]! - clipIY[i]!) * tt;
+      clipOZ[m] = near;
+      clipOU[m] = clipIU[i]! + (clipIU[j]! - clipIU[i]!) * tt;
+      clipOV[m] = clipIV[i]! + (clipIV[j]! - clipIV[i]!) * tt;
+      clipOLR[m] = clipILR[i]! + (clipILR[j]! - clipILR[i]!) * tt;
+      clipOLG[m] = clipILG[i]! + (clipILG[j]! - clipILG[i]!) * tt;
+      clipOLB[m] = clipILB[i]! + (clipILB[j]! - clipILB[i]!) * tt;
+      m++;
+      if (!zin && zjn) {
+        clipOX[m] = clipIX[j]!; clipOY[m] = clipIY[j]!; clipOZ[m] = clipIZ[j]!;
+        clipOU[m] = clipIU[j]!; clipOV[m] = clipIV[j]!;
+        clipOLR[m] = clipILR[j]!; clipOLG[m] = clipILG[j]!; clipOLB[m] = clipILB[j]!;
+        m++;
+      }
+    }
+  }
+  return m;
+}
+
+/**
+ * Perspective-correct triangle filler into the RGB plane. Backface-culls
+ * like fillAffineTri (screen-space winding). Per-pixel: one perspective
+ * divide, mip pick from the per-tri LOD, bilinear sample, mask skip,
+ * modulate, opaque/alpha composite. Fully transparent (alpha <= 0) draws
+ * nothing and writes no depth.
+ */
+export function fillPerspTriRGB(
+  color: Uint32Array,
+  cover: Uint8Array,
+  zb: Float32Array,
+  fbW: number,
+  fbH: number,
+  a: PerspVert, b: PerspVert, c: PerspVert,
+  mat: RGBMaterial,
+  alphaQ: number,
+  blend: RGBBlend,
+  depthWrite: boolean,
+): number {
+  const area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+  if (area <= 0) return 0;
+  const levels = mat.levels;
+  if (levels.length < 1) return 0;
+  const maxLevel = levels.length - 1;
+  const base = levels[0]!;
+  // Per-tri LOD: worst texel-per-pixel edge footprint (static per tri, so
+  // the per-pixel Bayer dither still varies the chosen level within it).
+  let rho = 0;
+  const edges: Array<[PerspVert, PerspVert]> = [[a, b], [b, c], [c, a]];
+  for (let e = 0; e < 3; e++) {
+    const p = edges[e]![0], q = edges[e]![1];
+    const dx = p.x - q.x, dy = p.y - q.y;
+    const pix = Math.sqrt(dx * dx + dy * dy);
+    if (!(pix > 0)) continue;
+    const pu0 = p.uiz / p.iz, pv0 = p.viz / p.iz;
+    const qu0 = q.uiz / q.iz, qv0 = q.viz / q.iz;
+    const du = Math.abs(pu0 - qu0) * base.width / pix;
+    const dv = Math.abs(pv0 - qv0) * base.height / pix;
+    const r = du > dv ? du : dv;
+    if (r > rho) rho = r;
+  }
+  const lod = rgbMipLevel(rho, mat.lodBias, maxLevel);
+  const overbright = mat.overbright;
+  const mipDither = mat.mipDither;
+  let minY = Math.max(0, Math.ceil(Math.min(a.y, b.y, c.y) - 0.5));
+  const maxY = Math.min(fbH - 1, Math.floor(Math.max(a.y, b.y, c.y) - 0.5));
+  if (maxY < minY) return 0;
+  let pixels = 0;
+  const inv = 1 / area;
+  for (let y = minY; y <= maxY; y++) {
+    const yc = y + 0.5;
+    let xa = Infinity, xb = -Infinity;
+    const pts = [a, b, c];
+    for (let i = 0; i < 3; i++) {
+      const p0 = pts[i]!, p1 = pts[(i + 1) % 3]!;
+      if ((p0.y <= yc && p1.y > yc) || (p1.y <= yc && p0.y > yc)) {
+        const tt = (yc - p0.y) / (p1.y - p0.y);
+        const x = p0.x + (p1.x - p0.x) * tt;
+        if (x < xa) xa = x;
+        if (x > xb) xb = x;
+      }
+    }
+    if (!(xb > xa)) continue;
+    const x0 = Math.max(0, Math.ceil(xa - 0.5));
+    const x1 = Math.min(fbW - 1, Math.floor(xb - 0.5));
+    for (let x = x0; x <= x1; x++) {
+      const xc = x + 0.5;
+      const w0 = ((b.x - xc) * (c.y - yc) - (c.x - xc) * (b.y - yc)) * inv;
+      const w1 = ((c.x - xc) * (a.y - yc) - (a.x - xc) * (c.y - yc)) * inv;
+      const w2 = 1 - w0 - w1;
+      if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+      const iz = w0 * a.iz + w1 * b.iz + w2 * c.iz;
+      const o = y * fbW + x;
+      if (iz > zb[o]!) {
+        const u = (w0 * a.uiz + w1 * b.uiz + w2 * c.uiz) / iz;
+        const v = (w0 * a.viz + w1 * b.viz + w2 * c.viz) / iz;
+        const lvl = rgbPickMipLevel(lod, x, y, mipDither, maxLevel);
+        const t = levels[lvl]!;
+        const mx = rgbWrapCoord(u | 0, t.width, true);
+        const my = rgbWrapCoord(v | 0, t.height, true);
+        if (t.mask[my * t.width + mx]! === 0) continue;
+        rgbSampleTexture(t.data, t.width, t.height, u, v, _aliasTex, 0, true, true);
+        const lr = Math.round((w0 * a.r + w1 * b.r + w2 * c.r) * 255);
+        const lg = Math.round((w0 * a.g + w1 * b.g + w2 * c.g) * 255);
+        const lb = Math.round((w0 * a.b + w1 * b.b + w2 * c.b) * 255);
+        rgbModulate(_aliasTex[0]!, _aliasTex[1]!, _aliasTex[2]!, lr, lg, lb,
+          overbright, _aliasLit, 0);
+        if (depthWrite) zb[o] = iz;
+        rgbBlendPixel(color, o, _aliasLit[0]!, _aliasLit[1]!, _aliasLit[2]!, blend, alphaQ);
+        cover[o] = 1;
+        pixels++;
+      }
+    }
+  }
+  return pixels;
+}
+
+/**
+ * Draw one alias instance into the RGB plane (perspective-correct twin of
+ * drawAliasInstance). Traversal, frame lerp, near-plane clip and
+ * depthHack scale are identical; only the filler differs (perspective
+ * instead of affine) and Entity.alpha blends instead of stippling.
+ * `dlights` tint vertices per channel (red/blue patches keep hues);
+ * pass null/[] for unlit-by-dynamics. Writes only the RGB planes + the
+ * handed depth plane (the caller hands the RGB-owned zb, never the
+ * software one, so the indexed path stays bit-identical).
+ */
+export function drawAliasInstanceRGB(
+  color: Uint32Array,
+  cover: Uint8Array,
+  zb: Float32Array,
+  fbW: number,
+  fbH: number,
+  inst: AliasInstance,
+  mat: RGBMaterial,
+  cam: Camera,
+  anorms: Float32Array,
+  shadeDots: Float32Array,
+  dlights: DynamicLight[] | null,
+): number {
+  const mesh = inst.mesh;
+  const nv = mesh.numVerts;
+  ensureAliasScratch(nv);
+  ensureAliasLightScratch(nv);
+  const alpha = inst.alpha;
+  if (alpha !== undefined && alpha <= 0) return 0;
+  const translucent = alpha !== undefined && Number.isFinite(alpha) && (alpha as number) < 1;
+  const alphaQ = translucent ? Math.round((alpha as number) * 256) : 256;
+  const blend: RGBBlend = translucent ? 'alpha' : 'opaque';
+  const depthWrite = translucent ? false : mat.depthWrite;
+  const pitchR = (inst.angles[0]! * Math.PI) / 180;
+  const yawR = (inst.angles[1]! * Math.PI) / 180;
+  const rollR = (inst.angles[2]! * Math.PI) / 180;
+  const sp = Math.sin(pitchR), cp = Math.cos(pitchR);
+  const sy = Math.sin(yawR), cy = Math.cos(yawR);
+  const sr = Math.sin(rollR), cr = Math.cos(rollR);
+  const fxx = cp * cy, fxy = cp * sy, fxz = -sp;
+  const rxx = -sr * sp * cy + cr * sy;
+  const rxy = -sr * sp * sy - cr * cy;
+  const rxz = -sr * cp;
+  const uxx = cr * sp * cy + sr * sy;
+  const uxy = cr * sp * sy - sr * cy;
+  const uxz = cr * cp;
+  const eox = inst.origin[0]!, eoy = inst.origin[1]!, eoz = inst.origin[2]!;
+  const fA = mesh.frames.subarray(inst.frameA * nv * 3, (inst.frameA + 1) * nv * 3);
+  const fB = mesh.frames.subarray(inst.frameB * nv * 3, (inst.frameB + 1) * nv * 3);
+  const t = inst.lerp;
+  const wx = aliasScratchX, wy = aliasScratchY, wz = aliasScratchZ;
+  for (let i = 0; i < nv; i++) {
+    const lx = fA[i * 3]! + (fB[i * 3]! - fA[i * 3]!) * t;
+    const ly = fA[i * 3 + 1]! + (fB[i * 3 + 1]! - fA[i * 3 + 1]!) * t;
+    const lz = fA[i * 3 + 2]! + (fB[i * 3 + 2]! - fA[i * 3 + 2]!) * t;
+    wx[i] = lx * fxx - ly * rxx + lz * uxx + eox;
+    wy[i] = lx * fxy - ly * rxy + lz * uxy + eoy;
+    wz[i] = lx * fxz - ly * rxz + lz * uxz + eoz;
+  }
+  void anorms;
+  const row = (inst.lightAngle & 255) * ANORM_COUNT;
+  const depthScale = inst.depthScale ?? 1;
+  const shadeFrame = t < 0.5 ? inst.frameA : inst.frameB;
+  // Per-vertex RGB light: shade-dot base (achromatic) + colored dynamics.
+  for (let i = 0; i < nv; i++) {
+    const ni = mesh.normals[(shadeFrame * nv + i) % mesh.normals.length]! % ANORM_COUNT;
+    let r = shadeDots[row + ni]! / 63;
+    let g = r, b = r;
+    if (dlights) {
+      for (let d = 0; d < dlights.length; d++) {
+        const dl = dlights[d]!;
+        const dx = dl.origin[0]! - wx[i]!;
+        const dy = dl.origin[1]! - wy[i]!;
+        const dz = dl.origin[2]! - wz[i]!;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        const rad = dl.intensity;
+        if (dist < rad && rad > 0) {
+          const f = (rad - dist) / rad;
+          r += f * dl.color[0]!;
+          g += f * dl.color[1]!;
+          b += f * dl.color[2]!;
+        }
+      }
+    }
+    aliasLightR[i] = r < 0 ? 0 : r;
+    aliasLightG[i] = g < 0 ? 0 : g;
+    aliasLightB[i] = b < 0 ? 0 : b;
+  }
+  let pixels = 0;
+  const tv = aliasPersp;
+  for (let ti = 0; ti < mesh.numTris; ti++) {
+    let allIn = true;
+    for (let k = 0; k < 3; k++) {
+      const vi = mesh.tris[ti * 3 + k]!;
+      const px = wx[vi]! - cam.origin[0]!;
+      const py = wy[vi]! - cam.origin[1]!;
+      const pz = wz[vi]! - cam.origin[2]!;
+      const vx = px * cam.right[0]! + py * cam.right[1]! + pz * cam.right[2]!;
+      const vy = px * cam.up[0]! + py * cam.up[1]! + pz * cam.up[2]!;
+      const vz2 = px * cam.forward[0]! + py * cam.forward[1]! + pz * cam.forward[2]!;
+      clipIX[k] = vx; clipIY[k] = vy; clipIZ[k] = vz2;
+      clipIU[k] = mesh.st[vi * 2]!;
+      clipIV[k] = mesh.st[vi * 2 + 1]!;
+      clipIG[k] = 0;
+      clipILR[k] = aliasLightR[vi]!;
+      clipILG[k] = aliasLightG[vi]!;
+      clipILB[k] = aliasLightB[vi]!;
+      if (vz2 < cam.near) allIn = false;
+    }
+    if (allIn) {
+      for (let k = 0; k < 3; k++) {
+        const vi = mesh.tris[ti * 3 + k]!;
+        const v = tv[k]!;
+        const iz = 1 / clipIZ[k]!;
+        v.x = cam.xCenter + clipIX[k]! * cam.focalX * iz;
+        v.y = cam.yCenter - clipIY[k]! * cam.focalY * iz;
+        v.iz = iz * depthScale;
+        v.uiz = clipIU[k]! * iz;
+        v.viz = clipIV[k]! * iz;
+        v.r = aliasLightR[vi]!;
+        v.g = aliasLightG[vi]!;
+        v.b = aliasLightB[vi]!;
+      }
+      pixels += fillPerspTriRGB(color, cover, zb, fbW, fbH,
+        tv[0]!, tv[1]!, tv[2]!, mat, alphaQ, blend, depthWrite);
+      continue;
+    }
+    // Straddler: Sutherland clip carries position + uv + RGB light, then
+    // the same projection + 1-2 persp tris as the classic path.
+    const m = clipPolyNearLight(cam.near);
+    if (m < 3) continue;
+    for (let k = 0; k < m; k++) {
+      const c = tv[k]!;
+      const iz = 1 / clipOZ[k]!;
+      c.x = cam.xCenter + clipOX[k]! * cam.focalX * iz;
+      c.y = cam.yCenter - clipOY[k]! * cam.focalY * iz;
+      c.iz = iz * depthScale;
+      c.uiz = clipOU[k]! * iz;
+      c.viz = clipOV[k]! * iz;
+      c.r = clipOLR[k]!;
+      c.g = clipOLG[k]!;
+      c.b = clipOLB[k]!;
+    }
+    pixels += fillPerspTriRGB(color, cover, zb, fbW, fbH,
+      tv[0]!, tv[1]!, tv[2]!, mat, alphaQ, blend, depthWrite);
+    if (m === 4) {
+      pixels += fillPerspTriRGB(color, cover, zb, fbW, fbH,
+        tv[0]!, tv[2]!, tv[3]!, mat, alphaQ, blend, depthWrite);
+    }
+  }
   return pixels;
 }
