@@ -35,6 +35,122 @@ export function setProgress(el: unknown, fraction: number, label: string): Progr
   return state;
 }
 
+/** Retro console strip (ported from retro-game-settings-ui App.tsx).
+ * Headless-safe ring buffer (last 40 lines) + DOM mirror into
+ * `#q2-console-lines` / `#q2-console-count` when a DOM is present. */
+export type ConsoleKind = 'cmd' | 'info' | 'warn' | 'ok';
+export interface ConsoleLine { id: number; t: string; text: string; kind: ConsoleKind }
+export const MAX_CONSOLE_LINES = 40;
+let consoleSeq = 0;
+let consoleLines: ConsoleLine[] = [];
+
+function consoleStamp(): string {
+  try {
+    return new Date().toLocaleTimeString('en-GB', { hour12: false });
+  } catch {
+    return '00:00:00';
+  }
+}
+
+/** Snapshot of the console buffer (copy, oldest-first). */
+export function getConsoleLines(): ConsoleLine[] {
+  return [...consoleLines];
+}
+
+/** Push one line, evicting past MAX_CONSOLE_LINES; mirrors to the DOM. */
+export function pushConsoleLog(text: string, kind: ConsoleKind = 'info'): ConsoleLine {
+  const line: ConsoleLine = { id: ++consoleSeq, t: consoleStamp(), text, kind };
+  consoleLines = [...consoleLines.slice(-(MAX_CONSOLE_LINES - 1)), line];
+  renderConsoleLines();
+  return line;
+}
+
+/** Clear the buffer + DOM mirror. */
+export function clearConsoleLog(): void {
+  consoleLines = [];
+  renderConsoleLines();
+}
+
+/** Test hook: reset the buffer and the id sequence. */
+export function resetConsoleLog(): void {
+  consoleLines = [];
+  consoleSeq = 0;
+}
+
+/** Mirror the buffer into `#q2-console-lines`; returns the line count. */
+export function renderConsoleLines(container?: unknown): number {
+  if (typeof document === 'undefined') return consoleLines.length;
+  const g = globalThis as unknown as { document?: { querySelector(s: string): HTMLElement | null } };
+  if (!g.document) return consoleLines.length;
+  const box = (container as HTMLElement | undefined) ?? g.document.querySelector('#q2-console-lines');
+  if (!box) return consoleLines.length;
+  try {
+    box.innerHTML = '';
+    if (consoleLines.length === 0) {
+      const empty = g.document.querySelector('#q2-console-lines');
+      if (empty) {
+        const row = document.createElement('div');
+        row.id = 'q2-console-empty';
+        const lead = document.createElement('span');
+        lead.textContent = '» console cleared — new events will appear here';
+        row.appendChild(lead);
+        box.appendChild(row);
+      }
+    } else {
+      for (const l of consoleLines) {
+        const row = document.createElement('div');
+        row.className = 'row';
+        const ts = document.createElement('span');
+        ts.className = 'ts tnum';
+        ts.textContent = l.t;
+        const msg = document.createElement('span');
+        msg.className = l.kind === 'warn' ? 'm-warn' : l.kind === 'ok' ? 'm-ok' : l.kind === 'cmd' ? 'm-cmd' : 'm-info';
+        msg.textContent = l.text;
+        row.appendChild(ts);
+        row.appendChild(msg);
+        box.appendChild(row);
+      }
+    }
+    box.scrollTop = box.scrollHeight;
+    const count = g.document.querySelector('#q2-console-count');
+    if (count) count.textContent = `${String(consoleLines.length).padStart(3, '0')} lines`;
+  } catch {
+    /* non-DOM stub */
+  }
+  return consoleLines.length;
+}
+
+/** Wire the `clear` button in the console strip. No-op without DOM. */
+export function attachConsoleClear(btn?: unknown): () => void {
+  if (typeof document === 'undefined') return () => undefined;
+  const g = globalThis as unknown as { document?: { querySelector(s: string): HTMLElement | null } };
+  const node = (btn as HTMLElement | undefined) ?? g.document?.querySelector('#q2-console-clear');
+  if (!node) return () => undefined;
+  const onClick = (): void => {
+    clearConsoleLog();
+    pushConsoleLog('console cleared', 'warn');
+  };
+  node.addEventListener('click', onClick);
+  return () => node.removeEventListener('click', onClick);
+}
+
+/** Mirror the current mode string into the top strip + faceplate box. */
+export function setModeReadout(mode: string, dirtyCount = 0): void {
+  if (typeof document === 'undefined') return;
+  try {
+    const top = document.querySelector('#q2-top-mode');
+    if (top) top.textContent = mode;
+    const val = document.querySelector('#q2-mode-val');
+    if (val) val.textContent = mode;
+    const dirty = document.querySelector('#q2-dirty');
+    if (dirty) dirty.textContent = dirtyCount > 0 ? `${dirtyCount} pending` : 'applied';
+    const pending = document.querySelector('#q2-pending');
+    if (pending) pending.textContent = dirtyCount === 0 ? 'no pending changes' : `${dirtyCount} unapplied`;
+  } catch {
+    /* non-DOM stub */
+  }
+}
+
 /** Cvar gate for the fps readout (`cl_showfps`, default 1). */
 export function showFpsEnabled(): boolean {
   // resetCVars() restores only compiled-in defaults; an absent cl_showfps
@@ -683,6 +799,13 @@ export function renderCvarPanel(
     if (grouped.length === 0) continue;
     const head = document.createElement('q2-group');
     head.className = 'q2-cvar-group';
+    const idx = String(GROUP_ORDER.indexOf(group) + 1).padStart(2, '0');
+    // Fake-DOM safe (pos/canvas-lock tests stub createElement without
+    // setAttribute): prefer the attribute, fall back to an expando.
+    try {
+      (head as unknown as { setAttribute?: (k: string, v: string) => void }).setAttribute?.('data-index', idx);
+    } catch { /* fake node: expando below */ }
+    (head as unknown as Record<string, unknown>)['data-index'] = idx;
     head.textContent = group;
     node.appendChild(head);
     for (const name of grouped) {

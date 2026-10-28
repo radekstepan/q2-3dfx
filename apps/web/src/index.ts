@@ -16,8 +16,8 @@ export { bootPlay };
 export type { PlayBoot };
 export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
-export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';export { blitToCanvas, blitCopyRGBA, blitIsLittleEndian, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, showFpsEnabled, showPosEnabled, cvarIsCheckbox, CHECKBOX_CVARS, cvarOptions, cvarControlKind, cvarOptionLabels, cvarDescription, CVAR_DESCRIPTIONS, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, MAP_SOURCE_LABELS, setMapSourceHasPak, getMapSourceHasPak, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS } from './dom.js';
-export type { PlayLoop } from './dom.js';
+export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';export { blitToCanvas, blitCopyRGBA, blitIsLittleEndian, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, showFpsEnabled, showPosEnabled, cvarIsCheckbox, CHECKBOX_CVARS, cvarOptions, cvarControlKind, cvarOptionLabels, cvarDescription, CVAR_DESCRIPTIONS, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, MAP_SOURCE_LABELS, setMapSourceHasPak, getMapSourceHasPak, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS, pushConsoleLog, clearConsoleLog, resetConsoleLog, getConsoleLines, renderConsoleLines, attachConsoleClear, setModeReadout, MAX_CONSOLE_LINES } from './dom.js';
+export type { PlayLoop, ConsoleKind, ConsoleLine } from './dom.js';
 export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpExplosionLights, pumpBoltLights, pumpTracers, registerPakModels, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, posHudAnchor, formatFpsText, fpsVisible, posVisible, formatPlayerPos, playerPosText, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, applyRendererCvar, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, POS_GREY, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
 export type { PakModelHandles, TracerBeam } from './play.js';
 export {
@@ -78,9 +78,12 @@ if (typeof document !== 'undefined') {
     // Restore the menu cvars (renderer/skill/resolution/map/brightness)
     // before the first boot so a reload keeps the previous session's menu.
     dom.restorePersistedCVars();
+    dom.attachConsoleClear();
+    dom.pushConsoleLog('execing config.cfg', 'info');
     const canvas = document.querySelector('#q2');
     const progress = document.querySelector('#q2-progress');
     const cvars = document.querySelector('#q2-cvars');
+    const topPak = document.querySelector('#q2-top-pak');
     let current: { stop(): void } | null = null;
     let currentBoot: PlayBoot | null = null;
     let lastPak: WebPak | null = null;
@@ -102,11 +105,14 @@ if (typeof document !== 'undefined') {
       const boot = bootPlay({ pak: effective });
       currentBoot = boot;
       current = dom.startPlayLoop(canvas, boot, { pak: effective });
-      dom.setProgress(
-        progress,
-        1,
-        name ? `loaded ${name}: ${pak?.entries.length} entries` : `devroom ready — drop pak0.pak for base1`,
-      );
+      const label = name ? `loaded ${name}: ${pak?.entries.length} entries` : `devroom ready — drop pak0.pak for base1`;
+      dom.setProgress(progress, 1, label);
+      const w = boot.host.fb.width;
+      const h = boot.host.fb.height;
+      const mode = `${w}×${h} · ${effective ? 'pak · base1' : 'devroom'}`;
+      dom.setModeReadout(mode, 0);
+      if (topPak) topPak.textContent = effective ? `pak0.pak · ${pak?.entries.length} lumps` : 'pak0.pak · not cached';
+      dom.pushConsoleLog(name ? `loaded ${name}: ${pak?.entries.length} entries` : 'video subsystem ready · awaiting changes', 'ok');
     };
     // Skill/resolution/map-source changes reboot the level at once (id
     // latches them; the menu applies them immediately by re-calling the
@@ -118,9 +124,14 @@ if (typeof document !== 'undefined') {
       dom.savePersistedCVars();
       if (cvarName === 'vid_renderer') {
         if (currentBoot) applyRendererCvar(currentBoot);
+        dom.pushConsoleLog(`vid_ref "${cvarName}" hot-swapped in place`, 'cmd');
         return;
       }
-      if (!dom.cvarNeedsReboot(cvarName)) return;
+      if (!dom.cvarNeedsReboot(cvarName)) {
+        dom.pushConsoleLog(`${cvarName} updated`, 'cmd');
+        return;
+      }
+      dom.pushConsoleLog(`vid_restart · restarting video subsystem (${cvarName})`, 'warn');
       startWithPak(lastPak, lastName);
     };
     const renderCvars = (): void => {
@@ -159,22 +170,22 @@ if (typeof document !== 'undefined') {
       });
     }
     renderCvars();
-    // Minimal "clear cached pak" affordance next to the cvar panel.
-    const ui = document.querySelector('#q2-ui');
-    if (ui && !document.querySelector('#q2-clear-pak')) {
-      const btn = document.createElement('button');
-      btn.id = 'q2-clear-pak';
-      btn.textContent = 'clear cached pak';
-      btn.addEventListener('click', () => {
-        void clearCachedPak().then(() => {
-          lastPak = null;
-          // Clearing drops the pak from the dropdown and latches devroom.
-          setCVarFromString('map_source', 'devroom');
-          startWithPak(null);
-          dom.setProgress(progress, 1, 'cached pak cleared — drop pak0.pak for base1');
-        });
+    // Static faceplate footer buttons (present in index.html): revert just
+    // re-renders the panel, clear drops the cached pak and latches devroom.
+    const clearBtn = document.querySelector('#q2-clear-pak');
+    clearBtn?.addEventListener('click', () => {
+      void clearCachedPak().then(() => {
+        lastPak = null;
+        // Clearing drops the pak from the dropdown and latches devroom.
+        setCVarFromString('map_source', 'devroom');
+        startWithPak(null);
+        dom.setProgress(progress, 1, 'cached pak cleared — drop pak0.pak for base1');
+        dom.pushConsoleLog('cached pak cleared — drop pak0.pak for base1', 'warn');
       });
-      ui.appendChild(btn);
-    }
+    });
+    document.querySelector('#q2-revert')?.addEventListener('click', () => {
+      renderCvars();
+      dom.pushConsoleLog('changes reverted to last applied configuration', 'warn');
+    });
   });
 }
