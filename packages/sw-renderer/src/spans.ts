@@ -1503,6 +1503,11 @@ export function runSubdivRGBRepeat(
   const rowA = ly0 * lbW, rowB = ly1 * lbW;
   const bOff = (((yAbs | 0) & 3) << 2);
   const fixedLevel = baseLevel === nextLevel;
+  // UVs step in level-0 texel units but the picked mip is 2^sh times
+  // smaller: shift the fixed-point coords into the selected level before
+  // wrapping/sampling (same defect as fillPerspTriRGB had — full-res coords
+  // wrapped into the shrunken mip read the wrong texel).
+  const shFix = baseLevel;
   let lux = lux0;
   if (fixedLevel) {
     for (let i = 0, o = o0; i < n; i++, o++) {
@@ -1521,7 +1526,8 @@ export function runSubdivRGBRepeat(
         pass = qn < qo;
       }
       if (pass) {
-        const xi = tu >> 16, yi = tv >> 16;
+        const st = tu >> shFix, sv = tv >> shFix;
+        const xi = st >> 16, yi = sv >> 16;
         // Inlined rgbWrapInt (same integer ops, no call): the POT lane is
         // call-constant, so the branch predicts perfectly.
         let mx: number, my: number;
@@ -1530,8 +1536,8 @@ export function runSubdivRGBRepeat(
         if (hm0 !== 0) my = yi & hm0;
         else { my = yi % h0; if (my < 0) my += h0; }
         if (mk0[my * w0 + mx]! !== 0) {
-          const fu = ((tu & 0xffff) + 128) >> 8;
-          const fv = ((tv & 0xffff) + 128) >> 8;
+          const fu = ((st & 0xffff) + 128) >> 8;
+          const fv = ((sv & 0xffff) + 128) >> 8;
           const x1 = mx + 1 === w0 ? 0 : mx + 1;
           const y1 = my + 1 === h0 ? 0 : my + 1;
           const row0 = my * w0, row1 = y1 * w0;
@@ -1605,13 +1611,15 @@ export function runSubdivRGBRepeat(
     if (pass) {
       // Single-TMU dither pick between the two hoisted descriptors.
       const use1 = f16 <= RGB_BAYER4[bOff | ((xAbs + i) & 3)]! ? 0 : 1;
+      const sh = use1 === 0 ? baseLevel : nextLevel;
+      const st = tu >> sh, sv = tv >> sh;
       const dd = use1 === 0 ? d0 : d1;
       const ww = use1 === 0 ? w0 : w1;
       const hh = use1 === 0 ? h0 : h1;
       const mk = use1 === 0 ? mk0 : mk1;
       const wmm = use1 === 0 ? wm0 : wm1;
       const hmm = use1 === 0 ? hm0 : hm1;
-      const xi = tu >> 16, yi = tv >> 16;
+      const xi = st >> 16, yi = sv >> 16;
       // Inlined rgbWrapInt (same integer ops, no call): the POT lane is
       // call-constant, so the branch predicts perfectly.
       let mx: number, my: number;
@@ -1620,8 +1628,8 @@ export function runSubdivRGBRepeat(
       if (hmm !== 0) my = yi & hmm;
       else { my = yi % hh; if (my < 0) my += hh; }
       if (mk[my * ww + mx]! !== 0) {
-        const fu = ((tu & 0xffff) + 128) >> 8;
-        const fv = ((tv & 0xffff) + 128) >> 8;
+        const fu = ((st & 0xffff) + 128) >> 8;
+        const fv = ((sv & 0xffff) + 128) >> 8;
         const x1 = mx + 1 === ww ? 0 : mx + 1;
         const y1 = my + 1 === hh ? 0 : my + 1;
         const row0 = my * ww, row1 = y1 * ww;
@@ -1751,6 +1759,11 @@ export function runSubdivRGBClamp(
   const lwV = 256 - lfv;
   const rowA = ly0 * lbW, rowB = ly1 * lbW;
   const bOff = (((yAbs | 0) & 3) << 2);
+  // Level-0 texel units -> selected-mip scale (same defect as the repeat
+  // loop: full-res coords clamped into the shrunken mip read the wrong
+  // texel). Hoisted per level; the loop below multiplies before clamping.
+  const sc0 = 1 / (1 << baseLevel);
+  const sc1 = 1 / (1 << nextLevel);
   let lux = lux0;
   for (let i = 0, o = o0; i < n; i++, o++) {
     // Window-Z test: depth01 from the projection window, LESS wins,
@@ -1777,7 +1790,8 @@ export function runSubdivRGBClamp(
       const twMax = tw - 1, thMax = th - 1;
       // Clamp addressing inlined (no modulo anywhere on this path): the
       // float clamp is kept verbatim so edge weights match rgbSampleTexture.
-      const u = tu / 65536, v = tv / 65536;
+      const sc = use1 === 0 ? sc0 : sc1;
+      const u = (tu / 65536) * sc, v = (tv / 65536) * sc;
       const uc = u < 0 ? 0 : u > twMax ? twMax : u;
       const vc = v < 0 ? 0 : v > thMax ? thMax : v;
       const mx = uc | 0, my = vc | 0;
@@ -1984,6 +1998,12 @@ export function runSubdivRGBGeneric(
   const lwV = 256 - lfv;
   const rowA = ly0 * lbW, rowB = ly1 * lbW;
   const bOff = (((yAbs | 0) & 3) << 2);
+  // Level-0 texel units -> selected-mip scale (same defect as the repeat
+  // loop). The turbulence warp stays in full-res units and is scaled after,
+  // so the same world-space distortion covers fewer mip texels at coarser
+  // levels, like hardware.
+  const sc0 = 1 / (1 << baseLevel);
+  const sc1 = 1 / (1 << nextLevel);
   let lux = lux0;
   for (let i = 0, o = o0; i < n; i++, o++) {
     // Window-Z test: depth01 from the projection window, LESS wins,
@@ -2016,23 +2036,29 @@ export function runSubdivRGBGeneric(
       const wmm = use1 === 0 ? wm0 : wm1;
       const hmm = use1 === 0 ? hm0 : hm1;
       const wMax = ww - 1, hMax = hh - 1;
+      // Scale full-res coords into the selected mip (fixed-point for wrap
+      // lanes, float for clamp lanes; the warp above ran in full-res units
+      // so it scales along, like hardware).
+      const sh = use1 === 0 ? baseLevel : nextLevel;
+      const sc = use1 === 0 ? sc0 : sc1;
+      const fsu = fu >> sh, fsv = fv >> sh;
       let mx: number, my: number, qfu: number, qfv: number;
       if (wrapS) {
-        const xi = fu >> 16;
+        const xi = fsu >> 16;
         mx = rgbWrapInt(xi, ww, wmm);
-        qfu = ((fu & 0xffff) + 128) >> 8;
+        qfu = ((fsu & 0xffff) + 128) >> 8;
       } else {
-        const u = fu / 65536;
+        const u = (fu / 65536) * sc;
         const uc = u < 0 ? 0 : u > wMax ? wMax : u;
         mx = uc | 0;
         qfu = Math.round((uc - mx) * 256);
       }
       if (wrapT) {
-        const yi = fv >> 16;
+        const yi = fsv >> 16;
         my = rgbWrapInt(yi, hh, hmm);
-        qfv = ((fv & 0xffff) + 128) >> 8;
+        qfv = ((fsv & 0xffff) + 128) >> 8;
       } else {
-        const v = fv / 65536;
+        const v = (fsv / 65536) * sc;
         const vc = v < 0 ? 0 : v > hMax ? hMax : v;
         my = vc | 0;
         qfv = Math.round((vc - my) * 256);

@@ -4,7 +4,7 @@
 // so spans reuse built blocks across frames. Dynamic lights invalidate via
 // invalidateSurfaces() driven by DLightState.markLights().
 
-import type { RGBMaterial } from './spans.js';
+import type { RGBMaterial, RGBMipLevel } from './spans.js';
 
 export const SURFACE_CACHE_BUDGET = 4 * 1024 * 1024;
 
@@ -303,6 +303,46 @@ export class RGBLightCache {
         this.used -= e.bytes;
       }
     }
+  }
+
+  /**
+   * Coordinated chain-eviction path (P2): drop every entry whose material
+   * shares the evicted per-texture mip chain object. The chain cache in
+   * frame.ts budgets chains while this cache budgets owned luxels only, so
+   * without this an evicted chain stays alive through `material.levels`
+   * references — real retention exceeds the chain budget with no accounting
+   * trace, and the next miss for the same texture expands a DUPLICATE chain
+   * beside the pinned original. Surgical (only that texture's surfaces
+   * rebuild), not a full clear. Returns the dropped entry count.
+   */
+  invalidateChain(chain: RGBMipLevel[]): number {
+    let dropped = 0;
+    for (const [k, e] of [...this.map.keys()].map((k) => [k, this.map.get(k)!] as const)) {
+      if (e.entry.material.levels === chain) {
+        this.map.delete(k);
+        this.used -= e.bytes;
+        dropped++;
+      }
+    }
+    return dropped;
+  }
+
+  /**
+   * Distinct shared-chain objects currently referenced by cached materials
+   * (identity set, for eviction-accounting tests: every returned chain must
+   * still be owned by the per-texture chain cache, never an orphan).
+   */
+  referencedChains(): RGBMipLevel[][] {
+    const seen = new Set<RGBMipLevel[]>();
+    const out: RGBMipLevel[][] = [];
+    for (const e of this.map.values()) {
+      const ch = e.entry.material.levels;
+      if (!seen.has(ch)) {
+        seen.add(ch);
+        out.push(ch);
+      }
+    }
+    return out;
   }
 
   invalidateAll(): void {

@@ -126,7 +126,10 @@ describe('banded vs serial RGB equivalence (dither phase + seam rows)', () => {
     // the correct mip instead of the coarsest. Index pin unchanged.
     // Gutter-LOD re-pin (was 436fe0c5): alias ALIAS_LOD_BIAS_DELTA +
     // clamp-addressed taps (see rgbPerf.test.ts); critter pixels only.
-    expect(a.colorHash).toBe('206e1dad');
+    // Mip-UV-scale + bias-removal re-pin (was 206e1dad): RGB samplers scale
+    // UVs into the picked mip and alias tracks the shared bias (delta 0);
+    // see rgbPerf.test.ts. Index pin unchanged.
+    expect(a.colorHash).toBe('68b22dea');
     expect(a.indexHash).toBe('58e0ecf1');
   });
 

@@ -124,8 +124,32 @@ describe.runIf(!!WEB_Q2_PAK)('voodoo regression release gate (base1, 640x480)', 
     // gun region (bottom-right): not black, not holed — within a brightness
     // band of the software reference (overbright x2 lifts RGB by design, so
     // the band is asymmetric; a black-gun regression reads ~5x darker)
+    // Entity-isolated gun coverage (P2 gate): the bbox means below mix gun
+    // pixels with background wall/floor, so a missing or invisible gun still
+    // passes the brightness band (background keeps the rect bright). Compare
+    // gun-present vs gun-absent submissions in the SAME renderer mode: only
+    // pixels the depthHack entity actually paints can differ. A gun that
+    // renders nothing (or is stripped) yields diff ~ 0 and fails here.
     const bbox = { x0: 380, y0: 280, x1: W - 1, y1: H - 1 };
+    const noGun = renderables.filter((e) => (e as { depthHack?: boolean }).depthHack !== true);
+    expect(noGun.length).toBe(renderables.length - 1);
+    setCVar('vid_renderer', 'software');
+    applyRendererCvar(boot);
+    (boot.refresh as unknown as { setRGBWorldEnabled: (b: boolean) => void }).setRGBWorldEnabled(false);
+    boot.refresh.beginFrame();
+    boot.refresh.renderView(view, boot.host.world, noGun);
+    boot.refresh.endFrame();
+    const swNoGun = boot.refresh.getFramebuffer().color.slice();
+    setCVar('vid_renderer', 'voodoo');
+    applyRendererCvar(boot);
+    (boot.refresh as unknown as { setRGBWorldEnabled: (b: boolean) => void }).setRGBWorldEnabled(true);
+    boot.refresh.beginFrame();
+    boot.refresh.renderView(view, boot.host.world, noGun);
+    boot.refresh.endFrame();
+    const vdNoGun = boot.refresh.getFramebuffer().color.slice();
+    const DIFF_T = 8;
     let swSum = 0, vdSum = 0, vdNz = 0, n = 0;
+    let swDiff = 0, vdDiff = 0;
     for (let y = bbox.y0; y <= bbox.y1; y++) {
       for (let x = bbox.x0; x <= bbox.x1; x++) {
         const s = luminance(swColor[y * W + x]!);
@@ -134,8 +158,19 @@ describe.runIf(!!WEB_Q2_PAK)('voodoo regression release gate (base1, 640x480)', 
         vdSum += v;
         if (v > 4) vdNz++;
         n++;
+        if (Math.abs(s - luminance(swNoGun[y * W + x]!)) > DIFF_T) swDiff++;
+        if (Math.abs(v - luminance(vdNoGun[y * W + x]!)) > DIFF_T) vdDiff++;
       }
     }
+    // The reference leg must actually show the gun here (guards a camera
+    // where the gun is off-screen: without this the voodoo asserts below
+    // could pass vacuously). 2% of the 52k-px box = ~1040 px; a real
+    // viewmodel covers several thousand.
+    expect(swDiff / n).toBeGreaterThan(0.02);
+    // Voodoo must paint a comparable gun silhouette: an invisible gun
+    // (full ~= absent, diff ~ 0) fails, as does a holed/shrunken one.
+    expect(vdDiff / n).toBeGreaterThan(0.02);
+    expect(vdDiff).toBeGreaterThan(0.5 * swDiff);
     const swMean = swSum / n, vdMean = vdSum / n;
     expect(vdNz / n).toBeGreaterThan(0.5);
     expect(vdMean).toBeGreaterThan(0.5 * swMean);

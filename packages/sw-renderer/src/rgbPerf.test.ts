@@ -98,7 +98,14 @@ describe('step-5 RGB output hash pin (byte-identical before/after)', () => {
     // and fillPerspTriRGB honors clamp addressing (was hardcoded repeat,
     // wrapping edge taps into far-edge gutter). Only the few devroom
     // critter pixels move (diff bbox 8x7 at 160x120); index untouched.
-    expect(a.colorHash).toBe('206e1dad');
+    // Mip-UV-scale + bias-removal re-pin (was 206e1dad): every RGB sampler
+    // now scales UVs into the picked mip (was full-res coords wrapped into
+    // shrunken mips — see rgbMipUV.test.ts) and ALIAS_LOD_BIAS_DELTA is 0
+    // (was -3.3 masking that bug; post-fix re-measurement shows no
+    // bias-sensitive gutter collapse, so alias tracks the shared bias like
+    // world). Devroom critter/world minified texels sample correctly;
+    // index untouched.
+    expect(a.colorHash).toBe('68b22dea');
     expect(a.indexHash).toBe('58e0ecf1');
     // second frame is stable (cache hits serve identical color)
     const b = renderRGB160();

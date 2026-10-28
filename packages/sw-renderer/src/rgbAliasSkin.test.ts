@@ -7,13 +7,15 @@
 //    repeat for the hole-test tap and all four bilinear taps, so edge taps
 //    wrapped to the opposite skin edge — usually black gutter — fringing
 //    every UV-island border dark.
-// 2. Alias LOD must carry ALIAS_LOD_BIAS_DELTA. Real MD2 skins are ~40%
-//    pure-black gutter around thin mapped islands; the shared vd_lodbias
-//    parks mid-range models (rho 2-4) on coarse box-filtered mips that
-//    average to gutter grey, and the shadow side renders flat black while
-//    software (affine L0, never mips alias) keeps the mottling. Measured:
-//    soldier yaw90 @120u, entity-isolated pre-resolve: bias -0.35 -> 29.4%
-//    pure-black pixels, -1 -> 6.5%, -2 -> 1.7% (floor).
+// 2. Alias carries no extra LOD bias (ALIAS_LOD_BIAS_DELTA = 0). Real MD2
+//    skins are ~40% pure-black gutter, and the old -3.3 content bias hid a
+//    sampling bug, not genuine mip poisoning: fillPerspTriRGB sampled the
+//    picked mip with full-res UVs, so coarse picks wrapped into gutter
+//    black (soldier yaw90 @120u 29.4% pure-black pre-resolve, bolt @40u
+//    64.5%). Post mip-UV-scale fix, re-measured on real skins: soldier
+//    @120u 1.7%, v_blast @40u 4.4%, thin island 91% of L0 — all flat
+//    across the bias sweep, so the delta is 0 and alias tracks the shared
+//    vd_lodbias exactly like world textures (see rgbMipUV.test.ts).
 import { describe, expect, it, afterEach } from 'vitest';
 import { createFramebuffer } from '@q2/renderer-api';
 import type { Entity } from '@q2/renderer-api';
@@ -155,13 +157,16 @@ describe('alias LOD bias defeats gutter poisoning', () => {
     };
   }
 
-  it('ALIAS_LOD_BIAS_DELTA lands the default bias on the measured floor', () => {
-    // soldier yaw90 @120u needed total -2, thin-island bolt @40u total
-    // -3.65: the delta must take the default (-0.35) to ~-3.65 or finer.
-    expect(-0.35 + ALIAS_LOD_BIAS_DELTA).toBeLessThanOrEqual(-3.5);
+  it('ALIAS_LOD_BIAS_DELTA is zero: alias tracks the shared bias', () => {
+    // The old -3.3 content bias masked the mip-UV scaling bug (see header
+    // note 2). Post-fix re-measurement shows no bias-sensitive gutter
+    // collapse, so the delta is 0 — a nonzero value would pin alias to L0
+    // (no minification filtering, distant shimmer) for zero benefit.
+    expect(ALIAS_LOD_BIAS_DELTA).toBe(0);
+    expect(-0.35 + ALIAS_LOD_BIAS_DELTA).toBe(-0.35);
   });
 
-  it('delta-biased sampling matches L0 on a gutter island; shared bias goes dark', () => {
+  it('shared-bias sampling matches L0 on a gutter island (no collapse post-fix)', () => {
     const pal = defaultPalette();
     const skin = gutterSkin();
     const mesh = islandQuad();
@@ -185,11 +190,13 @@ describe('alias LOD bias defeats gutter poisoning', () => {
     const shared = draw(-0.35);
     const alias = draw(-0.35 + ALIAS_LOD_BIAS_DELTA);
     expect(alias.n).toBe(ref.n);
-    // delta-biased ≈ L0 reference (texture kept, not gutter average)
+    // delta is 0, so alias sampling == shared-bias sampling ...
+    expect(alias.mean).toBe(shared.mean);
+    // ... and both sit near the L0 reference (texture kept, not gutter
+    // average). Fail-before: with the UV-scaling bug the shared pick read
+    // gutter black and collapsed to <60% of the reference.
     expect(Math.abs(alias.mean - ref.mean) / Math.max(ref.mean, 1)).toBeLessThan(0.15);
-    // ...while the shared world bias is dramatically darker (fail-before:
-    // removing the delta makes `alias` identical to `shared`)
-    expect(shared.mean).toBeLessThan(alias.mean * 0.6);
+    expect(Math.abs(shared.mean - ref.mean) / Math.max(ref.mean, 1)).toBeLessThan(0.15);
   });
 
   it('frame-level RGB/software parity on a gutter-skinned entity', () => {

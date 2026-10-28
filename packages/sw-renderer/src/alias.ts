@@ -893,10 +893,16 @@ export function fillPerspTriRGB(
         const v = (w0 * a.viz + w1 * b.viz + w2 * c.viz) / iz;
         const lvl = rgbPickMipLevel(lod, x, y, mipDither, maxLevel);
         const t = levels[lvl]!;
-        const mx = rgbWrapCoord(u | 0, t.width, wrapS);
-        const my = rgbWrapCoord(v | 0, t.height, wrapT);
+        // UVs arrive in level-0 texel units but the picked mip is 2^lvl
+        // times smaller: scale into the selected level before the hole test
+        // and the sample, or full-res coords wrap/clamp into the wrong texel
+        // (e.g. u=2.0 on a 2-wide mip1 reads (0,0) instead of (1,0)).
+        const sc = 1 / (1 << lvl);
+        const us = u * sc, vs = v * sc;
+        const mx = rgbWrapCoord(us | 0, t.width, wrapS);
+        const my = rgbWrapCoord(vs | 0, t.height, wrapT);
         if (t.mask[my * t.width + mx]! === 0) continue;
-        rgbSampleTexture(t.data, t.width, t.height, u, v, _aliasTex, 0, wrapS, wrapT);
+        rgbSampleTexture(t.data, t.width, t.height, us, vs, _aliasTex, 0, wrapS, wrapT);
         const lr = Math.round((w0 * a.r + w1 * b.r + w2 * c.r) * 255);
         const lg = Math.round((w0 * a.g + w1 * b.g + w2 * c.g) * 255);
         const lb = Math.round((w0 * a.b + w1 * b.b + w2 * c.b) * 255);

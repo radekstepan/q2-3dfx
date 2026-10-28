@@ -293,21 +293,26 @@ export const RGB_TEXCHAIN_BUDGET = 16 * 1024 * 1024;
 
 /**
  * Extra LOD bias for alias (MD2) RGB materials, added to the `vd_lodbias`
- * fidelity value. Real MD2 skins carry ~40% pure-black gutter texels around
- * thin mapped islands (measured: barrel 37%, soldier 47% index-127 black),
- * so the box-filtered coarse mip levels average to dark gutter grey and the
- * shadow side of every model renders as flat black instead of dark texture
- * (software alias never mips — affine L0 — so it keeps the mottling).
- * Measured entity-isolated pre-resolve: soldier yaw90 @120u needs total
- * bias -2 for the floor (29.4% -> 1.7% pure-black pixels), the thin-island
- * blaster bolt @40u needs total -3.65 (64.5% -> 0.0%). The delta below
- * lands the default (-0.35) on -3.65 while tracking user vd_lodbias A/B.
- * World textures tile (no gutters) and keep the unmodified bias.
- * Close-range viewmodels (rho < 1, L0 either way) are unaffected in kind;
- * far blobs sample finer than strict-GL would (sharper, software-like —
- * documented trade).
+ * fidelity value. Deliberately ZERO since the mip-UV-scale fix (P1):
+ * fillPerspTriRGB and the world span loops used to sample the picked mip
+ * with full-resolution UVs, so any coarse pick wrapped deep into the black
+ * gutter around thin MD2 skin islands (barrel 37%, soldier 47% index-127
+ * black) and the shadow side rendered flat black (soldier yaw90 @120u 29.4%
+ * pure-black pre-resolve, blaster bolt @40u 64.5%). The -3.3 content bias
+ * hid that sampling bug by pinning alias to L0. Re-measured post-fix on
+ * real skins with production sampling (clamp, dither, bilinear): soldier
+ * @120u 1.7% black, @300u 2.5%, v_blast @40u 4.4%, synthetic thin island
+ * 91% of L0 with 0% black — all flat across the bias sweep (-0.35..-3.65),
+ * i.e. no bias-sensitive gutter collapse remains. A nonzero delta would
+ * pin alias to L0 (no minification filtering, distant shimmer, diverging
+ * from the real-Voodoo behavior the RGB path emulates) for zero measured
+ * benefit, so alias now tracks the shared bias exactly like world
+ * textures. Close-range viewmodels (rho < 1, L0 either way) are unaffected
+ * in kind. Kept as a named hook (instead of inlining 0) so a future
+ * real-Voodoo3 capture review (M4.1) can re-tune content bias against
+ * hardware with one knob.
  */
-export const ALIAS_LOD_BIAS_DELTA = -3.3;
+export const ALIAS_LOD_BIAS_DELTA = 0;
 
 export class SoftwareRenderer implements Refresh {
   private fbW = 0;
@@ -1149,9 +1154,10 @@ export class SoftwareRenderer implements Refresh {
    * Opaque palette-baked RGB material for alias (MD2) models: identical to
    * rgbMaterialForSkin except opaqueMask (index 255 draws opaque, never a
    * hole — see the rgbAliasMats field doc for the id-source audit) plus the
-   * ALIAS_LOD_BIAS_DELTA content bias (black-gutter skins poison coarse
-   * mips). Separate cache because the mask is baked into the mip chain at
-   * upload.
+   * ALIAS_LOD_BIAS_DELTA hook (currently 0: the mip-UV-scale fix removed
+   * the gutter collapse that motivated the old -3.3 content bias — see its
+   * doc comment). Separate cache because the mask is baked into the mip
+   * chain at upload.
    */
   private rgbMaterialForAlias(skin: Texture): RGBMaterial {
     const fid = this.rgbFidelity;
@@ -2276,6 +2282,42 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
+   * Eviction-accounting probe (P2 pin): real chain retention vs the
+   * budgeted `chainUsed`. `retainedChainBytes` walks the chain map plus
+   * every DISTINCT chain still referenced by RGBLightCache materials;
+   * `orphanChainBytes` is the unbudgeted part (chains evicted from the map
+   * but pinned alive by surviving materials). Coordinated eviction keeps
+   * orphans at zero, so `retainedChainBytes === chainUsed <= BUDGET`.
+   * Byte formula matches rgbChainFor (64 + data + mask per level).
+   */
+  testRGBChainAccounting(): {
+    chainUsed: number; chainMapBytes: number; orphanChainBytes: number;
+    retainedChainBytes: number; rgbEntries: number; budget: number;
+  } {
+    let mapBytes = 0;
+    const live = new Set<RGBMipLevel[]>();
+    for (const e of this.rgbTexChains.values()) {
+      mapBytes += e.bytes;
+      live.add(e.chain);
+    }
+    let orphan = 0;
+    for (const ch of this.rgbCache.referencedChains()) {
+      if (live.has(ch)) continue;
+      let b = 64;
+      for (const lvl of ch) b += lvl.data.length + lvl.mask.length;
+      orphan += b;
+    }
+    return {
+      chainUsed: this.rgbTexUsed,
+      chainMapBytes: mapBytes,
+      orphanChainBytes: orphan,
+      retainedChainBytes: mapBytes + orphan,
+      rgbEntries: this.rgbCache.size,
+      budget: RGB_TEXCHAIN_BUDGET,
+    };
+  }
+
+  /**
    * RGB cover count inside a screen rect (step-3 test hook: dense-cover
    * asserts for filtered explosions — stipple would leave holes). Clamped
    * to the framebuffer. Zero unless the flag was enabled for the last
@@ -2505,8 +2547,17 @@ export class SoftwareRenderer implements Refresh {
     };
   }
 
-  /** Drop the shared per-texture RGB chains (palette/world change). */
+  /**
+   * Drop the shared per-texture RGB chains (palette/world change).
+   * Coordinated ownership (P2): chains are shared by reference with
+   * RGBLightCache materials, so the drop also invalidates the light
+   * cache — otherwise evicted/cleared chains stay alive through
+   * `material.levels` with no accounting trace. All callers already
+   * invalidate the light cache too; the second clear is a harmless no-op
+   * that keeps the pairing enforceable in one place.
+   */
   private clearRGBTextureChains(): void {
+    this.rgbCache.invalidateAll();
     this.rgbTexChains.clear();
     this.rgbTexUsed = 0;
   }
@@ -2552,6 +2603,12 @@ export class SoftwareRenderer implements Refresh {
       this.rgbTexChains.delete(victim);
       this.rgbTexUsed -= e.bytes;
       this.rgbTexEvictions++;
+      // Coordinated ownership (P2): entries whose material shares this
+      // chain would otherwise pin the evicted bytes alive (retention above
+      // budget, plus a duplicate chain on the next miss for the texture).
+      // Drop only that texture's dependents; the next access rebuilds both
+      // the chain and the small luxel blocks.
+      this.rgbCache.invalidateChain(e.chain);
     }
     this.rgbTexChains.set(texId, { chain, bytes, used: this.frame });
     this.rgbTexUsed += bytes;

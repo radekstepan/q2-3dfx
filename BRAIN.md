@@ -46,7 +46,9 @@ Rebuild Quake II so that it:
 - **Renders in "3dfx Voodoo 3 3000" mode.** Emulation of `ref_gl`-on-Voodoo3: RGB565 + 4×4
   ordered dither, 2×2 "22-bit" post filter, bilinear, mip LOD with mip-dithering, 64-entry
   table fog, LOD bias, 256×256 max texture size, 16-bit depth, ~1.3 Glide gamma lift.
-  Full checklist + cvars: `docs/renderers.md`.
+  Full checklist + cvars: `docs/renderers.md`. RGB mip sampling scales UVs
+  into the picked level (`1/(1<<lvl)`); alias tracks the shared `vd_lodbias`
+  (`ALIAS_LOD_BIAS_DELTA = 0`, reassessed post-fix — see VOODOO-REPAIR-2 note).
 - **Runs in a browser** at ≥60 fps at 640×480, and in Node for headless tests.
 - **Plays shareware map end to end** (`base1`): movement, collision, doors, buttons, lifts,
   triggers, items, two monster types, three weapons.
@@ -228,9 +230,9 @@ depends: VOODOO-REPAIR
 status: done
 done-when:
 - [x] reproduced entity-isolated with real base1 assets (soldier yaw90 @120u 29.4% pure-black pre-resolve px, bolt @40u 64.5%; software keeps texture in both)
-- [x] root cause fixed, not masked: MD2 skins are ~40% black gutter (barrel 37%, soldier 47% idx-127) poisoning coarse box-filter mips (software alias never mips — affine L0); alias RGB materials carry ALIAS_LOD_BIAS_DELTA (-3.3, lands default on total -3.65, tracks vd_lodbias) + fillPerspTriRGB honors clamp addressing (was hardcoded repeat)
+- [x] root cause fixed, not masked: MD2 skins are ~40% black gutter (barrel 37%, soldier 47% idx-127) poisoning coarse box-filter mips (software alias never mips — affine L0); fillPerspTriRGB honored clamp addressing (was hardcoded repeat). FOLLOW-UP 2026-10-27: the -3.3 content bias masked a second sampling bug (full-res UVs into shrunken mips — green-where-red repro); all samplers now scale UVs into the picked mip (`1/(1<<lvl)`) and the bias is reassessed to `ALIAS_LOD_BIAS_DELTA = 0` (alias tracks shared `vd_lodbias`; post-fix soldier @120u 1.7% black, v_blast @40u 4.4%, flat across bias sweep; gates `rgbMipUV.test.ts` 4 fail-before, `rgbAliasSkin.test.ts` re-pinned, devroom RGB `206e1dad` → `68b22dea`)
 - [x] post-fix at/below software black levels post-resolve, all measured classes: soldier 0.4%, barrel 0.1%, bolt 0.0%, infantry 1.2%, gunner 0.2%, corpse 0.2%, explode 0.0%, all 3 viewmodels ≤0.3%; before/after crops reviewed (backs mottled again, bolt glows red-orange)
-- [x] regression gates: `rgbAliasSkin.test.ts` (4 fail-before: clamp tap, delta value, delta-vs-shared sampling, frame RGB/software parity); devroom RGB re-pinned with cause (`436fe0c5` → `206e1dad`, critter px only, index `58e0ecf1` unchanged)
+- [x] regression gates: `rgbAliasSkin.test.ts` (4 fail-before: clamp tap, delta value, delta-vs-shared sampling, frame RGB/software parity); devroom RGB re-pinned with cause (`436fe0c5` → `206e1dad`, critter px only, index `58e0ecf1` unchanged). FOLLOW-UP 2026-10-27: `rgbMipUV.test.ts` (alias+world UV-scale, 4 fail-before), chain-eviction ownership `rgbChainEvict.test.ts` (retained==accounted<=16MiB), voodoo-regression gun-present-vs-absent diff asserts (fails with viewmodel stripped)
 - [x] `yarn verify` green (76 tasks) + Q2_PAK voodoo-regression gate 4/4 + changeset
 - [ ] OPEN (not this card): real-Voodoo3 capture review (M4.1) is the only oracle that can confirm distant-minification brightness vs strict-GL; current trade (finer alias mips = sharper/software-like at range) is documented in ALIAS_LOD_BIAS_DELTA
 ```
