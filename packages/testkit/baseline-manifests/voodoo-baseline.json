@@ -1,0 +1,419 @@
+{
+  "generated": "2026-10-27T16:26:34.032Z",
+  "tool": "@q2/testkit voodoo-baseline",
+  "scenes": [
+    {
+      "scene": "flat",
+      "map": "maps/devroom",
+      "camera": {
+        "name": "demo-spawn",
+        "origin": [
+          0,
+          0,
+          48
+        ],
+        "angles": [
+          0,
+          0,
+          0
+        ],
+        "fovX": 90
+      },
+      "simTime": 0,
+      "resolution": {
+        "width": 640,
+        "height": 480
+      },
+      "renderPath": "serial",
+      "profile": {
+        "vd_16bit": 1,
+        "vd_dither": 1,
+        "vd_postfilter": 1,
+        "vd_bilinear": 1,
+        "vd_mipdither": 1,
+        "vd_lodbias": -0.35,
+        "vd_fog": 1,
+        "vd_gamma": 1.3,
+        "vd_maxtexsize": 256,
+        "vd_zbits": 16,
+        "vd_palettetex": 1,
+        "vd_overbright": 1,
+        "vd_dithermode": "4x4",
+        "vd_reconmode": "legacy",
+        "vd_rgbmaxdelta": "0,0,0"
+      },
+      "renderer": {
+        "revision": "5f93c54",
+        "resolve": "pinned-duplicate@5e13d42"
+      },
+      "stages": {
+        "raw-565": {
+          "hash": "c57e9dc5",
+          "pixels": 307200
+        },
+        "reconstructed": {
+          "hash": "11bed9eb",
+          "pixels": 307200
+        },
+        "display": {
+          "hash": "11bed9eb",
+          "pixels": 307200
+        }
+      }
+    },
+    {
+      "scene": "ramp",
+      "map": "maps/devroom",
+      "camera": {
+        "name": "demo-pillar",
+        "origin": [
+          -168,
+          0,
+          32
+        ],
+        "angles": [
+          0,
+          0,
+          0
+        ],
+        "fovX": 90
+      },
+      "simTime": 1.5,
+      "resolution": {
+        "width": 640,
+        "height": 480
+      },
+      "renderPath": "serial",
+      "profile": {
+        "vd_16bit": 1,
+        "vd_dither": 1,
+        "vd_postfilter": 1,
+        "vd_bilinear": 1,
+        "vd_mipdither": 1,
+        "vd_lodbias": -0.35,
+        "vd_fog": 1,
+        "vd_gamma": 1.3,
+        "vd_maxtexsize": 256,
+        "vd_zbits": 16,
+        "vd_palettetex": 1,
+        "vd_overbright": 1,
+        "vd_dithermode": "4x4",
+        "vd_reconmode": "legacy",
+        "vd_rgbmaxdelta": "0,0,0"
+      },
+      "renderer": {
+        "revision": "5f93c54",
+        "resolve": "pinned-duplicate@5e13d42"
+      },
+      "stages": {
+        "raw-565": {
+          "hash": "c6ce15a5",
+          "pixels": 307200
+        },
+        "reconstructed": {
+          "hash": "b38ff7f6",
+          "pixels": 307200
+        },
+        "display": {
+          "hash": "b38ff7f6",
+          "pixels": 307200
+        }
+      }
+    },
+    {
+      "scene": "checker",
+      "map": "maps/devroom",
+      "camera": {
+        "name": "demo-wide",
+        "origin": [
+          120,
+          -120,
+          96
+        ],
+        "angles": [
+          -10,
+          45,
+          0
+        ],
+        "fovX": 90
+      },
+      "simTime": 3,
+      "resolution": {
+        "width": 640,
+        "height": 480
+      },
+      "renderPath": "serial",
+      "profile": {
+        "vd_16bit": 1,
+        "vd_dither": 1,
+        "vd_postfilter": 1,
+        "vd_bilinear": 1,
+        "vd_mipdither": 1,
+        "vd_lodbias": -0.35,
+        "vd_fog": 1,
+        "vd_gamma": 1.3,
+        "vd_maxtexsize": 256,
+        "vd_zbits": 16,
+        "vd_palettetex": 1,
+        "vd_overbright": 1,
+        "vd_dithermode": "4x4",
+        "vd_reconmode": "legacy",
+        "vd_rgbmaxdelta": "0,0,0"
+      },
+      "renderer": {
+        "revision": "5f93c54",
+        "resolve": "pinned-duplicate@5e13d42"
+      },
+      "stages": {
+        "raw-565": {
+          "hash": "e5b34cc5",
+          "pixels": 307200
+        },
+        "reconstructed": {
+          "hash": "d9cda8c6",
+          "pixels": 307200
+        },
+        "display": {
+          "hash": "d9cda8c6",
+          "pixels": 307200
+        }
+      }
+    },
+    {
+      "scene": "litwall",
+      "map": "maps/devroom",
+      "camera": {
+        "name": "demo-spawn",
+        "origin": [
+          0,
+          0,
+          48
+        ],
+        "angles": [
+          0,
+          0,
+          0
+        ],
+        "fovX": 90
+      },
+      "simTime": 0,
+      "resolution": {
+        "width": 640,
+        "height": 480
+      },
+      "renderPath": "serial",
+      "profile": {
+        "vd_16bit": 1,
+        "vd_dither": 1,
+        "vd_postfilter": 1,
+        "vd_bilinear": 1,
+        "vd_mipdither": 1,
+        "vd_lodbias": -0.35,
+        "vd_fog": 1,
+        "vd_gamma": 1.3,
+        "vd_maxtexsize": 256,
+        "vd_zbits": 16,
+        "vd_palettetex": 1,
+        "vd_overbright": 1,
+        "vd_dithermode": "4x4",
+        "vd_reconmode": "legacy",
+        "vd_rgbmaxdelta": "0,0,0"
+      },
+      "renderer": {
+        "revision": "5f93c54",
+        "resolve": "pinned-duplicate@5e13d42"
+      },
+      "stages": {
+        "raw-565": {
+          "hash": "a1da4cb5",
+          "pixels": 307200
+        },
+        "reconstructed": {
+          "hash": "7df8afd1",
+          "pixels": 307200
+        },
+        "display": {
+          "hash": "7df8afd1",
+          "pixels": 307200
+        }
+      }
+    },
+    {
+      "scene": "hole",
+      "map": "maps/devroom",
+      "camera": {
+        "name": "demo-pillar",
+        "origin": [
+          -168,
+          0,
+          32
+        ],
+        "angles": [
+          0,
+          0,
+          0
+        ],
+        "fovX": 90
+      },
+      "simTime": 1.5,
+      "resolution": {
+        "width": 640,
+        "height": 480
+      },
+      "renderPath": "serial",
+      "profile": {
+        "vd_16bit": 1,
+        "vd_dither": 1,
+        "vd_postfilter": 1,
+        "vd_bilinear": 1,
+        "vd_mipdither": 1,
+        "vd_lodbias": -0.35,
+        "vd_fog": 1,
+        "vd_gamma": 1.3,
+        "vd_maxtexsize": 256,
+        "vd_zbits": 16,
+        "vd_palettetex": 1,
+        "vd_overbright": 1,
+        "vd_dithermode": "4x4",
+        "vd_reconmode": "legacy",
+        "vd_rgbmaxdelta": "0,0,0"
+      },
+      "renderer": {
+        "revision": "5f93c54",
+        "resolve": "pinned-duplicate@5e13d42"
+      },
+      "stages": {
+        "raw-565": {
+          "hash": "2057b2cd",
+          "pixels": 307200
+        },
+        "reconstructed": {
+          "hash": "826133bc",
+          "pixels": 307200
+        },
+        "display": {
+          "hash": "826133bc",
+          "pixels": 307200
+        }
+      }
+    },
+    {
+      "scene": "edge",
+      "map": "maps/devroom",
+      "camera": {
+        "name": "demo-wide",
+        "origin": [
+          120,
+          -120,
+          96
+        ],
+        "angles": [
+          -10,
+          45,
+          0
+        ],
+        "fovX": 90
+      },
+      "simTime": 3,
+      "resolution": {
+        "width": 640,
+        "height": 480
+      },
+      "renderPath": "serial",
+      "profile": {
+        "vd_16bit": 1,
+        "vd_dither": 1,
+        "vd_postfilter": 1,
+        "vd_bilinear": 1,
+        "vd_mipdither": 1,
+        "vd_lodbias": -0.35,
+        "vd_fog": 1,
+        "vd_gamma": 1.3,
+        "vd_maxtexsize": 256,
+        "vd_zbits": 16,
+        "vd_palettetex": 1,
+        "vd_overbright": 1,
+        "vd_dithermode": "4x4",
+        "vd_reconmode": "legacy",
+        "vd_rgbmaxdelta": "0,0,0"
+      },
+      "renderer": {
+        "revision": "5f93c54",
+        "resolve": "pinned-duplicate@5e13d42"
+      },
+      "stages": {
+        "raw-565": {
+          "hash": "bdc20c05",
+          "pixels": 307200
+        },
+        "reconstructed": {
+          "hash": "6e3be036",
+          "pixels": 307200
+        },
+        "display": {
+          "hash": "6e3be036",
+          "pixels": 307200
+        }
+      }
+    },
+    {
+      "scene": "devroom",
+      "map": "maps/devroom",
+      "camera": {
+        "name": "demo-spawn",
+        "origin": [
+          0,
+          0,
+          48
+        ],
+        "angles": [
+          0,
+          0,
+          0
+        ],
+        "fovX": 90
+      },
+      "simTime": 0,
+      "resolution": {
+        "width": 640,
+        "height": 480
+      },
+      "renderPath": "serial",
+      "profile": {
+        "vd_16bit": 1,
+        "vd_dither": 1,
+        "vd_postfilter": 1,
+        "vd_bilinear": 1,
+        "vd_mipdither": 1,
+        "vd_lodbias": -0.35,
+        "vd_fog": 1,
+        "vd_gamma": 1.3,
+        "vd_maxtexsize": 256,
+        "vd_zbits": 16,
+        "vd_palettetex": 1,
+        "vd_overbright": 1,
+        "vd_dithermode": "4x4",
+        "vd_reconmode": "legacy",
+        "vd_rgbmaxdelta": "0,0,0"
+      },
+      "renderer": {
+        "revision": "5f93c54",
+        "resolve": "pinned-duplicate@5e13d42"
+      },
+      "stages": {
+        "raw-565": {
+          "hash": "785eecfd",
+          "pixels": 307200
+        },
+        "reconstructed": {
+          "hash": "bd62fae1",
+          "pixels": 307200
+        },
+        "display": {
+          "hash": "bd62fae1",
+          "pixels": 307200
+        }
+      }
+    }
+  ]
+}

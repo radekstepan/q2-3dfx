@@ -4,6 +4,7 @@ import type { Entity, Framebuffer, RefDef, Refresh, WorldModel } from '@q2/rende
 export * from './demo-fallback.js';
 export * from './sidebyside.js';
 export * from './cache-flythrough.js';
+export * from './voodoo-baseline.js';
 
 export const GOLDEN_TOLERANCE_SOFTWARE = 0;
 export const GOLDEN_TOLERANCE_VOODOO_LSB = 1;

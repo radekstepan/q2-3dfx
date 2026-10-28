@@ -18,7 +18,8 @@
     "lint": "eslint src --no-warn-ignored || true",
     "test": "vitest run --passWithNoTests",
     "golden": "echo golden-ok",
-    "bench": "echo bench-ok"
+    "bench": "echo bench-ok",
+    "baseline": "VOODOO_BASELINE_WRITE=1 BASELINE_HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo unrecorded) vitest run src/voodoo-baseline.test.ts"
   },
   "dependencies": {
     "@q2/bsp": "workspace:*",
