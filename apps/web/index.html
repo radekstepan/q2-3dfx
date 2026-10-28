@@ -29,7 +29,7 @@ button{font-family:inherit}
 .aperture{background-image:repeating-linear-gradient(to right,rgba(255,60,20,.09) 0 1px,rgba(40,255,120,.07) 1px 2px,rgba(60,120,255,.09) 2px 3px)}
 .crtvignette{background:radial-gradient(115% 115% at 50% 50%,rgba(0,0,0,0) 52%,rgba(0,0,0,.55) 100%),linear-gradient(to bottom,rgba(255,255,255,.05),rgba(0,0,0,0) 22%)}
 #q2-shell{display:flex;min-height:100vh;flex-direction:column}
-#q2-topbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 20px;border-bottom:1px solid var(--line);background:var(--surface);padding:12px 20px}
+#q2-topbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;border-bottom:1px solid var(--line);background:var(--surface);padding:8px 14px}
 #q2-brand{display:flex;align-items:center;gap:10px}
 #q2-brand .silk.bone{color:var(--bone)}
 #q2-brand .silk.dim{color:var(--dim)}
@@ -38,83 +38,80 @@ button{font-family:inherit}
 #q2-topright .dot{width:5px;height:5px;border-radius:999px;background:var(--amber);display:inline-block;margin-right:6px}
 #q2-topright .mode{color:var(--amber)}
 #q2-main{display:flex;flex:1;min-height:0;flex-direction:column}
-#q2-left{display:flex;flex-direction:column;flex:1;min-width:0;min-height:560px}
-#q2-stage{display:flex;flex:1;min-height:0;align-items:center;justify-content:center;overflow:hidden;background:#07080a;padding:16px 32px}
-#q2-bezel{position:relative;border:1px solid #20242a;background:#000;box-shadow:0 40px 90px -30px rgba(0,0,0,.95),0 0 0 1px rgba(255,255,255,.03)}
-#q2{cursor:crosshair;display:block;background:#000;image-rendering:pixelated}
+#q2-left{display:flex;flex-direction:column;flex:1;min-width:0;min-height:420px}
+#q2-stage{display:flex;flex:1;min-height:0;align-items:center;justify-content:center;overflow:hidden;background:#07080a;padding:12px 16px}
+#q2-bezel{position:relative;display:flex;max-width:100%;max-height:100%;overflow:hidden;border:1px solid #20242a;background:#000;box-shadow:0 24px 60px -30px rgba(0,0,0,.95),0 0 0 1px rgba(255,255,255,.03)}
+#q2{cursor:crosshair;display:block;background:#000;image-rendering:pixelated;max-width:100%;max-height:100%;object-fit:contain}
 #q2-glass{pointer-events:none;position:absolute;inset:0;border:1px solid rgba(255,255,255,.05);background:linear-gradient(135deg,rgba(255,255,255,.055),rgba(255,255,255,0) 38%)}
 #q2-console{border-top:1px solid var(--line);background:var(--surface);flex:none}
-#q2-console-head{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding:8px 20px}
+#q2-console-head{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding:6px 14px}
 #q2-console-head .left{display:flex;align-items:center;gap:12px}
 #q2-console-head .silk.dim{color:var(--dim)}
 #q2-console-count{font-family:var(--font-mono);font-size:9.5px;color:var(--ember)}
 #q2-console-clear{background:none;border:0;color:var(--dim);cursor:pointer;padding:0}
 #q2-console-clear:hover{color:var(--amber)}
-#q2-console-lines{height:104px;overflow-y:auto;padding:10px 20px}
+#q2-console-lines{height:76px;overflow-y:auto;padding:8px 14px}
 #q2-console-lines .row{display:flex;gap:12px;font-family:var(--font-mono);font-size:10.5px;line-height:1.75}
 #q2-console-lines .ts{color:var(--dim);flex:none}
 #q2-console-lines .m-info{color:var(--muted)} #q2-console-lines .m-cmd{color:var(--bone)}
 #q2-console-lines .m-warn{color:var(--rust)} #q2-console-lines .m-ok{color:var(--amber)}
 #q2-console-empty{display:flex;height:100%;align-items:center;font-family:var(--font-mono);font-size:10.5px;color:var(--dim)}
 #q2-ui{width:100%;flex:none;border-top:1px solid var(--line);display:flex;min-height:0;flex-direction:column;background:var(--panel)}
-#q2-ui-head{padding:20px 20px 16px;border-bottom:1px solid var(--line)}
+#q2-ui-head{padding:12px 14px 10px;border-bottom:1px solid var(--line)}
 #q2-ui-head .topline{display:flex;align-items:center;justify-content:space-between}
 #q2-ui-head .ledrow{display:flex;align-items:center;gap:8px}
 #q2-led{width:7px;height:7px;border-radius:999px;background:var(--amber);box-shadow:0 0 9px 1px rgba(255,122,24,.6)}
-#q2-ui-head h1{margin:12px 0 0;font-size:38px;font-weight:700;text-transform:uppercase;line-height:.86;letter-spacing:-.03em}
+#q2-ui-head h1{margin:8px 0 0;font-size:20px;font-weight:700;text-transform:uppercase;line-height:1;letter-spacing:-.02em}
 #q2-ui-head h1 .dim{color:var(--dim)}
-#q2-modebox{margin-top:16px;display:flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--void);padding:8px 12px}
+#q2-modebox{margin-top:10px;display:flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--void);padding:6px 10px}
 #q2-modebox .val{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:11px;color:var(--amber)}
 #q2-progress{font-family:var(--font-mono);font-size:9.5px;color:var(--dim)}
 #q2-cvars-wrap{flex:1;min-height:0;overflow-y:auto}
-#q2-help{margin:0;padding:12px 20px;border-top:1px solid var(--line);background:var(--void);color:var(--muted);white-space:pre-line;font-family:var(--font-mono);font-size:10.5px;line-height:1.7}
-#q2-help .pk{color:var(--amber)}
 #q2-ui-foot{border-top:1px solid var(--line);background:var(--surface);flex:none}
-#q2-ui-foot .hint{display:flex;align-items:center;justify-content:space-between;padding:12px 20px 8px}
+#q2-ui-foot .hint{display:flex;align-items:center;justify-content:space-between;padding:8px 14px 6px}
 #q2-ui-foot .silk.dim{color:var(--dim)}
 #q2-actions{display:flex;gap:1px;border-top:1px solid var(--line);background:var(--line)}
-#q2-actions button{flex:1;padding:14px 0}
+#q2-actions button{flex:1;padding:10px 0}
 #q2-revert{background:var(--panel);color:var(--muted);border:0}
 #q2-revert:hover{background:var(--raise);color:var(--bone)}
 #q2-clear-pak{flex:1.6;background:var(--panel);color:var(--muted);border:0}
 #q2-clear-pak:hover{background:var(--raise);color:var(--bone)}
 /* sidebar rows: q2 custom elements */
 q2-settings-panel{display:block}
-q2-group,.q2-cvar-group{display:flex;align-items:baseline;gap:12px;padding:20px 20px 8px 20px;border-top:1px solid var(--line);font-family:var(--font-mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--bone)}
+q2-group,.q2-cvar-group{display:flex;align-items:baseline;gap:10px;padding:12px 14px 6px 14px;border-top:1px solid var(--line);font-family:var(--font-mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--bone)}
 q2-group::before,.q2-cvar-group::before{content:attr(data-index);color:var(--amber);font-size:10px}
 q2-group:first-child,.q2-cvar-group:first-child{border-top:0}
-q2-cvar-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 20px;border-top:1px solid rgba(39,43,49,.7)}
+q2-cvar-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 14px;border-top:1px solid rgba(39,43,49,.7)}
 q2-cvar-row:hover{background:rgba(255,255,255,.015)}
-q2-cvar-row label{width:150px;flex:none;font-family:var(--font-mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:default}
+q2-cvar-row label{width:132px;flex:none;font-family:var(--font-mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:default}
 q2-checkbox,q2-select,q2-text{display:inline-flex;flex:1;min-width:0}
 q2-checkbox input[type=checkbox]{width:16px;height:16px;accent-color:var(--amber);cursor:pointer}
-q2-select select,q2-text input{flex:1;min-width:0;font:11px var(--font-mono);background:var(--void);color:var(--bone);border:1px solid var(--line);padding:8px 10px}
+q2-select select,q2-text input{flex:1;min-width:0;font:11px var(--font-mono);background:var(--void);color:var(--bone);border:1px solid var(--line);padding:5px 8px}
 q2-select select:hover,q2-text input:hover{border-color:var(--linehi)}
 q2-select select:focus-visible,q2-text input:focus-visible,q2-checkbox input:focus-visible{outline:1px solid var(--amber);outline-offset:1px}
 #q2-ui button.silkbtn{background:none;border:0;cursor:pointer}
 :focus-visible{outline:1px solid var(--amber);outline-offset:1px}
 @media(min-width:1024px){
-  #q2-main{flex-direction:row}
-  #q2-left{min-height:0}
-  #q2-ui{width:418px;border-top:0;border-left:1px solid var(--line)}
+  #q2-shell{height:100vh;overflow:hidden}
+  #q2-main{flex-direction:row;overflow:hidden}
+  #q2-left{min-height:0;overflow:hidden}
+  #q2-stage{min-height:0}
+  #q2-ui{width:340px;border-top:0;border-left:1px solid var(--line);overflow:hidden}
 }
-@media(min-width:1280px){#q2-ui{width:452px}}
+@media(min-width:1280px){#q2-ui{width:360px}}
 @media(prefers-reduced-motion:reduce){*{animation-duration:.001ms!important;transition-duration:.001ms!important}}
 </style></head><body><div id="q2-shell">
 <header id="q2-topbar"><div id="q2-brand">
 <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 1.5 L22 7v10l-10 5.5L2 17V7z" fill="none" stroke="#383E47" stroke-width="1.1"/><path d="M8.4 6.2h7.6l-4.1 5h4.3l-7.6 6.9 2-5.1H6.6z" fill="#FF7A18"/></svg>
 <span class="silk bone">strogg engine</span><span id="q2-topsep"></span><span class="silk dim">q2ts live build</span>
-</div><div id="q2-topright"><span><span class="dot"></span>localhost:27910</span><span>64 fps tick</span><span id="q2-top-pak">pak0.pak · cached</span><span class="mode tnum" id="q2-top-mode">320×240 · software</span></div></header>
+</div><div id="q2-topright"><span><span class="dot"></span>localhost:27910</span><span id="q2-top-pak">pak0.pak · cached</span><span class="mode tnum" id="q2-top-mode">320×240 · software</span></div></header>
 <main id="q2-main"><div id="q2-left">
 <div id="q2-stage" class="grain"><div id="q2-bezel"><canvas id="q2" width="320" height="240"></canvas><div id="q2-glass"></div></div></div>
 <section id="q2-console" aria-label="Engine console"><div id="q2-console-head"><div class="left"><span class="silk dim">console</span><span id="q2-console-count" class="tnum">000 lines</span></div><button id="q2-console-clear" class="silk silkbtn" type="button">clear</button></div><div id="q2-console-lines" class="thin-scroll" aria-live="polite"></div></section>
 </div>
 <aside id="q2-ui" aria-label="Settings sidebar"><div id="q2-ui-head" class="faceplate"><div class="topline"><div class="ledrow"><span id="q2-led"></span><span class="silk" style="color:var(--muted)">strogg engine · q2ts</span></div><span style="font-family:var(--font-mono);font-size:9.5px;color:var(--dim)">VID_CONFIG</span></div>
-<h1>Game<br><span class="dim">Configuration</span></h1>
+<h1>Game <span class="dim">config</span></h1>
 <div id="q2-modebox"><span class="silk" style="color:var(--dim)">mode</span><span class="val tnum" id="q2-mode-val">320×240 · software</span><span class="silk" style="color:var(--dim)" id="q2-dirty">applied</span></div></div>
 <div id="q2-cvars-wrap" class="thin-scroll"><q2-settings-panel id="q2-cvars"></q2-settings-panel></div>
-<div id="q2-help">WASD move · C crouch · Space jump · E use · 1/2/3 weapons
-click: shoot · skill + resolution + map in cvars (change reboots the level)
-drop pak0.pak for base1 (cached across reloads)</div>
 <div id="q2-ui-foot"><div class="hint"><span class="silk dim">q2ts · base1 / devroom</span><span class="silk dim" id="q2-pending">no pending changes</span></div><div id="q2-actions"><button id="q2-revert" class="silk" type="button">revert view</button><button id="q2-clear-pak" class="silk" type="button">clear cached pak</button></div></div></aside></main>
 </div><script type="module" src="/src/index.ts"></script></body></html>
