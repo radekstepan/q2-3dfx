@@ -11,8 +11,21 @@ import { createDevroom, DEVROOM_CAMERA } from './devroom.js';
 import {
   SPAN_FLAT, SPAN_OPAQUE,
   buildRGBMaterial, createSpan, drawSpansRGB, quantiseIz, quantiseIzInt,
+  windowDepth01, windowDepthQ16, DEFAULT_RGB_FAR, DEFAULT_RGB_NEAR,
   type SpanList,
 } from './spans.js';
+
+/** Expand one stored 565 quantum to 8:8:8 (matches the endFrame resolve). */
+function expandQ(q: Uint16Array, i: number): [number, number, number] {
+  const v = q[i]!;
+  const r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
+  return [(r5 << 3) | (r5 >> 2), (g6 << 2) | (g6 >> 4), (b5 << 3) | (b5 >> 2)];
+}
+
+/** Fresh 565 authority planes (depth cleared to all-ones = far). */
+function mkPlanes(n: number): { q: Uint16Array; cover: Uint8Array; depth: Uint16Array } {
+  return { q: new Uint16Array(n), cover: new Uint8Array(n), depth: new Uint16Array(n).fill(0xffff) };
+}
 
 const VD_CVARS = ['vd_overbright', 'vd_lodbias', 'vd_mipdither', 'vd_bilinear', 'vd_zbits'];
 
@@ -282,22 +295,22 @@ describe('fidelity snapshot per renderView', () => {
 describe('vd_bilinear nearest sampling', () => {
   it('point-samples the centre texel when bilinear is false', () => {
     const pal = grayPalette();
-    const texels = new Uint8Array([10, 20]);
+    // texels chosen to stay distinct through the RGB565 write quantise
+    // (8 -> 8, 248 -> 252, 50/50 average 128 -> 132)
+    const texels = new Uint8Array([8, 248]);
     const lin = buildRGBMaterial(texels, 2, 1, pal, null,
       { overbright: false, lodBias: 0, mipDither: false, bilinear: true });
     const near = buildRGBMaterial(texels, 2, 1, pal, null,
       { overbright: false, lodBias: 0, mipDither: false, bilinear: false });
     // u = 0.5 lands exactly between the two texels
     const draw = (mat: ReturnType<typeof buildRGBMaterial>): number => {
-      const color = new Uint32Array(2);
-      const cover = new Uint8Array(2);
-      const zb = new Float32Array(2);
+      const pl = mkPlanes(2);
       const list: SpanList = { spans: [flatSpanU(0.5)], count: 1 };
-      drawSpansRGB(color, cover, zb, 2, 1, list, mat);
-      return color[0]! & 255;
+      drawSpansRGB(pl.q, pl.cover, pl.depth, 2, 1, list, mat);
+      return expandQ(pl.q, 0)[0];
     };
-    expect(draw(lin)).toBe(15);
-    expect(draw(near)).toBe(10);
+    expect(draw(lin)).toBe(132);
+    expect(draw(near)).toBe(8);
   });
 
   it('defaults to bilinear when the option is omitted', () => {
@@ -310,7 +323,7 @@ describe('vd_bilinear nearest sampling', () => {
 });
 
 describe('vd_zbits visibility', () => {
-  function flatDraw(zbits: number, iz: number, flat: [number, number, number]): { color: Uint32Array; zb: Float32Array; qzb: Uint16Array } {
+  function flatDraw(zbits: number, iz: number, flat: [number, number, number]): { q: Uint16Array; cover: Uint8Array; depth: Uint16Array } {
     const pal = grayPalette();
     const mat = buildRGBMaterial(new Uint8Array([0]), 1, 1, pal, null, {
       overbright: false, lodBias: 0, mipDither: false, flatColor: new Uint8Array(flat),
@@ -321,22 +334,26 @@ describe('vd_zbits visibility', () => {
     s.y = 0; s.x0 = 0; s.x1 = 1;
     s.iz = iz; s.diz = 0;
     s.ord = 0;
-    const color = new Uint32Array(1);
-    const cover = new Uint8Array(1);
-    const zb = new Float32Array(1);
-    const qzb = new Uint16Array(1);
-    drawSpansRGB(color, cover, zb, 1, 1, { spans: [s], count: 1 }, mat, qzb);
-    return { color, zb, qzb };
+    const pl = mkPlanes(1);
+    drawSpansRGB(pl.q, pl.cover, pl.depth, 1, 1, { spans: [s], count: 1 }, mat);
+    return pl;
   }
 
   it('coplanar-ish fragments tie at 16 bits but not in the legacy path', () => {
-    const iz1 = 0.5;
-    const iz2 = 0.5 + 1e-6; // same 16-bit step, strictly greater as float
-    expect(quantiseIzInt(iz1, 16)).toBe(quantiseIzInt(iz2, 16));
-    // legacy: the strictly nearer (blue) fragment wins over red
+    // 50 units out (in front of the near plane: window-Z is live here,
+    // not clamped): the pair shares one 16-bit step but differs as floats
+    const iz1 = 0.02;
+    const iz2 = 0.02 + 2e-7; // same 16-bit window-Z step, strictly nearer as float
+    // window-Z mapping: normalized depth ties at 16 bits for this pair
+    const d1 = windowDepthQ16(windowDepth01(iz1, DEFAULT_RGB_NEAR, DEFAULT_RGB_FAR), 16);
+    const d2 = windowDepthQ16(windowDepth01(iz2, DEFAULT_RGB_NEAR, DEFAULT_RGB_FAR), 16);
+    expect(d1).toBe(d2);
+    // legacy (zbits 0 = full-precision float compare): the strictly nearer
+    // (blue) fragment wins over red
     const legacy = flatDraw(0, iz1, [200, 0, 0]);
-    const redLegacy = legacy.color[0]!;
-    expect(redLegacy & 255).toBe(200);
+    const redLegacy = legacy.q[0]!;
+    // 8-bit 200 quantises to 206 through RGB565 (200>>3=25 -> 206)
+    expect(expandQ(legacy.q, 0)).toEqual([206, 0, 0]);
     const blueLegacyMat = buildRGBMaterial(new Uint8Array([0]), 1, 1, grayPalette(), null, {
       overbright: false, lodBias: 0, mipDither: false,
       flatColor: new Uint8Array([0, 0, 200]), opaqueMask: true, zbits: 0,
@@ -345,14 +362,14 @@ describe('vd_zbits visibility', () => {
     sLegacy.kind = SPAN_FLAT;
     sLegacy.y = 0; sLegacy.x0 = 0; sLegacy.x1 = 1;
     sLegacy.iz = iz2; sLegacy.diz = 0;
-    drawSpansRGB(legacy.color, new Uint8Array(1), legacy.zb, 1, 1,
-      { spans: [sLegacy], count: 1 }, blueLegacyMat, new Uint16Array(1));
-    expect(legacy.color[0]! & 255).toBe(0);
-    expect((legacy.color[0]! >> 16) & 255).toBe(200);
-    // quantised: the tie keeps the first (red) writer; the int plane holds the step
+    drawSpansRGB(legacy.q, new Uint8Array(1), legacy.depth, 1, 1,
+      { spans: [sLegacy], count: 1 }, blueLegacyMat);
+    expect(expandQ(legacy.q, 0)).toEqual([0, 0, 206]);
+    // quantised: the tie keeps the first (red) writer; the depth plane
+    // holds the window-Z quantum
     const tied = flatDraw(16, iz1, [200, 0, 0]);
-    expect(tied.color[0]!).toBe(redLegacy);
-    expect(tied.qzb[0]).toBe(quantiseIzInt(iz1, 16));
+    expect(tied.q[0]!).toBe(redLegacy);
+    expect(tied.depth[0]).toBe(windowDepthQ16(windowDepth01(iz1, DEFAULT_RGB_NEAR, DEFAULT_RGB_FAR), 16));
     const blueTiedMat = buildRGBMaterial(new Uint8Array([0]), 1, 1, grayPalette(), null, {
       overbright: false, lodBias: 0, mipDither: false,
       flatColor: new Uint8Array([0, 0, 200]), opaqueMask: true, zbits: 16,
@@ -361,9 +378,9 @@ describe('vd_zbits visibility', () => {
     sTied.kind = SPAN_FLAT;
     sTied.y = 0; sTied.x0 = 0; sTied.x1 = 1;
     sTied.iz = iz2; sTied.diz = 0;
-    drawSpansRGB(tied.color, new Uint8Array(1), tied.zb, 1, 1,
-      { spans: [sTied], count: 1 }, blueTiedMat, tied.qzb);
-    expect(tied.color[0]!).toBe(redLegacy);
+    drawSpansRGB(tied.q, new Uint8Array(1), tied.depth, 1, 1,
+      { spans: [sTied], count: 1 }, blueTiedMat);
+    expect(tied.q[0]!).toBe(redLegacy);
   });
 });
 
@@ -461,12 +478,10 @@ describe('vertical-aware LOD', () => {
     const mat = buildRGBMaterial(texels, 4, 4, pal, null,
       { overbright: false, lodBias: 0, mipDither: false });
     const draw = (dudy?: number, dvdy?: number): number => {
-      const color = new Uint32Array(2);
-      const cover = new Uint8Array(2);
-      const zb = new Float32Array(2);
+      const pl = mkPlanes(2);
       const list: SpanList = { spans: [flatSpanU(0)], count: 1 };
-      drawSpansRGB(color, cover, zb, 2, 1, list, mat, null, dudy, dvdy);
-      return color[0]! & 255;
+      drawSpansRGB(pl.q, pl.cover, pl.depth, 2, 1, list, mat, null, dudy, dvdy);
+      return expandQ(pl.q, 0)[0];
     };
     const base = draw();
     expect(base).toBe(0); // level 0 texel (0,0)

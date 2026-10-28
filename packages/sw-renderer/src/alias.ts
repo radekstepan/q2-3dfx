@@ -4,9 +4,10 @@
 
 import type { Camera } from './camera.js';
 import {
-  rgbBlendPixel, rgbMipLevel, rgbModulate, rgbPickMipLevel,
-  rgbSampleTexture, rgbWrapCoord,
-  type RGBBlend, type RGBMaterial,
+  packRGB565, rgbBlendPixel565, rgbMipLevel, rgbModulate, rgbPickMipLevel,
+  rgbSampleTexture, rgbWrapCoord, windowDepthQ16,
+  DEFAULT_RGB_FAR, DEFAULT_RGB_NEAR,
+  type RGBBlend, type RGBMaterial, type RGBWindow,
 } from './spans.js';
 import type { DynamicLight } from './light.js';
 
@@ -784,16 +785,19 @@ function clipPolyNearLight(near: number): number {
 }
 
 /**
- * Perspective-correct triangle filler into the RGB plane. Backface-culls
- * like fillAffineTri (screen-space winding). Per-pixel: one perspective
- * divide, mip pick from the per-tri LOD, bilinear sample, mask skip,
- * modulate, opaque/alpha composite. Fully transparent (alpha <= 0) draws
- * nothing and writes no depth.
+ * Perspective-correct triangle filler into the RGB565 authority plane.
+ * Backface-culls like fillAffineTri (screen-space winding). Per-pixel: one
+ * perspective divide, mip pick from the per-tri LOD, bilinear sample, mask
+ * skip, modulate, window-Z depth test (LESS wins, ties keep stored, clear
+ * 0xFFFF = far) then opaque-pack or 565 read-modify-write blend. Fully
+ * transparent (alpha <= 0) draws nothing and writes no depth. `win` is the
+ * projection window (null = default 4..4096); depth precision follows
+ * mat.zbits (0 = full-precision float compare).
  */
 export function fillPerspTriRGB(
-  color: Uint32Array,
+  rgb565: Uint16Array,
   cover: Uint8Array,
-  zb: Float32Array,
+  rgbDepth: Uint16Array,
   fbW: number,
   fbH: number,
   a: PerspVert, b: PerspVert, c: PerspVert,
@@ -801,6 +805,7 @@ export function fillPerspTriRGB(
   alphaQ: number,
   blend: RGBBlend,
   depthWrite: boolean,
+  win?: RGBWindow | null,
 ): number {
   const area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
   if (area <= 0) return 0;
@@ -827,6 +832,12 @@ export function fillPerspTriRGB(
   const lod = rgbMipLevel(rho, mat.lodBias, maxLevel);
   const overbright = mat.overbright;
   const mipDither = mat.mipDither;
+  const zbw = mat.zbits;
+  const zOff = !Number.isInteger(zbw) || zbw < 1 || zbw > 23;
+  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
+  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
+  const winA = winF / (winF - winN);
+  const winB = (winF * winN) / (winF - winN);
   let minY = Math.max(0, Math.ceil(Math.min(a.y, b.y, c.y) - 0.5));
   const maxY = Math.min(fbH - 1, Math.floor(Math.max(a.y, b.y, c.y) - 0.5));
   if (maxY < minY) return 0;
@@ -856,7 +867,20 @@ export function fillPerspTriRGB(
       if (w0 < 0 || w1 < 0 || w2 < 0) continue;
       const iz = w0 * a.iz + w1 * b.iz + w2 * c.iz;
       const o = y * fbW + x;
-      if (iz > zb[o]!) {
+      // Window-Z depth: LESS wins, ties keep stored (first wins).
+      const dRaw = winA - winB * iz;
+      const d01 = dRaw < 0 ? 0 : dRaw > 1 ? 1 : (dRaw === dRaw ? dRaw : 1);
+      const qo = rgbDepth[o]!;
+      let qn: number;
+      let pass: boolean;
+      if (zOff) {
+        qn = Math.round(d01 * 65535) & 0xffff;
+        pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+      } else {
+        qn = windowDepthQ16(d01, zbw);
+        pass = qn < qo;
+      }
+      if (pass) {
         const u = (w0 * a.uiz + w1 * b.uiz + w2 * c.uiz) / iz;
         const v = (w0 * a.viz + w1 * b.viz + w2 * c.viz) / iz;
         const lvl = rgbPickMipLevel(lod, x, y, mipDither, maxLevel);
@@ -870,8 +894,9 @@ export function fillPerspTriRGB(
         const lb = Math.round((w0 * a.b + w1 * b.b + w2 * c.b) * 255);
         rgbModulate(_aliasTex[0]!, _aliasTex[1]!, _aliasTex[2]!, lr, lg, lb,
           overbright, _aliasLit, 0);
-        if (depthWrite) zb[o] = iz;
-        rgbBlendPixel(color, o, _aliasLit[0]!, _aliasLit[1]!, _aliasLit[2]!, blend, alphaQ);
+        if (depthWrite) rgbDepth[o] = qn;
+        if (blend === 'opaque') rgb565[o] = packRGB565(_aliasLit[0]!, _aliasLit[1]!, _aliasLit[2]!);
+        else rgb565[o] = rgbBlendPixel565(rgb565[o]!, _aliasLit[0]!, _aliasLit[1]!, _aliasLit[2]!, blend, alphaQ);
         cover[o] = 1;
         pixels++;
       }
@@ -881,19 +906,19 @@ export function fillPerspTriRGB(
 }
 
 /**
- * Draw one alias instance into the RGB plane (perspective-correct twin of
- * drawAliasInstance). Traversal, frame lerp, near-plane clip and
- * depthHack scale are identical; only the filler differs (perspective
- * instead of affine) and Entity.alpha blends instead of stippling.
- * `dlights` tint vertices per channel (red/blue patches keep hues);
- * pass null/[] for unlit-by-dynamics. Writes only the RGB planes + the
- * handed depth plane (the caller hands the RGB-owned zb, never the
- * software one, so the indexed path stays bit-identical).
+ * Draw one alias instance into the packed RGB565 plane (perspective-
+ * correct twin of drawAliasInstance). Traversal, frame lerp, near-plane
+ * clip and depthHack scale are identical; only the filler differs
+ * (perspective instead of affine) and Entity.alpha blends instead of
+ * stippling. `dlights` tint vertices per channel (red/blue patches keep
+ * hues); pass null/[] for unlit-by-dynamics. Writes only the RGB565 +
+ * window-Z planes + coverage (the caller hands the RGB-owned planes, never
+ * the software ones, so the indexed path stays bit-identical).
  */
 export function drawAliasInstanceRGB(
-  color: Uint32Array,
+  rgb565: Uint16Array,
   cover: Uint8Array,
-  zb: Float32Array,
+  rgbDepth: Uint16Array,
   fbW: number,
   fbH: number,
   inst: AliasInstance,
@@ -902,6 +927,7 @@ export function drawAliasInstanceRGB(
   anorms: Float32Array,
   shadeDots: Float32Array,
   dlights: DynamicLight[] | null,
+  win?: RGBWindow | null,
 ): number {
   const mesh = inst.mesh;
   const nv = mesh.numVerts;
@@ -1003,8 +1029,8 @@ export function drawAliasInstanceRGB(
         v.g = aliasLightG[vi]!;
         v.b = aliasLightB[vi]!;
       }
-      pixels += fillPerspTriRGB(color, cover, zb, fbW, fbH,
-        tv[0]!, tv[1]!, tv[2]!, mat, alphaQ, blend, depthWrite);
+      pixels += fillPerspTriRGB(rgb565, cover, rgbDepth, fbW, fbH,
+        tv[0]!, tv[1]!, tv[2]!, mat, alphaQ, blend, depthWrite, win ?? null);
       continue;
     }
     // Straddler: Sutherland clip carries position + uv + RGB light, then
@@ -1023,11 +1049,11 @@ export function drawAliasInstanceRGB(
       c.g = clipOLG[k]!;
       c.b = clipOLB[k]!;
     }
-    pixels += fillPerspTriRGB(color, cover, zb, fbW, fbH,
-      tv[0]!, tv[1]!, tv[2]!, mat, alphaQ, blend, depthWrite);
+    pixels += fillPerspTriRGB(rgb565, cover, rgbDepth, fbW, fbH,
+      tv[0]!, tv[1]!, tv[2]!, mat, alphaQ, blend, depthWrite, win ?? null);
     if (m === 4) {
-      pixels += fillPerspTriRGB(color, cover, zb, fbW, fbH,
-        tv[0]!, tv[2]!, tv[3]!, mat, alphaQ, blend, depthWrite);
+      pixels += fillPerspTriRGB(rgb565, cover, rgbDepth, fbW, fbH,
+        tv[0]!, tv[2]!, tv[3]!, mat, alphaQ, blend, depthWrite, win ?? null);
     }
   }
   return pixels;

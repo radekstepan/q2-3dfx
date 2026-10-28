@@ -40,10 +40,10 @@ describe('cvar registry', () => {
     }
   });
 
-  it('profile-data keys default to current behavior (read-path only)', () => {
+  it('profile-data keys default to matched scanout (hardware path)', () => {
     expect(getCVarString('vd_dithermode')).toBe('4x4');
-    expect(getCVarString('vd_reconmode')).toBe('legacy');
-    expect(getCVarString('vd_rgbmaxdelta')).toBe('0,0,0');
+    expect(getCVarString('vd_reconmode')).toBe('2x2sub+2x2box');
+    expect(getCVarString('vd_rgbmaxdelta')).toBe('8,8,8');
   });
 
   it('profile-data keys round-trip set/get', () => {

@@ -206,6 +206,42 @@ export function emitSpansForPoly(
   }
   const y0 = Math.max(0, Math.ceil(minY - 0.5));
   const y1 = Math.min(clipH - 1, Math.floor(maxY - 0.5));
+  // Vertical texture gradients for the Voodoo LOD footprint (rho): a
+  // least-squares plane fit of (u, v) over screen (x, y), computed once
+  // per polygon (not per span/row). Solves the 2x2 normal equations for
+  // [du/dx, du/dy] and [dv/dx, dv/dy]; only the vertical pair is stored
+  // (the horizontal pair is re-derived per span in drawSpansRGB from the
+  // iz/uz/vz steps, bit-identical to the fit). Degenerate (collinear)
+  // polys fall back to 0 (no vertical contribution — same rho as the old
+  // horizontal-only footprint). Zero allocation: pure scalar arithmetic.
+  let dudyP = 0, dvdyP = 0;
+  {
+    let mx = 0, my = 0, mu = 0, mv = 0;
+    for (let i = 0; i < count; i++) {
+      const p = poly[i]!;
+      mx += p.x; my += p.y;
+      const iu = p.iz !== 0 ? 1 / p.iz : 0;
+      mu += p.uz * iu; mv += p.vz * iu;
+    }
+    const inv = 1 / count;
+    mx *= inv; my *= inv; mu *= inv; mv *= inv;
+    let sxx = 0, sxy = 0, syy = 0, sxu = 0, syu = 0, sxv = 0, syv = 0;
+    for (let i = 0; i < count; i++) {
+      const p = poly[i]!;
+      const dx = p.x - mx, dy = p.y - my;
+      const iu = p.iz !== 0 ? 1 / p.iz : 0;
+      const du = p.uz * iu - mu, dv = p.vz * iu - mv;
+      sxx += dx * dx; sxy += dx * dy; syy += dy * dy;
+      sxu += dx * du; syu += dy * du;
+      sxv += dx * dv; syv += dy * dv;
+    }
+    const det = sxx * syy - sxy * sxy;
+    const adet = det < 0 ? -det : det;
+    if (det !== 0 && det === det && adet > 1e-12) {
+      dudyP = (sxx * syu - sxy * sxu) / det;
+      dvdyP = (sxx * syv - sxy * sxv) / det;
+    }
+  }
   for (let y = y0; y <= y1; y++) {
     const yc = y + 0.5;
     let xl = Infinity, xr = -Infinity;
@@ -251,6 +287,8 @@ export function emitSpansForPoly(
     s.lu = llu;
     s.lv = llv;
     s.dlu = (rlu - llu) / dx;
+    s.dudy = dudyP;
+    s.dvdy = dvdyP;
     s.turb = 0;
     if (fw) {
       // Batch tagging, fused: the caller passes the post-emit tag values
@@ -272,7 +310,7 @@ export function emitSpansForPoly(
       fw.F[o + 3] = s.duz; fw.F[o + 4] = s.vz; fw.F[o + 5] = s.dvz;
       fw.F[o + 6] = s.light;
       fw.F[o + 7] = s.dlight; fw.F[o + 8] = s.lu; fw.F[o + 9] = s.lv;
-      fw.F[o + 10] = s.dlu;
+      fw.F[o + 10] = s.dlu; fw.F[o + 11] = s.dudy; fw.F[o + 12] = s.dvdy;
       const q = (fw.base + fcount) * I_PER_SPAN;
       fw.I[q] = s.kind; fw.I[q + 1] = s.y; fw.I[q + 2] = s.x0;
       fw.I[q + 3] = s.x1; fw.I[q + 4] = s.turb;

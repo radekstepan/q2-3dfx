@@ -79,12 +79,12 @@ describe('step-5 RGB output hash pin (byte-identical before/after)', () => {
   it('RGB composite + index plane match the pinned step-4 hashes', () => {
     const a = renderRGB160();
     expect(a.cover).toBe(160 * 120);
-    // M4.1 re-pin (was 8372b322): seedRGBBackground used to clobber the
-    // world RGB plane with the indexed expand, so the pin captured
-    // indexed-world + RGB-foreground only. Covered pixels are now spared,
-    // so the world pass actually displays (ON differs from OFF). The index
-    // pin below is unchanged: the software path stays bit-identical.
-    expect(a.colorHash).toBe('3534624e');
+    // True-565 + window-Z re-pin (was 3534624e): the authority color
+    // plane is now packed RGB565 (per-write 8:8:8 -> 565 quantise, blends
+    // against the quantized destination) and depth is normalized window-Z
+    // (near/far from the Camera, LESS wins, clear all-ones). The index pin
+    // below is unchanged: the software path stays bit-identical.
+    expect(a.colorHash).toBe('a9988ff4');
     expect(a.indexHash).toBe('58e0ecf1');
     // second frame is stable (cache hits serve identical color)
     const b = renderRGB160();

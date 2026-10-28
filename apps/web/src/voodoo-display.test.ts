@@ -9,8 +9,8 @@
 
 import { describe, expect, it, afterEach } from 'vitest';
 import { getCVarNumber, setCVar } from '@q2/config';
-import { expandRGB565, gammaLUT, quantiseRGB565 } from '@q2/voodoo';
-import { splitBands } from '@q2/sw-renderer';
+import { applyDisplayGamma, expandRGB565, quantiseRGB565 } from '@q2/voodoo';
+import { isRGBWorldEnabled, setRGBWorldEnabled, splitBands, SoftwareRenderer } from '@q2/sw-renderer';
 import {
   applyRendererCvar,
   applyVoodooPresentation,
@@ -86,6 +86,8 @@ afterEach(() => {
     const def = ABSENT_DEFAULTS[name];
     if (def !== undefined) setCVar(name, def);
   }
+  // The RGB-world switch is module-global: never leak it into other tests.
+  setRGBWorldEnabled(false);
 });
 
 describe('voodoo display freshness (postfilter-off stale guard)', () => {
@@ -181,6 +183,34 @@ describe('voodoo display freshness (postfilter-off stale guard)', () => {
     }
   });
 
+  it('voodoo resolve is observable: display differs from the software plane, software is passthrough', () => {
+    voodooSandbox();
+    const boot = bootPlay({ width: W, height: H });
+    setCVar('vd_gamma', 1.3);
+    setCVar('vd_dither', 1);
+    setCVar('vd_postfilter', 1);
+    setCVar('vd_16bit', 1);
+    // Mid-tone grey: gamma 1.3 lifts 0x40 well clear of the 565 round
+    // trip, so EVERY display pixel differs from the live plane (dither
+    // only redistributes LSBs; gamma moves the value). Strict mode skips
+    // the r_brightness lift (effective 1.0) — the difference is the
+    // resolve itself, not the lift.
+    setCVar('vid_renderer', 'voodoo');
+    applyRendererCvar(boot);
+    paintLive(boot, 0xff404040);
+    const live = boot.refresh.getFramebuffer().color;
+    const out = resolveDisplay(boot);
+    expect(boot.lastResolveOrder).toBe('strict-hud-first');
+    let differs = 0;
+    for (let i = 0; i < out.length; i++) if (out[i] !== live[i]) differs++;
+    expect(differs).toBe(N);
+    // Software: the 1.0 path returns the live engine buffer untouched
+    // (byte-identical, same reference).
+    setCVar('vid_renderer', 'software');
+    applyRendererCvar(boot);
+    expect(resolveDisplay(boot)).toBe(live);
+  });
+
   it('brightness lift applies in LEGACY voodoo mode; strict voodoo skips it (vd_gamma is the gamma stage)', () => {
     voodooSandbox();
     const boot = bootPlay({ width: W, height: H });
@@ -222,24 +252,21 @@ describe('voodoo display freshness (postfilter-off stale guard)', () => {
 
 // V2d raster policy: vid_renderer drives the real backend selection.
 describe('renderer cvar policy (arm/disarm, no stale frame)', () => {
-  it('applyRendererCvar arms/disarms the RGB hook and zeroes scratch on switch (UNIT-ONLY: mocked instance hook)', () => {
-    // UNIT-ONLY contract test: injects a fake instance hook to prove the
-    // duck-call + scratch-zeroing wiring. It does NOT prove real RGB
-    // activation — see voodoo-rgb-activation.test.ts (real SoftwareRenderer,
-    // no mocks) for the integration proof.
+  it('applyRendererCvar arms/disarms the REAL RGB hook and zeroes scratch on switch (real class, no mocks)', () => {
+    // Real-class proof (no mocks anywhere in this file): bootPlay wires a
+    // genuine SoftwareRenderer, whose prototype ships setRGBWorldEnabled
+    // (per-renderer state + cache drop). Arming flips the shared module
+    // flag; disarming clears it. Shell scratch is zeroed on every switch
+    // so the next frame can never show previous-mode pixels.
     voodooSandbox();
     const boot = bootPlay({ width: W, height: H });
-    // Feature-detected hook (assumed name; see armRasterPolicy): the
-    // parallel sw-renderer agent owns the real one — absence is a no-op.
-    const calls: boolean[] = [];
-    (boot.refresh as unknown as Record<string, unknown>)['setRGBWorldEnabled'] = (on: boolean) => {
-      calls.push(on);
-    };
+    expect(boot.refresh).toBeInstanceOf(SoftwareRenderer);
+    expect(typeof boot.refresh.setRGBWorldEnabled).toBe('function');
     setCVar('vid_renderer', 'voodoo');
     expect(applyRendererCvar(boot)).toBe('voodoo');
     expect(boot.renderer).toBe('voodoo');
-    expect(calls).toEqual([true]);
-    // armRasterPolicy reports success and records the outcome for tests.
+    expect(boot.refresh.isRGBWorldEnabled()).toBe(true);
+    expect(isRGBWorldEnabled()).toBe(true);
     expect(boot.lastRasterPolicy).toEqual({ mode: 'voodoo', rgbEnabled: true, hooked: true });
 
     // Dirty the shell scratch, then switch away: zeroed immediately so the
@@ -248,7 +275,8 @@ describe('renderer cvar policy (arm/disarm, no stale frame)', () => {
     boot.fb565.fill(0x1234);
     setCVar('vid_renderer', 'software');
     expect(applyRendererCvar(boot)).toBe('software');
-    expect(calls).toEqual([true, false]);
+    expect(boot.refresh.isRGBWorldEnabled()).toBe(false);
+    expect(isRGBWorldEnabled()).toBe(false);
     expect(boot.display.every((v) => v === 0)).toBe(true);
     expect(boot.fb565.every((v) => v === 0)).toBe(true);
     expect(boot.lastRasterPolicy).toEqual({ mode: 'software', rgbEnabled: false, hooked: true });
@@ -379,13 +407,21 @@ describe('strict voodoo HUD-before-scanout ordering', () => {
     const out = resolveDisplay(boot, hud);
     expect(boot.lastResolveOrder).toBe('strict-hud-first');
     // Crosshair arm pixel: authored dim grey 0xff888888. Strict mode runs
-    // it through gamma + 565 quantise, so the display pixel is the
-    // scanout-transformed value — provably not the authored colour.
+    // it through linear pack + expand + display gamma, so the display
+    // pixel is the scanout-transformed value — provably not the authored
+    // colour.
     const cx = (SW / 2) | 0;
     const cy = (SH / 2) | 0;
     const arm = cy * SW + (cx - 4);
-    const g = gammaLUT(2.0)[0x88]!;
-    const expected = expandRGB565(quantiseRGB565(g, g, g));
+    // NEW backend (single gamma-after-reconstruction path for every
+    // reconmode, guide §7.2 RAMDAC order): the HUD grey is packed LINEAR
+    // (gamma 1; vd_dither is 0 here so no dither offset), per-pixel
+    // expanded (vd_postfilter is 0), then display-gamma corrected on the
+    // display plane. Compose the same reference through the public API.
+    const lin = expandRGB565(quantiseRGB565(0x88, 0x88, 0x88));
+    const disp = new Uint32Array([lin]);
+    applyDisplayGamma(disp, 1, 1, 2.0);
+    const expected = disp[0]!;
     expect(expected).not.toBe(0xff888888);
     expect(out[arm]).toBe(expected);
     // The live (pre-scanout) target really was HUD-painted: the authored

@@ -184,6 +184,18 @@ describe('drawSpansRGB vs indexed resolve', () => {
     return pal;
   }
 
+  /** Fresh 565 authority planes (depth cleared to all-ones = far). */
+  function mkPlanes(n: number): { q: Uint16Array; cover: Uint8Array; depth: Uint16Array } {
+    return { q: new Uint16Array(n), cover: new Uint8Array(n), depth: new Uint16Array(n).fill(0xffff) };
+  }
+
+  /** Expand one stored 565 quantum to 8:8:8 (matches the endFrame resolve). */
+  function expandQ(q: Uint16Array, i: number): [number, number, number] {
+    const v = q[i]!;
+    const r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
+    return [(r5 << 3) | (r5 >> 2), (g6 << 2) | (g6 >> 4), (b5 << 3) | (b5 >> 2)];
+  }
+
   /** One 4px span, constant u=v=1, constant depth, red luxel light. */
   function redSpan(): ReturnType<typeof createSpan> {
     const s = createSpan();
@@ -216,19 +228,17 @@ describe('drawSpansRGB vs indexed resolve', () => {
     expect(swR).toBe(pal[idx[0]! * 3 + 1]);
     expect(swR).toBe(pal[idx[0]! * 3 + 2]);
     // --- RGB path: same wall, red luxel light keeps its hue ---
-    const color = new Uint32Array(W * H);
-    const cover = new Uint8Array(W * H);
-    const zb2 = new Float32Array(W * H);
+    const pl = mkPlanes(W * H);
     const mat = buildRGBMaterial(texels, 4, 4, pal,
       { samples: new Uint8Array([255, 0, 0]), luxW: 1, luxH: 1 },
       { overbright: false, lodBias: 0, mipDither: false });
-    const rgb = drawSpansRGB(color, cover, zb2, W, H, list, mat);
+    const rgb = drawSpansRGB(pl.q, pl.cover, pl.depth, W, H, list, mat);
     expect(rgb.spans).toBe(1);
-    expect([...cover]).toEqual([1, 1, 1, 1]);
-    const px = color[0]!;
-    const r = px & 255, g = (px >> 8) & 255, b = (px >> 16) & 255;
+    expect([...pl.cover]).toEqual([1, 1, 1, 1]);
+    const [r, g, b] = expandQ(pl.q, 0);
     // gray texel (100,100,100) x red light, no overbright -> (100,0,0)
-    expect(r).toBe(100);
+    // in 8-bit, (99,0,0) after the 565 write quantise (100>>3=12 -> 99)
+    expect(r).toBe(99);
     expect(g).toBe(0);
     expect(b).toBe(0);
     // ...which the indexed resolve cannot reproduce (its pixel is gray)
@@ -243,15 +253,14 @@ describe('drawSpansRGB vs indexed resolve', () => {
     const s = redSpan();
     s.x1 = 2;
     const list: SpanList = { spans: [s], count: 1 };
-    for (const [overbright, want] of [[false, 100], [true, 200]] as const) {
-      const color = new Uint32Array(W * H);
-      const cover = new Uint8Array(W * H);
-      const zb = new Float32Array(W * H);
+    // 8-bit 100/200 quantise to 99/206 through RGB565 (12->99, 25->206)
+    for (const [overbright, want] of [[false, 99], [true, 206]] as const) {
+      const pl = mkPlanes(W * H);
       const mat = buildRGBMaterial(texels, 2, 2, pal,
         { samples: new Uint8Array([255, 255, 255]), luxW: 1, luxH: 1 },
         { overbright, lodBias: 0, mipDither: false });
-      drawSpansRGB(color, cover, zb, W, H, list, mat);
-      expect(color[0]! & 255).toBe(want);
+      drawSpansRGB(pl.q, pl.cover, pl.depth, W, H, list, mat);
+      expect(expandQ(pl.q, 0)[0]).toBe(want);
     }
   });
 
@@ -261,13 +270,11 @@ describe('drawSpansRGB vs indexed resolve', () => {
     const t = redSpan();
     t.kind = SPAN_TURBULENT;
     const list: SpanList = { spans: [t], count: 1 };
-    const color = new Uint32Array(W * H);
-    const cover = new Uint8Array(W * H);
-    const zb = new Float32Array(W * H);
+    const pl = mkPlanes(W * H);
     const mat = buildRGBMaterial(new Uint8Array(16).fill(100), 4, 4, pal, null, {});
-    const r = drawSpansRGB(color, cover, zb, W, H, list, mat);
+    const r = drawSpansRGB(pl.q, pl.cover, pl.depth, W, H, list, mat);
     expect(r.spans).toBe(1);
-    expect([...cover]).toEqual([1, 1, 1, 1]);
+    expect([...pl.cover]).toEqual([1, 1, 1, 1]);
   });
 });
 

@@ -54,21 +54,18 @@ Emulate **all** of the following; each is a cvar in `@q2/config` so we can A/B t
 | Single-TMU "trilinear" | mipmap dithering: per-pixel pick LOD *n* or *n+1* by Bayer threshold vs LOD fraction (avg +0.375, needs bias comp) | `vd_mipdither` |
 | LOD bias (Glide default ≈ -0.35) | added to computed `log2(rho)` (tLOD.lodbias convention; negative favours finer) | `vd_lodbias` |
 | Table fog (64 entries, exp²) | capability gate: per-pixel table lookup on w, blend to fog colour; scene contribution is zero unless a scene/material/profile enables it (no haze in `base1`) | `vd_fog` |
-| Glide gamma ≈ 1.3 | display-stage transfer LUT applied before dithering; 1.3 is a project preset, not a hardware constant | `vd_gamma` |
+| Glide gamma ≈ 1.3 | display-stage transfer LUT after reconstruction (RAMDAC placement); 1.3 is a project preset, not a hardware constant | `vd_gamma` |
 | 256×256 texture cap | asset cooker downsamples oversized WALs; helper currently returns capped dimensions — real texel resampling + mip/UV adjustment pending | `vd_maxtexsize` |
 | 16-bit Z precision at visibility tests | 16 for the hardware profile; the per-frame helper is a banding-only approximation (post-hoc, cannot affect visibility) — true emulation must quantise before test/write | `vd_zbits` |
 | 8-bit palettised textures (GL_EXT_shared_texture_palette) | texture storage/upload policy (paletted vs expanded RGB); expand through the palette at sample time; never gates filtering | `vd_palettetex` |
 | No per-pixel colour overbright, lightmap modulate ×2 | explicit compat policy: multiply, then clamp — clipping highlights like the real thing; blanket ×2 pending `gl_image.c` upload-intensity/`inverse_intensity` audit for strict mode | `vd_overbright` |
 | Dither matrix profile data (read-path only) | `2x2` \| `4x4`; current approximation is `4x4` | `vd_dithermode` |
-| Reconstruction mode profile data (read-path only) | `legacy` (current 4×4-dither + 2×2-box approx — not an established hardware pairing) \| `2x2sub+2x2box` \| `4x4sub+4x1` (vidProcCfg modes, reserved) | `vd_reconmode` |
-| Reconstruction edge thresholds profile data (read-path only) | `r,g,b` rgbMaxDelta thresholds; `0,0,0` = no rejection (current unconditional box) | `vd_rgbmaxdelta` |
+| Reconstruction mode (matched scanout) | `2x2sub+2x2box` (default: subtract 2x2 pattern then 2x2 box with edge rejection) \| `4x4sub+4x1` \| `legacy` (unconditional box, no subtract — compat alias) | `vd_reconmode` |
+| Reconstruction edge thresholds | `r,g,b` rgbMaxDelta thresholds; default `8,8,8` (smooth gradients pass, hard edges stay sharp) | `vd_rgbmaxdelta` |
 
-The current cvar preset is the **legacy** preset: it preserves long-standing captures and
-defaults. Do not change global defaults to make an uncalibrated image more dramatic — new
-defaults need a hardware/driver capture reference (Quake II build, MiniGL/driver version,
-gamma and filter settings) reviewed by a human. The three profile-data cvars
-(`vd_dithermode`, `vd_reconmode`, `vd_rgbmaxdelta`) are read-path only: they document the
-selected hardware state for future calibration and currently change no rendering behaviour.
+The current cvar preset is the **matched** preset: linear pack → matched
+reconstruction → display gamma (RAMDAC placement). `legacy` remains as an
+accepted alias for the unconditional box with no dither subtraction.
 
 Deliberately **not** emulated: the Voodoo's 3-bit sub-pixel accuracy, the 4 MB texture memory thrash,
 and the 22-bit output's chroma-only filtering (we filter all channels — it looks the same at 2× scale).

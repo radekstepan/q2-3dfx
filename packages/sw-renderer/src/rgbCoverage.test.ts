@@ -13,7 +13,9 @@ import {
 } from './alias.js';
 import {
   SPAN_FLAT, SPAN_OPAQUE, SPAN_TRANS33, SPAN_TRANS66, SPAN_TURBULENT,
-  buildRGBMaterial, createSpan, drawSpansRGB, type SpanList,
+  buildRGBMaterial, createSpan, drawSpansRGB,
+  windowDepth01, windowDepthQ16, DEFAULT_RGB_FAR, DEFAULT_RGB_NEAR,
+  type SpanList,
 } from './spans.js';
 import { drawParticlesRGB } from './particles.js';
 import { drawSpriteRGB } from './sprites.js';
@@ -53,6 +55,18 @@ function testPalette(): Uint8Array {
   return pal;
 }
 
+/** Fresh 565 authority planes (depth cleared to all-ones = far). */
+function mkPlanes(n: number): { q: Uint16Array; cover: Uint8Array; depth: Uint16Array } {
+  return { q: new Uint16Array(n), cover: new Uint8Array(n), depth: new Uint16Array(n).fill(0xffff) };
+}
+
+/** Expand one stored 565 quantum to 8:8:8 (matches the endFrame resolve). */
+function expandQ(q: Uint16Array, i: number): [number, number, number] {
+  const v = q[i]!;
+  const r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
+  return [(r5 << 3) | (r5 >> 2), (g6 << 2) | (g6 >> 4), (b5 << 3) | (b5 >> 2)];
+}
+
 /** 1x2 run: constant u/v/depth, no lightmap (lv < 0). */
 function flatSpan(u: number, kind = SPAN_OPAQUE): ReturnType<typeof createSpan> {
   const s = createSpan();
@@ -74,46 +88,40 @@ describe('transparent texels (index 255)', () => {
     const mat = buildRGBMaterial(texels, 2, 1, pal, null,
       { overbright: false, lodBias: 0, mipDither: false });
     // u = 1 lands on the 255 texel
-    const color = new Uint32Array(2);
-    const cover = new Uint8Array(2);
-    const zb = new Float32Array(2);
+    const pl = mkPlanes(2);
     const list: SpanList = { spans: [flatSpan(1)], count: 1 };
-    const r = drawSpansRGB(color, cover, zb, 2, 1, list, mat);
+    const r = drawSpansRGB(pl.q, pl.cover, pl.depth, 2, 1, list, mat);
     expect(r.spans).toBe(1);
-    expect([...cover]).toEqual([0, 0]);
-    expect(zb[0]).toBe(0);
-    expect(zb[1]).toBe(0);
+    expect([...pl.cover]).toEqual([0, 0]);
+    expect(pl.depth[0]).toBe(0xffff);
+    expect(pl.depth[1]).toBe(0xffff);
     // u = 0 lands on texel 10 -> drawn with the palette color, depth written
-    const color2 = new Uint32Array(2);
-    const cover2 = new Uint8Array(2);
-    const zb2 = new Float32Array(2);
+    const pl2 = mkPlanes(2);
     const list2: SpanList = { spans: [flatSpan(0)], count: 1 };
-    drawSpansRGB(color2, cover2, zb2, 2, 1, list2, mat);
-    expect([...cover2]).toEqual([1, 1]);
-    expect(zb2[0]).toBe(1);
-    const px = color2[0]!;
-    expect(px & 255).toBe(10);
-    expect((px >> 8) & 255).toBe(10);
-    expect((px >> 16) & 255).toBe(10);
+    drawSpansRGB(pl2.q, pl2.cover, pl2.depth, 2, 1, list2, mat);
+    expect([...pl2.cover]).toEqual([1, 1]);
+    expect(pl2.depth[0]).not.toBe(0xffff);
+    // 8-bit 10 quantises to 8 through RGB565 (10>>3=1 -> 8)
+    expect(expandQ(pl2.q, 0)).toEqual([8, 8, 8]);
   });
 
   it('translucent spans skip 255 holes too (no blended fringe, no depth)', () => {
     const pal = grayPalette();
     const mat = buildRGBMaterial(new Uint8Array([10, 255]), 2, 1, pal, null,
       { blend: 'alpha', alpha: 0.5, overbright: false, lodBias: 0, mipDither: false });
-    const color = new Uint32Array([0x42424242, 0x42424242]);
-    const cover = new Uint8Array(2);
-    const zb = new Float32Array(2);
+    const pl = mkPlanes(2);
+    pl.q[0] = 0x4242; pl.q[1] = 0x4242;
     const list: SpanList = { spans: [flatSpan(1, SPAN_TRANS33)], count: 1 };
-    drawSpansRGB(color, cover, zb, 2, 1, list, mat);
-    expect([...cover]).toEqual([0, 0]);
-    expect(zb[0]).toBe(0);
-    expect(color[0]).toBe(0x42424242);
+    drawSpansRGB(pl.q, pl.cover, pl.depth, 2, 1, list, mat);
+    expect([...pl.cover]).toEqual([0, 0]);
+    expect(pl.depth[0]).toBe(0xffff);
+    expect(pl.q[0]).toBe(0x4242);
   });
 });
 
 describe('alpha ordering + blend ratios', () => {
-  const BG = (50 | (50 << 8) | (50 << 16) | 0xff000000) >>> 0;
+  // 8-bit (50,50,50) background, stored + blended as RGB565: (49,48,49)
+  const BG565 = (((50 >> 3) << 11) | ((50 >> 2) << 5) | (50 >> 3)) & 0xffff;
 
   function coloredMats(): { red: ReturnType<typeof buildRGBMaterial>; blue: ReturnType<typeof buildRGBMaterial> } {
     const pal = new Uint8Array(768);
@@ -126,36 +134,30 @@ describe('alpha ordering + blend ratios', () => {
     };
   }
 
-  function drawOne(mat: ReturnType<typeof buildRGBMaterial>, color: Uint32Array): void {
+  function drawOne(mat: ReturnType<typeof buildRGBMaterial>, q: Uint16Array, depth: Uint16Array): void {
     const cover = new Uint8Array(1);
-    const zb = new Float32Array(1);
-    drawSpansRGB(color, cover, zb, 1, 1, { spans: [flatSpan(0)], count: 1 }, mat);
+    drawSpansRGB(q, cover, depth, 1, 1, { spans: [flatSpan(0)], count: 1 }, mat);
   }
 
   it('back-to-front over-blend matches the manual composite exactly', () => {
     const { red, blue } = coloredMats();
-    const color = new Uint32Array([BG]);
-    drawOne(red, color);   // far: red 0.5 over bg
-    drawOne(blue, color);  // near: blue 0.5 over that
-    const px = color[0]!;
-    // red over bg: ((50*128 + 200*128 + 128) >> 8, ...) = (125, 30, 30)
-    // blue over that: r = (125*128 + 10*128 + 128) >> 8 = 68,
-    // g = (30*128 + 10*128 + 128) >> 8 = 20,
-    // b = (30*128 + 200*128 + 128) >> 8 = 115
-    expect(px & 255).toBe(68);
-    expect((px >> 8) & 255).toBe(20);
-    expect((px >> 16) & 255).toBe(115);
+    // each draw takes a fresh cleared depth plane (same near iz), like the
+    // old test; only the 565 color plane carries over
+    const q = new Uint16Array([BG565]);
+    drawOne(red, q, new Uint16Array([0xffff]));   // far: red 0.5 over bg
+    drawOne(blue, q, new Uint16Array([0xffff]));  // near: blue 0.5 over that
+    // red over bg565 (49,48,49): (125,29,30) -> 565 -> (123,28,24);
+    // blue over that: (67,19,112) -> 565 -> (66,16,115)
+    expect(expandQ(q, 0)).toEqual([66, 16, 115]);
   });
 
   it('reversed draw order gives a different (wrong-order) result', () => {
     const { red, blue } = coloredMats();
-    const color = new Uint32Array([BG]);
-    drawOne(blue, color);
-    drawOne(red, color);
-    const px = color[0]!;
-    expect(px & 255).toBe(115);
-    expect((px >> 8) & 255).toBe(20);
-    expect((px >> 16) & 255).toBe(68);
+    const q = new Uint16Array([BG565]);
+    drawOne(blue, q, new Uint16Array([0xffff]));
+    drawOne(red, q, new Uint16Array([0xffff]));
+    // blue over bg first, then red: (112,19,67) -> 565 -> (115,16,66)
+    expect(expandQ(q, 0)).toEqual([115, 16, 66]);
   });
 
   it('TRANS66 uses the 66 ratio and never writes depth', () => {
@@ -163,14 +165,14 @@ describe('alpha ordering + blend ratios', () => {
     pal[1 * 3] = 200; pal[1 * 3 + 1] = 10; pal[1 * 3 + 2] = 10;
     const mat = buildRGBMaterial(new Uint8Array([1]), 1, 1, pal, null,
       { blend: 'opaque', overbright: false, lodBias: 0, mipDither: false });
-    const color = new Uint32Array([BG]);
+    const q = new Uint16Array([BG565]);
     const cover = new Uint8Array(1);
-    const zb = new Float32Array(1);
-    drawSpansRGB(color, cover, zb, 1, 1, { spans: [flatSpan(0, SPAN_TRANS66)], count: 1 }, mat);
+    const depth = new Uint16Array([0xffff]);
+    drawSpansRGB(q, cover, depth, 1, 1, { spans: [flatSpan(0, SPAN_TRANS66)], count: 1 }, mat);
     expect([...cover]).toEqual([1]);
-    expect(zb[0]).toBe(0);
-    // 169/256: r = (50*87 + 200*169 + 128) >> 8 = 149
-    expect(color[0]! & 255).toBe(149);
+    expect(depth[0]).toBe(0xffff);
+    // 169/256 over bg565 (49,48,49): (149,23,23) -> 565 -> (148,20,16)
+    expect(expandQ(q, 0)).toEqual([148, 20, 16]);
   });
 });
 
@@ -179,22 +181,21 @@ describe('flat spans + unsupported combos', () => {
     const pal = grayPalette();
     const mat = buildRGBMaterial(new Uint8Array([0]), 1, 1, pal, null,
       { flatColor: new Uint8Array([10, 20, 30]) });
-    const color = new Uint32Array(2);
-    const cover = new Uint8Array(2);
-    const zb = new Float32Array(2);
-    drawSpansRGB(color, cover, zb, 2, 1, { spans: [flatSpan(0, SPAN_FLAT)], count: 1 }, mat);
-    expect([...cover]).toEqual([1, 1]);
-    expect(zb[0]).toBe(1);
-    expect(color[0]).toBe((0xff000000 | (30 << 16) | (20 << 8) | 10) >>> 0);
+    const pl = mkPlanes(2);
+    drawSpansRGB(pl.q, pl.cover, pl.depth, 2, 1, { spans: [flatSpan(0, SPAN_FLAT)], count: 1 }, mat);
+    expect([...pl.cover]).toEqual([1, 1]);
+    // iz = 1 is nearer than the default window near (4): depth01 clamps to
+    // 0 (nearest quantum), written on the pass
+    expect(pl.depth[0]).toBe(0);
+    // (10,20,30) -> 565 (r5=1,g6=5,b5=3) -> (8,20,24)
+    expect(expandQ(pl.q, 0)).toEqual([8, 20, 24]);
   });
 
   it('FLAT without flatColor Com_Errors (never silent wrong pixels)', () => {
     const pal = grayPalette();
     const mat = buildRGBMaterial(new Uint8Array([7]), 1, 1, pal, null, {});
-    const color = new Uint32Array(1);
-    const cover = new Uint8Array(1);
-    const zb = new Float32Array(1);
-    expect(() => drawSpansRGB(color, cover, zb, 1, 1,
+    const pl = mkPlanes(1);
+    expect(() => drawSpansRGB(pl.q, pl.cover, pl.depth, 1, 1,
       { spans: [flatSpan(0, SPAN_FLAT)], count: 1 }, mat)).toThrow();
   });
 
@@ -203,10 +204,8 @@ describe('flat spans + unsupported combos', () => {
     const mat = buildRGBMaterial(new Uint8Array([7]), 1, 1, pal, null, {});
     const s = flatSpan(0);
     s.kind = 99;
-    const color = new Uint32Array(1);
-    const cover = new Uint8Array(1);
-    const zb = new Float32Array(1);
-    expect(() => drawSpansRGB(color, cover, zb, 1, 1,
+    const pl = mkPlanes(1);
+    expect(() => drawSpansRGB(pl.q, pl.cover, pl.depth, 1, 1,
       { spans: [s], count: 1 }, mat)).toThrow();
   });
 });
@@ -239,7 +238,7 @@ describe('alias RGB: viewmodel depth-hack + colored lights', () => {
   function renderTri(opts: {
     depthScale?: number; dlights?: { origin: Float32Array; intensity: number; color: Float32Array }[] | null;
     wallIz?: number;
-  }): { cover: Uint8Array; color: Uint32Array; zb: Float32Array } {
+  }): { cover: Uint8Array; q: Uint16Array; depth: Uint16Array } {
     const W = 64, H = 64;
     const cam = setupCamera(
       new Float32Array([0, 0, 0]), new Float32Array([0, 0, 0]), 90, W, H);
@@ -247,17 +246,22 @@ describe('alias RGB: viewmodel depth-hack + colored lights', () => {
     const skin = graySkin();
     const mat = buildRGBMaterial(skin.texels, skin.width, skin.height, pal, null,
       { addressS: 'clamp', addressT: 'clamp', overbright: false, lodBias: 0, mipDither: false });
-    const color = new Uint32Array(W * H);
-    const cover = new Uint8Array(W * H);
-    const zb = new Float32Array(W * H).fill(opts.wallIz ?? 0);
-    drawAliasInstanceRGB(color, cover, zb, W, H, {
+    // wall pre-fill as a window-Z quantum (mat.zbits 0 = full-precision
+    // float compare path, stored rounded to 16 bits like the filler does)
+    const wallIz = opts.wallIz ?? 0;
+    const wallQ = wallIz > 0
+      ? Math.round(windowDepth01(wallIz, cam.near, cam.far) * 65535) & 0xffff
+      : 0xffff;
+    const pl = mkPlanes(W * H);
+    if (wallIz > 0) pl.depth.fill(wallQ);
+    drawAliasInstanceRGB(pl.q, pl.cover, pl.depth, W, H, {
       mesh: triMesh(),
       origin: new Float32Array([0, 0, 0]),
       angles: new Float32Array([0, 0, 0]),
       frameA: 0, frameB: 0, lerp: 0, lightAngle: 0,
       depthScale: opts.depthScale ?? 1,
-    }, mat, cam, anorms, dots, opts.dlights ?? null);
-    return { cover, color, zb };
+    }, mat, cam, anorms, dots, opts.dlights ?? null, { near: cam.near, far: cam.far });
+    return { cover: pl.cover, q: pl.q, depth: pl.depth };
   }
 
   it('depth-hack scale wins vs a nearer wall (viewmodel semantics)', () => {
@@ -267,12 +271,15 @@ describe('alias RGB: viewmodel depth-hack + colored lights', () => {
     const hacked = renderTri({ wallIz: 0.02, depthScale: 3 });
     const n = hacked.cover.reduce((a, b) => a + b, 0);
     expect(n).toBeGreaterThan(100);
-    // stored depth is the SCALED 1/z (like the classic depthScale path)
-    let scaled = 0;
-    for (let i = 0; i < hacked.zb.length; i++) {
-      if (hacked.cover[i] === 1) { scaled = hacked.zb[i]!; break; }
+    // stored depth is the window-Z quantum of the SCALED 1/z (like the
+    // classic depthScale path, mapped through the projection window)
+    let scaled = -1;
+    for (let i = 0; i < hacked.depth.length; i++) {
+      if (hacked.cover[i] === 1) { scaled = hacked.depth[i]!; break; }
     }
-    expect(scaled).toBeCloseTo(0.03, 5);
+    const cam = setupCamera(new Float32Array([0, 0, 0]), new Float32Array([0, 0, 0]), 90, 64, 64);
+    const wantQ = windowDepthQ16(windowDepth01(0.01 * 3, cam.near, cam.far), 0);
+    expect(scaled).toBe(wantQ);
   });
 
   it('red/blue dynamic lights keep hues on the model', () => {
@@ -282,8 +289,7 @@ describe('alias RGB: viewmodel depth-hack + colored lights', () => {
     let rn = 0;
     for (let i = 0; i < red.cover.length; i++) {
       if (red.cover[i] !== 1) continue;
-      const px = red.color[i]!;
-      const r = px & 255, g = (px >> 8) & 255, b = (px >> 16) & 255;
+      const [r, g, b] = expandQ(red.q, i);
       expect(r).toBeGreaterThan(g + 40);
       expect(r).toBeGreaterThan(b + 40);
       rn++;
@@ -295,8 +301,7 @@ describe('alias RGB: viewmodel depth-hack + colored lights', () => {
     let bn = 0;
     for (let i = 0; i < blue.cover.length; i++) {
       if (blue.cover[i] !== 1) continue;
-      const px = blue.color[i]!;
-      const r = px & 255, g = (px >> 8) & 255, b = (px >> 16) & 255;
+      const [r, g, b] = expandQ(blue.q, i);
       expect(b).toBeGreaterThan(r + 40);
       expect(b).toBeGreaterThan(g + 40);
       bn++;
@@ -309,9 +314,11 @@ describe('alias RGB: viewmodel depth-hack + colored lights', () => {
     let n = 0;
     for (let i = 0; i < lit.cover.length; i++) {
       if (lit.cover[i] !== 1) continue;
-      const px = lit.color[i]!;
-      expect(px & 255).toBe((px >> 8) & 255);
-      expect(px & 255).toBe((px >> 16) & 255);
+      const [r, g, b] = expandQ(lit.q, i);
+      // 565 grey ramps expand achromatically up to the 5/6-bit rounding:
+      // r/b (5-bit) expand identically, g (6-bit) stays within 4
+      expect(r).toBe(b);
+      expect(Math.abs(g - r)).toBeLessThanOrEqual(4);
       n++;
     }
     expect(n).toBeGreaterThan(100);
@@ -328,20 +335,18 @@ describe('sprite / particle / beam RGB', () => {
     texels[2 * 4 + 2] = 255;
     const mat = buildRGBMaterial(texels, 4, 4, pal, null,
       { addressS: 'clamp', addressT: 'clamp', overbright: false, lodBias: 0, mipDither: false });
-    const color = new Uint32Array(W * H);
-    const cover = new Uint8Array(W * H);
-    const zb = new Float32Array(W * H);
-    const n = drawSpriteRGB(color, cover, zb, W, H,
+    const pl = mkPlanes(W * H);
+    const n = drawSpriteRGB(pl.q, pl.cover, pl.depth, W, H,
       { origin: new Float32Array([20, 0, 0]), width: 8, height: 8, texId: 0, grade: 60 },
       [{ width: 4, height: 4, texels }], mat, cam, { spans: [], count: 0 }, 1024);
     expect(n).toBeGreaterThan(0);
-    const total = cover.reduce((a, b) => a + b, 0);
+    const total = pl.cover.reduce((a, b) => a + b, 0);
     expect(total).toBeGreaterThan(0);
     // billboard bbox is fully spanned, so a hole must leave zeros inside it
     let minX = W, maxX = -1, minY = H, maxY = -1;
     for (let y = 0; y < H; y++) {
       for (let x = 0; x < W; x++) {
-        if (zb[y * W + x]! > 0) {
+        if (pl.depth[y * W + x]! !== 0xffff) {
           if (x < minX) minX = x;
           if (x > maxX) maxX = x;
           if (y < minY) minY = y;
@@ -356,21 +361,21 @@ describe('sprite / particle / beam RGB', () => {
   it('particles expand the palette and depth-test', () => {
     const W = 8, H = 8;
     const pal = grayPalette();
-    const color = new Uint32Array(W * H);
-    const cover = new Uint8Array(W * H);
-    const zb = new Float32Array(W * H);
-    const n = drawParticlesRGB(color, cover, zb, W, H,
+    const pl = mkPlanes(W * H);
+    const n = drawParticlesRGB(pl.q, pl.cover, pl.depth, W, H,
       [{ x: 3, y: 4, iz: 0.5, color: 200 }], 0, 1, pal);
     expect(n).toBe(1);
-    expect(cover[4 * W + 3]).toBe(1);
-    expect(zb[4 * W + 3]).toBe(0.5);
-    const px = color[4 * W + 3]!;
-    expect(px & 255).toBe(200);
-    // nearer depth already written -> skipped
-    const n2 = drawParticlesRGB(color, cover, zb, W, H,
+    expect(pl.cover[4 * W + 3]).toBe(1);
+    // window-Z quantum of iz = 0.5 under the default 4..4096 window
+    expect(pl.depth[4 * W + 3]).toBe(
+      windowDepthQ16(windowDepth01(0.5, DEFAULT_RGB_NEAR, DEFAULT_RGB_FAR), 16));
+    // 8-bit 200 quantises to 206 through RGB565 (200>>3=25 -> 206)
+    expect(expandQ(pl.q, 4 * W + 3)[0]).toBe(206);
+    // farther fragment (smaller iz -> larger window-Z) -> skipped
+    const n2 = drawParticlesRGB(pl.q, pl.cover, pl.depth, W, H,
       [{ x: 3, y: 4, iz: 0.25, color: 100 }], 0, 1, pal);
     expect(n2).toBe(0);
-    expect(color[4 * W + 3]! & 255).toBe(200);
+    expect(expandQ(pl.q, 4 * W + 3)[0]).toBe(206);
   });
 
   it('beams add onto the plane, depth-tested', () => {
@@ -378,21 +383,17 @@ describe('sprite / particle / beam RGB', () => {
     const cam = setupCamera(
       new Float32Array([0, 0, 0]), new Float32Array([0, 0, 0]), 90, W, H);
     const pal = grayPalette();
-    const color = new Uint32Array(W * H);
-    const cover = new Uint8Array(W * H);
-    const zb = new Float32Array(W * H);
-    const n = drawTracerBeamRGB(color, cover, zb, W, H, cam,
+    const pl = mkPlanes(W * H);
+    const n = drawTracerBeamRGB(pl.q, pl.cover, pl.depth, W, H, cam,
       10, -5, 0, 10, 5, 0, 200, pal);
     expect(n).toBeGreaterThan(0);
-    expect(cover.reduce((a, b) => a + b, 0)).toBeGreaterThan(0);
+    expect(pl.cover.reduce((a, b) => a + b, 0)).toBeGreaterThan(0);
     // fully behind the near plane -> nothing
-    const color2 = new Uint32Array(W * H);
-    const cover2 = new Uint8Array(W * H);
-    const zb2 = new Float32Array(W * H);
-    const n2 = drawTracerBeamRGB(color2, cover2, zb2, W, H, cam,
+    const pl2 = mkPlanes(W * H);
+    const n2 = drawTracerBeamRGB(pl2.q, pl2.cover, pl2.depth, W, H, cam,
       1, 0, 0, 2, 0, 0, 200, pal);
     expect(n2).toBe(0);
-    expect(cover2.reduce((a, b) => a + b, 0)).toBe(0);
+    expect(pl2.cover.reduce((a, b) => a + b, 0)).toBe(0);
   });
 });
 

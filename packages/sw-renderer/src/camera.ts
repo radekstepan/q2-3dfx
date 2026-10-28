@@ -14,6 +14,8 @@ export interface Camera {
   focalX: number;
   focalY: number;
   near: number;
+  /** Far plane for the RGB window-Z mapping (depth01 = 1 at far). */
+  far: number;
   /** 4 side planes + near, each {normal: Float32Array(3), dist} inward-facing */
   frustum: { normal: Float32Array; dist: number }[];
 }
@@ -25,6 +27,7 @@ export function setupCamera(
   width: number,
   height: number,
   near = 4,
+  far = 32768,
 ): Camera {
   const forward = new Float32Array(3);
   const right = new Float32Array(3);
@@ -41,6 +44,7 @@ export function setupCamera(
     xCenter: width / 2 - 0.5,
     yCenter: height / 2 - 0.5,
     focalX, focalY, near,
+    far: far > near ? far : 32768,
     frustum: [],
   };
   cam.frustum = buildFrustum(cam);
@@ -158,6 +162,7 @@ export function setupCameraInto(
   width: number,
   height: number,
   near = 4,
+  far = 32768,
 ): Camera {
   AngleVectors(angles, cam.forward, cam.right, cam.up);
   const halfFovX = ((fovX * Math.PI) / 180) / 2;
@@ -169,6 +174,7 @@ export function setupCameraInto(
   cam.focalX = width / 2 / tanX;
   cam.focalY = height / 2 / tanY;
   cam.near = near;
+  cam.far = far > near ? far : 32768;
   const tx = (cam.xCenter + 0.5) / cam.focalX;
   const ty = (cam.yCenter + 0.5) / cam.focalY;
   const f = cam.forward, r = cam.right, u = cam.up, o = cam.origin;

@@ -1,0 +1,5 @@
+---
+"@q2/voodoo": minor
+---
+
+Hardware-correct resolve defaults (single gamma-after-reconstruction path). `resolveFrame` no longer keeps the historical LUT-on-source ordering: every reconmode now packs a linear 565 target (gamma 1) → dither+quant → reconstruction/box → `applyDisplayGamma` on the display plane (guide §7.2 RAMDAC order), postfilter-off included (linear pack → expand → display gamma). The `legacy` reconmode stays an accepted alias for the unconditional 2x2 box (no subtraction, no edge rejection) with the same gamma placement — the gamma-on-source ordering is removed, so the `e923ad78` golden is recomputed (`f4ebd424`, now bound against the linear input). Default `reconmode` changes `'legacy'` → `'2x2sub+2x2box'` (matched mode; unknown strings fall back there, `legacy` still parses to itself) and default `rgbmaxdelta` changes `{0,0,0}` → `{8,8,8}` (smooth passes, hard edges reject). `VOODOO_APPROX_PROFILE` updated (`scanout.default` replaces `scanout.legacy-default`, gamma-stage/order entries describe the single path). `vd_16bit=0` RGB888 bypass (gamma on, dither/recon off) and mode-forced subtract (null when dither off) are unchanged.

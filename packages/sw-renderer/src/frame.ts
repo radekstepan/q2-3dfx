@@ -57,10 +57,12 @@ const MAX_ROW = 4096;
  * indexed path (always drawn, so `index` + the software depth plane stay
  * bit-identical) and the RGB overlay (opaque world, turbulent water,
  * sky/skybox, translucent glass/water, alias/MD2 incl. the depth-hack
- * viewmodel, sprites, particles, tracer beams) into an RGB888 plane +
- * coverage mask composited in endFrame. The RGB path owns a SEPARATE depth
- * plane (rgbZb): sharing the software zb would perturb indexed draws after
- * it (strict-greater tests). Pooled (banded) backends route the same RGB
+ * viewmodel, sprites, particles, tracer beams) into a packed RGB565 plane
+ * + window-Z Uint16 depth plane + coverage mask, composited (565 expanded
+ * to 8:8:8) in endFrame. The RGB path owns SEPARATE planes: sharing the
+ * software zb would perturb indexed draws after it, and sharing an 888
+ * color plane would hide the hardware 565 quantise (blends must read the
+ * quantized destination). Pooled (banded) backends route the same RGB
  * spans per band (inline, absolute screen coords) and merge them in the
  * single global endFrame composite; the wasm backend has no RGB pass and
  * errors explicitly when the flag is on (never silent software output).
@@ -313,31 +315,34 @@ export class SoftwareRenderer implements Refresh {
   private dlights = new DLightState();
   private lastDynSerial = 0;
   /**
-   * Serial RGB world pass state (astra V2a/V2c). Planes are sized in init()
-   * and re-attached every enabled frame so backend switches (wasm/banded)
-   * can never leave a stale depth view behind. All no-ops while the module
-   * flag is off.
+   * Serial RGB world pass state (astra V2a/V2c + true-565 window-Z). Planes
+   * are sized in init() and re-attached every enabled frame so backend
+   * switches (wasm/banded) can never leave a stale depth view behind. All
+   * no-ops while the module flag is off.
    */
   private readonly rgbBackend = new RGBWorldBackend();
-  private rgbColor: Uint32Array = new Uint32Array(0);
+  /**
+   * Packed RGB565 authority plane (5:6:5, the ONLY RGB color target). Every
+   * opaque write quantises 8:8:8 -> 565 on write; translucent/alpha/additive
+   * expand the stored quantum, blend in 8-bit, and re-quantise.
+   */
+  private rgb565: Uint16Array = new Uint16Array(0);
   private rgbCover: Uint8Array = new Uint8Array(0);
   /**
-   * RGB-owned depth plane (step 3): the RGB overlay depth-tests and writes
-   * here instead of the software zb, so the always-drawn classic path keeps
-   * bit-identical depth decisions whether the flag is on or off. 1/z
-   * semantics, same strict-greater test.
-   */
-  private rgbZb: Float32Array = new Float32Array(0);
-  /**
-   * Optional 16-bit authority depth plane (M4.1 vd_zbits): attached to the
-   * RGB backend while the fidelity snapshot selects 1..23 bits and cleared
-   * to 0 (far: 1/z is larger-nearer, so far is the minimum) every enabled
-   * frame. Span tests/writes go to the int plane with the float round-trip
-   * mirrored to rgbZb, so foreground effect draws that only see the float
-   * plane stay consistent. Detached (left stale, never read) while zbits
-   * is 0.
+   * RGB-owned window-Z depth plane (Voodoo3 hardware model): normalized
+   * depth01 quanta, integer LESS wins, ties keep stored (first wins),
+   * cleared to 0xFFFF (far) every enabled frame. The always-drawn classic
+   * path keeps bit-identical depth decisions whether the flag is on or off
+   * (it never reads this plane).
    */
   private rgbDepth16: Uint16Array = new Uint16Array(0);
+  /**
+   * EndFrame resolve scratch only (expanded from rgb565 where covered).
+   * Nothing blends against it mid-frame.
+   */
+  private rgbColor: Uint32Array = new Uint32Array(0);
+  /** Projection window for this frame's window-Z mapping (from the Camera). */
+  private rgbWin: { near: number; far: number } = { near: 4, far: 32768 };
   /**
    * Fidelity snapshot for this frame's RGB materials (M4.1 resolve chain):
    * refreshed from the vd_* cvars once per renderView; any change drops the
@@ -515,11 +520,11 @@ export class SoftwareRenderer implements Refresh {
     this.idx = fb.index;
     this.zb = fb.depth;
     this.color = fb.color;
-    this.rgbColor = new Uint32Array(fb.width * fb.height);
+    this.rgb565 = new Uint16Array(fb.width * fb.height);
     this.rgbCover = new Uint8Array(fb.width * fb.height);
-    this.rgbZb = new Float32Array(fb.width * fb.height);
     this.rgbDepth16 = new Uint16Array(fb.width * fb.height);
-    this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, this.rgbDepth16);
+    this.rgbColor = new Uint32Array(fb.width * fb.height);
+    this.rgbBackend.attach(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
     this.pickSkyIndex();
     for (let i = 0; i < MAX_SPANS; i++) this.pool.push(createSpan());
     for (let i = 0; i < MAX_SPANS; i++) this.tmpSort.push(this.pool[i]!);
@@ -915,11 +920,8 @@ export class SoftwareRenderer implements Refresh {
     rgbWorldEnabled = on === true;
     this.rgbUsedThisFrame = false;
     if (this.rgbCover.length > 0) this.rgbCover.fill(0);
-    if (this.rgbZb.length > 0) this.rgbZb.fill(0);
-    // Far in 1/z semantics is the minimum (larger 1/z wins), so the int
-    // plane clears to 0 — NOT all-ones (that clear value belongs to the
-    // LESS-wins window-Z convention; see the backend doc).
-    if (this.rgbDepth16.length > 0) this.rgbDepth16.fill(0);
+    // Window-Z clear value is all-ones (far) under the LESS-wins convention.
+    if (this.rgbDepth16.length > 0) this.rgbDepth16.fill(0xffff);
     this.rgbCache.invalidateAll();
     this.rgbSkinMats.clear();
     this.rgbSkyMat = null;
@@ -962,7 +964,7 @@ export class SoftwareRenderer implements Refresh {
     this.rgbSkyMat = null;
     this.rgbFlatSky = null;
     if (zChanged && rgbWorldEnabled && this.rgbDepth16.length > 0) {
-      this.rgbDepth16.fill(0);
+      this.rgbDepth16.fill(0xffff);
     }
   }
 
@@ -978,32 +980,36 @@ export class SoftwareRenderer implements Refresh {
    * endFrame runs the single global composite.
    */
   private drawRGBSpans(list: SpanList, mat: RGBMaterial): void {
-    if (this.backend === this.bandBackend) this.bandBackend.drawSpansRGB(list, mat);
-    else this.rgbBackend.drawSpansRGB(list, mat);
+    if (this.backend === this.bandBackend) this.bandBackend.drawSpansRGB(list, mat, this.rgbWin);
+    else this.rgbBackend.drawSpansRGB(list, mat, this.rgbWin);
     this.rgbUsedThisFrame = true;
   }
 
   /**
-   * Seed the RGB plane from the indexed framebuffer (palette expand) before
-   * any RGB foreground/alpha draws. Alpha/additive RGB composites read the
-   * current plane pixel as their destination, so the seed gives them the
-   * exact software background (opaque world already drawn classically);
-   * opaque RGB writes overwrite it. Pixels the world RGB pass already
-   * covered are spared (their filtered color survives); uncovered pixels
-   * composite from the identical indexed expand in endFrame either way.
-   * Called once at the top of drawForeground (covers world + foreground).
+   * Seed the packed RGB565 plane from the indexed framebuffer (palette
+   * expand + 8:8:8 -> 565 quantise) before any RGB foreground/alpha draws.
+   * Alpha/additive RGB composites read the STORED 565 quantum as their
+   * destination, so the seed gives them the exact software background
+   * (opaque world already drawn classically); opaque RGB writes overwrite
+   * it. Pixels the world RGB pass already covered are spared (their
+   * filtered color survives); uncovered pixels composite from the identical
+   * indexed expand in endFrame either way. Called once at the top of
+   * drawForeground (covers world + foreground).
    */
   private seedRGBBackground(): void {
     const pal = this.palette;
     const src = this.idx;
-    const dst = this.rgbColor;
+    const dst = this.rgb565;
     const cover = this.rgbCover;
     const n = this.fbW * this.fbH;
     for (let i = 0; i < n; i++) {
       if (cover[i] !== 0) continue;
       const c = src[i]! * 3;
       const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
-      dst[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      const rr = r < 0 ? 0 : r > 255 ? 255 : r | 0;
+      const gg = g < 0 ? 0 : g > 255 ? 255 : g | 0;
+      const bb = b < 0 ? 0 : b > 255 ? 255 : b | 0;
+      dst[i] = (((rr >> 3) << 11) | ((gg >> 2) << 5) | (bb >> 3)) & 0xffff;
     }
   }
 
@@ -1147,17 +1153,16 @@ export class SoftwareRenderer implements Refresh {
     this.rgbBackend.pixelsDrawn = 0;
     this.rgbUsedThisFrame = false;
     if (rgbWorldEnabled) {
-      this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, this.rgbDepth16);
+      this.rgbBackend.attach(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
       this.rgbCover.fill(0);
-      this.rgbZb.fill(0);
-      // 16-bit plane clears to 0 (far under larger-1/z-wins; see the field
-      // doc). Detached-but-stale while zbits is 0 (no RGB test reads it).
-      this.rgbDepth16.fill(0);
+      // Window-Z clear value is all-ones (far) under the LESS-wins
+      // convention (see the field doc).
+      this.rgbDepth16.fill(0xffff);
       // The banded backend partitions RGB spans per row band over the same
       // planes (workers never touch them); binding follows the live planes
       // like the serial backend above.
       if (this.backend === this.bandBackend) {
-        this.bandBackend.attachRGB(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, this.rgbDepth16);
+        this.bandBackend.attachRGB(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
       }
     }
     this.rgbCache.nextFrame();
@@ -1175,6 +1180,10 @@ export class SoftwareRenderer implements Refresh {
     const cam = this.camMemo
       ? setupCameraInto(this.camMemo, view.origin, view.angles, view.fovX, this.fbW, this.fbH)
       : (this.camMemo = setupCamera(view.origin, view.angles, view.fovX, this.fbW, this.fbH));
+    // Thread the projection window (near/far) into every RGB draw this
+    // frame: the window-Z mapping derives normalized depth from it.
+    this.rgbWin = { near: cam.near, far: cam.far };
+    this.rgbBackend.setWindow(cam.near, cam.far);
     this.backend.time = view.time;
     // Renderer-owned dynamic lights (muzzle flashes) age out on their own:
     // expire before the serial check so a stale flash invalidates the cache
@@ -1727,11 +1736,11 @@ export class SoftwareRenderer implements Refresh {
       }, skin, cam, this.anorms, this.shadeDots, this.colormap);
       if (rgbActive) {
         this.rgbBackend.pixelsDrawn += drawAliasInstanceRGB(
-          this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, {
+          this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, {
             mesh, origin: pa.origin, angles: pa.angles,
             frameA: pa.frameA, frameB: pa.frameB, lerp: pa.lerp,
             lightAngle: ((pa.angles[1]! * 256) / 360) & 255,
-          }, this.rgbMaterialForSkin(skin), cam, this.anorms, this.shadeDots, dyn);
+          }, this.rgbMaterialForSkin(skin), cam, this.anorms, this.shadeDots, dyn, this.rgbWin);
         this.rgbUsedThisFrame = true;
       }
     }
@@ -1743,9 +1752,9 @@ export class SoftwareRenderer implements Refresh {
         emptyLight, this.colormap, cam, this.spriteScratch, 1024);
       if (rgbActive) {
         this.rgbBackend.pixelsDrawn += drawSpriteRGB(
-          this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH,
+          this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
           { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
-          [tex], this.rgbMaterialForSkin(tex), cam, this.spriteScratch, 1024);
+          [tex], this.rgbMaterialForSkin(tex), cam, this.spriteScratch, 1024, undefined, this.rgbWin);
         this.rgbUsedThisFrame = true;
       }
     }
@@ -1767,8 +1776,8 @@ export class SoftwareRenderer implements Refresh {
       drawParticles(this.idx, this.zb, this.fbW, this.fbH, this.partPool, 0, np);
       if (rgbActive) {
         this.rgbBackend.pixelsDrawn += drawParticlesRGB(
-          this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH,
-          this.partPool, 0, np, this.palette);
+          this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
+          this.partPool, 0, np, this.palette, this.rgbWin);
         this.rgbUsedThisFrame = true;
       }
     }
@@ -1816,13 +1825,13 @@ export class SoftwareRenderer implements Refresh {
         // explosions (no screen-door stipple in the RGB path).
         if (rgbActive) {
           this.rgbBackend.pixelsDrawn += drawAliasInstanceRGB(
-            this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, {
+            this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, {
               mesh: m.data, origin: e.origin, angles: e.angles,
               frameA: frA, frameB: fr, lerp,
               lightAngle: ((e.angles[1]! * 256) / 360) & 255,
               depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
               alpha: alpha >= 1 ? undefined : alpha,
-            }, this.rgbMaterialForSkin(skin), cam, this.anorms, this.shadeDots, dyn);
+            }, this.rgbMaterialForSkin(skin), cam, this.anorms, this.shadeDots, dyn, this.rgbWin);
           this.rgbUsedThisFrame = true;
         }
       } else if (m.kind === 'sp2') {
@@ -1832,9 +1841,9 @@ export class SoftwareRenderer implements Refresh {
           [skin], emptyLight, this.colormap, cam, this.spriteScratch, 1024);
         if (rgbActive) {
           this.rgbBackend.pixelsDrawn += drawSpriteRGB(
-            this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH,
+            this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
             { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
-            [skin], this.rgbMaterialForSkin(skin), cam, this.spriteScratch, 1024);
+            [skin], this.rgbMaterialForSkin(skin), cam, this.spriteScratch, 1024, undefined, this.rgbWin);
           this.rgbUsedThisFrame = true;
         }
       } else if (m.kind === 'tracer') {
@@ -1854,12 +1863,12 @@ export class SoftwareRenderer implements Refresh {
           col);
         if (rgbActive) {
           this.rgbBackend.pixelsDrawn += drawTracerBeamRGB(
-            this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, cam,
+            this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, cam,
             e.origin[0]!, e.origin[1]!, e.origin[2]!,
             e.origin[0]! + this.tracerFwd[0]! * len,
             e.origin[1]! + this.tracerFwd[1]! * len,
             e.origin[2]! + this.tracerFwd[2]! * len,
-            col, this.palette);
+            col, this.palette, TRACER_CORE_COLOR, this.rgbWin);
           this.rgbUsedThisFrame = true;
         }
       }
@@ -1876,10 +1885,10 @@ export class SoftwareRenderer implements Refresh {
         this.tracerColors[ti]!, this.tracerCores[ti]!);
       if (rgbActive) {
         this.rgbBackend.pixelsDrawn += drawTracerBeamRGB(
-          this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, cam,
+          this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, cam,
           this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
           this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
-          this.tracerColors[ti]!, this.palette, this.tracerCores[ti]!);
+          this.tracerColors[ti]!, this.palette, this.tracerCores[ti]!, this.rgbWin);
         this.rgbUsedThisFrame = true;
       }
       this.tracerTtl[ti]--;
@@ -1983,9 +1992,9 @@ export class SoftwareRenderer implements Refresh {
         const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
         this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
       }
-      // RGB composite (step 3): pixels any RGB draw wrote this frame come
-      // from the RGB888 plane (opaque world, water, sky, glass, alias,
-      // sprites, particles, beams); everything else keeps the indexed
+      // RGB composite: pixels any RGB draw wrote this frame expand from
+      // the packed RGB565 authority plane (opaque world, water, sky, glass,
+      // alias, sprites, particles, beams); everything else keeps the indexed
       // resolve. Skipped while disabled, so classic output is untouched.
       if (this.rgbUsedThisFrame) this.compositeRGB();
     }
@@ -1993,15 +2002,25 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
-   * Merge the RGB overlay plane over the resolved color plane wherever the
+   * Merge the RGB overlay over the resolved color plane wherever the
    * coverage mask is set (the single global reconstruct for every backend:
-   * serial, banded-inline and pooled all funnel here).
+   * serial, banded-inline and pooled all funnel here). The source is the
+   * packed RGB565 authority plane, expanded to 8:8:8 into the resolve
+   * scratch (5/6-bit upscale replicates the top bits into the low bits).
    */
   private compositeRGB(): void {
-    const rgb = this.rgbColor, cover = this.rgbCover;
+    const q = this.rgb565, cover = this.rgbCover, rgb = this.rgbColor;
     const n = this.fbW * this.fbH;
     for (let i = 0; i < n; i++) {
-      if (cover[i]) this.color[i] = rgb[i]!;
+      if (cover[i]) {
+        const v = q[i]!;
+        const r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
+        rgb[i] = (0xff000000 |
+          ((((b5 << 3) | (b5 >> 2)) << 16) |
+            (((g6 << 2) | (g6 >> 4)) << 8) |
+            ((r5 << 3) | (r5 >> 2)))) >>> 0;
+        this.color[i] = rgb[i]!;
+      }
     }
   }
 

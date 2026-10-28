@@ -1,18 +1,16 @@
-// q2ts-web RGB-world activation proof (P1 feedback #1).
+// q2ts-web RGB-world activation proof.
 //
 // NO MOCKS anywhere in this file: every assertion runs against the REAL
 // `SoftwareRenderer` class (imported from `@q2/sw-renderer`) driving the
-// REAL devroom through the REAL `Host` tick loop. The mocked-hook contract
-// test lives in voodoo-display.test.ts and is marked UNIT-ONLY there.
+// REAL devroom through the REAL `Host` tick loop.
 //
-// Background: `apps/web/src/play.ts armRasterPolicy` used to probe an
-// instance hook (`callFirstHook(boot.refresh, RGB_ENABLE_HOOKS, voodoo)`)
-// that does not exist — `SoftwareRenderer` exposes the RGB-world switch as
-// the MODULE-level `setRGBWorldEnabled(bool)` / `isRGBWorldEnabled()` pair
-// (`packages/sw-renderer/src/frame.ts`). The flag therefore stayed false and
-// voodoo mode silently ran the indexed rasterizer. `armRasterPolicy` now
-// returns a boolean, records `boot.lastRasterPolicy`, and `console.warn`s
-// when no hook consumes the request.
+// Background: `apps/web/src/play.ts armRasterPolicy` probes the instance
+// hook `setRGBWorldEnabled(bool)` on the renderer (with module-level
+// `setRGBWorldEnabled` / `isRGBWorldEnabled` fallback pair in
+// `packages/sw-renderer/src/frame.ts`). The instance method sets the shared
+// module flag AND drops the renderer's RGB caches + coverage, so arming
+// records `hooked: true` on `boot.lastRasterPolicy` and the RGB world pass
+// runs inside the very next renderView.
 
 import { describe, expect, it, afterEach } from 'vitest';
 import { getCVarNumber, setCVar } from '@q2/config';
@@ -83,25 +81,21 @@ describe('voodoo RGB-world activation (real class, no mocks)', () => {
     expect(boot.refresh).toBeInstanceOf(SoftwareRenderer);
   });
 
-  it('instance-hook probe reports the P1 gap loudly when the sw-renderer card is absent', () => {
+  it('instance hook is present on the real class: arming succeeds loudly (hooked:true)', () => {
     rgbSandbox();
     const boot = bootPlay({ width: W, height: H });
-    const hook = realInstanceHook(boot.refresh);
-    if (hook !== null) {
-      // The sw-renderer instance card landed: arming must succeed loudly.
-      setCVar('vid_renderer', 'voodoo');
-      boot.renderer = 'voodoo';
-      expect(armRasterPolicy(boot)).toBe(true);
-      expect(boot.lastRasterPolicy).toEqual({ mode: 'voodoo', rgbEnabled: true, hooked: true });
-      return;
-    }
-    // Absent at this HEAD (the switch is module-level): the shell must say
-    // so (boolean + record), not silently run indexed in voodoo mode.
+    // The sw-renderer instance card landed: SoftwareRenderer.prototype
+    // ships setRGBWorldEnabled (per-renderer state + cache drop). Probe
+    // the REAL class — no mocks in this file, ever.
+    expect(boot.refresh).toBeInstanceOf(SoftwareRenderer);
+    expect(typeof boot.refresh.setRGBWorldEnabled).toBe('function');
+    expect(realInstanceHook(boot.refresh)).toBe('setRGBWorldEnabled');
     setCVar('vid_renderer', 'voodoo');
     boot.renderer = 'voodoo';
-    expect(armRasterPolicy(boot)).toBe(false);
-    expect(boot.lastRasterPolicy).toEqual({ mode: 'voodoo', rgbEnabled: true, hooked: false });
-    expect(isRGBWorldEnabled()).toBe(false);
+    expect(armRasterPolicy(boot)).toBe(true);
+    expect(boot.lastRasterPolicy).toEqual({ mode: 'voodoo', rgbEnabled: true, hooked: true });
+    expect(boot.refresh.isRGBWorldEnabled()).toBe(true);
+    expect(isRGBWorldEnabled()).toBe(true);
   });
 
   it('module-level RGB switch enables the real RGB pass: cover non-zero, output differs from software-only', () => {
@@ -135,12 +129,14 @@ describe('voodoo RGB-world activation (real class, no mocks)', () => {
       const rgb = rgbBoot.refresh.getFramebuffer().color;
 
       // The RGB composite reaches the presented plane: not byte-identical
-      // to the indexed-only render (or the cover mask proves the pass ran).
+      // to the indexed-only render (the pass visibly changes output) and
+      // the cover mask proves the pass ran.
       let differs = 0;
       for (let i = 0; i < rgb.length; i++) {
         if (rgb[i] !== soft[i]) differs++;
       }
-      expect(differs > 0 || rgbStats.coverPixels > 0).toBe(true);
+      expect(rgbStats.coverPixels).toBeGreaterThan(0);
+      expect(differs).toBeGreaterThan(0);
     } finally {
       setRGBWorldEnabled(was);
     }

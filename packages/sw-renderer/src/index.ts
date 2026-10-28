@@ -17,11 +17,15 @@ export {
   rgbMipLevel, rgbPickMipLevel, rgbSampleTexture, rgbSampleLightmap,
   rgbModulate, expandPaletteRGB, buildRGBMaterial,
   quantiseIz, quantiseIzInt,
+  packRGB565, expandRGB565, rgbBlendPixel565,
+  windowDepth01, windowDepthQ16, windowDepthQ16FromIz,
+  DEFAULT_RGB_NEAR, DEFAULT_RGB_FAR, DEFAULT_RGB_WINDOW,
   rgbWrapCoord, rgbBlendPixel,
   runSubdivRGBRepeat, runSubdivRGBClamp, runSubdivRGBGeneric, runSpanFlatRGB,
   drawSpansRGB, RGBWorldBackend,
   type Span, type SpanList, type Texture, type LightBlock, type RasterBackend,
   type RGBAddressMode, type RGBBlend, type RGBMipLevel, type RGBLightmap, type RGBMaterial,
+  type RGBWindow,
 } from './spans.js';
 
 export {

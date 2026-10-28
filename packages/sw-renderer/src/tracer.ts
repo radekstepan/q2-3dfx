@@ -6,6 +6,10 @@
 // Zero allocation: pure function of the handed planes.
 
 import type { Camera } from './camera.js';
+import {
+  packRGB565, windowDepthQ16,
+  DEFAULT_RGB_FAR, DEFAULT_RGB_NEAR, type RGBWindow,
+} from './spans.js';
 
 /** Default beam length in world units (entity `frame` overrides). */
 export const TRACER_DEFAULT_LENGTH = 96;
@@ -129,20 +133,40 @@ function splat(
   return 0;
 }
 
-/** Single depth-tested additive RGB write (beam glow over the RGB plane). */
+/** Single window-Z-tested additive RGB565 write (beam glow over the RGB plane).
+ * The destination expands from the STORED 565 quantum, adds in 8-bit, and
+ * re-quantises (transparent effects blend against the quantized destination).
+ * LESS wins, ties keep stored, clear 0xFFFF = far. */
 function splatRGB(
-  color: Uint32Array, cover: Uint8Array, zb: Float32Array, fbW: number, fbH: number,
+  rgb565: Uint16Array, cover: Uint8Array, rgbDepth: Uint16Array,
+  fbW: number, fbH: number,
   x: number, y: number, iz: number, r: number, g: number, b: number,
+  winA: number, winB: number, qn16: (d01: number) => number,
+  zOff: boolean,
 ): number {
   if (x < 0 || y < 0 || x >= fbW || y >= fbH) return 0;
   const o = y * fbW + x;
-  if (iz > zb[o]!) {
-    zb[o] = iz;
-    const dst = color[o]!;
-    const ar = (dst & 255) + r > 255 ? 255 : (dst & 255) + r;
-    const ag = ((dst >> 8) & 255) + g > 255 ? 255 : ((dst >> 8) & 255) + g;
-    const ab = ((dst >> 16) & 255) + b > 255 ? 255 : ((dst >> 16) & 255) + b;
-    color[o] = (0xff000000 | (ab << 16) | (ag << 8) | ar) >>> 0;
+  const dRaw = winA - winB * iz;
+  const d01 = dRaw < 0 ? 0 : dRaw > 1 ? 1 : (dRaw === dRaw ? dRaw : 1);
+  const qo = rgbDepth[o]!;
+  let qn: number;
+  let pass: boolean;
+  if (zOff) {
+    qn = Math.round(d01 * 65535) & 0xffff;
+    pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+  } else {
+    qn = qn16(d01);
+    pass = qn < qo;
+  }
+  if (pass) {
+    rgbDepth[o] = qn;
+    const dst = rgb565[o]!;
+    const dr5 = (dst >> 11) & 31, dg6 = (dst >> 5) & 63, db5 = dst & 31;
+    const dr = (dr5 << 3) | (dr5 >> 2), dg = (dg6 << 2) | (dg6 >> 4), db = (db5 << 3) | (db5 >> 2);
+    const ar = dr + r > 255 ? 255 : dr + r;
+    const ag = dg + g > 255 ? 255 : dg + g;
+    const ab = db + b > 255 ? 255 : db + b;
+    rgb565[o] = packRGB565(ar, ag, ab);
     cover[o] = 1;
     return 1;
   }
@@ -151,15 +175,17 @@ function splatRGB(
 
 /**
  * RGB (voodoo-policy) twin of drawTracerBeam: the same clipped 1/z DDA,
- * but palette indices expand through the palette and add onto the RGB
- * plane (the ref_gl "additive" bolt read) instead of writing an index.
- * Depth-tested and depth-writing into the RGB-owned depth plane, so
- * occlusion matches the indexed path exactly. Writes only the RGB planes.
+ * but palette indices expand through the palette and add onto the packed
+ * RGB565 plane (the ref_gl "additive" bolt read) instead of writing an
+ * index. Window-Z-tested (LESS wins, ties keep stored; clear 0xFFFF = far)
+ * and depth-writing into the RGB-owned depth plane, so occlusion matches
+ * the indexed path exactly. Writes only the RGB565 + depth planes.
+ * `zbits` follows the vd_zbits policy (0 = full-precision float compare).
  */
 export function drawTracerBeamRGB(
-  color: Uint32Array,
+  rgb565: Uint16Array,
   cover: Uint8Array,
-  zb: Float32Array,
+  rgbDepth: Uint16Array,
   fbW: number,
   fbH: number,
   cam: Camera,
@@ -168,6 +194,8 @@ export function drawTracerBeamRGB(
   colorIdx: number,
   palette: Uint8Array,
   coreIdx: number = TRACER_CORE_COLOR,
+  win?: RGBWindow | null,
+  zbits = 16,
 ): number {
   const pax = ax - cam.origin[0]!, pay = ay - cam.origin[1]!, paz = az - cam.origin[2]!;
   const pbx = bx - cam.origin[0]!, pby = by - cam.origin[1]!, pbz = bz - cam.origin[2]!;
@@ -178,6 +206,12 @@ export function drawTracerBeamRGB(
   const bdy = pby * cam.up[0]! + pby * cam.up[1]! + pbz * cam.up[2]!;
   const bdz = pbx * cam.forward[0]! + pby * cam.forward[1]! + pbz * cam.forward[2]!;
   const near = cam.near;
+  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
+  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
+  const winA = winF / (winF - winN);
+  const winB = (winF * winN) / (winF - winN);
+  const zOff = !Number.isInteger(zbits) || zbits < 1 || zbits > 23;
+  const qn16 = (d01: number): number => windowDepthQ16(d01, zbits);
   let t0 = 0, t1 = 1;
   if (adz < near && bdz < near) return 0;
   if (adz < near) t0 = (near - adz) / (bdz - adz);
@@ -203,32 +237,32 @@ export function drawTracerBeamRGB(
   if (steps <= 0) {
     const x = Math.round(x0), y = Math.round(y0);
     const iz = (iz0 + iz1) / 2;
-    let drawn = splatRGB(color, cover, zb, fbW, fbH, x, y, iz, cr, cg, cb);
+    let drawn = splatRGB(rgb565, cover, rgbDepth, fbW, fbH, x, y, iz, cr, cg, cb, winA, winB, qn16, zOff);
     if (horizontal) {
-      drawn += splatRGB(color, cover, zb, fbW, fbH, x, y - 1, iz, gr, gg, gb);
-      drawn += splatRGB(color, cover, zb, fbW, fbH, x, y + 1, iz, gr, gg, gb);
+      drawn += splatRGB(rgb565, cover, rgbDepth, fbW, fbH, x, y - 1, iz, gr, gg, gb, winA, winB, qn16, zOff);
+      drawn += splatRGB(rgb565, cover, rgbDepth, fbW, fbH, x, y + 1, iz, gr, gg, gb, winA, winB, qn16, zOff);
     } else {
-      drawn += splatRGB(color, cover, zb, fbW, fbH, x - 1, y, iz, gr, gg, gb);
-      drawn += splatRGB(color, cover, zb, fbW, fbH, x + 1, y, iz, gr, gg, gb);
+      drawn += splatRGB(rgb565, cover, rgbDepth, fbW, fbH, x - 1, y, iz, gr, gg, gb, winA, winB, qn16, zOff);
+      drawn += splatRGB(rgb565, cover, rgbDepth, fbW, fbH, x + 1, y, iz, gr, gg, gb, winA, winB, qn16, zOff);
     }
     return drawn;
   }
   let drawn = 0;
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
-    drawn += splatRGB(color, cover, zb, fbW, fbH,
-      Math.round(x0 + dx * t), Math.round(y0 + dy * t), iz0 + (iz1 - iz0) * t, cr, cg, cb);
+    drawn += splatRGB(rgb565, cover, rgbDepth, fbW, fbH,
+      Math.round(x0 + dx * t), Math.round(y0 + dy * t), iz0 + (iz1 - iz0) * t, cr, cg, cb, winA, winB, qn16, zOff);
   }
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
     const x = Math.round(x0 + dx * t), y = Math.round(y0 + dy * t);
     const iz = iz0 + (iz1 - iz0) * t;
     if (horizontal) {
-      drawn += splatRGB(color, cover, zb, fbW, fbH, x, y - 1, iz, gr, gg, gb);
-      drawn += splatRGB(color, cover, zb, fbW, fbH, x, y + 1, iz, gr, gg, gb);
+      drawn += splatRGB(rgb565, cover, rgbDepth, fbW, fbH, x, y - 1, iz, gr, gg, gb, winA, winB, qn16, zOff);
+      drawn += splatRGB(rgb565, cover, rgbDepth, fbW, fbH, x, y + 1, iz, gr, gg, gb, winA, winB, qn16, zOff);
     } else {
-      drawn += splatRGB(color, cover, zb, fbW, fbH, x - 1, y, iz, gr, gg, gb);
-      drawn += splatRGB(color, cover, zb, fbW, fbH, x + 1, y, iz, gr, gg, gb);
+      drawn += splatRGB(rgb565, cover, rgbDepth, fbW, fbH, x - 1, y, iz, gr, gg, gb, winA, winB, qn16, zOff);
+      drawn += splatRGB(rgb565, cover, rgbDepth, fbW, fbH, x + 1, y, iz, gr, gg, gb, winA, winB, qn16, zOff);
     }
   }
   return drawn;

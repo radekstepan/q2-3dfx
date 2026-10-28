@@ -8,7 +8,7 @@ import {
 import {
   createEdgeScratch, emitSpansForPoly, projectClippedPoly, sortRowSpans,
 } from './edges.js';
-import { runSpanFlat } from './spans.js';
+import { runSpanFlat, type Span } from './spans.js';
 import { createDevroom, DEVROOM_CAMERA } from './devroom.js';
 
 function facingQuadCam() {
@@ -112,7 +112,7 @@ describe('edge emit + z-sort', () => {
     };
     const n = projectClippedPoly(input, cam, 64, 64, scratch);
     expect(n).toBe(4);
-    const pool: { kind: number; y: number; x0: number; x1: number; iz: number; diz: number; uz: number; duz: number; vz: number; dvz: number; light: number; dlight: number; lu: number; lv: number; dlu: number; turb: number; ord: number }[] = [];
+    const pool: Span[] = [];
     const end = emitSpansForPoly(scratch.poly, n, 0, pool, 0, 1024, 63, 0, 64);
     expect(end).toBe(64);
     for (const s of pool) {
@@ -136,7 +136,7 @@ describe('edge emit + z-sort', () => {
 
   it('sortRowSpans orders by descending 1/z, BSP order breaks ties', () => {
     const mkS = (iz: number, ord: number) => ({
-      span: { kind: 0, y: 5, x0: 0, x1: 2, iz, diz: 0, uz: 0, duz: 0, vz: 0, dvz: 0, light: 0, dlight: 0, lu: 0, lv: -1, dlu: 0, turb: 0, ord },
+      span: { kind: 0, y: 5, x0: 0, x1: 2, iz, diz: 0, uz: 0, duz: 0, vz: 0, dvz: 0, light: 0, dlight: 0, lu: 0, lv: -1, dlu: 0, turb: 0, ord, dudy: 0, dvdy: 0 },
       order: ord,
     });
     const rows = [mkS(0.1, 2), mkS(0.5, 1), mkS(0.5, 0)];

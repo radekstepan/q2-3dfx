@@ -1,7 +1,28 @@
 // @q2/sw-renderer spans — D_DrawSpans16 port (r_scan.c, BRAIN.md §7.1).
 //
+// Window-Z + RGB565 authority (Voodoo3 hardware model).
+//
+// DEPTH: normalized window-Z derived from the projection near/far planes.
+//   depth01 = far/(far-near) - (far*near/(far-near))*iz, clamped to [0,1],
+//   where iz = 1/vz is the eye-space reciprocal depth carried by spans.
+//   near -> 0, far -> 1. The per-fragment value is quantised to mat.zbits
+//   (default 16; 0 = full-precision float compare, legacy escape hatch) via
+//   integer compare LESS: a fragment wins iff qn < qo (strict). Ties keep
+//   the stored fragment (first wins). Clear value is all-ones (far:
+//   0xFFFF), so every in-frustum fragment passes on a cleared plane.
+//   mat.zbits stays the policy field; the window (near/far) arrives per
+//   draw via RGBWindow (threaded from Camera through renderView).
+// COLOR: the authority target is a packed Uint16Array RGB565 plane (5:6:5).
+//   Every opaque write quantises 8:8:8 -> 565 on write; every translucent /
+//   alpha / additive read-modify-write expands the STORED 565 value to 8:8:8,
+//   blends in 8-bit integer math, and re-quantises. The Uint32 rgbColor
+//   plane is only the endFrame resolve scratch (expanded from rgb565 where
+//   covered); nothing blends against it mid-frame. This matches Voodoo3
+//   (framebuffer is physically 16-bit) instead of an 888 accumulator with a
+//   565 tail quantise.
+//
 // Rules enforced here (BRAIN.md §2):
-// - Uint8Array/Float32Array only in the inner loop. No objects, no closures.
+// - Uint8Array/Uint16Array only in the inner loop. No objects, no closures.
 // - 16.16 fixed point texture coords, ONE division per 16-pixel subdivision.
 // - Separate monomorphic entry points per span kind (opaque / turbulent /
 //   flat / translucent33 / translucent66). The kind branches once per SPAN,
@@ -49,8 +70,8 @@ export function translucencyModeFromCvars(): 0 | 1 | 2 {
   }
 }
 
-/** Doubles packed per span: iz diz uz duz vz dvz light dlight lu lv dlu. */
-export const F_PER_SPAN = 11;
+/** Doubles packed per span: iz diz uz duz vz dvz light dlight lu lv dlu dudy dvdy. */
+export const F_PER_SPAN = 13;
 /** Ints packed per span: kind y x0 x1 turb. */
 export const I_PER_SPAN = 5;
 
@@ -74,6 +95,16 @@ export interface Span {
   turb: number;
   /** BSP front-to-back order (coplanar tie-break, lower = nearer) */
   ord: number;
+  /**
+   * Vertical texture gradients (du/dy, dv/dy at the span origin, texels per
+   * pixel). Filled by emitSpansForPoly via a screen-space plane fit over the
+   * projected polygon; horizontal gradients (dudx/dvdx) are derived per span
+   * in drawSpansRGB from the iz/uz/vz steps. rho = max(|dudx|, |dvdx|,
+   * |dudy|, |dvdy|) + lodBias. Manually built spans leave these 0 (no
+   * vertical footprint contribution — identical rho to the old isotropic
+   * default when the true vertical gradient is 0).
+   */
+  dudy: number; dvdy: number;
 }
 
 export interface SpanList {
@@ -112,6 +143,7 @@ export function createSpan(): Span {
     y: 0, x0: 0, x1: 0,
     iz: 0, diz: 0, uz: 0, duz: 0, vz: 0, dvz: 0,
     light: 63, dlight: 0, lu: 0, lv: -1, dlu: 0, turb: 0, ord: 0,
+    dudy: 0, dvdy: 0,
   };
 }
 
@@ -842,15 +874,15 @@ export interface RGBMaterial {
    */
   bilinear: boolean;
   /**
-   * Depth precision in bits at test/write (vd_zbits policy, 0 = off =
-   * legacy raw 1/z compare). When 1..23 the span loops quantise 1/z to
-   * that many steps before the test and store the quantised value, so
-   * coplanar-ish fragments tie exactly like a fixed-point Z buffer.
-   * APPROXIMATION (voodoo guide §4): true hardware quantises NORMALIZED
-   * window-Z derived from the projection near/far planes (see
-   * quantiseDepthBeforeTest in @q2/voodoo); the rasteriser has no near/far
-   * plane at span time, so 1/z itself is quantised — same tie behaviour,
-   * different mapping. The software path never reads this field.
+   * Depth precision in bits at test/write (vd_zbits policy, 0 = full-
+   * precision float compare, legacy escape hatch). When 1..23 the span
+   * loops quantise NORMALIZED window-Z — depth01 = far/(far-near) -
+   * (far*near/(far-near))*iz, clamped to [0,1], near -> 0, far -> 1 —
+   * derived from the projection near/far window threaded per draw, to that
+   * many steps before the test and store the quantum, so coplanar-ish
+   * fragments tie exactly like a fixed-point Z buffer (Voodoo3 guide §4).
+   * Integer LESS wins, ties keep stored, clear is all-ones (far). The
+   * software path never reads this field.
    */
   zbits: number;
   /**
@@ -932,12 +964,12 @@ export function rgbPickMipLevel(
 }
 
 /**
- * Quantise stored 1/z depth to `bits` bits BEFORE the depth test/write
- * (vd_zbits policy; mirrors voodoo quantiseDepthBeforeTest but WITHOUT the
- * near/far window-Z mapping — see RGBMaterial.zbits for why the rasteriser
- * quantises raw 1/z instead). Returns Math.round(iz * scale) / scale with
- * scale = 2^bits - 1, clamped to [0, 1]; bits outside 1..23 (0 = off,
- * >= 24 = Float32-exact) returns iz unchanged. Pure, no allocation.
+ * Quantise stored 1/z depth to `bits` bits BEFORE the depth test/write.
+ * LEGACY helper (kept for the software-adjacent unit tests that pin its
+ * steps): the live RGB loops below do NOT use this — they use the
+ * normalized window-Z mapping (windowDepth01/windowDepthQ16 with the
+ * per-frame near/far window), which ties exactly like a fixed-point Z
+ * buffer AND orders by true eye depth. Pure, no allocation.
  */
 export function quantiseIz(iz: number, bits: number): number {
   if (!Number.isInteger(bits) || bits < 1 || bits > 23) return iz;
@@ -960,6 +992,126 @@ export function quantiseIzInt(iz: number, bits: number): number {
   const q = Math.round(iz * scale);
   if (!(q >= 0)) return 0;
   return q > scale ? scale : q;
+}
+
+// --- RGB565 authority + window-Z depth (Voodoo3 hardware model) ---------
+
+/** Projection window for normalized depth (threaded from Camera). */
+export interface RGBWindow {
+  near: number;
+  far: number;
+}
+
+/** Default depth window (matches setupCamera defaults). */
+export const DEFAULT_RGB_NEAR = 4;
+/**
+ * Default far plane (contains the SKY_BOX_HALF = 16384 skybox: background
+ * geometry at "infinity" must map to depth01 < 1 so it draws exactly once
+ * against the all-ones clear under the LESS test, like real hardware with
+ * a far plane beyond the scene).
+ */
+export const DEFAULT_RGB_FAR = 32768;
+
+/** Default window used when the caller hands no explicit window. */
+export const DEFAULT_RGB_WINDOW: RGBWindow = { near: DEFAULT_RGB_NEAR, far: DEFAULT_RGB_FAR };
+
+/**
+ * Pack 8:8:8 into RGB565 (5:6:5). Inputs clamp to 0..255; truncation
+ * (>>) matches the hardware drop of low bits (no rounding — Voodoo3
+ * truncates on the write path).
+ */
+export function packRGB565(r: number, g: number, b: number): number {
+  const rr = r < 0 ? 0 : r > 255 ? 255 : r | 0;
+  const gg = g < 0 ? 0 : g > 255 ? 255 : g | 0;
+  const bb = b < 0 ? 0 : b > 255 ? 255 : b | 0;
+  return (((rr >> 3) << 11) | ((gg >> 2) << 5) | (bb >> 3)) & 0xffff;
+}
+
+/**
+ * Expand one RGB565 quantum to 8:8:8 (replicate top bits into the low
+ * bits, the standard 5/6-bit -> 8-bit upscale). Pure, no allocation.
+ */
+export function expandRGB565(q: number, out: Uint8Array, off: number): void {
+  const v = q & 0xffff;
+  const r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
+  out[off] = (r5 << 3) | (r5 >> 2);
+  out[off + 1] = (g6 << 2) | (g6 >> 4);
+  out[off + 2] = (b5 << 3) | (b5 >> 2);
+}
+
+/**
+ * Normalized window-Z in [0,1] from reciprocal eye depth iz = 1/vz:
+ * depth01 = far/(far-near) - (far*near/(far-near))*iz. near -> 0,
+ * far -> 1, clamped. Non-finite iz maps to far (loses every LESS test,
+ * never writes). Pure, no allocation.
+ */
+export function windowDepth01(iz: number, near: number, far: number): number {
+  if (!(iz > 0)) return 1;
+  if (!(far > near) || !(near > 0)) return 1;
+  const a = far / (far - near);
+  const b = (far * near) / (far - near);
+  const d = a - b * iz;
+  return d < 0 ? 0 : d > 1 ? 1 : d;
+}
+
+/**
+ * Quantise a [0,1] window depth to a 16-bit stored quantum under `bits`
+ * (1..23; anything else -> full 16-bit). Sub-16-bit policies truncate the
+ * low bits (store the quantised step expanded back to 16 bits) so the
+ * integer compare is a plain Uint16 LESS and ties are exact. Clear/far is
+ * 0xFFFF in all policies.
+ */
+export function windowDepthQ16(d01: number, bits: number): number {
+  const c = d01 < 0 ? 0 : d01 > 1 ? 1 : d01;
+  if (!Number.isInteger(bits) || bits < 1 || bits > 23) {
+    return Math.round(c * 65535) & 0xffff;
+  }
+  if (bits >= 16) return Math.round(c * 65535) & 0xffff;
+  const s = (1 << bits) - 1;
+  const q = Math.round(c * s);
+  return Math.round((q * 65535) / s) & 0xffff;
+}
+
+/**
+ * Quantised window depth directly from iz (convenience for the loops).
+ */
+export function windowDepthQ16FromIz(iz: number, near: number, far: number, bits: number): number {
+  return windowDepthQ16(windowDepth01(iz, near, far), bits);
+}
+
+/** Scratch for 565 expand/blend (module-scope, never the per-pixel alloc). */
+const _qExpand = new Uint8Array(3);
+
+/**
+ * Composite one RGB source pixel over the STORED 565 quantum (the Voodoo3
+ * alpha/additive stages, integer math, no floats per channel). Opaque
+ * replaces (packs src); alpha blends src*a + dst*(1-a) with a = alphaQ/256
+ * against the EXPANDED destination; additive adds and clamps. Returns the
+ * packed 565 quantum to store. `cover` is always marked by the caller on a
+ * passed depth test.
+ */
+export function rgbBlendPixel565(
+  dstQ: number,
+  r: number, g: number, b: number,
+  blend: RGBBlend,
+  alphaQ: number,
+): number {
+  if (blend === 'opaque') return packRGB565(r, g, b);
+  expandRGB565(dstQ, _qExpand, 0);
+  const dr = _qExpand[0]!, dg = _qExpand[1]!, db = _qExpand[2]!;
+  if (blend === 'additive') {
+    const ar = dr + r > 255 ? 255 : dr + r;
+    const ag = dg + g > 255 ? 255 : dg + g;
+    const ab = db + b > 255 ? 255 : db + b;
+    return packRGB565(ar, ag, ab);
+  }
+  const a = alphaQ < 0 ? 0 : alphaQ > 256 ? 256 : alphaQ;
+  const ia = 256 - a;
+  return packRGB565(
+    ((dr * ia + r * a + 128) >> 8),
+    ((dg * ia + g * a + 128) >> 8),
+    ((db * ia + b * a + 128) >> 8),
+  );
 }
 
 /**
@@ -1252,9 +1404,9 @@ const _rgbTurb = buildTurbTable();
  * tuple (iz, lux, u1, v1) so the caller chains subdivisions exactly.
  */
 export function runSubdivRGBRepeat(
-  color: Uint32Array,
+  rgb565: Uint16Array,
   cover: Uint8Array,
-  zb: Float32Array,
+  rgbDepth: Uint16Array,
   o0: number,
   n: number,
   xAbs: number,
@@ -1273,18 +1425,22 @@ export function runSubdivRGBRepeat(
   mat: RGBMaterial,
   spanLod: number,
   maxLevel: number,
-  qzb?: Uint16Array | null,
+  win?: RGBWindow | null,
 ): { iz: number; lux: number; u1: number; v1: number } {
   const levels = mat.levels;
   const lb = mat.light;
   const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
   const bilinear = mat.bilinear !== false;
-  // Depth quantisation (vd_zbits): inactive (0) keeps the legacy raw-1/z
-  // path bit-identical; active quantises before test/write (see RGBMaterial).
+  // Window-Z depth (Voodoo3 hardware model): per-fragment depth01 from the
+  // projection window, quantised to mat.zbits steps (0 = full-precision
+  // float compare, legacy escape hatch). Integer LESS, ties keep stored.
+  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
+  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
+  const winA = winF / (winF - winN);
+  const winB = (winF * winN) / (winF - winN);
   const zbw = mat.zbits;
-  const qScale = Number.isInteger(zbw) && zbw >= 1 && zbw <= 23 ? (1 << zbw) - 1 : 0;
-  const qInv = qScale > 0 ? 1 / qScale : 0;
+  const zOff = !Number.isInteger(zbw) || zbw < 1 || zbw > 23;
   const z1 = 1 / (iz + diz * n);
   const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
   let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
@@ -1329,12 +1485,21 @@ export function runSubdivRGBRepeat(
   let lux = lux0;
   if (fixedLevel) {
     for (let i = 0, o = o0; i < n; i++, o++) {
-      // Depth test: legacy raw-1/z compare, or quantised-before-test when
-      // vd_zbits is active (qzb int plane when attached, else float
-      // round-trip on the shared plane — same winning fragment either way).
-      const qn = qScale === 0 ? 0 : quantiseIzInt(iz, zbw);
-      const qo = qScale === 0 ? 0 : (qzb ? qzb[o]! : quantiseIzInt(zb[o]!, zbw));
-      if (qScale === 0 ? iz > zb[o]! : qn > qo) {
+      // Window-Z test: depth01 from the projection window, LESS wins,
+      // ties keep the stored fragment (first wins). Clear (0xFFFF) is far.
+      const dRaw = winA - winB * iz;
+      const d01 = dRaw < 0 ? 0 : dRaw > 1 ? 1 : (dRaw === dRaw ? dRaw : 1);
+      const qo = rgbDepth[o]!;
+      let qn: number;
+      let pass: boolean;
+      if (zOff) {
+        qn = Math.round(d01 * 65535) & 0xffff;
+        pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+      } else {
+        qn = windowDepthQ16(d01, zbw);
+        pass = qn < qo;
+      }
+      if (pass) {
         const xi = tu >> 16, yi = tv >> 16;
         // Inlined rgbWrapInt (same integer ops, no call): the POT lane is
         // call-constant, so the branch predicts perfectly.
@@ -1392,15 +1557,8 @@ export function runSubdivRGBRepeat(
             g = g > 255 ? 255 : g;
             b = b > 255 ? 255 : b;
           }
-          // Depth write mirrors the test above: quantised value to the int
-          // plane (when attached) and its float round-trip to the shared
-          // plane, so later tests see the same steps either way.
-          if (qScale === 0) zb[o] = iz;
-          else {
-            if (qzb) qzb[o] = qn;
-            zb[o] = qn * qInv;
-          }
-          color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+          rgbDepth[o] = qn;
+          rgb565[o] = packRGB565(r, g, b);
           cover[o] = 1;
         }
       }
@@ -1409,12 +1567,21 @@ export function runSubdivRGBRepeat(
     return { iz, lux, u1, v1 };
   }
   for (let i = 0, o = o0; i < n; i++, o++) {
-    // Depth test: legacy raw-1/z compare, or quantised-before-test when
-    // vd_zbits is active (qzb int plane when attached, else float
-    // round-trip on the shared plane — same winning fragment either way).
-    const qn = qScale === 0 ? 0 : quantiseIzInt(iz, zbw);
-    const qo = qScale === 0 ? 0 : (qzb ? qzb[o]! : quantiseIzInt(zb[o]!, zbw));
-    if (qScale === 0 ? iz > zb[o]! : qn > qo) {
+    // Window-Z test: depth01 from the projection window, LESS wins,
+    // ties keep the stored fragment (first wins). Clear (0xFFFF) is far.
+    const dRaw = winA - winB * iz;
+    const d01 = dRaw < 0 ? 0 : dRaw > 1 ? 1 : (dRaw === dRaw ? dRaw : 1);
+    const qo = rgbDepth[o]!;
+    let qn: number;
+    let pass: boolean;
+    if (zOff) {
+      qn = Math.round(d01 * 65535) & 0xffff;
+      pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+    } else {
+      qn = windowDepthQ16(d01, zbw);
+      pass = qn < qo;
+    }
+    if (pass) {
       // Single-TMU dither pick between the two hoisted descriptors.
       const use1 = f16 <= RGB_BAYER4[bOff | ((xAbs + i) & 3)]! ? 0 : 1;
       const dd = use1 === 0 ? d0 : d1;
@@ -1478,15 +1645,8 @@ export function runSubdivRGBRepeat(
           g = g > 255 ? 255 : g;
           b = b > 255 ? 255 : b;
         }
-        // Depth write mirrors the test above: quantised value to the int
-        // plane (when attached) and its float round-trip to the shared
-        // plane, so later tests see the same steps either way.
-        if (qScale === 0) zb[o] = iz;
-        else {
-          if (qzb) qzb[o] = qn;
-          zb[o] = qn * qInv;
-        }
-        color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+        rgbDepth[o] = qn;
+        rgb565[o] = packRGB565(r, g, b);
         cover[o] = 1;
       }
     }
@@ -1501,9 +1661,9 @@ export function runSubdivRGBRepeat(
  * monomorphic loop so the address mode branches per span, never per pixel.
  */
 export function runSubdivRGBClamp(
-  color: Uint32Array,
+  rgb565: Uint16Array,
   cover: Uint8Array,
-  zb: Float32Array,
+  rgbDepth: Uint16Array,
   o0: number,
   n: number,
   xAbs: number,
@@ -1522,18 +1682,22 @@ export function runSubdivRGBClamp(
   mat: RGBMaterial,
   spanLod: number,
   maxLevel: number,
-  qzb?: Uint16Array | null,
+  win?: RGBWindow | null,
 ): { iz: number; lux: number; u1: number; v1: number } {
   const levels = mat.levels;
   const lb = mat.light;
   const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
   const bilinear = mat.bilinear !== false;
-  // Depth quantisation (vd_zbits): inactive (0) keeps the legacy raw-1/z
-  // path bit-identical; active quantises before test/write (see RGBMaterial).
+  // Window-Z depth (Voodoo3 hardware model): per-fragment depth01 from the
+  // projection window, quantised to mat.zbits steps (0 = full-precision
+  // float compare, legacy escape hatch). Integer LESS, ties keep stored.
+  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
+  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
+  const winA = winF / (winF - winN);
+  const winB = (winF * winN) / (winF - winN);
   const zbw = mat.zbits;
-  const qScale = Number.isInteger(zbw) && zbw >= 1 && zbw <= 23 ? (1 << zbw) - 1 : 0;
-  const qInv = qScale > 0 ? 1 / qScale : 0;
+  const zOff = !Number.isInteger(zbw) || zbw < 1 || zbw > 23;
   const z1 = 1 / (iz + diz * n);
   const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
   let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
@@ -1568,12 +1732,21 @@ export function runSubdivRGBClamp(
   const bOff = (((yAbs | 0) & 3) << 2);
   let lux = lux0;
   for (let i = 0, o = o0; i < n; i++, o++) {
-    // Depth test: legacy raw-1/z compare, or quantised-before-test when
-    // vd_zbits is active (qzb int plane when attached, else float
-    // round-trip on the shared plane — same winning fragment either way).
-    const qn = qScale === 0 ? 0 : quantiseIzInt(iz, zbw);
-    const qo = qScale === 0 ? 0 : (qzb ? qzb[o]! : quantiseIzInt(zb[o]!, zbw));
-    if (qScale === 0 ? iz > zb[o]! : qn > qo) {
+    // Window-Z test: depth01 from the projection window, LESS wins,
+    // ties keep the stored fragment (first wins). Clear (0xFFFF) is far.
+    const dRaw = winA - winB * iz;
+    const d01 = dRaw < 0 ? 0 : dRaw > 1 ? 1 : (dRaw === dRaw ? dRaw : 1);
+    const qo = rgbDepth[o]!;
+    let qn: number;
+    let pass: boolean;
+    if (zOff) {
+      qn = Math.round(d01 * 65535) & 0xffff;
+      pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+    } else {
+      qn = windowDepthQ16(d01, zbw);
+      pass = qn < qo;
+    }
+    if (pass) {
       // Per-pixel dither pick between the two span-constant levels (the
       // fixed-level case always selects base: same value rgbPickMipLevel
       // returns, without the per-pixel call).
@@ -1634,15 +1807,8 @@ export function runSubdivRGBClamp(
           g = g > 255 ? 255 : g;
           b = b > 255 ? 255 : b;
         }
-        // Depth write mirrors the test above: quantised value to the int
-        // plane (when attached) and its float round-trip to the shared
-        // plane, so later tests see the same steps either way.
-        if (qScale === 0) zb[o] = iz;
-        else {
-          if (qzb) qzb[o] = qn;
-          zb[o] = qn * qInv;
-        }
-        color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+        rgbDepth[o] = qn;
+        rgb565[o] = packRGB565(r, g, b);
         cover[o] = 1;
       }
     }
@@ -1712,9 +1878,9 @@ export function rgbBlendPixel(
  * the same integer formulation.
  */
 export function runSubdivRGBGeneric(
-  color: Uint32Array,
+  rgb565: Uint16Array,
   cover: Uint8Array,
-  zb: Float32Array,
+  rgbDepth: Uint16Array,
   o0: number,
   n: number,
   xAbs: number,
@@ -1737,18 +1903,22 @@ export function runSubdivRGBGeneric(
   alphaQ: number,
   turbTable: Uint8Array | null,
   turbPhase: number,
-  qzb?: Uint16Array | null,
+  win?: RGBWindow | null,
 ): { iz: number; lux: number; u1: number; v1: number } {
   const levels = mat.levels;
   const lb = mat.light;
   const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
   const bilinear = mat.bilinear !== false;
-  // Depth quantisation (vd_zbits): inactive (0) keeps the legacy raw-1/z
-  // path bit-identical; active quantises before test/write (see RGBMaterial).
+  // Window-Z depth (Voodoo3 hardware model): per-fragment depth01 from the
+  // projection window, quantised to mat.zbits steps (0 = full-precision
+  // float compare, legacy escape hatch). Integer LESS, ties keep stored.
+  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
+  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
+  const winA = winF / (winF - winN);
+  const winB = (winF * winN) / (winF - winN);
   const zbw = mat.zbits;
-  const qScale = Number.isInteger(zbw) && zbw >= 1 && zbw <= 23 ? (1 << zbw) - 1 : 0;
-  const qInv = qScale > 0 ? 1 / qScale : 0;
+  const zOff = !Number.isInteger(zbw) || zbw < 1 || zbw > 23;
   const wrapS = mat.addressS === 'repeat';
   const wrapT = mat.addressT === 'repeat';
   const writeDepth = blend === 'opaque' ? mat.depthWrite : false;
@@ -1795,12 +1965,21 @@ export function runSubdivRGBGeneric(
   const bOff = (((yAbs | 0) & 3) << 2);
   let lux = lux0;
   for (let i = 0, o = o0; i < n; i++, o++) {
-    // Depth test: legacy raw-1/z compare, or quantised-before-test when
-    // vd_zbits is active (qzb int plane when attached, else float
-    // round-trip on the shared plane — same winning fragment either way).
-    const qn = qScale === 0 ? 0 : quantiseIzInt(iz, zbw);
-    const qo = qScale === 0 ? 0 : (qzb ? qzb[o]! : quantiseIzInt(zb[o]!, zbw));
-    if (qScale === 0 ? iz > zb[o]! : qn > qo) {
+    // Window-Z test: depth01 from the projection window, LESS wins,
+    // ties keep the stored fragment (first wins). Clear (0xFFFF) is far.
+    const dRaw = winA - winB * iz;
+    const d01 = dRaw < 0 ? 0 : dRaw > 1 ? 1 : (dRaw === dRaw ? dRaw : 1);
+    const qo = rgbDepth[o]!;
+    let qn: number;
+    let pass: boolean;
+    if (zOff) {
+      qn = Math.round(d01 * 65535) & 0xffff;
+      pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+    } else {
+      qn = windowDepthQ16(d01, zbw);
+      pass = qn < qo;
+    }
+    if (pass) {
       let fu = tu, fv = tv;
       if (turbTable) {
         const wu = (tu + (turbTable[((tv >> 16) + turbPhase) & tmask]! << 16)) >> 16;
@@ -1882,14 +2061,8 @@ export function runSubdivRGBGeneric(
           g = g > 255 ? 255 : g;
           b = b > 255 ? 255 : b;
         }
-        if (writeDepth) {
-          if (qScale === 0) zb[o] = iz;
-          else {
-            if (qzb) qzb[o] = qn;
-            zb[o] = qn * qInv;
-          }
-        }
-        rgbBlendPixel(color, o, r, g, b, blend, alphaQ);
+        if (writeDepth) rgbDepth[o] = qn;
+        rgb565[o] = rgbBlendPixel565(rgb565[o]!, r, g, b, blend, alphaQ);
         cover[o] = 1;
       }
     }
@@ -1899,36 +2072,44 @@ export function runSubdivRGBGeneric(
 }
 
 /** Flat RGB span fill (flat sky): depth-tested solid color, no texture.
- * `zbits`/`qzb` apply the same vd_zbits quantised-before-test policy as the
- * textured loops (0/legacy default keeps the raw-1/z path bit-identical). */
+ * Same window-Z LESS policy as the textured loops (clear 0xFFFF = far,
+ * ties keep stored). The solid color quantises 8:8:8 -> 565 on write. */
 export function runSpanFlatRGB(
-  color: Uint32Array,
+  rgb565: Uint16Array,
   cover: Uint8Array,
-  zb: Float32Array,
+  rgbDepth: Uint16Array,
   o0: number,
   n: number,
   iz: number,
   diz: number,
   r: number, g: number, b: number,
   depthWrite: boolean,
-  qzb?: Uint16Array | null,
+  win?: RGBWindow | null,
   zbits = 0,
 ): number {
-  const qScale = Number.isInteger(zbits) && zbits >= 1 && zbits <= 23 ? (1 << zbits) - 1 : 0;
-  const qInv = qScale > 0 ? 1 / qScale : 0;
+  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
+  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
+  const winA = winF / (winF - winN);
+  const winB = (winF * winN) / (winF - winN);
+  const zOff = !Number.isInteger(zbits) || zbits < 1 || zbits > 23;
+  const q = packRGB565(r, g, b);
   let z = iz;
   for (let i = 0, o = o0; i < n; i++, o++) {
-    const qn = qScale === 0 ? 0 : quantiseIzInt(z, zbits);
-    const qo = qScale === 0 ? 0 : (qzb ? qzb[o]! : quantiseIzInt(zb[o]!, zbits));
-    if (qScale === 0 ? z > zb[o]! : qn > qo) {
-      if (depthWrite) {
-        if (qScale === 0) zb[o] = z;
-        else {
-          if (qzb) qzb[o] = qn;
-          zb[o] = qn * qInv;
-        }
-      }
-      color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+    const dRaw = winA - winB * z;
+    const d01 = dRaw < 0 ? 0 : dRaw > 1 ? 1 : (dRaw === dRaw ? dRaw : 1);
+    const qo = rgbDepth[o]!;
+    let qn: number;
+    let pass: boolean;
+    if (zOff) {
+      qn = Math.round(d01 * 65535) & 0xffff;
+      pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+    } else {
+      qn = windowDepthQ16(d01, zbits);
+      pass = qn < qo;
+    }
+    if (pass) {
+      if (depthWrite) rgbDepth[o] = qn;
+      rgb565[o] = q;
       cover[o] = 1;
     }
     z += diz;
@@ -1940,11 +2121,11 @@ export function runSpanFlatRGB(
  * RGB span rasteriser (drawSpansSoftware twin + effect coverage). Reuses
  * traversal/clipping: perspective-correct UVs (uz/vz/iz), lightmap bilinear
  * in luxel space (lu + dlu*x at constant lv, exactly the software gradient
- * convention). Writes 0xAABBGGRR into `color`, 1/z into `zb` (the RGB
- * path owns a separate depth plane; Framebuffer.depth semantics untouched),
- * and marks `cover` per written pixel so endFrame can composite over the
- * indexed resolve. Per-span-kind dispatch (branch on the span, never in
- * the pixel loop):
+ * convention). Writes packed RGB565 into `rgb565`, window-Z quanta into
+ * `rgbDepth` (LESS wins, ties keep stored, clear 0xFFFF = far), and marks
+ * `cover` per written pixel so endFrame can expand over the indexed
+ * resolve. Per-span-kind dispatch (branch on the span, never in the pixel
+ * loop):
  * - SPAN_OPAQUE: textured, opaque/alpha/additive per material.
  * - SPAN_TURBULENT: water-warped texture, blend per material.
  * - SPAN_TRANS33/TRANS66: glass/water alpha (33/66 ratios, or additive
@@ -1953,23 +2134,30 @@ export function runSpanFlatRGB(
  * Anything else (unknown kind, FLAT without flatColor, empty mip chain,
  * unknown blend string) is an unsupported combo and Com_Errors — never
  * silent wrong pixels. Zero allocation.
- * `qzb` is the optional Uint16 authority depth plane (parallel to `zb`;
- * see RGBWorldBackend): when non-null and mat.zbits is active, tests and
- * writes go to the int plane (cleared to 0 = far, same larger-1/z-wins
- * convention) with the float round-trip mirrored to `zb`.
- * `dudy`/`dvdy` are the optional vertical texture gradients (du/dy, dv/dy
- * at the span origin); omitted they default to the horizontal gradients
- * (isotropic footprint — span records carry no vertical derivatives).
+ * `win` is the projection window (near/far) for the window-Z mapping;
+ * null selects the compiled-in default (4..32768, matches setupCamera).
+ * `dudy`/`dvdy` are explicit vertical-gradient overrides (unit tests);
+ * omitted they come from the span records filled by emitSpansForPoly.
+ *
+ * VERTICAL LOD COVERAGE (all RGB effect paths carry true 2D footprints —
+ * none fall back to horizontal-only):
+ * - world spans: least-squares plane fit in emitSpansForPoly (dudy/dvdy
+ *   ride the Span; F_PER_SPAN = 13 carries them through the banded flat
+ *   pack, whose indexed raster core ignores the extra two doubles);
+ * - sprites: analytic billboard gradients (du/dy = 0, dv/dy = h/rowH);
+ * - alias: per-tri edge footprint in fillPerspTriRGB (perspective-correct,
+ *   inherently 2D — no span gradients involved);
+ * - particles/beams: points/lines with no mip footprint (depth-only).
  */
 export function drawSpansRGB(
-  color: Uint32Array,
+  rgb565: Uint16Array,
   cover: Uint8Array,
-  zb: Float32Array,
+  rgbDepth: Uint16Array,
   fbW: number,
   fbH: number,
   list: SpanList,
   mat: RGBMaterial,
-  qzb?: Uint16Array | null,
+  win?: RGBWindow | null,
   dudy?: number,
   dvdy?: number,
 ): { pixels: number; spans: number } {
@@ -2006,9 +2194,9 @@ export function drawSpansRGB(
       if (!fc) {
         Com_Error('error', 'drawSpansRGB: FLAT span without flatColor');
       }
-      runSpanFlatRGB(color, cover, zb, s.y * fbW + x0, count,
+      runSpanFlatRGB(rgb565, cover, rgbDepth, s.y * fbW + x0, count,
         s.iz + s.diz * (x0 - s.x0), s.diz, fc[0]!, fc[1]!, fc[2]!, mat.depthWrite,
-        qzb ?? null, mat.zbits);
+        win ?? null, mat.zbits);
       pixels += count;
       drawn++;
       continue;
@@ -2021,17 +2209,14 @@ export function drawSpansRGB(
     let lux = s.lu + s.dlu * skip;
     let u0 = uz / iz, v0 = vz / iz;
     // Per-span LOD from the screen-space texture footprint (max of the
-    // horizontal and vertical gradients — the Voodoo rho). Span records
-    // carry no vertical derivatives (emitSpansForPoly packs horizontal
-    // steps only), so dudy/dvdy default to their horizontal counterparts
-    // (isotropic approximation). Explicit dudy/dvdy widen rho to the true
-    // footprint (wired for future polygon-gradient callers; unit tests pin
-    // the effect). The per-pixel Bayer dither still varies the chosen
-    // level within the row.
+    // horizontal and vertical gradients — the Voodoo rho). The vertical
+    // gradients ride the span records (emitSpansForPoly plane fit);
+    // explicit dudy/dvdy override them (unit-test hook). The per-pixel
+    // Bayer dither still varies the chosen level within the row.
     const dudx = (s.duz - u0 * s.diz) / iz;
     const dvdx = (s.dvz - v0 * s.diz) / iz;
-    const dudyV = dudy ?? dudx;
-    const dvdyV = dvdy ?? dvdx;
+    const dudyV = dudy ?? s.dudy;
+    const dvdyV = dvdy ?? s.dvdy;
     let rho = dudx < 0 ? -dudx : dudx;
     const avd = dvdx < 0 ? -dvdx : dvdx;
     if (avd > rho) rho = avd;
@@ -2058,14 +2243,14 @@ export function drawSpansRGB(
         let r: { iz: number; lux: number; u1: number; v1: number };
         if (repeat) {
           r = runSubdivRGBRepeat(
-            color, cover, zb, o, m, xRun, s.y,
+            rgb565, cover, rgbDepth, o, m, xRun, s.y,
             iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
-            mat, spanLod, maxLevel, qzb ?? null);
+            mat, spanLod, maxLevel, win ?? null);
         } else {
           r = runSubdivRGBClamp(
-            color, cover, zb, o, m, xRun, s.y,
+            rgb565, cover, rgbDepth, o, m, xRun, s.y,
             iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
-            mat, spanLod, maxLevel, qzb ?? null);
+            mat, spanLod, maxLevel, win ?? null);
         }
         iz = r.iz;
         lux = r.lux;
@@ -2083,11 +2268,11 @@ export function drawSpansRGB(
       while (remaining > 0) {
         const m = remaining >= SUBDIV ? SUBDIV : remaining;
         const r = runSubdivRGBGeneric(
-          color, cover, zb, o, m, xRun, s.y,
+          rgb565, cover, rgbDepth, o, m, xRun, s.y,
           iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
           mat, spanLod, maxLevel, useBlend, useAlphaQ, turb,
           turb ? (mat.turbPhase + s.turb) & (turb.length - 1) : 0,
-          qzb ?? null);
+          win ?? null);
         iz = r.iz;
         lux = r.lux;
         uz += s.duz * m;
@@ -2106,40 +2291,52 @@ export function drawSpansRGB(
 }
 
 /**
- * Monomorphic RGB backend: owns the RGB888 work plane + coverage mask,
- * dispatches the opaque world pass. Framebuffer.depth keeps 1/z semantics
- * (same strict-greater test as the software loop); the optional Uint16
- * `qzb` plane (attached by the renderer when vd_zbits is active) is the
- * 16-bit authority for the test/write under the same larger-1/z-wins
- * convention (cleared to 0 = far) — the float plane mirrors its quantised
- * values so foreground effect draws that only see `zb` stay consistent.
+ * Monomorphic RGB backend: owns the packed RGB565 authority plane + the
+ * window-Z Uint16 depth plane + coverage mask, and dispatches the RGB
+ * world/effect passes. `rgb565` is the ONLY color target: opaque writes
+ * quantise 8:8:8 -> 565 on write, translucent/alpha/additive expand the
+ * stored quantum, blend in 8-bit, and re-quantise. `rgbDepth` holds
+ * window-Z quanta (LESS wins, ties keep stored, cleared to 0xFFFF = far).
+ * `color` is only the endFrame resolve scratch (expanded from rgb565 where
+ * covered); nothing blends against it mid-frame. `win` is the projection
+ * window threaded from the Camera (defaults 4..32768, matches setupCamera).
  */
 export class RGBWorldBackend {
-  color: Uint32Array = new Uint32Array(0);
+  rgb565: Uint16Array = new Uint16Array(0);
   cover: Uint8Array = new Uint8Array(0);
-  zb: Float32Array = new Float32Array(0);
-  qzb: Uint16Array | null = null;
+  rgbDepth: Uint16Array = new Uint16Array(0);
+  /** Resolve scratch only (expanded from rgb565 in endFrame). */
+  color: Uint32Array = new Uint32Array(0);
+  win: RGBWindow = { near: DEFAULT_RGB_NEAR, far: DEFAULT_RGB_FAR };
   fbW = 0;
   fbH = 0;
   spansDrawn = 0;
   pixelsDrawn = 0;
 
   attach(
-    color: Uint32Array, cover: Uint8Array, zb: Float32Array, w: number, h: number,
-    qzb?: Uint16Array | null,
+    rgb565: Uint16Array, cover: Uint8Array, rgbDepth: Uint16Array,
+    w: number, h: number, color?: Uint32Array | null,
   ): void {
-    this.color = color;
+    this.rgb565 = rgb565;
     this.cover = cover;
-    this.zb = zb;
-    this.qzb = qzb ?? null;
+    this.rgbDepth = rgbDepth;
+    if (color) this.color = color;
     this.fbW = w;
     this.fbH = h;
   }
 
-  /** Opaque RGB world pass (counts mirror SoftwareBackend accounting). */
-  drawSpansRGB(list: SpanList, mat: RGBMaterial): { pixels: number; spans: number } {
+  /** Projection window for the window-Z mapping (threaded from Camera). */
+  setWindow(near: number, far: number): void {
+    this.win = {
+      near: near > 0 ? near : DEFAULT_RGB_NEAR,
+      far: far > near ? far : DEFAULT_RGB_FAR,
+    };
+  }
+
+  /** RGB world/effect pass (counts mirror SoftwareBackend accounting). */
+  drawSpansRGB(list: SpanList, mat: RGBMaterial, win?: RGBWindow | null): { pixels: number; spans: number } {
     const r = drawSpansRGB(
-      this.color, this.cover, this.zb, this.fbW, this.fbH, list, mat, this.qzb,
+      this.rgb565, this.cover, this.rgbDepth, this.fbW, this.fbH, list, mat, win ?? this.win,
     );
     this.spansDrawn += r.spans;
     this.pixelsDrawn += r.pixels;

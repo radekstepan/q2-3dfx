@@ -3,7 +3,7 @@
 // optional scissor rect), rasterised with the shared perspective span path.
 
 import type { Camera } from './camera.js';
-import { SPAN_OPAQUE, createSpan, drawSpansRGB, drawSpansSoftware, type RGBMaterial, type SpanList, type Texture } from './spans.js';
+import { SPAN_OPAQUE, createSpan, drawSpansRGB, drawSpansSoftware, type RGBMaterial, type RGBWindow, type SpanList, type Texture } from './spans.js';
 import type { LightBlock } from './spans.js';
 
 export interface SpriteDef {
@@ -86,8 +86,11 @@ function emitSpriteSpans(
   if (yB < yA || xB < xA) return 0;
   // The billboard is planar at constant depth: iz is uniform, u runs
   // 0..w across the row, v is constant per row. Clipping only moves x0.
+  // Vertical footprint for the Voodoo LOD: u is constant down columns
+  // (du/dy = 0), v spans 0..h over (maxY - minY) rows.
   const q = iz;
   const fullW = Math.max(1, maxX - minX);
+  const dvdyS = h / Math.max(1e-6, maxY - minY);
   for (let y = yA; y <= yB; y++) {
     if (cursor >= maxSpans) break;
     while (spans.length <= cursor) spans.push(createSpan());
@@ -109,6 +112,7 @@ function emitSpriteSpans(
     s.light = sprite.grade;
     s.dlight = 0;
     s.lu = 0; s.lv = -1; s.dlu = 0; s.ord = 0;
+    s.dudy = 0; s.dvdy = dvdyS;
     s.turb = 0;
   }
   pool.count = cursor;
@@ -145,14 +149,14 @@ export function drawSprite(
  * RGB (voodoo-policy) twin of drawSprite: the same emitted billboard spans
  * go through drawSpansRGB with the caller's material (unlit sprite texture,
  * transparent-255 holes skipped, per-material blend/depthWrite). Writes
- * only the RGB planes + the handed (RGB-owned) depth plane, so the indexed
- * path stays bit-identical. PORT-DIFF vs @q2/voodoo sampler.ts: same tap
- * math via drawSpansRGB; the billboard emission above is reused verbatim.
+ * only the RGB565 + window-Z planes + coverage, so the indexed path stays
+ * bit-identical. PORT-DIFF vs @q2/voodoo sampler.ts: same tap math via
+ * drawSpansRGB; the billboard emission above is reused verbatim.
  */
 export function drawSpriteRGB(
-  color: Uint32Array,
+  rgb565: Uint16Array,
   cover: Uint8Array,
-  zb: Float32Array,
+  rgbDepth: Uint16Array,
   fbW: number,
   fbH: number,
   sprite: SpriteDef,
@@ -162,10 +166,11 @@ export function drawSpriteRGB(
   pool: SpanList,
   maxSpans: number,
   scissor?: Scissor,
+  win?: RGBWindow | null,
 ): number {
   const n = emitSpriteSpans(sprite, textures, cam, fbW, fbH, pool, maxSpans, scissor);
   if (n === 0) return 0;
-  const r = drawSpansRGB(color, cover, zb, fbW, fbH, pool, mat);
+  const r = drawSpansRGB(rgb565, cover, rgbDepth, fbW, fbH, pool, mat, win ?? null);
   pool.count = 0;
   return r.pixels;
 }

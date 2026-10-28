@@ -53,9 +53,9 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
   }),
   Object.freeze({
     setting: 'scanout.order',
-    value: 'subtract-then-filter for non-legacy reconmodes',
+    value: 'linear pack -> reconstruct/box -> display gamma for all modes (incl. legacy box)',
     source: 'manual:vidProcCfg',
-    note: 'vidProcCfg specifies dither subtraction before 2x2-box / 4x1 reconstruction.',
+    note: 'Single hardware-correct RAMDAC order; the legacy gamma-on-source ordering is removed.',
   }),
   Object.freeze({
     setting: 'scanout.matched-pairs',
@@ -77,15 +77,15 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
   }),
   Object.freeze({
     setting: 'scanout.rgbMaxDelta-values',
-    value: 'default 0,0,0 (no rejection = legacy unconditional box); comparison profile 8,8,8',
+    value: 'default 8,8,8 (smooth passes, hard edges reject); 0,0,0 disables rejection (= unconditional box)',
     source: 'approx:chosen',
     note: 'MiniGL programming of the register unestablished; thresholds are placeholders.',
   }),
   Object.freeze({
-    setting: 'scanout.legacy-default',
-    value: "reconmode defaults to 'legacy' (4x4-dither write + unconditional 2x2 box, no subtraction)",
+    setting: 'scanout.default',
+    value: "reconmode defaults to '2x2sub+2x2box' (matched 2x2 subtract + box with 8,8,8 rejection); 'legacy' is an accepted alias for the unconditional 2x2 box (no subtraction)",
     source: 'approx:chosen',
-    note: 'Legacy stays default to preserve the bit-exact M4.1 path; subtract modes are opt-in until HW capture.',
+    note: 'Matched mode is the hardware-correct default; legacy alias kept for compat tests.',
   }),
   Object.freeze({
     setting: 'gamma.curve',
@@ -101,9 +101,9 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
   }),
   Object.freeze({
     setting: 'gamma.stage',
-    value: 'legacy: LUT on the 8:8:8 source before dither/quantise; strict (non-legacy recon): linear pack + reconstruct, LUT on the display plane after',
+    value: 'all modes: linear pack + reconstruct/box, LUT on the display plane after',
     source: 'approx:chosen',
-    note: 'Strict follows the guide RAMDAC order; legacy keeps LUT-on-source so goldens stay bit-exact until HW capture.',
+    note: 'Single hardware-correct RAMDAC order; the legacy gamma-on-source ordering is removed.',
   }),
   Object.freeze({
     setting: 'lod.bias-sign',

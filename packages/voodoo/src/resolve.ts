@@ -3,18 +3,16 @@
 // Pipeline order (Glide on Voodoo3, guide §7.2): the display gamma LUT lives
 // in the RAMDAC on the already-reconstructed signal:
 //   8:8:8 framebuffer -> ordered dither -> RGB565 quantise
-//   -> scanout reconstruction (box / matched subtract+box) for display
+//   -> scanout reconstruction (matched subtract+box, or unconditional box
+//      under the 'legacy' alias) for display
 //   -> display gamma LUT.
-// Two orderings exist in this package:
-// - 'legacy' reconmode (DEFAULT): gamma LUT on the 8:8:8 source, then dither
-//   -> RGB565, then unconditional 2x2 box (or per-pixel expand when the
-//   postfilter is off). Byte-exact M4.1 path — every golden pins it.
-// - strict (non-legacy reconmode: '2x2sub+2x2box' / '4x4sub+4x1'): LINEAR
-//   dither+quant (gamma 1) -> matched reconstruction (subtract matrix
-//   dictated by the mode, never by vd_dithermode) -> display gamma LUT on
-//   the display plane via applyDisplayGamma. Postfilter-off strict follows
-//   the same rule with no reconstruction: linear pack -> expand -> display
-//   gamma (direct-view strict path).
+// Single hardware-correct path for ALL reconmodes (postfilter on or off):
+// linear dither+quant (gamma 1) -> reconstruction/box (subtract matrix
+// dictated by the mode, never by vd_dithermode; 'legacy' = unconditional
+// 2x2 box with NO subtraction, kept as a compat alias) -> display gamma LUT
+// on the display plane via applyDisplayGamma. Postfilter-off follows the
+// same rule with no reconstruction: linear pack -> expand -> display gamma
+// (direct-view path).
 // The RGB888 debug bypass keeps the historical LUT-on-source order (gamma
 // on, dither/reconstruction off); gamma 1.0 disables the stage everywhere.
 //   Depth: stored 1/z quantised to vd_zbits bits is a DISPLAY/BANDING
@@ -61,10 +59,9 @@ export function gammaLUT(gamma: number): Uint8Array {
  * runs on the already-reconstructed signal, AFTER dither/quant/recon.
  * gamma = 1 validates then no-ops. Zero-alloc inner loop.
  *
- * Used by the strict (non-legacy reconmode) resolveFrame path: the 565
- * target is packed linear (gamma 1), reconstructed, then this LUT runs on
- * the display plane. The legacy path keeps the historical LUT-on-source
- * order byte-exact and never calls this. Raster backends must NOT import
+ * Used by every quantise-on resolveFrame path: the 565 target is packed
+ * linear (gamma 1), reconstructed (or box-filtered under the 'legacy'
+ * alias), then this LUT runs on the display plane. Raster backends must NOT import
  * this to gamma-correct their own buffers — it is resolve-internal; call
  * resolveFrame and treat the display plane as final.
  */
@@ -107,26 +104,24 @@ export function expandRGB565(v: number): number {
 
 // --- Scanout profile data (vd_dithermode / vd_reconmode / vd_rgbmaxdelta) -----
 //
-// Read-path-only driver-profile selectors (registered in @q2/config, defaults
-// preserve the legacy M4.1 bit-exact path). Values are snapshots in
+// Read-path-only driver-profile selectors (registered in @q2/config).
+// Values are snapshots in
 // VoodooState; resolveFrame wires them into write dither + scanout. Every
-// non-legacy combination is a DETERMINISTIC APPROXIMATION until an HW capture
+// combination is a DETERMINISTIC APPROXIMATION until an HW capture
 // establishes the MiniGL programming of fbzMode / vidProcCfg / rgbMaxDelta.
 
-/** Ordered-dither matrix at target writes: '4x4' (legacy default) or '2x2'. */
+/** Ordered-dither matrix at target writes: '4x4' (default) or '2x2'. */
 export type DitherMode = '2x2' | '4x4';
 
 /**
  * Scanout reconstruction profile (vidProcCfg):
- * - 'legacy' (default): 4x4-dither write + unconditional 2x2 box, NO dither
- *   subtraction — the M4.1 approximation, bit-exact preserved. Legacy stays
- *   the DEFAULT because every existing golden/capture pins this exact path;
- *   the subtract modes below are opt-in comparison profiles until an HW
- *   capture establishes the MiniGL programming of fbzMode / vidProcCfg.
- * - '2x2sub+2x2box': subtract the 2x2 dither pattern, then 2x2 box with
- *   rgbMaxDelta edge rejection.
+ * - '2x2sub+2x2box' (DEFAULT): subtract the 2x2 dither pattern, then 2x2
+ *   box with rgbMaxDelta edge rejection — the matched hardware pairing.
  * - '4x4sub+4x1': subtract the 4x4 dither pattern, then a horizontal 4x1 box
  *   (centered window [x-1, x+2], clamp-to-edge) with rgbMaxDelta rejection.
+ * - 'legacy': accepted alias for the unconditional 2x2 box with NO dither
+ *   subtraction (compat/tests only) — same linear-pack + display-gamma
+ *   placement as every other mode, just no subtract and no edge rejection.
  * The subtract matrix is dictated by the MODE, never by vd_dithermode: the
  * scanout filter is programmed for the mode's pattern regardless of the
  * write matrix. A mismatched write dither (e.g. 2x2 writes under 4x4sub+4x1
@@ -136,14 +131,19 @@ export type DitherMode = '2x2' | '4x4';
  */
 export type ReconMode = 'legacy' | '2x2sub+2x2box' | '4x4sub+4x1';
 
-/** Parse vd_dithermode; anything but '2x2' falls back to legacy '4x4'. */
+/** Parse vd_dithermode; anything but '2x2' falls back to '4x4'. */
 export function parseDitherMode(s: string): DitherMode {
   return s === '2x2' ? '2x2' : '4x4';
 }
 
-/** Parse vd_reconmode; unknown strings fall back to legacy 'legacy'. */
+/**
+ * Parse vd_reconmode; 'legacy' stays an accepted alias for the
+ * unconditional box (no subtraction). Unknown strings fall back to the
+ * hardware-correct default '2x2sub+2x2box'.
+ */
 export function parseReconMode(s: string): ReconMode {
-  return s === '2x2sub+2x2box' || s === '4x4sub+4x1' ? s : 'legacy';
+  if (s === 'legacy') return 'legacy';
+  return s === '4x4sub+4x1' ? '4x4sub+4x1' : '2x2sub+2x2box';
 }
 
 export interface ResolveOptions {
@@ -151,7 +151,7 @@ export interface ResolveOptions {
   gamma: number;
   /** Ordered dither before quantise (matrix selected by ditherMode). */
   dither: boolean;
-  /** Dither matrix: '4x4' (default, legacy bit-exact) or '2x2'. */
+  /** Dither matrix: '4x4' (default) or '2x2'. */
   ditherMode?: DitherMode;  /**
    * Quantise 8:8:8 -> 5:6:5 (vd_16bit). Off still packs 565 (round-to-nearest
    * instead of truncating) for backwards compatibility — it is NOT a true
@@ -533,10 +533,9 @@ export function testAndWriteDepth16(
  * edge and must NOT be box-averaged away.
  *
  * APPROXIMATION UNTIL HW CAPTURE: the Quake II MiniGL programming of this
- * register is not yet established from a hardware capture, so the defaults
- * below are a placeholder (smooth gradients pass, hard edges reject) and the
- * current applyPostFilter path stays unconditional. Wire passes through
- * passesReconstructionThreshold only behind an explicit comparison profile.
+ * register is not yet established from a hardware capture, so the default
+ * below is a placeholder (smooth gradients pass, hard edges reject); the
+ * all-zero value disables the gate (unconditional box).
  */
 export interface RgbMaxDelta {
   r: number;
@@ -544,19 +543,23 @@ export interface RgbMaxDelta {
   b: number;
 }
 
-/** Placeholder comparison-profile thresholds (NOT the default): smooth
- * gradients pass, hard edges reject. The live default is {0,0,0} (no
- * rejection — unconditional box, preserving legacy behaviour); use
- * parseRgbMaxDelta(getCVarString('vd_rgbmaxdelta')) for the frame value. */
+/** Default reconstruction thresholds: smooth gradients pass, hard edges
+ * reject. This IS the live default (see defaultVoodooState); the all-zero
+ * value disables rejection (= unconditional box, e.g. under the 'legacy'
+ * alias). Use parseRgbMaxDelta(getCVarString('vd_rgbmaxdelta')) for the
+ * frame value. */
 export function defaultRgbMaxDelta(): RgbMaxDelta {
   return { r: 8, g: 8, b: 8 };
 }
 
 /**
  * Parse vd_rgbmaxdelta ('r,g,b', each 0..255, clamped; unparseable or missing
- * components fall back to 0). '0,0,0' (the default) disables rejection:
- * passesReconstructionThreshold returns true unconditionally, i.e. the
- * legacy unconditional box.
+ * components fall back to 0). '0,0,0' disables rejection:
+ * passesReconstructionThreshold returns true unconditionally, i.e. an
+ * unconditional box. The live voodoo default is {8,8,8} (see
+ * defaultRgbMaxDelta); the parse fallback stays per-component 0 so an
+ * explicitly cleared cvar ('0,0,0' as registered in @q2/config) keeps
+ * parsing to itself.
  */
 export function parseRgbMaxDelta(s: string): RgbMaxDelta {
   const parts = s.split(',');
@@ -575,9 +578,9 @@ export function parseRgbMaxDelta(s: string): RgbMaxDelta {
  * false when any channel spread exceeds it (one-pixel edge: keep sharp, do
  * not blur the dither/edge away). Pure, zero-alloc.
  *
- * ALL-ZERO DISABLES THE GATE: maxDelta {0,0,0} (the vd_rgbmaxdelta default)
- * returns true unconditionally — the legacy unconditional box. Nonzero
- * thresholds reject per channel; a channel threshold of 0 while others are
+ * ALL-ZERO DISABLES THE GATE: maxDelta {0,0,0} returns true
+ * unconditionally — an unconditional box (e.g. under the 'legacy' alias).
+ * Nonzero thresholds reject per channel; a channel threshold of 0 while others are
  * nonzero still rejects on that channel (any spread > 0 fails), so enable
  * the gate with all three components (e.g. the {8,8,8} comparison profile).
  * Threshold programming is a DETERMINISTIC APPROXIMATION until HW capture.

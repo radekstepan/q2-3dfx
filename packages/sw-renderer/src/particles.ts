@@ -1,6 +1,11 @@
 // @q2/sw-renderer particles — r_part.c equivalent: single-pixel particles.
 // Depth-tested point writes; the caller projects (or passes screen space).
 
+import {
+  packRGB565, windowDepthQ16,
+  DEFAULT_RGB_FAR, DEFAULT_RGB_NEAR, type RGBWindow,
+} from './spans.js';
+
 export interface ScreenParticle {
   x: number; y: number;
   /** 1/z depth */
@@ -79,25 +84,34 @@ export function projectParticles(
 
 /**
  * RGB (voodoo-policy) twin of drawParticles: one palette-expanded pixel
- * each, depth-tested and depth-writing into the RGB-owned depth plane
- * (matches the indexed path's occlusion, with full color depth instead of
- * the colormap grade). Writes only the RGB planes, so the software path
- * stays bit-identical. PORT-DIFF vs @q2/voodoo policy: point sprites have
- * no filtered footprint; expansion is the upload-time palette applied per
- * point (no voodoo import per the sw-renderer dep allowlist).
+ * each, window-Z depth-tested (LESS wins, ties keep stored; clear 0xFFFF
+ * = far) and depth-writing into the RGB-owned depth plane. The color
+ * quantises 8:8:8 -> 565 on write (the 565 plane is the authority, like
+ * every other RGB path). Writes only the RGB565 + depth planes, so the
+ * software path stays bit-identical. PORT-DIFF vs @q2/voodoo policy: point
+ * sprites have no filtered footprint; expansion is the upload-time palette
+ * applied per point (no voodoo import per the sw-renderer dep allowlist).
+ * `zbits` follows the vd_zbits policy (0 = full-precision float compare).
  */
 export function drawParticlesRGB(
-  color: Uint32Array,
+  rgb565: Uint16Array,
   cover: Uint8Array,
-  zb: Float32Array,
+  rgbDepth: Uint16Array,
   fbW: number,
   fbH: number,
   parts: ScreenParticle[] | { list: ScreenParticle[]; count: number },
   start: number,
   end: number,
   palette: Uint8Array,
+  win?: RGBWindow | null,
+  zbits = 16,
 ): number {
   const list = Array.isArray(parts) ? parts : parts.list;
+  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
+  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
+  const winA = winF / (winF - winN);
+  const winB = (winF * winN) / (winF - winN);
+  const zOff = !Number.isInteger(zbits) || zbits < 1 || zbits > 23;
   let drawn = 0;
   const s = Math.max(0, start);
   const e = Math.min(end, list.length);
@@ -106,11 +120,23 @@ export function drawParticlesRGB(
     const x = p.x | 0, y = p.y | 0;
     if (x < 0 || y < 0 || x >= fbW || y >= fbH) continue;
     const o = y * fbW + x;
-    if (p.iz > zb[o]) {
-      zb[o] = p.iz;
+    const dRaw = winA - winB * p.iz;
+    const d01 = dRaw < 0 ? 0 : dRaw > 1 ? 1 : (dRaw === dRaw ? dRaw : 1);
+    const qo = rgbDepth[o]!;
+    let qn: number;
+    let pass: boolean;
+    if (zOff) {
+      qn = Math.round(d01 * 65535) & 0xffff;
+      pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+    } else {
+      qn = windowDepthQ16(d01, zbits);
+      pass = qn < qo;
+    }
+    if (pass) {
+      rgbDepth[o] = qn;
       const c = (p.color & 255) * 3;
       const r = palette[c] ?? 0, g = palette[c + 1] ?? 0, b = palette[c + 2] ?? 0;
-      color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      rgb565[o] = packRGB565(r, g, b);
       cover[o] = 1;
       drawn++;
     }

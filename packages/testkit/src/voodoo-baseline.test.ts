@@ -7,7 +7,22 @@
 //   yarn workspace @q2/testkit baseline
 
 import { describe, expect, it } from 'vitest';
-import { setRGBWorldEnabled } from '@q2/sw-renderer';
+import { readFileSync } from 'fs';
+import { PakFile } from '@q2/filesystem';
+import { loadBsp } from '@q2/bsp';
+import type { BspMap } from '@q2/bsp';
+import { parsePCX, parseWAL } from '@q2/formats';
+import { createFramebuffer } from '@q2/renderer-api';
+import { v3 } from '@q2/math';
+import {
+  bspToMiniWorld,
+  createDevroom,
+  DEVROOM_CAMERA,
+  isRGBWorldEnabled,
+  setRGBWorldEnabled,
+  SoftwareRenderer,
+} from '@q2/sw-renderer';
+import type { BspTexelSource } from '@q2/sw-renderer';
 import {
   BASELINE_HEIGHT,
   BASELINE_MANIFEST_DIR,
@@ -260,22 +275,152 @@ describe('voodoo working baseline', () => {
     for (const t of [0, 1.5, 3]) expect(times.has(t), `simTime ${t}`).toBe(true);
   });
 
-  it('game adapter sanity: web shell hooks exist (feature checks, no apps/* import)', async () => {
-    // Renderer-side arm/disarm hook (real dep edge, already allowed).
-    expect(typeof setRGBWorldEnabled).toBe('function');
-    // Web-shell side: source-level feature check only — testkit must not
-    // import apps/* (BRAIN.md §3), so assert the exports/hook probes exist.
-    const fs = await import('fs');
-    const playPath = new URL('../../../apps/web/src/play.ts', import.meta.url).pathname;
-    const raw = fs.readFileSync(playPath) as unknown as Uint8Array | string;
-    const play = typeof raw === 'string' ? raw : new TextDecoder().decode(raw);
-    expect(play).toContain('export function applyRendererCvar');
-    expect(play).toContain('export function resolveDisplay');
-    expect(play).toContain("'setRGBWorldEnabled'");
+  it('game adapter sanity: REAL instance RGB hook + real render cover (no source-text probes)', () => {
+    // The RGB-world switch is a REAL instance method on SoftwareRenderer
+    // (`packages/sw-renderer/src/frame.ts`) plus the module-level pair it
+    // drives. Probe the prototype (never source text — testkit must not
+    // parse apps/* and must not depend on backend file layout) and prove
+    // the instance hook drives a real RGB pass through the real devroom:
+    // cover > 0 + used when armed via the instance, 0/unused when off.
+    expect(typeof SoftwareRenderer.prototype.setRGBWorldEnabled).toBe('function');
+    expect(typeof SoftwareRenderer.prototype.isRGBWorldEnabled).toBe('function');
+    const pal = new Uint8Array(768);
+    for (let i = 0; i < 256; i++) {
+      pal[i * 3] = (i * 5) & 255;
+      pal[i * 3 + 1] = (i * 3 + 40) & 255;
+      pal[i * 3 + 2] = (i * 2 + 80) & 255;
+    }
+    const renderDevroomRGB = (on: boolean): { used: boolean; cover: number } => {
+      const r = new SoftwareRenderer();
+      r.init(createFramebuffer(160, 120, true));
+      r.setPalette(pal);
+      r.setRGBWorldEnabled(on); // the REAL instance method under test
+      expect(r.isRGBWorldEnabled()).toBe(on);
+      expect(isRGBWorldEnabled()).toBe(on); // instance drives the shared flag
+      r.beginFrame();
+      r.renderView(
+        {
+          origin: DEVROOM_CAMERA.origin,
+          angles: DEVROOM_CAMERA.angles,
+          fovX: DEVROOM_CAMERA.fovX,
+          time: 1.5,
+          lightStyles: new Float32Array(256).fill(1),
+        },
+        { name: 'devroom', data: createDevroom() },
+        [],
+      );
+      r.endFrame();
+      const st = r.testRGBStats();
+      r.setRGBWorldEnabled(false); // never leak the module-global flag
+      return { used: st.used, cover: st.coverPixels };
+    };
+    try {
+      const off = renderDevroomRGB(false);
+      expect(off.used).toBe(false);
+      expect(off.cover).toBe(0);
+      const on = renderDevroomRGB(true);
+      expect(on.used).toBe(true);
+      // The RGB backend drew world spans: the coverage mask is non-zero.
+      expect(on.cover).toBeGreaterThan(0);
+    } finally {
+      setRGBWorldEnabled(false);
+    }
+    expect(isRGBWorldEnabled()).toBe(false);
   });
 
-  it('voodoo stable API feature detection (passes with or without the package)', async () => {
-    let voodoo: Record<string, unknown> | null = null;
+  describe('real-map (base1) voodoo capture note (Q2_PAK-gated)', () => {
+    // The committed baseline above is procedural-devroom-only by design
+    // (asset-free, Q2_PAK never read). This block records the real-map
+    // counterpart as a NOTE, not a gate: when Q2_PAK is present it renders
+    // the base1 spawn view through the real pipeline (indexed + RGB via
+    // the real instance hook) and logs both resolve-stage hashes; when
+    // absent it records the skip explicitly so the log shows the note was
+    // considered, not silently dropped.
+    const Q2_PAK = process.env.Q2_PAK;
+
+    it.runIf(!!Q2_PAK)('renders base1 spawn through indexed + real RGB and logs the capture note', { timeout: 300000 }, () => {
+      const bytes = readFileSync(Q2_PAK as string);
+      const buf = new ArrayBuffer(bytes.length);
+      new Uint8Array(buf).set(bytes);
+      const pak = new PakFile(buf);
+      const map = loadBsp(pak.readFile('maps/base1.bsp')) as BspMap;
+      const walCache = new Map<string, BspTexelSource | null>();
+      const texelFor = (walName: string): BspTexelSource | null => {
+        if (walCache.has(walName)) return walCache.get(walName)!;
+        let src: BspTexelSource | null = null;
+        try {
+          const wal = parseWAL(pak.readFile(`textures/${walName}.wal`));
+          src = { texels: wal.mips[0]!, width: wal.width, height: wal.height };
+        } catch { src = null; }
+        walCache.set(walName, src);
+        return src;
+      };
+      const world = bspToMiniWorld(map, { texelFor });
+      const pcx = parsePCX(pak.readFile('pics/colormap.pcx'));
+      const W2 = 320;
+      const H2 = 240;
+      const view = {
+        origin: v3(128, -320, 54),
+        angles: v3(0, 90, 0),
+        fovX: 90,
+        time: 1.5,
+        lightStyles: new Float32Array(256).fill(1),
+      };
+      const renders: Record<'indexed' | 'rgb', { color: Uint32Array; cover: number; used: boolean }> = {
+        indexed: { color: new Uint32Array(0), cover: 0, used: false },
+        rgb: { color: new Uint32Array(0), cover: 0, used: false },
+      };
+      try {
+        for (const mode of ['indexed', 'rgb'] as const) {
+          const r = new SoftwareRenderer();
+          r.init(createFramebuffer(W2, H2, true));
+          r.setPalette(pcx.palette);
+          r.setRGBWorldEnabled(mode === 'rgb'); // real instance hook
+          r.beginFrame();
+          r.renderView(view, { name: 'base1', data: world }, []);
+          r.endFrame();
+          const live = r.getFramebuffer();
+          renders[mode] = {
+            color: live.color.slice(),
+            cover: r.testRGBStats().coverPixels,
+            used: r.testRGBStats().used,
+          };
+        }
+      } finally {
+        setRGBWorldEnabled(false);
+      }
+      // Sanity only (no hash pinning — the renderer is owned by parallel
+      // lanes): real WAL texels, opaque frame, RGB pass covered the map.
+      for (const mode of ['indexed', 'rgb'] as const) {
+        const { color } = renders[mode];
+        expect(color.length).toBe(W2 * H2);
+        for (let i = 0; i < color.length; i++) expect(color[i]! >>> 24).toBe(0xff);
+      }
+      expect(new Set(renders['indexed'].color).size).toBeGreaterThan(20);
+      expect(renders['rgb'].used).toBe(true);
+      expect(renders['rgb'].cover).toBeGreaterThan(0);
+      // The NOTE: both resolve stages over the real RGB frame, logged for
+      // the human-review side-by-side (M4.1 tail), never gated.
+      const profile = baselineProfile();
+      const raw = resolveRaw565Display(renders['rgb'].color, W2, H2, profile.vd_gamma);
+      const recon = resolveReconstructedDisplay(renders['rgb'].color, W2, H2, profile.vd_gamma);
+      console.log(
+        `[testkit] base1 voodoo capture note: spawn-north ${W2}x${H2} ` +
+          `indexed=${hashBaseline(renders['indexed'].color)} rgb=${hashBaseline(renders['rgb'].color)} ` +
+          `raw-565=${hashBaseline(raw)} reconstructed=${hashBaseline(recon)} rgbCover=${renders['rgb'].cover}`,
+      );
+    });
+
+    it.runIf(!Q2_PAK)('records the skip explicitly (no Q2_PAK in this environment)', () => {
+      console.log(
+        '[testkit] base1 voodoo capture SKIPPED: Q2_PAK is unset — ' +
+          'committed baseline stays procedural-devroom-only (see VOODOO_BASELINE_APPROXIMATIONS.md).',
+      );
+      expect(process.env.Q2_PAK).toBeFalsy();
+    });
+  });
+
+  it('voodoo stable API feature detection (passes with or without the package)', async () => {    let voodoo: Record<string, unknown> | null = null;
     try {
       const spec = '@q2/' + 'voodoo';
       voodoo = (await import(/* @vite-ignore */ spec)) as unknown as Record<string, unknown>;

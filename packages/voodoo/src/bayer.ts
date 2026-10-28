@@ -53,7 +53,7 @@ export function bayerThreshold(x: number, y: number): number {
 // RB (amp 4): [-3, +1, +3, -1]; G (amp 2): [-1, +1, +2, 0] — the G asymmetry
 // (+2 vs -1) is JS Math.round half-up on exact .5 fractions, kept verbatim so
 // the table stays a pure function of the stated formula. Select via
-// vd_dithermode ('2x2' | '4x4', default '4x4' = legacy bit-exact path).
+// vd_dithermode ('2x2' | '4x4', default '4x4').
 
 // Row-major 2x2 Bayer matrix, values 0..3.
 export const BAYER2: Readonly<Uint8Array> = new Uint8Array([0, 2, 3, 1]);

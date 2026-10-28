@@ -17,7 +17,7 @@ import {
   SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SoftwareBackend, RGBWorldBackend,
   buildTurbTable, drawSpansSoftware, drawSpansTurbulent, drawSpansFlatPerSpan,
   runSubdiv16, runSubdivTurbulent, runSpanFlat, sampleLightBlock, textureMasks,
-  type LightBlock, type RasterBackend, type RGBMaterial, type Span, type SpanList, type Texture,
+  type LightBlock, type RasterBackend, type RGBMaterial, type RGBWindow, type Span, type SpanList, type Texture,
 } from './spans.js';
 import { COLORMAP_SIZE } from './colormap.js';
 
@@ -371,6 +371,10 @@ export function packFrameSpans(
     F[o] = s.iz; F[o + 1] = s.diz; F[o + 2] = s.uz; F[o + 3] = s.duz;
     F[o + 4] = s.vz; F[o + 5] = s.dvz; F[o + 6] = s.light;
     F[o + 7] = s.dlight; F[o + 8] = s.lu; F[o + 9] = s.lv; F[o + 10] = s.dlu;
+    // Vertical LOD footprint rides the flat copy (F_PER_SPAN = 13); the
+    // indexed raster core below ignores [o+11, o+12] (horizontal-only LOD
+    // there is unchanged), while the RGB path reads them per span.
+    F[o + 11] = s.dudy; F[o + 12] = s.dvdy;
     const q = (iBase + p) * I_PER_SPAN;
     I[q] = s.kind; I[q + 1] = s.y; I[q + 2] = s.x0; I[q + 3] = s.x1; I[q + 4] = s.turb | 0;
     est += s.x1 - s.x0;
@@ -757,6 +761,7 @@ function createScratchSpan(): Span {
     y: 0, x0: 0, x1: 0,
     iz: 0, diz: 0, uz: 0, duz: 0, vz: 0, dvz: 0,
     light: 63, dlight: 0, lu: 0, lv: -1, dlu: 0, turb: 0, ord: 0,
+    dudy: 0, dvdy: 0,
   };
 }
 
@@ -1031,13 +1036,13 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
   }
 
   /**
-   * Bind the renderer's RGB overlay planes (color/cover/separate rgbZb +
-   * the optional 16-bit authority plane).
-   * Called every enabled frame (see SoftwareRenderer.beginFrame); workers
-   * never touch these planes, so no SAB staging is involved.
+   * Bind the renderer's RGB overlay planes (packed RGB565 authority +
+   * window-Z Uint16 depth + coverage; the Uint32 resolve scratch is
+   * optional). Called every enabled frame (see SoftwareRenderer.beginFrame);
+   * workers never touch these planes, so no SAB staging is involved.
    */
-  attachRGB(color: Uint32Array, cover: Uint8Array, zb: Float32Array, w: number, h: number, qzb?: Uint16Array | null): void {
-    this.rgb.attach(color, cover, zb, w, h, qzb ?? null);
+  attachRGB(rgb565: Uint16Array, cover: Uint8Array, rgbDepth: Uint16Array, w: number, h: number, color?: Uint32Array | null): void {
+    this.rgb.attach(rgb565, cover, rgbDepth, w, h, color ?? null);
     this.bands = splitBands(h, this.bandCount);
   }
 
@@ -1053,9 +1058,9 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
    * endFrame merges the planes afterwards. Zero allocation (scratch +
    * bandList are backend-owned, shared with runInline, never re-entered).
    */
-  drawSpansRGB(list: SpanList, mat: RGBMaterial): void {
+  drawSpansRGB(list: SpanList, mat: RGBMaterial, win?: RGBWindow | null): void {
     if (this.bandCount <= 1 || this.fbH <= 0) {
-      this.rgb.drawSpansRGB(list, mat);
+      this.rgb.drawSpansRGB(list, mat, win ?? null);
       return;
     }
     const spans = list.spans;
@@ -1073,7 +1078,7 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
         }
         if (m === 0) continue;
         this.bandList.count = m;
-        this.rgb.drawSpansRGB(this.bandList, mat);
+        this.rgb.drawSpansRGB(this.bandList, mat, win ?? null);
       }
       base += end;
     }

@@ -240,16 +240,17 @@ describe('matched recon enforcement: subtract forced by reconmode, not dithermod
     expect(dst565).toEqual(ref565);
     expect(display).toEqual(refDisplay);
   });
-  it('legacy ignores the subtract profiles entirely (unconditional box, gamma on source)', () => {
+  it("legacy alias is the unconditional box (no subtraction) with display-gamma placement", () => {
     const src = fieldSrc();
     const st = { ...defaultVoodooState(), dithermode: '2x2' as const, reconmode: 'legacy' as const, gamma: 1.3, dither: true, postfilter: true };
     const dst565 = new Uint16Array(w * h);
     const display = new Uint32Array(w * h);
     resolveFrame(src, dst565, display, w, h, st);
     const ref565 = new Uint16Array(w * h);
-    resolveRGB565(src, ref565, w, h, { gamma: 1.3, dither: true, ditherMode: '2x2', quantise: true });
+    resolveRGB565(src, ref565, w, h, { gamma: 1, dither: true, ditherMode: '2x2', quantise: true });
     const refDisplay = new Uint32Array(w * h);
     applyPostFilter(ref565, refDisplay, w, h);
+    applyDisplayGamma(refDisplay, w, h, 1.3);
     expect(dst565).toEqual(ref565);
     expect(display).toEqual(refDisplay);
   });
@@ -391,19 +392,24 @@ describe('fog zero-contribution gate (base1 has no scene fog)', () => {
 });
 
 describe('profile cvar parsing', () => {
-  it('parses vd_dithermode / vd_reconmode / vd_rgbmaxdelta with legacy fallbacks', () => {
+  it('parses vd_dithermode / vd_reconmode / vd_rgbmaxdelta with matched-mode fallbacks', () => {
     expect(parseDitherMode('2x2')).toBe('2x2');
     expect(parseDitherMode('4x4')).toBe('4x4');
     expect(parseDitherMode('bogus')).toBe('4x4');
     expect(parseReconMode('2x2sub+2x2box')).toBe('2x2sub+2x2box');
     expect(parseReconMode('4x4sub+4x1')).toBe('4x4sub+4x1');
     expect(parseReconMode('legacy')).toBe('legacy');
-    expect(parseReconMode('nope')).toBe('legacy');
+    expect(parseReconMode('nope')).toBe('2x2sub+2x2box');
     expect(parseRgbMaxDelta('8,4,8')).toEqual({ r: 8, g: 4, b: 8 });
     expect(parseRgbMaxDelta('0,0,0')).toEqual({ r: 0, g: 0, b: 0 });
     expect(parseRgbMaxDelta('junk')).toEqual({ r: 0, g: 0, b: 0 });
     expect(parseRgbMaxDelta('8,4')).toEqual({ r: 8, g: 4, b: 0 });
     expect(parseRgbMaxDelta('300,-5,8')).toEqual({ r: 255, g: 0, b: 8 });
+  });
+  it('defaults are the matched hardware-correct profile (2x2sub+2x2box, 8,8,8)', () => {
+    expect(parseReconMode('')).toBe('2x2sub+2x2box');
+    expect(defaultVoodooState().reconmode).toBe('2x2sub+2x2box');
+    expect(defaultVoodooState().rgbmaxdelta).toEqual({ r: 8, g: 8, b: 8 });
   });
   it('readVoodooState snapshots the profile cvars', () => {
     const saved = new Map<string, string>([

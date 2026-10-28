@@ -27,7 +27,7 @@ describe('VOODOO_APPROX_PROFILE', () => {
       'scanout.tap-alignment',
       'scanout.rgbMaxDelta-register',
       'scanout.rgbMaxDelta-values',
-      'scanout.legacy-default',
+      'scanout.default',
       'gamma.curve',
       'gamma.value',
       'gamma.stage',
@@ -60,6 +60,6 @@ describe('VOODOO_APPROX_PROFILE', () => {
     expect(by('lod.bias-value').source).toBe('preset:appearance');
     expect(by('lod.bias-value').value).toContain('-0.35');
     expect(by('depth.wbuffer').value).toBe('W-buffer NOT implemented');
-    expect(by('scanout.legacy-default').source).toBe('approx:chosen');
+    expect(by('scanout.default').source).toBe('approx:chosen');
   });
 });
