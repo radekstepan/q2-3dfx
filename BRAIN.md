@@ -222,6 +222,44 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 ## 8. Active tasks (everything else is DONE — see `docs/tasks-archive.md`)
 
 ```
+### VOODOO-REPAIR — Voodoo regression repair (black gun, missing geometry, FPS decline)
+owns: `packages/sw-renderer`, `apps/web` (investigated with no changes needed: `packages/voodoo`, `packages/config`, `packages/testkit` — see note)
+depends: M7.1
+status: done
+done-when:
+- [x] real base1 assets + real browser boot/render loop reproduce all three symptoms at 640x480 (viewmodel, entities, HUD, resolve/display stages; software-vs-voodoo same-scene)
+- [x] gun renders textured (not black, no holes): depth-bias UV invariant (ordinary + near-clipped), per-tri LOD in texels/pixel, opaque alias materials (255 masked for sprites only, per ref_soft/ref_gl audit)
+- [x] no missing geometry: world/entities/sprites/tracers/HUD verified through resolveDisplay (strict pre-scanout HUD); tracer bdy typo fixed
+- [x] no progressive FPS decline: shared per-texture RGB chains + surgical dlight invalidation (serial-free keys); soak shows stable frame times, bounded caches, zero evictions (stationary, combat, frozen scene)
+- [x] regression gates: `rgbAliasDepth.test.ts` (5 fail-before), `rgbSustain.test.ts` (3 fail-before), `apps/web/src/voodoo-regression.test.ts` (Q2_PAK release gate, fails clearly when assets unavailable); devroom RGB pins re-pinned with documented cause (`a9988ff4` → `436fe0c5`, index `58e0ecf1` unchanged)
+- [x] `yarn verify` green + changeset; perf-ledger rows appended (honest shortfalls, no relaxed thresholds)
+- [ ] OPEN (not this card): serial RGB spanfill ~6Mpx/s needs pooled/worker composition to reach the ≤16ms budget (~152ms/frame serial at spawn-north overdraw 3.1); headless-Chromium soak done 2026-10-27 (voodoo ~13.5fps/no-decline over 326s, software ~50.5fps — SwiftShader, serial path) but real-GPU + BrowserBandPool worker-count sweep stay with M7.1; human Voodoo3-capture review stays with M4.1
+```
+
+> VOODOO-REPAIR note (2026-10-27): all three symptoms reproduced and fixed.
+> Voodoo/config/testkit packages needed NO changes: the vd_* cvars and
+> resolve/scanout/upload/sampler policies are sound (audit vs prog guide +
+> MiniGL behavior); the testkit empty-entity baseline is harness-level by
+> design (entity coverage lives in the web release gate). Root causes were
+> all in `packages/sw-renderer`'s RGB backend + `apps/web` gates:
+> (1) drawAliasInstanceRGB stored iz*depthScale in v.iz but u*iz/v*iz
+> unscaled (plus the same in the near-clipped path) → viewmodel UVs /3
+> (black gun); per-tri LOD multiplied texels by width/height again (→
+> coarsest mip, dark edge-repeat averages); index-255 holes punched in
+> MD2 skins that ref_soft/ref_gl draw opaque (only sprites/HUD honor 255).
+> (2) tracer bdy copy-paste (`pby` for `pbx`) misplaced RGB beams off-axis.
+> (3) per-surface full-chain expansion thrashed the 4MB RGBLightCache (0%
+> hits, ~445ms/frame + MBs of garbage/frame) and invalidateAll-on-serial
+> rebuilt everything per combat frame; now per-texture shared chains
+> (71 chains/2.39MB base1, VRAM-like 16MB LRU) + surgical union
+> invalidation with serial-free keys (~152ms stationary, ~340ms combat
+> frameAsync, drift <5%, zero evictions). Evidence: before/after
+> screenshots (`software.png` vs `voodoo_prefix.png` vs `post_vd.png`),
+> soaks, and fail-before gates listed above. No frozen §5 contract changed;
+> software rendering bit-identical (all goldens green).
+```
+
+```
 ### M7.1 — Web app shell (tail: fps sign-off)
 owns: `apps/web`
 depends: M6.1

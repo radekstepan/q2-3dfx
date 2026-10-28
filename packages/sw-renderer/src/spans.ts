@@ -1278,33 +1278,26 @@ function halveRGBLevel(
 }
 
 /**
- * Build an RGBMaterial from indexed texels + an optional RGB luxel block.
- * The mip chain is expanded once here (upload-time cost); the span loop
- * only reads. levels is never empty (invalid dims fall back to 1x1 black).
- * The base opacity mask marks index-255 texels as holes, so transparent
- * texels never write color or depth at any mip; `opaqueMask: true` (skybox,
- * whose PCX art must sample verbatim) forces an all-opaque mask instead.
+ * Build the expanded-RGB mip chain for one texture (upload-time cost; the
+ * span loop only reads). Levels[0] is the palette-expanded full-res image,
+ * each halve box-filters the parent. The base opacity mask marks index-255
+ * texels as holes; each halve keeps a texel opaque only when ALL four
+ * sources are opaque (edges erode toward transparency instead of smearing
+ * opaque black fringes); `opaqueMask: true` forces an all-opaque mask.
+ * Invalid dims fall back to 1x1 black (levels is never empty).
  */
-export function buildRGBMaterial(
+export function buildRGBChain(
   texels: Uint8Array,
   w: number,
   h: number,
   palette: Uint8Array,
-  light: RGBLightmap | null,
-  opts?: {
-    addressS?: RGBAddressMode; addressT?: RGBAddressMode;
-    overbright?: boolean; lodBias?: number; mipDither?: boolean;
-    bilinear?: boolean; zbits?: number;
-    blend?: RGBBlend; alphaTest?: number | null; depthWrite?: boolean;
-    alpha?: number; warp?: boolean; turbPhase?: number;
-    flatColor?: Uint8Array | null; opaqueMask?: boolean;
-  },
-): RGBMaterial {
+  opaqueMask = false,
+): RGBMipLevel[] {
   const levels: RGBMipLevel[] = [];
   if (w >= 1 && h >= 1 && texels.length >= w * h) {
     const base = expandPaletteRGB(texels.subarray(0, w * h), w, h, palette);
     const baseMask = new Uint8Array(w * h);
-    if (opts?.opaqueMask === true) {
+    if (opaqueMask) {
       baseMask.fill(1);
     } else {
       for (let i = 0; i < w * h; i++) baseMask[i] = texels[i]! === 255 ? 0 : 1;
@@ -1324,6 +1317,34 @@ export function buildRGBMaterial(
   } else {
     levels.push({ data: new Uint8Array(3), width: 1, height: 1, mask: new Uint8Array([1]) });
   }
+  return levels;
+}
+
+/**
+ * Build an RGBMaterial from indexed texels + an optional RGB luxel block.
+ * The mip chain is expanded once here (upload-time cost) via buildRGBChain;
+ * the span loop only reads. levels is never empty (invalid dims fall back
+ * to 1x1 black). The base opacity mask marks index-255 texels as holes, so
+ * transparent texels never write color or depth at any mip; `opaqueMask:
+ * true` (skybox, whose PCX art must sample verbatim) forces an all-opaque
+ * mask instead.
+ */
+export function buildRGBMaterial(
+  texels: Uint8Array,
+  w: number,
+  h: number,
+  palette: Uint8Array,
+  light: RGBLightmap | null,
+  opts?: {
+    addressS?: RGBAddressMode; addressT?: RGBAddressMode;
+    overbright?: boolean; lodBias?: number; mipDither?: boolean;
+    bilinear?: boolean; zbits?: number;
+    blend?: RGBBlend; alphaTest?: number | null; depthWrite?: boolean;
+    alpha?: number; warp?: boolean; turbPhase?: number;
+    flatColor?: Uint8Array | null; opaqueMask?: boolean;
+  },
+): RGBMaterial {
+  const levels = buildRGBChain(texels, w, h, palette, opts?.opaqueMask === true);
   const alphaRaw = opts?.alpha ?? 1;
   const alpha = Number.isFinite(alphaRaw) ? (alphaRaw < 0 ? 0 : alphaRaw > 1 ? 1 : alphaRaw) : 1;
   const zraw = opts?.zbits ?? 0;

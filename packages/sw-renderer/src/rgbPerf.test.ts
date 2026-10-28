@@ -84,7 +84,14 @@ describe('step-5 RGB output hash pin (byte-identical before/after)', () => {
     // against the quantized destination) and depth is normalized window-Z
     // (near/far from the Camera, LESS wins, clear all-ones). The index pin
     // below is unchanged: the software path stays bit-identical.
-    expect(a.colorHash).toBe('a9988ff4');
+    // Alias-LOD re-pin (was a9988ff4): fillPerspTriRGB's per-tri rho was
+    // texels*width/pixel (double-scaled), forcing the coarsest mip on every
+    // alias tri (the devroom box critter rendered nearly flat); rho is now
+    // texels/pixel like drawSpansRGB's dudx, so close alias samples level
+    // 0. Isolated proof: real v_blast skin renders at the forced-LOD0
+    // mean with full texture detail (see rgbAliasDepth.test.ts); the index
+    // plane is untouched, so this pin moves for RGB only.
+    expect(a.colorHash).toBe('436fe0c5');
     expect(a.indexHash).toBe('58e0ecf1');
     // second frame is stable (cache hits serve identical color)
     const b = renderRGB160();

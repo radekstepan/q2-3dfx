@@ -279,7 +279,7 @@ describe('drawSpansRGB vs indexed resolve', () => {
 });
 
 describe('RGBLightCache keying', () => {
-  it('misses across dlight serials, hits within one', () => {
+  it('hits within one generation; variant separates loops', () => {
     const c = new RGBLightCache(1024);
     const texels = new Uint8Array([1, 2, 3, 4]);
     const mat = buildRGBMaterial(texels, 2, 2, new Uint8Array(768), null, {});
@@ -291,17 +291,21 @@ describe('RGBLightCache keying', () => {
       },
       material: mat,
     };
-    expect(c.get(7, 11, 0, 5)).toBeNull();
-    c.put(7, 11, 0, 5, entry);
-    expect(c.get(7, 11, 0, 5)).toBe(entry);
-    // dlight generation changed -> stale color must not serve
-    expect(c.get(7, 11, 0, 6)).toBeNull();
+    expect(c.get(7, 11, 0)).toBeNull();
+    c.put(7, 11, 0, entry);
+    expect(c.get(7, 11, 0)).toBe(entry);
+    // the deferred alpha loop's variant never serves the opaque binding
+    expect(c.get(7, 11, 0, 1)).toBeNull();
     expect(c.hits).toBe(1);
     expect(c.misses).toBe(2);
-    expect(rgbCacheKey(7, 11, 0, 5)).toBe(rgbCacheKey(7, 11, 0, 5));
+    expect(rgbCacheKey(7, 11, 0)).toBe(rgbCacheKey(7, 11, 0));
+    // serial-free key: dlight generations do NOT miss by themselves —
+    // surgical invalidation (dropTouchedSurfaces) owns staleness, so a
+    // muzzle flash keeps every untouched surface hot.
+    expect(rgbCacheKey(7, 11, 0)).toBe('7:11:0:0');
   });
 
-  it('invalidateSurfaces drops every style/mip/serial of a surface', () => {
+  it('invalidateSurfaces drops every style/mip/variant of a surface', () => {
     const c = new RGBLightCache(1 << 20);
     const texels = new Uint8Array([9]);
     const mat = buildRGBMaterial(texels, 1, 1, new Uint8Array(768), null, {});
@@ -309,13 +313,13 @@ describe('RGBLightCache keying', () => {
       block: { texels, bw: 1, bh: 1, light: new Uint8Array(0), luxW: 1, luxH: 1, rgb: new Uint8Array([1, 1, 1]) },
       material: mat,
     };
-    c.put(3, 1, 0, 1, entry);
-    c.put(3, 2, 1, 2, entry);
-    c.put(4, 1, 0, 1, entry);
+    c.put(3, 1, 0, entry);
+    c.put(3, 2, 1, entry, 1);
+    c.put(4, 1, 0, entry);
     expect(c.size).toBe(3);
     c.invalidateSurfaces([3]);
     expect(c.size).toBe(1);
-    expect(c.get(4, 1, 0, 1)).toBe(entry);
+    expect(c.get(4, 1, 0)).toBe(entry);
   });
 });
 

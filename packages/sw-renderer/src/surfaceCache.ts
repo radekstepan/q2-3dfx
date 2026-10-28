@@ -187,25 +187,25 @@ export interface RGBCachedBlock {
 }
 
 /**
- * Key for the parallel RGB block cache. Carries the dlight serial in
- * addition to (surface, stylesHash, mip): RGB lighting depends on the
- * dynamic-light generation, and the scalar key alone could serve a block
- * whose colored lights predate the latest add/remove. A serial change
- * therefore misses (never serves stale color); the frame loop also drops
- * the whole RGB cache whenever it drops the scalar one. String keys keep
- * the 32-bit serial exact (a packed-number key would lose precision).
- * `variant` separates the opaque main-loop binding (0) from the deferred
- * alpha-loop binding (1, blended + non-depth-writing): the same glass
- * surface must never serve the other loop's material across cvar flips.
+ * Key for the parallel RGB block cache. Carries (surface, stylesHash, mip)
+ * plus the `variant` separating the opaque main-loop binding (0) from the
+ * deferred alpha-loop binding (1, blended + non-depth-writing): the same
+ * glass surface must never serve the other loop's material across cvar
+ * flips. There is deliberately NO dynamic-light serial in the key: lighting
+ * changes are handled by surgical invalidation (the renderer drops the union
+ * of last-frame-touched and current-affected surfaces on every add/remove/
+ * expire), so entries stay valid — and hot — across serial bumps. A serial
+ * in the key would miss for every surface on every muzzle flash (full luxel
+ * rebuild per combat frame) and leak never-read old-serial entries for
+ * untouched surfaces. String keys keep the 32-bit hashes exact.
  */
 export function rgbCacheKey(
   surface: number,
   stylesHash: number,
   mip: number,
-  dlightSerial: number,
   variant = 0,
 ): string {
-  return `${surface}:${stylesHash >>> 0}:${mip & 3}:${dlightSerial >>> 0}:${variant | 0}`;
+  return `${surface}:${stylesHash >>> 0}:${mip & 3}:${variant | 0}`;
 }
 
 /**
@@ -213,11 +213,16 @@ export function rgbCacheKey(
  * frame-stamp LRU policy and budget discipline, separate map and counters
  * so the software path stays bit-identical whether or not the RGB path is
  * armed. Entries are RGBCachedBlocks (block + built material); byte
- * accounting covers the owned RGB luxels + mip chain only (texels/grades
- * are shared with the scalar cache entry). Callers mirror every scalar
- * invalidation (invalidateSurfaces / invalidateAll / nextFrame) on this
- * cache; palette changes must invalidateAll since the mip-chain expansion
- * bakes palette colors in.
+ * accounting covers the owned RGB luxels + a per-entry constant ONLY —
+ * the mip chain (`material.levels`) is SHARED with the per-texture chain
+ * cache in frame.ts (identical chain object across every surface using one
+ * texture) and is budgeted there, never here. Without the split, every
+ * surface carried its own full-res chain and the real-map working set
+ * (~100+ textures x full chains) thrashed this 4MB budget every frame
+ * (0% hits, full rebuild + megabytes of garbage per frame). Callers mirror
+ * every scalar invalidation (invalidateSurfaces / invalidateAll /
+ * nextFrame) on this cache; palette changes must invalidateAll since the
+ * shared chains bake palette colors in.
  */
 export class RGBLightCache {
   readonly budget: number;
@@ -245,8 +250,8 @@ export class RGBLightCache {
     this.frame = (this.frame + 1) >>> 0;
   }
 
-  get(surface: number, stylesHash: number, mip: number, dlightSerial: number, variant = 0): RGBCachedBlock | null {
-    const e = this.map.get(rgbCacheKey(surface, stylesHash, mip, dlightSerial, variant));
+  get(surface: number, stylesHash: number, mip: number, variant = 0): RGBCachedBlock | null {
+    const e = this.map.get(rgbCacheKey(surface, stylesHash, mip, variant));
     if (!e) {
       this.misses++;
       return null;
@@ -256,11 +261,13 @@ export class RGBLightCache {
     return e.entry;
   }
 
-  put(surface: number, stylesHash: number, mip: number, dlightSerial: number, entry: RGBCachedBlock, variant = 0): void {
-    const key = rgbCacheKey(surface, stylesHash, mip, dlightSerial, variant);
-    let chainBytes = 0;
-    for (const lvl of entry.material.levels) chainBytes += lvl.data.length;
-    const bytes = chainBytes + (entry.block.rgb ? entry.block.rgb.length : 0) + 64;
+  put(surface: number, stylesHash: number, mip: number, entry: RGBCachedBlock, variant = 0): void {
+    const key = rgbCacheKey(surface, stylesHash, mip, variant);
+    // Owned bytes only: the RGB luxels + a per-entry constant. The mip
+    // chain is shared with the per-texture chain cache (frame.ts) and
+    // budgeted there — counting it here reintroduced the per-surface
+    // full-chain accounting that thrashed this budget on real maps.
+    const bytes = (entry.block.rgb ? entry.block.rgb.length : 0) + 64;
     const old = this.map.get(key);
     if (old) {
       this.used -= old.bytes;

@@ -121,8 +121,10 @@ describe('banded vs serial RGB equivalence (dither phase + seam rows)', () => {
     const a = renderRGBSerial(160, 120);
     expect(a.used).toBe(true);
     expect(a.cover).toBe(160 * 120);
-    // True-565 + window-Z re-pin (was 3534624e): see rgbPerf.test.ts.
-    expect(a.colorHash).toBe('a9988ff4');
+    // True-565 + window-Z re-pin (was 3534624e) + alias-LOD re-pin (was
+    // a9988ff4): see rgbPerf.test.ts — the devroom box critter now samples
+    // the correct mip instead of the coarsest. Index pin unchanged.
+    expect(a.colorHash).toBe('436fe0c5');
     expect(a.indexHash).toBe('58e0ecf1');
   });
 

@@ -203,7 +203,7 @@ export function drawTracerBeamRGB(
   const ady = pax * cam.up[0]! + pay * cam.up[1]! + paz * cam.up[2]!;
   const adz = pax * cam.forward[0]! + pay * cam.forward[1]! + paz * cam.forward[2]!;
   const bdx = pbx * cam.right[0]! + pby * cam.right[1]! + pbz * cam.right[2]!;
-  const bdy = pby * cam.up[0]! + pby * cam.up[1]! + pbz * cam.up[2]!;
+  const bdy = pbx * cam.up[0]! + pby * cam.up[1]! + pbz * cam.up[2]!;
   const bdz = pbx * cam.forward[0]! + pby * cam.forward[1]! + pbz * cam.forward[2]!;
   const near = cam.near;
   const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;

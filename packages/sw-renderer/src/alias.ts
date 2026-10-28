@@ -812,9 +812,11 @@ export function fillPerspTriRGB(
   const levels = mat.levels;
   if (levels.length < 1) return 0;
   const maxLevel = levels.length - 1;
-  const base = levels[0]!;
   // Per-tri LOD: worst texel-per-pixel edge footprint (static per tri, so
   // the per-pixel Bayer dither still varies the chosen level within it).
+  // uiz/iz recover level-0 texel units, so du/dv are already texels per
+  // pixel (no width multiply — cf. drawSpansRGB's dudx; multiplying by
+  // base.width here forced coarse mips and dark edge-repeat averages).
   let rho = 0;
   const edges: Array<[PerspVert, PerspVert]> = [[a, b], [b, c], [c, a]];
   for (let e = 0; e < 3; e++) {
@@ -824,8 +826,8 @@ export function fillPerspTriRGB(
     if (!(pix > 0)) continue;
     const pu0 = p.uiz / p.iz, pv0 = p.viz / p.iz;
     const qu0 = q.uiz / q.iz, qv0 = q.viz / q.iz;
-    const du = Math.abs(pu0 - qu0) * base.width / pix;
-    const dv = Math.abs(pv0 - qv0) * base.height / pix;
+    const du = Math.abs(pu0 - qu0) / pix;
+    const dv = Math.abs(pv0 - qv0) / pix;
     const r = du > dv ? du : dv;
     if (r > rho) rho = r;
   }
@@ -1022,9 +1024,15 @@ export function drawAliasInstanceRGB(
         const iz = 1 / clipIZ[k]!;
         v.x = cam.xCenter + clipIX[k]! * cam.focalX * iz;
         v.y = cam.yCenter - clipIY[k]! * cam.focalY * iz;
-        v.iz = iz * depthScale;
-        v.uiz = clipIU[k]! * iz;
-        v.viz = clipIV[k]! * iz;
+        // Depth bias must not alter UV mapping: the perspective numerators
+        // carry the SAME scaled 1/z as v.iz, so u = uiz/iz (and the
+        // uiz/iz LOD footprint) is invariant to depthScale. Storing scaled
+        // iz with unscaled numerators would compress UVs by depthScale
+        // (the depthHack viewmodel sampled at u/3: black + holes).
+        const izs = iz * depthScale;
+        v.iz = izs;
+        v.uiz = clipIU[k]! * izs;
+        v.viz = clipIV[k]! * izs;
         v.r = aliasLightR[vi]!;
         v.g = aliasLightG[vi]!;
         v.b = aliasLightB[vi]!;
@@ -1042,9 +1050,13 @@ export function drawAliasInstanceRGB(
       const iz = 1 / clipOZ[k]!;
       c.x = cam.xCenter + clipOX[k]! * cam.focalX * iz;
       c.y = cam.yCenter - clipOY[k]! * cam.focalY * iz;
-      c.iz = iz * depthScale;
-      c.uiz = clipOU[k]! * iz;
-      c.viz = clipOV[k]! * iz;
+      // Same depth-bias/UV invariant as the all-inside path above: scale
+      // the numerators with the stored 1/z so clipped tris (the
+      // eye-anchored viewmodel straddles vz = near) shade identically.
+      const izs = iz * depthScale;
+      c.iz = izs;
+      c.uiz = clipOU[k]! * izs;
+      c.viz = clipOV[k]! * izs;
       c.r = clipOLR[k]!;
       c.g = clipOLG[k]!;
       c.b = clipOLB[k]!;

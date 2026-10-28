@@ -25,8 +25,8 @@ import {
 import {
   SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SPAN_TRANS33, SPAN_TRANS66, buildTurbTable, createSpan,
   drawSpansTranslucent, drawSpansTurbulent, SoftwareBackend, translucencyModeFromCvars,
-  buildRGBMaterial, RGBWorldBackend,
-  type LightBlock, type RasterBackend, type RGBMaterial, type Span, type SpanList, type Texture,
+  buildRGBChain, buildRGBMaterial, RGBWorldBackend,
+  type LightBlock, type RasterBackend, type RGBMaterial, type RGBMipLevel, type Span, type SpanList, type Texture,
 } from './spans.js';
 import { WasmSpanBackend, wasmRequestedByCvar } from './wasmSpans.js';
 import {
@@ -284,6 +284,13 @@ export function countValidStyles(
   return nValid;
 }
 
+/**
+ * VRAM-like budget for the shared per-texture RGB mip chains (upload-time
+ * expansion, retained across frames). Base1's chain working set is ~7-15MB;
+ * LRU eviction only bites on texture churn (cvar/palette flips clear it).
+ */
+export const RGB_TEXCHAIN_BUDGET = 16 * 1024 * 1024;
+
 export class SoftwareRenderer implements Refresh {
   private fbW = 0;
   private fbH = 0;
@@ -313,7 +320,18 @@ export class SoftwareRenderer implements Refresh {
   private hostFb: Framebuffer | null = null;
   private cache = new SurfaceCache();
   private dlights = new DLightState();
-  private lastDynSerial = 0;
+  /**
+   * Surfaces the previous frame's lights touched (sorted, reused array).
+   * dropTouchedSurfaces invalidates the union of this and the current
+   * frame's affected set on both caches, then this becomes the current set.
+   * The union is the completeness argument for serial-free cache keys: a
+   * surface whose lighting changed is always in one of the two sets (a live
+   * light marks it now; a removed/expired light marked it last frame), so no
+   * stale luxels survive and no global invalidation is ever needed.
+   */
+  private lastTouched: number[] = [];
+  /** Reused union scratch for dropTouchedSurfaces (no per-frame allocation). */
+  private touchScratch: number[] = [];
   /**
    * Serial RGB world pass state (astra V2a/V2c + true-565 window-Z). Planes
    * are sized in init() and re-attached every enabled frame so backend
@@ -351,6 +369,28 @@ export class SoftwareRenderer implements Refresh {
    */
   private rgbFidelity: RGBFidelity = readRGBFidelity();
   private rgbCache = new RGBLightCache();
+  /**
+   * Per-texture shared RGB mip chains (upload-time expansion, like GL
+   * texture upload to VRAM): texId -> expanded chain, shared by every
+   * surface using that texture. buildRGBEntry used to expand a FULL chain
+   * per (surface, serial) entry, so the real-map working set (hundreds of
+   * surfaces x full chains) permanently thrashed the 4MB RGBLightCache
+   * (0% hits, full rebuild + megabytes of garbage per frame). Chains depend
+   * only on (world, texels, palette) — never on lighting, styles, mip or
+   * the vd_* fidelity snapshot — so they survive dlight serial bumps,
+   * style changes and cvar toggles; only the small per-surface luxel block
+   * rebuilds (same cost profile as the scalar cache). Budgeted VRAM-like
+   * (RGB_TEXCHAIN_BUDGET) with frame-stamp LRU; guarded by world identity
+   * (a new world clears chains AND the surface caches, whose ids are
+   * world-relative). Cleared on setPalette / setRGBWorldEnabled /
+   * invalidateCaches (palette is baked in), NOT on fidelity changes.
+   */
+  private rgbTexChains = new Map<number, { chain: RGBMipLevel[]; bytes: number; used: number }>();
+  private rgbTexUsed = 0;
+  private rgbTexWorld: MiniWorld | null = null;
+  private rgbTexHits = 0;
+  private rgbTexMisses = 0;
+  private rgbTexEvictions = 0;
   private rgbUsedThisFrame = false;
   /**
    * Skin/sky/flat RGB materials (step 3, serial RGB only): palette-baked
@@ -359,6 +399,17 @@ export class SoftwareRenderer implements Refresh {
    * (renderer-owned stable refs), single-slot for sky/flat.
    */
   private rgbSkinMats = new Map<Texture, RGBMaterial>();
+  /**
+   * Opaque RGB materials for alias (MD2) models, keyed by Texture identity
+   * like rgbSkinMats but built with opaqueMask (index 255 draws opaque).
+   * ref_soft's alias path (r_polyse/D_DrawPoly) has no TRANSPARENT_COLOR
+   * check and ref_gl draws meshes opaque (blend only under RF_TRANSLUCENT,
+   * which rides Entity.alpha instead) — only sprites/HUD pics honor 255
+   * (r_spr8.asm, r_draw.c). A separate map because the SAME Texture object
+   * can back both an alias skin and a sprite, and the mask is baked into
+   * the mip chain at upload. Cleared everywhere rgbSkinMats is.
+   */
+  private rgbAliasMats = new Map<Texture, RGBMaterial>();
   private rgbSkyMat: { tex: { width: number; height: number; texels: Uint8Array }; mat: RGBMaterial } | null = null;
   private rgbFlatSky: { index: number; mat: RGBMaterial } | null = null;
   private models: RegisteredModel[] = [];
@@ -709,6 +760,8 @@ export class SoftwareRenderer implements Refresh {
     this.alpha66 = new Uint8Array(0);
     this.rgbCache.invalidateAll();
     this.rgbSkinMats.clear();
+    this.rgbAliasMats.clear();
+    this.clearRGBTextureChains();
     this.rgbSkyMat = null;
     this.rgbFlatSky = null;
   }
@@ -924,6 +977,8 @@ export class SoftwareRenderer implements Refresh {
     if (this.rgbDepth16.length > 0) this.rgbDepth16.fill(0xffff);
     this.rgbCache.invalidateAll();
     this.rgbSkinMats.clear();
+    this.rgbAliasMats.clear();
+    this.clearRGBTextureChains();
     this.rgbSkyMat = null;
     this.rgbFlatSky = null;
   }
@@ -941,16 +996,52 @@ export class SoftwareRenderer implements Refresh {
    */
   invalidateCaches(): void {
     this.cache.invalidateAll();
+    this.lastTouched.length = 0;
     this.rgbCache.invalidateAll();
     this.rgbSkinMats.clear();
+    this.rgbAliasMats.clear();
+    this.clearRGBTextureChains();
     this.rgbSkyMat = null;
     this.rgbFlatSky = null;
   }
 
   /**
+   * Surgical dlight invalidation: invalidate the union of the previous
+   * frame's touched set and the current frame's affected set (both sorted
+   * ascending — markLights sorts, and lastTouched is always a copy of a
+   * past affected), deduped via a linear merge into the reused scratch.
+   * Then lastTouched becomes the current set (copied, still sorted).
+   * Zero allocation beyond the reused arrays' amortised growth.
+   */
+  private dropTouchedSurfaces(affected: number[]): void {
+    const prev = this.lastTouched;
+    if (prev.length === 0 && affected.length === 0) return;
+    const scratch = this.touchScratch;
+    scratch.length = 0;
+    let i = 0, j = 0;
+    while (i < affected.length && j < prev.length) {
+      const a = affected[i]!, p = prev[j]!;
+      if (a === p) { scratch.push(a); i++; j++; }
+      else if (a < p) { scratch.push(a); i++; }
+      else { scratch.push(p); j++; }
+    }
+    while (i < affected.length) scratch.push(affected[i++]!);
+    while (j < prev.length) scratch.push(prev[j++]!);
+    if (scratch.length > 0) {
+      this.cache.invalidateSurfaces(scratch);
+      this.rgbCache.invalidateSurfaces(scratch);
+    }
+    prev.length = 0;
+    for (let k = 0; k < affected.length; k++) prev.push(affected[k]!);
+  }
+
+  /**
    * Refresh the per-frame fidelity snapshot (M4.1): read the vd_* cvars
    * once per renderView; on any change drop the RGB cache + memos so the
-   * new policy rebuilds instead of serving stale materials. Also re-clears
+   * new policy rebuilds instead of serving stale materials. The shared
+   * texture chains SURVIVE (they depend only on texels+palette, never on
+   * the fidelity snapshot), so a cvar toggle re-links luxels without
+   * re-expanding every texture. Also re-clears
    * the 16-bit plane when the zbits selection changed mid-stream (beginFrame
    * already cleared for the frame-start snapshot).
    */
@@ -961,6 +1052,7 @@ export class SoftwareRenderer implements Refresh {
     this.rgbFidelity = snap;
     this.rgbCache.invalidateAll();
     this.rgbSkinMats.clear();
+    this.rgbAliasMats.clear();
     this.rgbSkyMat = null;
     this.rgbFlatSky = null;
     if (zChanged && rgbWorldEnabled && this.rgbDepth16.length > 0) {
@@ -1019,6 +1111,7 @@ export class SoftwareRenderer implements Refresh {
    * Cached by Texture identity; cleared on setPalette, cvar toggles and
    * renderer enable/disable. Sampling policy comes from the per-frame
    * fidelity snapshot (overbright is inert here — no lightmap to modulate).
+   * Sprites keep the 255-hole mask (masked); alias models are opaque.
    */
   private rgbMaterialForSkin(skin: Texture): RGBMaterial {
     const fid = this.rgbFidelity;
@@ -1030,6 +1123,26 @@ export class SoftwareRenderer implements Refresh {
         bilinear: fid.bilinear, zbits: fid.zbits,
       });
       this.rgbSkinMats.set(skin, mat);
+    }
+    return mat;
+  }
+
+  /**
+   * Opaque palette-baked RGB material for alias (MD2) models: identical to
+   * rgbMaterialForSkin except opaqueMask (index 255 draws opaque, never a
+   * hole — see the rgbAliasMats field doc for the id-source audit). Separate
+   * cache because the mask is baked into the mip chain at upload.
+   */
+  private rgbMaterialForAlias(skin: Texture): RGBMaterial {
+    const fid = this.rgbFidelity;
+    let mat = this.rgbAliasMats.get(skin);
+    if (!mat) {
+      mat = buildRGBMaterial(skin.texels, skin.width, skin.height, this.palette, null, {
+        addressS: 'clamp', addressT: 'clamp',
+        overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
+        bilinear: fid.bilinear, zbits: fid.zbits, opaqueMask: true,
+      });
+      this.rgbAliasMats.set(skin, mat);
     }
     return mat;
   }
@@ -1194,12 +1307,6 @@ export class SoftwareRenderer implements Refresh {
     // Skybox emission guard (id r_skyframe): at most one box per frame no
     // matter how many SURF_SKY surfaces are visible.
     this.skyBoxEmitted = false;
-    // dynamic lights -> cache invalidation (serial change = add/remove)
-    if (this.dlights.serial !== this.lastDynSerial) {
-      this.cache.invalidateAll();
-      this.rgbCache.invalidateAll();
-      this.lastDynSerial = this.dlights.serial;
-    }
     const nSurfs = worldData.surfaces.length;
     // R_MarkLeaves input: mirror (id, mins, maxs) per surface. Worlds are
     // static per level, so refill only when the world identity or surface
@@ -1248,10 +1355,18 @@ export class SoftwareRenderer implements Refresh {
     dlState.lights = dyn;
     const affected = dlState.markLights(bounds, nSurfs);
     dlState.lights = savedLights;
-    if (affected.length > 0) {
-      this.cache.invalidateSurfaces(affected);
-      this.rgbCache.invalidateSurfaces(affected);
-    }
+    // Surgical dlight invalidation (ownership fix): drop every surface the
+    // lights touched LAST frame or touch THIS frame, on both caches. The
+    // union covers expiry/removal — a gone light's surfaces were touched
+    // last frame, so they rebuild to baseline exactly once — while surfaces
+    // no light ever reaches keep hot entries across serial bumps (a muzzle
+    // flash used to invalidateAll both caches every frame: full rebuild +
+    // megabytes of garbage per combat frame). The keys carry no global
+    // serial (it would miss for every surface on every bump and leak
+    // never-read old-serial entries); completeness of the union is the
+    // correctness argument (see the lastTouched field doc). Reused array,
+    // no per-frame allocation beyond markLights' own.
+    this.dropTouchedSurfaces(affected);
     const hasRendererLights = savedLights.length > 0;
     const dlightFrameBits = (id: number): number => {
       if (hasRendererLights) return dlState.bitsFor(id);
@@ -1482,7 +1597,7 @@ export class SoftwareRenderer implements Refresh {
       // RGB overlay composites over them in endFrame.
       let rgbMat: RGBMaterial | null = null;
       if (this.rgbOverlayActive() && !surf.sky) {
-        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, this.dlights.serial, 0);
+        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 0);
         rgbMat = rgbHit
           ? rgbHit.material
           : this.buildRGBEntry(
@@ -1687,7 +1802,7 @@ export class SoftwareRenderer implements Refresh {
       // the surface is turbulent, never depth-writing. Reverse traversal
       // order is preserved (back-to-front over-blend).
       if (this.rgbOverlayActive()) {
-        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, this.dlights.serial, 1);
+        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 1);
         let rgbMat = rgbHit
           ? rgbHit.material
           : this.buildRGBEntry(
@@ -1740,7 +1855,7 @@ export class SoftwareRenderer implements Refresh {
             mesh, origin: pa.origin, angles: pa.angles,
             frameA: pa.frameA, frameB: pa.frameB, lerp: pa.lerp,
             lightAngle: ((pa.angles[1]! * 256) / 360) & 255,
-          }, this.rgbMaterialForSkin(skin), cam, this.anorms, this.shadeDots, dyn, this.rgbWin);
+          }, this.rgbMaterialForAlias(skin), cam, this.anorms, this.shadeDots, dyn, this.rgbWin);
         this.rgbUsedThisFrame = true;
       }
     }
@@ -1831,7 +1946,7 @@ export class SoftwareRenderer implements Refresh {
               lightAngle: ((e.angles[1]! * 256) / 360) & 255,
               depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
               alpha: alpha >= 1 ? undefined : alpha,
-            }, this.rgbMaterialForSkin(skin), cam, this.anorms, this.shadeDots, dyn, this.rgbWin);
+            }, this.rgbMaterialForAlias(skin), cam, this.anorms, this.shadeDots, dyn, this.rgbWin);
           this.rgbUsedThisFrame = true;
         }
       } else if (m.kind === 'sp2') {
@@ -2124,9 +2239,20 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /** Live RGB cache hit rate (bench/ledger observability). */
-  testRGBCacheStats(): { hits: number; misses: number; size: number; hitRate: number } {
+  testRGBCacheStats(): {
+    hits: number; misses: number; size: number; hitRate: number;
+    evictions: number;
+    chainHits: number; chainMisses: number; chainSize: number;
+    chainUsed: number; chainEvictions: number;
+  } {
     const c = this.rgbCache;
-    return { hits: c.hits, misses: c.misses, size: c.size, hitRate: c.hitRate() };
+    return {
+      hits: c.hits, misses: c.misses, size: c.size, hitRate: c.hitRate(),
+      evictions: c.evictions,
+      chainHits: this.rgbTexHits, chainMisses: this.rgbTexMisses,
+      chainSize: this.rgbTexChains.size, chainUsed: this.rgbTexUsed,
+      chainEvictions: this.rgbTexEvictions,
+    };
   }
 
   /**
@@ -2359,21 +2485,75 @@ export class SoftwareRenderer implements Refresh {
     };
   }
 
+  /** Drop the shared per-texture RGB chains (palette/world change). */
+  private clearRGBTextureChains(): void {
+    this.rgbTexChains.clear();
+    this.rgbTexUsed = 0;
+  }
+
+  /**
+   * Get-or-build the shared expanded mip chain for one world texture
+   * (upload-time cost, amortised across every surface using it). Frame-stamp
+   * LRU inside RGB_TEXCHAIN_BUDGET; a world-identity change drops chains
+   * AND the surface caches (surface ids are world-relative). Returns null
+   * only for unusable texture data (caller falls back to the scalar block).
+   */
+  private rgbChainFor(texId: number, src: Texture, worldData: MiniWorld): RGBMipLevel[] | null {
+    if (this.rgbTexWorld !== worldData) {
+      this.clearRGBTextureChains();
+      this.rgbTexWorld = worldData;
+      this.lastTouched.length = 0;
+      this.rgbCache.invalidateAll();
+    }
+    const hit = this.rgbTexChains.get(texId);
+    if (hit) {
+      hit.used = this.frame;
+      this.rgbTexHits++;
+      return hit.chain;
+    }
+    this.rgbTexMisses++;
+    if (!(src.width >= 1 && src.height >= 1) || src.texels.length < src.width * src.height) return null;
+    const chain = buildRGBChain(src.texels, src.width, src.height, this.palette, false);
+    let bytes = 64;
+    for (const lvl of chain) bytes += lvl.data.length + lvl.mask.length;
+    while (this.rgbTexUsed + bytes > RGB_TEXCHAIN_BUDGET && this.rgbTexChains.size > 0) {
+      let victim: number | undefined;
+      let victimAge = -1;
+      for (const [k, e] of this.rgbTexChains) {
+        const age = (this.frame - e.used) >>> 0;
+        if (age > victimAge) {
+          victimAge = age;
+          victim = k;
+          if (age > 0) break;
+        }
+      }
+      if (victim === undefined) break;
+      const e = this.rgbTexChains.get(victim)!;
+      this.rgbTexChains.delete(victim);
+      this.rgbTexUsed -= e.bytes;
+      this.rgbTexEvictions++;
+    }
+    this.rgbTexChains.set(texId, { chain, bytes, used: this.frame });
+    this.rgbTexUsed += bytes;
+    return chain;
+  }
+
   /**
    * RGB miss path: build the cached binding for one surface from the
-   * ORIGINAL full-res texture texels (the mip chain is expanded at upload
-   * from level 0, so the per-span LOD walks the true chain — the old
-   * point-subsampled scalar texels double-applied the mip select) plus a
-   * fresh per-channel luxel block (buildRGBLightMap). Returns null when the
-   * lightmap or texture is unusable; the caller then draws the scalar
-   * block/backend alone, so output shape never changes. The entry shares
-   * texels/grades with the scalar block and owns only the RGB luxels +
-   * mip chain (palette-baked: setPalette drops the whole RGB cache).
-   * Turbulent surfaces get a warp material; `extra` lets the deferred
-   * alpha loop request the blended, non-depth-writing variant for
-   * TRANS33/66 (the main loop always draws opaque). Sampling policy comes
-   * from the per-frame fidelity snapshot; a cvar change invalidates the
-   * whole RGB cache in syncRGBFidelity, so cached materials never go stale.
+   * SHARED per-texture mip chain (see rgbChainFor: expanded once per
+   * texture, reused by every surface) plus a fresh per-channel luxel block
+   * (buildRGBLightMap). Returns null when the lightmap or texture is
+   * unusable; the caller then draws the scalar block/backend alone, so
+   * output shape never changes. The entry shares the chain with every
+   * other surface on the same texture and owns only the RGB luxels, so the
+   * RGBLightCache budget covers thousands of surfaces (scalar-style
+   * discipline); only lighting/serial changes rebuild luxels. Turbulent
+   * surfaces get a warp material; `extra` lets the deferred alpha loop
+   * request the blended, non-depth-writing variant for TRANS33/66 (the main
+   * loop always draws opaque). Sampling policy comes from the per-frame
+   * fidelity snapshot; a cvar change invalidates the per-surface luxels in
+   * syncRGBFidelity but keeps the shared chains (fidelity-independent), so
+   * the next frame re-links without re-expanding textures.
    */
   private buildRGBEntry(
     world: MiniWorld, surf: MiniSurf, block: SurfaceBlock,
@@ -2410,20 +2590,27 @@ export class SoftwareRenderer implements Refresh {
       scales, dyn, surf.center, dlightBits, LIGHT_OVERBRIGHT, luxelPos,
     );
     const rgb = this.rgbLightScratch.slice(0, need);
+    // Shared chain (one expansion per texture, reused by every surface on
+    // it) + per-surface luxels. The material shell is small and cached with
+    // the luxels; the chain lives in the texture cache (own budget).
+    const texId = surf.texId % world.textures.length;
+    const chain = this.rgbChainFor(texId, src, world);
+    if (!chain) return null;
     const fid = this.rgbFidelity;
-    const material = buildRGBMaterial(
-      src.texels, src.width, src.height, this.palette,
-      { samples: rgb, luxW: lm.luxW, luxH: lm.luxH },
-      {
-        addressS: 'repeat', addressT: 'repeat',
-        overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
-        bilinear: fid.bilinear, zbits: fid.zbits,
-        warp: surf.turbulent,
-        turbPhase: surf.turbulent ? (((this.backend.time * 64) | 0) & 1023) : 0,
-        blend: extra?.blend ?? 'opaque',
-        depthWrite: extra?.depthWrite ?? true,
-      },
-    );
+    const material: RGBMaterial = {
+      levels: chain,
+      addressS: 'repeat', addressT: 'repeat',
+      light: { samples: rgb, luxW: lm.luxW, luxH: lm.luxH },
+      overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
+      bilinear: fid.bilinear, zbits: fid.zbits,
+      blend: extra?.blend ?? 'opaque',
+      alphaTest: null,
+      depthWrite: extra?.depthWrite ?? true,
+      alpha: 1,
+      warp: surf.turbulent,
+      turbPhase: surf.turbulent ? (((this.backend.time * 64) | 0) & 1023) : 0,
+      flatColor: null,
+    };
     const entry: RGBCachedBlock = {
       block: {
         texels: block.texels, bw: block.bw, bh: block.bh,
@@ -2431,7 +2618,7 @@ export class SoftwareRenderer implements Refresh {
       },
       material,
     };
-    this.rgbCache.put(surf.id, stylesHash, mip, this.dlights.serial, entry, extra?.variant ?? 0);
+    this.rgbCache.put(surf.id, stylesHash, mip, entry, extra?.variant ?? 0);
     return material;
   }
 }

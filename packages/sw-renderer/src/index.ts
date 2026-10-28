@@ -15,7 +15,7 @@ export {
   drawSpans16, SoftwareBackend,
   buildTurbTable, spanListView,
   rgbMipLevel, rgbPickMipLevel, rgbSampleTexture, rgbSampleLightmap,
-  rgbModulate, expandPaletteRGB, buildRGBMaterial,
+  rgbModulate, expandPaletteRGB, buildRGBMaterial, buildRGBChain,
   quantiseIz, quantiseIzInt,
   packRGB565, expandRGB565, rgbBlendPixel565,
   windowDepth01, windowDepthQ16, windowDepthQ16FromIz,

@@ -771,6 +771,18 @@ export function startPlayLoop(
     }
     blitFb.color = target;
     blitToCanvas(el, blitFb);
+    // Headless/browser-soak observability (no behavior change): publish the
+    // loop's fps EMA + frame counter for CDP-driven measurement (the
+    // in-canvas glyphs are not machine-readable). Single reused record, one
+    // store per frame, never allocated in steady state.
+    try {
+      const g = globalThis as unknown as { __q2stats?: { fps: number; frame: number } };
+      const rec = g.__q2stats ?? (g.__q2stats = { fps: 0, frame: 0 });
+      rec.fps = fps;
+      rec.frame = frame;
+    } catch {
+      /* non-DOM/shimmed runtimes stay silent */
+    }
     // The fps (`cl_showfps`) and position (`cl_showpos`, default ON)
     // readouts are in-canvas conchars glyphs painted by drawPlayHud above
     // (top-right / top-left of the framebuffer itself) — no DOM overlay.

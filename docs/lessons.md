@@ -402,3 +402,33 @@ behavior template; C source (`../external/quake-2-source`) is ground truth.
 - after `flushAccumAsync`). Regression pins: pooled async vs pooled sync
 - with world alias and with a depthHack gun entity (both fail pre-fix with
 - the foreground wiped, green post-fix). Web base1-gate 23/23 green.
+- CLOSED 2026-10-27 (voodoo repair — black gun, missing geometry, FPS
+- decline; card VOODOO-REPAIR in BRAIN.md §8): three compounding RGB
+- defects, all in `packages/sw-renderer` (+ gates in `apps/web`), none in
+- `packages/voodoo`/`config`/`testkit` (audited, unchanged). (1)
+- depth-bias UV: drawAliasInstanceRGB stored iz*depthScale but unscaled
+- uiz/viz (ordinary + near-clipped paths) → viewmodel sampled at u/3
+- (black gun with holes); numerators now carry the scaled iz (UV/LOD
+- invariant, depth still biased). (2) LOD double-scale: per-tri rho
+- multiplied texels by width/height again → coarsest mip everywhere (dark
+- edge-repeat averages); rho is texels/pixel like drawSpansRGB. (3)
+- index-255: MD2 skins drew masked holes that ref_soft (no 255 check in
+- r_polyse/D_DrawPoly) and ref_gl (opaque meshes) draw opaque — only
+- sprites/HUD honor 255 (r_spr8.asm, r_draw.c); alias materials are now
+- opaque, sprites keep the mask; world WALs contain zero 255 texels
+- (whole-pak audit), so world behavior is unchanged. (4) tracer bdy
+- copy-paste (`pby` for `pbx`) misplaced RGB beams off-axis. (5) FPS
+- decline: per-surface full-chain expansion thrashed the 4MB RGBLightCache
+- (0% hits, ~445ms/frame + MBs of garbage/frame) and
+- invalidateAll-on-serial rebuilt everything per combat frame; now
+- per-texture shared chains (base1: 71/2.39MB, 16MB VRAM-like LRU) +
+- surgical union invalidation with serial-free keys (~152ms stationary,
+- ~340ms combat frameAsync, drift <5%, 0 evictions). Permanent gates:
+- `rgbAliasDepth.test.ts` (5 fail-before), `rgbSustain.test.ts` (3
+- fail-before), `apps/web/src/voodoo-regression.test.ts` (Q2_PAK release
+- gate incl. gun/HUD/soak; fails clearly when assets are unavailable).
+- Devroom RGB pins re-pinned with cause (`a9988ff4` → `436fe0c5`; index
+- `58e0ecf1` + all software goldens unchanged). Open remainder (NOT
+- relaxed): serial RGB spanfill ~6Mpx/s still needs pooled/worker
+- composition for the ≤16ms budget; real-browser soak + 60fps sign-off
+- stay with M7.1, human capture review with M4.1.
