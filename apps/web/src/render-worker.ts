@@ -21,15 +21,23 @@ interface InitMsg {
   y1: number;
   band: number;
   /**
-   * V2d: optional frame VoodooState snapshot (see snapshotVoodooState in
-   * render-workers.ts). Stashed as the band's latest frame state for the
-   * future worker-side voodoo backend; the current bandWorkerLoop ignores
-   * it (scanout stays global-serial on the main thread). Same snapshot
-   * object is sent to every band — never per-pixel state reads.
+   * V2d: optional per-frame VoodooState snapshot (see snapshotVoodooState /
+   * broadcastVoodooState in render-workers.ts). Stashed as the band's
+   * latest frame state for the future worker-side voodoo backend; the
+   * current bandWorkerLoop ignores it (scanout stays global-serial on the
+   * main thread). The shell posts the SAME snapshot values to every band
+   * with absolute y0/y1/width/height — never per-pixel state reads.
    */
   voodoo?: unknown;
-  /** V2d: lightweight per-frame state refresh (same contract as voodoo). */
+  /**
+   * V2d: lightweight per-frame state refresh (same contract as voodoo):
+   * `{ voodooState, y0, y1, width, height, band }` (see VoodooBandMessage).
+   * Absolute screen coords so dither phase stays global across bands.
+   */
   voodooState?: unknown;
+  /** Absolute slice / full-frame dims travelling with a state refresh. */
+  width?: unknown;
+  height?: unknown;
 }
 
 const scope = self as unknown as {
@@ -40,11 +48,19 @@ const scope = self as unknown as {
 /**
  * V2d: latest frame VoodooState snapshot stashed from init / `voodooState`
  * messages. Reserved for the future worker-side voodoo backend (same
- * snapshot object across all bands, absolute screen coords); the current
+ * snapshot values across all bands, absolute screen coords); the current
  * raster loop never reads it — scanout stays global-serial on the main
  * thread so filter taps cross band boundaries.
+ *
+ * TODO(worker-rgb-backend): consume the envelope in `renderVoodooBand`
+ * (worker entry, name assumed) / wasm `voodoo_raster_band` (name assumed)
+ * once the backend lands; until then this stash is protocol groundwork
+ * only and `selectVoodooBandPath` stays `serial`.
  */
 let latestVoodoo: unknown = null;
+
+/** V2d: absolute slice/dims travelling with the latest state refresh. */
+let latestVoodooCoords: { y0: number; y1: number; width: number; height: number; band: number } | null = null;
 
 /** Test/observability hook: the currently stashed frame state (null until set). */
 export function latestVoodooState(): unknown {
@@ -53,11 +69,19 @@ export function latestVoodooState(): unknown {
 
 scope.onmessage = (ev: MessageEvent): void => {
   const init = ev.data as InitMsg;
-  // V2d: a bare `{ voodooState }` message refreshes the stashed frame state
-  // (init carries no `sab`); anything without `sab` is state-only.
+  // V2d: a bare `{ voodooState, ...coords }` message refreshes the stashed
+  // frame state (init carries `sab`; anything without `sab` is state-only).
   if (init.sab === undefined) {
-    if (init.voodooState !== undefined) latestVoodoo = init.voodooState;
-    else if (init.voodoo !== undefined) latestVoodoo = init.voodoo;
+    if (init.voodooState !== undefined) {
+      latestVoodoo = init.voodooState;
+      latestVoodooCoords = {
+        y0: typeof init.y0 === 'number' ? init.y0 : 0,
+        y1: typeof init.y1 === 'number' ? init.y1 : 0,
+        width: typeof init.width === 'number' ? init.width : 0,
+        height: typeof init.height === 'number' ? init.height : 0,
+        band: typeof init.band === 'number' ? init.band : 0,
+      };
+    } else if (init.voodoo !== undefined) latestVoodoo = init.voodoo;
     return;
   }
   if (init.voodoo !== undefined) latestVoodoo = init.voodoo;

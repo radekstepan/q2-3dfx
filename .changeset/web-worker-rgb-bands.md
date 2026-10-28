@@ -1,0 +1,4 @@
+'web': patch
+---
+
+Wire the worker-band RGB groundwork on the shell side (astra §5). `frameAsync` snapshots ONE `VoodooState` per frame and broadcasts the same values to every band with absolute y0/y1 (`BrowserBandPool.broadcastVoodooState` / `voodooBandMessages`); the worker entry stashes the envelope for the future backend while the raster loop stays untouched. The same snapshot threads into `resolveDisplay` (new optional `frameState`), so bands and the single global serial scanout can never disagree mid-frame. Ownership verified by test: `endFrame` never touches shell scratch, exactly one shell `resolveFrame` fills it, and the path stays explicit `serial` (never silent software). Mode switches call feature-detected cache-invalidate hooks and zero scratch. Adds a report-only 640x480 serial raster+resolve bench (`voodoo-perf.test.ts`, console breakdown, no budget change).

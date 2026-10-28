@@ -103,7 +103,7 @@ import type { Entity, RefDef } from '@q2/renderer-api';
 import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
-import { selectVoodooBandPath } from './render-workers.js';
+import { selectVoodooBandPath, snapshotVoodooState } from './render-workers.js';
 import type { VoodooBandPath } from './render-workers.js';
 
 export type RendererKind = 'software' | 'voodoo';
@@ -2677,6 +2677,13 @@ export interface PlayBoot {
    * completed; never a silent software fallback (see selectVoodooBandPath).
    */
   lastVoodooPath: VoodooBandPath | 'none';
+  /**
+   * Browser worker pool attached by `attachBrowserPool` (null = sync /
+   * single-threaded path: headless, no SAB, or `sw_workers` 0). Set once
+   * per boot; `frameAsync` feature-detects `broadcastVoodooState` on it to
+   * transfer the frame's single VoodooState snapshot to every band.
+   */
+  browserPool: BrowserBandPool | null;
   /** Real-pak MD2/skin handles (null without a pak). */
   models: PakModelHandles | null;
   /** The pak this boot was built from (null = devroom): reboot reuses it. */
@@ -2966,6 +2973,7 @@ export function bootPlay(opts: {
     host, driver, refresh, renderer, source: driver.source,
     display: new Uint32Array(n), fb565: new Uint16Array(n),
     strictVoodoo: true, lastResolveOrder: 'none', lastVoodooPath: 'none',
+    browserPool: null,
     models, pak: opts.pak ?? null,
   };
   // Arm the raster policy the cvar selects (RGB path on for voodoo, off for
@@ -3150,8 +3158,14 @@ export function hudComposedPreScanout(boot: PlayBoot): boolean {
  * V2d: `hud` enables the strict-voodoo pre-scanout HUD composition (painted
  * into the emulated target before `resolveFrame`). Omit it (headless/tests)
  * to resolve the scene alone; the legacy post-resolve HUD pass is unchanged.
+ *
+ * `frameState` is the frame's single VoodooState snapshot (astra §5): when
+ * provided (the `frameAsync` path snapshots once per frame and shares it
+ * with every band via `broadcastBandVoodoo`) the resolve reuses it instead
+ * of taking a second `readVoodooState()`, so bands and scanout can never
+ * disagree mid-frame. Omit it and the resolve snapshots itself (sync path).
  */
-export function resolveDisplay(boot: PlayBoot, hud?: HudState): Uint32Array {
+export function resolveDisplay(boot: PlayBoot, hud?: HudState, frameState?: VoodooState): Uint32Array {
   const { host } = boot;
   const brightness = getBrightness();
   // Source the LIVE renderer color plane, not host.fb.color: with a worker
@@ -3165,8 +3179,9 @@ export function resolveDisplay(boot: PlayBoot, hud?: HudState): Uint32Array {
     const n = w * h;
     // One VoodooState snapshot per frame, passed explicitly (astra §5): no
     // per-pixel cvar reads inside the resolve, and the same object selects
-    // the band envelopes (see render-workers.ts).
-    const st: VoodooState = readVoodooState();
+    // the band envelopes (see render-workers.ts). The async path passes its
+    // already-broadcast snapshot in; the sync path snapshots here.
+    const st: VoodooState = frameState ?? readVoodooState();
     // Explicit raster-policy selection: until a worker/WASM voodoo backend
     // exists the ONLY supported voodoo path is serial main-thread scanout
     // after every band completes (selectVoodooBandPath documents this and
@@ -3751,21 +3766,51 @@ export function createAsyncLoopState(): AsyncLoopState {
  */
 export function attachBrowserPool(boot: PlayBoot, workers?: number): BrowserBandPool | null {
   const { refresh, host } = boot;
+  // The boot records the pool (or its absence) so frameAsync can transfer
+  // the frame's VoodooState snapshot to every band (see broadcastBandVoodoo).
+  const drop = (pool: BrowserBandPool | null): BrowserBandPool | null => {
+    boot.browserPool = pool;
+    return pool;
+  };
   try {
     refresh.syncWorkersFromCvar();
   } catch {
-    return null;
+    return drop(null);
   }
-  if (!refresh.isWorkersActive()) return null;
-  if (!browserPoolAvailable()) return null;
+  if (!refresh.isWorkersActive()) return drop(null);
+  if (!browserPoolAvailable()) return drop(null);
   const bands = Math.floor(getCVarNumber('sw_workers'));
   const want = workers === undefined ? bands - 1 : workers;
   const n = Math.max(1, Math.min(7, Math.floor(want)));
-  if (!Number.isFinite(n)) return null;
+  if (!Number.isFinite(n)) return drop(null);
   const pool = BrowserBandPool.create(n, host.fb.width, host.fb.height);
-  if (!pool) return null;
+  if (!pool) return drop(null);
   refresh.attachWorkerPool(pool);
-  return pool;
+  return drop(pool);
+}
+
+/**
+ * Transfer the frame's single VoodooState snapshot to every worker band
+ * (astra §5 shell side): same snapshot values + absolute y0/y1 per band,
+ * so a future worker-side voodoo backend rasterises with global dither
+ * phase. Feature-detected (`as unknown as`) so the shell works with or
+ * without a pool (or with a pool predating `broadcastVoodooState`):
+ * absent/unavailable → 0, never throws. The current raster loop ignores
+ * the stash — the shell still waits for ALL bands, then runs the ONE
+ * global serial resolve in `resolveDisplay`.
+ */
+export function broadcastBandVoodoo(boot: PlayBoot, st: VoodooState): number {
+  try {
+    const pool = boot.browserPool as unknown as {
+      broadcastVoodooState?: (state: VoodooState) => unknown;
+    } | null;
+    const fn = pool?.broadcastVoodooState;
+    if (typeof fn !== 'function') return 0;
+    const sent = fn.call(pool, st);
+    return typeof sent === 'number' && Number.isFinite(sent) ? sent : 0;
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -3928,8 +3973,16 @@ export function buildAsyncView(host: Host, remainder = 0): { view: RefDef; rende
  * V2d: `hud` threads through to `resolveDisplay` for the strict-voodoo
  * pre-scanout HUD composition; omit it (or run legacy/software) and HUD is
  * painted post-resolve by the caller as before.
+ *
+ * Voodoo modes snapshot ONE VoodooState per frame (astra §5): the snapshot
+ * is broadcast to every worker band BEFORE the raster kick
+ * (`broadcastBandVoodoo`, absolute y0/y1) and threaded into
+ * `resolveDisplay`, so bands and the single global serial scanout share one
+ * frame state. Software mode snapshots nothing.
  */
 export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: number, hud?: HudState): Promise<Uint32Array> {
+  const frameState = getCVarString('vid_renderer') === 'voodoo' ? snapshotVoodooState() : undefined;
+  if (frameState !== undefined) broadcastBandVoodoo(boot, frameState);
   pumpMuzzleLight(boot);
   pumpExplosionLights(boot);
   pumpTracers(boot);
@@ -3938,5 +3991,5 @@ export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: numb
   boot.refresh.beginFrame();
   await boot.refresh.renderViewAsync(view, boot.host.world, renderables);
   await boot.refresh.endFrameAsync();
-  return resolveDisplay(boot, hud);
+  return resolveDisplay(boot, hud, frameState);
 }

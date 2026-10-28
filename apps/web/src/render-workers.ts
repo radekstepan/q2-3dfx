@@ -378,9 +378,33 @@ export class BrowserBandPool implements BandDispatcher {
     return finished;
   }
 
+  /**
+   * Transfer the frame's single VoodooState snapshot to every band (astra
+   * §5): the SAME `st` values go to all workers with absolute y0/y1, so a
+   * future worker-side voodoo backend rasterises with global dither phase.
+   * Fire-and-forget per worker (the raster kick below is the barrier the
+   * shell waits on); per-worker try/catch so one dead worker degrades to
+   * the inline-convergent path instead of throwing. Returns workers
+   * messaged (0 when disposed/workerless). The current raster loop ignores
+   * the stash (scanout stays global-serial after ALL bands complete).
+   */
+  broadcastVoodooState(st: VoodooState): number {
+    if (this.disposed || this.workers.length === 0) return 0;
+    const msgs = voodooBandMessages(st, this.bands, this.fbW, this.fbH);
+    let sent = 0;
+    for (let i = 0; i < this.workers.length; i++) {
+      try {
+        this.workers[i]!.postMessage(msgs[i]);
+        sent += 1;
+      } catch {
+        /* worker gone: the frame kick below still converges inline */
+      }
+    }
+    return sent;
+  }
+
   /** Shut workers down; safe to call twice. */
-  async dispose(): Promise<void> {
-    if (this.disposed) return;
+  async dispose(): Promise<void> {    if (this.disposed) return;
     this.disposed = true;
     try {
       Atomics.store(this.ctl, CTL_SEQ, -1);
@@ -554,6 +578,25 @@ export class BrowserBandPool implements BandDispatcher {
  * coordinates (never a per-band phase restart). Until a worker/WASM voodoo
  * backend exists, the supported path is selected EXPLICITLY (serial) —
  * never a silent software fallback (see selectVoodooBandPath).
+ *
+ * Per-frame state flow (shell side, all in apps/web):
+ *   1. `frameAsync` (play.ts) snapshots ONE VoodooState via
+ *      `snapshotVoodooState` and hands it to `broadcastBandVoodoo`, which
+ *      feature-detects `BrowserBandPool.broadcastVoodooState` and posts the
+ *      SAME snapshot values to every band with absolute y0/y1
+ *      (`voodooBandMessages` below). The worker entry (render-worker.ts)
+ *      stashes the envelope for the future backend; the current raster loop
+ *      ignores it and scanout stays global-serial on the main thread.
+ *   2. The same snapshot object threads into `resolveDisplay` as
+ *      `frameState`, so bands and the global resolve can never disagree
+ *      mid-frame (no second `readVoodooState()` per frame on that path).
+ *
+ * TODO(worker-rgb-backend): when the worker/WASM RGB backend lands, consume
+ * the stashed envelope worker-side. Assumed hook names (never imported
+ * directly — feature-detect with `as unknown as`):
+ *   worker entry: `renderVoodooBand(envelope)` in render-worker.ts
+ *   wasm export:  `voodoo_raster_band(...)` / `voodoo_resolve_band(...)`
+ * Until then `selectVoodooBandPath` stays `serial` (see below).
  */
 
 /** Supported voodoo scanout paths. `worker` is reserved for the future
@@ -609,4 +652,45 @@ export function voodooBandEnvelopes(
   height: number,
 ): VoodooBandEnvelope[] {
   return bands.map((b) => ({ state: st, y0: b.y0, y1: b.y1, width, height }));
+}
+
+/**
+ * Per-band voodoo state message posted to each worker (astra §5 shell
+ * side): the SAME frame snapshot object for every band plus the band's
+ * ABSOLUTE screen slice (full-frame y0/y1) and full-frame dimensions, so
+ * dither phase and LOD stay stable across band boundaries and camera
+ * motion. `voodooState` is the identical reference in every message on the
+ * sending side (structured-clone copies the same values per worker).
+ * The current bandWorkerLoop ignores these (scanout stays global-serial);
+ * the future worker/WASM voodoo backend consumes them (see TODO above).
+ */
+export interface VoodooBandMessage {
+  /** The frame's single shared snapshot (same reference in every message). */
+  voodooState: VoodooState;
+  /** Band slice in absolute screen rows [y0, y1). */
+  y0: number;
+  /** Band slice end in absolute screen rows. */
+  y1: number;
+  /** Full-frame width (dither/reconstruction address this space). */
+  width: number;
+  /** Full-frame height (dither/reconstruction address this space). */
+  height: number;
+  /** Band index (matches the worker's slice assignment). */
+  band: number;
+}
+
+/**
+ * Build one state message per band sharing a single `st` snapshot (pure).
+ * Contiguous full-frame coverage: messages[i] spans the same absolute
+ * rows as bands[i]; every message carries the identical `st` reference.
+ */
+export function voodooBandMessages(
+  st: VoodooState,
+  bands: Band[],
+  width: number,
+  height: number,
+): VoodooBandMessage[] {
+  return bands.map((b, i) => ({
+    voodooState: st, y0: b.y0, y1: b.y1, width, height, band: i,
+  }));
 }
