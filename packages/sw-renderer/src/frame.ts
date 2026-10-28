@@ -6,7 +6,7 @@
 import type {
   Entity, Framebuffer, FrameStats, Model, ModelHandle, RefDef, Refresh, TextureHandle, WorldModel,
 } from '@q2/renderer-api';
-import { Com_Error } from '@q2/config';
+import { Com_Error, getCVarNumber } from '@q2/config';
 import type { MiniLightmap } from './worldNodes.js';import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, buildRGBLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
 import { SurfaceCache, hashLightStyles, RGBLightCache, type RGBCachedBlock, type SurfaceBlock } from './surfaceCache.js';
 import { setupCamera, setupCameraInto, culledByFlatFrustum, type Camera } from './camera.js';
@@ -68,11 +68,13 @@ const MAX_ROW = 4096;
 let rgbWorldEnabled = false;
 
 /**
- * Select the serial RGB world pass. For the apps/web agent: call with true
- * when `vid_renderer` selects the voodoo path (and the renderer runs the
- * serial classic or banded backend), false when switching back to software.
- * No stale color survives a switch: the coverage mask is cleared every
- * enabled frame and the composite is skipped entirely while disabled.
+ * Select the serial RGB world pass. For the apps/web agent: prefer the
+ * `SoftwareRenderer.setRGBWorldEnabled` instance method (it also drops the
+ * renderer's RGB caches + coverage so no stale frame survives a switch);
+ * this module-level flag exists so headless tests and backend probes can
+ * arm the pass without a renderer instance. No stale color survives a
+ * switch: the coverage mask is cleared every enabled frame and the
+ * composite is skipped entirely while disabled.
  */
 export function setRGBWorldEnabled(on: boolean): void {
   rgbWorldEnabled = on === true;
@@ -81,6 +83,50 @@ export function setRGBWorldEnabled(on: boolean): void {
 /** Observability hook for the RGB world flag (default false). */
 export function isRGBWorldEnabled(): boolean {
   return rgbWorldEnabled;
+}
+
+/**
+ * Per-frame Voodoo fidelity snapshot for the RGB world pass (M4.1 resolve
+ * chain). Read from the `vd_*` cvars (see docs/renderers.md + the @q2/config
+ * defaults) once per renderView — never per pixel. A @q2/voodoo import is
+ * deliberately NOT used here: the enforced dependency rules
+ * (math<-formats<-bsp<-{sw-renderer,voodoo}) forbid sw-renderer depending on
+ * voodoo, so the snapshot reads the same cvar names directly. Unset cvars
+ * fall back to the compiled-in Voodoo3 profile (the values the hardcoded
+ * RGB path always used); vd_zbits falls back to 0 (off) when unset or out
+ * of range so direct unit-test renders without cvar setup stay legacy.
+ */
+export interface RGBFidelity {
+  /** vd_overbright: lightmap modulate x2 + clamp. */
+  overbright: boolean;
+  /** vd_lodbias: added to log2(rho). */
+  lodBias: number;
+  /** vd_mipdither: per-pixel Bayer n/n+1 pick. */
+  mipDither: boolean;
+  /** vd_bilinear: bilinear taps (false = nearest point sample). */
+  bilinear: boolean;
+  /** vd_zbits: depth precision 1..23, 0 = off (legacy raw-1/z test). */
+  zbits: number;
+}
+
+/** Read the current fidelity snapshot (pure, no allocation, sanitised). */
+export function readRGBFidelity(): RGBFidelity {
+  const lodRaw = getCVarNumber('vd_lodbias');
+  const zRaw = getCVarNumber('vd_zbits');
+  return {
+    overbright: getCVarNumber('vd_overbright') !== 0,
+    lodBias: Number.isFinite(lodRaw) ? lodRaw : -0.35,
+    mipDither: getCVarNumber('vd_mipdither') !== 0,
+    bilinear: getCVarNumber('vd_bilinear') !== 0,
+    zbits: Number.isInteger(zRaw) && zRaw >= 1 && zRaw <= 23 ? zRaw : 0,
+  };
+}
+
+/** True when two fidelity snapshots select identical RGB behaviour. */
+export function sameRGBFidelity(a: RGBFidelity, b: RGBFidelity): boolean {
+  return a.overbright === b.overbright && a.lodBias === b.lodBias &&
+    a.mipDither === b.mipDither && a.bilinear === b.bilinear &&
+    a.zbits === b.zbits;
 }
 
 function isAliasMesh(data: unknown): data is AliasMesh {
@@ -279,10 +325,26 @@ export class SoftwareRenderer implements Refresh {
    * RGB-owned depth plane (step 3): the RGB overlay depth-tests and writes
    * here instead of the software zb, so the always-drawn classic path keeps
    * bit-identical depth decisions whether the flag is on or off. 1/z
-   * semantics, same strict-greater test; 16-bit quantization is deferred
-   * to step 4 (target/depth).
+   * semantics, same strict-greater test.
    */
   private rgbZb: Float32Array = new Float32Array(0);
+  /**
+   * Optional 16-bit authority depth plane (M4.1 vd_zbits): attached to the
+   * RGB backend while the fidelity snapshot selects 1..23 bits and cleared
+   * to 0 (far: 1/z is larger-nearer, so far is the minimum) every enabled
+   * frame. Span tests/writes go to the int plane with the float round-trip
+   * mirrored to rgbZb, so foreground effect draws that only see the float
+   * plane stay consistent. Detached (left stale, never read) while zbits
+   * is 0.
+   */
+  private rgbDepth16: Uint16Array = new Uint16Array(0);
+  /**
+   * Fidelity snapshot for this frame's RGB materials (M4.1 resolve chain):
+   * refreshed from the vd_* cvars once per renderView; any change drops the
+   * RGB cache + palette-baked skin/sky memos so toggling a cvar rebuilds
+   * instead of serving stale materials.
+   */
+  private rgbFidelity: RGBFidelity = readRGBFidelity();
   private rgbCache = new RGBLightCache();
   private rgbUsedThisFrame = false;
   /**
@@ -456,7 +518,8 @@ export class SoftwareRenderer implements Refresh {
     this.rgbColor = new Uint32Array(fb.width * fb.height);
     this.rgbCover = new Uint8Array(fb.width * fb.height);
     this.rgbZb = new Float32Array(fb.width * fb.height);
-    this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH);
+    this.rgbDepth16 = new Uint16Array(fb.width * fb.height);
+    this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, this.rgbDepth16);
     this.pickSkyIndex();
     for (let i = 0; i < MAX_SPANS; i++) this.pool.push(createSpan());
     for (let i = 0; i < MAX_SPANS; i++) this.tmpSort.push(this.pool[i]!);
@@ -840,6 +903,69 @@ export class SoftwareRenderer implements Refresh {
    * banded backend routes RGB spans per band; see drawRGBSpans). The wasm
    * backend has no RGB pass and refuses to enable while the flag is on.
    */
+  /**
+   * Select the serial RGB world pass for THIS renderer (what
+   * `apps/web/src/play.ts` probes as `setRGBWorldEnabled` on the instance):
+   * sets the shared module flag AND drops this renderer's RGB state
+   * (coverage, both depth planes, RGB cache, palette-baked skin/sky memos)
+   * so no stale frame survives the switch in either direction. Disabling
+   * additionally marks the frame unused so endFrame skips the composite.
+   */
+  setRGBWorldEnabled(on: boolean): void {
+    rgbWorldEnabled = on === true;
+    this.rgbUsedThisFrame = false;
+    if (this.rgbCover.length > 0) this.rgbCover.fill(0);
+    if (this.rgbZb.length > 0) this.rgbZb.fill(0);
+    // Far in 1/z semantics is the minimum (larger 1/z wins), so the int
+    // plane clears to 0 — NOT all-ones (that clear value belongs to the
+    // LESS-wins window-Z convention; see the backend doc).
+    if (this.rgbDepth16.length > 0) this.rgbDepth16.fill(0);
+    this.rgbCache.invalidateAll();
+    this.rgbSkinMats.clear();
+    this.rgbSkyMat = null;
+    this.rgbFlatSky = null;
+  }
+
+  /** Instance view of the shared RGB world flag (default false). */
+  isRGBWorldEnabled(): boolean {
+    return rgbWorldEnabled;
+  }
+
+  /**
+   * Drop every cached raster (scalar surface cache, RGB light cache, and
+   * the palette-baked skin/sky material memos). Palette changes and cvar
+   * toggles funnel here; the next renderView rebuilds from source. Frame
+   * planes are untouched (beginFrame clears those).
+   */
+  invalidateCaches(): void {
+    this.cache.invalidateAll();
+    this.rgbCache.invalidateAll();
+    this.rgbSkinMats.clear();
+    this.rgbSkyMat = null;
+    this.rgbFlatSky = null;
+  }
+
+  /**
+   * Refresh the per-frame fidelity snapshot (M4.1): read the vd_* cvars
+   * once per renderView; on any change drop the RGB cache + memos so the
+   * new policy rebuilds instead of serving stale materials. Also re-clears
+   * the 16-bit plane when the zbits selection changed mid-stream (beginFrame
+   * already cleared for the frame-start snapshot).
+   */
+  private syncRGBFidelity(): void {
+    const snap = readRGBFidelity();
+    if (sameRGBFidelity(snap, this.rgbFidelity)) return;
+    const zChanged = snap.zbits !== this.rgbFidelity.zbits;
+    this.rgbFidelity = snap;
+    this.rgbCache.invalidateAll();
+    this.rgbSkinMats.clear();
+    this.rgbSkyMat = null;
+    this.rgbFlatSky = null;
+    if (zChanged && rgbWorldEnabled && this.rgbDepth16.length > 0) {
+      this.rgbDepth16.fill(0);
+    }
+  }
+
   private rgbOverlayActive(): boolean {
     return rgbWorldEnabled && (this.backend === this.tsBackend || this.backend === this.bandBackend);
   }
@@ -862,16 +988,19 @@ export class SoftwareRenderer implements Refresh {
    * any RGB foreground/alpha draws. Alpha/additive RGB composites read the
    * current plane pixel as their destination, so the seed gives them the
    * exact software background (opaque world already drawn classically);
-   * opaque RGB writes overwrite it. Cover is NOT marked: uncovered pixels
-   * composite from the identical indexed expand in endFrame. Called once at
-   * the top of drawForeground (covers world + all foreground draws).
+   * opaque RGB writes overwrite it. Pixels the world RGB pass already
+   * covered are spared (their filtered color survives); uncovered pixels
+   * composite from the identical indexed expand in endFrame either way.
+   * Called once at the top of drawForeground (covers world + foreground).
    */
   private seedRGBBackground(): void {
     const pal = this.palette;
     const src = this.idx;
     const dst = this.rgbColor;
+    const cover = this.rgbCover;
     const n = this.fbW * this.fbH;
     for (let i = 0; i < n; i++) {
+      if (cover[i] !== 0) continue;
       const c = src[i]! * 3;
       const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
       dst[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
@@ -881,14 +1010,18 @@ export class SoftwareRenderer implements Refresh {
   /**
    * Palette-baked RGB material for an entity/placed skin (unlit: alias and
    * sprite lighting rides vertex colors / fullbright, not a lightmap).
-   * Cached by Texture identity; cleared on setPalette.
+   * Cached by Texture identity; cleared on setPalette, cvar toggles and
+   * renderer enable/disable. Sampling policy comes from the per-frame
+   * fidelity snapshot (overbright is inert here — no lightmap to modulate).
    */
   private rgbMaterialForSkin(skin: Texture): RGBMaterial {
+    const fid = this.rgbFidelity;
     let mat = this.rgbSkinMats.get(skin);
     if (!mat) {
       mat = buildRGBMaterial(skin.texels, skin.width, skin.height, this.palette, null, {
         addressS: 'clamp', addressT: 'clamp',
-        overbright: true, lodBias: -0.35, mipDither: true,
+        overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
+        bilinear: fid.bilinear, zbits: fid.zbits,
       });
       this.rgbSkinMats.set(skin, mat);
     }
@@ -904,9 +1037,11 @@ export class SoftwareRenderer implements Refresh {
       cached.tex.texels.length === sky.texels.length) {
       return cached.mat;
     }
+    const fid = this.rgbFidelity;
     const mat = buildRGBMaterial(sky.texels, sky.width, sky.height, this.palette, null, {
       addressS: 'clamp', addressT: 'clamp',
-      overbright: false, lodBias: 0, mipDither: false, opaqueMask: true,
+      overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
+      bilinear: fid.bilinear, zbits: fid.zbits, opaqueMask: true,
     });
     this.rgbSkyMat = { tex: { width: sky.width, height: sky.height, texels: sky.texels }, mat };
     return mat;
@@ -920,8 +1055,11 @@ export class SoftwareRenderer implements Refresh {
     const flat = new Uint8Array([
       this.palette[c] ?? 0, this.palette[c + 1] ?? 0, this.palette[c + 2] ?? 0,
     ]);
+    const fid = this.rgbFidelity;
     const mat = buildRGBMaterial(new Uint8Array([0]), 1, 1, this.palette, null, {
       flatColor: flat, opaqueMask: true,
+      overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
+      bilinear: fid.bilinear, zbits: fid.zbits,
     });
     this.rgbFlatSky = { index: this.skyIndex, mat };
     return mat;
@@ -1009,14 +1147,17 @@ export class SoftwareRenderer implements Refresh {
     this.rgbBackend.pixelsDrawn = 0;
     this.rgbUsedThisFrame = false;
     if (rgbWorldEnabled) {
-      this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH);
+      this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, this.rgbDepth16);
       this.rgbCover.fill(0);
       this.rgbZb.fill(0);
+      // 16-bit plane clears to 0 (far under larger-1/z-wins; see the field
+      // doc). Detached-but-stale while zbits is 0 (no RGB test reads it).
+      this.rgbDepth16.fill(0);
       // The banded backend partitions RGB spans per row band over the same
       // planes (workers never touch them); binding follows the live planes
       // like the serial backend above.
       if (this.backend === this.bandBackend) {
-        this.bandBackend.attachRGB(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH);
+        this.bandBackend.attachRGB(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH, this.rgbDepth16);
       }
     }
     this.rgbCache.nextFrame();
@@ -1024,6 +1165,8 @@ export class SoftwareRenderer implements Refresh {
 
   renderView(view: RefDef, world: WorldModel, entities: Entity[]): FrameStats {
     const t0 = Date.now();
+    // M4.1: fidelity snapshot once per view (cvar toggles invalidate below).
+    this.syncRGBFidelity();
     const ph = this.phaseArmed ? this.phaseAcc : null;
     let pt = ph ? phaseNow() : 0;
     const worldData = isMiniWorld(world.data) ? world.data : createDevroom();
@@ -2199,15 +2342,19 @@ export class SoftwareRenderer implements Refresh {
 
   /**
    * RGB miss path: build the cached binding for one surface from the
-   * scalar block's texels (shared by reference — no second mip pass)
-   * plus a fresh per-channel luxel block (buildRGBLightMap). Returns null
-   * when the lightmap is unusable; the caller then draws the scalar
-   * block/backend instead, so output shape never changes. The entry shares
+   * ORIGINAL full-res texture texels (the mip chain is expanded at upload
+   * from level 0, so the per-span LOD walks the true chain — the old
+   * point-subsampled scalar texels double-applied the mip select) plus a
+   * fresh per-channel luxel block (buildRGBLightMap). Returns null when the
+   * lightmap or texture is unusable; the caller then draws the scalar
+   * block/backend alone, so output shape never changes. The entry shares
    * texels/grades with the scalar block and owns only the RGB luxels +
    * mip chain (palette-baked: setPalette drops the whole RGB cache).
    * Turbulent surfaces get a warp material; `extra` lets the deferred
    * alpha loop request the blended, non-depth-writing variant for
-   * TRANS33/66 (the main loop always draws opaque).
+   * TRANS33/66 (the main loop always draws opaque). Sampling policy comes
+   * from the per-frame fidelity snapshot; a cvar change invalidates the
+   * whole RGB cache in syncRGBFidelity, so cached materials never go stale.
    */
   private buildRGBEntry(
     world: MiniWorld, surf: MiniSurf, block: SurfaceBlock,
@@ -2219,6 +2366,11 @@ export class SoftwareRenderer implements Refresh {
     if (!lm || lm.luxW < 1 || lm.luxH < 1) return null;
     if (lm.samples.length < lm.luxW * lm.luxH * 3) return null;
     if (block.texels.length < block.bw * block.bh || block.bw < 1 || block.bh < 1) return null;
+    // Full-res mip source (see doc above): the cache key keeps `mip`, so
+    // entries filed under different scalar mips share the identical chain.
+    const src = world.textures[surf.texId % world.textures.length]!;
+    if (!src || src.width < 1 || src.height < 1) return null;
+    if (src.texels.length < src.width * src.height) return null;
     const n = lm.luxW * lm.luxH;
     const need = n * 3;
     if (this.rgbLightScratch.length < need) this.rgbLightScratch = new Uint8Array(need);
@@ -2239,12 +2391,14 @@ export class SoftwareRenderer implements Refresh {
       scales, dyn, surf.center, dlightBits, LIGHT_OVERBRIGHT, luxelPos,
     );
     const rgb = this.rgbLightScratch.slice(0, need);
+    const fid = this.rgbFidelity;
     const material = buildRGBMaterial(
-      block.texels, block.bw, block.bh, this.palette,
+      src.texels, src.width, src.height, this.palette,
       { samples: rgb, luxW: lm.luxW, luxH: lm.luxH },
       {
         addressS: 'repeat', addressT: 'repeat',
-        overbright: true, lodBias: -0.35, mipDither: true,
+        overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
+        bilinear: fid.bilinear, zbits: fid.zbits,
         warp: surf.turbulent,
         turbPhase: surf.turbulent ? (((this.backend.time * 64) | 0) & 1023) : 0,
         blend: extra?.blend ?? 'opaque',

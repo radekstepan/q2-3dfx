@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { getCVarString, setCVar } from '@q2/config';
 import {
+  applyDisplayGamma,
   applyPostFilter,
   applyReconstruction2x2,
   applyReconstruction4x1,
@@ -159,6 +160,98 @@ describe('dither subtract wiring', () => {
     let differ = 0;
     for (let i = 0; i < 64; i++) if (a[i] !== b[i]) differ++;
     expect(differ).toBeGreaterThan(0);
+  });
+});
+
+describe('matched recon enforcement: subtract forced by reconmode, not dithermode', () => {
+  const w = 8;
+  const h = 6;
+  function fieldSrc(): Uint32Array {
+    const src = new Uint32Array(w * h);
+    for (let i = 0; i < w * h; i++) {
+      const v = (i * 53 + 17) & 255;
+      src[i] = (0xff000000 | (v << 16) | (v << 8) | v) >>> 0;
+    }
+    return src;
+  }
+  // gamma 1 isolates the subtract wiring: display gamma is the identity, so
+  // the display plane exposes exactly which pattern was subtracted.
+  it("dithermode '2x2' writes + '4x4sub+4x1' scanout still subtracts '4x4'", () => {
+    const src = fieldSrc();
+    const st = { ...defaultVoodooState(), dithermode: '2x2' as const, reconmode: '4x4sub+4x1' as const, gamma: 1, dither: true, postfilter: true };
+    const dst565 = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h);
+    resolveFrame(src, dst565, display, w, h, st);
+    // Write path honours dithermode (2x2 matrix on the target)...
+    const ref565 = new Uint16Array(w * h);
+    resolveRGB565(src, ref565, w, h, { gamma: 1, dither: true, ditherMode: '2x2', quantise: true });
+    expect(dst565).toEqual(ref565);
+    // ...but scanout subtracts the MODE's pattern ('4x4'), not the write's.
+    const refDisplay = new Uint32Array(w * h);
+    applyReconstruction4x1(ref565, refDisplay, w, h, st.rgbmaxdelta, '4x4');
+    expect(display).toEqual(refDisplay);
+    // And that differs from subtracting the write pattern ('2x2'):
+    const wrong = new Uint32Array(w * h);
+    applyReconstruction4x1(ref565, wrong, w, h, st.rgbmaxdelta, '2x2');
+    let differ = 0;
+    for (let i = 0; i < w * h; i++) if (display[i] !== wrong[i]) differ++;
+    expect(differ).toBeGreaterThan(0);
+  });
+  it("dithermode '4x4' writes + '2x2sub+2x2box' scanout still subtracts '2x2'", () => {
+    const src = fieldSrc();
+    const st = { ...defaultVoodooState(), dithermode: '4x4' as const, reconmode: '2x2sub+2x2box' as const, gamma: 1, dither: true, postfilter: true };
+    const dst565 = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h);
+    resolveFrame(src, dst565, display, w, h, st);
+    const ref565 = new Uint16Array(w * h);
+    resolveRGB565(src, ref565, w, h, { gamma: 1, dither: true, ditherMode: '4x4', quantise: true });
+    expect(dst565).toEqual(ref565);
+    const refDisplay = new Uint32Array(w * h);
+    applyReconstruction2x2(ref565, refDisplay, w, h, st.rgbmaxdelta, '2x2');
+    expect(display).toEqual(refDisplay);
+  });
+  it('vd_dither=0 under a subtract mode subtracts null (no pattern was added)', () => {
+    const src = fieldSrc();
+    for (const recon of ['2x2sub+2x2box', '4x4sub+4x1'] as const) {
+      const st = { ...defaultVoodooState(), dithermode: '2x2' as const, reconmode: recon, gamma: 1, dither: false, postfilter: true };
+      const dst565 = new Uint16Array(w * h);
+      const display = new Uint32Array(w * h);
+      resolveFrame(src, dst565, display, w, h, st);
+      const refDisplay = new Uint32Array(w * h);
+      if (recon === '2x2sub+2x2box') {
+        applyReconstruction2x2(dst565, refDisplay, w, h, st.rgbmaxdelta, null);
+      } else {
+        applyReconstruction4x1(dst565, refDisplay, w, h, st.rgbmaxdelta, null);
+      }
+      expect(display).toEqual(refDisplay);
+    }
+  });
+  it('mismatched strict path still applies display gamma after reconstruction', () => {
+    const src = fieldSrc();
+    const st = { ...defaultVoodooState(), dithermode: '2x2' as const, reconmode: '4x4sub+4x1' as const, gamma: 1.3, dither: true, postfilter: true };
+    const dst565 = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h);
+    resolveFrame(src, dst565, display, w, h, st);
+    const ref565 = new Uint16Array(w * h);
+    resolveRGB565(src, ref565, w, h, { gamma: 1, dither: true, ditherMode: '2x2', quantise: true });
+    const refDisplay = new Uint32Array(w * h);
+    applyReconstruction4x1(ref565, refDisplay, w, h, st.rgbmaxdelta, '4x4');
+    applyDisplayGamma(refDisplay, w, h, 1.3);
+    expect(dst565).toEqual(ref565);
+    expect(display).toEqual(refDisplay);
+  });
+  it('legacy ignores the subtract profiles entirely (unconditional box, gamma on source)', () => {
+    const src = fieldSrc();
+    const st = { ...defaultVoodooState(), dithermode: '2x2' as const, reconmode: 'legacy' as const, gamma: 1.3, dither: true, postfilter: true };
+    const dst565 = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h);
+    resolveFrame(src, dst565, display, w, h, st);
+    const ref565 = new Uint16Array(w * h);
+    resolveRGB565(src, ref565, w, h, { gamma: 1.3, dither: true, ditherMode: '2x2', quantise: true });
+    const refDisplay = new Uint32Array(w * h);
+    applyPostFilter(ref565, refDisplay, w, h);
+    expect(dst565).toEqual(ref565);
+    expect(display).toEqual(refDisplay);
   });
 });
 

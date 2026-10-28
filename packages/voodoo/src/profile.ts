@@ -101,9 +101,9 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
   }),
   Object.freeze({
     setting: 'gamma.stage',
-    value: 'LUT applied to the 8:8:8 source before dither/quantise, standing in for display-stage RAMDAC gamma',
+    value: 'legacy: LUT on the 8:8:8 source before dither/quantise; strict (non-legacy recon): linear pack + reconstruct, LUT on the display plane after',
     source: 'approx:chosen',
-    note: 'Differs from gamma-of-average by <= 1 LSB after the 565 round-trip; kept until HW capture.',
+    note: 'Strict follows the guide RAMDAC order; legacy keeps LUT-on-source so goldens stay bit-exact until HW capture.',
   }),
   Object.freeze({
     setting: 'lod.bias-sign',

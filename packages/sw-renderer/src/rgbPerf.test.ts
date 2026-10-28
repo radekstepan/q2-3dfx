@@ -79,7 +79,12 @@ describe('step-5 RGB output hash pin (byte-identical before/after)', () => {
   it('RGB composite + index plane match the pinned step-4 hashes', () => {
     const a = renderRGB160();
     expect(a.cover).toBe(160 * 120);
-    expect(a.colorHash).toBe('8372b322');
+    // M4.1 re-pin (was 8372b322): seedRGBBackground used to clobber the
+    // world RGB plane with the indexed expand, so the pin captured
+    // indexed-world + RGB-foreground only. Covered pixels are now spared,
+    // so the world pass actually displays (ON differs from OFF). The index
+    // pin below is unchanged: the software path stays bit-identical.
+    expect(a.colorHash).toBe('3534624e');
     expect(a.indexHash).toBe('58e0ecf1');
     // second frame is stable (cache hits serve identical color)
     const b = renderRGB160();

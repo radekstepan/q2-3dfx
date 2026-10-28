@@ -122,6 +122,20 @@ export type ResolveOrder =
   | 'software-lifted';
 
 /**
+ * Last `armRasterPolicy` outcome (P1 observability: the old hook-probe
+ * silently no-oped, leaving voodoo mode on the indexed rasterizer).
+ * `mode` echoes the boot renderer the policy armed for, `rgbEnabled` is the
+ * requested RGB-world state (true in voodoo mode), and `hooked` reports
+ * whether a real renderer hook consumed the request. When `hooked` is false
+ * `armRasterPolicy` `console.warn`s and keeps the indexed fallback.
+ */
+export interface RasterPolicyStatus {
+  mode: RendererKind;
+  rgbEnabled: boolean;
+  hooked: boolean;
+}
+
+/**
  * Rotate a baked brush-model vertex about a pivot by Quake delta angles
  * (degrees [pitch, yaw, roll]). Render-side twin of the server's angular
  * movers (func_door_rotating): v' = pivot + dx*F - dy*R + dz*U, the
@@ -149,9 +163,12 @@ export function rotateDoorVert(base: Vec3, pivot: Vec3, delta: Vec3, out?: Vec3)
 // `r_brightness` is a pure presentation lift applied post-resolve in
 // `resolveDisplay` (0xAABBGGRR scale + clamp). It never touches lightmaps,
 // the palette, the pak, or the renderer internals — the framebuffer the
-// engine produced is unchanged. Registered here (apps/web owns the display
-// path); `getBrightness` treats an absent cvar (e.g. after `resetCVars()` in
-// tests) as the default so headless boots stay deterministic.
+// engine produced is unchanged. Strict voodoo is EXEMPT (effective 1.0):
+// `vd_gamma` inside `resolveFrame` is already the display-gamma stage, so
+// stacking the lift would double-apply gamma; legacy voodoo + software keep
+// it. Registered here (apps/web owns the display path); `getBrightness`
+// treats an absent cvar (e.g. after `resetCVars()` in tests) as the default
+// so headless boots stay deterministic.
 export const BRIGHTNESS_DEFAULT = 2.0;
 export const BRIGHTNESS_MIN = 0.5;
 export const BRIGHTNESS_MAX = 2.0;
@@ -2678,6 +2695,12 @@ export interface PlayBoot {
    */
   lastVoodooPath: VoodooBandPath | 'none';
   /**
+   * Last `armRasterPolicy` outcome (P1: `{mode, rgbEnabled, hooked}` for
+   * tests; `hooked === false` means no renderer hook consumed the request
+   * and the indexed fallback is active — see `armRasterPolicy`).
+   */
+  lastRasterPolicy: RasterPolicyStatus;
+  /**
    * Browser worker pool attached by `attachBrowserPool` (null = sync /
    * single-threaded path: headless, no SAB, or `sw_workers` 0). Set once
    * per boot; `frameAsync` feature-detects `broadcastVoodooState` on it to
@@ -2973,6 +2996,7 @@ export function bootPlay(opts: {
     host, driver, refresh, renderer, source: driver.source,
     display: new Uint32Array(n), fb565: new Uint16Array(n),
     strictVoodoo: true, lastResolveOrder: 'none', lastVoodooPath: 'none',
+    lastRasterPolicy: { mode: renderer, rgbEnabled: false, hooked: false },
     browserPool: null,
     models, pak: opts.pak ?? null,
   };
@@ -3021,15 +3045,16 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
 
 /* --- V2d raster-policy hooks (feature-detected, never imported) ---------
  *
- * A parallel sw-renderer agent is adding an internal RGB-world switch
- * (`setRGBWorldEnabled(bool)` or a similarly named method) plus texture /
- * light cache invalidation; a voodoo agent is adding upload/depth helpers.
- * Their exact names are NOT depended on here: every hook below is probed
- * with `as unknown as` and skipped when absent, so this file passes with
- * or without those landings (fallback = current postfilter behaviour).
+ * The sw-renderer RGB-world switch exists as BOTH the module-level
+ * `setRGBWorldEnabled(bool)` / `isRGBWorldEnabled()` pair and the
+ * `SoftwareRenderer.setRGBWorldEnabled/isRGBWorldEnabled/invalidateCaches`
+ * instance methods (`packages/sw-renderer/src/frame.ts`). The shell probes
+ * the instance first (correct per-renderer state + cache drop); the hook
+ * names below are probed with `as unknown as` so this file passes with or
+ * without future renames. A miss records `hooked: false` and warns LOUDLY
+ * instead of silently running the indexed rasterizer in voodoo mode (P1).
  *
- * ASSUMED hook names (tried in order; TODO(V2d): pin the final names once
- * the sw-renderer/voodoo cards land and drop the aliases):
+ * Hook names (tried in order):
  *   RGB arm/disarm: setRGBWorldEnabled(bool)
  *   cache invalidate: invalidateCaches() | invalidateTextureCaches() |
  *     clearTextureCache() | invalidateLightCaches() | clearCaches()
@@ -3075,11 +3100,24 @@ function callFirstHook(target: object, names: readonly string[], arg?: boolean):
  * present (TODO(V2d): no public cache-invalidate hook exists on
  * SoftwareRenderer yet — `surfaceCache.invalidateAll` is internal — so this
  * currently documents the need; the scratch-plane zeroing below is what
- * guarantees no stale frame today). Never throws.
+ * guarantees no stale frame today).
+ *
+ * Returns whether a real renderer hook consumed the request and records the
+ * outcome on `boot.lastRasterPolicy` (P1 observability). When no hook is
+ * present it `console.warn`s (loud, not silent) and keeps the indexed
+ * fallback. Never throws.
  */
-export function armRasterPolicy(boot: PlayBoot): void {
+export function armRasterPolicy(boot: PlayBoot): boolean {
   const voodoo = boot.renderer === 'voodoo';
-  callFirstHook(boot.refresh, RGB_ENABLE_HOOKS, voodoo);
+  const hooked = callFirstHook(boot.refresh, RGB_ENABLE_HOOKS, voodoo);
+  boot.lastRasterPolicy = { mode: boot.renderer, rgbEnabled: voodoo, hooked };
+  if (!hooked) {
+    console.warn(
+      `[q2ts-web] armRasterPolicy(${boot.renderer}): no RGB-world hook on ` +
+        `SoftwareRenderer (tried ${RGB_ENABLE_HOOKS.join(', ')}) — indexed ` +
+        `fallback stays active until the sw-renderer instance hook lands`,
+    );
+  }
   // TODO(V2d): call the real texture/light cache invalidate hooks once the
   // sw-renderer card publishes them; no public hook exists at this HEAD.
   callFirstHook(boot.refresh, CACHE_INVALIDATE_HOOKS);
@@ -3087,6 +3125,7 @@ export function armRasterPolicy(boot: PlayBoot): void {
   // previous-mode pixels (engine planes are repainted by the next render).
   boot.display.fill(0);
   boot.fb565.fill(0);
+  return hooked;
 }
 
 /* --- V2d resolve ownership (astra §5) ------------------------------------
@@ -3104,9 +3143,10 @@ export function armRasterPolicy(boot: PlayBoot): void {
  * HUD is composed into the emulated target BEFORE scanout reconstruction
  * + display gamma (astra §4 pipeline). Legacy/software path keeps the
  * current paint-HUD-after + `r_brightness` behaviour. The legacy
- * `r_brightness` lift is retained post-scanout in BOTH voodoo branches for
- * compat (display-gamma calibration will revisit it); `vd_gamma` inside
- * `resolveFrame` is the display-gamma stage in strict mode.
+ * `r_brightness` lift is retained post-scanout in the LEGACY voodoo branch
+ * only: strict voodoo skips it (effective brightness 1.0) because
+ * `vd_gamma` inside `resolveFrame` is already the display-gamma stage —
+ * stacking the lift on top would double-apply gamma.
  */
 
 /** Optional renderer-side scanout-done flag (see ownership note above). */
@@ -3155,6 +3195,11 @@ export function hudComposedPreScanout(boot: PlayBoot): boolean {
  * At 1.0 the software path returns the engine buffer untouched
  * (byte-identical, same reference).
  *
+ * Strict voodoo (`boot.strictVoodoo`, default ON) SKIPS the `r_brightness`
+ * post-scanout lift (effective brightness 1.0): `vd_gamma` inside
+ * `resolveFrame` is already the display-gamma stage, so stacking the lift
+ * would double-apply gamma. The legacy voodoo branch keeps the lift.
+ *
  * V2d: `hud` enables the strict-voodoo pre-scanout HUD composition (painted
  * into the emulated target before `resolveFrame`). Omit it (headless/tests)
  * to resolve the scene alone; the legacy post-resolve HUD pass is unchanged.
@@ -3195,11 +3240,15 @@ export function resolveDisplay(boot: PlayBoot, hud?: HudState, frameState?: Vood
         // STRICT: HUD into the emulated target BEFORE scanout so the
         // reconstruction filter taps cross HUD/scene edges with absolute
         // screen-coordinate dither phase (global frame, never per-band).
+        // NO r_brightness post-scanout lift here (effective 1.0): vd_gamma
+        // inside resolveFrame is already the display-gamma stage, so
+        // stacking the lift would double-apply gamma.
         if (hud !== undefined) paintHudPreScanout(boot, hud);
         boot.lastResolveOrder = 'strict-hud-first';
         resolveFrame(live, boot.fb565, boot.display, w, h, st);
       } else {
-        // LEGACY: scanout first, HUD painted after by the caller.
+        // LEGACY: scanout first, HUD painted after by the caller. Keeps the
+        // r_brightness post-scanout lift (compat); strict mode above skips it.
         boot.lastResolveOrder = 'legacy-hud-last';
         // Canary for pre-fix `resolveFrame` (astra §2 defect #1): it only fills
         // `display` when `vd_postfilter` is on, leaving last frame's
@@ -3225,7 +3274,9 @@ export function resolveDisplay(boot: PlayBoot, hud?: HudState, frameState?: Vood
         }
       }
     }
-    applyBrightness(boot.display, brightness);
+    // r_brightness post-scanout lift: LEGACY voodoo branch only. Strict
+    // voodoo skips it (vd_gamma is the display-gamma stage there).
+    if (!boot.strictVoodoo) applyBrightness(boot.display, brightness);
     return boot.display;
   }
   boot.lastVoodooPath = 'none';

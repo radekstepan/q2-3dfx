@@ -1,27 +1,27 @@
 // @q2/voodoo — M4.1 resolve chain.
 //
-// Pipeline order (fixed, matches Glide on Voodoo3):
-//   8:8:8 framebuffer -> gamma LUT -> 4x4 ordered dither -> RGB565 quantise
-//   -> optional 2x2 box ("22-bit" RAMDAC post filter) for display.
+// Pipeline order (Glide on Voodoo3, guide §7.2): the display gamma LUT lives
+// in the RAMDAC on the already-reconstructed signal:
+//   8:8:8 framebuffer -> ordered dither -> RGB565 quantise
+//   -> scanout reconstruction (box / matched subtract+box) for display
+//   -> display gamma LUT.
+// Two orderings exist in this package:
+// - 'legacy' reconmode (DEFAULT): gamma LUT on the 8:8:8 source, then dither
+//   -> RGB565, then unconditional 2x2 box (or per-pixel expand when the
+//   postfilter is off). Byte-exact M4.1 path — every golden pins it.
+// - strict (non-legacy reconmode: '2x2sub+2x2box' / '4x4sub+4x1'): LINEAR
+//   dither+quant (gamma 1) -> matched reconstruction (subtract matrix
+//   dictated by the mode, never by vd_dithermode) -> display gamma LUT on
+//   the display plane via applyDisplayGamma. Postfilter-off strict follows
+//   the same rule with no reconstruction: linear pack -> expand -> display
+//   gamma (direct-view strict path).
+// The RGB888 debug bypass keeps the historical LUT-on-source order (gamma
+// on, dither/reconstruction off); gamma 1.0 disables the stage everywhere.
 //   Depth: stored 1/z quantised to vd_zbits bits is a DISPLAY/BANDING
 //   approximation only, NOT a depth-buffer emulation (see quantiseDepth).
 //   True depth emulation must quantise BEFORE the depth test/write against
 //   an internal quantized plane; Framebuffer.depth keeps its documented 1/z
 //   semantics (frozen @q2/renderer-api contract).
-//
-// GAMMA STAGE (documented placement — behaviour unchanged since M4.1).
-//
-// The guide pipeline lists "display gamma" AFTER scanout reconstruction, i.e.
-// in the RAMDAC on the already-reconstructed signal. This package applies the
-// equivalent Glide transfer LUT to the 8:8:8 source BEFORE dither/quantise:
-// for a per-frame resolve of an 8:8:8 framebuffer the two placements differ
-// only by gamma-of-average vs average-of-gamma rounding (<= 1 LSB per channel
-// after the 565 round-trip), so the LUT-on-source placement stands in for the
-// RAMDAC stage deterministically. Moving the LUT after the box would change
-// every golden value for no calibrated gain — NOT done until an HW capture
-// establishes the real RAMDAC curve. The RGB888 bypass keeps the SAME LUT
-// stage (gamma on, dither/reconstruction off); gamma 1.0 disables the stage
-// on both paths.
 //
 // Conventions: colour is Uint32 0xAABBGGRR (see @q2/renderer-api Framebuffer).
 // Inner loops use typed arrays only and allocate nothing.
@@ -52,6 +52,36 @@ export function gammaLUT(gamma: number): Uint8Array {
   cachedGamma = gamma;
   cachedLUT = lut;
   return lut;
+}
+
+/**
+ * Display-stage gamma (guide §7.2 placement): apply the Glide transfer LUT
+ * in place to a packed 0xFFBBGGRR display plane (alpha forced opaque, like
+ * every other display-plane producer here). This is the RAMDAC stage — it
+ * runs on the already-reconstructed signal, AFTER dither/quant/recon.
+ * gamma = 1 validates then no-ops. Zero-alloc inner loop.
+ *
+ * Used by the strict (non-legacy reconmode) resolveFrame path: the 565
+ * target is packed linear (gamma 1), reconstructed, then this LUT runs on
+ * the display plane. The legacy path keeps the historical LUT-on-source
+ * order byte-exact and never calls this. Raster backends must NOT import
+ * this to gamma-correct their own buffers — it is resolve-internal; call
+ * resolveFrame and treat the display plane as final.
+ */
+export function applyDisplayGamma(dst32: Uint32Array, w: number, h: number, gamma: number): void {
+  if (dst32.length < w * h) {
+    throw new Error('[voodoo] applyDisplayGamma: buffer too small');
+  }
+  const lut = gammaLUT(gamma);
+  if (gamma === 1) return;
+  const n = w * h;
+  for (let i = 0; i < n; i++) {
+    const px = dst32[i]!;
+    const r = lut[px & 255]!;
+    const g = lut[(px >> 8) & 255]!;
+    const b = lut[(px >> 16) & 255]!;
+    dst32[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+  }
 }
 
 // --- RGB565 quantise -----------------------------------------------------
@@ -97,9 +127,12 @@ export type DitherMode = '2x2' | '4x4';
  *   rgbMaxDelta edge rejection.
  * - '4x4sub+4x1': subtract the 4x4 dither pattern, then a horizontal 4x1 box
  *   (centered window [x-1, x+2], clamp-to-edge) with rgbMaxDelta rejection.
- * The subtract matrix is dictated by the MODE, not by vd_dithermode: a
- * mismatched write dither (e.g. 4x4 writes + 2x2sub scanout) subtracts the
- * wrong pattern and is a documented misconfiguration, not an error.
+ * The subtract matrix is dictated by the MODE, never by vd_dithermode: the
+ * scanout filter is programmed for the mode's pattern regardless of the
+ * write matrix. A mismatched write dither (e.g. 2x2 writes under 4x4sub+4x1
+ * scanout) still subtracts the mode's pattern — deterministic and tolerated,
+ * not an error (see resolveFrame matched-reconforcement comment). Pass
+ * ditherSub = null when the write path ran dither-off.
  */
 export type ReconMode = 'legacy' | '2x2sub+2x2box' | '4x4sub+4x1';
 

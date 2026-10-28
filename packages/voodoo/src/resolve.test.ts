@@ -3,7 +3,9 @@
 import { describe, expect, it } from 'vitest';
 import { getCVarNumber, setCVar } from '@q2/config';
 import {
+  applyDisplayGamma,
   applyPostFilter,
+  applyReconstruction2x2,
   bayerThreshold,
   capTextureSizeFrame,
   defaultResolveRGB888Options,
@@ -327,6 +329,124 @@ describe('cvar switching', () => {
       for (const [k, v] of saved) setCVar(k, v);
     }
     expect(defaultVoodooState().gamma).toBe(1.3);
+  });
+});
+
+describe('applyDisplayGamma (RAMDAC stage)', () => {
+  it('gamma 1 validates then no-ops byte-exact', () => {
+    const src = new Uint32Array([0xff102030, 0xff00ff00, 0xffffffff, 0xff000000]);
+    const dst = new Uint32Array(src);
+    applyDisplayGamma(dst, 2, 2, 1);
+    expect(dst).toEqual(src);
+  });
+  it('applies the same LUT as the source stage per channel, alpha forced opaque', () => {
+    const lut = gammaLUT(1.3);
+    const src = new Uint32Array([(0x00332211) >>> 0, (0xff4080c0 | 0xff000000) >>> 0]);
+    applyDisplayGamma(src, 2, 1, 1.3);
+    expect(src[0]).toBe((0xff000000 | (lut[0x33]! << 16) | (lut[0x22]! << 8) | lut[0x11]!) >>> 0);
+    expect(src[1]).toBe((0xff000000 | (lut[0x40]! << 16) | (lut[0x80]! << 8) | lut[0xc0]!) >>> 0);
+  });
+  it('rejects non-positive gamma and short buffers', () => {
+    const dst = new Uint32Array(4);
+    expect(() => applyDisplayGamma(dst, 2, 2, 0)).toThrow();
+    expect(() => applyDisplayGamma(dst, 2, 2, -1.3)).toThrow();
+    expect(() => applyDisplayGamma(new Uint32Array(3), 2, 2, 1.3)).toThrow();
+  });
+});
+
+describe('strict resolveFrame: gamma after reconstruction', () => {
+  const w = 8;
+  const h = 6;
+  function rampSrc(): Uint32Array {
+    const src = new Uint32Array(w * h);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        const r = (x * 32 + 5) & 255;
+        const g = (y * 40 + 11) & 255;
+        const b = ((x + y) * 24 + 3) & 255;
+        src[y * w + x] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      }
+    return src;
+  }
+  it('strict packs a linear 565 target (gamma 1), legacy bakes gamma in', () => {
+    const src = rampSrc();
+    const stStrict = { ...defaultVoodooState(), reconmode: '2x2sub+2x2box' as const, gamma: 1.3, dither: true, dithermode: '4x4' as const };
+    const stLegacy = { ...defaultVoodooState(), reconmode: 'legacy' as const, gamma: 1.3, dither: true, dithermode: '4x4' as const };
+    const dstStrict = new Uint16Array(w * h);
+    const dstLegacy = new Uint16Array(w * h);
+    resolveFrame(src, dstStrict, null, w, h, stStrict);
+    resolveFrame(src, dstLegacy, null, w, h, stLegacy);
+    const refLinear = new Uint16Array(w * h);
+    resolveRGB565(src, refLinear, w, h, { gamma: 1, dither: true, ditherMode: '4x4', quantise: true });
+    expect(dstStrict).toEqual(refLinear);
+    let differ = 0;
+    for (let i = 0; i < w * h; i++) if (dstStrict[i] !== dstLegacy[i]) differ++;
+    expect(differ).toBeGreaterThan(0); // gamma placement moves the target
+  });
+  it('strict display == linear pack -> matched recon -> display gamma (manual pipeline)', () => {
+    const src = rampSrc();
+    const st = {
+      ...defaultVoodooState(),
+      reconmode: '2x2sub+2x2box' as const,
+      gamma: 1.3,
+      dither: true,
+      dithermode: '4x4' as const,
+      postfilter: true,
+      rgbmaxdelta: { r: 0, g: 0, b: 0 },
+    };
+    const dst565 = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h);
+    resolveFrame(src, dst565, display, w, h, st);
+    // Manual reference pipeline:
+    const ref565 = new Uint16Array(w * h);
+    resolveRGB565(src, ref565, w, h, { gamma: 1, dither: true, ditherMode: '4x4', quantise: true });
+    const refDisplay = new Uint32Array(w * h);
+    applyReconstruction2x2(ref565, refDisplay, w, h, st.rgbmaxdelta, '2x2');
+    applyDisplayGamma(refDisplay, w, h, 1.3);
+    expect(dst565).toEqual(ref565);
+    expect(display).toEqual(refDisplay);
+  });
+  it('strict differs from legacy display (gamma placement is observable)', () => {
+    const src = rampSrc();
+    const strict = { ...defaultVoodooState(), reconmode: '2x2sub+2x2box' as const, gamma: 1.3, dither: true, dithermode: '4x4' as const, postfilter: true };
+    const legacy = { ...defaultVoodooState(), reconmode: 'legacy' as const, gamma: 1.3, dither: true, dithermode: '4x4' as const, postfilter: true };
+    const dS = new Uint16Array(w * h);
+    const dL = new Uint16Array(w * h);
+    const dispS = new Uint32Array(w * h);
+    const dispL = new Uint32Array(w * h);
+    resolveFrame(src, dS, dispS, w, h, strict);
+    resolveFrame(src, dL, dispL, w, h, legacy);
+    let differ = 0;
+    for (let i = 0; i < w * h; i++) if (dispS[i] !== dispL[i]) differ++;
+    expect(differ).toBeGreaterThan(w * h * 0.5); // placement moves most pixels
+  });
+  it('strict postfilter-off == linear pack -> expand -> display gamma', () => {
+    const src = rampSrc();
+    const st = { ...defaultVoodooState(), reconmode: '4x4sub+4x1' as const, gamma: 1.3, dither: true, dithermode: '2x2' as const, postfilter: false };
+    const dst565 = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h).fill(0xdeadbeef);
+    resolveFrame(src, dst565, display, w, h, st);
+    const ref565 = new Uint16Array(w * h);
+    resolveRGB565(src, ref565, w, h, { gamma: 1, dither: true, ditherMode: '2x2', quantise: true });
+    expect(dst565).toEqual(ref565);
+    const refDisplay = new Uint32Array(w * h);
+    for (let i = 0; i < w * h; i++) refDisplay[i] = expandRGB565(ref565[i]!);
+    applyDisplayGamma(refDisplay, w, h, 1.3);
+    expect(display).toEqual(refDisplay);
+    for (let i = 0; i < w * h; i++) expect(display[i]).not.toBe(0xdeadbeef);
+  });
+  it('legacy order pinned byte-exact: gamma-on-source pack -> unconditional box', () => {
+    const src = rampSrc();
+    const st = { ...defaultVoodooState(), reconmode: 'legacy' as const, gamma: 1.3, dither: true, dithermode: '4x4' as const, postfilter: true };
+    const dst565 = new Uint16Array(w * h);
+    const display = new Uint32Array(w * h);
+    resolveFrame(src, dst565, display, w, h, st);
+    const ref565 = new Uint16Array(w * h);
+    resolveRGB565(src, ref565, w, h, { gamma: 1.3, dither: true, ditherMode: '4x4', quantise: true });
+    const refDisplay = new Uint32Array(w * h);
+    applyPostFilter(ref565, refDisplay, w, h);
+    expect(dst565).toEqual(ref565);
+    expect(display).toEqual(refDisplay);
   });
 });
 

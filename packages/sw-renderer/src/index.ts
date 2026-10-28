@@ -16,6 +16,7 @@ export {
   buildTurbTable, spanListView,
   rgbMipLevel, rgbPickMipLevel, rgbSampleTexture, rgbSampleLightmap,
   rgbModulate, expandPaletteRGB, buildRGBMaterial,
+  quantiseIz, quantiseIzInt,
   rgbWrapCoord, rgbBlendPixel,
   runSubdivRGBRepeat, runSubdivRGBClamp, runSubdivRGBGeneric, runSpanFlatRGB,
   drawSpansRGB, RGBWorldBackend,
@@ -124,6 +125,8 @@ export {
 export {
   SoftwareRenderer, sortBatchByRow, nextPot, MAX_SPANS,
   setRGBWorldEnabled, isRGBWorldEnabled,
+  readRGBFidelity, sameRGBFidelity,
+  type RGBFidelity,
 } from './frame.js';
 export {
   createFramePhases, phaseNow,

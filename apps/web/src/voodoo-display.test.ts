@@ -181,7 +181,7 @@ describe('voodoo display freshness (postfilter-off stale guard)', () => {
     }
   });
 
-  it('brightness lift still applies in voodoo mode without touching the engine buffer', () => {
+  it('brightness lift applies in LEGACY voodoo mode; strict voodoo skips it (vd_gamma is the gamma stage)', () => {
     voodooSandbox();
     const boot = bootPlay({ width: W, height: H });
     setCVar('vd_gamma', 1.0);
@@ -191,6 +191,8 @@ describe('voodoo display freshness (postfilter-off stale guard)', () => {
     paintLive(boot, 0xff404040);
     const live = boot.refresh.getFramebuffer().color;
 
+    // LEGACY branch keeps the post-scanout lift.
+    boot.strictVoodoo = false;
     setCVar('r_brightness', 1.0);
     const plain = resolveDisplay(boot).slice();
     expect(meanChannels(plain).r).toBe(0x40);
@@ -206,12 +208,25 @@ describe('voodoo display freshness (postfilter-off stale guard)', () => {
     for (let i = 0; i < live.length; i++) {
       expect(live[i]).toBe(0xff404040);
     }
+
+    // STRICT branch skips the lift (effective 1.0): 2.0 resolves exactly
+    // like 1.0 because vd_gamma inside resolveFrame is the gamma stage.
+    boot.strictVoodoo = true;
+    const strictLifted = resolveDisplay(boot).slice();
+    setCVar('r_brightness', 1.0);
+    paintLive(boot, 0xff404040);
+    const strictPlain = resolveDisplay(boot);
+    expect(Array.from(strictLifted)).toEqual(Array.from(strictPlain));
   });
 });
 
 // V2d raster policy: vid_renderer drives the real backend selection.
 describe('renderer cvar policy (arm/disarm, no stale frame)', () => {
-  it('applyRendererCvar arms/disarms the RGB hook and zeroes scratch on switch', () => {
+  it('applyRendererCvar arms/disarms the RGB hook and zeroes scratch on switch (UNIT-ONLY: mocked instance hook)', () => {
+    // UNIT-ONLY contract test: injects a fake instance hook to prove the
+    // duck-call + scratch-zeroing wiring. It does NOT prove real RGB
+    // activation — see voodoo-rgb-activation.test.ts (real SoftwareRenderer,
+    // no mocks) for the integration proof.
     voodooSandbox();
     const boot = bootPlay({ width: W, height: H });
     // Feature-detected hook (assumed name; see armRasterPolicy): the
@@ -224,6 +239,8 @@ describe('renderer cvar policy (arm/disarm, no stale frame)', () => {
     expect(applyRendererCvar(boot)).toBe('voodoo');
     expect(boot.renderer).toBe('voodoo');
     expect(calls).toEqual([true]);
+    // armRasterPolicy reports success and records the outcome for tests.
+    expect(boot.lastRasterPolicy).toEqual({ mode: 'voodoo', rgbEnabled: true, hooked: true });
 
     // Dirty the shell scratch, then switch away: zeroed immediately so the
     // next frame can never show previous-mode pixels.
@@ -234,6 +251,34 @@ describe('renderer cvar policy (arm/disarm, no stale frame)', () => {
     expect(calls).toEqual([true, false]);
     expect(boot.display.every((v) => v === 0)).toBe(true);
     expect(boot.fb565.every((v) => v === 0)).toBe(true);
+    expect(boot.lastRasterPolicy).toEqual({ mode: 'software', rgbEnabled: false, hooked: true });
+  });
+
+  it('missing hook fails LOUDLY: returns false, records hooked:false, warns', () => {
+    // The real SoftwareRenderer now ships the instance hook, so arm against
+    // the real boot succeeds. Loud-failure is covered with a hookless stub.
+    voodooSandbox();
+    const boot = bootPlay({ width: W, height: H });
+    setCVar('vid_renderer', 'voodoo');
+    expect(armRasterPolicy(boot)).toBe(true);
+    expect(boot.lastRasterPolicy).toEqual({ mode: 'voodoo', rgbEnabled: true, hooked: true });
+    const warned: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(' '));
+    };
+    try {
+      const stub = { display: boot.display, fb565: boot.fb565, renderer: 'voodoo', refresh: {} };
+      expect(armRasterPolicy(stub as never)).toBe(false);
+      expect((stub as { lastRasterPolicy?: unknown }).lastRasterPolicy).toEqual({ mode: 'voodoo', rgbEnabled: true, hooked: false });
+      expect(warned.length).toBeGreaterThan(0);
+      expect(warned.join('\n')).toContain('setRGBWorldEnabled');
+      setCVar('vid_renderer', 'software');
+      expect(applyRendererCvar(boot)).toBe('software');
+      expect(boot.lastRasterPolicy).toEqual({ mode: 'software', rgbEnabled: false, hooked: true });
+    } finally {
+      console.warn = origWarn;
+    }
   });
 
   it('applyRendererCvar is a no-op without hooks (future-agent-absent fallback)', () => {

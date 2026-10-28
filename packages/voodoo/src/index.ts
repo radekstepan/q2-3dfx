@@ -17,7 +17,7 @@ export * from './resolve.js';
 export * from './sampler.js';
 export * from './upload.js';
 
-import { applyPostFilter, applyReconstruction2x2, applyReconstruction4x1, expandRGB565, parseDitherMode, parseReconMode, parseRgbMaxDelta, quantiseDepth, resolveRGB565, resolveRGB888 } from './resolve.js';
+import { applyDisplayGamma, applyPostFilter, applyReconstruction2x2, applyReconstruction4x1, expandRGB565, parseDitherMode, parseReconMode, parseRgbMaxDelta, quantiseDepth, resolveRGB565, resolveRGB888 } from './resolve.js';
 import { applyFog, capTextureSize, modulateLightmap, samplePalette, sampleRGBTexture } from './sampler.js';
 import type { DitherMode, ReconMode, RgbMaxDelta } from './resolve.js';
 
@@ -86,21 +86,30 @@ export function readVoodooState(): VoodooState {
 }
 
 /**
- * Full M4.1 frame resolve: gamma -> dither -> RGB565, then the scanout
- * reconstruction into display (when enabled and provided). Zero-alloc inner
- * loops; pass display = null to skip the postfilter stage.
+ * Full M4.1 frame resolve. Two orderings (see resolve.ts header):
+ * - 'legacy' reconmode (DEFAULT): gamma LUT on the 8:8:8 source -> dither
+ *   -> RGB565, then scanout into display. Bit-exact M4.1 path.
+ * - strict (non-legacy reconmode): LINEAR dither+quant (gamma 1) -> matched
+ *   reconstruction -> display gamma LUT on the display plane (guide §7.2
+ *   order). Postfilter-off strict packs linear, expands, then gamma-corrects
+ *   the display (direct-view strict path).
+ * Zero-alloc inner loops; pass display = null to skip the display plane
+ * (strict then leaves a linear-transfer 565 target — display gamma is a
+ * scanout-stage operation and is dropped with the display plane).
  *
  * Display contract (astra §2.1/§2.2):
- * - quantise on, postfilter on: display = scanout reconstruction of the 565
- *   target per st.reconmode ('legacy' = unconditional 2x2 box, the M4.1
- *   approximation; '2x2sub+2x2box' / '4x4sub+4x1' = dither-subtract + box
- *   with rgbMaxDelta edge rejection — deterministic approximations).
- * - quantise on, postfilter off: display = per-pixel expandRGB565 of the
- *   freshly packed target (NEVER stale — every pixel is rewritten).
+ * - legacy, quantise on, postfilter on: display = unconditional 2x2 box of
+ *   the 565 target (the M4.1 approximation).
+ * - legacy, quantise on, postfilter off: display = per-pixel expandRGB565
+ *   of the freshly packed target (NEVER stale — every pixel rewritten).
+ * - strict, quantise on: display = matched reconstruction
+ *   ('2x2sub+2x2box' / '4x4sub+4x1', subtract matrix forced by the MODE —
+ *   see matched-reconforcement comment below) or per-pixel expand when the
+ *   postfilter is off, then display gamma via applyDisplayGamma.
  * - quantise off (vd_16bit=0 debug bypass): display = resolveRGB888
- *   output (gamma on, dither/postfilter bypassed); dst565 is still packed
- *   via resolveRGB565 for compat readers. Pass display = null to skip the
- *   display plane entirely.
+ *   output (gamma on source, dither/postfilter bypassed); dst565 is still
+ *   packed via resolveRGB565 for compat readers. Pass display = null to
+ *   skip the display plane entirely.
  */
 export function resolveFrame(
   src: Uint32Array,
@@ -111,31 +120,47 @@ export function resolveFrame(
   st: VoodooState = readVoodooState(),
 ): void {
   if (!st.quantise) {
-    // Genuine RGB888 debug bypass: gamma stays on, dither/postfilter off.
+    // Genuine RGB888 debug bypass: gamma stays on source, dither/postfilter off.
     resolveRGB565(src, dst565, w, h, { gamma: st.gamma, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
     if (display !== null) resolveRGB888(src, display, w, h, { gamma: st.gamma, dither: false });
     return;
   }
-  resolveRGB565(src, dst565, w, h, { gamma: st.gamma, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
+  if (st.reconmode === 'legacy') {
+    // LEGACY BIT-EXACT PATH: gamma LUT on source -> dither -> 565 -> box/expand.
+    // Do not touch: every golden pins these exact bytes.
+    resolveRGB565(src, dst565, w, h, { gamma: st.gamma, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
+    if (display === null) return;
+    if (!st.postfilter) {
+      // Postfilter off: expand every newly packed pixel — no stale pixels.
+      const n = w * h;
+      for (let i = 0; i < n; i++) display[i] = expandRGB565(dst565[i]!);
+      return;
+    }
+    applyPostFilter(dst565, display, w, h);
+    return;
+  }
+  // STRICT PATH (guide §7.2): linear dither+quant, reconstruct, display gamma.
+  resolveRGB565(src, dst565, w, h, { gamma: 1, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
   if (display === null) return;
+  // MATCHED RECON ENFORCEMENT: the subtract matrix is forced by the recon
+  // MODE, never by st.dithermode (the write matrix). A mismatch — e.g.
+  // dithermode '2x2' writes under '4x4sub+4x1' scanout — still subtracts the
+  // mode's pattern ('4x4' here): the scanout filter is programmed for the
+  // mode's pattern regardless of the write matrix, so the mismatch is
+  // tolerated deterministically, not an error. vd_dither=0 means no pattern
+  // was added, so subtract is null (subtracting one would corrupt).
   if (!st.postfilter) {
-    // Postfilter off: expand every newly packed pixel — no stale pixels.
+    // Direct-view strict path: linear pack -> expand -> display gamma.
     const n = w * h;
     for (let i = 0; i < n; i++) display[i] = expandRGB565(dst565[i]!);
-    return;
-  }
-  // Matched scanout reconstruction. The subtract matrix is dictated by the
-  // recon MODE; a null subtract means the write path ran dither-off, so
-  // there is no pattern to remove (subtracting one would corrupt).
-  if (st.reconmode === '2x2sub+2x2box') {
+  } else if (st.reconmode === '2x2sub+2x2box') {
     applyReconstruction2x2(dst565, display, w, h, st.rgbmaxdelta, st.dither ? '2x2' : null);
-    return;
-  }
-  if (st.reconmode === '4x4sub+4x1') {
+  } else {
+    // '4x4sub+4x1' (parseReconMode falls back to 'legacy', handled above —
+    // any non-legacy value reaching here is the 4x1 mode).
     applyReconstruction4x1(dst565, display, w, h, st.rgbmaxdelta, st.dither ? '4x4' : null);
-    return;
   }
-  applyPostFilter(dst565, display, w, h);
+  applyDisplayGamma(display, w, h, st.gamma);
 }
 
 /**

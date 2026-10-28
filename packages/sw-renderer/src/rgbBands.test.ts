@@ -121,7 +121,9 @@ describe('banded vs serial RGB equivalence (dither phase + seam rows)', () => {
     const a = renderRGBSerial(160, 120);
     expect(a.used).toBe(true);
     expect(a.cover).toBe(160 * 120);
-    expect(a.colorHash).toBe('8372b322');
+    // M4.1 re-pin (was 8372b322): see rgbPerf.test.ts — the seed no longer
+    // clobbers world RGB pixels, so the world pass displays.
+    expect(a.colorHash).toBe('3534624e');
     expect(a.indexHash).toBe('58e0ecf1');
   });
 

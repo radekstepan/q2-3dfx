@@ -835,6 +835,25 @@ export interface RGBMaterial {
   /** Per-pixel Bayer choice between level n / n+1 (single-TMU trilinear). */
   mipDither: boolean;
   /**
+   * Texture magnification/minification filter (vd_bilinear policy). True
+   * (default) = bilinear 4-tap blend; false = nearest point sample (the
+   * single centre tap, weights 1/0/0/0). The opacity-mask hole test and the
+   * lightmap bilinear tap are unaffected (the lightmap has no nearest mode).
+   */
+  bilinear: boolean;
+  /**
+   * Depth precision in bits at test/write (vd_zbits policy, 0 = off =
+   * legacy raw 1/z compare). When 1..23 the span loops quantise 1/z to
+   * that many steps before the test and store the quantised value, so
+   * coplanar-ish fragments tie exactly like a fixed-point Z buffer.
+   * APPROXIMATION (voodoo guide §4): true hardware quantises NORMALIZED
+   * window-Z derived from the projection near/far planes (see
+   * quantiseDepthBeforeTest in @q2/voodoo); the rasteriser has no near/far
+   * plane at span time, so 1/z itself is quantised — same tie behaviour,
+   * different mapping. The software path never reads this field.
+   */
+  zbits: number;
+  /**
    * Blend policy for this material. 'opaque' replaces the plane pixel;
    * 'alpha' blends with `alpha` (0..1, clamped; TRANS span kinds override
    * with their 33/66 ratio); 'additive' adds and clamps. Depth-test always
@@ -910,6 +929,37 @@ export function rgbPickMipLevel(
     level = f * 16 <= RGB_BAYER4[(by << 2) | bx]! ? n : n + 1;
   }
   return level > maxLevel ? maxLevel : level;
+}
+
+/**
+ * Quantise stored 1/z depth to `bits` bits BEFORE the depth test/write
+ * (vd_zbits policy; mirrors voodoo quantiseDepthBeforeTest but WITHOUT the
+ * near/far window-Z mapping — see RGBMaterial.zbits for why the rasteriser
+ * quantises raw 1/z instead). Returns Math.round(iz * scale) / scale with
+ * scale = 2^bits - 1, clamped to [0, 1]; bits outside 1..23 (0 = off,
+ * >= 24 = Float32-exact) returns iz unchanged. Pure, no allocation.
+ */
+export function quantiseIz(iz: number, bits: number): number {
+  if (!Number.isInteger(bits) || bits < 1 || bits > 23) return iz;
+  const scale = (1 << bits) - 1;
+  // No upper clamp: raw 1/z is unbounded above (near geometry has iz > 1
+  // and must keep ordering); only the step size is quantised. NaN stays
+  // NaN and loses every strict-greater test, exactly like the legacy path.
+  return Math.round(iz * scale) / scale;
+}
+
+/**
+ * Integer quantised 1/z for the optional Uint16 authority plane (same
+ * mapping as quantiseIz, unscaled): round(iz * (2^bits-1)) clamped to
+ * [0, 2^bits-1]. Non-finite/negative iz clamps to 0; bits outside 1..23
+ * returns 0 (caller treats the int plane as detached — float path only).
+ */
+export function quantiseIzInt(iz: number, bits: number): number {
+  if (!Number.isInteger(bits) || bits < 1 || bits > 23) return 0;
+  const scale = (1 << bits) - 1;
+  const q = Math.round(iz * scale);
+  if (!(q >= 0)) return 0;
+  return q > scale ? scale : q;
 }
 
 /**
@@ -1092,6 +1142,7 @@ export function buildRGBMaterial(
   opts?: {
     addressS?: RGBAddressMode; addressT?: RGBAddressMode;
     overbright?: boolean; lodBias?: number; mipDither?: boolean;
+    bilinear?: boolean; zbits?: number;
     blend?: RGBBlend; alphaTest?: number | null; depthWrite?: boolean;
     alpha?: number; warp?: boolean; turbPhase?: number;
     flatColor?: Uint8Array | null; opaqueMask?: boolean;
@@ -1123,6 +1174,8 @@ export function buildRGBMaterial(
   }
   const alphaRaw = opts?.alpha ?? 1;
   const alpha = Number.isFinite(alphaRaw) ? (alphaRaw < 0 ? 0 : alphaRaw > 1 ? 1 : alphaRaw) : 1;
+  const zraw = opts?.zbits ?? 0;
+  const zbits = Number.isInteger(zraw) && zraw >= 1 && zraw <= 23 ? zraw : 0;
   return {
     levels,
     addressS: opts?.addressS ?? 'repeat',
@@ -1131,6 +1184,8 @@ export function buildRGBMaterial(
     overbright: opts?.overbright ?? true,
     lodBias: opts?.lodBias ?? -0.35,
     mipDither: opts?.mipDither ?? true,
+    bilinear: opts?.bilinear ?? true,
+    zbits,
     blend: opts?.blend ?? 'opaque',
     alphaTest: opts?.alphaTest ?? null,
     depthWrite: opts?.depthWrite ?? true,
@@ -1155,7 +1210,7 @@ export function buildRGBMaterial(
 //   on an exact dyadic), and `(x0+1)` needs no modulo once wrapped.
 // - Level pick: spanLod is constant per span, so the Bayer compare threshold
 //   `f*16` is hoisted; the non-dither pick is loop-invariant.
-// Perf-2 (same file, same guarantee — frame hash `8372b322` pinned in
+// Perf-2 (same file, same guarantee — frame hash `3534624e` pinned in
 // rgbPerf.test.ts): lightmap v-side state hoisted per subdiv call (lv is
 // span-constant: clamp/row/fraction/row-base computed once, not per pixel),
 // Bayer row offset folded to `bOff` (one shift per call, not per pixel),
@@ -1218,11 +1273,18 @@ export function runSubdivRGBRepeat(
   mat: RGBMaterial,
   spanLod: number,
   maxLevel: number,
+  qzb?: Uint16Array | null,
 ): { iz: number; lux: number; u1: number; v1: number } {
   const levels = mat.levels;
   const lb = mat.light;
   const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
+  const bilinear = mat.bilinear !== false;
+  // Depth quantisation (vd_zbits): inactive (0) keeps the legacy raw-1/z
+  // path bit-identical; active quantises before test/write (see RGBMaterial).
+  const zbw = mat.zbits;
+  const qScale = Number.isInteger(zbw) && zbw >= 1 && zbw <= 23 ? (1 << zbw) - 1 : 0;
+  const qInv = qScale > 0 ? 1 / qScale : 0;
   const z1 = 1 / (iz + diz * n);
   const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
   let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
@@ -1267,7 +1329,12 @@ export function runSubdivRGBRepeat(
   let lux = lux0;
   if (fixedLevel) {
     for (let i = 0, o = o0; i < n; i++, o++) {
-      if (iz > zb[o]!) {
+      // Depth test: legacy raw-1/z compare, or quantised-before-test when
+      // vd_zbits is active (qzb int plane when attached, else float
+      // round-trip on the shared plane — same winning fragment either way).
+      const qn = qScale === 0 ? 0 : quantiseIzInt(iz, zbw);
+      const qo = qScale === 0 ? 0 : (qzb ? qzb[o]! : quantiseIzInt(zb[o]!, zbw));
+      if (qScale === 0 ? iz > zb[o]! : qn > qo) {
         const xi = tu >> 16, yi = tv >> 16;
         // Inlined rgbWrapInt (same integer ops, no call): the POT lane is
         // call-constant, so the branch predicts perfectly.
@@ -1286,13 +1353,21 @@ export function runSubdivRGBRepeat(
           const pb = (row0 + x1) * 3;
           const pc = (row1 + mx) * 3;
           const pd = (row1 + x1) * 3;
-          const w00 = (256 - fu) * (256 - fv);
-          const w10 = fu * (256 - fv);
-          const w01 = (256 - fu) * fv;
-          const w11 = fu * fv;
-          let r = (w00 * d0[pa]! + w10 * d0[pb]! + w01 * d0[pc]! + w11 * d0[pd]! + 32768) >> 16;
-          let g = (w00 * d0[pa + 1]! + w10 * d0[pb + 1]! + w01 * d0[pc + 1]! + w11 * d0[pd + 1]! + 32768) >> 16;
-          let b = (w00 * d0[pa + 2]! + w10 * d0[pb + 2]! + w01 * d0[pc + 2]! + w11 * d0[pd + 2]! + 32768) >> 16;
+          let r: number, g: number, b: number;
+          if (!bilinear) {
+            // vd_bilinear=0 point sample: the centre texel only (the
+            // opacity-mask hole test above still applies; the lightmap tap
+            // below stays bilinear — it has no nearest mode).
+            r = d0[pa]!; g = d0[pa + 1]!; b = d0[pa + 2]!;
+          } else {
+            const w00 = (256 - fu) * (256 - fv);
+            const w10 = fu * (256 - fv);
+            const w01 = (256 - fu) * fv;
+            const w11 = fu * fv;
+            r = (w00 * d0[pa]! + w10 * d0[pb]! + w01 * d0[pc]! + w11 * d0[pd]! + 32768) >> 16;
+            g = (w00 * d0[pa + 1]! + w10 * d0[pb + 1]! + w01 * d0[pc + 1]! + w11 * d0[pd + 1]! + 32768) >> 16;
+            b = (w00 * d0[pa + 2]! + w10 * d0[pb + 2]! + w01 * d0[pc + 2]! + w11 * d0[pd + 2]! + 32768) >> 16;
+          }
           if (lbS) {
             const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
             const lx0 = luc | 0;
@@ -1317,7 +1392,14 @@ export function runSubdivRGBRepeat(
             g = g > 255 ? 255 : g;
             b = b > 255 ? 255 : b;
           }
-          zb[o] = iz;
+          // Depth write mirrors the test above: quantised value to the int
+          // plane (when attached) and its float round-trip to the shared
+          // plane, so later tests see the same steps either way.
+          if (qScale === 0) zb[o] = iz;
+          else {
+            if (qzb) qzb[o] = qn;
+            zb[o] = qn * qInv;
+          }
           color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
           cover[o] = 1;
         }
@@ -1327,7 +1409,12 @@ export function runSubdivRGBRepeat(
     return { iz, lux, u1, v1 };
   }
   for (let i = 0, o = o0; i < n; i++, o++) {
-    if (iz > zb[o]!) {
+    // Depth test: legacy raw-1/z compare, or quantised-before-test when
+    // vd_zbits is active (qzb int plane when attached, else float
+    // round-trip on the shared plane — same winning fragment either way).
+    const qn = qScale === 0 ? 0 : quantiseIzInt(iz, zbw);
+    const qo = qScale === 0 ? 0 : (qzb ? qzb[o]! : quantiseIzInt(zb[o]!, zbw));
+    if (qScale === 0 ? iz > zb[o]! : qn > qo) {
       // Single-TMU dither pick between the two hoisted descriptors.
       const use1 = f16 <= RGB_BAYER4[bOff | ((xAbs + i) & 3)]! ? 0 : 1;
       const dd = use1 === 0 ? d0 : d1;
@@ -1354,13 +1441,19 @@ export function runSubdivRGBRepeat(
         const pb = (row0 + x1) * 3;
         const pc = (row1 + mx) * 3;
         const pd = (row1 + x1) * 3;
-        const w00 = (256 - fu) * (256 - fv);
-        const w10 = fu * (256 - fv);
-        const w01 = (256 - fu) * fv;
-        const w11 = fu * fv;
-        let r = (w00 * dd[pa]! + w10 * dd[pb]! + w01 * dd[pc]! + w11 * dd[pd]! + 32768) >> 16;
-        let g = (w00 * dd[pa + 1]! + w10 * dd[pb + 1]! + w01 * dd[pc + 1]! + w11 * dd[pd + 1]! + 32768) >> 16;
-        let b = (w00 * dd[pa + 2]! + w10 * dd[pb + 2]! + w01 * dd[pc + 2]! + w11 * dd[pd + 2]! + 32768) >> 16;
+        let r: number, g: number, b: number;
+        if (!bilinear) {
+          // vd_bilinear=0 point sample (see the fixed-level loop above).
+          r = dd[pa]!; g = dd[pa + 1]!; b = dd[pa + 2]!;
+        } else {
+          const w00 = (256 - fu) * (256 - fv);
+          const w10 = fu * (256 - fv);
+          const w01 = (256 - fu) * fv;
+          const w11 = fu * fv;
+          r = (w00 * dd[pa]! + w10 * dd[pb]! + w01 * dd[pc]! + w11 * dd[pd]! + 32768) >> 16;
+          g = (w00 * dd[pa + 1]! + w10 * dd[pb + 1]! + w01 * dd[pc + 1]! + w11 * dd[pd + 1]! + 32768) >> 16;
+          b = (w00 * dd[pa + 2]! + w10 * dd[pb + 2]! + w01 * dd[pc + 2]! + w11 * dd[pd + 2]! + 32768) >> 16;
+        }
         if (lbS) {
           const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
           const lx0 = luc | 0;
@@ -1385,7 +1478,14 @@ export function runSubdivRGBRepeat(
           g = g > 255 ? 255 : g;
           b = b > 255 ? 255 : b;
         }
-        zb[o] = iz;
+        // Depth write mirrors the test above: quantised value to the int
+        // plane (when attached) and its float round-trip to the shared
+        // plane, so later tests see the same steps either way.
+        if (qScale === 0) zb[o] = iz;
+        else {
+          if (qzb) qzb[o] = qn;
+          zb[o] = qn * qInv;
+        }
         color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
         cover[o] = 1;
       }
@@ -1422,11 +1522,18 @@ export function runSubdivRGBClamp(
   mat: RGBMaterial,
   spanLod: number,
   maxLevel: number,
+  qzb?: Uint16Array | null,
 ): { iz: number; lux: number; u1: number; v1: number } {
   const levels = mat.levels;
   const lb = mat.light;
   const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
+  const bilinear = mat.bilinear !== false;
+  // Depth quantisation (vd_zbits): inactive (0) keeps the legacy raw-1/z
+  // path bit-identical; active quantises before test/write (see RGBMaterial).
+  const zbw = mat.zbits;
+  const qScale = Number.isInteger(zbw) && zbw >= 1 && zbw <= 23 ? (1 << zbw) - 1 : 0;
+  const qInv = qScale > 0 ? 1 / qScale : 0;
   const z1 = 1 / (iz + diz * n);
   const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
   let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
@@ -1461,7 +1568,12 @@ export function runSubdivRGBClamp(
   const bOff = (((yAbs | 0) & 3) << 2);
   let lux = lux0;
   for (let i = 0, o = o0; i < n; i++, o++) {
-    if (iz > zb[o]!) {
+    // Depth test: legacy raw-1/z compare, or quantised-before-test when
+    // vd_zbits is active (qzb int plane when attached, else float
+    // round-trip on the shared plane — same winning fragment either way).
+    const qn = qScale === 0 ? 0 : quantiseIzInt(iz, zbw);
+    const qo = qScale === 0 ? 0 : (qzb ? qzb[o]! : quantiseIzInt(zb[o]!, zbw));
+    if (qScale === 0 ? iz > zb[o]! : qn > qo) {
       // Per-pixel dither pick between the two span-constant levels (the
       // fixed-level case always selects base: same value rgbPickMipLevel
       // returns, without the per-pixel call).
@@ -1485,13 +1597,19 @@ export function runSubdivRGBClamp(
         const pb = (row0 + x1) * 3;
         const pc = (row1 + mx) * 3;
         const pd = (row1 + x1) * 3;
-        const w00 = (256 - fu) * (256 - fv);
-        const w10 = fu * (256 - fv);
-        const w01 = (256 - fu) * fv;
-        const w11 = fu * fv;
-        let r = (w00 * td[pa]! + w10 * td[pb]! + w01 * td[pc]! + w11 * td[pd]! + 32768) >> 16;
-        let g = (w00 * td[pa + 1]! + w10 * td[pb + 1]! + w01 * td[pc + 1]! + w11 * td[pd + 1]! + 32768) >> 16;
-        let b = (w00 * td[pa + 2]! + w10 * td[pb + 2]! + w01 * td[pc + 2]! + w11 * td[pd + 2]! + 32768) >> 16;
+        let r: number, g: number, b: number;
+        if (!bilinear) {
+          // vd_bilinear=0 point sample (see the repeat loop above).
+          r = td[pa]!; g = td[pa + 1]!; b = td[pa + 2]!;
+        } else {
+          const w00 = (256 - fu) * (256 - fv);
+          const w10 = fu * (256 - fv);
+          const w01 = (256 - fu) * fv;
+          const w11 = fu * fv;
+          r = (w00 * td[pa]! + w10 * td[pb]! + w01 * td[pc]! + w11 * td[pd]! + 32768) >> 16;
+          g = (w00 * td[pa + 1]! + w10 * td[pb + 1]! + w01 * td[pc + 1]! + w11 * td[pd + 1]! + 32768) >> 16;
+          b = (w00 * td[pa + 2]! + w10 * td[pb + 2]! + w01 * td[pc + 2]! + w11 * td[pd + 2]! + 32768) >> 16;
+        }
         if (lbS) {
           const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
           const lx0 = luc | 0;
@@ -1516,7 +1634,14 @@ export function runSubdivRGBClamp(
           g = g > 255 ? 255 : g;
           b = b > 255 ? 255 : b;
         }
-        zb[o] = iz;
+        // Depth write mirrors the test above: quantised value to the int
+        // plane (when attached) and its float round-trip to the shared
+        // plane, so later tests see the same steps either way.
+        if (qScale === 0) zb[o] = iz;
+        else {
+          if (qzb) qzb[o] = qn;
+          zb[o] = qn * qInv;
+        }
         color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
         cover[o] = 1;
       }
@@ -1612,11 +1737,18 @@ export function runSubdivRGBGeneric(
   alphaQ: number,
   turbTable: Uint8Array | null,
   turbPhase: number,
+  qzb?: Uint16Array | null,
 ): { iz: number; lux: number; u1: number; v1: number } {
   const levels = mat.levels;
   const lb = mat.light;
   const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
+  const bilinear = mat.bilinear !== false;
+  // Depth quantisation (vd_zbits): inactive (0) keeps the legacy raw-1/z
+  // path bit-identical; active quantises before test/write (see RGBMaterial).
+  const zbw = mat.zbits;
+  const qScale = Number.isInteger(zbw) && zbw >= 1 && zbw <= 23 ? (1 << zbw) - 1 : 0;
+  const qInv = qScale > 0 ? 1 / qScale : 0;
   const wrapS = mat.addressS === 'repeat';
   const wrapT = mat.addressT === 'repeat';
   const writeDepth = blend === 'opaque' ? mat.depthWrite : false;
@@ -1663,7 +1795,12 @@ export function runSubdivRGBGeneric(
   const bOff = (((yAbs | 0) & 3) << 2);
   let lux = lux0;
   for (let i = 0, o = o0; i < n; i++, o++) {
-    if (iz > zb[o]!) {
+    // Depth test: legacy raw-1/z compare, or quantised-before-test when
+    // vd_zbits is active (qzb int plane when attached, else float
+    // round-trip on the shared plane — same winning fragment either way).
+    const qn = qScale === 0 ? 0 : quantiseIzInt(iz, zbw);
+    const qo = qScale === 0 ? 0 : (qzb ? qzb[o]! : quantiseIzInt(zb[o]!, zbw));
+    if (qScale === 0 ? iz > zb[o]! : qn > qo) {
       let fu = tu, fv = tv;
       if (turbTable) {
         const wu = (tu + (turbTable[((tv >> 16) + turbPhase) & tmask]! << 16)) >> 16;
@@ -1708,13 +1845,19 @@ export function runSubdivRGBGeneric(
         const pb = (row0 + x1) * 3;
         const pc = (row1 + mx) * 3;
         const pd = (row1 + x1) * 3;
-        const w00 = (256 - qfu) * (256 - qfv);
-        const w10 = qfu * (256 - qfv);
-        const w01 = (256 - qfu) * qfv;
-        const w11 = qfu * qfv;
-        let r = (w00 * dd[pa]! + w10 * dd[pb]! + w01 * dd[pc]! + w11 * dd[pd]! + 32768) >> 16;
-        let g = (w00 * dd[pa + 1]! + w10 * dd[pb + 1]! + w01 * dd[pc + 1]! + w11 * dd[pd + 1]! + 32768) >> 16;
-        let b = (w00 * dd[pa + 2]! + w10 * dd[pb + 2]! + w01 * dd[pc + 2]! + w11 * dd[pd + 2]! + 32768) >> 16;
+        let r: number, g: number, b: number;
+        if (!bilinear) {
+          // vd_bilinear=0 point sample (see the repeat loop above).
+          r = dd[pa]!; g = dd[pa + 1]!; b = dd[pa + 2]!;
+        } else {
+          const w00 = (256 - qfu) * (256 - qfv);
+          const w10 = qfu * (256 - qfv);
+          const w01 = (256 - qfu) * qfv;
+          const w11 = qfu * qfv;
+          r = (w00 * dd[pa]! + w10 * dd[pb]! + w01 * dd[pc]! + w11 * dd[pd]! + 32768) >> 16;
+          g = (w00 * dd[pa + 1]! + w10 * dd[pb + 1]! + w01 * dd[pc + 1]! + w11 * dd[pd + 1]! + 32768) >> 16;
+          b = (w00 * dd[pa + 2]! + w10 * dd[pb + 2]! + w01 * dd[pc + 2]! + w11 * dd[pd + 2]! + 32768) >> 16;
+        }
         if (lbS) {
           const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
           const lx0 = luc | 0;
@@ -1739,7 +1882,13 @@ export function runSubdivRGBGeneric(
           g = g > 255 ? 255 : g;
           b = b > 255 ? 255 : b;
         }
-        if (writeDepth) zb[o] = iz;
+        if (writeDepth) {
+          if (qScale === 0) zb[o] = iz;
+          else {
+            if (qzb) qzb[o] = qn;
+            zb[o] = qn * qInv;
+          }
+        }
         rgbBlendPixel(color, o, r, g, b, blend, alphaQ);
         cover[o] = 1;
       }
@@ -1749,7 +1898,9 @@ export function runSubdivRGBGeneric(
   return { iz, lux, u1, v1 };
 }
 
-/** Flat RGB span fill (flat sky): depth-tested solid color, no texture. */
+/** Flat RGB span fill (flat sky): depth-tested solid color, no texture.
+ * `zbits`/`qzb` apply the same vd_zbits quantised-before-test policy as the
+ * textured loops (0/legacy default keeps the raw-1/z path bit-identical). */
 export function runSpanFlatRGB(
   color: Uint32Array,
   cover: Uint8Array,
@@ -1760,11 +1911,23 @@ export function runSpanFlatRGB(
   diz: number,
   r: number, g: number, b: number,
   depthWrite: boolean,
+  qzb?: Uint16Array | null,
+  zbits = 0,
 ): number {
+  const qScale = Number.isInteger(zbits) && zbits >= 1 && zbits <= 23 ? (1 << zbits) - 1 : 0;
+  const qInv = qScale > 0 ? 1 / qScale : 0;
   let z = iz;
   for (let i = 0, o = o0; i < n; i++, o++) {
-    if (z > zb[o]!) {
-      if (depthWrite) zb[o] = z;
+    const qn = qScale === 0 ? 0 : quantiseIzInt(z, zbits);
+    const qo = qScale === 0 ? 0 : (qzb ? qzb[o]! : quantiseIzInt(zb[o]!, zbits));
+    if (qScale === 0 ? z > zb[o]! : qn > qo) {
+      if (depthWrite) {
+        if (qScale === 0) zb[o] = z;
+        else {
+          if (qzb) qzb[o] = qn;
+          zb[o] = qn * qInv;
+        }
+      }
       color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
       cover[o] = 1;
     }
@@ -1790,6 +1953,13 @@ export function runSpanFlatRGB(
  * Anything else (unknown kind, FLAT without flatColor, empty mip chain,
  * unknown blend string) is an unsupported combo and Com_Errors — never
  * silent wrong pixels. Zero allocation.
+ * `qzb` is the optional Uint16 authority depth plane (parallel to `zb`;
+ * see RGBWorldBackend): when non-null and mat.zbits is active, tests and
+ * writes go to the int plane (cleared to 0 = far, same larger-1/z-wins
+ * convention) with the float round-trip mirrored to `zb`.
+ * `dudy`/`dvdy` are the optional vertical texture gradients (du/dy, dv/dy
+ * at the span origin); omitted they default to the horizontal gradients
+ * (isotropic footprint — span records carry no vertical derivatives).
  */
 export function drawSpansRGB(
   color: Uint32Array,
@@ -1799,6 +1969,9 @@ export function drawSpansRGB(
   fbH: number,
   list: SpanList,
   mat: RGBMaterial,
+  qzb?: Uint16Array | null,
+  dudy?: number,
+  dvdy?: number,
 ): { pixels: number; spans: number } {
   const blend = mat.blend;
   if (blend !== 'opaque' && blend !== 'alpha' && blend !== 'additive') {
@@ -1834,7 +2007,8 @@ export function drawSpansRGB(
         Com_Error('error', 'drawSpansRGB: FLAT span without flatColor');
       }
       runSpanFlatRGB(color, cover, zb, s.y * fbW + x0, count,
-        s.iz + s.diz * (x0 - s.x0), s.diz, fc[0]!, fc[1]!, fc[2]!, mat.depthWrite);
+        s.iz + s.diz * (x0 - s.x0), s.diz, fc[0]!, fc[1]!, fc[2]!, mat.depthWrite,
+        qzb ?? null, mat.zbits);
       pixels += count;
       drawn++;
       continue;
@@ -1846,14 +2020,26 @@ export function drawSpansRGB(
     let vz = s.vz + s.dvz * skip;
     let lux = s.lu + s.dlu * skip;
     let u0 = uz / iz, v0 = vz / iz;
-    // Per-span LOD from the screen-space texture footprint (x-gradients;
-    // y-derivatives are ignored — serial-milestone approximation, the
-    // per-pixel Bayer dither still varies the chosen level within the row).
+    // Per-span LOD from the screen-space texture footprint (max of the
+    // horizontal and vertical gradients — the Voodoo rho). Span records
+    // carry no vertical derivatives (emitSpansForPoly packs horizontal
+    // steps only), so dudy/dvdy default to their horizontal counterparts
+    // (isotropic approximation). Explicit dudy/dvdy widen rho to the true
+    // footprint (wired for future polygon-gradient callers; unit tests pin
+    // the effect). The per-pixel Bayer dither still varies the chosen
+    // level within the row.
     const dudx = (s.duz - u0 * s.diz) / iz;
     const dvdx = (s.dvz - v0 * s.diz) / iz;
-    const aud = dudx < 0 ? -dudx : dudx;
+    const dudyV = dudy ?? dudx;
+    const dvdyV = dvdy ?? dvdx;
+    let rho = dudx < 0 ? -dudx : dudx;
     const avd = dvdx < 0 ? -dvdx : dvdx;
-    const spanLod = rgbMipLevel(aud > avd ? aud : avd, mat.lodBias, maxLevel);
+    if (avd > rho) rho = avd;
+    const audy = dudyV < 0 ? -dudyV : dudyV;
+    if (audy > rho) rho = audy;
+    const avdy = dvdyV < 0 ? -dvdyV : dvdyV;
+    if (avdy > rho) rho = avdy;
+    const spanLod = rgbMipLevel(rho, mat.lodBias, maxLevel);
     const isTrans = kind === SPAN_TRANS33 || kind === SPAN_TRANS66;
     const useWarp = kind === SPAN_TURBULENT || (isTrans && mat.warp);
     const useBlend: RGBBlend = isTrans
@@ -1874,12 +2060,12 @@ export function drawSpansRGB(
           r = runSubdivRGBRepeat(
             color, cover, zb, o, m, xRun, s.y,
             iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
-            mat, spanLod, maxLevel);
+            mat, spanLod, maxLevel, qzb ?? null);
         } else {
           r = runSubdivRGBClamp(
             color, cover, zb, o, m, xRun, s.y,
             iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
-            mat, spanLod, maxLevel);
+            mat, spanLod, maxLevel, qzb ?? null);
         }
         iz = r.iz;
         lux = r.lux;
@@ -1900,7 +2086,8 @@ export function drawSpansRGB(
           color, cover, zb, o, m, xRun, s.y,
           iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
           mat, spanLod, maxLevel, useBlend, useAlphaQ, turb,
-          turb ? (mat.turbPhase + s.turb) & (turb.length - 1) : 0);
+          turb ? (mat.turbPhase + s.turb) & (turb.length - 1) : 0,
+          qzb ?? null);
         iz = r.iz;
         lux = r.lux;
         uz += s.duz * m;
@@ -1921,13 +2108,17 @@ export function drawSpansRGB(
 /**
  * Monomorphic RGB backend: owns the RGB888 work plane + coverage mask,
  * dispatches the opaque world pass. Framebuffer.depth keeps 1/z semantics
- * (same strict-greater test as the software loop); 16-bit depth
- * quantization at test/write is deferred to step 4 (target/depth).
+ * (same strict-greater test as the software loop); the optional Uint16
+ * `qzb` plane (attached by the renderer when vd_zbits is active) is the
+ * 16-bit authority for the test/write under the same larger-1/z-wins
+ * convention (cleared to 0 = far) — the float plane mirrors its quantised
+ * values so foreground effect draws that only see `zb` stay consistent.
  */
 export class RGBWorldBackend {
   color: Uint32Array = new Uint32Array(0);
   cover: Uint8Array = new Uint8Array(0);
   zb: Float32Array = new Float32Array(0);
+  qzb: Uint16Array | null = null;
   fbW = 0;
   fbH = 0;
   spansDrawn = 0;
@@ -1935,10 +2126,12 @@ export class RGBWorldBackend {
 
   attach(
     color: Uint32Array, cover: Uint8Array, zb: Float32Array, w: number, h: number,
+    qzb?: Uint16Array | null,
   ): void {
     this.color = color;
     this.cover = cover;
     this.zb = zb;
+    this.qzb = qzb ?? null;
     this.fbW = w;
     this.fbH = h;
   }
@@ -1946,7 +2139,7 @@ export class RGBWorldBackend {
   /** Opaque RGB world pass (counts mirror SoftwareBackend accounting). */
   drawSpansRGB(list: SpanList, mat: RGBMaterial): { pixels: number; spans: number } {
     const r = drawSpansRGB(
-      this.color, this.cover, this.zb, this.fbW, this.fbH, list, mat,
+      this.color, this.cover, this.zb, this.fbW, this.fbH, list, mat, this.qzb,
     );
     this.spansDrawn += r.spans;
     this.pixelsDrawn += r.pixels;

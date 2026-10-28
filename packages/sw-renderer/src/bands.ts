@@ -1031,12 +1031,13 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
   }
 
   /**
-   * Bind the renderer's RGB overlay planes (color/cover/separate rgbZb).
+   * Bind the renderer's RGB overlay planes (color/cover/separate rgbZb +
+   * the optional 16-bit authority plane).
    * Called every enabled frame (see SoftwareRenderer.beginFrame); workers
    * never touch these planes, so no SAB staging is involved.
    */
-  attachRGB(color: Uint32Array, cover: Uint8Array, zb: Float32Array, w: number, h: number): void {
-    this.rgb.attach(color, cover, zb, w, h);
+  attachRGB(color: Uint32Array, cover: Uint8Array, zb: Float32Array, w: number, h: number, qzb?: Uint16Array | null): void {
+    this.rgb.attach(color, cover, zb, w, h, qzb ?? null);
     this.bands = splitBands(h, this.bandCount);
   }
 
