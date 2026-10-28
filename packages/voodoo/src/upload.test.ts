@@ -12,7 +12,10 @@ import {
   lodBiasCompensation,
   mipLevel,
   mipRho,
+  nextPOT,
+  padTextureToPOT,
   passesReconstructionThreshold,
+  pickMipLevel,
   quantiseDepthBeforeTest,
   resampleTexture,
   sampleBilinear,
@@ -318,5 +321,111 @@ describe('fog gate (base1 stays at zero)', () => {
     expect(fogContribution(true, 0)).toBe(0);
     expect(fogContribution(true, 200)).toBe(200);
     expect(fogContribution(true, 300)).toBe(255); // clamped
+  });
+});
+
+describe('LOD compensation applies exactly once, hardware-style path only', () => {
+  it('mipLevel(true) exceeds mipLevel(false) by precisely +0.375 (one application)', () => {
+    for (const [rho, bias] of [
+      [4, 0],
+      [2, -0.35],
+      [8, 0.5],
+      [1.5, -0.35],
+    ] as Array<[number, number]>) {
+      const off = mipLevel(rho, bias, 16, false);
+      const on = mipLevel(rho, bias, 16, true);
+      expect(off).toBeGreaterThan(0);
+      expect(on).toBeLessThan(16);
+      expect(on - off).toBeCloseTo(0.375, 12);
+    }
+  });
+  it('round-to-nearest path carries NO compensation (pure f < 0.5 rule on every pixel)', () => {
+    for (let y = 0; y < 4; y++)
+      for (let x = 0; x < 4; x++) {
+        // lod 2.375 is what the compensated path yields for rho=4: the
+        // uncompensated selector must still round it DOWN (0.375 < 0.5),
+        // proving no second +0.375 hides inside pickMipLevel.
+        expect(pickMipLevel(2.375, x, y, false)).toBe(2);
+        expect(pickMipLevel(2.374, x, y, false)).toBe(2);
+        expect(pickMipLevel(2.5, x, y, false)).toBe(3);
+        // Fraction 0 always picks n regardless of path: no path shifts integers.
+        expect(pickMipLevel(2.0, x, y, false)).toBe(2);
+        expect(pickMipLevel(2.0, x, y, true)).toBe(2);
+      }
+  });
+});
+
+describe('non-POT policy: REPEAT resamples, CLAMPED pads + UV-adjusts', () => {
+  it('nextPOT rounds up to powers of two', () => {
+    expect(nextPOT(1)).toBe(1);
+    expect(nextPOT(2)).toBe(2);
+    expect(nextPOT(3)).toBe(4);
+    expect(nextPOT(5)).toBe(8);
+    expect(nextPOT(256)).toBe(256);
+    expect(nextPOT(257)).toBe(512);
+    expect(() => nextPOT(0)).toThrow();
+  });
+  it('REPEAT policy: resampleTexture filters non-POT texels to POT + reports upscale UV', () => {
+    // 3x1 RGB row [10, 20, 30] resampled to 4x1: box filter blends (policy for
+    // repeating world textures — padding would break wrap seams).
+    const rgb = new Uint8Array([10, 10, 10, 20, 20, 20, 30, 30, 30]);
+    const r = resampleTexture(rgb, 3, 1, 4, 1);
+    expect([r.w, r.h]).toEqual([4, 1]);
+    expect(r.uvScaleS).toBeCloseTo(4 / 3, 12);
+    expect(r.uvScaleT).toBe(1);
+    expect([...r.data.slice(0, 3)]).toEqual([10, 10, 10]); // first footprint is exact
+    expect(r.data[9]).not.toBe(10); // interior taps are filtered blends, not copies
+  });
+  it('CLAMPED policy: padTextureToPOT preserves texels byte-exact + edge-replicates', () => {
+    // 3x1 RGB row [10, 20, 30] padded to 4x1: original texels untouched, pad
+    // replicates the edge (clamp semantics, no filtering blur).
+    const rgb = new Uint8Array([10, 10, 10, 20, 20, 20, 30, 30, 30]);
+    const p = padTextureToPOT(rgb, 3, 1);
+    expect([p.w, p.h]).toEqual([4, 1]);
+    expect([p.srcW, p.srcH]).toEqual([3, 1]);
+    expect(p.uvScaleS).toBeCloseTo(3 / 4, 12);
+    expect(p.uvScaleT).toBe(1);
+    expect([...p.data]).toEqual([10, 10, 10, 20, 20, 20, 30, 30, 30, 30, 30, 30]);
+  });
+  it('pads 2D to next POT on each axis with corner replication', () => {
+    // 3x5 -> 4x8; bottom-right pad corner replicates source texel (2,4).
+    const src = new Uint8Array(3 * 5 * 3);
+    for (let i = 0; i < 3 * 5; i++) {
+      src[i * 3] = i;
+      src[i * 3 + 1] = i + 100;
+      src[i * 3 + 2] = i + 200;
+    }
+    const p = padTextureToPOT(src, 3, 5);
+    expect([p.w, p.h]).toEqual([4, 8]);
+    expect(p.uvScaleS).toBeCloseTo(3 / 4, 12);
+    expect(p.uvScaleT).toBeCloseTo(5 / 8, 12);
+    const at = (x: number, y: number): Array<number> => {
+      const o = (y * p.w + x) * 3;
+      return [p.data[o]!, p.data[o + 1]!, p.data[o + 2]!];
+    };
+    expect(at(0, 0)).toEqual([0, 100, 200]); // origin preserved
+    expect(at(2, 4)).toEqual(at(3, 4)); // right pad replicates edge column
+    expect(at(2, 4)).toEqual(at(2, 7)); // bottom pad replicates edge row
+    expect(at(2, 4)).toEqual(at(3, 7)); // corner replicates corner texel
+  });
+  it('already-POT input copies with uvScale 1; indexed input pads indices incl. transparency', () => {
+    const rgb = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    const p = padTextureToPOT(rgb, 2, 2);
+    expect([p.w, p.h]).toEqual([2, 2]);
+    expect(p.uvScaleS).toBe(1);
+    expect(p.uvScaleT).toBe(1);
+    expect([...p.data]).toEqual([...rgb]);
+    expect(p.data).not.toBe(rgb); // fresh upload buffer, not aliased
+    // Indexed 3x1 [7, 255, 9]: pad replicates the edge INDEX (255 stays 255,
+    // no palette lookup, no nearest-match — transparency preserved exactly).
+    const pal = greyPalette();
+    const q = padTextureToPOT(new Uint8Array([7, 255, 9]), 3, 1, { palette: pal });
+    expect([q.w, q.h]).toEqual([4, 1]);
+    expect([...q.data]).toEqual([7, 255, 9, 9]);
+  });
+  it('validates sizes and palette', () => {
+    expect(() => padTextureToPOT(new Uint8Array(3), 2, 2)).toThrow();
+    expect(() => padTextureToPOT(new Uint8Array(12), 0, 2)).toThrow();
+    expect(() => padTextureToPOT(new Uint8Array(4), 2, 2, { palette: new Uint8Array(3) })).toThrow();
   });
 });

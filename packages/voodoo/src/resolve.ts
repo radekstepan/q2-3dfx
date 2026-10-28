@@ -89,7 +89,10 @@ export type DitherMode = '2x2' | '4x4';
 /**
  * Scanout reconstruction profile (vidProcCfg):
  * - 'legacy' (default): 4x4-dither write + unconditional 2x2 box, NO dither
- *   subtraction — the M4.1 approximation, bit-exact preserved.
+ *   subtraction — the M4.1 approximation, bit-exact preserved. Legacy stays
+ *   the DEFAULT because every existing golden/capture pins this exact path;
+ *   the subtract modes below are opt-in comparison profiles until an HW
+ *   capture establishes the MiniGL programming of fbzMode / vidProcCfg.
  * - '2x2sub+2x2box': subtract the 2x2 dither pattern, then 2x2 box with
  *   rgbMaxDelta edge rejection.
  * - '4x4sub+4x1': subtract the 4x4 dither pattern, then a horizontal 4x1 box
@@ -282,6 +285,10 @@ export function resolveRGB888(
  * expanded back to 8:8:8 (0xFFBBGGRR) for display. Dither subtract + box is
  * what melts the Bayer pattern into smooth "22-bit" output. Edge pixels
  * replicate (clamp-to-edge). Zero-alloc.
+ *
+ * TAP ALIGNMENT (provisional but deterministic): the forward [x, x+1] window
+ * origin and clamp-to-edge borders are a CHOICE — HW phase is uncalibrated.
+ * Taps use absolute screen coordinates so worker bands stay seamless.
  */
 export function applyPostFilter(src565: Uint16Array, dst32: Uint32Array, w: number, h: number): void {
   if (src565.length < w * h || dst32.length < w * h) {
@@ -416,9 +423,10 @@ export function depthTestLess(quantNew: number, quantStored: number): boolean {
 // (0 at invZ = 1/near, 1 at invZ = 1/far; clamp outside [near, far] —
 // clipped geometry never produces it). Quantizing raw 1/z WITHOUT this
 // near/far mapping is NOT either hardware operation: it is neither window-Z
-// nor 1/W. A true W-buffer would instead quantize 1/W with the Voodoo3
-// hardware encoding (nonlinear, card-specific); that encoding is NOT
-// implemented here — these helpers are Z-operation only, labeled accordingly.
+// nor 1/W. W-BUFFER NOT IMPLEMENTED: a true W-buffer would instead quantize
+// 1/W with the Voodoo3 hardware encoding (nonlinear, card-specific); that
+// encoding is NOT implemented here — these helpers are Z-operation only,
+// labeled accordingly.
 //
 // NEAR/FAR DERIVATION CONTRACT for the rasterizer: near/far come from the
 // active projection setup (the same values feeding clipping); clear value is
@@ -623,7 +631,9 @@ function expandTap565(v: number): { r: number; g: number; b: number } {
 
 /**
  * '2x2sub+2x2box': subtract the 2x2 dither pattern, then 2x2 box with edge
- * rejection. Zero-alloc inner loop; clamp-to-edge borders.
+ * rejection. Zero-alloc inner loop; clamp-to-edge borders. TAP ALIGNMENT
+ * (provisional but deterministic): forward [x, x+1] window like the legacy
+ * box; absolute screen coordinates so worker bands stay seamless.
  */
 export function applyReconstruction2x2(
   src565: Uint16Array,

@@ -12,11 +12,20 @@
 //   cap, else generate missing levels by 2x2 box filtering (completeMipChainRGB
 //   halves with halveRGB; indexed sources must be expanded first — see below).
 // - Cap each upload to vd_maxtexsize (default 256) preserving aspect ratio via
-//   capTextureSize, then REALLY resample the texels with resampleTexture (box
-//   filter). Halving keeps POT inputs POT; non-POT inputs stay non-POT — a
-//   documented approximation (real hardware wants POT). The returned uvScale
-//   maps original texel-space UVs onto the resampled image:
-//   u' = u * uvScaleS, v' = v * uvScaleT.
+//   capTextureSize, then handle power-of-two (POT) dimensions per ADDRESSING
+//   POLICY (application/driver choice, NOT hardware-mandated — real hardware
+//   wants POT; which emulation applies is chosen by the material's addressing):
+//   - REPEAT (tiled world textures): REALLY resample the texels with
+//     resampleTexture (box filter) to the capped/POT size. Padding cannot
+//     emulate repeat: a padded edge would break wrap seams. Halving keeps POT
+//     inputs POT; non-POT inputs stay non-POT until the caller resamples — a
+//     documented approximation (real hardware wants POT). The returned uvScale
+//     maps original texel-space UVs onto the resampled image:
+//     u' = u * uvScaleS, v' = v * uvScaleT.
+//   - CLAMP (lightmaps, sprites/UI): PAD to POT with padTextureToPOT (edge
+//     replication, texels preserved byte-exact, no filtering blur) + UV scale
+//     adjust (uvScaleS = srcW/padW for normalized-UV callers; texel-space
+//     callers address the original region directly, clamp pins the edge).
 // - NEVER average palette indices numerically: indexed resampling expands each
 //   tap through the palette first and filters the resulting COLORS, then maps
 //   the average back to the nearest non-transparent palette entry. Index
@@ -309,4 +318,90 @@ export function completeMipChainRGB(present: MipLevel[], wantLevels: number): Mi
     chain.push(halveRGB(last.data, last.w, last.h));
   }
   return chain;
+}
+
+// --- Non-POT padded upload (CLAMPED texture policy) ----------------------------
+//
+// CLAMPED textures (lightmaps, sprites/UI) with non-power-of-two dimensions
+// upload via PAD-TO-POT + UV SCALE ADJUST: the source texels are preserved
+// byte-exact (no filtering blur) in the top-left of a next-POT buffer, the
+// padding replicates the edge texel (clamp semantics), and normalized-UV
+// callers scale by uvScaleS/srcW (u' = u * srcW/padW) to address the padded
+// upload. Texel-space callers (this package's sampler convention) address the
+// original region directly — no scaling, clamp addressing pins the edge.
+//
+// POLICY CHOICE (application/driver, not hardware-mandated): REPEAT textures
+// use resampleTexture (true resampled texels — padding would break wrap
+// seams); CLAMPED textures use this pad helper (exact texels — resampling
+// would blur). Upload-time allocation; never called in the inner loop.
+
+/** Next power of two >= n. Throws on non-integer n < 1. */
+export function nextPOT(n: number): number {
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`[voodoo] nextPOT: n must be a positive int, got ${n}`);
+  }
+  let p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
+
+export interface PaddedTexture {
+  /** Padded upload pixels (padW*padH*bpp bytes; bpp = 1 indexed, 3 RGB). */
+  data: Uint8Array;
+  /** Padded upload dimensions (each a POT >= the matching source dimension). */
+  w: number;
+  h: number;
+  /** Source dimensions (the original region inside the padded upload). */
+  srcW: number;
+  srcH: number;
+  /**
+   * UV scale of this upload vs the source for NORMALIZED-UV callers:
+   * multiply normalized u/v (0..1 over the ORIGINAL image) by
+   * uvScaleS/uvScaleT (srcW/w, srcH/h) to sample the padded upload.
+   * Texel-space callers need no scaling (original region is at the origin).
+   */
+  uvScaleS: number;
+  uvScaleT: number;
+}
+
+/**
+ * Pad a non-POT texture to POT for CLAMPED addressing (guide §4 "Texture
+ * policy"): edge-replicate into a next-POT buffer, preserving every source
+ * texel byte-exact. RGB input (default) pads triplets; indexed input
+ * (opts.palette present) pads indices — padding replicates the EDGE index
+ * as-is, so transparentIndex texels on the border stay transparent (no
+ * filtering, no nearest-match lookup). Already-POT inputs still copy into a
+ * fresh buffer with uvScale 1. Returns the pixels plus dimensions and the
+ * normalized-UV scale (srcW/w, srcH/h).
+ */
+export function padTextureToPOT(
+  src: Uint8Array,
+  srcW: number,
+  srcH: number,
+  opts: ResampleOptions = {},
+): PaddedTexture {
+  checkDims(srcW, srcH, srcW, srcH);
+  const indexed = opts.palette !== undefined;
+  const bpp = indexed ? 1 : 3;
+  if (src.length < srcW * srcH * bpp) {
+    throw new Error(
+      `[voodoo] padTextureToPOT: src too small (${src.length} < ${srcW * srcH * bpp})`,
+    );
+  }
+  if (indexed && opts.palette!.length < 768) {
+    throw new Error(`[voodoo] padTextureToPOT: palette too small (${opts.palette!.length} < 768)`);
+  }
+  const w = nextPOT(srcW);
+  const h = nextPOT(srcH);
+  const data = new Uint8Array(w * h * bpp);
+  for (let y = 0; y < h; y++) {
+    const sy = y < srcH ? y : srcH - 1;
+    for (let x = 0; x < w; x++) {
+      const sx = x < srcW ? x : srcW - 1;
+      const s = (sy * srcW + sx) * bpp;
+      const d = (y * w + x) * bpp;
+      for (let c = 0; c < bpp; c++) data[d + c] = src[s + c]!;
+    }
+  }
+  return { data, w, h, srcW, srcH, uvScaleS: srcW / w, uvScaleT: srcH / h };
 }

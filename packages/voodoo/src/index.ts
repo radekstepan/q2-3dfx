@@ -12,6 +12,7 @@ import { getCVarNumber, getCVarString } from '@q2/config';
 
 export * from './bayer.js';
 export * from './capture.js';
+export * from './profile.js';
 export * from './resolve.js';
 export * from './sampler.js';
 export * from './upload.js';
@@ -35,7 +36,9 @@ export interface VoodooState {
   zbits: number;
   /** Write-path ordered-dither matrix (vd_dithermode read-path profile). */
   dithermode: DitherMode;
-  /** Scanout reconstruction profile (vd_reconmode read-path profile). */
+  /** Scanout reconstruction profile (vd_reconmode read-path profile). 'legacy'
+   * stays the default: it preserves the bit-exact M4.1 path all goldens pin;
+   * subtract modes are opt-in until an HW capture calibrates them. */
   reconmode: ReconMode;
   /** Per-component reconstruction rejection thresholds (vd_rgbmaxdelta). */
   rgbmaxdelta: RgbMaxDelta;
