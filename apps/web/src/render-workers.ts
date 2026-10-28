@@ -45,6 +45,7 @@ import {
   JOB_RASTER,
   JOB_RESOLVE,
   JOB_RGB,
+  JOB_SCANOUT,
   MAX_FRAME_BATCHES,
   MAX_FRAME_SPANS,
   MAX_WORKERS,
@@ -83,6 +84,7 @@ import {
   packFrameSpans,
   processFrameJob,
   processRGBFrameJob,
+  processScanoutBand,
   resolveBand,
   resolveBandFused,
   sabAvailable,
@@ -93,11 +95,13 @@ import {
   type BandViews,
   type FrameAccumViews,
   type RGBAccumViews,
+  type ScanoutBandOptions,
   type LightBlock,
   type SpanList,
   type Texture,
   type RGBMipLevel,
 } from '@q2/sw-renderer';
+export type { ScanoutBandOptions } from '@q2/sw-renderer';
 import { readVoodooState } from '@q2/voodoo';
 import type { VoodooState } from '@q2/voodoo';
 
@@ -436,6 +440,64 @@ export class BrowserBandPool implements BandDispatcher {
     };
   }
 
+  /** Live shared scanout buffers (Track A: workers write the presented frame directly). */
+  get scanoutPlanes(): { scan565: Uint16Array; scanDisplay: Uint32Array } {
+    return {
+      scan565: this.rgbViews.scan565,
+      scanDisplay: this.rgbViews.scanDisplay,
+    };
+  }
+
+  /** Sync scanout unsupported in the browser (would block): false. */
+  flushScanout(): boolean {
+    return false;
+  }
+
+  /**
+   * Parallel scanout kick (Track A, message-driven): fused pack→recon→gamma
+   * from the finished shared color plane into the shared scanout buffers.
+   * False when dead/timed out (caller runs the serial voodoo path).
+   */
+  async flushScanoutAsync(opts: ScanoutBandOptions): Promise<boolean> {
+    if (this.disposed || this.workers.length === 0) return false;
+    if (!(await this.awaitReadyAsync())) return false;
+    this.publishScanout(opts);
+    const seq = this.seq;
+    const finished = this.awaitWorkerMessages(seq, this.workers.length);
+    if (!this.kick(seq)) {
+      this.pending.delete(seq);
+      return false;
+    }
+    const mainBand = this.bands[this.bands.length - 1]!;
+    processScanoutBand(
+      this.views.fColor, this.rgbViews.scan565, this.rgbViews.scanDisplay,
+      this.fbW, this.fbH, opts, mainBand.y0, mainBand.y1,
+    );
+    return finished;
+  }
+
+  /** Publish a scanout kick (main side, pre-notify). */
+  private publishScanout(o: ScanoutBandOptions): void {
+    try {
+      Atomics.store(this.ctl, CTL_FBW, this.fbW);
+      Atomics.store(this.ctl, CTL_FBH, this.fbH);
+      Atomics.store(this.ctl, CTL_JOB, JOB_SCANOUT);
+    } catch {
+      /* ignore */
+    }
+    const k = this.rgbViews.kick;
+    k[0] = o.gamma;
+    k[1] = o.dither ? 1 : 0;
+    k[2] = o.ditherMode;
+    k[3] = o.postfilter ? 1 : 0;
+    k[4] = o.reconmode;
+    k[5] = o.maxR;
+    k[6] = o.maxG;
+    k[7] = o.maxB;
+    k[8] = o.quantise ? 1 : 0;
+    this.seq += 1;
+  }
+
   /**
    * Stage one world RGB batch into the SAB (main side). Same contract as
    * the Node pool's stageRGB (spans + persistent chain cache + luxels +
@@ -501,6 +563,12 @@ export class BrowserBandPool implements BandDispatcher {
       };
       let s = allocChain();
       if (s === undefined) {
+        // Ownership fix (Phase 0, mirrors the Node pool): staged descriptors
+        // hold slot indices into the persistent chain region. Evicting while
+        // batches are pending would reuse those slots and corrupt their
+        // bytes. Refuse to stage when pending (caller replays inline first);
+        // evict-and-retry only when nothing is pending.
+        if (this.rgbDescCount > 0) return false;
         this.clearRGBChains();
         s = allocChain();
         if (s === undefined) return false;
@@ -873,16 +941,33 @@ export class BrowserBandPool implements BandDispatcher {
 export type VoodooBandPath = 'serial' | 'worker';
 
 /**
- * Explicit voodoo path selection (V2d). Always `serial` until a
- * worker/WASM voodoo backend exists — even when a raster pool is active,
- * the pool drains first and scanout runs globally after. Callers record the
- * result (PlayBoot.lastVoodooPath) instead of branching on backend
- * folklore. Pure/headless-safe.
+ * Explicit voodoo path selection (Track A parallel scanout): `worker` when a
+ * band pool is active (pooled scanout kick drains all bands in parallel with
+ * disjoint outputs + halo handling, byte-identical to serial), `serial`
+ * otherwise. Callers record the result (PlayBoot.lastVoodooPath) instead of
+ * branching on backend folklore. Pure/headless-safe.
  */
-export function selectVoodooBandPath(_poolActive: boolean): VoodooBandPath {
-  // No worker/WASM voodoo backend at this HEAD: serial main-thread
-  // `resolveFrame` after all bands complete. Revisit when the backend lands.
-  return 'serial';
+export function selectVoodooBandPath(poolActive: boolean): VoodooBandPath {
+  return poolActive ? 'worker' : 'serial';
+}
+
+/**
+ * Convert a frame VoodooState snapshot to band scanout kick params (Track A):
+ * numbers only, no per-pixel cvar reads in workers. reconmode maps to
+ * 0 = legacy, 1 = 2x2sub+2x2box, 2 = 4x4sub+4x1. Pure.
+ */
+export function voodooStateToScanoutOpts(st: VoodooState): ScanoutBandOptions {
+  return {
+    gamma: st.gamma,
+    dither: st.dither,
+    ditherMode: st.dithermode === '2x2' ? 1 : 0,
+    postfilter: st.postfilter,
+    reconmode: st.reconmode === 'legacy' ? 0 : st.reconmode === '4x4sub+4x1' ? 2 : 1,
+    maxR: st.rgbmaxdelta.r | 0,
+    maxG: st.rgbmaxdelta.g | 0,
+    maxB: st.rgbmaxdelta.b | 0,
+    quantise: st.quantise,
+  };
 }
 
 /**

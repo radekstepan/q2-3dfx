@@ -472,9 +472,9 @@ describe('voodoo worker-band contract', () => {
       expect(e.width).toBe(64);
       expect(e.height).toBe(48);
     }
-    // No worker/WASM voodoo backend yet: explicit serial, never silent software.
+    // Track A parallel scanout: explicit worker path when pooled, serial otherwise.
     expect(selectVoodooBandPath(false)).toBe('serial');
-    expect(selectVoodooBandPath(true)).toBe('serial');
+    expect(selectVoodooBandPath(true)).toBe('worker');
   });
 
   it('banded raster resolves byte-identical to serial, dither phase included', () => {

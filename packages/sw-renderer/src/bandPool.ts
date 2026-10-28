@@ -21,17 +21,17 @@ import {
   CTL_WMASK, CTL_WSHIFT, D_HMASK, D_LIGHT_H, D_LIGHT_OFF, D_LIGHT_W,
   D_PER_BATCH, D_SPAN_BASE, D_SPAN_COUNT, D_TEX_H, D_TEX_OFF, D_TEX_W,
   D_TURBPHASE, D_WMASK, D_WSHIFT, FRAME_LIGHT_CAP, FRAME_TEX_CAP,
-  JOB_RASTER, JOB_RESOLVE, JOB_RGB,
+  JOB_RASTER, JOB_RESOLVE, JOB_RGB, JOB_SCANOUT,
   LIGHT_CAP, MAX_FRAME_BATCHES, MAX_FRAME_SPANS, MAX_WORKERS, MIN_BAND_PIXELS, TEX_CAP,
   MAX_RGB_BATCHES, MAX_RGB_SPANS, RGB_CHAIN_CAP, RGB_LUX_CAP, RGB_MAX_CHAINS, RGB_MAX_LEVELS,
   C_LEVEL_BASE, C_LEVEL_COUNT, C_PER_CHAIN, L_DATA_OFF, L_H, L_MASK_OFF, L_PER_LEVEL, L_W,
   R_CHAIN, R_FLAGS, R_FLATRGB, R_LUX_H, R_LUX_OFF, R_LUX_W, R_PER_BATCH,
   R_SPAN_BASE, R_SPAN_COUNT, R_TURBPHASE, R_YMAX, R_YMIN, R_ZBITS,
   attachFrameAccum, attachRGBAccum, frameAccumTotal, rgbAccumTotal, packBandSpans, packFrameSpans,
-  processBandJob, processFrameJob, processRGBFrameJob, readBandJob, resolveBand, resolveBandFused,
+  processBandJob, processFrameJob, processRGBFrameJob, processScanoutBand, readBandJob, resolveBand, resolveBandFused,
   sabAvailable, splitBands, syncWaitAllowed, writeBandJob, I_PER_SPAN,
   type Band,
-  type BandDispatcher, type BandViews, type FrameAccumViews, type RGBAccumViews,
+  type BandDispatcher, type BandViews, type FrameAccumViews, type RGBAccumViews, type ScanoutBandOptions,
 } from './bands.js';
 import { textureMasks, type LightBlock, type SpanList, type Texture, type RGBMipLevel } from './spans.js';
 
@@ -677,6 +677,78 @@ export class BandWorkerPool implements BandDispatcher {
     };
   }
 
+  /** Live shared scanout buffers (Track A: workers write the presented frame directly). */
+  get scanoutPlanes(): { scan565: Uint16Array; scanDisplay: Uint32Array } {
+    return {
+      scan565: this.rgbViews.scan565,
+      scanDisplay: this.rgbViews.scanDisplay,
+    };
+  }
+
+  /**
+   * Parallel scanout kick (Track A, blocking): fused pack→recon→gamma from
+   * the finished shared color plane into the shared scanout buffers, drained
+   * by all bands. Inputs immutable for the kick, outputs disjoint, dither
+   * uses absolute coords — byte-identical to the serial voodoo path. True
+   * unless the pool is dead or the wait times out (caller runs serial).
+   */
+  flushScanout(opts: ScanoutBandOptions): boolean {
+    if (this.disposed || this.workers.length === 0) return false;
+    if (!this.awaitReadySync()) return false;
+    this.publishScanout(opts);
+    const seq = this.seq;
+    if (!this.kick(seq)) return false;
+    const mainBand = this.bands[this.bands.length - 1]!;
+    processScanoutBand(
+      this.views.fColor, this.rgbViews.scan565, this.rgbViews.scanDisplay,
+      this.fbW, this.fbH, opts, mainBand.y0, mainBand.y1,
+    );
+    return this.awaitDoneSync();
+  }
+
+  /**
+   * Same as flushScanout but message-driven (browser async completion).
+   */
+  async flushScanoutAsync(opts: ScanoutBandOptions): Promise<boolean> {
+    if (this.disposed || this.workers.length === 0) return false;
+    if (!(await this.awaitReadyAsync())) return false;
+    this.publishScanout(opts);
+    const seq = this.seq;
+    const finished = this.awaitWorkerMessages(seq, this.workers.length);
+    if (!this.kick(seq)) {
+      this.pending.delete(seq);
+      return false;
+    }
+    const mainBand = this.bands[this.bands.length - 1]!;
+    processScanoutBand(
+      this.views.fColor, this.rgbViews.scan565, this.rgbViews.scanDisplay,
+      this.fbW, this.fbH, opts, mainBand.y0, mainBand.y1,
+    );
+    return finished;
+  }
+
+  /** Publish a scanout kick (main side, pre-notify). */
+  private publishScanout(o: ScanoutBandOptions): void {
+    try {
+      Atomics.store(this.ctl, CTL_FBW, this.fbW);
+      Atomics.store(this.ctl, CTL_FBH, this.fbH);
+      Atomics.store(this.ctl, CTL_JOB, JOB_SCANOUT);
+    } catch {
+      /* ignore */
+    }
+    const k = this.rgbViews.kick;
+    k[0] = o.gamma;
+    k[1] = o.dither ? 1 : 0;
+    k[2] = o.ditherMode;
+    k[3] = o.postfilter ? 1 : 0;
+    k[4] = o.reconmode;
+    k[5] = o.maxR;
+    k[6] = o.maxG;
+    k[7] = o.maxB;
+    k[8] = o.quantise ? 1 : 0;
+    this.seq += 1;
+  }
+
   /**
    * Stage one world RGB batch into the SAB (main side). Copies the span
    * slice, the material's mip chain (deduplicated across frames by chain
@@ -751,10 +823,15 @@ export class BandWorkerPool implements BandDispatcher {
       };
       let s = allocChain();
       if (s === undefined) {
-        // Working set changed (new texture/palette/world): drop the whole
-        // persistent upload cache once and retry. Stale chain identity refs
-        // are also dropped on palette/world changes via clearRGBChains, so
-        // this path only triggers on genuine growth.
+        // Ownership fix (Phase 0): previously staged descriptors hold slot
+        // indices into the persistent chain region. Evicting here would reuse
+        // those slots for different chains and silently corrupt pending work.
+        // When batches are already pending, refuse to stage (caller replays
+        // pending inline first, preserving order); the next frame starts with
+        // an empty pending set and may safely evict. Only evict-and-retry
+        // when nothing is pending, so no live descriptor references stale
+        // bytes. Never throws.
+        if (this.rgbDescCount > 0) return false;
         this.clearRGBChains();
         s = allocChain();
         if (s === undefined) return false;

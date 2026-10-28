@@ -90,6 +90,15 @@ export const JOB_RESOLVE = 1;
  * write is depth-guarded, and dither/LOD use absolute screen coords.
  */
 export const JOB_RGB = 2;
+/**
+ * Voodoo scanout kick (Track A parallel scanout): fused pack→recon→gamma
+ * over the shared color plane into shared scanout buffers. Bands are
+ * disjoint row ranges; the halo row for 2x2 reconstruction is packed locally
+ * per band (no cross-band barrier), inputs are immutable for the kick,
+ * outputs are disjoint, dither uses absolute screen coords. Byte-identical
+ * to the serial voodoo resolveFusedFrame.
+ */
+export const JOB_SCANOUT = 3;
 
 /** Clamped worker/band count requested by the operator (0 = classic path). */
 export function workersRequestedByCvar(): number {
@@ -444,6 +453,10 @@ export const L_PER_LEVEL = 4;
 /** Max flat-packed RGB spans per frame (mirrors MAX_FRAME_SPANS; live frames exceed frozen-benchmark counts). */
 export const MAX_RGB_SPANS = 131072;
 
+/** Scanout kick params (Float64, shared): gamma, dither, ditherMode, postfilter,
+ *  reconmode, maxR, maxG, maxB, quantise. RGB kicks reuse [0..2] only. */
+export const SCAN_KICK_LEN = 16;
+
 export interface RGBAccumLayout {
   total: number;
   rgb565Off: number;
@@ -456,7 +469,9 @@ export interface RGBAccumLayout {
   levelOff: number;
   luxOff: number;
   rgbDescOff: number;
-  kickOff: number; // Float64 kick params (near, far, lodBias)
+  kickOff: number; // Float64 kick params (RGB: near, far, lodBias; scanout: 9 params)
+  scan565Off: number; // shared 565 scanout target (Track A)
+  scanDisplayOff: number; // shared display scanout plane (Track A)
 }
 
 /** Byte layout of the RGB worker regions appended after frameAccumTotal. */
@@ -474,10 +489,16 @@ export function rgbAccumLayout(w: number, h: number): RGBAccumLayout {
   const luxOff = levelOff + RGB_MAX_LEVELS * L_PER_LEVEL * 4;
   const rgbDescOff = luxOff + RGB_LUX_CAP;
   const kickOff = (rgbDescOff + MAX_RGB_BATCHES * R_PER_BATCH * 4 + 7) & ~7;
-  const total = kickOff + 4 * 8;
+  // Scanout buffers (Track A parallel scanout): shared 565 target + display
+  // plane. The shell adopts these when pooled so workers write the presented
+  // frame directly (zero copy); the serial path ignores them.
+  const scan565Off = (kickOff + SCAN_KICK_LEN * 8 + 7) & ~7;
+  const scanDisplayOff = (scan565Off + n * 2 + 7) & ~7;
+  const total = scanDisplayOff + n * 4;
   return {
     total, rgb565Off, coverOff, rgbDepthOff, spansFOff, spansIOff,
     chainOff, chainDirOff, levelOff, luxOff, rgbDescOff, kickOff,
+    scan565Off, scanDisplayOff,
   };
 }
 
@@ -497,8 +518,12 @@ export interface RGBAccumViews {
   levelTab: Int32Array;
   lux: Uint8Array;
   rgbDesc: Int32Array;
-  /** Per-kick float params: [near, far, lodBias, reserved]. */
+  /** Per-kick float params (RGB: near/far/lodBias; scanout: 9 params, len 16). */
   kick: Float64Array;
+  /** Shared 565 scanout target (Track A parallel scanout). */
+  scan565: Uint16Array;
+  /** Shared display scanout plane (Track A parallel scanout). */
+  scanDisplay: Uint32Array;
 }
 
 /** Attach RGB worker views to a SAB sized by rgbAccumTotal(w, h). */
@@ -522,7 +547,9 @@ export function attachRGBAccum(
       levelTab: new Int32Array(sab, layout.levelOff, RGB_MAX_LEVELS * L_PER_LEVEL),
       lux: new Uint8Array(sab, layout.luxOff, RGB_LUX_CAP),
       rgbDesc: new Int32Array(sab, layout.rgbDescOff, MAX_RGB_BATCHES * R_PER_BATCH),
-      kick: new Float64Array(sab, layout.kickOff, 4),
+      kick: new Float64Array(sab, layout.kickOff, SCAN_KICK_LEN),
+      scan565: new Uint16Array(sab, layout.scan565Off, n),
+      scanDisplay: new Uint32Array(sab, layout.scanDisplayOff, n),
     },
   };
 }
@@ -917,6 +944,403 @@ export function rasterizePackedRGBRange(
   return { pixels, spans: drawn };
 }
 
+// --- Track A parallel scanout (banded fused pack→recon→gamma) --------------
+//
+// Byte-identical to voodoo resolveFusedFrame for the same options. Tables
+// are recomputed with the same formulas as voodoo/bayer.ts (no import:
+// sw-renderer must not depend on voodoo per deps:check). Dither uses
+// absolute screen coords; bands write disjoint dst565/display rows; the one
+// halo row needed by 2x2 reconstruction is packed locally per band (no
+// cross-band barrier, no shared writes). Inputs are immutable for the kick.
+
+export interface ScanoutBandOptions {
+  gamma: number;
+  dither: boolean;
+  /** 0 = 4x4, 1 = 2x2 */
+  ditherMode: number;
+  postfilter: boolean;
+  /** 0 = legacy, 1 = 2x2sub+2x2box, 2 = 4x4sub+4x1 */
+  reconmode: number;
+  maxR: number; maxG: number; maxB: number;
+  quantise: boolean;
+}
+
+const SCAN_BAYER4 = new Uint8Array([0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]);
+const SCAN_BAYER2 = new Uint8Array([0, 2, 3, 1]);
+
+function scanOffset4(amp: number): Int8Array {
+  const t = new Int8Array(16);
+  for (let p = 0; p < 16; p++) t[p] = Math.round((SCAN_BAYER4[p]! - 7.5) * amp / 8);
+  return t;
+}
+function scanOffset2(amp: number): Int8Array {
+  const t = new Int8Array(4);
+  for (let p = 0; p < 4; p++) t[p] = Math.round((SCAN_BAYER2[p]! - 1.5) * amp / 2);
+  return t;
+}
+const SCAN_RB4 = scanOffset4(4);
+const SCAN_G4 = scanOffset4(2);
+const SCAN_RB2 = scanOffset2(4);
+const SCAN_G2 = scanOffset2(2);
+
+let scanGammaCached = Number.NaN;
+let scanGammaLUT: Uint8Array = new Uint8Array(256);
+function scanGamma(gamma: number): Uint8Array {
+  if (gamma === scanGammaCached) return scanGammaLUT;
+  const lut = new Uint8Array(256);
+  const inv = 1 / gamma;
+  for (let i = 0; i < 256; i++) lut[i] = Math.min(255, Math.round(255 * Math.pow(i / 255, inv)));
+  scanGammaCached = gamma;
+  scanGammaLUT = lut;
+  return lut;
+}
+
+function scanQuantise(r: number, g: number, b: number): number {
+  return (((r & 0xf8) << 8) | ((g & 0xfc) << 3) | ((b & 0xf8) >> 3)) & 0xffff;
+}
+
+function scanPackRow(
+  src: Uint32Array, dst565: Uint16Array, w: number, y: number,
+  dither: boolean, rbW: Int8Array, gW: Int8Array, xmW: number, ymW: number, shW: number,
+): void {
+  const rowPh = (y & ymW) << shW;
+  let i = y * w;
+  for (let x = 0; x < w; x++, i++) {
+    const px = src[i]!;
+    let r = px & 255;
+    let g = (px >> 8) & 255;
+    let b = (px >> 16) & 255;
+    if (dither) {
+      const p = rowPh | (x & xmW);
+      r += rbW[p]!;
+      g += gW[p]!;
+      b += rbW[p]!;
+      r = r < 0 ? 0 : r > 255 ? 255 : r;
+      g = g < 0 ? 0 : g > 255 ? 255 : g;
+      b = b < 0 ? 0 : b > 255 ? 255 : b;
+    }
+    dst565[i] = scanQuantise(r, g, b);
+  }
+}
+
+/**
+ * Banded fused scanout for rows [y0, y1): byte-identical to the serial fused
+ * path. Disjoint writes (dst565 + display rows y0..y1-1); halo packed
+ * locally; absolute dither phase; global gamma LUT.
+ */
+export function processScanoutBand(
+  src: Uint32Array, dst565: Uint16Array, display: Uint32Array,
+  w: number, h: number, o: ScanoutBandOptions,
+  y0: number, y1: number,
+): void {
+  if (y0 < 0) y0 = 0;
+  if (y1 > h) y1 = h;
+  if (y1 <= y0) return;
+  if (src.length < w * h || dst565.length < w * h || display.length < w * h) {
+    Com_Error('drop', '[scanout] buffer too small');
+  }
+  const lut = o.gamma !== 1 ? scanGamma(o.gamma) : null;
+  if (!o.quantise) {
+    // RGB888 debug bypass: gamma-lifted copy, no dither/recon.
+    for (let y = y0; y < y1; y++) {
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        const i = row + x;
+        const px = src[i]!;
+        let r = px & 255;
+        let g = (px >> 8) & 255;
+        let b = (px >> 16) & 255;
+        if (lut !== null) {
+          r = lut[r]!;
+          g = lut[g]!;
+          b = lut[b]!;
+        }
+        // dst565 still packed (round-to-nearest compat, mirrors voodoo).
+        const r5 = (r + 4) >> 3;
+        const g6 = (g + 2) >> 2;
+        const b5 = (b + 4) >> 3;
+        dst565[i] = ((r5 > 31 ? 31 : r5) << 11) | ((g6 > 63 ? 63 : g6) << 5) | (b5 > 31 ? 31 : b5);
+        display[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      }
+    }
+    return;
+  }
+  const twoW = o.ditherMode === 1;
+  const rbW = twoW ? SCAN_RB2 : SCAN_RB4;
+  const gW = twoW ? SCAN_G2 : SCAN_G4;
+  const xmW = twoW ? 1 : 3;
+  const ymW = twoW ? 1 : 3;
+  const shW = twoW ? 1 : 2;
+  const dither = o.dither;
+
+  if (!o.postfilter) {
+    for (let y = y0; y < y1; y++) {
+      scanPackRow(src, dst565, w, y, dither, rbW, gW, xmW, ymW, shW);
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        const i = row + x;
+        const v = dst565[i]!;
+        const r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
+        let r = (r5 << 3) | (r5 >> 2);
+        let g = (g6 << 2) | (g6 >> 4);
+        let b = (b5 << 3) | (b5 >> 2);
+        if (lut !== null) {
+          r = lut[r]!;
+          g = lut[g]!;
+          b = lut[b]!;
+        }
+        display[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      }
+    }
+    return;
+  }
+
+  if (o.reconmode === 2) {
+    const subOn = dither;
+    const rbS = SCAN_RB4, gS = SCAN_G4;
+    const mdR = o.maxR | 0, mdG = o.maxG | 0, mdB = o.maxB | 0;
+    const gateOff = mdR === 0 && mdG === 0 && mdB === 0;
+    for (let y = y0; y < y1; y++) {
+      scanPackRow(src, dst565, w, y, dither, rbW, gW, xmW, ymW, shW);
+      const row = y * w;
+      const ph = (y & 3) << 2;
+      for (let x = 0; x < w; x++) {
+        const xa = x - 1 < 0 ? 0 : x - 1;
+        const xb = x;
+        const xc = x + 1 < w ? x + 1 : x;
+        const xd = x + 2 < w ? x + 2 : xc;
+        const va = dst565[row + xa]!, vb = dst565[row + xb]!;
+        const vc = dst565[row + xc]!, vd = dst565[row + xd]!;
+        let ra = (((va >> 11) & 31) << 3) | (((va >> 11) & 31) >> 2);
+        let ga = (((va >> 5) & 63) << 2) | (((va >> 5) & 63) >> 4);
+        let ba = ((va & 31) << 3) | ((va & 31) >> 2);
+        let rb = (((vb >> 11) & 31) << 3) | (((vb >> 11) & 31) >> 2);
+        let gb = (((vb >> 5) & 63) << 2) | (((vb >> 5) & 63) >> 4);
+        let bb = ((vb & 31) << 3) | ((vb & 31) >> 2);
+        let rc = (((vc >> 11) & 31) << 3) | (((vc >> 11) & 31) >> 2);
+        let gc = (((vc >> 5) & 63) << 2) | (((vc >> 5) & 63) >> 4);
+        let bc = ((vc & 31) << 3) | ((vc & 31) >> 2);
+        let rd = (((vd >> 11) & 31) << 3) | (((vd >> 11) & 31) >> 2);
+        let gd = (((vd >> 5) & 63) << 2) | (((vd >> 5) & 63) >> 4);
+        let bd = ((vd & 31) << 3) | ((vd & 31) >> 2);
+        if (subOn) {
+          const sa = rbS[ph | (xa & 3)]!, sb = rbS[ph | (xb & 3)]!;
+          const sc = rbS[ph | (xc & 3)]!, sd = rbS[ph | (xd & 3)]!;
+          const ta = gS[ph | (xa & 3)]!, tb = gS[ph | (xb & 3)]!;
+          const tc = gS[ph | (xc & 3)]!, td = gS[ph | (xd & 3)]!;
+          ra = ra - sa < 0 ? 0 : ra - sa > 255 ? 255 : ra - sa;
+          ga = ga - ta < 0 ? 0 : ga - ta > 255 ? 255 : ga - ta;
+          ba = ba - sa < 0 ? 0 : ba - sa > 255 ? 255 : ba - sa;
+          rb = rb - sb < 0 ? 0 : rb - sb > 255 ? 255 : rb - sb;
+          gb = gb - tb < 0 ? 0 : gb - tb > 255 ? 255 : gb - tb;
+          bb = bb - sb < 0 ? 0 : bb - sb > 255 ? 255 : bb - sb;
+          rc = rc - sc < 0 ? 0 : rc - sc > 255 ? 255 : rc - sc;
+          gc = gc - tc < 0 ? 0 : gc - tc > 255 ? 255 : gc - tc;
+          bc = bc - sc < 0 ? 0 : bc - sc > 255 ? 255 : bc - sc;
+          rd = rd - sd < 0 ? 0 : rd - sd > 255 ? 255 : rd - sd;
+          gd = gd - td < 0 ? 0 : gd - td > 255 ? 255 : gd - td;
+          bd = bd - sd < 0 ? 0 : bd - sd > 255 ? 255 : bd - sd;
+        }
+        let pass = gateOff;
+        if (!pass) {
+          const rs = Math.max(ra, rb, rc, rd) - Math.min(ra, rb, rc, rd);
+          if (rs <= mdR) {
+            const gs = Math.max(ga, gb, gc, gd) - Math.min(ga, gb, gc, gd);
+            if (gs <= mdG) {
+              const bs = Math.max(ba, bb, bc, bd) - Math.min(ba, bb, bc, bd);
+              if (bs <= mdB) pass = true;
+            }
+          }
+        }
+        let r: number, g: number, b: number;
+        if (pass) {
+          r = (ra + rb + rc + rd + 2) >> 2;
+          g = (ga + gb + gc + gd + 2) >> 2;
+          b = (ba + bb + bc + bd + 2) >> 2;
+        } else {
+          r = rb; g = gb; b = bb;
+        }
+        if (lut !== null) {
+          r = lut[r]!;
+          g = lut[g]!;
+          b = lut[b]!;
+        }
+        display[row + x] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      }
+    }
+    return;
+  }
+
+  if (o.reconmode === 0) {
+    // Legacy unconditional 2x2 box. Pack all own rows first, halo locally.
+    for (let y = y0; y < y1; y++) scanPackRow(src, dst565, w, y, dither, rbW, gW, xmW, ymW, shW);
+    let halo: Uint16Array | null = null;
+    if (y1 < h) {
+      halo = new Uint16Array(w);
+      const rowPh = (y1 & ymW) << shW;
+      for (let x = 0; x < w; x++) {
+        const i = y1 * w + x;
+        const px = src[i]!;
+        let r = px & 255, g = (px >> 8) & 255, b = (px >> 16) & 255;
+        if (dither) {
+          const p = rowPh | (x & xmW);
+          r += rbW[p]!; g += gW[p]!; b += rbW[p]!;
+          r = r < 0 ? 0 : r > 255 ? 255 : r;
+          g = g < 0 ? 0 : g > 255 ? 255 : g;
+          b = b < 0 ? 0 : b > 255 ? 255 : b;
+        }
+        halo[x] = scanQuantise(r, g, b);
+      }
+    }
+    for (let y = y0; y < y1; y++) {
+      const y1row = y + 1 < h ? y + 1 : y;
+      const row0 = y * w;
+      const useHalo = y + 1 === y1 && halo !== null && y1 < h;
+      for (let x = 0; x < w; x++) {
+        const x1 = x + 1 < w ? x + 1 : x;
+        const a = dst565[row0 + x]!;
+        const bq = dst565[row0 + x1]!;
+        let c: number, dq: number;
+        if (useHalo) {
+          c = halo![x]!;
+          dq = halo![x1]!;
+        } else {
+          const row1 = y1row * w;
+          c = dst565[row1 + x]!;
+          dq = dst565[row1 + x1]!;
+        }
+        const ar5 = (a >> 11) & 31, br5 = (bq >> 11) & 31;
+        const cr5 = (c >> 11) & 31, dr5 = (dq >> 11) & 31;
+        const ag6 = (a >> 5) & 63, bg6 = (bq >> 5) & 63;
+        const cg6 = (c >> 5) & 63, dg6 = (dq >> 5) & 63;
+        const ab5 = a & 31, bb5 = bq & 31, cb5 = c & 31, db5 = dq & 31;
+        const rSum = ((ar5 << 3) | (ar5 >> 2)) + ((br5 << 3) | (br5 >> 2)) + ((cr5 << 3) | (cr5 >> 2)) + ((dr5 << 3) | (dr5 >> 2));
+        const gSum = ((ag6 << 2) | (ag6 >> 4)) + ((bg6 << 2) | (bg6 >> 4)) + ((cg6 << 2) | (cg6 >> 4)) + ((dg6 << 2) | (dg6 >> 4));
+        const bSum = ((ab5 << 3) | (ab5 >> 2)) + ((bb5 << 3) | (bb5 >> 2)) + ((cb5 << 3) | (cb5 >> 2)) + ((db5 << 3) | (db5 >> 2));
+        let r = (rSum + 2) >> 2;
+        let g = (gSum + 2) >> 2;
+        let b = (bSum + 2) >> 2;
+        if (lut !== null) {
+          r = lut[r]!;
+          g = lut[g]!;
+          b = lut[b]!;
+        }
+        display[row0 + x] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      }
+    }
+    return;
+  }
+
+  // Matched 2x2sub+2x2box: pack own rows, halo locally, subtract mode's 2x2
+  // pattern, 2x2 box with edge rejection.
+  for (let y = y0; y < y1; y++) scanPackRow(src, dst565, w, y, dither, rbW, gW, xmW, ymW, shW);
+  let halo2: Uint16Array | null = null;
+  if (y1 < h) {
+    halo2 = new Uint16Array(w);
+    const rowPh = (y1 & ymW) << shW;
+    for (let x = 0; x < w; x++) {
+      const i = y1 * w + x;
+      const px = src[i]!;
+      let r = px & 255, g = (px >> 8) & 255, b = (px >> 16) & 255;
+      if (dither) {
+        const p = rowPh | (x & xmW);
+        r += rbW[p]!; g += gW[p]!; b += rbW[p]!;
+        r = r < 0 ? 0 : r > 255 ? 255 : r;
+        g = g < 0 ? 0 : g > 255 ? 255 : g;
+        b = b < 0 ? 0 : b > 255 ? 255 : b;
+      }
+      halo2[x] = scanQuantise(r, g, b);
+    }
+  }
+  const sub2 = dither;
+  const rbS = SCAN_RB2, gS = SCAN_G2;
+  const xmS = 1, ymS = 1, shS = 1;
+  const mdR = o.maxR | 0, mdG = o.maxG | 0, mdB = o.maxB | 0;
+  const gateOff = mdR === 0 && mdG === 0 && mdB === 0;
+  for (let y = y0; y < y1; y++) {
+    const y1abs = y + 1 < h ? y + 1 : y;
+    const useHalo = y + 1 === y1 && halo2 !== null && y1 < h;
+    const ph0 = (y & ymS) << shS;
+    const ph1 = (y1abs & ymS) << shS;
+    const row0 = y * w;
+    for (let x = 0; x < w; x++) {
+      const x1 = x + 1 < w ? x + 1 : x;
+      const v00 = dst565[row0 + x]!;
+      const v10 = dst565[row0 + x1]!;
+      let v01: number, v11: number;
+      if (useHalo) {
+        v01 = halo2![x]!;
+        v11 = halo2![x1]!;
+      } else {
+        const row1 = y1abs * w;
+        v01 = dst565[row1 + x]!;
+        v11 = dst565[row1 + x1]!;
+      }
+      let r0 = (((v00 >> 11) & 31) << 3) | (((v00 >> 11) & 31) >> 2);
+      let g0 = (((v00 >> 5) & 63) << 2) | (((v00 >> 5) & 63) >> 4);
+      let b0 = ((v00 & 31) << 3) | ((v00 & 31) >> 2);
+      let r1 = (((v10 >> 11) & 31) << 3) | (((v10 >> 11) & 31) >> 2);
+      let g1 = (((v10 >> 5) & 63) << 2) | (((v10 >> 5) & 63) >> 4);
+      let b1 = ((v10 & 31) << 3) | ((v10 & 31) >> 2);
+      let r2 = (((v01 >> 11) & 31) << 3) | (((v01 >> 11) & 31) >> 2);
+      let g2 = (((v01 >> 5) & 63) << 2) | (((v01 >> 5) & 63) >> 4);
+      let b2 = ((v01 & 31) << 3) | ((v01 & 31) >> 2);
+      let r3 = (((v11 >> 11) & 31) << 3) | (((v11 >> 11) & 31) >> 2);
+      let g3 = (((v11 >> 5) & 63) << 2) | (((v11 >> 5) & 63) >> 4);
+      let b3 = ((v11 & 31) << 3) | ((v11 & 31) >> 2);
+      if (sub2) {
+        const d00 = rbS[ph0 | (x & xmS)]!, d10 = rbS[ph0 | (x1 & xmS)]!;
+        const d01 = rbS[ph1 | (x & xmS)]!, d11 = rbS[ph1 | (x1 & xmS)]!;
+        const e00 = gS[ph0 | (x & xmS)]!, e10 = gS[ph0 | (x1 & xmS)]!;
+        const e01 = gS[ph1 | (x & xmS)]!, e11 = gS[ph1 | (x1 & xmS)]!;
+        r0 = r0 - d00 < 0 ? 0 : r0 - d00 > 255 ? 255 : r0 - d00;
+        g0 = g0 - e00 < 0 ? 0 : g0 - e00 > 255 ? 255 : g0 - e00;
+        b0 = b0 - d00 < 0 ? 0 : b0 - d00 > 255 ? 255 : b0 - d00;
+        r1 = r1 - d10 < 0 ? 0 : r1 - d10 > 255 ? 255 : r1 - d10;
+        g1 = g1 - e10 < 0 ? 0 : g1 - e10 > 255 ? 255 : g1 - e10;
+        b1 = b1 - d10 < 0 ? 0 : b1 - d10 > 255 ? 255 : b1 - d10;
+        r2 = r2 - d01 < 0 ? 0 : r2 - d01 > 255 ? 255 : r2 - d01;
+        g2 = g2 - e01 < 0 ? 0 : g2 - e01 > 255 ? 255 : g2 - e01;
+        b2 = b2 - d01 < 0 ? 0 : b2 - d01 > 255 ? 255 : b2 - d01;
+        r3 = r3 - d11 < 0 ? 0 : r3 - d11 > 255 ? 255 : r3 - d11;
+        g3 = g3 - e11 < 0 ? 0 : g3 - e11 > 255 ? 255 : g3 - e11;
+        b3 = b3 - d11 < 0 ? 0 : b3 - d11 > 255 ? 255 : b3 - d11;
+      }
+      let r: number, g: number, b: number;
+      if (gateOff) {
+        r = (r0 + r1 + r2 + r3 + 2) >> 2;
+        g = (g0 + g1 + g2 + g3 + 2) >> 2;
+        b = (b0 + b1 + b2 + b3 + 2) >> 2;
+      } else {
+        const rs = Math.max(r0, r1, r2, r3) - Math.min(r0, r1, r2, r3);
+        if (rs > mdR) {
+          r = r0; g = g0; b = b0;
+        } else {
+          const gs = Math.max(g0, g1, g2, g3) - Math.min(g0, g1, g2, g3);
+          if (gs > mdG) {
+            r = r0; g = g0; b = b0;
+          } else {
+            const bs = Math.max(b0, b1, b2, b3) - Math.min(b0, b1, b2, b3);
+            if (bs > mdB) {
+              r = r0; g = g0; b = b0;
+            } else {
+              r = (r0 + r1 + r2 + r3 + 2) >> 2;
+              g = (g0 + g1 + g2 + g3 + 2) >> 2;
+              b = (b0 + b1 + b2 + b3 + 2) >> 2;
+            }
+          }
+        }
+      }
+      if (lut !== null) {
+        r = lut[r]!;
+        g = lut[g]!;
+        b = lut[b]!;
+      }
+      display[row0 + x] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+    }
+  }
+}
+
 /** Reused window record for the worker RGB core (workers are single-threaded). */
 const matWin: RGBWindow = { near: 4, far: 32768 };
 
@@ -1224,7 +1648,9 @@ export function bandWorkerLoop(
     // raster kicks and main-thread full clears, never by the resolve.
     // RGB kicks must never clear either: they run AFTER the indexed world
     // kick whose planes the foreground seed still reads.
-    if (frame !== lastFrame && job !== JOB_RESOLVE && job !== JOB_RGB) {
+    // Scanout kicks must never clear: they only read the finished color
+    // plane into disjoint scanout buffers.
+    if (frame !== lastFrame && job !== JOB_RESOLVE && job !== JOB_RGB && job !== JOB_SCANOUT) {
       views.idx.fill(0, y0 * fbW, y1 * fbW);
       views.zb.fill(0, y0 * fbW, y1 * fbW);
       lastFrame = frame;
@@ -1251,6 +1677,25 @@ export function bandWorkerLoop(
       r = processRGBFrameJob(
         rgb, fbWNow, fbHNow, Atomics.load(ctl, CTL_RGBCOUNT), y0, y1,
       );
+    } else if (job === JOB_SCANOUT) {
+      // Scanout kick (Track A): fused pack→recon→gamma from the finished
+      // shared color plane into shared scanout buffers. Disjoint rows,
+      // immutable input, absolute dither phase — byte-identical to serial.
+      if (!rgb) {
+        Com_Error('error', 'bandWorkerLoop: JOB_SCANOUT without RGB views');
+      }
+      const k = rgb.kick;
+      processScanoutBand(
+        fav.fColor, rgb.scan565, rgb.scanDisplay, fbWNow, fbHNow,
+        {
+          gamma: k[0]!, dither: k[1]! !== 0, ditherMode: k[2]! | 0,
+          postfilter: k[3]! !== 0, reconmode: k[4]! | 0,
+          maxR: k[5]! | 0, maxG: k[6]! | 0, maxB: k[7]! | 0,
+          quantise: k[8]! !== 0,
+        },
+        y0, y1,
+      );
+      r = { pixels: 0, spans: 0 };
     } else {
       const fcount = Atomics.load(ctl, CTL_FCOUNT);
       r = fcount > 0

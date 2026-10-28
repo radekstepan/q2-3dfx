@@ -103,9 +103,9 @@ describe('voodoo band messages (one snapshot, absolute coords)', () => {
     }
   });
 
-  it('path selection stays explicit serial with or without a pool', () => {
+  it('path selection is explicit: serial without a pool, worker with one', () => {
     expect(selectVoodooBandPath(false)).toBe('serial');
-    expect(selectVoodooBandPath(true)).toBe('serial');
+    expect(selectVoodooBandPath(true)).toBe('worker');
   });
 
   it('broadcastBandVoodoo is a no-op without a pool and never throws', () => {

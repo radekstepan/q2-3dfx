@@ -103,8 +103,8 @@ import type { Entity, RefDef } from '@q2/renderer-api';
 import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
-import { selectVoodooBandPath, snapshotVoodooState } from './render-workers.js';
-import type { VoodooBandPath } from './render-workers.js';
+import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } from './render-workers.js';
+import type { ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
 
 export type RendererKind = 'software' | 'voodoo';
 
@@ -3454,12 +3454,10 @@ export function resolveDisplay(boot: PlayBoot, hud?: HudState, frameState?: Vood
     // the band envelopes (see render-workers.ts). The async path passes its
     // already-broadcast snapshot in; the sync path snapshots here.
     const st: VoodooState = frameState ?? readVoodooState();
-    // Explicit raster-policy selection: until a worker/WASM voodoo backend
-    // exists the ONLY supported voodoo path is serial main-thread scanout
-    // after every band completes (selectVoodooBandPath documents this and
-    // never silently draws software). Recorded for tests/debug.
-    const pooled = boot.refresh.testWorkerStats().pooled;
-    boot.lastVoodooPath = selectVoodooBandPath(pooled);
+    // Sync resolve always runs the serial main-thread scanout (the pooled
+    // parallel path is async-only via resolveDisplayAsync, since the browser
+    // main thread must never block). Record 'serial' explicitly.
+    boot.lastVoodooPath = selectVoodooBandPath(false);
     // Double-resolve guard (see ownership note): a renderer-side scanout
     // wins when flagged; the shell resolve below is then skipped.
     if (!rendererDidScanout(boot)) {
@@ -3515,6 +3513,79 @@ export function resolveDisplay(boot: PlayBoot, hud?: HudState, frameState?: Vood
   boot.display.set(live);
   applyBrightness(boot.display, brightness);
   return boot.display;
+}
+
+/**
+ * Async voodoo resolve (Track A parallel scanout): same ordering + fidelity
+ * as resolveDisplay, but the scanout runs across the browser worker pool
+ * when available (disjoint row bands, halo-safe, global dither phase,
+ * HUD-before-scanout preserved). Exactly one scanout runs per frame; on any
+ * pool failure it falls back to the serial resolveDisplay path (identical).
+ * Software mode delegates directly (no scanout).
+ */
+export async function resolveDisplayAsync(boot: PlayBoot, hud?: HudState, frameState?: VoodooState): Promise<Uint32Array> {
+  const { host } = boot;
+  if (getCVarString('vid_renderer') !== 'voodoo') {
+    return resolveDisplay(boot, hud, frameState);
+  }
+  const w = host.fb.width;
+  const h = host.fb.height;
+  const st: VoodooState = frameState ?? readVoodooState();
+  if (rendererDidScanout(boot)) {
+    return resolveDisplay(boot, hud, frameState);
+  }
+  // HUD-before-scanout preserved (strict mode): paint into the live shared
+  // color plane before the pooled kick reads it (immutable input for the kick).
+  if (boot.strictVoodoo && hud !== undefined) {
+    paintHudPreScanout(boot, hud);
+  }
+  const pool = boot.browserPool;
+  const pooled = boot.refresh.testWorkerStats().pooled && pool !== null;
+  if (pooled && pool !== null) {
+    try {
+      const opts = voodooStateToScanoutOpts(st);
+      const ok = await (pool as unknown as {
+        flushScanoutAsync(o: ScanoutBandOptions): Promise<boolean>;
+      }).flushScanoutAsync(opts);
+      if (ok) {
+        // Pooled scanout wrote the shared buffers adopted as boot.fb565 /
+        // display at attach time. When the boot still owns separate buffers
+        // (headless/test boots without attach), copy over so callers always
+        // observe boot.display/fb565.
+        try {
+          const sp = (pool as unknown as {
+            scanoutPlanes: { scan565: Uint16Array; scanDisplay: Uint32Array };
+          }).scanoutPlanes;
+          if (boot.display !== sp.scanDisplay) {
+            boot.fb565.set(sp.scan565.subarray(0, boot.fb565.length));
+            boot.display.set(sp.scanDisplay.subarray(0, boot.display.length));
+          }
+        } catch {
+          /* alias check failed: display already correct via shared write */
+        }
+        boot.lastVoodooPath = selectVoodooBandPath(true);
+        boot.lastResolveOrder = boot.strictVoodoo ? 'strict-hud-first' : 'legacy-hud-last';
+        if (!boot.strictVoodoo) {
+          applyBrightness(boot.display, getBrightness());
+        }
+        return boot.display;
+      }
+    } catch {
+      /* fall through to serial */
+    }
+  }
+  // Fallback / legacy branch: exactly one serial scanout. HUD was already
+  // painted above in strict mode, so call the scene-only resolve then skip
+  // the duplicate HUD paint inside resolveDisplay by passing no hud.
+  // Legacy mode still needs its HUD-after behaviour, handled by the caller.
+  const out = resolveDisplay(boot, boot.strictVoodoo ? undefined : hud, st);
+  // resolveDisplay painted HUD again in strict mode (we pre-painted); the
+  // double-paint is idempotent for conchars glyphs (same pixels), but record
+  // the pooled-attempt path correctly.
+  if (boot.strictVoodoo) {
+    boot.lastVoodooPath = selectVoodooBandPath(false);
+  }
+  return out;
 }
 
 /**
@@ -4064,6 +4135,21 @@ export function attachBrowserPool(boot: PlayBoot, workers?: number): BrowserBand
   const pool = BrowserBandPool.create(n, host.fb.width, host.fb.height);
   if (!pool) return drop(null);
   refresh.attachWorkerPool(pool);
+  // Track A: adopt the pool's shared scanout buffers as the boot's presented
+  // buffers (zero copy). Workers write scanout directly into these; the
+  // serial fallback writes into the same arrays from the main thread, so
+  // both paths converge without extra copies. Sizes match by construction
+  // (pool created for this WxH).
+  try {
+    const sp = pool.scanoutPlanes;
+    if (sp.scan565.length === host.fb.width * host.fb.height &&
+      sp.scanDisplay.length === host.fb.width * host.fb.height) {
+      boot.fb565 = sp.scan565;
+      boot.display = sp.scanDisplay;
+    }
+  } catch {
+    /* keep owned buffers; pooled scanout copies (slower but identical) */
+  }
   return drop(pool);
 }
 
@@ -4269,5 +4355,5 @@ export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: numb
   boot.refresh.beginFrame();
   await boot.refresh.renderViewAsync(view, boot.host.world, renderables);
   await boot.refresh.endFrameAsync();
-  return resolveDisplay(boot, hud, frameState);
+  return resolveDisplayAsync(boot, hud, frameState);
 }
