@@ -423,18 +423,46 @@ export function drawAliasInstance(
   const fA = mesh.frames.subarray(inst.frameA * nv * 3, (inst.frameA + 1) * nv * 3);
   const fB = mesh.frames.subarray(inst.frameB * nv * 3, (inst.frameB + 1) * nv * 3);
   const t = inst.lerp;
-  // world verts (stack scratch, bounded by mesh size)
+  // world verts (stack scratch, bounded by mesh size) + view verts, once
+  // per instance (perf remediation item 7): the old path recomputed the
+  // world lerp AND the world->view transform per tri-vert (~6x per vert
+  // for closed meshes). The loops below run the identical operations in
+  // the identical order — bit-identical arrays — and the RGB twin reuses
+  // them outright when its inputs match (aliasViewMatches: same mesh,
+  // transform, lerp and camera), so the pair costs one setup, not two.
   const wx = aliasScratchX, wy = aliasScratchY, wz = aliasScratchZ;
-  for (let i = 0; i < nv; i++) {
-    const lx = fA[i * 3]! + (fB[i * 3]! - fA[i * 3]!) * t;
-    const ly = fA[i * 3 + 1]! + (fB[i * 3 + 1]! - fA[i * 3 + 1]!) * t;
-    const lz = fA[i * 3 + 2]! + (fB[i * 3 + 2]! - fA[i * 3 + 2]!) * t;
-    // R_AliasSetUpTransform columns (F, -R, U), then translate. Operation
-    // order ((lx*F - ly*R) + lz*U) + origin keeps pitch-0/roll-0 bit-identical
-    // to the old yaw-about-Z path (mult commutes exactly; +0 is exact).
-    wx[i] = lx * fxx - ly * rxx + lz * uxx + eox;
-    wy[i] = lx * fxy - ly * rxy + lz * uxy + eoy;
-    wz[i] = lx * fxz - ly * rxz + lz * uxz + eoz;
+  const a0 = inst.angles[0]!, a1 = inst.angles[1]!, a2 = inst.angles[2]!;
+  if (!aliasViewMatches(mesh, nv, eox, eoy, eoz, a0, a1, a2,
+    inst.frameA, inst.frameB, t, cam)) {
+    sharedViewMisses++;
+    ensureAliasViewScratch(nv);
+    for (let i = 0; i < nv; i++) {
+      const lx = fA[i * 3]! + (fB[i * 3]! - fA[i * 3]!) * t;
+      const ly = fA[i * 3 + 1]! + (fB[i * 3 + 1]! - fA[i * 3 + 1]!) * t;
+      const lz = fA[i * 3 + 2]! + (fB[i * 3 + 2]! - fA[i * 3 + 2]!) * t;
+      // R_AliasSetUpTransform columns (F, -R, U), then translate. Operation
+      // order ((lx*F - ly*R) + lz*U) + origin keeps pitch-0/roll-0 bit-identical
+      // to the old yaw-about-Z path (mult commutes exactly; +0 is exact).
+      // NOTE: the world verts are STORED to the Float32 scratch first and
+      // the view transform reads the stored values back — exactly like the
+      // old per-tri-vert path did. Consuming the unrounded float64 locals
+      // directly would move the projection off the pinned golden bits.
+      wx[i] = lx * fxx - ly * rxx + lz * uxx + eox;
+      wy[i] = lx * fxy - ly * rxy + lz * uxy + eoy;
+      wz[i] = lx * fxz - ly * rxz + lz * uxz + eoz;
+      // To view space (no projection yet); u/v + shade grade ride along
+      // per tri below so the near-plane clip can interpolate them.
+      const px = wx[i]! - cam.origin[0]!;
+      const py = wy[i]! - cam.origin[1]!;
+      const pz = wz[i]! - cam.origin[2]!;
+      aliasViewX[i] = px * cam.right[0]! + py * cam.right[1]! + pz * cam.right[2]!;
+      aliasViewY[i] = px * cam.up[0]! + py * cam.up[1]! + pz * cam.up[2]!;
+      aliasViewZ[i] = px * cam.forward[0]! + py * cam.forward[1]! + pz * cam.forward[2]!;
+    }
+    aliasViewRecord(mesh, nv, eox, eoy, eoz, a0, a1, a2,
+      inst.frameA, inst.frameB, t, cam);
+  } else {
+    sharedViewHits++;
   }
   void anorms;
   const row = (inst.lightAngle & 255) * ANORM_COUNT;
@@ -448,18 +476,13 @@ export function drawAliasInstance(
   let pixels = 0;
   const tv: TriVert[] = aliasTri;
   for (let ti = 0; ti < mesh.numTris; ti++) {
-    // To view space first (no projection yet); u/v + shade grade ride
-    // along so the near-plane clip below can interpolate them.
+    // View-space tri verts come from the per-instance precompute above
+    // (no projection yet); u/v + shade grade ride along so the near-plane
+    // clip below can interpolate them.
     let allIn = true;
     for (let k = 0; k < 3; k++) {
       const vi = mesh.tris[ti * 3 + k]!;
-      // to view space
-      const px = wx[vi]! - cam.origin[0]!;
-      const py = wy[vi]! - cam.origin[1]!;
-      const pz = wz[vi]! - cam.origin[2]!;
-      const vx = px * cam.right[0]! + py * cam.right[1]! + pz * cam.right[2]!;
-      const vy = px * cam.up[0]! + py * cam.up[1]! + pz * cam.up[2]!;
-      const vz2 = px * cam.forward[0]! + py * cam.forward[1]! + pz * cam.forward[2]!;
+      const vx = aliasViewX[vi]!, vy = aliasViewY[vi]!, vz2 = aliasViewZ[vi]!;
       clipIX[k] = vx; clipIY[k] = vy; clipIZ[k] = vz2;
       clipIU[k] = mesh.st[vi * 2]!;
       clipIV[k] = mesh.st[vi * 2 + 1]!;
@@ -546,6 +569,89 @@ let aliasScratchX = new Float32Array(4096);
 let aliasScratchY = new Float32Array(4096);
 let aliasScratchZ = new Float32Array(4096);
 
+/**
+ * View-space verts (perf remediation item 7): the world→view transform is
+ * identical for every tri sharing a vert (a 2000-vert/4000-tri MD2
+ * recomputed each vert ~6x), so compute it ONCE per instance into these
+ * arrays instead of per tri-vert. Bit-identical: the same operations on
+ * the same inputs in the same order, stored in the same Float64 lanes the
+ * old path used (clipIX/IY/IZ were Float64).
+ */
+let aliasViewX = new Float64Array(4096);
+let aliasViewY = new Float64Array(4096);
+let aliasViewZ = new Float64Array(4096);
+
+/**
+ * Cross-call setup sharing (perf remediation item 7): drawForeground
+ * draws every instance twice (classic affine + RGB perspective) with
+ * identical inputs, so the second call reuses the first call's world +
+ * view verts instead of recomputing them. Keyed on the FULL input set
+ * (mesh identity, vert count, entity transform, frame lerp, AND the
+ * camera origin+basis the view transform consumes) plus the scratch
+ * array identities (a re-allocation between calls invalidates the memo).
+ * Any mismatch recomputes — output is identical either way (the skipped
+ * loops would produce bitwise-identical arrays).
+ */
+const sharedViewKey = new Float64Array(21);
+let sharedViewMesh: AliasMesh | null = null;
+let sharedViewNV = -1;
+let sharedViewWX: Float32Array | null = null;
+let sharedViewVX: Float64Array | null = null;
+/** Observability (perf remediation item 7): shared-setup memo hits/misses. */
+let sharedViewHits = 0;
+let sharedViewMisses = 0;
+
+/** Shared-setup memo stats (test hook): hits skip the world+view loops. */
+export function testAliasShareStats(): { hits: number; misses: number } {
+  return { hits: sharedViewHits, misses: sharedViewMisses };
+}
+
+/** Reset the shared-setup counters (test hook). */
+export function testResetAliasShareStats(): void {
+  sharedViewHits = 0;
+  sharedViewMisses = 0;
+}
+
+function aliasViewMatches(
+  mesh: AliasMesh, nv: number,
+  ex: number, ey: number, ez: number,
+  a0: number, a1: number, a2: number,
+  fA: number, fB: number, t: number,
+  cam: Camera,
+): boolean {
+  if (sharedViewMesh !== mesh || sharedViewNV !== nv) return false;
+  if (sharedViewWX !== aliasScratchX || sharedViewVX !== aliasViewX) return false;
+  const k = sharedViewKey;
+  return k[0] === ex && k[1] === ey && k[2] === ez &&
+    k[3] === a0 && k[4] === a1 && k[5] === a2 &&
+    k[6] === t && k[7] === fA && k[8] === fB &&
+    k[9] === cam.origin[0]! && k[10] === cam.origin[1]! && k[11] === cam.origin[2]! &&
+    k[12] === cam.forward[0]! && k[13] === cam.forward[1]! && k[14] === cam.forward[2]! &&
+    k[15] === cam.right[0]! && k[16] === cam.right[1]! && k[17] === cam.right[2]! &&
+    k[18] === cam.up[0]! && k[19] === cam.up[1]! && k[20] === cam.up[2]!;
+}
+
+function aliasViewRecord(
+  mesh: AliasMesh, nv: number,
+  ex: number, ey: number, ez: number,
+  a0: number, a1: number, a2: number,
+  fA: number, fB: number, t: number,
+  cam: Camera,
+): void {
+  sharedViewMesh = mesh;
+  sharedViewNV = nv;
+  sharedViewWX = aliasScratchX;
+  sharedViewVX = aliasViewX;
+  const k = sharedViewKey;
+  k[0] = ex; k[1] = ey; k[2] = ez;
+  k[3] = a0; k[4] = a1; k[5] = a2;
+  k[6] = t; k[7] = fA; k[8] = fB;
+  k[9] = cam.origin[0]!; k[10] = cam.origin[1]!; k[11] = cam.origin[2]!;
+  k[12] = cam.forward[0]!; k[13] = cam.forward[1]!; k[14] = cam.forward[2]!;
+  k[15] = cam.right[0]!; k[16] = cam.right[1]!; k[17] = cam.right[2]!;
+  k[18] = cam.up[0]!; k[19] = cam.up[1]!; k[20] = cam.up[2]!;
+}
+
 /** Grow world-vert scratch for meshes larger than the default 4096 verts
  * (register-time-sized real MD2s). Amortised: allocates only on a new max. */
 function ensureAliasScratch(nv: number): void {
@@ -553,6 +659,14 @@ function ensureAliasScratch(nv: number): void {
   aliasScratchX = new Float32Array(nv);
   aliasScratchY = new Float32Array(nv);
   aliasScratchZ = new Float32Array(nv);
+}
+
+/** Grow the view-space scratch alongside the world scratch (same policy). */
+function ensureAliasViewScratch(nv: number): void {
+  if (nv <= aliasViewX.length) return;
+  aliasViewX = new Float64Array(nv);
+  aliasViewY = new Float64Array(nv);
+  aliasViewZ = new Float64Array(nv);
 }
 const aliasTri: TriVert[] = [
   { x: 0, y: 0, iz: 0, u: 0, v: 0, grade: 0 },
@@ -655,11 +769,12 @@ export function fillAffineTri(
   const inv = 1 / area;
   for (let y = minY; y <= maxY; y++) {
     const yc = y + 0.5;
-    // clip x range via edge intersections
+    // clip x range via edge intersections (no per-row temp array — perf
+    // remediation item 7: identical intersections, zero allocation).
     let xa = Infinity, xb = -Infinity;
-    const pts = [a, b, c];
     for (let i = 0; i < 3; i++) {
-      const p0 = pts[i]!, p1 = pts[(i + 1) % 3]!;
+      const p0 = i === 0 ? a : i === 1 ? b : c;
+      const p1 = i === 0 ? b : i === 1 ? c : a;
       if ((p0.y <= yc && p1.y > yc) || (p1.y <= yc && p0.y > yc)) {
         const tt = (yc - p0.y) / (p1.y - p0.y);
         const x = p0.x + (p1.x - p0.x) * tt;
@@ -751,6 +866,14 @@ const clipOLB = new Float64Array(4);
 const _aliasTex = new Uint8Array(3);
 const _aliasLit = new Uint8Array(3);
 
+/**
+ * Per-tri mip-scale table (perf remediation item 4): `1 / (1 << lvl)` is
+ * exact in binary, so the table holds the identical doubles the per-pixel
+ * division would compute. Module-scope (alias is main-thread only), sized
+ * for any sane chain depth, filled per tri for [0, maxLevel].
+ */
+const triInvScale = new Float64Array(32);
+
 function clipPolyNearLight(near: number): number {
   let m = 0;
   for (let i = 0; i < 3; i++) {
@@ -817,19 +940,41 @@ export function fillPerspTriRGB(
   // uiz/iz recover level-0 texel units, so du/dv are already texels per
   // pixel (no width multiply — cf. drawSpansRGB's dudx; multiplying by
   // base.width here forced coarse mips and dark edge-repeat averages).
+  //
+  // Perf remediation item 7: the old per-tri Array-of-pairs alloc is
+  // unrolled (identical arithmetic, zero allocation).
   let rho = 0;
-  const edges: Array<[PerspVert, PerspVert]> = [[a, b], [b, c], [c, a]];
-  for (let e = 0; e < 3; e++) {
-    const p = edges[e]![0], q = edges[e]![1];
-    const dx = p.x - q.x, dy = p.y - q.y;
-    const pix = Math.sqrt(dx * dx + dy * dy);
-    if (!(pix > 0)) continue;
-    const pu0 = p.uiz / p.iz, pv0 = p.viz / p.iz;
-    const qu0 = q.uiz / q.iz, qv0 = q.viz / q.iz;
-    const du = Math.abs(pu0 - qu0) / pix;
-    const dv = Math.abs(pv0 - qv0) / pix;
-    const r = du > dv ? du : dv;
-    if (r > rho) rho = r;
+  {
+    let dx = a.x - b.x, dy = a.y - b.y;
+    let pix = Math.sqrt(dx * dx + dy * dy);
+    if (pix > 0) {
+      const pu0 = a.uiz / a.iz, pv0 = a.viz / a.iz;
+      const qu0 = b.uiz / b.iz, qv0 = b.viz / b.iz;
+      let r = Math.abs(pu0 - qu0) / pix;
+      const dv = Math.abs(pv0 - qv0) / pix;
+      if (dv > r) r = dv;
+      if (r > rho) rho = r;
+    }
+    dx = b.x - c.x; dy = b.y - c.y;
+    pix = Math.sqrt(dx * dx + dy * dy);
+    if (pix > 0) {
+      const pu0 = b.uiz / b.iz, pv0 = b.viz / b.iz;
+      const qu0 = c.uiz / c.iz, qv0 = c.viz / c.iz;
+      let r = Math.abs(pu0 - qu0) / pix;
+      const dv = Math.abs(pv0 - qv0) / pix;
+      if (dv > r) r = dv;
+      if (r > rho) rho = r;
+    }
+    dx = c.x - a.x; dy = c.y - a.y;
+    pix = Math.sqrt(dx * dx + dy * dy);
+    if (pix > 0) {
+      const pu0 = c.uiz / c.iz, pv0 = c.viz / c.iz;
+      const qu0 = a.uiz / a.iz, qv0 = a.viz / a.iz;
+      let r = Math.abs(pu0 - qu0) / pix;
+      const dv = Math.abs(pv0 - qv0) / pix;
+      if (dv > r) r = dv;
+      if (r > rho) rho = r;
+    }
   }
   const lod = rgbMipLevel(rho, mat.lodBias, maxLevel);
   const overbright = mat.overbright;
@@ -841,6 +986,15 @@ export function fillPerspTriRGB(
   // usually black gutter — fringing every UV-island border dark.
   const wrapS = mat.addressS === 'repeat';
   const wrapT = mat.addressT === 'repeat';
+  // Upload-time opacity proof (perf remediation item 4): alias materials
+  // are built with opaqueMask, so every mip mask is all-opaque and the
+  // per-pixel hole test below short-circuits before the mask load.
+  // Bit-identical: masked-out texels cannot exist when the proof holds.
+  const opaque = mat.opaqueMask === true;
+  // Per-tri mip-scale table (perf remediation item 4): `1 / (1 << lvl)` is
+  // exact in binary for every lvl, so hoisting the per-pixel division into
+  // a table lookup is bit-identical and saves a division per pixel.
+  for (let l = 0; l <= maxLevel && l < 31; l++) triInvScale[l] = 1 / (1 << l);
   const zOff = !Number.isInteger(zbw) || zbw < 1 || zbw > 23;
   const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
   const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
@@ -854,9 +1008,11 @@ export function fillPerspTriRGB(
   for (let y = minY; y <= maxY; y++) {
     const yc = y + 0.5;
     let xa = Infinity, xb = -Infinity;
-    const pts = [a, b, c];
+    // Edge walk without the per-row [a,b,c] temp array (perf remediation
+    // item 7): identical intersections, zero allocation.
     for (let i = 0; i < 3; i++) {
-      const p0 = pts[i]!, p1 = pts[(i + 1) % 3]!;
+      const p0 = i === 0 ? a : i === 1 ? b : c;
+      const p1 = i === 0 ? b : i === 1 ? c : a;
       if ((p0.y <= yc && p1.y > yc) || (p1.y <= yc && p0.y > yc)) {
         const tt = (yc - p0.y) / (p1.y - p0.y);
         const x = p0.x + (p1.x - p0.x) * tt;
@@ -884,6 +1040,11 @@ export function fillPerspTriRGB(
       if (zOff) {
         qn = Math.round(d01 * 65535) & 0xffff;
         pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+      } else if (zbw >= 16) {
+        // Fast path (perf remediation item 4): the helper's `bits >= 16`
+        // lane, verbatim — same rounding/saturation/tie behaviour, no call.
+        qn = Math.round(d01 * 65535) & 0xffff;
+        pass = qn < qo;
       } else {
         qn = windowDepthQ16(d01, zbw);
         pass = qn < qo;
@@ -897,11 +1058,11 @@ export function fillPerspTriRGB(
         // times smaller: scale into the selected level before the hole test
         // and the sample, or full-res coords wrap/clamp into the wrong texel
         // (e.g. u=2.0 on a 2-wide mip1 reads (0,0) instead of (1,0)).
-        const sc = 1 / (1 << lvl);
+        const sc = triInvScale[lvl]!;
         const us = u * sc, vs = v * sc;
         const mx = rgbWrapCoord(us | 0, t.width, wrapS);
         const my = rgbWrapCoord(vs | 0, t.height, wrapT);
-        if (t.mask[my * t.width + mx]! === 0) continue;
+        if (!opaque && t.mask[my * t.width + mx]! === 0) continue;
         rgbSampleTexture(t.data, t.width, t.height, us, vs, _aliasTex, 0, wrapS, wrapT);
         const lr = Math.round((w0 * a.r + w1 * b.r + w2 * c.r) * 255);
         const lg = Math.round((w0 * a.g + w1 * b.g + w2 * c.g) * 255);
@@ -970,14 +1131,37 @@ export function drawAliasInstanceRGB(
   const fA = mesh.frames.subarray(inst.frameA * nv * 3, (inst.frameA + 1) * nv * 3);
   const fB = mesh.frames.subarray(inst.frameB * nv * 3, (inst.frameB + 1) * nv * 3);
   const t = inst.lerp;
+  // Shared setup (perf remediation item 7): the classic twin computes the
+  // identical world + view verts for the identical inputs, so reuse them
+  // when they match (drawForeground always runs classic first). The
+  // per-vertex RGB light below still runs (lighting is RGB-only state).
   const wx = aliasScratchX, wy = aliasScratchY, wz = aliasScratchZ;
-  for (let i = 0; i < nv; i++) {
-    const lx = fA[i * 3]! + (fB[i * 3]! - fA[i * 3]!) * t;
-    const ly = fA[i * 3 + 1]! + (fB[i * 3 + 1]! - fA[i * 3 + 1]!) * t;
-    const lz = fA[i * 3 + 2]! + (fB[i * 3 + 2]! - fA[i * 3 + 2]!) * t;
-    wx[i] = lx * fxx - ly * rxx + lz * uxx + eox;
-    wy[i] = lx * fxy - ly * rxy + lz * uxy + eoy;
-    wz[i] = lx * fxz - ly * rxz + lz * uxz + eoz;
+  const a0 = inst.angles[0]!, a1 = inst.angles[1]!, a2 = inst.angles[2]!;
+  if (!aliasViewMatches(mesh, nv, eox, eoy, eoz, a0, a1, a2,
+    inst.frameA, inst.frameB, t, cam)) {
+    sharedViewMisses++;
+    ensureAliasViewScratch(nv);
+    for (let i = 0; i < nv; i++) {
+      const lx = fA[i * 3]! + (fB[i * 3]! - fA[i * 3]!) * t;
+      const ly = fA[i * 3 + 1]! + (fB[i * 3 + 1]! - fA[i * 3 + 1]!) * t;
+      const lz = fA[i * 3 + 2]! + (fB[i * 3 + 2]! - fA[i * 3 + 2]!) * t;
+      // Store-then-read like the classic path (see its NOTE): the view
+      // transform consumes the Float32-rounded world verts, not the
+      // unrounded locals, so the shared record stays projection-identical.
+      wx[i] = lx * fxx - ly * rxx + lz * uxx + eox;
+      wy[i] = lx * fxy - ly * rxy + lz * uxy + eoy;
+      wz[i] = lx * fxz - ly * rxz + lz * uxz + eoz;
+      const px = wx[i]! - cam.origin[0]!;
+      const py = wy[i]! - cam.origin[1]!;
+      const pz = wz[i]! - cam.origin[2]!;
+      aliasViewX[i] = px * cam.right[0]! + py * cam.right[1]! + pz * cam.right[2]!;
+      aliasViewY[i] = px * cam.up[0]! + py * cam.up[1]! + pz * cam.up[2]!;
+      aliasViewZ[i] = px * cam.forward[0]! + py * cam.forward[1]! + pz * cam.forward[2]!;
+    }
+    aliasViewRecord(mesh, nv, eox, eoy, eoz, a0, a1, a2,
+      inst.frameA, inst.frameB, t, cam);
+  } else {
+    sharedViewHits++;
   }
   void anorms;
   const row = (inst.lightAngle & 255) * ANORM_COUNT;
@@ -1014,12 +1198,7 @@ export function drawAliasInstanceRGB(
     let allIn = true;
     for (let k = 0; k < 3; k++) {
       const vi = mesh.tris[ti * 3 + k]!;
-      const px = wx[vi]! - cam.origin[0]!;
-      const py = wy[vi]! - cam.origin[1]!;
-      const pz = wz[vi]! - cam.origin[2]!;
-      const vx = px * cam.right[0]! + py * cam.right[1]! + pz * cam.right[2]!;
-      const vy = px * cam.up[0]! + py * cam.up[1]! + pz * cam.up[2]!;
-      const vz2 = px * cam.forward[0]! + py * cam.forward[1]! + pz * cam.forward[2]!;
+      const vx = aliasViewX[vi]!, vy = aliasViewY[vi]!, vz2 = aliasViewZ[vi]!;
       clipIX[k] = vx; clipIY[k] = vy; clipIZ[k] = vz2;
       clipIU[k] = mesh.st[vi * 2]!;
       clipIV[k] = mesh.st[vi * 2 + 1]!;

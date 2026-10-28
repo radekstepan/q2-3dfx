@@ -320,6 +320,17 @@ export class DLightState {
   dlightBits = new Map<number, number>();
   dlightFrame = new Map<number, number>();
   frame = 0;
+  /**
+   * Per-surface stamp (perf remediation item 6): appends each affected
+   * surface id exactly once per markLights call without the old O(n^2)
+   * `affected.includes()` scan. Indexed by surface position, stamped by
+   * frame; sized on demand, never reallocated in steady state.
+   */
+  private markStamp: Int32Array = new Int32Array(0);
+  private markTick = 0;
+  /** Observability (test hook): precise distance tests vs AABB early-outs. */
+  lastTests = 0;
+  lastAabbRejects = 0;
 
   clear(): void {
     if (this.lights.length === 0) return;
@@ -387,22 +398,71 @@ export class DLightState {
     this.frame++;
     const n = count ?? surfs.length;
     const affected: number[] = [];
+    if (this.lights.length === 0 || n <= 0) return affected;
+    // Bounded once-per-surface storage: stamp each position the first time
+    // a light touches it this call, append the id then (not once per
+    // light). The old `affected.includes()` scan was O(touched^2) per
+    // frame; this is O(1) amortised per touch. Tick overflow (2^31 calls)
+    // clears the stamps instead of aliasing a stale generation.
+    if (this.markStamp.length < n) {
+      const grown = new Int32Array(Math.max(16, n));
+      grown.set(this.markStamp.subarray(0, Math.min(this.markStamp.length, grown.length)));
+      this.markStamp = grown;
+    }
+    this.markTick++;
+    if (this.markTick === 0x7fffffff) {
+      this.markStamp.fill(0);
+      this.markTick = 1;
+    }
+    const tick = this.markTick;
+    const stamp = this.markStamp;
+    let tests = 0;
+    let rejects = 0;
     for (let li = 0; li < this.lights.length; li++) {
       const l = this.lights[li]!;
       const rad = l.intensity < 0 ? -l.intensity : l.intensity;
+      const rad2 = rad * rad;
       const bit = 1 << li;
+      const ox = l.origin[0]!, oy = l.origin[1]!, oz = l.origin[2]!;
       for (let si = 0; si < n; si++) {
         const s = surfs[si]!;
-        const dist = bboxDistance(l.origin, s.mins, s.maxs);
-        if (dist > rad) continue;
-        if (this.dlightFrame.get(s.id) !== this.frame) {
-          this.dlightFrame.set(s.id, this.frame);
-          this.dlightBits.set(s.id, 0);
+        // Spatial rejection before the precise test: per-axis excess over
+        // the surface bbox, exiting early when the partial sum already
+        // exceeds rad^2. Surfaces rejected here can never satisfy
+        // dist <= rad (dist^2 is the full three-axis sum), so the sqrt
+        // below runs only for true candidates — identical affected set,
+        // far fewer sqrts on combat frames (all-lights x all-surfaces).
+        const mins = s.mins, maxs = s.maxs;
+        let d2 = 0;
+        let d = mins[0]! - ox;
+        if (d > 0) { d2 = d * d; if (d2 > rad2) { rejects++; continue; } }
+        else { d = ox - maxs[0]!; if (d > 0) { d2 = d * d; if (d2 > rad2) { rejects++; continue; } } }
+        d = mins[1]! - oy;
+        if (d > 0) { d2 += d * d; if (d2 > rad2) { rejects++; continue; } }
+        else { d = oy - maxs[1]!; if (d > 0) { d2 += d * d; if (d2 > rad2) { rejects++; continue; } } }
+        d = mins[2]! - oz;
+        if (d > 0) { d2 += d * d; if (d2 > rad2) { rejects++; continue; } }
+        else { d = oz - maxs[2]!; if (d > 0) { d2 += d * d; if (d2 > rad2) { rejects++; continue; } } }
+        tests++;
+        if (d2 > rad2) continue;
+        if (stamp[si]! !== tick) {
+          stamp[si] = tick;
+          if (this.dlightFrame.get(s.id) !== this.frame) {
+            this.dlightFrame.set(s.id, this.frame);
+            this.dlightBits.set(s.id, 0);
+          }
+          this.dlightBits.set(s.id, this.dlightBits.get(s.id)! | bit);
+          affected.push(s.id);
+        } else {
+          this.dlightBits.set(s.id, this.dlightBits.get(s.id)! | bit);
         }
-        this.dlightBits.set(s.id, this.dlightBits.get(s.id)! | bit);
-        if (!affected.includes(s.id)) affected.push(s.id);
       }
     }
+    this.lastTests = tests;
+    this.lastAabbRejects = rejects;
+    // Sorted output preserved (the frame path binary-searches it): pushes
+    // arrive in surface order, which is id order for level bounds but NOT
+    // guaranteed (mover grafts), so the explicit sort stays.
     affected.sort((a, b) => a - b);
     return affected;
   }

@@ -915,6 +915,15 @@ export interface RGBMaterial {
   alphaTest: number | null;
   /** Write 1/z on a passed depth test (false for translucent surfaces). */
   depthWrite: boolean;
+  /**
+   * Upload-time opacity proof (perf remediation item 4): true when every
+   * mip mask is all-opaque (built with `opaqueMask: true` — see
+   * buildRGBChain/halveRGBLevel, which preserve all-ones masks through
+   * every halve). Lets the pixel loops skip the mask tap + hole branch
+   * entirely (`opaque || mask[i]` short-circuits before the load).
+   * Internal only; the frozen renderer-api contract is untouched.
+   */
+  opaqueMask: boolean;
 }
 
 /** Row-major 4x4 Bayer matrix, values 0..15 (voodoo bayer.ts port). */
@@ -1407,6 +1416,7 @@ export function buildRGBMaterial(
     alphaTest: opts?.alphaTest ?? null,
     depthWrite: opts?.depthWrite ?? true,
     alpha,
+    opaqueMask: opts?.opaqueMask === true,
     warp: opts?.warp ?? false,
     turbPhase: (opts?.turbPhase ?? 0) & 1023,
     flatColor: opts?.flatColor ? opts.flatColor.slice(0, 3) : null,
@@ -1497,6 +1507,12 @@ export function runSubdivRGBRepeat(
   const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
   const bilinear = mat.bilinear !== false;
+  // Upload-time opacity proof (perf remediation item 4): when true every
+  // mip mask is all-opaque, so the pixel loops below skip the mask tap +
+  // hole branch via `opaque || mask[i]` (short-circuit: no load, no index
+  // arithmetic). Loop-invariant → perfectly predicted. Bit-identical: the
+  // masked-out pixels cannot exist when the proof holds.
+  const opaque = mat.opaqueMask === true;
   // Window-Z depth (Voodoo3 hardware model): per-fragment depth01 from the
   // projection window, quantised to mat.zbits steps (0 = full-precision
   // float compare, legacy escape hatch). Integer LESS, ties keep stored.
@@ -1566,6 +1582,17 @@ export function runSubdivRGBRepeat(
       if (zOff) {
         qn = Math.round(d01 * 65535) & 0xffff;
         pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+      } else if (zbw >= 16) {
+        // Fast path (perf remediation item 4): 16+ bit policies store the
+        // full-precision rounded quantum — windowDepthQ16's own `bits >= 16`
+        // lane, verbatim (d01 is already clamped + NaN-free above, so the
+        // call would compute exactly this). Inlined to save the call per
+        // pixel; sub-16-bit policies keep the quantised helper. Rounding
+        // (half-up via Math.round), saturation (d01 in [0,1]) and tie
+        // behaviour (strict LESS below) are unchanged; the zOff
+        // float-compare escape hatch above is untouched.
+        qn = Math.round(d01 * 65535) & 0xffff;
+        pass = qn < qo;
       } else {
         qn = windowDepthQ16(d01, zbw);
         pass = qn < qo;
@@ -1580,7 +1607,7 @@ export function runSubdivRGBRepeat(
         else { mx = xi % w0; if (mx < 0) mx += w0; }
         if (hm0 !== 0) my = yi & hm0;
         else { my = yi % h0; if (my < 0) my += h0; }
-        if (mk0[my * w0 + mx]! !== 0) {
+        if (opaque || mk0[my * w0 + mx]! !== 0) {
           const fu = ((st & 0xffff) + 128) >> 8;
           const fv = ((sv & 0xffff) + 128) >> 8;
           const x1 = mx + 1 === w0 ? 0 : mx + 1;
@@ -1649,6 +1676,17 @@ export function runSubdivRGBRepeat(
     if (zOff) {
       qn = Math.round(d01 * 65535) & 0xffff;
       pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+    } else if (zbw >= 16) {
+      // Fast path (perf remediation item 4): 16+ bit policies store the
+      // full-precision rounded quantum — windowDepthQ16's own `bits >= 16`
+      // lane, verbatim (d01 is already clamped + NaN-free above, so the call
+      // would compute exactly this). Inlined to save the call per pixel;
+      // sub-16-bit policies keep the quantised helper. Rounding (half-up
+      // via Math.round), saturation (d01 in [0,1]) and tie behaviour
+      // (strict LESS below) are unchanged; the zOff float-compare escape
+      // hatch above is untouched.
+      qn = Math.round(d01 * 65535) & 0xffff;
+      pass = qn < qo;
     } else {
       qn = windowDepthQ16(d01, zbw);
       pass = qn < qo;
@@ -1672,7 +1710,7 @@ export function runSubdivRGBRepeat(
       else { mx = xi % ww; if (mx < 0) mx += ww; }
       if (hmm !== 0) my = yi & hmm;
       else { my = yi % hh; if (my < 0) my += hh; }
-      if (mk[my * ww + mx]! !== 0) {
+      if (opaque || mk[my * ww + mx]! !== 0) {
         const fu = ((st & 0xffff) + 128) >> 8;
         const fv = ((sv & 0xffff) + 128) >> 8;
         const x1 = mx + 1 === ww ? 0 : mx + 1;
@@ -1763,6 +1801,12 @@ export function runSubdivRGBClamp(
   const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
   const bilinear = mat.bilinear !== false;
+  // Upload-time opacity proof (perf remediation item 4): when true every
+  // mip mask is all-opaque, so the pixel loops below skip the mask tap +
+  // hole branch via `opaque || mask[i]` (short-circuit: no load, no index
+  // arithmetic). Loop-invariant → perfectly predicted. Bit-identical: the
+  // masked-out pixels cannot exist when the proof holds.
+  const opaque = mat.opaqueMask === true;
   // Window-Z depth (Voodoo3 hardware model): per-fragment depth01 from the
   // projection window, quantised to mat.zbits steps (0 = full-precision
   // float compare, legacy escape hatch). Integer LESS, ties keep stored.
@@ -1821,6 +1865,17 @@ export function runSubdivRGBClamp(
     if (zOff) {
       qn = Math.round(d01 * 65535) & 0xffff;
       pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+    } else if (zbw >= 16) {
+      // Fast path (perf remediation item 4): 16+ bit policies store the
+      // full-precision rounded quantum — windowDepthQ16's own `bits >= 16`
+      // lane, verbatim (d01 is already clamped + NaN-free above, so the call
+      // would compute exactly this). Inlined to save the call per pixel;
+      // sub-16-bit policies keep the quantised helper. Rounding (half-up
+      // via Math.round), saturation (d01 in [0,1]) and tie behaviour
+      // (strict LESS below) are unchanged; the zOff float-compare escape
+      // hatch above is untouched.
+      qn = Math.round(d01 * 65535) & 0xffff;
+      pass = qn < qo;
     } else {
       qn = windowDepthQ16(d01, zbw);
       pass = qn < qo;
@@ -1840,7 +1895,7 @@ export function runSubdivRGBClamp(
       const uc = u < 0 ? 0 : u > twMax ? twMax : u;
       const vc = v < 0 ? 0 : v > thMax ? thMax : v;
       const mx = uc | 0, my = vc | 0;
-      if (tm[my * tw + mx]! !== 0) {
+      if (opaque || tm[my * tw + mx]! !== 0) {
         const fu = Math.round((uc - mx) * 256);
         const fv = Math.round((vc - my) * 256);
         const x1 = mx + 1 < tw ? mx + 1 : mx;
@@ -1990,6 +2045,12 @@ export function runSubdivRGBGeneric(
   const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
   const bilinear = mat.bilinear !== false;
+  // Upload-time opacity proof (perf remediation item 4): when true every
+  // mip mask is all-opaque, so the pixel loops below skip the mask tap +
+  // hole branch via `opaque || mask[i]` (short-circuit: no load, no index
+  // arithmetic). Loop-invariant → perfectly predicted. Bit-identical: the
+  // masked-out pixels cannot exist when the proof holds.
+  const opaque = mat.opaqueMask === true;
   // Window-Z depth (Voodoo3 hardware model): per-fragment depth01 from the
   // projection window, quantised to mat.zbits steps (0 = full-precision
   // float compare, legacy escape hatch). Integer LESS, ties keep stored.
@@ -2061,6 +2122,17 @@ export function runSubdivRGBGeneric(
     if (zOff) {
       qn = Math.round(d01 * 65535) & 0xffff;
       pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+    } else if (zbw >= 16) {
+      // Fast path (perf remediation item 4): 16+ bit policies store the
+      // full-precision rounded quantum — windowDepthQ16's own `bits >= 16`
+      // lane, verbatim (d01 is already clamped + NaN-free above, so the call
+      // would compute exactly this). Inlined to save the call per pixel;
+      // sub-16-bit policies keep the quantised helper. Rounding (half-up
+      // via Math.round), saturation (d01 in [0,1]) and tie behaviour
+      // (strict LESS below) are unchanged; the zOff float-compare escape
+      // hatch above is untouched.
+      qn = Math.round(d01 * 65535) & 0xffff;
+      pass = qn < qo;
     } else {
       qn = windowDepthQ16(d01, zbw);
       pass = qn < qo;
@@ -2108,7 +2180,7 @@ export function runSubdivRGBGeneric(
         my = vc | 0;
         qfv = Math.round((vc - my) * 256);
       }
-      if (mk[my * ww + mx]! !== 0) {
+      if (opaque || mk[my * ww + mx]! !== 0) {
         const x1 = wrapS ? (mx + 1 === ww ? 0 : mx + 1) : (mx + 1 < ww ? mx + 1 : mx);
         const y1 = wrapT ? (my + 1 === hh ? 0 : my + 1) : (my + 1 < hh ? my + 1 : my);
         const row0 = my * ww, row1 = y1 * ww;
@@ -2195,6 +2267,11 @@ export function runSpanFlatRGB(
     if (zOff) {
       qn = Math.round(d01 * 65535) & 0xffff;
       pass = qo === 0xffff ? d01 < 1 : d01 < qo / 65535;
+    } else if (zbits >= 16) {
+      // Fast path (perf remediation item 4): same verbatim equivalence as
+      // the subdiv loops — the helper's `bits >= 16` lane, no call.
+      qn = Math.round(d01 * 65535) & 0xffff;
+      pass = qn < qo;
     } else {
       qn = windowDepthQ16(d01, zbits);
       pass = qn < qo;

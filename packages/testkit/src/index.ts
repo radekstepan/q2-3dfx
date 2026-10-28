@@ -7,6 +7,7 @@ export * from './demo-determinism.js';
 export * from './sidebyside.js';
 export * from './cache-flythrough.js';
 export * from './voodoo-baseline.js';
+export * from './perf-budget.js';
 
 export const GOLDEN_TOLERANCE_SOFTWARE = 0;
 export const GOLDEN_TOLERANCE_VOODOO_LSB = 1;

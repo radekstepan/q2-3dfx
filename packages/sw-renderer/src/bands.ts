@@ -437,6 +437,13 @@ export const R_FLAG_REPEAT = 32;
 export const R_FLAG_LIGHT = 64;
 /** SPAN_FLAT solid fill (flatColor in R_FLATRGB). */
 export const R_FLAG_FLAT = 128;
+/**
+ * Upload-time opacity proof (perf remediation item 4): the staged chain's
+ * masks are all-opaque, so the raster core skips the mask tap + hole
+ * branch. Set by frame.ts from mat.opaqueMask; old writers leave it clear
+ * (mask path, identical output).
+ */
+export const R_FLAG_OPAQUE = 256;
 
 /** Int32 fields per chain directory entry. */
 export const C_LEVEL_BASE = 0; // base into the level table
@@ -783,6 +790,8 @@ export interface RGBWorkerMaterial {
   flatColor: Uint8Array | null;
   depthWrite: boolean;
   repeat: boolean;
+  /** Upload-time opacity proof: skips the mask tap + hole branch. */
+  opaqueMask: boolean;
 }
 
 /** Adapt a worker material to the shared RGBMaterial shape (subdiv input). */
@@ -804,6 +813,7 @@ export function workerMaterialToRGB(m: RGBWorkerMaterial): RGBMaterial {
     flatColor: m.flatColor,
     alphaTest: null,
     depthWrite: m.depthWrite,
+    opaqueMask: m.opaqueMask,
   };
 }
 
@@ -1406,6 +1416,7 @@ export function processRGBFrameJob(
     flatColor: null,
     alphaTest: null,
     depthWrite: true,
+    opaqueMask: false,
   };
   let pixels = 0;
   let drawn = 0;
@@ -1459,6 +1470,7 @@ export function processRGBFrameJob(
       reuseMat.flatColor = null;
     }
     reuseMat.depthWrite = (flags & R_FLAG_DEPTHWRITE) !== 0;
+    reuseMat.opaqueMask = (flags & R_FLAG_OPAQUE) !== 0;
     const r = rasterizePackedRGBRange(
       rgb.rgb565, rgb.cover, rgb.rgbDepth, fbW, fbH,
       rgb.spansF, rgb.spansI, spanBase, spanCount,
@@ -1482,6 +1494,23 @@ export function processRGBFrameJob(
  * descriptors run sequentially in pack order, exactly like the equivalent
  * per-batch kicks. Bit-identical to the single-threaded path.
  */
+/**
+ * Rasterise one band's share of a frame kick: every descriptor in order,
+ * each with its own staged (tex, light) setup. Bands are disjoint row
+ * ranges so cross-band order cannot affect any pixel; within a band the
+ * descriptors run sequentially in pack order, exactly like the equivalent
+ * per-batch kicks. Bit-identical to the single-threaded path.
+ *
+ * Perf remediation item 2: the first pass derives each descriptor's staged
+ * span y-range into scratch (one integer pass over the frame's flat spans),
+ * and the drain pass skips descriptors with no overlap for this band BEFORE
+ * any material/view setup (no texel/light subarray views, no mask math).
+ * Order is preserved (skips only touch rows this band never draws); legacy
+ * empty batches (spanCount <= 0) still `continue` exactly as before, and
+ * the full-frame inline replay overlaps everything so it culls nothing.
+ */
+const jobRangeScratch = new Int32Array(MAX_FRAME_BATCHES * 2);
+
 export function processFrameJob(
   fv: FrameAccumViews, fbW: number, fbH: number, descCount: number,
   y0: number, y1: number,
@@ -1489,13 +1518,37 @@ export function processFrameJob(
   const { base, fSpansF, fSpansI, fTex, fLight, desc } = fv;
   const colormap = base.colormap;
   const turbTable = base.turb;
+  const total = descCount < MAX_FRAME_BATCHES ? descCount : MAX_FRAME_BATCHES;
+  // Range pass: staged spans are row-ordered per batch (the emitter writes
+  // strictly increasing y), but batches interleave arbitrarily, so derive
+  // [ymin, ymax) per descriptor with one scan instead of trusting layout.
+  for (let b = 0; b < total; b++) {
+    const d = b * D_PER_BATCH;
+    const spanBase = desc[d + D_SPAN_BASE]!;
+    const spanCount = desc[d + D_SPAN_COUNT]!;
+    let ymin = 0x7fffffff;
+    let ymax = -0x80000000;
+    for (let s = 0; s < spanCount; s++) {
+      const y = fSpansI[(spanBase + s) * I_PER_SPAN + 1]!;
+      if (y < ymin) ymin = y;
+      if (y + 1 > ymax) ymax = y + 1;
+    }
+    jobRangeScratch[b * 2] = ymin;
+    jobRangeScratch[b * 2 + 1] = ymax;
+  }
   let pixels = 0;
   let drawn = 0;
-  for (let b = 0; b < descCount; b++) {
+  for (let b = 0; b < total; b++) {
     const d = b * D_PER_BATCH;
     const spanBase = desc[d + D_SPAN_BASE]!;
     const spanCount = desc[d + D_SPAN_COUNT]!;
     if (spanCount <= 0) continue;
+    // Band-cull: no staged row belongs to [y0, y1) — skip material + view
+    // setup entirely. Empty-range sentinels (no spans scanned) never reach
+    // here (spanCount <= 0 continued above), so ymax > ymin always holds.
+    const ymin = jobRangeScratch[b * 2]!;
+    const ymax = jobRangeScratch[b * 2 + 1]!;
+    if (ymax <= y0 || ymin >= y1) continue;
     const texOff = desc[d + D_TEX_OFF]!;
     const texW = desc[d + D_TEX_W]!;
     const texH = desc[d + D_TEX_H]!;

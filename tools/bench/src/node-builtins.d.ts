@@ -13,6 +13,12 @@ interface BenchBuffer extends Uint8Array {
 declare module 'node:fs' {
   export function readFileSync(path: string): BenchBuffer;
   export function existsSync(path: string): boolean;
+  export function statSync(path: string): { mtimeMs: number; isDirectory(): boolean };
+  export function readdirSync(path: string): string[];
+}
+
+declare module 'node:path' {
+  export function join(...parts: string[]): string;
 }
 
 declare module 'node:module' {

@@ -3,17 +3,25 @@
 // clear error without it, like the asset tests). Methodology recreated
 // from the gitignored bench.mjs era: medians over repeats, best-of-N
 // pooling comparison, phase split via SoftwareRenderer.testMeasurePhases.
+//
+// INSTRUMENTED attribution (attributeView: testMeasurePhases medians) vs
+// UNINSTRUMENTED totals (poolCompareView: whole begin+render+end loops
+// timed together per rep — never summed medians). Software path only;
+// the RGB production frame (fused resolveFrame / pooled flushScanout)
+// lives in rgbattr.ts.
 import { readFileSync, existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { loadBsp } from '@q2/bsp';
 import { parsePCX, parseWAL } from '@q2/formats';
 import { createFramebuffer } from '@q2/renderer-api';
 import { resetCVars, setCVar } from '@q2/config';
+import { machineJson } from '@q2/testkit';
 import {
   SoftwareRenderer, BandWorkerPool, bspToMiniWorld,
   SW_WORKERS_CVAR, SW_ACCUM_CVAR,
   type BspTexelSource, type FramePhases,
 } from '@q2/sw-renderer';
+import { distFreshness } from './rgbattr.js';
 
 export interface AttribView {
   origin: [number, number, number];
@@ -246,4 +254,17 @@ export async function runFrameBench(pakPath: string, workers = 5): Promise<void>
   for (const v of BASE1_VIEWS) attributeView(fw, v);
   console.log(`pooled A/B (workers=${workers}): spawn-north`);
   await poolCompareView(fw, BASE1_VIEWS[0]!, workers);
+  let commit = 'unknown';
+  try {
+    const cp = await import('child_process');
+    commit = cp.execSync('git rev-parse --short HEAD', { encoding: 'utf8' }).trim();
+  } catch { /* offline */ }
+  const machine = await machineJson().catch(() => ({ node: process.version }));
+  const fresh = distFreshness();
+  if (!fresh.fresh) {
+    console.log(
+      `WARN stale dist: tools/bench/dist older than ${fresh.newestSrcFile} — rebuild before trusting numbers (yarn build)`,
+    );
+  }
+  console.log(JSON.stringify({ machine, node: process.version, commit, workers, distFresh: fresh.fresh }, null, 2));
 }

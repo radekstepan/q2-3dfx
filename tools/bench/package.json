@@ -13,7 +13,8 @@
     "golden": "echo golden-ok",
     "bench": "echo bench-ok",
     "bench:frame": "node ./frame-bench.mjs",
-    "bench:rgb": "node ./rgb-attr.mjs"
+    "bench:rgb": "node ./rgb-attr.mjs",
+    "bench:accept": "node ./bench-accept.mjs"
   },
   "dependencies": {
     "@q2/bsp": "workspace:*",

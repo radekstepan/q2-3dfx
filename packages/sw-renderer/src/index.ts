@@ -59,7 +59,7 @@ export {
   R_SPAN_BASE, R_SPAN_COUNT, R_CHAIN, R_LUX_OFF, R_LUX_W, R_LUX_H,
   R_FLAGS, R_ZBITS, R_TURBPHASE, R_FLATRGB, R_YMIN, R_YMAX, R_PER_BATCH,
   R_FLAG_WARP, R_FLAG_BILINEAR, R_FLAG_MIPDITHER, R_FLAG_OVERBRIGHT,
-  R_FLAG_DEPTHWRITE, R_FLAG_REPEAT, R_FLAG_LIGHT, R_FLAG_FLAT,
+  R_FLAG_DEPTHWRITE, R_FLAG_REPEAT, R_FLAG_LIGHT, R_FLAG_FLAT, R_FLAG_OPAQUE,
   rgbAccumLayout, rgbAccumTotal, attachRGBAccum,
   workerMaterialToRGB, SCAN_KICK_LEN,
   BandedSoftwareBackend,
@@ -101,7 +101,7 @@ export {
 
 export {
   collectVisibleSurfaces, findLeaf, clusterVisible, surfFrustumCulled, nodePlaneSide,
-  isMiniWorld,
+  isMiniWorld, testMarkCacheStats, testResetMarkCacheStats,
   type MiniNode, type MiniLeaf, type MiniTexture, type MiniLightmap, type MiniSurf,
   type MiniWorld, type PlacedAlias, type PlacedSprite, type PlacedParticle,
 } from './worldNodes.js';
@@ -116,6 +116,7 @@ export {
   drawAliasInstance, fillAffineTri, DEPTHHACK_SCALE,
   drawAliasInstanceRGB, fillPerspTriRGB,
   clampBacklerp, aliasAlphaKeeps,
+  testAliasShareStats, testResetAliasShareStats,
   type AliasMesh, type AliasInstance, type AliasSkin, type Md2Like,
 } from './alias.js';
 
@@ -139,12 +140,13 @@ export {
 } from './bspWorld.js';
 
 export {
-  SoftwareRenderer, sortBatchByRow, nextPot, MAX_SPANS,
+  SoftwareRenderer, sortBatchByRow, spansBatchIsRowOrdered, nextPot, MAX_SPANS,
+  aliasModelBounds, sphereCulledByFlatFrustum,
   setRGBWorldEnabled, isRGBWorldEnabled,
   SW_RGB_SKIP_CLASSIC_CVAR, skipClassicRequested,
   readRGBFidelity, sameRGBFidelity,
   ALIAS_LOD_BIAS_DELTA,
-  type RGBFidelity,
+  type RGBFidelity, type ModelBounds,
 } from './frame.js';
 export {
   createFramePhases, phaseNow,

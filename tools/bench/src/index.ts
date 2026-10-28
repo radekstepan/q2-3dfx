@@ -17,12 +17,17 @@ export {
   type AttribView, type FrameWorld, type PhaseRow, type PoolRow,
 } from './frame.js';
 export {
-  runRgbAttr, loadRgbAttrWorld, pinPerfCvars, fixedEntities,
-  RGB_ATTR_RESS, RGB_ATTR_SCENES,
+  runRgbAttr, runAttrConfig, loadRgbAttrWorld, pinPerfCvars, fixedEntities, combatEntities,
+  pumpCombatLights, scanoutOptsFromState, distFreshness, repoRoot,
+  PLAYBENCH_FRESHNESS_PKGS,
+  rgbBenchWorkers, rgbBenchEnts,
+  RGB_ATTR_RESS, RGB_ATTR_SCENES, RGB_ATTR_ENTS,
   type RgbAttrScene, type RgbAttrEntities, type RgbAttrMode,
   type RgbAttrWorld, type RgbAttrOptions, type AttrRow,
+  type DistFreshness,
 } from './rgbattr.js';
 export { playBench, type PlayBenchRow } from './playbench.js';
+export { runAcceptance, acceptWorkers, type AcceptOptions } from './acceptance.js';
 
 export async function runBenchTool(opts: BenchOptions = {}): Promise<string> {
   const width = opts.width ?? 640;

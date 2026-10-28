@@ -57,6 +57,7 @@ function testMat(levels: RGBMipLevel[], addressS: 'repeat' | 'clamp', addressT: 
     flatColor: null,
     alphaTest: null,
     depthWrite: true,
+    opaqueMask: false,
   };
 }
 

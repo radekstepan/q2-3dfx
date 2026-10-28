@@ -43,6 +43,7 @@ function pinEntry(chain: RGBMipLevel[]) {
       light: { samples: rgb, luxW: 4, luxH: 4 },
       overbright: false, lodBias: 0, mipDither: false, bilinear: true,
       zbits: 0, blend: 'opaque' as const, alphaTest: null, depthWrite: true,
+      opaqueMask: false,
       alpha: 1, warp: false, turbPhase: 0, flatColor: null,
     },
   };
@@ -127,6 +128,7 @@ describe('RGB texture-chain eviction ownership (P2)', () => {
         light: null, overbright: false, lodBias: 0, mipDither: false,
         bilinear: true, zbits: 0, blend: 'opaque' as const, alphaTest: null,
         depthWrite: true, alpha: 1, warp: false, turbPhase: 0, flatColor: null,
+        opaqueMask: false,
       },
     });
     const chainA = [{} as RGBMipLevel];

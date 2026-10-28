@@ -33,7 +33,7 @@ import {
   BandedSoftwareBackend, createBandBuffers, sabAvailable, workersRequestedByCvar,
   accumRequestedByCvar,
   R_FLAG_BILINEAR, R_FLAG_DEPTHWRITE, R_FLAG_FLAT, R_FLAG_LIGHT,
-  R_FLAG_MIPDITHER, R_FLAG_OVERBRIGHT, R_FLAG_REPEAT, R_FLAG_WARP,
+  R_FLAG_MIPDITHER, R_FLAG_OPAQUE, R_FLAG_OVERBRIGHT, R_FLAG_REPEAT, R_FLAG_WARP,
   type BandDispatcher,
 } from './bands.js';
 import {
@@ -285,11 +285,102 @@ export function sortBatchByRow(
   for (let i = 0; i < count; i++) spans[start + i] = tmp[i]!;
 }
 
+/**
+ * Emitter-order fast path (perf remediation item 3): emitSpansForPoly
+ * emits strictly increasing y with one span per row, which is exactly the
+ * order the row z-sort establishes — so for batches that came straight
+ * from the emitter the sort is a proven no-op. This single linear pass
+ * confirms the invariant (strictly increasing y) and the caller skips the
+ * counting sort entirely: no rowBase fill, no counting pass. Anything else
+ * (multi-face skybox batches are still per-face ordered; manual spans,
+ * translucent reordering) fails the check and falls through to the exact
+ * legacy sortBatchByRow above — output is identical in all cases. Clipping
+ * preserves the invariant (it only drops rows, never reorders). Call
+ * sites: single-poly world batches (opaque, sky-flat, skybox faces). The
+ * deferred translucent alpha loop keeps the general sorter (back-to-front
+ * ordering must be established, not assumed).
+ */
+export function spansBatchIsRowOrdered(pool: Span[], start: number, count: number): boolean {
+  if (count <= 1) return true;
+  let prev = pool[start]!.y;
+  for (let i = 1; i < count; i++) {
+    const y = pool[start + i]!.y;
+    if (y <= prev) return false;
+    prev = y;
+  }
+  return true;
+}
+
 interface RegisteredModel {
   kind: string;
   data: unknown;
   /** True when data is the procedural gun fallback (unknown md2 payload). */
   fallback: boolean;
+}
+
+/**
+ * Conservative model-space bounding sphere (perf remediation item 1):
+ * center + radius covering EVERY frame of the mesh (union over frames, so
+ * RF_FRAMELERP interpolation can never escape it). The world-space test
+ * uses origin + (|center| + radius), which is rotation-invariant (the
+ * entity basis is orthonormal), translation-exact, and — unlike
+ * origin-only culling — can never cull a large/rotated model whose origin
+ * is off-screen but whose geometry is visible. Depth-hack viewmodels are
+ * exempt from culling entirely (eye-anchored by contract).
+ */
+export interface ModelBounds {
+  cx: number; cy: number; cz: number; r: number;
+}
+
+/** Model-space sphere covering all frames of an alias mesh (register-time). */
+export function aliasModelBounds(mesh: AliasMesh): ModelBounds {
+  let minx = Infinity, miny = Infinity, minz = Infinity;
+  let maxx = -Infinity, maxy = -Infinity, maxz = -Infinity;
+  const f = mesh.frames;
+  const total = mesh.numFrames * mesh.numVerts * 3;
+  for (let i = 0; i < total; i += 3) {
+    const x = f[i]!, y = f[i + 1]!, z = f[i + 2]!;
+    if (x < minx) minx = x;
+    if (y < miny) miny = y;
+    if (z < minz) minz = z;
+    if (x > maxx) maxx = x;
+    if (y > maxy) maxy = y;
+    if (z > maxz) maxz = z;
+  }
+  if (!(minx <= maxx)) return { cx: 0, cy: 0, cz: 0, r: 0 };
+  const cx = (minx + maxx) / 2, cy = (miny + maxy) / 2, cz = (minz + maxz) / 2;
+  let r = 0;
+  for (let i = 0; i < total; i += 3) {
+    const dx = f[i]! - cx, dy = f[i + 1]! - cy, dz = f[i + 2]! - cz;
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (d > r) r = d;
+  }
+  return { cx, cy, cz, r };
+}
+
+/**
+ * Sphere-vs-frustum test on the hoisted flat planes (perf remediation item
+ * 1): true when the world-space sphere (center + radius) is entirely
+ * outside any frustum plane or fully behind the near plane. Conservative:
+ * touching/intersecting spheres always draw. Rotation/interp/near-plane/
+ * large-model safe by construction (the radius covers all frames and the
+ * worst-case center rotation).
+ */
+export function sphereCulledByFlatFrustum(
+  fp: Float64Array,
+  ox: number, oy: number, oz: number,
+  fwdx: number, fwdy: number, fwdz: number,
+  near: number,
+  cx: number, cy: number, cz: number,
+  r: number,
+): boolean {
+  // Fully behind the near plane (1/z would be negative — unprojectable).
+  if ((cx - ox) * fwdx + (cy - oy) * fwdy + (cz - oz) * fwdz + r < near) return true;
+  for (let p = 0; p < 20; p += 4) {
+    const d = fp[p]! * cx + fp[p + 1]! * cy + fp[p + 2]! * cz - fp[p + 3]!;
+    if (d < -r) return true;
+  }
+  return false;
 }
 
 /** Next power of two >= n (n >= 1). */
@@ -490,6 +581,26 @@ export class SoftwareRenderer implements Refresh {
   private rgbSkyMat: { tex: { width: number; height: number; texels: Uint8Array }; mat: RGBMaterial } | null = null;
   private rgbFlatSky: { index: number; mat: RGBMaterial } | null = null;
   private models: RegisteredModel[] = [];
+  /**
+   * Parallel model-space bounds (perf remediation item 1): modelBounds[h]
+   * covers models[h] for kind-'md2' alias meshes, null when the kind has
+   * no precomputable bounds (sprites billboard per frame, tracers are
+   * segments). Kept in lockstep with `models` (pushed in registerModel).
+   */
+  private modelBounds: (ModelBounds | null)[] = [];
+  /**
+   * Per-frame entity cull counters (perf remediation item 1): culled =
+   * instances skipped by the sphere test (zero expensive work: no setup,
+   * no projection, no fill), drawn = instances that reached a draw call.
+   * Reset at the top of renderView; read via testEntityCullStats().
+   */
+  private fgCulled = 0;
+  private fgDrawn = 0;
+  /**
+   * Memoised dev-mesh bounds for world-placed alias (same sphere rule as
+   * modelBounds, keyed by dev-mesh id; dev meshes are static).
+   */
+  private devMeshBounds = new Map<number, ModelBounds | null>();
   private skins: Texture[] = [];
   private skinNames: string[] = [];
   private scratch: EdgeScratch = createEdgeScratch(64);
@@ -613,8 +724,14 @@ export class SoftwareRenderer implements Refresh {
    * non-reentrant by contract).
    */
   private skipForeground = false;
-  private fgCam: Camera | null = null;
-  private fgWorld: MiniWorld | null = null;
+  /**
+   * Stashed authoritative-skip decision for the async path (perf
+   * remediation item 8): phase-1 renderView records it with the other
+   * foreground inputs; phase-2 (after flushRGBAsync) applies the zb
+   * backfill from the same decision so both halves agree.
+   */
+  private fgSkipClassic = false;
+  private fgCam: Camera | null = null;  private fgWorld: MiniWorld | null = null;
   private fgDyn: DynamicLight[] | null = null;
   private fgTMode = 0;
   private fgAlphaCount = 0;
@@ -941,15 +1058,23 @@ export class SoftwareRenderer implements Refresh {
       // (frames/normals/st/tris) converts via weld; anything else keeps the
       // procedural gun silhouette so enemies/weapons stay visible in devroom
       // instead of vanishing (the old unchecked path drew nothing).
+      // Bounds (item 1) are computed at registration, covering all frames.
       if (isAliasMesh(m.data)) {
         this.models.push({ kind: m.kind, data: m.data, fallback: false });
+        this.modelBounds.push(aliasModelBounds(m.data));
       } else {
         const conv = md2ToAliasMesh(m.data);
-        if (conv) this.models.push({ kind: m.kind, data: conv, fallback: false });
-        else this.models.push({ kind: m.kind, data: this.getGunMesh(), fallback: true });
+        if (conv) {
+          this.models.push({ kind: m.kind, data: conv, fallback: false });
+          this.modelBounds.push(aliasModelBounds(conv));
+        } else {
+          this.models.push({ kind: m.kind, data: this.getGunMesh(), fallback: true });
+          this.modelBounds.push(aliasModelBounds(this.getGunMesh()));
+        }
       }
     } else {
       this.models.push({ kind: m.kind, data: m.data, fallback: false });
+      this.modelBounds.push(null);
     }
     return this.models.length - 1;
   }
@@ -1061,6 +1186,54 @@ export class SoftwareRenderer implements Refresh {
   /** Live flat-sky palette index (observability, test hook). */
   testSkyIndex(): number {
     return this.skyIndex;
+  }
+
+  /**
+   * Conservative instance sphere cull (perf remediation item 1): the
+   * world-space sphere covers the model under any rotation (|center| +
+   * radius around the entity origin), so rotation, frame lerp (bounds
+   * union all frames), near-plane straddlers, large models and the
+   * depth-hack gun (explicitly exempt — eye-anchored by contract) are all
+   * handled without origin-only shortcuts. Entities carry no
+   * leaf/cluster association, so PVS is not consulted for them (the
+   * world-surface traversal already applies PVS where it is reliable);
+   * frustum-only is the exact, reliable rule here. True = skip all setup,
+   * projection and fill work for this instance.
+   */
+  private sphereCulledAt(
+    ox: number, oy: number, oz: number, b: ModelBounds, cam: Camera,
+  ): boolean {
+    const r = Math.sqrt(b.cx * b.cx + b.cy * b.cy + b.cz * b.cz) + b.r;
+    return sphereCulledByFlatFrustum(
+      this.frustumFlat,
+      cam.origin[0]!, cam.origin[1]!, cam.origin[2]!,
+      cam.forward[0]!, cam.forward[1]!, cam.forward[2]!, cam.near,
+      ox, oy, oz, r);
+  }
+
+  /** Entity wrapper: depth-hack viewmodels always draw (see above). */
+  private entityCulled(e: Entity, b: ModelBounds | null, cam: Camera): boolean {
+    if (!b || e.depthHack === true) return false;
+    return this.sphereCulledAt(e.origin[0]!, e.origin[1]!, e.origin[2]!, b, cam);
+  }
+
+  /** Memoised dev-mesh bounds for world-placed alias (see devMeshBounds). */
+  private devBoundsFor(id: number): ModelBounds | null {
+    const hit = this.devMeshBounds.get(id);
+    if (hit !== undefined) return hit;
+    let b: ModelBounds | null = null;
+    try {
+      b = aliasModelBounds(getDevMesh(id));
+    } catch {
+      b = null;
+    }
+    this.devMeshBounds.set(id, b);
+    return b;
+  }
+
+  /** Per-frame entity cull counters (item 1 observability, test hook). */
+  testEntityCullStats(): { culled: number; drawn: number } {
+    return { culled: this.fgCulled, drawn: this.fgDrawn };
   }
 
   /**
@@ -1213,6 +1386,30 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
+   * Restore the classic 1/z plane from the RGB window-Z quanta (perf
+   * remediation item 8): exact inverse of the windowDepth01 mapping the
+   * RGB loops quantised on write (iz = (winA - d01) / winB), applied to
+   * every RGB-covered pixel the authoritative skip left unwritten. The
+   * foreground (alias/sprites/particles/tracers) then depth-tests as if
+   * the world had drawn classically. Uncovered pixels are untouched (they
+   * hold classic values). Quantisation ties vs float-z are the documented
+   * residual (measured, tiny, opaque-scenes-only by the tMode gate).
+   */
+  private backfillZbFromRGB(): void {
+    const near = this.rgbWin.near, far = this.rgbWin.far;
+    if (!(far > near) || !(near > 0)) return;
+    const winA = far / (far - near);
+    const winB = (far * near) / (far - near);
+    const cover = this.rgbCover, q = this.rgbDepth16, zb = this.zb;
+    const n = cover.length < zb.length ? cover.length : zb.length;
+    for (let i = 0; i < n; i++) {
+      if (cover[i]) {
+        zb[i] = (winA - q[i]! / 65535) / winB;
+      }
+    }
+  }
+
+  /**
    * Stage one world RGB batch for the worker kick (PERF-2 RGB workers).
    * Only opaque, depth-writing world materials stage (the world + sky
    * materials: repeat or uniform-clamp addressing, always with a mip
@@ -1246,6 +1443,9 @@ export class SoftwareRenderer implements Refresh {
     if (mat.bilinear !== false) flags |= R_FLAG_BILINEAR;
     if (mat.mipDither) flags |= R_FLAG_MIPDITHER;
     if (mat.overbright) flags |= R_FLAG_OVERBRIGHT;
+    // Upload-time opacity proof (perf remediation item 4): the worker core
+    // skips the mask tap + hole branch for these batches.
+    if (mat.opaqueMask) flags |= R_FLAG_OPAQUE;
     flags |= R_FLAG_DEPTHWRITE;
     if (repeatS) flags |= R_FLAG_REPEAT;
     let luxels: Uint8Array | null = null;
@@ -1438,8 +1638,7 @@ export class SoftwareRenderer implements Refresh {
     if (cached && cached.tex.width === sky.width && cached.tex.height === sky.height &&
       cached.tex.texels.length === sky.texels.length) {
       return cached.mat;
-    }
-    const fid = this.rgbFidelity;
+    }    const fid = this.rgbFidelity;
     const mat = buildRGBMaterial(sky.texels, sky.width, sky.height, this.palette, null, {
       addressS: 'clamp', addressT: 'clamp',
       overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
@@ -1572,6 +1771,11 @@ export class SoftwareRenderer implements Refresh {
     const t0 = Date.now();
     // M4.1: fidelity snapshot once per view (cvar toggles invalidate below).
     this.syncRGBFidelity();
+    // Perf remediation item 1: per-frame entity cull counters (drawForeground
+    // accumulates; the async path's phase-1 renderView resets before the
+    // phase-2 drawForeground counts).
+    this.fgCulled = 0;
+    this.fgDrawn = 0;
     const ph = this.phaseArmed ? this.phaseAcc : null;
     let pt = ph ? phaseNow() : 0;
     const worldData = isMiniWorld(world.data) ? world.data : createDevroom();
@@ -1709,10 +1913,28 @@ export class SoftwareRenderer implements Refresh {
     // r_translucency = 0 collapses to one loop with translucent surfaces
     // drawn opaque (pre-port behaviour).
     const tMode = translucencyModeFromCvars();
-    // PERF-2 B: operator-gated classic skip (default off — see
-    // SW_RGB_SKIP_CLASSIC_CVAR). Read once per frame like the translucency
-    // mode; applies only where an RGB material is drawn (below).
-    const skipClassicWorld = skipClassicRequested();
+    // PERF-2 B authoriative gate (perf remediation item 8): the operator
+    // cvar only takes effect in all-opaque frames (tMode === 0). That
+    // resolves every dependency the old "proof not airtight" comment
+    // warned about, by construction rather than by audit:
+    // - translucency/stipple: with tMode === 0 no surface ever reaches the
+    //   deferred alpha loop (nAlpha === 0 guaranteed), so no blend or
+    //   screen-door read of the classic index plane can observe a skip;
+    // - foreground depth: backfillZbFromRGB restores the classic 1/z plane
+    //   from the RGB window-Z quanta (exact inverse mapping) for every
+    //   RGB-covered pixel before drawForeground runs, so alias/sprite/
+    //   particle/tracer depth tests behave as if the world had drawn;
+    // - uncovered seeding: uncovered pixels keep their classic index
+    //   values (skips happen only where an RGB material drew), so
+    //   seedRGBBackground still sees the exact software background.
+    // The residual (documented, measured in skipClassic tests): float-z
+    // vs quantised window-Z can disagree on depth-tie pixels, so a few
+    // pixels may composite from the seed where classic would have drawn
+    // a surface. Default OFF: software mode is untouched. Frame stats
+    // intentionally still track the classic path, so they undercount
+    // while the skip is armed (integrator: docs/tests invariant update).
+    const skipClassicWorld = skipClassicRequested() && tMode === 0;
+    this.fgSkipClassic = skipClassicWorld;
     if (this.alphaDeferredSi.length < nvis) {
       this.alphaDeferredSi = new Int32Array(Math.max(16, nvis));
       this.alphaDeferredOrd = new Int32Array(Math.max(16, nvis));
@@ -1813,7 +2035,14 @@ export class SoftwareRenderer implements Refresh {
           }
         }
         if (ph) { ph.emit += phaseNow() - pt; pt = phaseNow(); }
-        sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+        // Emitter-order fast path (perf remediation item 3): the sky fill
+        // batch came straight from emitSpansForPoly (one span per row,
+        // ascending), so the counting sort is a proven no-op — one linear
+        // confirmation pass replaces the min/max + counting + fill. The
+        // fallback keeps bit-identical output for any other order.
+        if (!spansBatchIsRowOrdered(this.pool, start, endCount - start)) {
+          sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+        }
         if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = endCount;
         // PERF-2 B: skip the redundant classic fill only when gated on AND
@@ -1931,7 +2160,10 @@ export class SoftwareRenderer implements Refresh {
         }
       }
       if (ph) { ph.emit += phaseNow() - pt; pt = phaseNow(); }
-      sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+      // Emitter-order fast path (item 3, see the sky-fill call site above).
+      if (!spansBatchIsRowOrdered(this.pool, start, endCount - start)) {
+        sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+      }
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
       // Classic draw always with the default flag (software planes
@@ -1979,6 +2211,10 @@ export class SoftwareRenderer implements Refresh {
       !(this.backend === this.bandBackend && this.bandBackend.flushDeferred)) {
       if (ph) pt = phaseNow();
       this.flushRGB();
+      // Authoritative skip (item 8): the classic world plane holds holes
+      // where the RGB overlay drew — restore 1/z from the window-Z quanta
+      // so the foreground depth-tests below behave classically.
+      if (skipClassicWorld) this.backfillZbFromRGB();
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
     }
     candidatePixels = this.backend.pixelsDrawn - pixelsBase;
@@ -2157,6 +2393,16 @@ export class SoftwareRenderer implements Refresh {
     for (const pa of worldData.alias) {
       const mesh = getDevMeshSafe(pa.meshId, this.fallbackMesh);
       const skin = worldData.textures[pa.skinId % worldData.textures.length]!;
+      // Perf remediation item 1: frustum sphere cull — fully off-screen
+      // critters skip setup, projection and fill entirely. Conservative:
+      // intersecting spheres always draw; output unchanged (culled
+      // instances rasterise zero pixels).
+      const db = this.devBoundsFor(pa.meshId);
+      if (db && this.sphereCulledAt(pa.origin[0]!, pa.origin[1]!, pa.origin[2]!, db, cam)) {
+        this.fgCulled++;
+        continue;
+      }
+      this.fgDrawn++;
       drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
         mesh, origin: pa.origin, angles: pa.angles,
         frameA: pa.frameA, frameB: pa.frameB, lerp: pa.lerp,
@@ -2174,6 +2420,16 @@ export class SoftwareRenderer implements Refresh {
     }
     for (const ps of worldData.sprites) {
       const tex = worldData.textures[ps.skinId % worldData.textures.length]!;
+      // Item 1: billboard sphere cull (half-diagonal + margin: exact for a
+      // screen-aligned quad under any orientation, so never over-culls).
+      if (sphereCulledByFlatFrustum(this.frustumFlat,
+        cam.origin[0]!, cam.origin[1]!, cam.origin[2]!,
+        cam.forward[0]!, cam.forward[1]!, cam.forward[2]!, cam.near,
+        ps.origin[0]!, ps.origin[1]!, ps.origin[2]!, ps.size * 0.72)) {
+        this.fgCulled++;
+        continue;
+      }
+      this.fgDrawn++;
       drawSprite(this.idx, this.zb, this.fbW, this.fbH,
         { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
         [{ width: tex.width, height: tex.height, texels: tex.texels }],
@@ -2239,6 +2495,16 @@ export class SoftwareRenderer implements Refresh {
         if (!Number.isFinite(alpha)) alpha = 1;
         if (alpha <= 0) continue;
         if (alpha > 1) alpha = 1;
+        // Perf remediation item 1: model-bounds frustum cull. The sphere
+        // unions all frames (RF_FRAMELERP-safe), is rotation-invariant, and
+        // exempts the depth-hack viewmodel — so culled instances provably
+        // rasterise zero pixels and output is unchanged. No origin-only
+        // shortcut: large models with off-screen origins still draw.
+        if (this.entityCulled(e, this.modelBounds[e.model] ?? null, cam)) {
+          this.fgCulled++;
+          continue;
+        }
+        this.fgDrawn++;
         drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
           mesh: m.data, origin: e.origin, angles: e.angles,
           frameA: frA, frameB: fr, lerp,
@@ -2264,6 +2530,16 @@ export class SoftwareRenderer implements Refresh {
         }
       } else if (m.kind === 'sp2') {
         const skin = this.skins[e.skin] ?? devSkin0(worldData);
+        // Item 1: sprite-entity billboard cull (48px quad, same rule as
+        // world sprites above).
+        if (sphereCulledByFlatFrustum(this.frustumFlat,
+          cam.origin[0]!, cam.origin[1]!, cam.origin[2]!,
+          cam.forward[0]!, cam.forward[1]!, cam.forward[2]!, cam.near,
+          e.origin[0]!, e.origin[1]!, e.origin[2]!, 48 * 0.72)) {
+          this.fgCulled++;
+          continue;
+        }
+        this.fgDrawn++;
         drawSprite(this.idx, this.zb, this.fbW, this.fbH,
           { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
           [skin], emptyLight, this.colormap, cam, this.spriteScratch, 1024);
@@ -2283,6 +2559,22 @@ export class SoftwareRenderer implements Refresh {
         AngleVectors(e.angles, this.tracerFwd, this.tracerRight, this.tracerUp);
         const len = e.frame > 0 ? Math.min(e.frame, 1024) : TRACER_DEFAULT_LENGTH;
         const col = e.skin >= 0 && e.skin <= 255 ? e.skin & 255 : TRACER_DEFAULT_COLOR;
+        // Item 1: beam-segment sphere cull (midpoint + half-length + margin
+        // covers the whole segment under any orientation).
+        {
+          const ex = e.origin[0]! + this.tracerFwd[0]! * len;
+          const ey = e.origin[1]! + this.tracerFwd[1]! * len;
+          const ez = e.origin[2]! + this.tracerFwd[2]! * len;
+          if (sphereCulledByFlatFrustum(this.frustumFlat,
+            cam.origin[0]!, cam.origin[1]!, cam.origin[2]!,
+            cam.forward[0]!, cam.forward[1]!, cam.forward[2]!, cam.near,
+            (e.origin[0]! + ex) / 2, (e.origin[1]! + ey) / 2, (e.origin[2]! + ez) / 2,
+            len / 2 + 2)) {
+            this.fgCulled++;
+            continue;
+          }
+          this.fgDrawn++;
+        }
         drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
           e.origin[0]!, e.origin[1]!, e.origin[2]!,
           e.origin[0]! + this.tracerFwd[0]! * len,
@@ -2307,6 +2599,22 @@ export class SoftwareRenderer implements Refresh {
     for (let ti = 0; ti < TRACER_POOL_SIZE; ti++) {
       if (this.tracerTtl[ti] === 0) continue;
       const o = ti * 6;
+      // Item 1: pooled-beam segment cull (same midpoint rule as entities).
+      {
+        const ax = this.tracerSegs[o]!, ay = this.tracerSegs[o + 1]!, az = this.tracerSegs[o + 2]!;
+        const bx = this.tracerSegs[o + 3]!, by = this.tracerSegs[o + 4]!, bz = this.tracerSegs[o + 5]!;
+        const dx = bx - ax, dy = by - ay, dz = bz - az;
+        const hl = Math.sqrt(dx * dx + dy * dy + dz * dz) / 2 + 2;
+        if (sphereCulledByFlatFrustum(this.frustumFlat,
+          cam.origin[0]!, cam.origin[1]!, cam.origin[2]!,
+          cam.forward[0]!, cam.forward[1]!, cam.forward[2]!, cam.near,
+          (ax + bx) / 2, (ay + by) / 2, (az + bz) / 2, hl)) {
+          this.fgCulled++;
+          this.tracerTtl[ti]--;
+          continue;
+        }
+        this.fgDrawn++;
+      }
       drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
         this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
         this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
@@ -2385,6 +2693,9 @@ export class SoftwareRenderer implements Refresh {
     // before the foreground seed + inline foreground RGB draws below.
     if (this.rgbUsedThisFrame) {
       await this.flushRGBAsync();
+      // Authoritative skip (item 8, same decision as phase 1): backfill
+      // before the foreground draws below.
+      if (this.fgSkipClassic) this.backfillZbFromRGB();
     }
     // World kick complete (planes valid) — now the direct plane writes.
     const fgCam = this.fgCam;
@@ -2807,7 +3118,11 @@ export class SoftwareRenderer implements Refresh {
           sp.lv = -1;
         }
       }
-      sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+      // Emitter-order fast path (item 3): each skybox face is one
+      // emitSpansForPoly batch (one span per row, ascending).
+      if (!spansBatchIsRowOrdered(this.pool, start, endCount - start)) {
+        sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
+      }
       this.spanList.count = endCount;
       // Gated PERF-2 B skip (default off): elide the classic face fill only
       // where the RGB sky material drew.
@@ -3006,6 +3321,10 @@ export class SoftwareRenderer implements Refresh {
       alphaTest: null,
       depthWrite: extra?.depthWrite ?? true,
       alpha: 1,
+      // World chains are NOT opacity-proven (WAL texels may carry index
+      // 255 in test palettes), so the mask tap stays — alias/sky materials
+      // set this via buildRGBMaterial's opaqueMask option instead.
+      opaqueMask: false,
       warp: surf.turbulent,
       turbPhase: surf.turbulent ? (((this.backend.time * 64) | 0) & 1023) : 0,
       flatColor: null,

@@ -1055,6 +1055,89 @@ function blip(ctx: AudioContext, master: GainNode, freq: number, dur: number, wh
 }
 
 /**
+ * Browser-loop frame statistics published to `window.__q2stats` once per
+ * presented frame (CDP/soak observability, zero behavior change).
+ *
+ * - `fps`/`frame`: the loop's fps EMA + presented-frame counter. Acceptance
+ *   FPS is ALWAYS derived from `frame` deltas over wall-clock time
+ *   (presented frames, sim+HUD+blit included) — never from phase medians.
+ * - `pooled`/`rgbStaged`/`rgbKicks`/`rgbInline`: the RGB raster worker path
+ *   executed this frame (staged batches + completed kicks + inline
+ *   fallbacks, per-frame since the last beginFrame).
+ * - `voodooPath`/`resolveOrder`: which scanout path the last resolve took
+ *   (`worker` = pooled Track A kick, `serial` = main-thread resolve,
+ *   `none` = software mode) and the HUD ordering. Proves the pooled
+ *   scanout executed instead of silently falling back.
+ * - `scanoutKicks`/`scanoutFallbacks`: monotonic pooled-scanout outcomes
+ *   (healthy pooled soak: kicks == frames, fallbacks == 0; any fallback is
+ *   counted here, never silent).
+ * - `asyncFallbacks`: `frameAsync` throws the tick absorbed via the classic
+ *   sync path (healthy: 0).
+ */
+export interface Q2Stats {
+  fps: number;
+  frame: number;
+  pooled: boolean;
+  rgbStaged: number;
+  rgbKicks: number;
+  rgbInline: number;
+  voodooPath: string;
+  resolveOrder: string;
+  scanoutKicks: number;
+  scanoutFallbacks: number;
+  asyncFallbacks: number;
+}
+
+const Q2STATS_ZERO: Q2Stats = {
+  fps: 0, frame: 0, pooled: false, rgbStaged: 0, rgbKicks: 0, rgbInline: 0,
+  voodooPath: 'none', resolveOrder: 'none',
+  scanoutKicks: 0, scanoutFallbacks: 0, asyncFallbacks: 0,
+};
+
+/**
+ * Publish one frame's stats to `globalThis.__q2stats` (single reused
+ * record, one store per frame, zero steady-state allocation) and return
+ * the record (a copy headless, for unit pins). Never throws: worker-stat
+ * probes are guarded so a throwing/future renderer can never break the
+ * production present path. Production instrumentation is limited to these
+ * counters — no per-phase `performance.now()` runs in the loop, so the
+ * accepted (presented) FPS is never perturbed by measurement; phase
+ * breakdowns live in instrumented test harnesses only (voodoo-perf,
+ * bench), clearly labeled report-only.
+ */
+export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2Stats {
+  const snap: Q2Stats = { ...Q2STATS_ZERO, fps, frame };
+  try {
+    const g = globalThis as unknown as { __q2stats?: Q2Stats };
+    const rec = g.__q2stats ?? (g.__q2stats = { ...Q2STATS_ZERO });
+    rec.fps = fps;
+    rec.frame = frame;
+    try {
+      const ws = boot.refresh.testWorkerStats();
+      const rs = boot.refresh.testRGBWorkerStats();
+      rec.pooled = ws.pooled;
+      rec.rgbStaged = rs.staged;
+      rec.rgbKicks = rs.kicks;
+      rec.rgbInline = rs.inline;
+    } catch {
+      rec.pooled = false;
+      rec.rgbStaged = 0;
+      rec.rgbKicks = 0;
+      rec.rgbInline = 0;
+    }
+    rec.voodooPath = boot.lastVoodooPath;
+    rec.resolveOrder = boot.lastResolveOrder;
+    rec.scanoutKicks = boot.statScanoutKicks;
+    rec.scanoutFallbacks = boot.statScanoutFallbacks;
+    rec.asyncFallbacks = boot.statAsyncFallbacks;
+    return { ...rec };
+  } catch {
+    /* non-DOM/shimmed runtimes stay silent */
+    return snap;
+  }
+}
+
+/**
  * Drive a booted game on a canvas: pointer-lock input, rAF frames,
  * voodoo resolve, HUD, blit, and gesture-unlocked sound. No-op without DOM.
  */
@@ -1153,8 +1236,7 @@ export function startPlayLoop(
   };
 
   /** Shared post-render tail (HUD + blit + sound/event cues), both paths. */
-  const finishFrame = (target: Uint32Array, hud: { fps: number; frame: number }): void => {
-    // V2d strict voodoo: HUD was already composed into the emulated target
+  const finishFrame = (target: Uint32Array, hud: { fps: number; frame: number }): void => {    // V2d strict voodoo: HUD was already composed into the emulated target
     // BEFORE scanout (paintHudPreScanout via resolveDisplay/frameAsync) —
     // painting again here would double-paint and defeat the strict ordering.
     // Legacy/software paths paint HUD after resolve as before.
@@ -1177,30 +1259,11 @@ export function startPlayLoop(
     // store per frame, never allocated in steady state. Pool/RGB worker
     // engagement rides along so soaks can verify the real worker path
     // executes (staged batches + kicks per frame) instead of inferring it
-    // from a nonzero sw_workers value.
-    try {
-      const g = globalThis as unknown as {
-        __q2stats?: { fps: number; frame: number; pooled: boolean; rgbStaged: number; rgbKicks: number; rgbInline: number };
-      };
-      const rec = g.__q2stats ?? (g.__q2stats = { fps: 0, frame: 0, pooled: false, rgbStaged: 0, rgbKicks: 0, rgbInline: 0 });
-      rec.fps = fps;
-      rec.frame = frame;
-      try {
-        const ws = boot.refresh.testWorkerStats();
-        const rs = boot.refresh.testRGBWorkerStats();
-        rec.pooled = ws.pooled;
-        rec.rgbStaged = rs.staged;
-        rec.rgbKicks = rs.kicks;
-        rec.rgbInline = rs.inline;
-      } catch {
-        rec.pooled = false;
-        rec.rgbStaged = 0;
-        rec.rgbKicks = 0;
-        rec.rgbInline = 0;
-      }
-    } catch {
-      /* non-DOM/shimmed runtimes stay silent */
-    }
+    // from a nonzero sw_workers value. Scanout kick/fallback counters and
+    // the resolve path prove the Track A pooled scanout executed per frame
+    // (kicks == frames, fallbacks == 0 healthy) and that any fallback was
+    // counted, never silent. See publishQ2Stats (pure, unit-covered).
+    publishQ2Stats(boot, fps, frame);
     // The fps (`cl_showfps`) and position (`cl_showpos`, default ON)
     // readouts are in-canvas conchars glyphs painted by drawPlayHud above
     // (top-right / top-left of the framebuffer itself) — no DOM overlay.
@@ -1264,7 +1327,13 @@ export function startPlayLoop(
           // One bad frame (worker timeout, torn-down pool) falls back to the
           // classic sync path from the next tick — inline replay converges to
           // identical pixels, so the loop never wedges and never tears.
+          // Counted (never silent): healthy soaks keep statAsyncFallbacks 0.
           useAsync = false;
+          try {
+            boot.statAsyncFallbacks += 1;
+          } catch {
+            /* counter write must never break the fallback */
+          }
           try {
             boot.refresh.syncWorkersFromCvar();
           } catch {

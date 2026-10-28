@@ -95,8 +95,10 @@ host ← {server, client} · apps/web ← host
   is a float of seconds; never use wall-clock in game logic.
 - **Texture mapping:** `u = dot(p, texinfo.s)/scale + s_off` in *texels*. Lightmap luxels are every
   **16 texels**. Keep the `LUXEL = 16` constant in `@q2/math`.
-- **Colour:** software path never leaves 8-bit until resolve. Voodoo path works in 8:8:8 and is
-  quantised to 5:6:5 at resolve. No path uses floats per channel in the inner loop.
+- **Colour:** software path never leaves 8-bit until resolve. Voodoo path rasters
+  authoritatively to RGB565 + window-Z (16-bit depth) planes and scanout
+  reconstructs from that target (matched `2x2sub+2x2box` by default; `vd_16bit=0`
+  is an RGB888 debug bypass). No path uses floats per channel in the inner loop.
 - **Naming:** keep id's names (`R_DrawSurface`, `SV_LinkEdict`, `PM_StepSlideMove`,
   `cl.frame`, `pmove_t`) so the C source stays greppable.
 - **Modules:** `export`ed symbols only; no default exports. `.ts` only, no handwritten `.d.ts`.

@@ -148,6 +148,35 @@ export function clusterVisible(world: MiniWorld, cluster: number, target: number
  */
 const markCache = new WeakMap<MiniWorld, Uint8Array>();
 
+/**
+ * PVS-mark memo (perf remediation item 5): PVS marks depend only on
+ * (world, viewCluster) — NOT on camera orientation (frustum culling stays
+ * live per frame in walkNode via culledByFrustum). Rotating inside one
+ * cluster reuses the completed marking with zero traversal; crossing
+ * clusters, switching worlds, or a node-count change recomputes. Worlds are
+ * static per level, so no other invalidation is needed.
+ */
+interface MarkMemo {
+  cluster: number;
+  nodeCount: number;
+}
+/** Last completed marking per world (not just the buffer — the inputs). */
+const markMemo = new WeakMap<MiniWorld, MarkMemo>();
+/** Observability for the memo (test hook): hits skip the whole subtree walk. */
+let markCacheHits = 0;
+let markCacheMisses = 0;
+
+/** Hit/miss counts since the last reset (test hook, zero behavior change). */
+export function testMarkCacheStats(): { hits: number; misses: number } {
+  return { hits: markCacheHits, misses: markCacheMisses };
+}
+
+/** Reset the memo counters (test hook). */
+export function testResetMarkCacheStats(): void {
+  markCacheHits = 0;
+  markCacheMisses = 0;
+}
+
 function markSubtree(world: MiniWorld, marks: Uint8Array, ni: number, viewCluster: number): boolean {
   if (ni < 0) {
     const leaf = world.leafs[-ni - 1];
@@ -161,6 +190,19 @@ function markSubtree(world: MiniWorld, marks: Uint8Array, ni: number, viewCluste
 }
 
 function markedVisible(world: MiniWorld, viewCluster: number): Uint8Array {
+  // Memo hit: identical (world, cluster, node count) — the completed
+  // marking is still valid, so skip the recursive walk entirely. The
+  // buffer is untouched on this path (never zeroed, never rewritten).
+  const memo = markMemo.get(world);
+  if (memo && memo.cluster === viewCluster && memo.nodeCount === world.nodes.length) {
+    const kept = markCache.get(world);
+    if (kept && kept.length >= world.nodes.length) {
+      markCacheHits++;
+      return kept;
+    }
+    // Buffer lost or short (should not happen — same world, same count):
+    // fall through to the miss path and rebuild it.
+  }
   let marks = markCache.get(world);
   if (!marks || marks.length < world.nodes.length) {
     marks = new Uint8Array(world.nodes.length);
@@ -169,6 +211,8 @@ function markedVisible(world: MiniWorld, viewCluster: number): Uint8Array {
     marks.fill(0);
   }
   markSubtree(world, marks, 0, viewCluster);
+  markCacheMisses++;
+  markMemo.set(world, { cluster: viewCluster, nodeCount: world.nodes.length });
   return marks;
 }
 /**

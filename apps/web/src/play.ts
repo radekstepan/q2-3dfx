@@ -2930,6 +2930,24 @@ export interface PlayBoot {
    * transfer the frame's single VoodooState snapshot to every band.
    */
   browserPool: BrowserBandPool | null;
+  /**
+   * Monotonic pooled-scanout kick outcomes (Track A soak observability):
+   * `statScanoutKicks` counts frames the browser pool scanout completed
+   * (display == shared scanout buffers, zero copy); `statScanoutFallbacks`
+   * counts frames the pooled kick was attempted but failed (timeout/dead
+   * worker → serial `resolveDisplay`, bit-identical pixels). A healthy
+   * pooled soak shows kicks == frames and fallbacks == 0; any nonzero
+   * fallback count proves the fallback path executed (never silent).
+   * Written only by `resolveDisplayAsync`, read by `publishQ2Stats`.
+   */
+  statScanoutKicks: number;
+  statScanoutFallbacks: number;
+  /**
+   * `frameAsync` failures the dom.ts rAF tick absorbed via the classic sync
+   * fallback (worker timeout, torn-down pool). Incremented in the tick
+   * catch only; a healthy soak keeps this at 0. Never throws.
+   */
+  statAsyncFallbacks: number;
   /** Real-pak MD2/skin handles (null without a pak). */
   models: PakModelHandles | null;
   /** The pak this boot was built from (null = devroom): reboot reuses it. */
@@ -3225,6 +3243,7 @@ export function bootPlay(opts: {
     strictVoodoo: true, lastResolveOrder: 'none', lastVoodooPath: 'none',
     lastRasterPolicy: { mode: renderer, rgbEnabled: false, hooked: false },
     browserPool: null,
+    statScanoutKicks: 0, statScanoutFallbacks: 0, statAsyncFallbacks: 0,
     models, pak: opts.pak ?? null,
   };
   // Arm the raster policy the cvar selects (RGB path on for voodoo, off for
@@ -3563,6 +3582,7 @@ export async function resolveDisplayAsync(boot: PlayBoot, hud?: HudState, frameS
         } catch {
           /* alias check failed: display already correct via shared write */
         }
+        boot.statScanoutKicks += 1;
         boot.lastVoodooPath = selectVoodooBandPath(true);
         boot.lastResolveOrder = boot.strictVoodoo ? 'strict-hud-first' : 'legacy-hud-last';
         if (!boot.strictVoodoo) {
@@ -3573,6 +3593,10 @@ export async function resolveDisplayAsync(boot: PlayBoot, hud?: HudState, frameS
     } catch {
       /* fall through to serial */
     }
+    // Pooled kick attempted but failed (false/timeout/throw): exactly one
+    // serial scanout below, pixels bit-identical. Count it so soaks prove
+    // the fallback path executed instead of inferring health from fps.
+    boot.statScanoutFallbacks += 1;
   }
   // Fallback / legacy branch: exactly one serial scanout. HUD was already
   // painted above in strict mode, so call the scene-only resolve then skip
