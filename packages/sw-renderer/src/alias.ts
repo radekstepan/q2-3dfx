@@ -835,6 +835,12 @@ export function fillPerspTriRGB(
   const overbright = mat.overbright;
   const mipDither = mat.mipDither;
   const zbw = mat.zbits;
+  // Alias materials are clamp-addressed (frame.ts rgbMaterialForAlias):
+  // honor the binding like drawSpansRGB does. The old hardcoded repeat
+  // wrapped edge taps (and the hole-test tap) to the opposite skin edge —
+  // usually black gutter — fringing every UV-island border dark.
+  const wrapS = mat.addressS === 'repeat';
+  const wrapT = mat.addressT === 'repeat';
   const zOff = !Number.isInteger(zbw) || zbw < 1 || zbw > 23;
   const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
   const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
@@ -887,10 +893,10 @@ export function fillPerspTriRGB(
         const v = (w0 * a.viz + w1 * b.viz + w2 * c.viz) / iz;
         const lvl = rgbPickMipLevel(lod, x, y, mipDither, maxLevel);
         const t = levels[lvl]!;
-        const mx = rgbWrapCoord(u | 0, t.width, true);
-        const my = rgbWrapCoord(v | 0, t.height, true);
+        const mx = rgbWrapCoord(u | 0, t.width, wrapS);
+        const my = rgbWrapCoord(v | 0, t.height, wrapT);
         if (t.mask[my * t.width + mx]! === 0) continue;
-        rgbSampleTexture(t.data, t.width, t.height, u, v, _aliasTex, 0, true, true);
+        rgbSampleTexture(t.data, t.width, t.height, u, v, _aliasTex, 0, wrapS, wrapT);
         const lr = Math.round((w0 * a.r + w1 * b.r + w2 * c.r) * 255);
         const lg = Math.round((w0 * a.g + w1 * b.g + w2 * c.g) * 255);
         const lb = Math.round((w0 * a.b + w1 * b.b + w2 * c.b) * 255);

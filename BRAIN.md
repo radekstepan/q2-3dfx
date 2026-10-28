@@ -222,6 +222,20 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 ## 8. Active tasks (everything else is DONE — see `docs/tasks-archive.md`)
 
 ```
+### VOODOO-REPAIR-2 — black areas on MD2s (barrels, enemies, bolts, gun fringe)
+owns: `packages/sw-renderer` (gates: `packages/sw-renderer` unit pins; release: `apps/web` voodoo-regression)
+depends: VOODOO-REPAIR
+status: done
+done-when:
+- [x] reproduced entity-isolated with real base1 assets (soldier yaw90 @120u 29.4% pure-black pre-resolve px, bolt @40u 64.5%; software keeps texture in both)
+- [x] root cause fixed, not masked: MD2 skins are ~40% black gutter (barrel 37%, soldier 47% idx-127) poisoning coarse box-filter mips (software alias never mips — affine L0); alias RGB materials carry ALIAS_LOD_BIAS_DELTA (-3.3, lands default on total -3.65, tracks vd_lodbias) + fillPerspTriRGB honors clamp addressing (was hardcoded repeat)
+- [x] post-fix at/below software black levels post-resolve, all measured classes: soldier 0.4%, barrel 0.1%, bolt 0.0%, infantry 1.2%, gunner 0.2%, corpse 0.2%, explode 0.0%, all 3 viewmodels ≤0.3%; before/after crops reviewed (backs mottled again, bolt glows red-orange)
+- [x] regression gates: `rgbAliasSkin.test.ts` (4 fail-before: clamp tap, delta value, delta-vs-shared sampling, frame RGB/software parity); devroom RGB re-pinned with cause (`436fe0c5` → `206e1dad`, critter px only, index `58e0ecf1` unchanged)
+- [x] `yarn verify` green (76 tasks) + Q2_PAK voodoo-regression gate 4/4 + changeset
+- [ ] OPEN (not this card): real-Voodoo3 capture review (M4.1) is the only oracle that can confirm distant-minification brightness vs strict-GL; current trade (finer alias mips = sharper/software-like at range) is documented in ALIAS_LOD_BIAS_DELTA
+```
+
+```
 ### VOODOO-REPAIR — Voodoo regression repair (black gun, missing geometry, FPS decline)
 owns: `packages/sw-renderer`, `apps/web` (investigated with no changes needed: `packages/voodoo`, `packages/config`, `packages/testkit` — see note)
 depends: M7.1

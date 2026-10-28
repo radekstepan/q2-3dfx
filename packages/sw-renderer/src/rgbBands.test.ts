@@ -124,7 +124,9 @@ describe('banded vs serial RGB equivalence (dither phase + seam rows)', () => {
     // True-565 + window-Z re-pin (was 3534624e) + alias-LOD re-pin (was
     // a9988ff4): see rgbPerf.test.ts — the devroom box critter now samples
     // the correct mip instead of the coarsest. Index pin unchanged.
-    expect(a.colorHash).toBe('436fe0c5');
+    // Gutter-LOD re-pin (was 436fe0c5): alias ALIAS_LOD_BIAS_DELTA +
+    // clamp-addressed taps (see rgbPerf.test.ts); critter pixels only.
+    expect(a.colorHash).toBe('206e1dad');
     expect(a.indexHash).toBe('58e0ecf1');
   });
 

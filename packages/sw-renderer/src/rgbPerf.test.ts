@@ -91,7 +91,14 @@ describe('step-5 RGB output hash pin (byte-identical before/after)', () => {
     // 0. Isolated proof: real v_blast skin renders at the forced-LOD0
     // mean with full texture detail (see rgbAliasDepth.test.ts); the index
     // plane is untouched, so this pin moves for RGB only.
-    expect(a.colorHash).toBe('436fe0c5');
+    // Gutter-LOD re-pin (was 436fe0c5): alias materials carry
+    // ALIAS_LOD_BIAS_DELTA (-1.65: real MD2 skins are ~40% black gutter
+    // around thin islands, so coarse box-filter mips average to gutter
+    // grey and shadow sides render flat black — see rgbAliasSkin.test.ts)
+    // and fillPerspTriRGB honors clamp addressing (was hardcoded repeat,
+    // wrapping edge taps into far-edge gutter). Only the few devroom
+    // critter pixels move (diff bbox 8x7 at 160x120); index untouched.
+    expect(a.colorHash).toBe('206e1dad');
     expect(a.indexHash).toBe('58e0ecf1');
     // second frame is stable (cache hits serve identical color)
     const b = renderRGB160();

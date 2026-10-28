@@ -130,6 +130,7 @@ export {
   SoftwareRenderer, sortBatchByRow, nextPot, MAX_SPANS,
   setRGBWorldEnabled, isRGBWorldEnabled,
   readRGBFidelity, sameRGBFidelity,
+  ALIAS_LOD_BIAS_DELTA,
   type RGBFidelity,
 } from './frame.js';
 export {

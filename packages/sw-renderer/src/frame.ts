@@ -291,6 +291,24 @@ export function countValidStyles(
  */
 export const RGB_TEXCHAIN_BUDGET = 16 * 1024 * 1024;
 
+/**
+ * Extra LOD bias for alias (MD2) RGB materials, added to the `vd_lodbias`
+ * fidelity value. Real MD2 skins carry ~40% pure-black gutter texels around
+ * thin mapped islands (measured: barrel 37%, soldier 47% index-127 black),
+ * so the box-filtered coarse mip levels average to dark gutter grey and the
+ * shadow side of every model renders as flat black instead of dark texture
+ * (software alias never mips — affine L0 — so it keeps the mottling).
+ * Measured entity-isolated pre-resolve: soldier yaw90 @120u needs total
+ * bias -2 for the floor (29.4% -> 1.7% pure-black pixels), the thin-island
+ * blaster bolt @40u needs total -3.65 (64.5% -> 0.0%). The delta below
+ * lands the default (-0.35) on -3.65 while tracking user vd_lodbias A/B.
+ * World textures tile (no gutters) and keep the unmodified bias.
+ * Close-range viewmodels (rho < 1, L0 either way) are unaffected in kind;
+ * far blobs sample finer than strict-GL would (sharper, software-like —
+ * documented trade).
+ */
+export const ALIAS_LOD_BIAS_DELTA = -3.3;
+
 export class SoftwareRenderer implements Refresh {
   private fbW = 0;
   private fbH = 0;
@@ -1130,8 +1148,10 @@ export class SoftwareRenderer implements Refresh {
   /**
    * Opaque palette-baked RGB material for alias (MD2) models: identical to
    * rgbMaterialForSkin except opaqueMask (index 255 draws opaque, never a
-   * hole — see the rgbAliasMats field doc for the id-source audit). Separate
-   * cache because the mask is baked into the mip chain at upload.
+   * hole — see the rgbAliasMats field doc for the id-source audit) plus the
+   * ALIAS_LOD_BIAS_DELTA content bias (black-gutter skins poison coarse
+   * mips). Separate cache because the mask is baked into the mip chain at
+   * upload.
    */
   private rgbMaterialForAlias(skin: Texture): RGBMaterial {
     const fid = this.rgbFidelity;
@@ -1139,7 +1159,7 @@ export class SoftwareRenderer implements Refresh {
     if (!mat) {
       mat = buildRGBMaterial(skin.texels, skin.width, skin.height, this.palette, null, {
         addressS: 'clamp', addressT: 'clamp',
-        overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
+        overbright: fid.overbright, lodBias: fid.lodBias + ALIAS_LOD_BIAS_DELTA, mipDither: fid.mipDither,
         bilinear: fid.bilinear, zbits: fid.zbits, opaqueMask: true,
       });
       this.rgbAliasMats.set(skin, mat);
