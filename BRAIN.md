@@ -208,8 +208,14 @@ Rules for **any** card, whether from §8 or pasted in:
    `done` requires `apps/web/src/base1-gate.test.ts` green on that PR (real base1 lump,
    real tick loop, asserts on rendered/submitted state). Unit tests alone do not close it.
 8. Every `packages/**` PR ships a changeset. CI fails without one.
-9. Pasted lists are authoritative for the session: `status: ready` = eligible,
-   `depends:` must be `done` before starting, update `status`/`done-when` in place.
+9. Independent workstreams run as parallel subagents (one writer per package, disjoint
+    `owns:` — never two writers in one package). The integrator dispatches them with the
+    §7 card + §§1–6 context; each lane returns changed files, test/bench evidence, and
+    suggested changeset text, and does NOT commit. The integrator runs `yarn verify` +
+    bench on the merged tree, writes the changesets + ledger rows, ticks the boxes, and
+    commits. Full protocol: `docs/process.md` §12.
+10. Pasted lists are authoritative for the session: `status: ready` = eligible,
+    `depends:` must be `done` before starting, update `status`/`done-when` in place.
 
 Spawn prompt: read BRAIN.md §§1–7 + the card; modify only `owns:`; follow §4–§5 exactly —
 if a contract must change, stop and report. Finish with `yarn verify` + bench output,

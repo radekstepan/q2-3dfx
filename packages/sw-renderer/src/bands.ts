@@ -1102,36 +1102,66 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
   }
 
   /**
-   * RGB span pass over the bands (perf-2 lane): one kind-dispatched scan per
-   * band through the same monomorphic RGB loop as the serial path (the row
-   * range rides the call — no pre-filter scan). Absolute screen coords are
-   * preserved (s.y rides the span, x runs from the absolute x0), so the
-   * Bayer mip-dither phase and band-seam rows are bit-identical to serial.
-   * Bands are disjoint rows; opaque writes are depth-guarded and blend
-   * writes never cross a band boundary, so band order cannot affect any
-   * pixel. Runs inline on the calling thread (workers only handle the
-   * indexed planes); the single global composite in endFrame merges the
-   * planes afterwards. Zero allocation.
+   * RGB span pass over the bands (perf-2 lane): one fused full-range call
+   * when the bands contiguously partition the RGB frame (the splitBands
+   * steady state), falling back to one kind-dispatched scan per band
+   * otherwise. Both forms run the same monomorphic RGB loop as the serial
+   * path (absolute screen coords ride the call — s.y, x from the absolute
+   * x0 — so the Bayer mip-dither phase and band-seam rows are bit-identical
+   * to serial either way) and draw the identical pixel set:
+   * - every span touches exactly one row (y is constant per span) and all
+   *   plane effects (rgb565 / cover / rgbDepth) are per-pixel reads+writes
+   *   at o = y*fbW+x, so any two spans on different rows commute — even
+   *   alpha/additive blends, which only read the destination pixel they
+   *   also write, and even depth ties, which resolve per pixel;
+   * - same-row spans keep list order in both forms (the band filter
+   *   preserves order; the fused call is list order), so same-row overlap
+   *   (opaque ties, alpha over opaque) resolves identically;
+   * - the fused call covers exactly [0, rgbH): bands partitioning that
+   *   range (checked per call, <=8 integer compares, no allocation) draw
+   *   each in-range span once with identical parameters; out-of-range
+   *   spans are skipped by the same guard in both forms.
+   * Runs inline on the calling thread (workers only handle the indexed
+   * planes); the single global composite in endFrame merges the planes
+   * afterwards. Zero allocation.
    */
   drawSpansRGB(list: SpanList, mat: RGBMaterial, win?: RGBWindow | null): void {
     if (this.bandCount <= 1 || this.fbH <= 0) {
       this.rgb.drawSpansRGB(list, mat, win ?? null);
       return;
     }
-    // One kind-dispatched scan per band (PERF-2 A): the y-range rides the
-    // call, so each band's pass both filters and draws — no pre-filter
-    // scan plus second dispatch scan. Absolute screen coords are preserved
-    // (s.y rides the span, x runs from the absolute x0), so the Bayer
-    // mip-dither phase and band-seam rows are bit-identical to serial.
-    // Bands are disjoint rows; opaque writes are depth-guarded and blend
-    // writes never cross a band boundary, so band order cannot affect any
-    // pixel. Runs inline on the calling thread (workers only handle the
-    // indexed planes); the single global composite in endFrame merges the
-    // planes afterwards. Zero allocation.
+    // Fused single-range call: one full-list scan draws the identical pixel
+    // set as the per-band fan-out (proof above), saving (B-1) skip scans +
+    // (B-1) per-batch call setups per batch. The partition check makes the
+    // fallback airtight under any stale-band state (old behavior preserved).
+    if (this.rgbBandsPartitionFrame()) {
+      this.rgb.drawSpansRGB(list, mat, win ?? null);
+      return;
+    }
     const w = win ?? null;
     for (let b = 0; b < this.bands.length; b++) {
       const band = this.bands[b]!;
       this.rgb.drawSpansRGB(list, mat, w, band.y0, band.y1);
     }
+  }
+
+  /**
+   * True when the bands contiguously partition [0, rgbFbH): band 0 starts at
+   * row 0, each band starts where the previous ended, and the last ends at
+   * the RGB frame height. splitBands establishes this by construction (last
+   * band takes the remainder, so odd heights and bandCount > height stay
+   * covered); the check guards stale bands after an asymmetric attach.
+   */
+  private rgbBandsPartitionFrame(): boolean {
+    const H = this.rgb.fbH;
+    if (H <= 0 || this.bands.length === 0) return false;
+    if (this.bands[0]!.y0 !== 0) return false;
+    let hi = 0;
+    for (let b = 0; b < this.bands.length; b++) {
+      const band = this.bands[b]!;
+      if (band.y0 !== hi) return false;
+      hi = band.y1;
+    }
+    return hi === H;
   }
 }
