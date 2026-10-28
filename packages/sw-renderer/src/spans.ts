@@ -1141,7 +1141,7 @@ export function buildRGBMaterial(
   };
 }
 
-// RGB hot-path internals (step-5 perf, output-bit-identical).
+// RGB hot-path internals (step-5 perf + perf-2 cuts, output-bit-identical).
 //
 // The three subdiv loops below inline what used to be five per-pixel
 // helper calls (rgbPickMipLevel, rgbWrapCoord x2, rgbSampleTexture,
@@ -1155,6 +1155,22 @@ export function buildRGBMaterial(
 //   on an exact dyadic), and `(x0+1)` needs no modulo once wrapped.
 // - Level pick: spanLod is constant per span, so the Bayer compare threshold
 //   `f*16` is hoisted; the non-dither pick is loop-invariant.
+// Perf-2 (same file, same guarantee — frame hash `8372b322` pinned in
+// rgbPerf.test.ts): lightmap v-side state hoisted per subdiv call (lv is
+// span-constant: clamp/row/fraction/row-base computed once, not per pixel),
+// Bayer row offset folded to `bOff` (one shift per call, not per pixel),
+// and the two per-pixel rgbWrapInt calls inlined (identical integer ops,
+// POT lane is call-constant). ~10% @640x480 devroom (60.7 -> 54.6ms).
+// Deliberately SKIPPED (measured or proven output-changing):
+// - dlux==0 whole-light fast loop: only 4% of devroom spans (instrumented
+//   count) — a duplicated loop body is not worth ~1% for the added surface.
+// - modulate lookup tables (64K x mult): int32 `/255` already strength-
+//   reduced by the JIT; tables add 3 dependent loads/pixel (L2 pressure).
+// - clamp-path `tu/65536` float div: no rounding-identical strength
+//   reduction exists, and the clamp path is cold in world fill.
+// - POT `(mx+1)&mask` edge trim: saves one predictable branch per pixel.
+// - full Bayer unroll / 4-wide mask: still a data-dependent select/pixel.
+// - reciprocal-mult for 1/z stepping (tried step-5): V8 fdiv is faster.
 // The exported helpers above are UNCHANGED (alias/sprites/tests still call
 // them); only the pixel loops take the inlined path.
 
@@ -1237,15 +1253,29 @@ export function runSubdivRGBRepeat(
   const lbS = lb ? lb.samples : null;
   const lbW = lb ? lb.luxW : 0, lbH = lb ? lb.luxH : 0;
   const lbMaxU = lbW - 1, lbMaxV = lbH - 1;
-  const bRow = (yAbs | 0) & 3;
+  // Span-constant lightmap row state (lv is constant per span): v-side
+  // clamp, row select, fraction and row-base offsets hoisted out of the
+  // pixel loops below. Bit-identical: pure function of the same inputs.
+  const lvC = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
+  const ly0 = lvC | 0;
+  const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
+  const lfv = Math.round((lvC - ly0) * 256);
+  const lwV = 256 - lfv;
+  const rowA = ly0 * lbW, rowB = ly1 * lbW;
+  const bOff = (((yAbs | 0) & 3) << 2);
   const fixedLevel = baseLevel === nextLevel;
   let lux = lux0;
   if (fixedLevel) {
     for (let i = 0, o = o0; i < n; i++, o++) {
       if (iz > zb[o]!) {
         const xi = tu >> 16, yi = tv >> 16;
-        const mx = rgbWrapInt(xi, w0, wm0);
-        const my = rgbWrapInt(yi, h0, hm0);
+        // Inlined rgbWrapInt (same integer ops, no call): the POT lane is
+        // call-constant, so the branch predicts perfectly.
+        let mx: number, my: number;
+        if (wm0 !== 0) mx = xi & wm0;
+        else { mx = xi % w0; if (mx < 0) mx += w0; }
+        if (hm0 !== 0) my = yi & hm0;
+        else { my = yi % h0; if (my < 0) my += h0; }
         if (mk0[my * w0 + mx]! !== 0) {
           const fu = ((tu & 0xffff) + 128) >> 8;
           const fv = ((tv & 0xffff) + 128) >> 8;
@@ -1265,20 +1295,18 @@ export function runSubdivRGBRepeat(
           let b = (w00 * d0[pa + 2]! + w10 * d0[pb + 2]! + w01 * d0[pc + 2]! + w11 * d0[pd + 2]! + 32768) >> 16;
           if (lbS) {
             const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
-            const lvc = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
-            const lx0 = luc | 0, ly0 = lvc | 0;
+            const lx0 = luc | 0;
             const lx1 = lx0 + 1 < lbW ? lx0 + 1 : lx0;
-            const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
             const lfu = Math.round((luc - lx0) * 256);
-            const lfv = Math.round((lvc - ly0) * 256);
-            const lw00 = (256 - lfu) * (256 - lfv);
-            const lw10 = lfu * (256 - lfv);
-            const lw01 = (256 - lfu) * lfv;
+            const lwU = 256 - lfu;
+            const lw00 = lwU * lwV;
+            const lw10 = lfu * lwV;
+            const lw01 = lwU * lfv;
             const lw11 = lfu * lfv;
-            const lpa = (ly0 * lbW + lx0) * 3;
-            const lpb = (ly0 * lbW + lx1) * 3;
-            const lpc = (ly1 * lbW + lx0) * 3;
-            const lpd = (ly1 * lbW + lx1) * 3;
+            const lpa = (rowA + lx0) * 3;
+            const lpb = (rowA + lx1) * 3;
+            const lpc = (rowB + lx0) * 3;
+            const lpd = (rowB + lx1) * 3;
             const lr = (lw00 * lbS[lpa]! + lw10 * lbS[lpb]! + lw01 * lbS[lpc]! + lw11 * lbS[lpd]! + 32768) >> 16;
             const lg = (lw00 * lbS[lpa + 1]! + lw10 * lbS[lpb + 1]! + lw01 * lbS[lpc + 1]! + lw11 * lbS[lpd + 1]! + 32768) >> 16;
             const lb2 = (lw00 * lbS[lpa + 2]! + lw10 * lbS[lpb + 2]! + lw01 * lbS[lpc + 2]! + lw11 * lbS[lpd + 2]! + 32768) >> 16;
@@ -1301,7 +1329,7 @@ export function runSubdivRGBRepeat(
   for (let i = 0, o = o0; i < n; i++, o++) {
     if (iz > zb[o]!) {
       // Single-TMU dither pick between the two hoisted descriptors.
-      const use1 = f16 <= RGB_BAYER4[(bRow << 2) | ((xAbs + i) & 3)]! ? 0 : 1;
+      const use1 = f16 <= RGB_BAYER4[bOff | ((xAbs + i) & 3)]! ? 0 : 1;
       const dd = use1 === 0 ? d0 : d1;
       const ww = use1 === 0 ? w0 : w1;
       const hh = use1 === 0 ? h0 : h1;
@@ -1309,8 +1337,13 @@ export function runSubdivRGBRepeat(
       const wmm = use1 === 0 ? wm0 : wm1;
       const hmm = use1 === 0 ? hm0 : hm1;
       const xi = tu >> 16, yi = tv >> 16;
-      const mx = rgbWrapInt(xi, ww, wmm);
-      const my = rgbWrapInt(yi, hh, hmm);
+      // Inlined rgbWrapInt (same integer ops, no call): the POT lane is
+      // call-constant, so the branch predicts perfectly.
+      let mx: number, my: number;
+      if (wmm !== 0) mx = xi & wmm;
+      else { mx = xi % ww; if (mx < 0) mx += ww; }
+      if (hmm !== 0) my = yi & hmm;
+      else { my = yi % hh; if (my < 0) my += hh; }
       if (mk[my * ww + mx]! !== 0) {
         const fu = ((tu & 0xffff) + 128) >> 8;
         const fv = ((tv & 0xffff) + 128) >> 8;
@@ -1330,20 +1363,18 @@ export function runSubdivRGBRepeat(
         let b = (w00 * dd[pa + 2]! + w10 * dd[pb + 2]! + w01 * dd[pc + 2]! + w11 * dd[pd + 2]! + 32768) >> 16;
         if (lbS) {
           const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
-          const lvc = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
-          const lx0 = luc | 0, ly0 = lvc | 0;
+          const lx0 = luc | 0;
           const lx1 = lx0 + 1 < lbW ? lx0 + 1 : lx0;
-          const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
           const lfu = Math.round((luc - lx0) * 256);
-          const lfv = Math.round((lvc - ly0) * 256);
-          const lw00 = (256 - lfu) * (256 - lfv);
-          const lw10 = lfu * (256 - lfv);
-          const lw01 = (256 - lfu) * lfv;
+          const lwU = 256 - lfu;
+          const lw00 = lwU * lwV;
+          const lw10 = lfu * lwV;
+          const lw01 = lwU * lfv;
           const lw11 = lfu * lfv;
-          const lpa = (ly0 * lbW + lx0) * 3;
-          const lpb = (ly0 * lbW + lx1) * 3;
-          const lpc = (ly1 * lbW + lx0) * 3;
-          const lpd = (ly1 * lbW + lx1) * 3;
+          const lpa = (rowA + lx0) * 3;
+          const lpb = (rowA + lx1) * 3;
+          const lpc = (rowB + lx0) * 3;
+          const lpd = (rowB + lx1) * 3;
           const lr = (lw00 * lbS[lpa]! + lw10 * lbS[lpb]! + lw01 * lbS[lpc]! + lw11 * lbS[lpd]! + 32768) >> 16;
           const lg = (lw00 * lbS[lpa + 1]! + lw10 * lbS[lpb + 1]! + lw01 * lbS[lpc + 1]! + lw11 * lbS[lpd + 1]! + 32768) >> 16;
           const lb2 = (lw00 * lbS[lpa + 2]! + lw10 * lbS[lpb + 2]! + lw01 * lbS[lpc + 2]! + lw11 * lbS[lpd + 2]! + 32768) >> 16;
@@ -1418,14 +1449,23 @@ export function runSubdivRGBClamp(
   const lbS = lb ? lb.samples : null;
   const lbW = lb ? lb.luxW : 0, lbH = lb ? lb.luxH : 0;
   const lbMaxU = lbW - 1, lbMaxV = lbH - 1;
-  const bRow = (yAbs | 0) & 3;
+  // Span-constant lightmap row state (lv is constant per span): v-side
+  // clamp, row select, fraction and row-base offsets hoisted out of the
+  // pixel loops below. Bit-identical: pure function of the same inputs.
+  const lvC = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
+  const ly0 = lvC | 0;
+  const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
+  const lfv = Math.round((lvC - ly0) * 256);
+  const lwV = 256 - lfv;
+  const rowA = ly0 * lbW, rowB = ly1 * lbW;
+  const bOff = (((yAbs | 0) & 3) << 2);
   let lux = lux0;
   for (let i = 0, o = o0; i < n; i++, o++) {
     if (iz > zb[o]!) {
       // Per-pixel dither pick between the two span-constant levels (the
       // fixed-level case always selects base: same value rgbPickMipLevel
       // returns, without the per-pixel call).
-      const use1 = !fixedLevel && f16 > RGB_BAYER4[(bRow << 2) | ((xAbs + i) & 3)]! ? 1 : 0;
+      const use1 = !fixedLevel && f16 > RGB_BAYER4[bOff | ((xAbs + i) & 3)]! ? 1 : 0;
       const t = levels[use1 === 0 ? baseLevel : nextLevel]!;
       const td = t.data, tw = t.width, th = t.height, tm = t.mask;
       const twMax = tw - 1, thMax = th - 1;
@@ -1454,20 +1494,18 @@ export function runSubdivRGBClamp(
         let b = (w00 * td[pa + 2]! + w10 * td[pb + 2]! + w01 * td[pc + 2]! + w11 * td[pd + 2]! + 32768) >> 16;
         if (lbS) {
           const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
-          const lvc = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
-          const lx0 = luc | 0, ly0 = lvc | 0;
+          const lx0 = luc | 0;
           const lx1 = lx0 + 1 < lbW ? lx0 + 1 : lx0;
-          const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
           const lfu = Math.round((luc - lx0) * 256);
-          const lfv = Math.round((lvc - ly0) * 256);
-          const lw00 = (256 - lfu) * (256 - lfv);
-          const lw10 = lfu * (256 - lfv);
-          const lw01 = (256 - lfu) * lfv;
+          const lwU = 256 - lfu;
+          const lw00 = lwU * lwV;
+          const lw10 = lfu * lwV;
+          const lw01 = lwU * lfv;
           const lw11 = lfu * lfv;
-          const lpa = (ly0 * lbW + lx0) * 3;
-          const lpb = (ly0 * lbW + lx1) * 3;
-          const lpc = (ly1 * lbW + lx0) * 3;
-          const lpd = (ly1 * lbW + lx1) * 3;
+          const lpa = (rowA + lx0) * 3;
+          const lpb = (rowA + lx1) * 3;
+          const lpc = (rowB + lx0) * 3;
+          const lpd = (rowB + lx1) * 3;
           const lr = (lw00 * lbS[lpa]! + lw10 * lbS[lpb]! + lw01 * lbS[lpc]! + lw11 * lbS[lpd]! + 32768) >> 16;
           const lg = (lw00 * lbS[lpa + 1]! + lw10 * lbS[lpb + 1]! + lw01 * lbS[lpc + 1]! + lw11 * lbS[lpd + 1]! + 32768) >> 16;
           const lb2 = (lw00 * lbS[lpa + 2]! + lw10 * lbS[lpb + 2]! + lw01 * lbS[lpc + 2]! + lw11 * lbS[lpd + 2]! + 32768) >> 16;
@@ -1613,7 +1651,16 @@ export function runSubdivRGBGeneric(
   const lbS = lb ? lb.samples : null;
   const lbW = lb ? lb.luxW : 0, lbH = lb ? lb.luxH : 0;
   const lbMaxU = lbW - 1, lbMaxV = lbH - 1;
-  const bRow = (yAbs | 0) & 3;
+  // Span-constant lightmap row state (lv is constant per span): v-side
+  // clamp, row select, fraction and row-base offsets hoisted out of the
+  // pixel loops below. Bit-identical: pure function of the same inputs.
+  const lvC = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
+  const ly0 = lvC | 0;
+  const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
+  const lfv = Math.round((lvC - ly0) * 256);
+  const lwV = 256 - lfv;
+  const rowA = ly0 * lbW, rowB = ly1 * lbW;
+  const bOff = (((yAbs | 0) & 3) << 2);
   let lux = lux0;
   for (let i = 0, o = o0; i < n; i++, o++) {
     if (iz > zb[o]!) {
@@ -1624,7 +1671,7 @@ export function runSubdivRGBGeneric(
         fu = wu << 16;
         fv = wv << 16;
       }
-      const use1 = !fixedLevel && f16 > RGB_BAYER4[(bRow << 2) | ((xAbs + i) & 3)]! ? 1 : 0;
+      const use1 = !fixedLevel && f16 > RGB_BAYER4[bOff | ((xAbs + i) & 3)]! ? 1 : 0;
       const dd = use1 === 0 ? d0 : d1;
       const ww = use1 === 0 ? w0 : w1;
       const hh = use1 === 0 ? h0 : h1;
@@ -1670,20 +1717,18 @@ export function runSubdivRGBGeneric(
         let b = (w00 * dd[pa + 2]! + w10 * dd[pb + 2]! + w01 * dd[pc + 2]! + w11 * dd[pd + 2]! + 32768) >> 16;
         if (lbS) {
           const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
-          const lvc = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
-          const lx0 = luc | 0, ly0 = lvc | 0;
+          const lx0 = luc | 0;
           const lx1 = lx0 + 1 < lbW ? lx0 + 1 : lx0;
-          const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
           const lfu = Math.round((luc - lx0) * 256);
-          const lfv = Math.round((lvc - ly0) * 256);
-          const lw00 = (256 - lfu) * (256 - lfv);
-          const lw10 = lfu * (256 - lfv);
-          const lw01 = (256 - lfu) * lfv;
+          const lwU = 256 - lfu;
+          const lw00 = lwU * lwV;
+          const lw10 = lfu * lwV;
+          const lw01 = lwU * lfv;
           const lw11 = lfu * lfv;
-          const lpa = (ly0 * lbW + lx0) * 3;
-          const lpb = (ly0 * lbW + lx1) * 3;
-          const lpc = (ly1 * lbW + lx0) * 3;
-          const lpd = (ly1 * lbW + lx1) * 3;
+          const lpa = (rowA + lx0) * 3;
+          const lpb = (rowA + lx1) * 3;
+          const lpc = (rowB + lx0) * 3;
+          const lpd = (rowB + lx1) * 3;
           const lr = (lw00 * lbS[lpa]! + lw10 * lbS[lpb]! + lw01 * lbS[lpc]! + lw11 * lbS[lpd]! + 32768) >> 16;
           const lg = (lw00 * lbS[lpa + 1]! + lw10 * lbS[lpb + 1]! + lw01 * lbS[lpc + 1]! + lw11 * lbS[lpd + 1]! + 32768) >> 16;
           const lb2 = (lw00 * lbS[lpa + 2]! + lw10 * lbS[lpb + 2]! + lw01 * lbS[lpc + 2]! + lw11 * lbS[lpd + 2]! + 32768) >> 16;

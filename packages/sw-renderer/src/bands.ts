@@ -14,10 +14,10 @@
 
 import { Com_Error, getCVarNumber, registerCVar } from '@q2/config';
 import {
-  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SoftwareBackend,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SoftwareBackend, RGBWorldBackend,
   buildTurbTable, drawSpansSoftware, drawSpansTurbulent, drawSpansFlatPerSpan,
   runSubdiv16, runSubdivTurbulent, runSpanFlat, sampleLightBlock, textureMasks,
-  type LightBlock, type RasterBackend, type Span, type SpanList, type Texture,
+  type LightBlock, type RasterBackend, type RGBMaterial, type Span, type SpanList, type Texture,
 } from './spans.js';
 import { COLORMAP_SIZE } from './colormap.js';
 
@@ -808,6 +808,13 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
   private clearedFrame = -1;
   private scratch: Span[] = [];
   private readonly bandList: SpanList = { spans: [], count: 0 };
+  /**
+   * Monomorphic RGB overlay backend (perf-2 lane): owns the renderer's RGB
+   * planes (color/cover/rgbZb) when banded. Workers only handle the indexed
+   * planes, so RGB always runs inline per band on the calling thread; the
+   * single global composite in endFrame merges the planes afterwards.
+   */
+  private readonly rgb = new RGBWorldBackend();
 
   setBandCount(n: number): void {
     const c = Math.floor(n);
@@ -986,6 +993,7 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
 
   /** Inline chunked spanfill with the lazy-clear guard (shared fallback). */
   private runInline(list: SpanList, tex: Texture, light: LightBlock): void {
+
     if (this.dispatcher) {
       const f = this.dispatcher.frame();
       if (f !== this.clearedFrame) {
@@ -1018,6 +1026,55 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
         this.pixelsDrawn += a.pixels + t.pixels + f.pixels;
       }
       base = end;
+    }
+    this.bandList.count = 0;
+  }
+
+  /**
+   * Bind the renderer's RGB overlay planes (color/cover/separate rgbZb).
+   * Called every enabled frame (see SoftwareRenderer.beginFrame); workers
+   * never touch these planes, so no SAB staging is involved.
+   */
+  attachRGB(color: Uint32Array, cover: Uint8Array, zb: Float32Array, w: number, h: number): void {
+    this.rgb.attach(color, cover, zb, w, h);
+    this.bands = splitBands(h, this.bandCount);
+  }
+
+  /**
+   * RGB span pass over the bands (perf-2 lane): partitions each chunk by row
+   * band and routes it through the same monomorphic RGB loop as the serial
+   * path. Absolute screen coords are preserved (s.y rides the span, x runs
+   * from the absolute x0), so the Bayer mip-dither phase and band-seam rows
+   * are bit-identical to serial. Bands are disjoint rows; opaque writes are
+   * depth-guarded and blend writes never cross a band boundary, so chunk and
+   * band order cannot affect any pixel. Runs inline on the calling thread
+   * (workers only handle the indexed planes); the single global composite in
+   * endFrame merges the planes afterwards. Zero allocation (scratch +
+   * bandList are backend-owned, shared with runInline, never re-entered).
+   */
+  drawSpansRGB(list: SpanList, mat: RGBMaterial): void {
+    if (this.bandCount <= 1 || this.fbH <= 0) {
+      this.rgb.drawSpansRGB(list, mat);
+      return;
+    }
+    const spans = list.spans;
+    const total = list.count < spans.length ? list.count : spans.length;
+    const nb = this.bands.length;
+    let base = 0;
+    while (base < total) {
+      const end = Math.min(total, base + BAND_CHUNK);
+      for (let b = 0; b < nb; b++) {
+        const band = this.bands[b]!;
+        let m = 0;
+        for (let i = base; i < end; i++) {
+          const s = spans[i]!;
+          if (s.y >= band.y0 && s.y < band.y1) this.scratch[m++] = s;
+        }
+        if (m === 0) continue;
+        this.bandList.count = m;
+        this.rgb.drawSpansRGB(this.bandList, mat);
+      }
+      base += end;
     }
     this.bandList.count = 0;
   }

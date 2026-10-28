@@ -6,6 +6,7 @@
 import type {
   Entity, Framebuffer, FrameStats, Model, ModelHandle, RefDef, Refresh, TextureHandle, WorldModel,
 } from '@q2/renderer-api';
+import { Com_Error } from '@q2/config';
 import type { MiniLightmap } from './worldNodes.js';import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, buildRGBLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
 import { SurfaceCache, hashLightStyles, RGBLightCache, type RGBCachedBlock, type SurfaceBlock } from './surfaceCache.js';
 import { setupCamera, setupCameraInto, culledByFlatFrustum, type Camera } from './camera.js';
@@ -59,17 +60,19 @@ const MAX_ROW = 4096;
  * viewmodel, sprites, particles, tracer beams) into an RGB888 plane +
  * coverage mask composited in endFrame. The RGB path owns a SEPARATE depth
  * plane (rgbZb): sharing the software zb would perturb indexed draws after
- * it (strict-greater tests). Pooled (banded) and wasm backends ignore the
- * flag and keep software output.
+ * it (strict-greater tests). Pooled (banded) backends route the same RGB
+ * spans per band (inline, absolute screen coords) and merge them in the
+ * single global endFrame composite; the wasm backend has no RGB pass and
+ * errors explicitly when the flag is on (never silent software output).
  */
 let rgbWorldEnabled = false;
 
 /**
  * Select the serial RGB world pass. For the apps/web agent: call with true
  * when `vid_renderer` selects the voodoo path (and the renderer runs the
- * serial classic backend), false when switching back to software. No stale
- * color survives a switch: the coverage mask is cleared every enabled
- * frame and the composite is skipped entirely while disabled.
+ * serial classic or banded backend), false when switching back to software.
+ * No stale color survives a switch: the coverage mask is cleared every
+ * enabled frame and the composite is skipped entirely while disabled.
  */
 export function setRGBWorldEnabled(on: boolean): void {
   rgbWorldEnabled = on === true;
@@ -487,6 +490,12 @@ export class SoftwareRenderer implements Refresh {
    */
   setWasmEnabled(on: boolean): boolean {
     if (on) {
+      // No silent software fallback: the wasm kernel only implements the
+      // indexed opaque-span loop, so an armed RGB flag is an explicit error
+      // (a full WASM RGB port is out of scope — see spans.ts PORT-DIFF).
+      if (rgbWorldEnabled) {
+        Com_Error('error', 'sw-renderer: WASM backend has no RGB world pass (call setRGBWorldEnabled(false) first) — refusing to render silent software output');
+      }
       if (!this.wasmBackend && !this.initWasm()) return false;
       const wb = this.wasmBackend!;
       wb.attach(wb.idx, wb.zb, this.fbW, this.fbH, this.colormap);
@@ -827,11 +836,25 @@ export class SoftwareRenderer implements Refresh {
 
   /**
    * True when this frame may take the RGB overlay path: the module flag is
-   * on AND the active backend is the serial classic one (pooled/banded and
-   * wasm backends ignore the flag and keep software output).
+   * on AND the active backend is the serial classic or the banded one (the
+   * banded backend routes RGB spans per band; see drawRGBSpans). The wasm
+   * backend has no RGB pass and refuses to enable while the flag is on.
    */
-  private rgbSerialActive(): boolean {
-    return rgbWorldEnabled && this.backend === this.tsBackend;
+  private rgbOverlayActive(): boolean {
+    return rgbWorldEnabled && (this.backend === this.tsBackend || this.backend === this.bandBackend);
+  }
+
+  /**
+   * Route one RGB span batch (perf-2 lane): the serial classic backend draws
+   * through the renderer's RGB backend, the banded backend partitions the
+   * same spans per row band (absolute coords, bit-identical dither phase).
+   * The caller runs inside rgbOverlayActive(); marks the frame used so
+   * endFrame runs the single global composite.
+   */
+  private drawRGBSpans(list: SpanList, mat: RGBMaterial): void {
+    if (this.backend === this.bandBackend) this.bandBackend.drawSpansRGB(list, mat);
+    else this.rgbBackend.drawSpansRGB(list, mat);
+    this.rgbUsedThisFrame = true;
   }
 
   /**
@@ -989,6 +1012,12 @@ export class SoftwareRenderer implements Refresh {
       this.rgbBackend.attach(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH);
       this.rgbCover.fill(0);
       this.rgbZb.fill(0);
+      // The banded backend partitions RGB spans per row band over the same
+      // planes (workers never touch them); binding follows the live planes
+      // like the serial backend above.
+      if (this.backend === this.bandBackend) {
+        this.bandBackend.attachRGB(this.rgbColor, this.rgbCover, this.rgbZb, this.fbW, this.fbH);
+      }
     }
     this.rgbCache.nextFrame();
   }
@@ -1230,9 +1259,8 @@ export class SoftwareRenderer implements Refresh {
         if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = endCount;
         this.backend.drawSpans(this.spanList, texView, lightView);
-        if (this.rgbSerialActive()) {
-          this.rgbBackend.drawSpansRGB(this.spanList, this.rgbMaterialForFlatSky());
-          this.rgbUsedThisFrame = true;
+        if (this.rgbOverlayActive()) {
+          this.drawRGBSpans(this.spanList, this.rgbMaterialForFlatSky());
         }
         if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = 0;
@@ -1301,7 +1329,7 @@ export class SoftwareRenderer implements Refresh {
       // RGB material exists): software planes stay bit-identical, and the
       // RGB overlay composites over them in endFrame.
       let rgbMat: RGBMaterial | null = null;
-      if (this.rgbSerialActive() && !surf.sky) {
+      if (this.rgbOverlayActive() && !surf.sky) {
         const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, this.dlights.serial, 0);
         rgbMat = rgbHit
           ? rgbHit.material
@@ -1349,8 +1377,7 @@ export class SoftwareRenderer implements Refresh {
       // comparable across the flag.
       this.backend.drawSpans(this.spanList, tex, lb);
       if (rgbMat) {
-        this.rgbBackend.drawSpansRGB(this.spanList, rgbMat);
-        this.rgbUsedThisFrame = true;
+        this.drawRGBSpans(this.spanList, rgbMat);
       }
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
@@ -1429,7 +1456,7 @@ export class SoftwareRenderer implements Refresh {
     // composite against the current plane pixel, so seed the plane with the
     // exact software background (opaque world, classically drawn above)
     // before any RGB foreground write. Opaque RGB writes overwrite it.
-    const rgbActive = this.rgbSerialActive();
+    const rgbActive = this.rgbOverlayActive();
     if (rgbActive) this.seedRGBBackground();
     for (let a = this.fgAlphaCount - 1; a >= 0; a--) {
       const si = this.alphaDeferredSi[a]!;
@@ -1507,7 +1534,7 @@ export class SoftwareRenderer implements Refresh {
       // screen-door stipple — the RGB path has no stipple), warped when
       // the surface is turbulent, never depth-writing. Reverse traversal
       // order is preserved (back-to-front over-blend).
-      if (this.rgbSerialActive()) {
+      if (this.rgbOverlayActive()) {
         const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, this.dlights.serial, 1);
         let rgbMat = rgbHit
           ? rgbHit.material
@@ -1518,8 +1545,7 @@ export class SoftwareRenderer implements Refresh {
           );
         if (rgbMat) {
           if (rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-          this.rgbBackend.drawSpansRGB(this.spanList, rgbMat);
-          this.rgbUsedThisFrame = true;
+          this.drawRGBSpans(this.spanList, rgbMat);
         }
       }
       this.transSpans += t.spans;
@@ -1800,6 +1826,11 @@ export class SoftwareRenderer implements Refresh {
         this.zb.fill(0);
       }
       this.bandBackend.resolveAccum(this.palette, this.color);
+      // Single global reconstruct: the RGB overlay (world spans routed per
+      // band above, foreground draws) composites over the resolved plane
+      // once — bands only ever produce pre-scanout planes, never a display
+      // image. Skipped while disabled, so classic output is untouched.
+      if (this.rgbUsedThisFrame) this.compositeRGB();
     } else {
       // palette expand to 0xAABBGGRR (classic / wasm / banded-inline paths)
       const pal = this.palette;
@@ -1813,14 +1844,22 @@ export class SoftwareRenderer implements Refresh {
       // from the RGB888 plane (opaque world, water, sky, glass, alias,
       // sprites, particles, beams); everything else keeps the indexed
       // resolve. Skipped while disabled, so classic output is untouched.
-      if (this.rgbUsedThisFrame) {
-        const rgb = this.rgbColor, cover = this.rgbCover;
-        for (let i = 0; i < n; i++) {
-          if (cover[i]) this.color[i] = rgb[i]!;
-        }
-      }
+      if (this.rgbUsedThisFrame) this.compositeRGB();
     }
     this.mirrorIndexPlane();
+  }
+
+  /**
+   * Merge the RGB overlay plane over the resolved color plane wherever the
+   * coverage mask is set (the single global reconstruct for every backend:
+   * serial, banded-inline and pooled all funnel here).
+   */
+  private compositeRGB(): void {
+    const rgb = this.rgbColor, cover = this.rgbCover;
+    const n = this.fbW * this.fbH;
+    for (let i = 0; i < n; i++) {
+      if (cover[i]) this.color[i] = rgb[i]!;
+    }
   }
 
   /**
@@ -1835,6 +1874,7 @@ export class SoftwareRenderer implements Refresh {
         this.zb.fill(0);
       }
       await this.bandBackend.resolveAccumAsync(this.palette, this.color);
+      if (this.rgbUsedThisFrame) this.compositeRGB();
     } else {
       this.endFrame();
       return;
@@ -2107,11 +2147,10 @@ export class SoftwareRenderer implements Refresh {
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       this.spanList.count = endCount;
       this.backend.drawSpans(this.spanList, texView, lightView);
-      if (this.rgbSerialActive()) {
+      if (this.rgbOverlayActive()) {
         const skyMat = this.rgbMaterialForSky();
         if (skyMat) {
-          this.rgbBackend.drawSpansRGB(this.spanList, skyMat);
-          this.rgbUsedThisFrame = true;
+          this.drawRGBSpans(this.spanList, skyMat);
         }
       }
       this.spanList.count = 0;
