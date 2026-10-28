@@ -392,9 +392,51 @@ const WEAPON_WORLD_CLASSES = [
   'weapon_bfg',
 ];
 
-/** World-model lump for a pickup classname (weapons via the game table). */
+/**
+ * C world_model lumps (game/g_items.c) for the SP-remnant arsenal the game
+ * table does not carry (it stops at blaster/shotgun/machinegun): all
+ * verified present in pak0.pak (see WEAPON_WORLD_CLASSES registration).
+ * weapon_grenades is intentionally absent: C hand grenades have no g_ world
+ * model (the "Grenades" usable IS the ammo_grenades box — v_handgr is
+ * view-only), so the ammo box stays the C-identical pickup visual.
+ */
+const WEAPON_WORLD_FALLBACK: Record<string, string> = {
+  weapon_supershotgun: 'models/weapons/g_shotg2/tris.md2',
+  weapon_chaingun: 'models/weapons/g_chain/tris.md2',
+  weapon_grenadelauncher: 'models/weapons/g_launch/tris.md2',
+  weapon_rocketlauncher: 'models/weapons/g_rocket/tris.md2',
+  weapon_hyperblaster: 'models/weapons/g_hyperb/tris.md2',
+  weapon_railgun: 'models/weapons/g_rail/tris.md2',
+  weapon_bfg: 'models/weapons/g_bfg/tris.md2',
+};
+
+/**
+ * C view_model lumps (game/g_items.c) for the same remnant set, for the
+ * first-person view-model registration below (all verified in pak0.pak).
+ * weapon_grenades resolves to v_handgr (C "use grenades" view).
+ */
+const WEAPON_VIEW_FALLBACK: Record<string, string> = {
+  weapon_supershotgun: 'models/weapons/v_shotg2/tris.md2',
+  weapon_chaingun: 'models/weapons/v_chain/tris.md2',
+  weapon_grenades: 'models/weapons/v_handgr/tris.md2',
+  weapon_grenadelauncher: 'models/weapons/v_launch/tris.md2',
+  weapon_rocketlauncher: 'models/weapons/v_rocket/tris.md2',
+  weapon_hyperblaster: 'models/weapons/v_hyperb/tris.md2',
+  weapon_railgun: 'models/weapons/v_rail/tris.md2',
+  weapon_bfg: 'models/weapons/v_bfg/tris.md2',
+};
+
+/**
+ * View-model lump for a weapon classname (game table first, C fallback for
+ * the remnant arsenal). Null only for unknown classnames.
+ */
+export function viewModelForPickup(classname: string): string | null {
+  return viewModelForWeapon(classname) ?? WEAPON_VIEW_FALLBACK[classname] ?? null;
+}
+
+/** World-model lump for a pickup classname (weapons via the game table + C fallback). */
 export function worldModelForPickup(classname: string): string | null {
-  return worldModelForWeapon(classname) ?? ITEM_WORLD_MODELS[classname] ?? null;
+  return worldModelForWeapon(classname) ?? WEAPON_WORLD_FALLBACK[classname] ?? ITEM_WORLD_MODELS[classname] ?? null;
 }
 
 /** Skin lump next to an item/weapon world model (sibling skin.pcx). */
@@ -417,6 +459,18 @@ const REFIRE: Record<string, number> = {
   weapon_blaster: 0.25,
   weapon_shotgun: 0.9,
   weapon_machinegun: 0.1,
+  // Lite throttle for the SP-remnant arsenal (C Weapon_Generic fire-frame
+  // cadence at 10Hz: supershotgun ~10 ticks, launchers/railgun ~8-9, bfg
+  // ~12, chaingun/hyperblaster bursts, hand grenades ~8). Base1 never grants
+  // these in SP (all 1792 DM-only), so these only gate DM/synthetic use.
+  weapon_supershotgun: 1.0,
+  weapon_chaingun: 0.15,
+  weapon_grenades: 0.8,
+  weapon_grenadelauncher: 0.8,
+  weapon_rocketlauncher: 0.9,
+  weapon_hyperblaster: 0.15,
+  weapon_railgun: 0.9,
+  weapon_bfg: 1.2,
 };
 
 // --- devroom analytic collision (floor z=0, walls +-256, center pillar) ---
@@ -659,28 +713,65 @@ export const VIEWMODEL_FIRE_FRAME = 5;
 export const VIEWMODEL_IDLE_FRAMES: Record<string, number> = {
   weapon_blaster: 9,
   weapon_shotgun: 19,
+  weapon_supershotgun: 18,
   weapon_machinegun: 6,
+  weapon_chaingun: 32,
+  weapon_grenades: 16,
+  weapon_grenadelauncher: 17,
+  weapon_rocketlauncher: 13,
+  weapon_hyperblaster: 21,
+  weapon_railgun: 19,
+  weapon_bfg: 33,
 };
 export const VIEWMODEL_FIRE_FRAMES: Record<string, number> = {
   weapon_blaster: 5,
   weapon_shotgun: 8,
+  weapon_supershotgun: 7,
   weapon_machinegun: 4,
+  weapon_chaingun: 5,
+  weapon_grenades: 1,
+  weapon_grenadelauncher: 6,
+  weapon_rocketlauncher: 5,
+  weapon_hyperblaster: 6,
+  weapon_railgun: 4,
+  weapon_bfg: 9,
 };
 
 /**
- * Weapon_Generic frame bounds per weapon (p_weapon.c Weapon_* calls:
+ * Weapon_Generic frame bounds per weapon (p_weapon.c Weapon_* call sites:
  * Weapon_Generic(ent, ACTIVATE_LAST, FIRE_LAST, IDLE_LAST, DEACTIVATE_LAST)).
- * FIRE_FIRST = ACTIVATE_LAST+1, IDLE_FIRST = FIRE_LAST+1. The driver walks
- * gunframe FIRE_FIRST..IDLE_FIRST+1 while firing, then holds IDLE_FIRST
- * (READY) — viewModel() reports the live gunframe, not a frozen fire frame.
+ * FIRE_FIRST = ACTIVATE_LAST+1, IDLE_FIRST = FIRE_LAST+1 (READY), FIRST drop
+ * frame = IDLE_LAST+1. Blaster (4,8,52,55), Shotgun (7,18,36,39), SuperShotgun
+ * (6,17,57,61), Machinegun (3,5,45,49), Chaingun (4,31,61,64), GrenadeLauncher
+ * (5,16,59,64), RocketLauncher (4,12,50,54), HyperBlaster (5,20,49,53),
+ * Railgun (3,18,56,61), BFG (8,32,55,58). Hand grenades run the custom
+ * Weapon_Grenade (READY 16 = fire+1, throw run-up 1..15, wrap 48): the lite
+ * (0,15,48,51) is the Generic-shaped equivalent. The driver walks gunframe
+ * FIRE_FIRST..IDLE_FIRST+1 while firing, then holds IDLE_FIRST (READY) —
+ * viewModel() reports the live gunframe, not a frozen fire frame.
  */
-const GUN_BOUNDS: Record<string, { activate: number; fire: number; idle: number; deactivate: number }> = {
+export interface GunBounds {
+  activate: number;
+  fire: number;
+  idle: number;
+  deactivate: number;
+}
+
+const GUN_BOUNDS: Record<string, GunBounds> = {
   weapon_blaster: { activate: 4, fire: 8, idle: 52, deactivate: 55 },
   weapon_shotgun: { activate: 7, fire: 18, idle: 36, deactivate: 39 },
+  weapon_supershotgun: { activate: 6, fire: 17, idle: 57, deactivate: 61 },
   weapon_machinegun: { activate: 3, fire: 5, idle: 45, deactivate: 49 },
+  weapon_chaingun: { activate: 4, fire: 31, idle: 61, deactivate: 64 },
+  weapon_grenades: { activate: 0, fire: 15, idle: 48, deactivate: 51 },
+  weapon_grenadelauncher: { activate: 5, fire: 16, idle: 59, deactivate: 64 },
+  weapon_rocketlauncher: { activate: 4, fire: 12, idle: 50, deactivate: 54 },
+  weapon_hyperblaster: { activate: 5, fire: 20, idle: 49, deactivate: 53 },
+  weapon_railgun: { activate: 3, fire: 18, idle: 56, deactivate: 61 },
+  weapon_bfg: { activate: 8, fire: 32, idle: 55, deactivate: 58 },
 };
 
-function gunBoundsFor(classname: string): { activate: number; fire: number; idle: number; deactivate: number } {
+export function gunBoundsFor(classname: string): GunBounds {
   return GUN_BOUNDS[classname] ?? { activate: 4, fire: 8, idle: 52, deactivate: 55 };
 }
 
@@ -772,6 +863,10 @@ export class LocalDriver implements HostDriver {
   weapon: WeaponDef = WEAPON_BLASTER;
   shells = 0;
   bullets = 0;
+  grenades = 0;
+  cells = 0;
+  rockets = 0;
+  slugs = 0;
   readonly rand = mulberry32(0x51ab);
   private lastShotAt = -10;
   private doors: DoorSync[] = [];
@@ -780,13 +875,31 @@ export class LocalDriver implements HostDriver {
   /** Brush models already stripped from the leaf facelists after blowing. */
   private freedBrushHidden = new Set<number>();
   /**
-   * World trace for gameplay queries (pmove, shots, drops): the server
-   * C-mask helper (SV_TraceFor, MASK_PLAYERSOLID_C) wrapped with the solid
-   * brush clips (SV_ClipTrace) so func_explosive/func_wall block until
+   * World trace for gameplay queries (shots, drops, use reach checks): the
+   * server C-mask helper (SV_TraceFor, MASK_PLAYERSOLID_C) wrapped with the
+   * solid brush clips (SV_ClipTrace) so func_explosive/func_wall block until
    * SV_RemoveBrushClip opens them. Phase 1 fold: no game-side mask-1
    * hookup remains in the driver path (setPmoveWorldFromBsp/bspTraceFor).
+   *
+   * Live monsters are NOT in this trace (includeMonsters false): the server
+   * tick (monster locomotion on game.trace, bolts, explosions) runs on it,
+   * and a mover always starts inside its own hull — with the monster pass on,
+   * every sub-hull step reads allsolid and bodies freeze in place (see the
+   * SV_ClipTrace doc). Shots resolve flesh through the state-based
+   * bolt/pellet sweeps, never this trace.
    */
   private worldTrace: (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => TraceResult;
+  /**
+   * Pmove body trace: worldTrace PLUS the live-monster hull pass
+   * (SV_MonsterClipBox, C SV_ClipMoveToEntities SOLID_BBOX bodies), so the
+   * player cannot walk through live enemies. Corpses never block (C Killed
+   * sets SVF_DEADMONSTER — SV_MonsterClipBox drops dead/gibbed), dormant
+   * TRIGGER_SPAWN bodies pass through until monster_triggered_spawn wakes
+   * them (SOLID_NOT → SOLID_BBOX). Installed via setPmoveWorld; the monster
+   * tick keeps the monster-free worldTrace above (split traces: pmove sees
+   * monsters, monster locomotion never sees self).
+   */
+  private pmoveTrace: (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => TraceResult;
   /**
    * Solid-aware point contents for the pmove world AND the server
    * P_WorldEffects sampler (game/p_view.c): `bspPointContentsFor` carries
@@ -847,6 +960,19 @@ export class LocalDriver implements HostDriver {
   private gunframe = 0;
   private firing = false;
   /**
+   * Lower/raise switch (p_weapon.c Weapon_Generic WEAPON_DROPPING /
+   * WEAPON_ACTIVATING + ChangeWeapon): true from selectWeapon (or a
+   * first-pickup auto-switch) until the new gun reaches READY. Fire is
+   * blocked throughout (see handleAttack). `pendingWeapon` is the gun being
+   * raised (swapped in at the drop end), `dropBounds` the OUTGOING gun's
+   * bounds (C drops the old gun's DEACTIVATE range), `raising` false while
+   * lowering / true while raising 0..ACTIVATE_LAST.
+   */
+  private switching = false;
+  private pendingWeapon: WeaponDef | null = null;
+  private dropBounds: GunBounds | null = null;
+  private raising = false;
+  /**
    * Firing kick (p_weapon.c Blaster_Fire/weapon_shotgun_fire): kickOrigin =
    * -2*fwd, kickAngles [-1,0,0] blaster / [-2,0,0] shotgun. Set on the firing
    * tick, visible via viewKick() for exactly one 10Hz tick, then cleared at
@@ -887,6 +1013,7 @@ export class LocalDriver implements HostDriver {
       // game-side mask-1 hookup (setPmoveWorldFromBsp/bspTraceFor) is gone
       // from the driver path (it dropped through clip floors into the void).
       this.worldTrace = SV_ClipTrace(this.server, SV_TraceFor(built.map));
+      this.pmoveTrace = SV_ClipTrace(this.server, SV_TraceFor(built.map), -1, true);
       this.sightTrace = SV_TraceFor(built.map, MASK_OPAQUE_C);
       // Solid-aware contents (water.ts bspPointContentsFor, NOT the legacy
       // solid-less bspContentsFor): the pmove vault probe (`& CONTENTS_SOLID`)
@@ -896,7 +1023,7 @@ export class LocalDriver implements HostDriver {
       // the vault stayed inert (the SOLID probe is always false without the
       // bit). Dry-land consumers test MASK_WATER only: bit-identical there.
       this.worldContents = bspPointContentsFor(built.map);
-      setPmoveWorld(this.worldTrace, this.worldContents);
+      setPmoveWorld(this.pmoveTrace, this.worldContents);
       // Skill latch (id CVAR_LATCH, g_spawn.c): the server filters spawns,
       // damage scale, and the roster from st.skill — set it before spawning.
       SV_SetSkill(this.server, getSkill());
@@ -922,7 +1049,11 @@ export class LocalDriver implements HostDriver {
       this.map = null;
       this.mini = createDevroom();
       this.worldTrace = devroomTrace;
-      setPmoveWorld(devroomTrace, this.worldContents);
+      // Same split as the pak path (uniform single-sim semantics): devroom
+      // synthetics (SV_SpawnMonster SOLID_BBOX) block the body, never the
+      // monster tick (which runs on worldTrace).
+      this.pmoveTrace = SV_ClipTrace(this.server, devroomTrace, -1, true);
+      setPmoveWorld(this.pmoveTrace, this.worldContents);
       this.playerEdict = spawnEdict({ classname: 'player' });
       this.pm.origin = v3(-168, 0, 32);
       this.pm.velocity = v3();
@@ -1472,13 +1603,42 @@ export class LocalDriver implements HostDriver {
       return;
     }
     const def = findWeapon(classname);
-    if (def) {
-      this.weapon = def;
-      // Fresh weapon raises at the idle pose (Weapon_Generic READY state).
-      this.firing = false;
-      this.gunframe = gunBoundsFor(classname).fire + 1;
-      this.events.push('weapon');
-    }
+    if (!def) return;
+    // Re-selecting the raised gun is a no-op (C ChangeWeapon same-weapon
+    // early-out). Anything else lowers the old gun first (WEAPON_DROPPING
+    // from DEACTIVATE_FIRST of the OUTGOING bounds) and raises the new one
+    // (WEAPON_ACTIVATING 0..ACTIVATE_LAST, C ChangeWeapon) to READY — fire
+    // stays blocked until then (see handleAttack). The pickup auto-switch
+    // funnels here too, so the gunframe can never go stale across a swap
+    // (the old path assigned this.weapon directly and kept it).
+    //
+    // Feedback: the 'weapon' event fires at the drop start and the status
+    // line names the incoming gun. There is no C switch sound (ChangeWeapon
+    // is silent; the pickup path already played items/pkup.wav), so none is
+    // fabricated here. viewModel() keeps reporting the live gunframe — drop
+    // and raise frames are real v_weap frames, never a frozen pose.
+    //
+    // Deviation (≤2 ticks): C queues newweapon through a firing gun and only
+    // starts the drop at READY; the lite starts the drop at once (firing is
+    // a 2-tick anim here, queuing would only delay the swap).
+    if (!this.switching && this.weapon.classname === classname) return;
+    this.pendingWeapon = def;
+    this.dropBounds = gunBoundsFor(this.weapon.classname);
+    this.switching = true;
+    this.raising = false;
+    this.firing = false;
+    this.gunframe = this.dropBounds.idle + 1; // DEACTIVATE_FIRST
+    this.setMessage(classname.replace(/_/g, ' '));
+    this.events.push('weapon');
+  }
+
+  /**
+   * True while a lower/raise weapon switch runs (drop or raise leg): fire is
+   * blocked and the gun is not yet READY (test hook + the phase3/H setup
+   * waits below).
+   */
+  get weaponSwitching(): boolean {
+    return this.switching;
   }
 
   hasWeapon(classname: string): boolean {
@@ -1666,6 +1826,34 @@ export class LocalDriver implements HostDriver {
 
   /** Advance the Weapon_Generic-lite gunframe one step per server tick. */
   private stepGunframe(): void {
+    if (this.switching) {
+      if (!this.raising) {
+        // WEAPON_DROPPING: walk the outgoing DEACTIVATE range; reaching
+        // DEACTIVATE_LAST swaps the gun in (C ChangeWeapon) and starts the
+        // raise at frame 0 (C WEAPON_ACTIVATING).
+        const drop = this.dropBounds ?? gunBoundsFor(this.weapon.classname);
+        if (this.gunframe >= drop.deactivate) {
+          this.weapon = this.pendingWeapon ?? this.weapon;
+          this.pendingWeapon = null;
+          this.dropBounds = null;
+          this.raising = true;
+          this.gunframe = 0;
+        } else {
+          this.gunframe++;
+        }
+        return;
+      }
+      // WEAPON_ACTIVATING: 0..ACTIVATE_LAST, then READY at IDLE_FIRST.
+      const b = gunBoundsFor(this.weapon.classname);
+      if (this.gunframe >= b.activate) {
+        this.switching = false;
+        this.pendingWeapon = null;
+        this.gunframe = b.fire + 1;
+      } else {
+        this.gunframe++;
+      }
+      return;
+    }
     if (!this.firing) return;
     const b = gunBoundsFor(this.weapon.classname);
     this.gunframe++;
@@ -1817,13 +2005,43 @@ export class LocalDriver implements HostDriver {
 
   hudAmmo(): string {
     if (!this.weapon.ammoKind) return '∞';
-    return String(this.weapon.ammoKind === 'shells' ? this.shells : this.bullets);
+    return String(this.ammoFor(this.weapon.ammoKind));
   }
 
-  /** Compat sync: legacy shells/bullets ints mirror PlayerState ammo. */
+  /** Compat counter for the selected weapon's ammo kind (shells/bullets legacy). */
+  private ammoFor(kind: string): number {
+    switch (kind) {
+      case 'shells':
+        return this.shells;
+      case 'bullets':
+        return this.bullets;
+      case 'grenades':
+        return this.grenades;
+      case 'cells':
+        return this.cells;
+      case 'rockets':
+        return this.rockets;
+      case 'slugs':
+        return this.slugs;
+      default:
+        return this.ps.ammo[kind] ?? 0;
+    }
+  }
+
+  /** Write-through ammo grant (PlayerState + compat counters together). */
+  private setAmmo(kind: string, v: number): void {
+    this.ps.ammo[kind] = v;
+    this.syncAmmo();
+  }
+
+  /** Compat sync: legacy shells/bullets (+ grenades/cells/rockets/slugs) mirror PlayerState ammo. */
   private syncAmmo(): void {
     this.shells = this.ps.ammo['shells'] ?? 0;
     this.bullets = this.ps.ammo['bullets'] ?? 0;
+    this.grenades = this.ps.ammo['grenades'] ?? 0;
+    this.cells = this.ps.ammo['cells'] ?? 0;
+    this.rockets = this.ps.ammo['rockets'] ?? 0;
+    this.slugs = this.ps.ammo['slugs'] ?? 0;
   }
 
   private emitSound(name: string, origin: Vec3, attn = ATTN_NORM, masterVol = 1): number {
@@ -1934,6 +2152,10 @@ export class LocalDriver implements HostDriver {
       const dy = Math.abs(py - e.origin[1]!);
       const dz = pz - e.origin[2]!;
       if (dx > 40 || dy > 40 || dz < -24 || dz > 64) continue;
+      // C Pickup_Weapon (SP): the FIRST of a kind becomes newweapon (the
+      // ChangeWeapon lower/raise); re-pickups only top the ammo gift. Read
+      // ownership BEFORE the grant so only genuinely new guns switch.
+      const hadWeapon = c.startsWith('weapon_') && this.ps.weapons.includes(c);
       const res = pickupItem(this.ps, c, this.server.time);
       if (!res.picked) continue;
       e.freed = true;
@@ -1951,12 +2173,11 @@ export class LocalDriver implements HostDriver {
       this.setMessage(c.replace(/_/g, ' '));
       // Real pak pickup sound (C g_items.c pickup_sound, incl. the suits).
       this.emitSound('items/pkup.wav', v3(px, py, pz));
-      if (res.reason === 'weapon' && (c === 'weapon_shotgun' || c === 'weapon_machinegun')) {
-        const def = findWeapon(c);
-        if (def) {
-          this.weapon = def;
-          this.events.push('weapon');
-        }
+      // New guns switch through the unified selectWeapon lower/raise (never
+      // a direct assignment — that kept a stale gunframe). Unknown
+      // weapon_* lumps (no def) grant but never switch.
+      if (res.reason === 'weapon' && !hadWeapon && findWeapon(c)) {
+        this.selectWeapon(c);
       }
     }
     // Pickups (health) write through the authoritative pool so the next
@@ -2370,6 +2591,10 @@ export class LocalDriver implements HostDriver {
    */
   private handleAttack(cmd: UserCmdT): void {    if (!(cmd.buttons & BUTTON_ATTACK)) return;
     if (this.playerDead) return;
+    // Weapon_Generic: WEAPON_DROPPING / WEAPON_ACTIVATING ignore attack —
+    // the gun is mid-switch (lower/raise), not READY, so the trigger does
+    // nothing (no shot, no dry-fire, no refire latch).
+    if (this.switching) return;
     const t = this.server.time;
     const refire = REFIRE[this.weapon.classname] ?? 0.25;
     if (t - this.lastShotAt < refire) return;
@@ -2380,7 +2605,7 @@ export class LocalDriver implements HostDriver {
       feet: v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]),
       angles: new Float32Array(cmd.angles) as Vec3,
       viewheight,
-      ammo: this.weapon.ammoKind === 'shells' ? this.shells : this.bullets,
+      ammo: this.ammoFor(this.weapon.ammoKind),
       trace: this.worldTrace,
       rand: this.rand,
     });
@@ -2390,9 +2615,7 @@ export class LocalDriver implements HostDriver {
       this.lastShotAt = t;
       return;
     }
-    if (this.weapon.ammoKind === 'shells') this.ps.ammo['shells'] = res.ammoLeft;
-    if (this.weapon.ammoKind === 'bullets') this.ps.ammo['bullets'] = res.ammoLeft;
-    this.syncAmmo();
+    if (this.weapon.ammoKind) this.setAmmo(this.weapon.ammoKind, res.ammoLeft);
     this.lastShotAt = t;
     this.setMessage('');
     this.events.push('shot');
@@ -2844,8 +3067,12 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
   const infantry = loadModel(modelForMonster('infantry'));
   const weapons: Record<string, number> = {};
   const weaponSkins: Record<string, number> = {};
-  for (const cls of ['weapon_blaster', 'weapon_shotgun', 'weapon_machinegun']) {
-    const mdl = viewModelForWeapon(cls);
+  // Every weapon class with a C view lump (game table + WEAPON_VIEW_FALLBACK,
+  // all verified in pak0.pak): the first-person gun renders as a real v_weap
+  // MD2 after an auto-equip, never the 2D silhouette. Appended in class
+  // order; earlier handles (soldier 0, gunner, infantry) never shift.
+  for (const cls of [...WEAPON_WORLD_CLASSES, 'weapon_grenades']) {
+    const mdl = viewModelForPickup(cls);
     if (!mdl) continue;
     weaponSkins[cls] = loadSkin(skinForWeaponModel(mdl));
     weapons[cls] = loadModel(mdl);
@@ -2888,9 +3115,9 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
     const mdl = ITEM_WORLD_MODELS[cls]!;
     items[cls] = { model: loadModel(mdl), skin: loadSkin(skinForItemModel(mdl)) };
   }
-  for (const cls of WEAPON_WORLD_CLASSES) {
+  for (const cls of [...WEAPON_WORLD_CLASSES, 'weapon_grenades']) {
     if (items[cls] !== undefined) continue;
-    const mdl = worldModelForWeapon(cls);
+    const mdl = worldModelForPickup(cls);
     if (!mdl) continue;
     items[cls] = { model: loadModel(mdl), skin: loadSkin(skinForWeaponModel(mdl)) };
   }

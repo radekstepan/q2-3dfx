@@ -188,6 +188,10 @@ export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
   sw_workers: ['0', '2', '4'],
   r_brightness: ['0.75', '1.0', '1.25', '1.5', '2.0'],
   vd_gamma: ['1.0', '1.3', '2.2'],
+  vd_dithermode: ['2x2', '4x4'],
+  vd_reconmode: ['2x2sub+2x2box', '4x4sub+4x1', 'legacy'],
+  vd_maxtexsize: ['64', '128', '256'],
+  vd_zbits: ['8', '16'],
 };
 
 /** Re-register HUD cvars if a test `resetCVars()` wiped them, so the
@@ -208,9 +212,11 @@ function ensureHudCvars(): void {
  *
  * Every 0/1 cvar the panel can list lives here: the HUD gates (`cl_showfps`,
  * `cl_showpos`), the Voodoo fidelity switches (`vd_*`, BRAIN.md §7.2), the
- * client/world toggles (`cl_predict`, `cl_interp`, `r_drawworld`), and the
+ * client/world toggles (`cl_predict`, `cl_interp`, `r_drawworld`), the
  * span-backend switches (`sw_wasm`, `sw_accum` — registered lazily by
- * `@q2/sw-renderer`, so they are pinned here even before first registration).
+ * `@q2/sw-renderer`, so they are pinned here even before first registration),
+ * and the translucency pair (`r_translucency`, `sw_stipplealpha` — also
+ * lazily registered by `@q2/sw-renderer`'s spans backend).
  * `sw_workers` stays a select (0/2/4 band count, not boolean).
  */
 export const CHECKBOX_CVARS: ReadonlySet<string> = new Set([
@@ -225,6 +231,8 @@ export const CHECKBOX_CVARS: ReadonlySet<string> = new Set([
   'vd_palettetex',
   'vd_overbright',
   'r_drawworld',
+  'r_translucency',
+  'sw_stipplealpha',
   'cl_predict',
   'cl_interp',
   'sw_wasm',
@@ -266,6 +274,15 @@ export const RESOLUTION_LABELS = ['320×240', '640×480', '800×600', '1024×768
 export const MAP_SOURCE_LABELS = ['Built-in devroom (demomap)', 'Cached pak0.pak (game)'] as const;
 
 /**
+ * Display labels for the vd_reconmode dropdown (the raw values are
+ * MiniGL-flavoured profile names, so the menu shows what each mode does).
+ */
+export const RECON_LABELS = ['2×2 matched (default)', '4×4 horizontal', 'Legacy (compat)'] as const;
+
+/** Display labels for the vd_zbits dropdown (depth precision profile). */
+export const ZBITS_LABELS = ['8-bit (banded)', '16-bit (Voodoo3)'] as const;
+
+/**
  * Whether a pak is available for the map_source dropdown. Set by the boot
  * layer (index.ts) on cache load / drop / clear; the dropdown lists the pak
  * only afterwards. Defaults to false (devroom only) so headless/Node boots
@@ -284,13 +301,38 @@ export function getMapSourceHasPak(): boolean {
 }
 
 /**
- * Display labels for a cvar's options (currently skill + resolution).
+ * Display labels for a cvar's options (skill + resolution + map_source +
+ * recon + zbits are labeled; other domains show their bare values).
  */
 export function cvarOptionLabels(name: string): readonly string[] | null {
   if (name === 'skill') return SKILL_LABELS;
   if (name === 'vid_resolution') return RESOLUTION_LABELS;
   if (name === 'map_source') return MAP_SOURCE_LABELS;
+  if (name === 'vd_reconmode') return RECON_LABELS;
+  if (name === 'vd_zbits') return ZBITS_LABELS;
   return null;
+}
+
+/** Sidebar section order for the settings panel (Quake II menu groups). */
+export const GROUP_ORDER = [
+  'VIDEO',
+  'VOODOO 3DFX',
+  'SOFTWARE SPANS',
+  'GAME',
+  'HUD',
+  'SOUND + INPUT',
+  'OTHER',
+] as const;
+
+/** Sidebar section for a cvar row (unknown cvars fall into OTHER). */
+export function cvarGroup(name: string): (typeof GROUP_ORDER)[number] {
+  if (name.startsWith('vd_')) return 'VOODOO 3DFX';
+  if (name === 'vid_renderer' || name === 'vid_resolution' || name === 'r_brightness' || name === 'r_drawworld' || name === 'r_translucency') return 'VIDEO';
+  if (name.startsWith('sw_')) return 'SOFTWARE SPANS';
+  if (name === 'skill' || name === 'map_source' || name === 'cl_predict' || name === 'cl_interp') return 'GAME';
+  if (name === 'cl_showfps' || name === 'cl_showpos') return 'HUD';
+  if (name === 's_volume' || name === 'sensitivity' || name === 'm_yaw' || name === 'm_pitch') return 'SOUND + INPUT';
+  return 'OTHER';
 }
 
 /**
@@ -314,6 +356,9 @@ export const CVAR_DESCRIPTIONS: Readonly<Record<string, string>> = {
   vd_postfilter: '2x2 "22-bit" RAMDAC post filter',
   vd_bilinear: 'bilinear filtering',
   vd_mipdither: 'single-TMU trilinear via mip dithering',
+  vd_dithermode: 'ordered-dither matrix at target writes: 2x2 | 4x4 (default 4x4)',
+  vd_reconmode: 'scanout reconstruction: matched 2x2 (default) | 4x4 horizontal | legacy compat',
+  vd_rgbmaxdelta: 'per-component recon rejection thresholds r,g,b (default 8,8,8)',
   vd_lodbias: 'Glide LOD bias',
   vd_fog: '64-entry table fog',
   vd_gamma: 'Glide gamma lift',
@@ -326,6 +371,8 @@ export const CVAR_DESCRIPTIONS: Readonly<Record<string, string>> = {
   sw_accum: 'coalesce frame span batches into one pool kick (M8.1, default 1 = on)',
   sw_wasm: 'use the WASM spanfill backend (M9.1, default 0 = TS)',
   r_drawworld: 'draw world geometry',
+  r_translucency: 'translucent surfaces: 0 = opaque fallback, 1 = alphamap blend (ref_soft default)',
+  sw_stipplealpha: 'screen-door stipple for translucency (ref_soft sw_stipplealpha, default 0 = blend)',
   cl_predict: 'predict local player between 10Hz snapshots',
   cl_interp: 'interpolate remote entities between snapshots',
   s_volume: 'master sound volume 0..1',
@@ -415,93 +462,323 @@ export function cvarControlKind(name: string): 'select' | 'text' | 'checkbox' {
   return cvarOptions(name) === null ? 'text' : 'select';
 }
 
+// --- custom elements (settings panel controls) ---
+//
+// The whole settings UI is custom elements with light-DOM children, styled
+// by the page CSS (see apps/web/index.html): <q2-settings-panel> is the
+// sidebar container, <q2-group> a stencil section header, <q2-cvar-row> one
+// labeled row, and <q2-checkbox> / <q2-select> / <q2-text> the controls.
+// Each control hosts exactly one native input/select (keyboard-focusable,
+// label-linked via `bindControlId`) and proxies its state (`checked` /
+// `value`) so panel code treats the wrapper like the native control it
+// wraps. Native `change` events bubble out of the light-DOM child, so
+// element-local `change` listeners on the wrapper just work — no
+// document-level mouse wiring, so toggling can never produce game input
+// under the canvas pointer-lock discipline.
+//
+// Headless/fake-DOM safe: definitions are skipped without a real DOM, and
+// `document.createElement('q2-...')` on a fake just yields a plain stub node
+// carrying the same fields (type/checked/value/title/children).
+
+/** Minimal structural contract renderCvarPanel relies on (real or fake node). */
+interface Q2BoxNode {
+  type: string;
+  checked: boolean;
+  title: string;
+  addEventListener(type: string, fn: () => void): void;
+}
+
+/** Minimal structural contract for select/text wrappers. */
+interface Q2ValueNode {
+  value: string;
+  title: string;
+  addEventListener(type: string, fn: () => void): void;
+}
+
+/** Append an <option> to a select wrapper (real element or fake node). */
+function appendOption(host: unknown, opt: unknown): void {
+  const h = host as { addOption?: (o: unknown) => void; appendChild?: (o: never) => void };
+  if (typeof h.addOption === 'function') h.addOption(opt);
+  else h.appendChild?.(opt as never);
+}
+
+/** Link a control wrapper's inner native control to a label id (no-op on fakes). */
+function bindControlId(host: unknown, id: string): void {
+  const h = host as { bindControlId?: (id: string) => void };
+  if (typeof h.bindControlId === 'function') h.bindControlId(id);
+}
+
+/** Define the q2-* custom elements once (no-op without a real DOM). */
+function defineQ2Elements(): void {
+  const g = globalThis as unknown as {
+    HTMLElement?: typeof HTMLElement;
+    customElements?: CustomElementRegistry;
+  };
+  const H = g.HTMLElement;
+  const registry = g.customElements;
+  if (!H || !registry || registry.get('q2-cvar-row')) return;
+
+  class Q2SettingsPanel extends H {}
+  class Q2Group extends H {}
+  class Q2CvarRow extends H {}
+
+  /** Checkbox wrapper: hosts one native checkbox, proxies its state. */
+  class Q2Checkbox extends H {
+    private boxEl: HTMLInputElement | null = null;
+    private pendingChecked = false;
+    private pendingTitle: string | null = null;
+    private ensureBox(): HTMLInputElement {
+      let box = this.boxEl;
+      if (!box) {
+        box = document.createElement('input');
+        box.type = 'checkbox';
+        box.checked = this.pendingChecked;
+        if (this.pendingTitle !== null) box.title = this.pendingTitle;
+        this.boxEl = box;
+        this.appendChild(box);
+      }
+      return box;
+    }
+    override get title(): string {
+      return super.title;
+    }
+    override set title(v: string) {
+      super.title = v;
+      const box = this.boxEl;
+      if (box) box.title = v;
+      else this.pendingTitle = v;
+    }
+    get checked(): boolean {
+      const box = this.boxEl;
+      return box ? box.checked : this.pendingChecked;
+    }
+    set checked(v: boolean) {
+      const box = this.boxEl;
+      if (box) box.checked = v;
+      else this.pendingChecked = v;
+    }
+    bindControlId(id: string): void {
+      this.ensureBox().id = id;
+    }
+    connectedCallback(): void {
+      this.ensureBox();
+    }
+  }
+
+  /** Select wrapper: hosts one native select, proxies its value. */
+  class Q2Select extends H {
+    private selEl: HTMLSelectElement | null = null;
+    private pendingValue: string | null = null;
+    private pendingTitle: string | null = null;
+    private ensureSel(): HTMLSelectElement {
+      let sel = this.selEl;
+      if (!sel) {
+        sel = document.createElement('select');
+        if (this.pendingValue !== null) sel.value = this.pendingValue;
+        if (this.pendingTitle !== null) sel.title = this.pendingTitle;
+        this.selEl = sel;
+        this.appendChild(sel);
+      }
+      return sel;
+    }
+    override get title(): string {
+      return super.title;
+    }
+    override set title(v: string) {
+      super.title = v;
+      const sel = this.selEl;
+      if (sel) sel.title = v;
+      else this.pendingTitle = v;
+    }
+    get value(): string {
+      const sel = this.selEl;
+      return sel ? sel.value : (this.pendingValue ?? '');
+    }
+    set value(v: string) {
+      const sel = this.selEl;
+      if (sel) sel.value = v;
+      else this.pendingValue = v;
+    }
+    addOption(opt: HTMLOptionElement): void {
+      this.ensureSel().appendChild(opt);
+    }
+    bindControlId(id: string): void {
+      this.ensureSel().id = id;
+    }
+    connectedCallback(): void {
+      const sel = this.ensureSel();
+      if (this.pendingValue !== null) sel.value = this.pendingValue;
+    }
+  }
+
+  /** Text wrapper: hosts one native text input, proxies its value. */
+  class Q2Text extends H {
+    private inputEl: HTMLInputElement | null = null;
+    private pendingValue = '';
+    private pendingTitle: string | null = null;
+    private ensureInput(): HTMLInputElement {
+      let input = this.inputEl;
+      if (!input) {
+        input = document.createElement('input');
+        input.type = 'text';
+        input.value = this.pendingValue;
+        if (this.pendingTitle !== null) input.title = this.pendingTitle;
+        this.inputEl = input;
+        this.appendChild(input);
+      }
+      return input;
+    }
+    override get title(): string {
+      return super.title;
+    }
+    override set title(v: string) {
+      super.title = v;
+      const input = this.inputEl;
+      if (input) input.title = v;
+      else this.pendingTitle = v;
+    }
+    get value(): string {
+      const input = this.inputEl;
+      return input ? input.value : this.pendingValue;
+    }
+    set value(v: string) {
+      const input = this.inputEl;
+      if (input) input.value = v;
+      else this.pendingValue = v;
+    }
+    bindControlId(id: string): void {
+      this.ensureInput().id = id;
+    }
+    connectedCallback(): void {
+      this.ensureInput();
+    }
+  }
+
+  registry.define('q2-settings-panel', Q2SettingsPanel);
+  registry.define('q2-group', Q2Group);
+  registry.define('q2-cvar-row', Q2CvarRow);
+  registry.define('q2-checkbox', Q2Checkbox);
+  registry.define('q2-select', Q2Select);
+  registry.define('q2-text', Q2Text);
+}
+
+defineQ2Elements();
+
 /** Render a cvar editor panel into a container. Returns bound cvar names. */
 export function renderCvarPanel(
   container: unknown,
   filter = '',
   onChange: (name: string, value: string) => void = () => undefined,
-): string[] {  ensureHudCvars();
-  const names = listCVars()
+): string[] {
+  ensureHudCvars();
+  const all = listCVars()
     .map((c) => c.name)
     .filter((n) => !filter || n.includes(filter));
-  if (typeof document === 'undefined' || !container) return names;
+  if (typeof document === 'undefined' || !container) return all;
   const node = container as HTMLElement;
   node.innerHTML = '';
-  for (const name of names) {
-    const row = document.createElement('div');
-    row.className = 'q2-cvar-row';
-    // On-hover description for the row (tooltip source: the cvar registry
-    // doc, static fallback in CVAR_DESCRIPTIONS — see cvarDescription).
-    const tip = cvarDescription(name);
-    if (tip) row.title = tip;
-    const label = document.createElement('label');
-    label.textContent = name;
-    if (tip) label.title = tip;
-    const options = cvarOptions(name);
-    const current = getCVarString(name);
-    if (cvarIsCheckbox(name)) {
-      // Boolean checkbox: element-local `change` only, no document-level
-      // mouse wiring, so toggling never produces game input (canvas
-      // pointer-lock discipline holds — UI clicks never fire).
-      const box = document.createElement('input') as HTMLInputElement;
-      box.type = 'checkbox';
-      box.checked = getCVarNumber(name) !== 0;
-      if (tip) box.title = tip;
-      box.addEventListener('change', () => {
-        try {
-          setCVarFromString(name, box.checked ? '1' : '0');
-          onChange(name, box.checked ? '1' : '0');
-        } catch {
-          box.checked = getCVarNumber(name) !== 0;
-        }
-      });
-      row.appendChild(label);
-      row.appendChild(box);
-    } else if (options !== null) {
-      const select = document.createElement('select');
-      if (tip) select.title = tip;
-      // Reflect out-of-list values (e.g. sw_workers=8, r_brightness=1.1)
-      // instead of silently showing the wrong preset.
-      const choices = options.includes(current) ? options : [current, ...options];
-      // Labeled domains (skill 0-3 → Easy/Medium/Hard/Nightmare, resolution
-      // WxH → 320×240…) persist the bare value; the label is display-only.
-      const labels = cvarOptionLabels(name);
-      for (const opt of choices) {
-        const el = document.createElement('option');
-        el.value = opt;
-        const li = labels ? options.indexOf(opt) : -1;
-        el.textContent = li >= 0 ? labels![li]! : opt;
-        select.appendChild(el);
-      }
-      select.value = current;
-      select.addEventListener('change', () => {
-        try {
-          setCVarFromString(name, select.value);
-          onChange(name, select.value);
-        } catch {
-          select.value = getCVarString(name);
-        }
-      });
-      row.appendChild(label);
-      row.appendChild(select);
-    } else {
-      const input = document.createElement('input');
-      input.value = current;
-      if (tip) input.title = tip;
-      input.addEventListener('change', () => {
-        try {
-          setCVarFromString(name, input.value);
-          onChange(name, input.value);
-        } catch {
-          input.value = getCVarString(name);
-        }
-      });
-      row.appendChild(label);
-      row.appendChild(input);
+  const names: string[] = [];
+  for (const group of GROUP_ORDER) {
+    const grouped = all.filter((n) => cvarGroup(n) === group).sort();
+    if (grouped.length === 0) continue;
+    const head = document.createElement('q2-group');
+    head.className = 'q2-cvar-group';
+    head.textContent = group;
+    node.appendChild(head);
+    for (const name of grouped) {
+      renderCvarRow(node, name, onChange);
+      names.push(name);
     }
-    node.appendChild(row);
   }
   return names;
+}
+
+/** Render one labeled cvar row (<q2-cvar-row>) into the panel. */
+function renderCvarRow(
+  node: HTMLElement,
+  name: string,
+  onChange: (n: string, v: string) => void,
+): void {
+  const row = document.createElement('q2-cvar-row');
+  row.className = 'q2-cvar-row';
+  // On-hover description for the row (tooltip source: the cvar registry
+  // doc, static fallback in CVAR_DESCRIPTIONS — see cvarDescription).
+  const tip = cvarDescription(name);
+  if (tip) row.title = tip;
+  const label = document.createElement('label');
+  label.textContent = name;
+  if (tip) label.title = tip;
+  // Keyboard access: label linked to the inner native control (real DOM
+  // forwards via bindControlId; fakes keep the expando harmlessly).
+  const controlId = `q2c-${name}`;
+  (label as unknown as { htmlFor?: string }).htmlFor = controlId;
+  const options = cvarOptions(name);
+  const current = getCVarString(name);
+  if (cvarIsCheckbox(name)) {
+    // Boolean checkbox: element-local `change` only, no document-level
+    // mouse wiring, so toggling never produces game input (canvas
+    // pointer-lock discipline holds — UI clicks never fire).
+    const box = document.createElement('q2-checkbox') as unknown as Q2BoxNode;
+    box.type = 'checkbox';
+    box.checked = getCVarNumber(name) !== 0;
+    if (tip) box.title = tip;
+    bindControlId(box, controlId);
+    box.addEventListener('change', () => {
+      try {
+        const next = box.checked ? '1' : '0';
+        setCVarFromString(name, next);
+        onChange(name, next);
+      } catch {
+        box.checked = getCVarNumber(name) !== 0;
+      }
+    });
+    row.appendChild(label);
+    row.appendChild(box as unknown as HTMLElement);
+  } else if (options !== null) {
+    const select = document.createElement('q2-select') as unknown as Q2ValueNode;
+    if (tip) select.title = tip;
+    bindControlId(select, controlId);
+    // Reflect out-of-list values (e.g. sw_workers=8, r_brightness=1.1)
+    // instead of silently showing the wrong preset.
+    const choices = options.includes(current) ? options : [current, ...options];
+    // Labeled domains (skill 0-3 → Easy/Medium/Hard/Nightmare, resolution
+    // WxH → 320×240…) persist the bare value; the label is display-only.
+    const labels = cvarOptionLabels(name);
+    for (const opt of choices) {
+      const el = document.createElement('option');
+      el.value = opt;
+      const li = labels ? options.indexOf(opt) : -1;
+      el.textContent = li >= 0 ? labels![li]! : opt;
+      appendOption(select, el);
+    }
+    select.value = current;
+    select.addEventListener('change', () => {
+      try {
+        setCVarFromString(name, select.value);
+        onChange(name, select.value);
+      } catch {
+        select.value = getCVarString(name);
+      }
+    });
+    row.appendChild(label);
+    row.appendChild(select as unknown as HTMLElement);
+  } else {
+    const input = document.createElement('q2-text') as unknown as Q2ValueNode;
+    input.value = current;
+    if (tip) input.title = tip;
+    bindControlId(input, controlId);
+    input.addEventListener('change', () => {
+      try {
+        setCVarFromString(name, input.value);
+        onChange(name, input.value);
+      } catch {
+        input.value = getCVarString(name);
+      }
+    });
+    row.appendChild(label);
+    row.appendChild(input as unknown as HTMLElement);
+  }
+  node.appendChild(row);
 }
 
 /** Renderer switcher state (software/voodoo), persisted to cvar. */

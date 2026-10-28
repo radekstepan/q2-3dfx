@@ -39,6 +39,8 @@ export const RESPAWN_DELAY_ARMOR = 20;
 
 /** id respawn delay table by classname prefix (g_items.c Pickup_*). */
 export function respawnDelayFor(classname: string): number {
+  const qty = POWERUP_QUANTITY[classname];
+  if (qty !== undefined) return qty;
   if (classname.startsWith('item_armor')) return RESPAWN_DELAY_ARMOR;
   if (classname.startsWith('item_health')) return RESPAWN_DELAY_HEALTH;
   if (classname.startsWith('weapon_')) return RESPAWN_DELAY_WEAPON;
@@ -61,9 +63,24 @@ const ITEMS: Record<string, ItemDef> = {
   ammo_cells: { classname: 'ammo_cells', kind: 'ammo', amount: 50, ammoKind: 'cells', maxCarry: 200 },
   ammo_rockets: { classname: 'ammo_rockets', kind: 'ammo', amount: 5, ammoKind: 'rockets', maxCarry: 50 },
   ammo_slugs: { classname: 'ammo_slugs', kind: 'ammo', amount: 10, ammoKind: 'slugs', maxCarry: 50 },
+  // C g_items.c itemlist: ammo_grenades quantity 5, default max_grenades 50
+  // (p_client.c InitClientPersistant). Base1 fields two (one 1792 DM-only,
+  // one 2048 NOT_DEATHMATCH = SP-kept) plus the secret-cache one.
+  ammo_grenades: { classname: 'ammo_grenades', kind: 'ammo', amount: 5, ammoKind: 'grenades', maxCarry: 50 },
   weapon_shotgun: { classname: 'weapon_shotgun', kind: 'weapon', amount: 1, ammoKind: 'shells', maxCarry: 1 },
   weapon_machinegun: { classname: 'weapon_machinegun', kind: 'weapon', amount: 1, ammoKind: 'bullets', maxCarry: 1 },
   weapon_blaster: { classname: 'weapon_blaster', kind: 'weapon', amount: 1, ammoKind: '', maxCarry: 1 },
+  // C itemlist weapon rows (quantity = pickup ammo gift is on the AMMO item,
+  // see WEAPON_AMMO_GIFT): supershotgun/chaingun/grenadelauncher/
+  // rocketlauncher/hyperblaster/railgun/bfg. Base1's are all 1792 DM-only in
+  // SP, but the defs must exist so skill-kept ones (other maps, DM) grant.
+  weapon_supershotgun: { classname: 'weapon_supershotgun', kind: 'weapon', amount: 1, ammoKind: 'shells', maxCarry: 1 },
+  weapon_chaingun: { classname: 'weapon_chaingun', kind: 'weapon', amount: 1, ammoKind: 'bullets', maxCarry: 1 },
+  weapon_grenadelauncher: { classname: 'weapon_grenadelauncher', kind: 'weapon', amount: 1, ammoKind: 'grenades', maxCarry: 1 },
+  weapon_rocketlauncher: { classname: 'weapon_rocketlauncher', kind: 'weapon', amount: 1, ammoKind: 'rockets', maxCarry: 1 },
+  weapon_hyperblaster: { classname: 'weapon_hyperblaster', kind: 'weapon', amount: 1, ammoKind: 'cells', maxCarry: 1 },
+  weapon_railgun: { classname: 'weapon_railgun', kind: 'weapon', amount: 1, ammoKind: 'slugs', maxCarry: 1 },
+  weapon_bfg: { classname: 'weapon_bfg', kind: 'weapon', amount: 1, ammoKind: 'cells', maxCarry: 1 },
   // Timed suits (C g_items.c item_breather / item_enviro): Pickup_Powerup
   // with 30s effects (Use_Breather/Use_Envirosuit set framenum +300 @10Hz,
   // stacking). C arms them from the inventory via Use_*; this sim has no
@@ -71,6 +88,61 @@ const ITEMS: Record<string, ItemDef> = {
   // amount carries the C `quantity` (60) for the DM respawn table.
   item_breather: { classname: 'item_breather', kind: 'powerup', amount: 60, ammoKind: '', maxCarry: 0 },
   item_enviro: { classname: 'item_enviro', kind: 'powerup', amount: 60, ammoKind: '', maxCarry: 0 },
+  // Timed combat powerups (C g_items.c Pickup_Powerup quantity + Use_Quad /
+  // Use_Invulnerability / Use_Silencer arming +300 frames / +30 shots). No
+  // base1 instances survive SP skill inhibit (quad is 1792), but the defs
+  // must exist so kept ones grant instead of 'unknown item'.
+  item_quad: { classname: 'item_quad', kind: 'powerup', amount: 60, ammoKind: '', maxCarry: 0 },
+  item_invulnerability: { classname: 'item_invulnerability', kind: 'powerup', amount: 300, ammoKind: '', maxCarry: 0 },
+  // Base1's under-stairs secret (flags 0, target t76): Pickup_Powerup into
+  // the inventory, armed via Use_Silencer (+30 silencer_shots). No inventory
+  // UI here, so pickup arms the shots directly (same deviation as the suits).
+  item_silencer: { classname: 'item_silencer', kind: 'powerup', amount: 60, ammoKind: '', maxCarry: 0 },
+  // Max-health specials (C Pickup_Adrenaline: SP max_health+1 + heal to max;
+  // Pickup_AncientHead: max_health+2). Base1 fields one adrenaline.
+  item_adrenaline: { classname: 'item_adrenaline', kind: 'powerup', amount: 60, ammoKind: '', maxCarry: 0 },
+  item_ancient_head: { classname: 'item_ancient_head', kind: 'powerup', amount: 60, ammoKind: '', maxCarry: 0 },
+  // Keys (C Pickup_Key: inventory carry, no cap). Base1 ships none; other
+  // maps gate progress on them, so unknown-key 'picked:false' would softlock.
+  key_data_cd: { classname: 'key_data_cd', kind: 'key', amount: 1, ammoKind: '', maxCarry: 0 },
+  key_power_cube: { classname: 'key_power_cube', kind: 'key', amount: 1, ammoKind: '', maxCarry: 0 },
+  key_pyramid: { classname: 'key_pyramid', kind: 'key', amount: 1, ammoKind: '', maxCarry: 0 },
+  key_data_spinner: { classname: 'key_data_spinner', kind: 'key', amount: 1, ammoKind: '', maxCarry: 0 },
+  key_pass: { classname: 'key_pass', kind: 'key', amount: 1, ammoKind: '', maxCarry: 0 },
+  key_blue_key: { classname: 'key_blue_key', kind: 'key', amount: 1, ammoKind: '', maxCarry: 0 },
+  key_red_key: { classname: 'key_red_key', kind: 'key', amount: 1, ammoKind: '', maxCarry: 0 },
+  key_commander_head: { classname: 'key_commander_head', kind: 'key', amount: 1, ammoKind: '', maxCarry: 0 },
+  key_airstrike_target: { classname: 'key_airstrike_target', kind: 'key', amount: 1, ammoKind: '', maxCarry: 0 },
+};
+
+// --- C pickup quantities (g_items.c itemlist `quantity` = DM respawn delay) --
+//
+// respawnDelayFor consults this first so powerups report their C quantity
+// (invulnerability 300, everything else 60) instead of the 30s health bucket.
+
+const POWERUP_QUANTITY: Record<string, number> = {
+  item_quad: 60,
+  item_invulnerability: 300,
+  item_silencer: 60,
+  item_breather: 60,
+  item_enviro: 60,
+  item_adrenaline: 60,
+  item_ancient_head: 60,
+};
+
+// --- weapon ammo gifts (p_weapon.c Pickup_Weapon: Add_Ammo(other, ammo,
+// ammo->quantity) — the AMMO item's quantity, not a flat 10) ------------------
+//
+// Shells 10, Bullets 50, Cells 50, Rockets 5, Slugs 10, Grenades 5. The BFG
+// grants Cells' quantity (50), like every other cell weapon grants 50.
+
+const WEAPON_AMMO_GIFT: Record<string, number> = {
+  shells: 10,
+  bullets: 50,
+  cells: 50,
+  rockets: 5,
+  slugs: 10,
+  grenades: 5,
 };
 
 export function findItem(classname: string): ItemDef | null {
@@ -88,10 +160,18 @@ export interface PlayerState {
   breatherUntil: number;
   /** Server-time seconds until which the envirosuit protects (0 = none). */
   enviroUntil: number;
+  /** Suppressed-muzzle shots banked (C client->silencer_shots, +30/pickup). */
+  silencerShots: number;
+  /** Server-time seconds until which quad damage applies (0 = none). */
+  quadUntil: number;
+  /** Server-time seconds until which invulnerability applies (0 = none). */
+  invulnUntil: number;
+  /** Key classnames carried (C Pickup_Key inventory). */
+  keys: string[];
 }
 
 export function makePlayerState(): PlayerState {
-  return { health: 100, maxHealth: MAX_HEALTH, armor: 0, maxArmor: 100, ammo: {}, weapons: ['weapon_blaster'], breatherUntil: 0, enviroUntil: 0 };
+  return { health: 100, maxHealth: MAX_HEALTH, armor: 0, maxArmor: 100, ammo: {}, weapons: ['weapon_blaster'], breatherUntil: 0, enviroUntil: 0, silencerShots: 0, quadUntil: 0, invulnUntil: 0, keys: [] };
 }
 
 export interface PickupResult {
@@ -121,7 +201,39 @@ export function pickupItem(ps: PlayerState, classname: string, now = 0): PickupR
         ps.enviroUntil = Math.max(now, ps.enviroUntil) + SUIT_SECONDS;
         return { picked: true, applied: SUIT_SECONDS, reason: 'enviro' };
       }
+      // C Use_Silencer: silencer_shots += 30 (no timer, no cap).
+      if (classname === 'item_silencer') {
+        ps.silencerShots += SILENCER_SHOTS;
+        return { picked: true, applied: SILENCER_SHOTS, reason: 'silencer' };
+      }
+      // C Use_Quad / Use_Invulnerability: framenum += 300 (30s), extending
+      // an active timer exactly like the suits.
+      if (classname === 'item_quad') {
+        ps.quadUntil = Math.max(now, ps.quadUntil) + QUAD_SECONDS;
+        return { picked: true, applied: QUAD_SECONDS, reason: 'quad' };
+      }
+      if (classname === 'item_invulnerability') {
+        ps.invulnUntil = Math.max(now, ps.invulnUntil) + INVULN_SECONDS;
+        return { picked: true, applied: INVULN_SECONDS, reason: 'invulnerability' };
+      }
+      // C Pickup_Adrenaline (SP): max_health += 1, then heal to the new max.
+      if (classname === 'item_adrenaline') {
+        ps.maxHealth += 1;
+        ps.health = ps.maxHealth;
+        return { picked: true, applied: 1, reason: 'adrenaline' };
+      }
+      // C Pickup_AncientHead: max_health += 2 (no heal).
+      if (classname === 'item_ancient_head') {
+        ps.maxHealth += 2;
+        return { picked: true, applied: 2, reason: 'ancient head' };
+      }
       return { picked: false, applied: 0, reason: 'unhandled kind' };
+    }
+    case 'key': {
+      // C Pickup_Key: SP always carries (coop dedupes power cubes — SP-only
+      // sim, so carry; re-takes after respawn stack like C's inventory++).
+      if (!ps.keys.includes(classname)) ps.keys.push(classname);
+      return { picked: true, applied: 1, reason: 'key' };
     }
     case 'health': {
       const cap = classname === 'item_health_mega' ? def.maxCarry : ps.maxHealth;
@@ -139,9 +251,15 @@ export function pickupItem(ps: PlayerState, classname: string, now = 0): PickupR
     }
     case 'weapon': {
       if (!ps.weapons.includes(classname)) ps.weapons.push(classname);
+      // C Pickup_Weapon: Add_Ammo(other, ammo, ammo->quantity) — the ammo
+      // item's quantity (shells 10, bullets 50, cells 50, rockets 5,
+      // slugs 10, grenades 5; the BFG's Cells gift is 50 the same way),
+      // clamped to that ammo's max carry.
       if (def.ammoKind) {
+        const gift = WEAPON_AMMO_GIFT[def.ammoKind] ?? 0;
+        const cap = ITEMS[`ammo_${def.ammoKind}`]?.maxCarry ?? 200;
         const cur = ps.ammo[def.ammoKind] ?? 0;
-        ps.ammo[def.ammoKind] = Math.min(cur + 10, 200);
+        ps.ammo[def.ammoKind] = Math.min(cur + gift, cap);
       }
       return { picked: true, applied: 1, reason: 'weapon' };
     }
@@ -173,6 +291,12 @@ export function pickupItem(ps: PlayerState, classname: string, now = 0): PickupR
 
 /** C Use_Breather/Use_Envirosuit effect: +300 framenums @10Hz per pickup. */
 export const SUIT_SECONDS = 30;
+/** C Use_Quad effect: quad_framenum += 300 (30s), extending when active. */
+export const QUAD_SECONDS = 30;
+/** C Use_Invulnerability effect: invincible_framenum += 300 (30s). */
+export const INVULN_SECONDS = 30;
+/** C Use_Silencer effect: silencer_shots += 30 per pickup (no cap). */
+export const SILENCER_SHOTS = 30;
 /** C protected air supply while the head is under (level.time + 10). */
 export const SUIT_AIR_SECONDS = 10;
 /** C breath-sound cadence: every 25 frames = 2.5s, alternating pair. */

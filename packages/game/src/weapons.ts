@@ -77,6 +77,114 @@ export const WEAPON_MACHINEGUN: WeaponDef = {
   mod: 'MOD_MACHINEGUN',
 };
 
+// --- SP-remnant arsenal (base1's are 1792 DM-only, but the defs must exist
+// so skill-kept ones fire instead of 'no weapon'). All damage/ammo values
+// are the SP (non-deathmatch) branches of p_weapon.c Weapon_*_Fire. -------
+
+/** C g_local.h DEFAULT_SSHOTGUN_COUNT (20): the supershotgun fires half. */
+export const DEFAULT_SSHOTGUN_COUNT = 20;
+
+export const WEAPON_SUPERSHOTGUN: WeaponDef = {
+  classname: 'weapon_supershotgun',
+  ammoKind: 'shells',
+  ammoPerShot: 2,
+  damage: 6, // Weapon_SuperShotgun: damage 6, kick 12, both barrels
+  kick: 12,
+  hspread: DEFAULT_SHOTGUN_HSPREAD,
+  vspread: DEFAULT_SHOTGUN_VSPREAD,
+  pellets: DEFAULT_SSHOTGUN_COUNT / 2, // 10 pellets per 2-shell trigger
+  mod: 'MOD_SSHOTGUN',
+};
+
+export const WEAPON_CHAINGUN: WeaponDef = {
+  classname: 'weapon_chaingun',
+  ammoKind: 'bullets',
+  ammoPerShot: 1,
+  damage: 8, // Chaingun_Fire SP branch (6 in deathmatch)
+  kick: 2,
+  hspread: DEFAULT_BULLET_HSPREAD,
+  vspread: DEFAULT_BULLET_VSPREAD,
+  pellets: 1,
+  mod: 'MOD_CHAINGUN',
+};
+
+/**
+ * C Weapon_Grenade (hand grenades, thrown from the ammo_grenades inventory):
+ * damage 125 (weapon_grenade_fire). Projectile in C; carried here as data so
+ * findWeapon resolves the slot and the pickup path grants it.
+ */
+export const WEAPON_GRENADES: WeaponDef = {
+  classname: 'weapon_grenades',
+  ammoKind: 'grenades',
+  ammoPerShot: 1,
+  damage: 125,
+  kick: 0,
+  hspread: 0,
+  vspread: 0,
+  pellets: 1,
+  mod: 'MOD_HANDGRENADE',
+};
+
+export const WEAPON_GRENADELAUNCHER: WeaponDef = {
+  classname: 'weapon_grenadelauncher',
+  ammoKind: 'grenades',
+  ammoPerShot: 1,
+  damage: 120, // weapon_grenadelauncher_fire: damage + radius 120
+  kick: 0,
+  hspread: 0,
+  vspread: 0,
+  pellets: 1,
+  mod: 'MOD_GRENADE',
+};
+
+export const WEAPON_ROCKETLAUNCHER: WeaponDef = {
+  classname: 'weapon_rocketlauncher',
+  ammoKind: 'rockets',
+  ammoPerShot: 1,
+  damage: 100, // Weapon_RocketLauncher_Fire base (100 + rand*20, radius 120)
+  kick: 0,
+  hspread: 0,
+  vspread: 0,
+  pellets: 1,
+  mod: 'MOD_ROCKET',
+};
+
+export const WEAPON_HYPERBLASTER: WeaponDef = {
+  classname: 'weapon_hyperblaster',
+  ammoKind: 'cells',
+  ammoPerShot: 1,
+  damage: 20, // Weapon_HyperBlaster_Fire SP branch (15 in deathmatch)
+  kick: 0,
+  hspread: 0,
+  vspread: 0,
+  pellets: 1,
+  mod: 'MOD_HYPERBLASTER',
+};
+
+export const WEAPON_RAILGUN: WeaponDef = {
+  classname: 'weapon_railgun',
+  ammoKind: 'slugs',
+  ammoPerShot: 1,
+  damage: 150, // Weapon_Railgun_Fire SP branch (100 in deathmatch)
+  kick: 0,
+  hspread: 0,
+  vspread: 0,
+  pellets: 1,
+  mod: 'MOD_RAILGUN',
+};
+
+export const WEAPON_BFG: WeaponDef = {
+  classname: 'weapon_bfg',
+  ammoKind: 'cells',
+  ammoPerShot: 50,
+  damage: 500, // Weapon_BFG SP branch (200 in deathmatch)
+  kick: 0,
+  hspread: 0,
+  vspread: 0,
+  pellets: 1,
+  mod: 'MOD_BFG',
+};
+
 export function findWeapon(classname: string): WeaponDef | null {
   switch (classname) {
     case WEAPON_BLASTER.classname:
@@ -85,6 +193,22 @@ export function findWeapon(classname: string): WeaponDef | null {
       return WEAPON_SHOTGUN;
     case WEAPON_MACHINEGUN.classname:
       return WEAPON_MACHINEGUN;
+    case WEAPON_SUPERSHOTGUN.classname:
+      return WEAPON_SUPERSHOTGUN;
+    case WEAPON_CHAINGUN.classname:
+      return WEAPON_CHAINGUN;
+    case WEAPON_GRENADES.classname:
+      return WEAPON_GRENADES;
+    case WEAPON_GRENADELAUNCHER.classname:
+      return WEAPON_GRENADELAUNCHER;
+    case WEAPON_ROCKETLAUNCHER.classname:
+      return WEAPON_ROCKETLAUNCHER;
+    case WEAPON_HYPERBLASTER.classname:
+      return WEAPON_HYPERBLASTER;
+    case WEAPON_RAILGUN.classname:
+      return WEAPON_RAILGUN;
+    case WEAPON_BFG.classname:
+      return WEAPON_BFG;
     default:
       return null;
   }

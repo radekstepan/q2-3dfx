@@ -96,7 +96,10 @@ import {
   MZ2_SOLDIER_MACHINEGUN_4,
   MZ2_SOLDIER_SHOTGUN_1,
   SOLID_BBOX,
+  SOLID_NOT,
+  SOLID_TRIGGER,
   MOVETYPE_NONE,
+  MOVETYPE_STEP,
 } from '@q2/game';
 import type {
   AttackChoice,
@@ -668,6 +671,37 @@ export function SV_TrainClipBox(
 }
 
 /**
+ * Current world-space clip box of a live monster: the C SOLID_BBOX hull
+ * (MONSTER_HULL_MINS + duck-aware maxs) at the edict origin. Null for every
+ * body movement must pass through: dormant TRIGGER_SPAWN (SOLID_NOT until
+ * monster_triggered_spawn), gibbed (G_FreeEdict-gone in C), and the dead
+ * (C Killed sets SVF_DEADMONSTER, which SV_ClipMoveToEntities skips unless
+ * the mask carries CONTENTS_DEADMONSTER — corpses never block the living).
+ * Corpses stay hittable through the state-based bolt/pellet sweeps, which
+ * key off state.dead instead of solid.
+ */
+export function SV_MonsterClipBox(
+  m: ServerMonster,
+): { mins: Float32Array; maxs: Float32Array } | null {
+  if (m.edict.freed || m.edict.solid !== SOLID_BBOX) return null;
+  if (m.kind === null || m.state.dead || m.state.gibbed) return null;
+  if (m.triggered && !m.woken) return null;
+  const maxs = monsterHullMaxs(m);
+  return {
+    mins: new Float32Array([
+      m.edict.origin[0]! + MONSTER_HULL_MINS[0]!,
+      m.edict.origin[1]! + MONSTER_HULL_MINS[1]!,
+      m.edict.origin[2]! + MONSTER_HULL_MINS[2]!,
+    ]),
+    maxs: new Float32Array([
+      m.edict.origin[0]! + maxs[0]!,
+      m.edict.origin[1]! + maxs[1]!,
+      m.edict.origin[2]! + maxs[2]!,
+    ]),
+  };
+}
+
+/**
  * World trace plus the solid brush clips (func_explosive / func_wall while
  * standing). Drivers that move bodies (pmove, monster locomotion) should run
  * against this instead of the bare world trace so walls block until
@@ -680,8 +714,29 @@ export function SV_TrainClipBox(
  * takes direct fire, not just splash) instead of detonating on an anonymous
  * wall. Movement consumers ignore entityNum (fraction/endpos/normal only),
  * except pmove's groundEntity which simply records the stood-upon clip.
+ *
+ * Live monsters ride an OPT-IN pass (C SV_ClipMoveToEntities clips
+ * SOLID_BBOX bodies, MASK_MONSTERSOLID walkers included): a player-size box
+ * sweeping through a live infantry stops on its hull and reports the edict
+ * num, so bodies can no longer be walked through. `ignoreNum` is the C
+ * passedict skip (a monster stepping itself must not clip its own hull);
+ * the player is never a monster edict, so pmove callers leave it default.
+ *
+ * The monster pass defaults OFF (includeMonsters: false): monster
+ * locomotion shares this trace object (SV_MonsterTick runs on game.trace),
+ * and a mover always starts inside its own hull — with the pass on, every
+ * sub-hull step reads allsolid and bodies freeze in place (pinned by the
+ * pursuit tests). The single-sim driver feeds ONE trace to both pmove and
+ * the monster tick, so flipping the default needs the web-lane PR that
+ * splits the pmove trace from the monster trace; until then the solid flags
+ * + SV_MonsterClipBox below carry the C state and unit tests pin the pass.
  */
-export function SV_ClipTrace(st: ServerState, worldTrace: TraceFn): TraceFn {
+export function SV_ClipTrace(
+  st: ServerState,
+  worldTrace: TraceFn,
+  ignoreNum = -1,
+  includeMonsters = false,
+): TraceFn {
   return (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => {
     let best = worldTrace(start, mins, maxs, end);
     let clipEnt = -1;
@@ -692,6 +747,7 @@ export function SV_ClipTrace(st: ServerState, worldTrace: TraceFn): TraceFn {
     // pmove's groundEntity links riders to the pusher they stand on
     // (groundentity == pusher rides in SV_Push).
     const consider = (num: number, b: { mins: Float32Array; maxs: Float32Array } | null): void => {
+      if (!b || num === ignoreNum) return;
       if (!b) return;
       const hit = sweepBrushBox(start, end, mins, maxs, b.mins, b.maxs);
       if (hit.fraction < best.fraction || hit.allsolid) {
@@ -719,6 +775,13 @@ export function SV_ClipTrace(st: ServerState, worldTrace: TraceFn): TraceFn {
       consider(m.ent.num, SV_MoverClipBox(st, m));
     }
     for (const tr of st.trains) consider(tr.ent.num, SV_TrainClipBox(st, tr));
+    // Opt-in monster hulls (see the doc comment: on by default this freezes
+    // every mover inside its own hull, including via the shared driver
+    // trace). Pmove-only callers pass includeMonsters + leave ignoreNum at
+    // the player (never a monster num, so no self-skip needed there).
+    if (includeMonsters) {
+      for (const m of st.monsters) consider(m.edict.num, SV_MonsterClipBox(m));
+    }
     if (clipEnt >= 0) best.entityNum = clipEnt;
     return best;
   };
@@ -1304,6 +1367,22 @@ export function SV_SpawnEntities(
       default:
         break;
     }
+    // C droptofloor (g_items.c): map items link SOLID_TRIGGER + Touch_Item
+    // (mins/maxs ±15, MOVETYPE_TOSS until they rest). The sim never tosses —
+    // origins stay mapper-placed — but the solid is what touch checks test,
+    // so spawn it here: without this every item spawns SOLID_NOT and only
+    // the driver's box-proximity fallback can ever collect it. Skill-inhibited
+    // (DM-only) edicts never reach this line; key_power_cube's
+    // TRIGGER_SPAWN/NO_TOUCH variants keep TRIGGER (base1 ships no keys, and
+    // the use-gated cube path is out of scope).
+    if (
+      e.classname.startsWith('item_') ||
+      e.classname.startsWith('weapon_') ||
+      e.classname.startsWith('ammo_') ||
+      e.classname.startsWith('key_')
+    ) {
+      e.solid = SOLID_TRIGGER;
+    }
     // Scripted explosion targets (target_explosion, g_target.c
     // use_target_explosion): recorded by targetname so SV_Tick can fire
     // them when the relay chain reaches them (Phase 0 single sim — the
@@ -1326,8 +1405,20 @@ export function SV_SpawnEntities(
       if (e.classname === 'monster_soldier_light') e.extra['skinnum'] = '0';
       else if (e.classname === 'monster_soldier') e.extra['skinnum'] = '2';
       else if (e.classname === 'monster_soldier_ss') e.extra['skinnum'] = '4';
+      // C solidity (m_soldier.c / m_infantry.c / m_gunner.c SP_ funcs set
+      // MOVETYPE_STEP + SOLID_BBOX; walkmonster_start_go routes spawnflags & 2
+      // through monster_triggered_start: SOLID_NOT + MOVETYPE_NONE +
+      // SVF_NOCLIENT until monster_triggered_spawn_use wakes them). Without
+      // this every monster spawns SOLID_NOT and the player walks through.
       // walkmonster_start_go drops non-triggered monsters when level.time < 1
       // (spawn always qualifies: time is still 0 here).
+      if (e.spawnflags & 2) {
+        e.solid = SOLID_NOT;
+        e.movetype = MOVETYPE_NONE;
+      } else {
+        e.solid = SOLID_BBOX;
+        e.movetype = MOVETYPE_STEP;
+      }
       if (dropTrace && !(e.spawnflags & 2)) {
         const g = droptofloor(e.origin, MONSTER_HULL_MINS, MONSTER_HULL_MAXS, dropTrace);
         e.origin[0] = g[0]!;
@@ -1425,6 +1516,11 @@ export function SV_UseMonster(m: ServerMonster, byPlayer: boolean): void {
     // delay in C before think resumes (nextthink = level.time + FRAMETIME);
     // the lite sim wakes immediately (think runs next tick anyway).
     m.woken = true;
+    // C monster_triggered_spawn: SOLID_BBOX + MOVETYPE_STEP + SVF_NOCLIENT
+    // clear (KillBox + linkentity). The spawn set SOLID_NOT, so set it here
+    // or woken bodies stay intangible to movement forever.
+    m.edict.solid = SOLID_BBOX;
+    m.edict.movetype = MOVETYPE_STEP;
     // monster_triggered_spawn: non-ambush FoundTarget (acquire now), ambush
     // keeps enemy NULL and waits for line of sight.
     if (byPlayer && !m.ambush) m.seen = true;
@@ -2642,6 +2738,9 @@ export function SV_SpawnMonster(
   if (classname === 'monster_soldier_light') e.extra['skinnum'] = '0';
   else if (classname === 'monster_soldier') e.extra['skinnum'] = '2';
   else if (classname === 'monster_soldier_ss') e.extra['skinnum'] = '4';
+  // Live synthetic bodies block movement like lump spawns (SOLID_BBOX).
+  e.solid = SOLID_BBOX;
+  e.movetype = MOVETYPE_STEP;
   const m: ServerMonster = {
     edict: e,
     state: kind ? spawnMonster(kind) : spawnMonster('soldier'),
@@ -2743,6 +2842,11 @@ export function SV_DamageMonster(
     // C Killed(): every fresh SVF_MONSTER death counts (this sim has no
     // AI_GOOD_GUY bodies; deadsoldier minces run a separate counter).
     st.killedMonsters++;
+    // C Killed sets SVF_DEADMONSTER: SV_ClipMoveToEntities skips the corpse
+    // unless the mask carries CONTENTS_DEADMONSTER, so the dead never block
+    // the living. SOLID_NOT is that skip here (SV_MonsterClipBox drops them
+    // the same way). Corpses stay hittable via the state-based sweeps.
+    m.edict.solid = SOLID_NOT;
   }
   if ((res === 'dead' || res === 'gib') && wasAlive && m.edict.target) {
     // id monster_death_use: a dying monster fires its target (with the
@@ -3707,6 +3811,40 @@ export interface SVFireResult {
 }
 
 /**
+ * Per-trigger fire sound (client/cl_fx.c CL_ParseMuzzleFlash MZ_* cases —
+ * the client plays these on the muzzle flash, which is the sound slot
+ * SV_PlayerFire feeds). Machinegun/chaingun rotate machgf1-5b
+ * (Com_sprintf "weapons/machgf%ib.wav", (rand()%5)+1); the legacy fixed
+ * machgf1b for the machinegun is kept (driver pins depend on it).
+ */
+export function playerFireSound(weaponKind: string, rand: () => number): string {
+  switch (weaponKind) {
+    case 'weapon_shotgun':
+      return 'weapons/shotgf1b.wav';
+    case 'weapon_supershotgun':
+      return 'weapons/sshotf1b.wav';
+    case 'weapon_machinegun':
+      return 'weapons/machgf1b.wav';
+    case 'weapon_chaingun':
+      return `weapons/machgf${1 + ((rand() * 5) | 0)}b.wav`;
+    case 'weapon_grenades':
+      return 'weapons/hgrena1b.wav';
+    case 'weapon_grenadelauncher':
+      return 'weapons/grenlf1a.wav';
+    case 'weapon_rocketlauncher':
+      return 'weapons/rocklf1a.wav';
+    case 'weapon_hyperblaster':
+      return 'weapons/hyprbf1a.wav';
+    case 'weapon_railgun':
+      return 'weapons/railgf1a.wav';
+    case 'weapon_bfg':
+      return 'weapons/bfg__f1y.wav';
+    default:
+      return 'weapons/blastf1a.wav';
+  }
+}
+
+/**
  * SV_PlayerFire: the driver computes the shot (eye/feet/angles from input)
  * but the server applies it — ammo, muzzle dlight, foe/player bolts,
  * hitscan pellet traces vs wall/monsters/barrels, pain/gib/barrel damage,
@@ -3734,12 +3872,7 @@ export function SV_PlayerFire(
   const up = v3();
   AngleVectors(opts.angles, fwd, right, up);
   st.sounds.push({
-    name:
-      weaponKind === 'weapon_shotgun'
-        ? 'weapons/shotgf1b.wav'
-        : weaponKind === 'weapon_machinegun'
-          ? 'weapons/machgf1b.wav'
-          : 'weapons/blastf1a.wav',
+    name: playerFireSound(weaponKind, opts.rand),
     pos: v3(opts.eye[0], opts.eye[1], opts.eye[2]),
     born: st.time,
   });

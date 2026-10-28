@@ -198,6 +198,10 @@ describe('Phase 3: enemy muzzle flash renders at the m_flash offset only', () =>
     driver.ps.ammo['shells'] = 8;
     driver.shells = 8; // compat counter handleAttack reads (syncAmmo mirrors it)
     driver.selectWeapon('weapon_shotgun');
+    // Lower/raise switch (Weapon_Generic): the gun is not READY until the
+    // drop + raise legs complete — fire stays blocked until then.
+    for (let i = 0; i < 30 && driver.weaponSwitching; i++) stepDriver(driver, neutralCmd(), 1);
+    expect(driver.weaponSwitching).toBe(false);
     driver.pm.viewAngles = v3(0, 0, 0);
     driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
     expect(driver.events).toContain('shot');

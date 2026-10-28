@@ -14,6 +14,7 @@ import {
   DEFAULT_SHOTGUN_COUNT,
   DEFAULT_SHOTGUN_HSPREAD,
   DEFAULT_SHOTGUN_VSPREAD,
+  DEFAULT_SSHOTGUN_COUNT,
   DEFAULT_BULLET_HSPREAD,
   DEFAULT_BULLET_VSPREAD,
   GREEN_COLOR_BASE,
@@ -28,9 +29,16 @@ import {
   RANGE_NEAR,
   SOLDIER,
   SOLDIER_WEAPON_STATS,
+  WEAPON_BFG,
   WEAPON_BLASTER,
+  WEAPON_CHAINGUN,
+  WEAPON_GRENADELAUNCHER,
+  WEAPON_HYPERBLASTER,
   WEAPON_MACHINEGUN,
+  WEAPON_RAILGUN,
+  WEAPON_ROCKETLAUNCHER,
   WEAPON_SHOTGUN,
+  WEAPON_SUPERSHOTGUN,
   YELLOW_COLOR_BASE,
   YELLOW_COLOR_END,
   attackFiresBolt,
@@ -72,7 +80,25 @@ describe('weapons (M5.3)', () => {
     expect(WEAPON_MACHINEGUN.hspread).toBe(300);
     expect(WEAPON_MACHINEGUN.vspread).toBe(500);
     expect(WEAPON_MACHINEGUN.ammoKind).toBe('bullets');
-    expect(findWeapon('weapon_railgun')).toBe(null);
+    // Full SP arsenal (p_weapon.c SP branches): every base1/DM classname
+    // resolves instead of 'no weapon'.
+    expect(findWeapon('weapon_supershotgun')).toBe(WEAPON_SUPERSHOTGUN);
+    expect(WEAPON_SUPERSHOTGUN.ammoPerShot).toBe(2);
+    expect(WEAPON_SUPERSHOTGUN.pellets).toBe(DEFAULT_SSHOTGUN_COUNT / 2);
+    expect(WEAPON_SUPERSHOTGUN.damage).toBe(6);
+    expect(WEAPON_CHAINGUN.damage).toBe(8);
+    expect(WEAPON_CHAINGUN.ammoKind).toBe('bullets');
+    expect(findWeapon('weapon_grenadelauncher')).toBe(WEAPON_GRENADELAUNCHER);
+    expect(WEAPON_GRENADELAUNCHER.damage).toBe(120);
+    expect(findWeapon('weapon_rocketlauncher')).toBe(WEAPON_ROCKETLAUNCHER);
+    expect(WEAPON_ROCKETLAUNCHER.damage).toBe(100);
+    expect(findWeapon('weapon_hyperblaster')).toBe(WEAPON_HYPERBLASTER);
+    expect(WEAPON_HYPERBLASTER.damage).toBe(20);
+    expect(findWeapon('weapon_railgun')).toBe(WEAPON_RAILGUN);
+    expect(WEAPON_RAILGUN.damage).toBe(150);
+    expect(findWeapon('weapon_bfg')).toBe(WEAPON_BFG);
+    expect(WEAPON_BFG.ammoPerShot).toBe(50);
+    expect(WEAPON_BFG.damage).toBe(500);
   });
 
   it('shotgun fires 12 pellets and consumes 1 shell', () => {

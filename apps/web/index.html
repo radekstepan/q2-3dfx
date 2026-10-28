@@ -1,3 +1,24 @@
-<!doctype html><html><head><meta charset="utf-8"><title>q2ts</title><style>body{background:#000;color:#ccc;font-family:monospace;margin:0;display:flex;gap:16px}canvas{cursor:crosshair}#q2-ui{padding:8px;max-width:340px;margin-left:auto;text-align:left}#q2-help{margin:8px 0;white-space:pre-line}.q2-cvar-row{display:flex;align-items:center;justify-content:flex-start;gap:8px;margin:1px 0}.q2-cvar-row label{width:140px;text-align:left;font:11px/1.6 monospace;color:#999;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.q2-cvar-row input,.q2-cvar-row select{width:110px;font:11px monospace;background:#111;color:#ccc;border:1px solid #333;padding:1px 2px}.q2-cvar-row input[type=checkbox]{width:auto}</style></head><body><canvas id="q2"></canvas><div id="q2-ui"><div id="q2-progress"></div><div id="q2-help">WASD move · C crouch · Space jump · E use · 1/2/3 weapons
+<!doctype html><html><head><meta charset="utf-8"><title>q2ts</title><style>
+/* Quake II sidebar: dark industrial / military stencil. Phosphor-green
+   values on gunmetal, hazard-orange section headers + focus. */
+body{background:#050604;color:#c8cdb4;font-family:monospace;margin:0;display:flex;gap:16px}
+canvas{cursor:crosshair}
+#q2-ui{padding:10px 12px;width:372px;max-width:372px;margin-left:auto;text-align:left;background:linear-gradient(180deg,#0d0f0a 0%,#090b07 100%);border-left:3px solid #ff8c1a;min-height:100vh;box-sizing:border-box}
+#q2-help{margin:8px 0;padding:8px;border:1px solid #2a2f1e;background:#0a0c07;color:#9aa48a;white-space:pre-line;font-size:11px;line-height:1.5}
+#q2-progress{color:#ffb35e;font-size:11px;min-height:16px}
+q2-settings-panel{display:block;margin-top:6px}
+q2-group,.q2-cvar-group{display:block;margin:12px 0 4px;padding:3px 6px;font-family:Impact,'Arial Black',sans-serif;font-size:12px;letter-spacing:3px;text-transform:uppercase;color:#ff8c1a;background:linear-gradient(90deg,#1a1206,#0d0f0a);border-bottom:2px solid #ff8c1a}
+q2-group::before,.q2-cvar-group::before{content:"▚ "}
+q2-cvar-row,.q2-cvar-row{display:flex;align-items:center;justify-content:flex-start;gap:8px;margin:2px 0;padding:1px 4px;border-left:2px solid transparent}
+q2-cvar-row:hover,.q2-cvar-row:hover{background:#11140b;border-left-color:#4a5232}
+q2-cvar-row label,.q2-cvar-row label{width:150px;flex:none;text-align:left;font:11px/1.6 monospace;color:#9aa48a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:default}
+q2-checkbox,q2-select,q2-text{display:inline-flex;flex:1;min-width:0}
+q2-checkbox input[type=checkbox]{width:16px;height:16px;accent-color:#ff8c1a;cursor:pointer}
+q2-select select,q2-text input{flex:1;min-width:0;font:11px monospace;background:#0c0e08;color:#e4f0b8;border:1px solid #4a5232;padding:2px 4px}
+q2-select select option{background:#0c0e08;color:#e4f0b8}
+q2-select select:focus-visible,q2-text input:focus-visible,q2-checkbox input:focus-visible{outline:2px solid #ff8c1a;outline-offset:1px}
+#q2-ui button{font:11px monospace;background:#1a1206;color:#ffb35e;border:1px solid #ff8c1a;padding:3px 8px;cursor:pointer;letter-spacing:1px}
+#q2-ui button:hover{background:#2a1c08}
+</style></head><body><canvas id="q2"></canvas><div id="q2-ui"><div id="q2-progress"></div><div id="q2-help">WASD move · C crouch · Space jump · E use · 1/2/3 weapons
 click: shoot · skill + resolution + map in cvars (change reboots the level)
-drop pak0.pak for base1 (cached across reloads)</div><div id="q2-cvars"></div></div><script type="module" src="/src/index.ts"></script></body></html>
+drop pak0.pak for base1 (cached across reloads)</div><q2-settings-panel id="q2-cvars"></q2-settings-panel></div><script type="module" src="/src/index.ts"></script></body></html>

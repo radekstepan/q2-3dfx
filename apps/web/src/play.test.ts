@@ -492,6 +492,9 @@ describe('play driver (devroom, headless)', () => {
     const { driver } = boot;
     driver.ps.weapons.push('weapon_shotgun');
     driver.selectWeapon('weapon_shotgun');
+    // Lower/raise switch (Weapon_Generic): wait for READY before the kick shot.
+    for (let i = 0; i < 30 && driver.weaponSwitching; i++) stepDriver(driver, neutralCmd(), 1);
+    expect(driver.weaponSwitching).toBe(false);
     driver.shells = 5;
     driver.pm.viewAngles = v3(0, 0, 0);
     driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
