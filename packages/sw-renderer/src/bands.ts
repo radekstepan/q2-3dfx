@@ -412,7 +412,9 @@ export const R_FLAGS = 6; // bitmask (see R_FLAG_* below)
 export const R_ZBITS = 7;
 export const R_TURBPHASE = 8;
 export const R_FLATRGB = 9; // packed 0xRRGGBB (valid when R_FLAG_FLAT)
-export const R_PER_BATCH = 10;
+export const R_YMIN = 10; // inclusive min span row (band-cull, PERF-5)
+export const R_YMAX = 11; // exclusive max span row (band-cull, PERF-5)
+export const R_PER_BATCH = 12;
 
 /** R_FLAGS bits. */
 export const R_FLAG_WARP = 1; // turbulent water (generic effect path)
@@ -934,6 +936,8 @@ export function processRGBFrameJob(
   const far = rgb.kick[1]!;
   const lodBias = rgb.kick[2]!;
   // Per-kick chain-slot -> level-view cache (subarray views, no copies).
+  // Built lazily only for descriptors intersecting this band (PERF-5
+  // band-cull): out-of-band batches skip material + span scans entirely.
   const chainCache = new Map<number, RGBMipLevel[]>();
   const levelFor = (slot: number): RGBMipLevel[] => {
     const hit = chainCache.get(slot);
@@ -958,13 +962,41 @@ export function processRGBFrameJob(
     chainCache.set(slot, levels);
     return levels;
   };
+  // Reused per-descriptor records (no per-batch allocation on the hot path).
+  const reuseLight: RGBLightmap = { samples: new Uint8Array(0), luxW: 0, luxH: 0 };
+  const reuseFlat = new Uint8Array(3);
+  const reuseMat: RGBMaterial = {
+    levels: [],
+    addressS: 'repeat',
+    addressT: 'repeat',
+    light: null,
+    overbright: false,
+    lodBias,
+    mipDither: false,
+    bilinear: true,
+    zbits: 16,
+    blend: 'opaque',
+    alpha: 1,
+    warp: false,
+    turbPhase: 0,
+    flatColor: null,
+    alphaTest: null,
+    depthWrite: true,
+  };
   let pixels = 0;
   let drawn = 0;
   for (let b = 0; b < descCount; b++) {
     const d = b * R_PER_BATCH;
-    const spanBase = rgb.rgbDesc[d + R_SPAN_BASE]!;
     const spanCount = rgb.rgbDesc[d + R_SPAN_COUNT]!;
     if (spanCount <= 0) continue;
+    // Band-cull: descriptors carry their staged span y-range; bands with no
+    // overlap skip material resolution + span scans. Legacy descriptors with
+    // an empty range (ymax <= ymin) fall through to the raster core's own
+    // per-span y filter so output stays identical.
+    const ymin = rgb.rgbDesc[d + R_YMIN]!;
+    const ymax = rgb.rgbDesc[d + R_YMAX]!;
+    if (ymax > ymin && (ymax <= y0 || ymin >= y1)) continue;
+    const spanBase = rgb.rgbDesc[d + R_SPAN_BASE]!;
     const slot = rgb.rgbDesc[d + R_CHAIN]!;
     const luxOff = rgb.rgbDesc[d + R_LUX_OFF]!;
     const luxW = rgb.rgbDesc[d + R_LUX_W]!;
@@ -975,38 +1007,39 @@ export function processRGBFrameJob(
     const flatRGB = rgb.rgbDesc[d + R_FLATRGB]!;
     const hasLight = (flags & R_FLAG_LIGHT) !== 0;
     const hasFlat = (flags & R_FLAG_FLAT) !== 0;
-    const light: RGBLightmap | null = hasLight
-      ? {
-        samples: rgb.lux.subarray(luxOff, luxOff + luxW * luxH * 3),
-        luxW, luxH,
-      }
-      : null;
-    const flatColor = hasFlat
-      ? new Uint8Array([(flatRGB >> 16) & 255, (flatRGB >> 8) & 255, flatRGB & 255])
-      : null;
-    const mat: RGBMaterial = {
-      levels: levelFor(slot),
-      addressS: (flags & R_FLAG_REPEAT) !== 0 ? 'repeat' : 'clamp',
-      addressT: (flags & R_FLAG_REPEAT) !== 0 ? 'repeat' : 'clamp',
-      light,
-      overbright: (flags & R_FLAG_OVERBRIGHT) !== 0,
-      lodBias,
-      mipDither: (flags & R_FLAG_MIPDITHER) !== 0,
-      bilinear: (flags & R_FLAG_BILINEAR) !== 0,
-      zbits,
-      blend: 'opaque',
-      alpha: 1,
-      warp: (flags & R_FLAG_WARP) !== 0,
-      turbPhase,
-      flatColor,
-      alphaTest: null,
-      depthWrite: (flags & R_FLAG_DEPTHWRITE) !== 0,
-    };
+    const repeat = (flags & R_FLAG_REPEAT) !== 0;
+    reuseMat.levels = levelFor(slot);
+    reuseMat.addressS = repeat ? 'repeat' : 'clamp';
+    reuseMat.addressT = repeat ? 'repeat' : 'clamp';
+    if (hasLight) {
+      reuseLight.samples = rgb.lux.subarray(luxOff, luxOff + luxW * luxH * 3);
+      reuseLight.luxW = luxW;
+      reuseLight.luxH = luxH;
+      reuseMat.light = reuseLight;
+    } else {
+      reuseMat.light = null;
+    }
+    reuseMat.overbright = (flags & R_FLAG_OVERBRIGHT) !== 0;
+    reuseMat.lodBias = lodBias;
+    reuseMat.mipDither = (flags & R_FLAG_MIPDITHER) !== 0;
+    reuseMat.bilinear = (flags & R_FLAG_BILINEAR) !== 0;
+    reuseMat.zbits = zbits;
+    reuseMat.warp = (flags & R_FLAG_WARP) !== 0;
+    reuseMat.turbPhase = turbPhase;
+    if (hasFlat) {
+      reuseFlat[0] = (flatRGB >> 16) & 255;
+      reuseFlat[1] = (flatRGB >> 8) & 255;
+      reuseFlat[2] = flatRGB & 255;
+      reuseMat.flatColor = reuseFlat;
+    } else {
+      reuseMat.flatColor = null;
+    }
+    reuseMat.depthWrite = (flags & R_FLAG_DEPTHWRITE) !== 0;
     const r = rasterizePackedRGBRange(
       rgb.rgb565, rgb.cover, rgb.rgbDepth, fbW, fbH,
       rgb.spansF, rgb.spansI, spanBase, spanCount,
-      mat,
-      (flags & R_FLAG_REPEAT) !== 0,
+      reuseMat,
+      repeat,
       (flags & R_FLAG_WARP) !== 0,
       turbPhase,
       near, far,
@@ -1090,6 +1123,45 @@ export function resolveBand(
   }
 }
 
+/**
+ * Fused palette-expand + RGB composite for rows [y0, y1) (PERF-5 pooled
+ * end-frame fusion): bit-identical to the serial fused endFrame path —
+ * pixels the RGB overlay covered expand from the packed RGB565 authority
+ * plane (top-bit replication), everything else from the indexed plane.
+ * Disjoint pixel sets, no cross-pixel dependencies. When cover is all zero
+ * (RGB disabled/unused) this is exactly resolveBand. No allocation.
+ */
+export function resolveBandFused(
+  color: Uint32Array, pal: Uint8Array, idx: Uint8Array,
+  rgb565: Uint16Array | null, cover: Uint8Array | null,
+  y0: number, y1: number, fbW: number, fbH: number,
+): void {
+  if (y0 < 0) y0 = 0;
+  if (y1 > fbH) y1 = fbH;
+  if (!rgb565 || !cover || rgb565.length < fbW * fbH || cover.length < fbW * fbH) {
+    resolveBand(color, pal, idx, y0, y1, fbW, fbH);
+    return;
+  }
+  for (let y = y0; y < y1; y++) {
+    const row = y * fbW;
+    const end = row + fbW;
+    for (let o = row; o < end; o++) {
+      if (cover[o]) {
+        const v = rgb565[o]!;
+        const r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
+        color[o] = (0xff000000 |
+          ((((b5 << 3) | (b5 >> 2)) << 16) |
+            (((g6 << 2) | (g6 >> 4)) << 8) |
+            ((r5 << 3) | (r5 >> 2)))) >>> 0;
+      } else {
+        const c = idx[o]! * 3;
+        const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
+        color[o] = (0xff << 24) | (b << 16) | (g << 8) | r;
+      }
+    }
+  }
+}
+
 /** Minimal sink for worker completion posts (worker_threads / Web Worker). */
 export interface BandPort {
   postMessage(msg: unknown): void;
@@ -1159,11 +1231,14 @@ export function bandWorkerLoop(
     }
     let r: { pixels: number; spans: number };
     if (job === JOB_RESOLVE) {
-      // Resolve kick (M8.1 parallel resolve): expand the final index plane
-      // into the shared color plane. No tally contribution by construction
-      // (spans/pixels count spanfill, which this kick does not do).
+      // Resolve kick (M8.1 parallel resolve + PERF-5 fused composite): expand
+      // the final index plane into the shared color plane, compositing the
+      // RGB overlay where covered. No tally contribution by construction
+      // (spans/pixels count spanfill, which this kick does not do). Fused
+      // when RGB views exist (cover zero => plain expand, bit-identical).
       const pal = fav.fPal;
-      resolveBand(fav.fColor, pal, views.idx, y0, y1, fbWNow, fbHNow);
+      if (rgb) resolveBandFused(fav.fColor, pal, views.idx, rgb.rgb565, rgb.cover, y0, y1, fbWNow, fbHNow);
+      else resolveBand(fav.fColor, pal, views.idx, y0, y1, fbWNow, fbHNow);
       r = { pixels: 0, spans: 0 };
     } else if (job === JOB_RGB) {
       // RGB raster kick (PERF-2 RGB workers): drain every staged RGB
@@ -1276,6 +1351,8 @@ export interface BandDispatcher {
   flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number } | null>;
   /** Full-frame inline replay of the staged RGB batches (fallback). */
   drawInlineRGBAll(near: number, far: number, lodBias: number): { pixels: number; spans: number };
+  /** Drop the persistent RGB chain upload cache (palette/world change). */
+  clearRGBChains(): void;
 }
 
 const BAND_CHUNK = 4096;
@@ -1498,9 +1575,10 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
   }
 
   /**
-   * Complete the resolve kick (M8.1 parallel resolve): the pool expands
-   * the final index plane into the shared color plane. Falls back to an
-   * identical serial expand on timeout/dead pool. `color` is the destination
+   * Complete the resolve kick (M8.1 parallel resolve + PERF-5 fused
+   * composite): the pool expands the final index plane into the shared
+   * color plane, compositing RGB where covered. Falls back to an identical
+   * serial fused expand on timeout/dead pool. `color` is the destination
    * plane (pool-adopted when pooled), `palette` the 768-byte RGB palette.
    * No-op without a dispatcher (caller expands serially instead).
    */
@@ -1508,7 +1586,7 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
     const d = this.dispatcher;
     if (d && d.resolveFrame()) return;
     if (!d) return;
-    resolveBand(color, palette, this.idx, 0, this.fbH, this.fbW, this.fbH);
+    resolveBandFused(color, palette, this.idx, this.rgb.rgb565, this.rgb.cover, 0, this.fbH, this.fbW, this.fbH);
   }
 
   /**
@@ -1518,7 +1596,7 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
     const d = this.dispatcher;
     if (d && await d.resolveFrameAsync()) return;
     if (!d) return;
-    resolveBand(color, palette, this.idx, 0, this.fbH, this.fbW, this.fbH);
+    resolveBandFused(color, palette, this.idx, this.rgb.rgb565, this.rgb.cover, 0, this.fbH, this.fbW, this.fbH);
   }
 
   /** Inline single-pass spanfill (PERF-2 A fused core). */

@@ -26,10 +26,10 @@ import {
   MAX_RGB_BATCHES, MAX_RGB_SPANS, RGB_CHAIN_CAP, RGB_LUX_CAP, RGB_MAX_CHAINS, RGB_MAX_LEVELS,
   C_LEVEL_BASE, C_LEVEL_COUNT, C_PER_CHAIN, L_DATA_OFF, L_H, L_MASK_OFF, L_PER_LEVEL, L_W,
   R_CHAIN, R_FLAGS, R_FLATRGB, R_LUX_H, R_LUX_OFF, R_LUX_W, R_PER_BATCH,
-  R_SPAN_BASE, R_SPAN_COUNT, R_TURBPHASE, R_ZBITS,
+  R_SPAN_BASE, R_SPAN_COUNT, R_TURBPHASE, R_YMAX, R_YMIN, R_ZBITS,
   attachFrameAccum, attachRGBAccum, frameAccumTotal, rgbAccumTotal, packBandSpans, packFrameSpans,
-  processBandJob, processFrameJob, processRGBFrameJob, readBandJob, resolveBand,
-  sabAvailable, splitBands, syncWaitAllowed, writeBandJob,
+  processBandJob, processFrameJob, processRGBFrameJob, readBandJob, resolveBand, resolveBandFused,
+  sabAvailable, splitBands, syncWaitAllowed, writeBandJob, I_PER_SPAN,
   type Band,
   type BandDispatcher, type BandViews, type FrameAccumViews, type RGBAccumViews,
 } from './bands.js';
@@ -627,10 +627,11 @@ export class BandWorkerPool implements BandDispatcher {
   }
 
   /**
-   * Resolve kick (M8.1 parallel resolve): palette-expand the final index
-   * plane into the shared color plane across the pool (blocking). True
-   * unless the pool is dead, a worker never became ready, or the wait times
-   * out — the caller expands inline instead (identical).
+   * Resolve kick (M8.1 parallel resolve + PERF-5 fused composite):
+   * palette-expand the final index plane into the shared color plane across
+   * the pool, compositing the RGB overlay where covered. True unless the
+   * pool is dead, a worker never became ready, or the wait times out — the
+   * caller expands inline instead (identical).
    */
   resolveFrame(): boolean {
     if (this.disposed || this.workers.length === 0) return false;
@@ -642,7 +643,7 @@ export class BandWorkerPool implements BandDispatcher {
     const seq = this.seq;
     if (!this.kick(seq)) return false;
     const mainBand = this.bands[this.bands.length - 1]!;
-    resolveBand(this.views.fColor, this.views.fPal, this.base.idx, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
+    resolveBandFused(this.views.fColor, this.views.fPal, this.base.idx, this.rgbViews.rgb565, this.rgbViews.cover, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
     return this.awaitDoneSync();
   }
 
@@ -663,7 +664,7 @@ export class BandWorkerPool implements BandDispatcher {
       return false;
     }
     const mainBand = this.bands[this.bands.length - 1]!;
-    resolveBand(this.views.fColor, this.views.fPal, this.base.idx, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
+    resolveBandFused(this.views.fColor, this.views.fPal, this.base.idx, this.rgbViews.rgb565, this.rgbViews.cover, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
     return finished;
   }
 
@@ -678,11 +679,13 @@ export class BandWorkerPool implements BandDispatcher {
 
   /**
    * Stage one world RGB batch into the SAB (main side). Copies the span
-   * slice, the material's mip chain (deduped per frame by chain identity)
-   * and the luxel block, then records the descriptor. Returns false when
-   * the batch must run inline (dead pool, exhausted regions, too many
-   * chains/levels, oversized chain or luxels) — the caller replays pending
-   * batches inline first so global batch order is preserved. Never throws.
+   * slice, the material's mip chain (deduplicated across frames by chain
+   * identity — persistent SAB upload, PERF-5) and the luxel block, then
+   * records the descriptor (with its span y-range for worker band-culling).
+   * Returns false when the batch must run inline (dead pool, exhausted
+   * regions, too many chains/levels, oversized chain or luxels) — the caller
+   * replays pending batches inline first so global batch order is preserved.
+   * Never throws.
    */
   stageRGB(
     list: SpanList, spanStart: number, spanCount: number,
@@ -704,42 +707,59 @@ export class BandWorkerPool implements BandDispatcher {
       if (!packed || packed.count !== spanCount) return false;
     }
     // Chain dedupe by identity (shared per-texture chains hit every time).
+    // Persistent across frames: the SAB chain region is a stable upload
+    // cache (copy-on-first-use, retained by resetRGB). Evict-all + retry
+    // once when a genuinely new chain does not fit.
     let slot = this.rgbChainMap.get(levels);
     if (slot === undefined) {
-      if (this.rgbChainSlots >= RGB_MAX_CHAINS) return false;
-      let bytes = 0;
-      for (let l = 0; l < levels.length; l++) {
-        const lv = levels[l]!;
-        if (!(lv.width >= 1 && lv.height >= 1)) return false;
-        if (lv.data.length < lv.width * lv.height * 3) return false;
-        if (lv.mask.length < lv.width * lv.height) return false;
-        bytes += lv.data.length + lv.mask.length;
+      const allocChain = (): number | undefined => {
+        if (this.rgbChainSlots >= RGB_MAX_CHAINS) return undefined;
+        let bytes = 0;
+        for (let l = 0; l < levels.length; l++) {
+          const lv = levels[l]!;
+          if (!(lv.width >= 1 && lv.height >= 1)) return undefined;
+          if (lv.data.length < lv.width * lv.height * 3) return undefined;
+          if (lv.mask.length < lv.width * lv.height) return undefined;
+          bytes += lv.data.length + lv.mask.length;
+        }
+        if (bytes > RGB_CHAIN_CAP - this.rgbChainUsed) return undefined;
+        if (levels.length > RGB_MAX_LEVELS - this.rgbChainLevels) return undefined;
+        const s = this.rgbChainSlots;
+        const levelBase = this.rgbChainLevels;
+        for (let l = 0; l < levels.length; l++) {
+          const lv = levels[l]!;
+          const dataBytes = lv.data.length;
+          const maskBytes = lv.mask.length;
+          const dataOff = this.rgbChainUsed;
+          this.rgbViews.chainData.set(lv.data, dataOff);
+          const maskOff = dataOff + dataBytes;
+          this.rgbViews.chainData.set(lv.mask, maskOff);
+          const t = (levelBase + l) * L_PER_LEVEL;
+          this.rgbViews.levelTab[t + L_DATA_OFF] = dataOff;
+          this.rgbViews.levelTab[t + L_MASK_OFF] = maskOff;
+          this.rgbViews.levelTab[t + L_W] = lv.width;
+          this.rgbViews.levelTab[t + L_H] = lv.height;
+          this.rgbChainUsed += dataBytes + maskBytes;
+        }
+        const dd = s * C_PER_CHAIN;
+        this.rgbViews.chainDir[dd + C_LEVEL_BASE] = levelBase;
+        this.rgbViews.chainDir[dd + C_LEVEL_COUNT] = levels.length;
+        this.rgbChainLevels += levels.length;
+        this.rgbChainSlots += 1;
+        this.rgbChainMap.set(levels, s);
+        return s;
+      };
+      let s = allocChain();
+      if (s === undefined) {
+        // Working set changed (new texture/palette/world): drop the whole
+        // persistent upload cache once and retry. Stale chain identity refs
+        // are also dropped on palette/world changes via clearRGBChains, so
+        // this path only triggers on genuine growth.
+        this.clearRGBChains();
+        s = allocChain();
+        if (s === undefined) return false;
       }
-      if (bytes > RGB_CHAIN_CAP - this.rgbChainUsed) return false;
-      if (levels.length > RGB_MAX_LEVELS - this.rgbChainLevels) return false;
-      slot = this.rgbChainSlots;
-      const levelBase = this.rgbChainLevels;
-      for (let l = 0; l < levels.length; l++) {
-        const lv = levels[l]!;
-        const dataBytes = lv.data.length;
-        const maskBytes = lv.mask.length;
-        const dataOff = this.rgbChainUsed;
-        this.rgbViews.chainData.set(lv.data, dataOff);
-        const maskOff = dataOff + dataBytes;
-        this.rgbViews.chainData.set(lv.mask, maskOff);
-        const t = (levelBase + l) * L_PER_LEVEL;
-        this.rgbViews.levelTab[t + L_DATA_OFF] = dataOff;
-        this.rgbViews.levelTab[t + L_MASK_OFF] = maskOff;
-        this.rgbViews.levelTab[t + L_W] = lv.width;
-        this.rgbViews.levelTab[t + L_H] = lv.height;
-        this.rgbChainUsed += dataBytes + maskBytes;
-      }
-      const d = slot * C_PER_CHAIN;
-      this.rgbViews.chainDir[d + C_LEVEL_BASE] = levelBase;
-      this.rgbViews.chainDir[d + C_LEVEL_COUNT] = levels.length;
-      this.rgbChainLevels += levels.length;
-      this.rgbChainSlots += 1;
-      this.rgbChainMap.set(levels, slot);
+      slot = s;
     }
     let luxOff = 0;
     if (luxels && luxW > 0 && luxH > 0) {
@@ -761,6 +781,22 @@ export class BandWorkerPool implements BandDispatcher {
     this.rgbViews.rgbDesc[d + R_ZBITS] = zbits;
     this.rgbViews.rgbDesc[d + R_TURBPHASE] = turbPhase;
     this.rgbViews.rgbDesc[d + R_FLATRGB] = flatRGB;
+    // Band-cull range: min/max span row staged in this batch. Scans the
+    // just-packed flat spans (I_PER_SPAN stride, y at +1); per-batch spans
+    // are few, total cost is one integer pass over the frame's spans.
+    let ymin = 0, ymax = 0;
+    if (spanCount > 0) {
+      ymin = 0x7fffffff;
+      ymax = -0x80000000;
+      for (let s = 0; s < spanCount; s++) {
+        const y = this.rgbViews.spansI[(this.rgbSpansUsed + s) * I_PER_SPAN + 1]!;
+        if (y < ymin) ymin = y;
+        if (y + 1 > ymax) ymax = y + 1;
+      }
+      if (!(ymax > ymin)) { ymin = 0; ymax = 0; }
+    }
+    this.rgbViews.rgbDesc[d + R_YMIN] = ymin;
+    this.rgbViews.rgbDesc[d + R_YMAX] = ymax;
     this.rgbSpansUsed += spanCount;
     this.rgbDescCount += 1;
     return true;
@@ -893,18 +929,28 @@ export class BandWorkerPool implements BandDispatcher {
 
   /** Drop staged RGB batches (beginFrame + post-kick reset). */
   private resetRGB(): void {
+    // PERF-5 persistent uploads: the chain region + directory/level tables
+    // + identity map are a stable cross-frame cache (copy-on-first-use).
+    // Only the per-frame bump regions reset here (spans/lux/descriptors).
     this.rgbSpansUsed = 0;
-    this.rgbChainUsed = 0;
-    this.rgbChainLevels = 0;
-    this.rgbChainSlots = 0;
     this.rgbLuxUsed = 0;
     this.rgbDescCount = 0;
-    this.rgbChainMap.clear();
     try {
       Atomics.store(this.ctl, CTL_RGBCOUNT, 0);
     } catch {
       /* ignore */
     }
+  }
+
+  /**
+   * Drop the persistent RGB chain upload cache (palette/world/renderer
+   * change, eviction retry, worker restart). Next staged batch re-uploads.
+   */
+  clearRGBChains(): void {
+    this.rgbChainUsed = 0;
+    this.rgbChainLevels = 0;
+    this.rgbChainSlots = 0;
+    this.rgbChainMap.clear();
   }
 
   /** Stage the colormap once per backing store (surface blocks change, it does not). */

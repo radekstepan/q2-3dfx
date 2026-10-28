@@ -2401,21 +2401,18 @@ export class SoftwareRenderer implements Refresh {
 
   endFrame(): void {
     if (this.backend === this.bandBackend && this.bandBackend.dispatcher) {
-      // Pooled path: palette-expand via one resolve kick (workers + the
-      // main band drain the color plane in parallel; identical math to the
-      // serial loop below). Timeout/dead pool falls back to the serial
-      // expand inside resolveAccum. The zero-batch guard keeps the resolve
-      // input defined (mirrors the pre-alias guard in renderView).
+      // Pooled path: fused palette-expand + RGB composite via one resolve
+      // kick (workers + the main band drain the color plane in parallel;
+      // bit-identical to the serial fused loop below). Timeout/dead pool
+      // falls back to the serial fused expand inside resolveAccum. The
+      // zero-batch guard keeps the resolve input defined (mirrors the
+      // pre-alias guard in renderView). No second compositeRGB pass: the
+      // kick already composited (PERF-5 pooled end-frame fusion).
       if (this.bandBackend.batchesDrawn === 0) {
         this.idx.fill(0);
         this.zb.fill(0);
       }
       this.bandBackend.resolveAccum(this.palette, this.color);
-      // Single global reconstruct: the RGB overlay (world spans routed per
-      // band above, foreground draws) composites over the resolved plane
-      // once — bands only ever produce pre-scanout planes, never a display
-      // image. Skipped while disabled, so classic output is untouched.
-      if (this.rgbUsedThisFrame) this.compositeRGB();
     } else {
       // Palette expand to 0xAABBGGRR (classic / wasm / banded-inline paths).
       // PERF-2 C fused single pass: pixels the RGB overlay covered expand
@@ -2491,7 +2488,6 @@ export class SoftwareRenderer implements Refresh {
         this.zb.fill(0);
       }
       await this.bandBackend.resolveAccumAsync(this.palette, this.color);
-      if (this.rgbUsedThisFrame) this.compositeRGB();
     } else {
       this.endFrame();
       return;
@@ -2873,12 +2869,19 @@ export class SoftwareRenderer implements Refresh {
    * cache — otherwise evicted/cleared chains stay alive through
    * `material.levels` with no accounting trace. All callers already
    * invalidate the light cache too; the second clear is a harmless no-op
-   * that keeps the pairing enforceable in one place.
+   * that keeps the pairing enforceable in one place. Also drops the pool's
+   * persistent SAB upload cache (PERF-5), so stale chain bytes can never
+   * serve after a palette/world change.
    */
   private clearRGBTextureChains(): void {
     this.rgbCache.invalidateAll();
     this.rgbTexChains.clear();
     this.rgbTexUsed = 0;
+    try {
+      this.bandBackend.dispatcher?.clearRGBChains();
+    } catch {
+      /* pool gone: next attach re-uploads */
+    }
   }
 
   /**

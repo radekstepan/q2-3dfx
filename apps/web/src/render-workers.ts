@@ -72,7 +72,10 @@ import {
   R_SPAN_BASE,
   R_SPAN_COUNT,
   R_TURBPHASE,
+  R_YMAX,
+  R_YMIN,
   R_ZBITS,
+  I_PER_SPAN,
   attachFrameAccum,
   attachRGBAccum,
   frameAccumTotal,
@@ -81,6 +84,7 @@ import {
   processFrameJob,
   processRGBFrameJob,
   resolveBand,
+  resolveBandFused,
   sabAvailable,
   splitBands,
   textureMasks,
@@ -407,7 +411,7 @@ export class BrowserBandPool implements BandDispatcher {
     return false;
   }
 
-  /** Resolve kick (parallel palette expand): message-driven completion. */
+  /** Resolve kick (parallel palette expand + fused RGB composite): message-driven completion. */
   async resolveFrameAsync(): Promise<boolean> {
     if (this.disposed || this.workers.length === 0) return false;
     if (!(await this.awaitReadyAsync())) return false;
@@ -419,7 +423,7 @@ export class BrowserBandPool implements BandDispatcher {
       return false;
     }
     const mainBand = this.bands[this.bands.length - 1]!;
-    resolveBand(this.views.fColor, this.views.fPal, this.base.idx, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
+    resolveBandFused(this.views.fColor, this.views.fPal, this.base.idx, this.rgbViews.rgb565, this.rgbViews.cover, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
     return finished;
   }
 
@@ -434,8 +438,8 @@ export class BrowserBandPool implements BandDispatcher {
 
   /**
    * Stage one world RGB batch into the SAB (main side). Same contract as
-   * the Node pool's stageRGB (spans + deduped chain + luxels + flags);
-   * false = run inline. Never throws.
+   * the Node pool's stageRGB (spans + persistent chain cache + luxels +
+   * flags + y-range); false = run inline. Never throws.
    */
   stageRGB(
     list: SpanList, spanStart: number, spanCount: number,
@@ -458,40 +462,50 @@ export class BrowserBandPool implements BandDispatcher {
     }
     let slot = this.rgbChainMap.get(levels);
     if (slot === undefined) {
-      if (this.rgbChainSlots >= RGB_MAX_CHAINS) return false;
-      let bytes = 0;
-      for (let l = 0; l < levels.length; l++) {
-        const lv = levels[l]!;
-        if (!(lv.width >= 1 && lv.height >= 1)) return false;
-        if (lv.data.length < lv.width * lv.height * 3) return false;
-        if (lv.mask.length < lv.width * lv.height) return false;
-        bytes += lv.data.length + lv.mask.length;
+      const allocChain = (): number | undefined => {
+        if (this.rgbChainSlots >= RGB_MAX_CHAINS) return undefined;
+        let bytes = 0;
+        for (let l = 0; l < levels.length; l++) {
+          const lv = levels[l]!;
+          if (!(lv.width >= 1 && lv.height >= 1)) return undefined;
+          if (lv.data.length < lv.width * lv.height * 3) return undefined;
+          if (lv.mask.length < lv.width * lv.height) return undefined;
+          bytes += lv.data.length + lv.mask.length;
+        }
+        if (bytes > RGB_CHAIN_CAP - this.rgbChainUsed) return undefined;
+        if (levels.length > RGB_MAX_LEVELS - this.rgbChainLevels) return undefined;
+        const s = this.rgbChainSlots;
+        const levelBase = this.rgbChainLevels;
+        for (let l = 0; l < levels.length; l++) {
+          const lv = levels[l]!;
+          const dataBytes = lv.data.length;
+          const maskBytes = lv.mask.length;
+          const dataOff = this.rgbChainUsed;
+          this.rgbViews.chainData.set(lv.data, dataOff);
+          const maskOff = dataOff + dataBytes;
+          this.rgbViews.chainData.set(lv.mask, maskOff);
+          const t = (levelBase + l) * L_PER_LEVEL;
+          this.rgbViews.levelTab[t + L_DATA_OFF] = dataOff;
+          this.rgbViews.levelTab[t + L_MASK_OFF] = maskOff;
+          this.rgbViews.levelTab[t + L_W] = lv.width;
+          this.rgbViews.levelTab[t + L_H] = lv.height;
+          this.rgbChainUsed += dataBytes + maskBytes;
+        }
+        const dd = s * C_PER_CHAIN;
+        this.rgbViews.chainDir[dd + C_LEVEL_BASE] = levelBase;
+        this.rgbViews.chainDir[dd + C_LEVEL_COUNT] = levels.length;
+        this.rgbChainLevels += levels.length;
+        this.rgbChainSlots += 1;
+        this.rgbChainMap.set(levels, s);
+        return s;
+      };
+      let s = allocChain();
+      if (s === undefined) {
+        this.clearRGBChains();
+        s = allocChain();
+        if (s === undefined) return false;
       }
-      if (bytes > RGB_CHAIN_CAP - this.rgbChainUsed) return false;
-      if (levels.length > RGB_MAX_LEVELS - this.rgbChainLevels) return false;
-      slot = this.rgbChainSlots;
-      const levelBase = this.rgbChainLevels;
-      for (let l = 0; l < levels.length; l++) {
-        const lv = levels[l]!;
-        const dataBytes = lv.data.length;
-        const maskBytes = lv.mask.length;
-        const dataOff = this.rgbChainUsed;
-        this.rgbViews.chainData.set(lv.data, dataOff);
-        const maskOff = dataOff + dataBytes;
-        this.rgbViews.chainData.set(lv.mask, maskOff);
-        const t = (levelBase + l) * L_PER_LEVEL;
-        this.rgbViews.levelTab[t + L_DATA_OFF] = dataOff;
-        this.rgbViews.levelTab[t + L_MASK_OFF] = maskOff;
-        this.rgbViews.levelTab[t + L_W] = lv.width;
-        this.rgbViews.levelTab[t + L_H] = lv.height;
-        this.rgbChainUsed += dataBytes + maskBytes;
-      }
-      const d = slot * C_PER_CHAIN;
-      this.rgbViews.chainDir[d + C_LEVEL_BASE] = levelBase;
-      this.rgbViews.chainDir[d + C_LEVEL_COUNT] = levels.length;
-      this.rgbChainLevels += levels.length;
-      this.rgbChainSlots += 1;
-      this.rgbChainMap.set(levels, slot);
+      slot = s;
     }
     let luxOff = 0;
     if (luxels && luxW > 0 && luxH > 0) {
@@ -513,6 +527,19 @@ export class BrowserBandPool implements BandDispatcher {
     this.rgbViews.rgbDesc[d + R_ZBITS] = zbits;
     this.rgbViews.rgbDesc[d + R_TURBPHASE] = turbPhase;
     this.rgbViews.rgbDesc[d + R_FLATRGB] = flatRGB;
+    let ymin = 0, ymax = 0;
+    if (spanCount > 0) {
+      ymin = 0x7fffffff;
+      ymax = -0x80000000;
+      for (let s = 0; s < spanCount; s++) {
+        const y = this.rgbViews.spansI[(this.rgbSpansUsed + s) * I_PER_SPAN + 1]!;
+        if (y < ymin) ymin = y;
+        if (y + 1 > ymax) ymax = y + 1;
+      }
+      if (!(ymax > ymin)) { ymin = 0; ymax = 0; }
+    }
+    this.rgbViews.rgbDesc[d + R_YMIN] = ymin;
+    this.rgbViews.rgbDesc[d + R_YMAX] = ymax;
     this.rgbSpansUsed += spanCount;
     this.rgbDescCount += 1;
     return true;
@@ -733,17 +760,21 @@ export class BrowserBandPool implements BandDispatcher {
   /** Drop staged RGB batches (beginFrame + post-kick reset). */
   private resetRGB(): void {
     this.rgbSpansUsed = 0;
-    this.rgbChainUsed = 0;
-    this.rgbChainLevels = 0;
-    this.rgbChainSlots = 0;
     this.rgbLuxUsed = 0;
     this.rgbDescCount = 0;
-    this.rgbChainMap.clear();
     try {
       Atomics.store(this.ctl, CTL_RGBCOUNT, 0);
     } catch {
       /* ignore */
     }
+  }
+
+  /** Drop the persistent RGB chain upload cache (palette/world change). */
+  clearRGBChains(): void {
+    this.rgbChainUsed = 0;
+    this.rgbChainLevels = 0;
+    this.rgbChainSlots = 0;
+    this.rgbChainMap.clear();
   }
 
   /** Stage the colormap once per backing store (surface blocks change, it does not). */
