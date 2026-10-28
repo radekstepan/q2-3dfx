@@ -155,6 +155,17 @@ describe('banded vs serial RGB equivalence (dither phase + seam rows)', () => {
     }
   });
 
+  it('banded-inline matches serial on odd dims (PERF-2 A y-range)', async () => {
+    const serial = renderRGBSerial(161, 121);
+    expect(serial.used).toBe(true);
+    for (const bands of [2, 3, 5, 8]) {
+      const banded = await renderRGBBanded(161, 121, bands);
+      expect(banded.colorHash).toBe(serial.colorHash);
+      expect(banded.indexHash).toBe(serial.indexHash);
+      expect(banded.cover).toBe(serial.cover);
+    }
+  });
+
   it('pooled + serial RGB are byte-identical (dist-gated)', { timeout: 120000 }, async () => {
     const distUrl = new URL('../dist/index.mjs', import.meta.url);
     if (!existsSync(distUrl)) {

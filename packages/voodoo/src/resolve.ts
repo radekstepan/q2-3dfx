@@ -372,7 +372,413 @@ export function applyPostFilter(src565: Uint16Array, dst32: Uint32Array, w: numb
   }
 }
 
-// --- 16-bit W-buffer banding ----------------------------------------------
+// --- Fused pack→recon→gamma (PERF-3) ------------------------------------------
+//
+// Byte-identical fusion of the resolveFrame quantise-on path. Each src pixel
+// is dithered+packed exactly once (same ops as resolveRGB565, gamma 1) into
+// dst565; display rows are reconstructed from the just-written (cache-hot)
+// dst565 rows with the display-gamma LUT applied inline. This eliminates two
+// full-frame passes (cold dst565 re-read + display re-read/re-write) and the
+// threshold repack (resolve.ts used to pack p00..p11 then re-extract channels
+// for the spread test — the pack/unpack round-trip is lossless for 8-bit
+// channels, so spreads computed directly from the subtracted taps match
+// exactly). Taps are expanded into locals (the old path allocated 4 objects
+// per pixel via expandTap565). No scratch buffers, no per-frame allocation.
+//
+// Equivalence pins: src/fused.test.ts (cross-product differential vs the
+// manual pipeline + display golden). The exported stage functions above are
+// untouched so the manual pipeline stays available as the oracle.
+
+/** Ingredients for the fused quantise-on path (mirrors VoodooState subset). */
+export interface FusedFrameOptions {
+  dither: boolean;
+  ditherMode: DitherMode;
+  postfilter: boolean;
+  reconmode: ReconMode;
+  rgbmaxdelta: RgbMaxDelta;
+  gamma: number;
+}
+
+/**
+ * Pack one src row y into dst565 (linear transfer): identical per-pixel ops
+ * to resolveRGB565 with gamma 1 and truncating quantise. Module-level (not a
+ * closure) so the fused path allocates nothing per frame.
+ */
+function packLinearRow(
+  src: Uint32Array,
+  dst565: Uint16Array,
+  w: number,
+  y: number,
+  dither: boolean,
+  rbW: Readonly<Int8Array>,
+  gW: Readonly<Int8Array>,
+  xmW: number,
+  ymW: number,
+  shW: number,
+): void {
+  const rowPh = (y & ymW) << shW;
+  let i = y * w;
+  for (let x = 0; x < w; x++, i++) {
+    const px = src[i]!;
+    let r = px & 255;
+    let g = (px >> 8) & 255;
+    let b = (px >> 16) & 255;
+    if (dither) {
+      const p = rowPh | (x & xmW);
+      r += rbW[p]!;
+      g += gW[p]!;
+      b += rbW[p]!;
+      r = r < 0 ? 0 : r > 255 ? 255 : r;
+      g = g < 0 ? 0 : g > 255 ? 255 : g;
+      b = b < 0 ? 0 : b > 255 ? 255 : b;
+    }
+    dst565[i] = quantiseRGB565(r, g, b);
+  }
+}
+
+/**
+ * Fused quantise-on resolve: pack rows into dst565 on demand, reconstruct
+ * display rows from the hot dst565 rows, gamma LUT inline. Byte-identical to
+ * the manual linear-pack → recon/box → display-gamma pipeline for every
+ * reconmode, threshold, dither and gamma setting.
+ */
+export function resolveFusedFrame(
+  src: Uint32Array,
+  dst565: Uint16Array,
+  display: Uint32Array,
+  w: number,
+  h: number,
+  o: FusedFrameOptions,
+): void {
+  if (dst565.length < w * h || display.length < w * h || src.length < w * h) {
+    throw new Error('[voodoo] resolveFusedFrame: buffer too small');
+  }
+  // Same validation order as applyDisplayGamma: LUT lookup (throws on bad
+  // gamma) before the gamma==1 no-op.
+  const lut = o.gamma !== 1 ? gammaLUT(o.gamma) : null;
+  const dither = o.dither;
+  const twoW = o.ditherMode === '2x2';
+  const rbW = twoW ? DITHER2_RB_POS : DITHER_RB_POS;
+  const gW = twoW ? DITHER2_G_POS : DITHER_G_POS;
+  const xmW = twoW ? 1 : 3;
+  const ymW = twoW ? 1 : 3;
+  const shW = twoW ? 1 : 2;
+
+  // --- Postfilter off: pack -> expand -> display gamma, one row at a time.
+  if (!o.postfilter) {
+    for (let y = 0; y < h; y++) {
+      packLinearRow(src, dst565, w, y, dither, rbW, gW, xmW, ymW, shW);
+      const row = y * w;
+      for (let x = 0; x < w; x++) {
+        const i = row + x;
+        const v = dst565[i]!;
+        const r5 = (v >> 11) & 31;
+        const g6 = (v >> 5) & 63;
+        const b5 = v & 31;
+        let r = (r5 << 3) | (r5 >> 2);
+        let g = (g6 << 2) | (g6 >> 4);
+        let b = (b5 << 3) | (b5 >> 2);
+        if (lut !== null) {
+          r = lut[r]!;
+          g = lut[g]!;
+          b = lut[b]!;
+        }
+        display[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      }
+    }
+    return;
+  }
+
+  // --- '4x4sub+4x1': pack row, then horizontal 4-tap window from the hot row.
+  if (o.reconmode === '4x4sub+4x1') {
+    // Subtract matrix is mode-forced to '4x4' (or null when dither is off —
+    // same rule as applyReconstruction4x1's ditherSub parameter).
+    const subOn = dither;
+    const rbS = DITHER_RB_POS;
+    const gS = DITHER_G_POS;
+    const xmS = 3;
+    const ymS = 3;
+    const shS = 2;
+    const md = o.rgbmaxdelta;
+    const gateOff = md.r === 0 && md.g === 0 && md.b === 0;
+    const mdR = md.r;
+    const mdG = md.g;
+    const mdB = md.b;
+    for (let y = 0; y < h; y++) {
+      packLinearRow(src, dst565, w, y, dither, rbW, gW, xmW, ymW, shW);
+      const row = y * w;
+      const ph = (y & ymS) << shS;
+      for (let x = 0; x < w; x++) {
+        const xa = x - 1 < 0 ? 0 : x - 1;
+        const xb = x;
+        const xc = x + 1 < w ? x + 1 : x;
+        const xd = x + 2 < w ? x + 2 : xc;
+        const va = dst565[row + xa]!;
+        const vb = dst565[row + xb]!;
+        const vc = dst565[row + xc]!;
+        const vd = dst565[row + xd]!;
+        const qa5 = (va >> 11) & 31;
+        const qb5 = (vb >> 11) & 31;
+        const qc5 = (vc >> 11) & 31;
+        const qd5 = (vd >> 11) & 31;
+        const qa6 = (va >> 5) & 63;
+        const qb6 = (vb >> 5) & 63;
+        const qc6 = (vc >> 5) & 63;
+        const qd6 = (vd >> 5) & 63;
+        const qaf = va & 31;
+        const qbf = vb & 31;
+        const qcf = vc & 31;
+        const qdf = vd & 31;
+        let ra = (qa5 << 3) | (qa5 >> 2);
+        let ga = (qa6 << 2) | (qa6 >> 4);
+        let ba = (qaf << 3) | (qaf >> 2);
+        let rb = (qb5 << 3) | (qb5 >> 2);
+        let gb = (qb6 << 2) | (qb6 >> 4);
+        let bb = (qbf << 3) | (qbf >> 2);
+        let rc = (qc5 << 3) | (qc5 >> 2);
+        let gc = (qc6 << 2) | (qc6 >> 4);
+        let bc = (qcf << 3) | (qcf >> 2);
+        let rd = (qd5 << 3) | (qd5 >> 2);
+        let gd = (qd6 << 2) | (qd6 >> 4);
+        let bd = (qdf << 3) | (qdf >> 2);
+        if (subOn) {
+          const sa = rbS[ph | (xa & xmS)]!;
+          const sb = rbS[ph | (xb & xmS)]!;
+          const sc = rbS[ph | (xc & xmS)]!;
+          const sd = rbS[ph | (xd & xmS)]!;
+          const ta = gS[ph | (xa & xmS)]!;
+          const tb = gS[ph | (xb & xmS)]!;
+          const tc = gS[ph | (xc & xmS)]!;
+          const td = gS[ph | (xd & xmS)]!;
+          ra = ra - sa < 0 ? 0 : ra - sa > 255 ? 255 : ra - sa;
+          ga = ga - ta < 0 ? 0 : ga - ta > 255 ? 255 : ga - ta;
+          ba = ba - sa < 0 ? 0 : ba - sa > 255 ? 255 : ba - sa;
+          rb = rb - sb < 0 ? 0 : rb - sb > 255 ? 255 : rb - sb;
+          gb = gb - tb < 0 ? 0 : gb - tb > 255 ? 255 : gb - tb;
+          bb = bb - sb < 0 ? 0 : bb - sb > 255 ? 255 : bb - sb;
+          rc = rc - sc < 0 ? 0 : rc - sc > 255 ? 255 : rc - sc;
+          gc = gc - tc < 0 ? 0 : gc - tc > 255 ? 255 : gc - tc;
+          bc = bc - sc < 0 ? 0 : bc - sc > 255 ? 255 : bc - sc;
+          rd = rd - sd < 0 ? 0 : rd - sd > 255 ? 255 : rd - sd;
+          gd = gd - td < 0 ? 0 : gd - td > 255 ? 255 : gd - td;
+          bd = bd - sd < 0 ? 0 : bd - sd > 255 ? 255 : bd - sd;
+        }
+        // Direct row-spread gate: identical to passesReconstructionThresholdRow
+        // (pack/unpack of pa..pd is lossless for 8-bit channels). Per-channel
+        // r-then-g-then-b early-out order preserved.
+        let pass = gateOff;
+        if (!pass) {
+          const rs = Math.max(ra, rb, rc, rd) - Math.min(ra, rb, rc, rd);
+          if (rs <= mdR) {
+            const gs = Math.max(ga, gb, gc, gd) - Math.min(ga, gb, gc, gd);
+            if (gs <= mdG) {
+              const bs = Math.max(ba, bb, bc, bd) - Math.min(ba, bb, bc, bd);
+              if (bs <= mdB) pass = true;
+            }
+          }
+        }
+        let r: number;
+        let g: number;
+        let b: number;
+        if (pass) {
+          r = (ra + rb + rc + rd + 2) >> 2;
+          g = (ga + gb + gc + gd + 2) >> 2;
+          b = (ba + bb + bc + bd + 2) >> 2;
+        } else {
+          r = rb;
+          g = gb;
+          b = bb;
+        }
+        if (lut !== null) {
+          r = lut[r]!;
+          g = lut[g]!;
+          b = lut[b]!;
+        }
+        display[row + x] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      }
+    }
+    return;
+  }
+
+  // --- 'legacy' unconditional 2x2 box + display gamma. Own loop in the exact
+  // accumulation shape of applyPostFilter (minimal live variables): pack one
+  // row ahead, box from the hot dst565 rows, gamma inline.
+  if (o.reconmode === 'legacy') {
+    if (h > 0) packLinearRow(src, dst565, w, 0, dither, rbW, gW, xmW, ymW, shW);
+    for (let y = 0; y < h; y++) {
+      if (y + 1 < h) packLinearRow(src, dst565, w, y + 1, dither, rbW, gW, xmW, ymW, shW);
+      const y1 = y + 1 < h ? y + 1 : y;
+      const row0 = y * w;
+      const row1 = y1 * w;
+      for (let x = 0; x < w; x++) {
+        const x1 = x + 1 < w ? x + 1 : x;
+        const a = dst565[row0 + x]!;
+        const bq = dst565[row0 + x1]!;
+        const c = dst565[row1 + x]!;
+        const dq = dst565[row1 + x1]!;
+        const ar5 = (a >> 11) & 31;
+        const br5 = (bq >> 11) & 31;
+        const cr5 = (c >> 11) & 31;
+        const dr5 = (dq >> 11) & 31;
+        const ag6 = (a >> 5) & 63;
+        const bg6 = (bq >> 5) & 63;
+        const cg6 = (c >> 5) & 63;
+        const dg6 = (dq >> 5) & 63;
+        const ab5 = a & 31;
+        const bb5 = bq & 31;
+        const cb5 = c & 31;
+        const db5 = dq & 31;
+        const rSum =
+          ((ar5 << 3) | (ar5 >> 2)) +
+          ((br5 << 3) | (br5 >> 2)) +
+          ((cr5 << 3) | (cr5 >> 2)) +
+          ((dr5 << 3) | (dr5 >> 2));
+        const gSum =
+          ((ag6 << 2) | (ag6 >> 4)) +
+          ((bg6 << 2) | (bg6 >> 4)) +
+          ((cg6 << 2) | (cg6 >> 4)) +
+          ((dg6 << 2) | (dg6 >> 4));
+        const bSum =
+          ((ab5 << 3) | (ab5 >> 2)) +
+          ((bb5 << 3) | (bb5 >> 2)) +
+          ((cb5 << 3) | (cb5 >> 2)) +
+          ((db5 << 3) | (db5 >> 2));
+        let r = (rSum + 2) >> 2;
+        let g = (gSum + 2) >> 2;
+        let b = (bSum + 2) >> 2;
+        if (lut !== null) {
+          r = lut[r]!;
+          g = lut[g]!;
+          b = lut[b]!;
+        }
+        display[row0 + x] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+      }
+    }
+    return;
+  }
+
+  // --- '2x2sub+2x2box' matched recon: subtract the mode's 2x2 pattern, then
+  // 2x2 box with edge rejection. Pack rows one ahead; reconstruct row y from
+  // the hot dst565 rows y,y1. (2x2sub is the only remaining mode here: legacy
+  // and 4x4sub returned above, and parseReconMode falls back to this default.)
+  const sub: DitherMode | null = dither ? '2x2' : null;
+  const sub2 = sub === '2x2';
+  const rbS = sub2 ? DITHER2_RB_POS : DITHER_RB_POS;
+  const gS = sub2 ? DITHER2_G_POS : DITHER_G_POS;
+  const xmS = sub2 ? 1 : 3;
+  const ymS = sub2 ? 1 : 3;
+  const shS = sub2 ? 1 : 2;
+  const subOn = sub !== null;
+  const md = o.rgbmaxdelta;
+  const gateOff = md.r === 0 && md.g === 0 && md.b === 0;
+  const mdR = md.r;
+  const mdG = md.g;
+  const mdB = md.b;
+  if (h > 0) packLinearRow(src, dst565, w, 0, dither, rbW, gW, xmW, ymW, shW);
+  for (let y = 0; y < h; y++) {
+    if (y + 1 < h) packLinearRow(src, dst565, w, y + 1, dither, rbW, gW, xmW, ymW, shW);
+    const y1 = y + 1 < h ? y + 1 : y;
+    const ph0 = (y & ymS) << shS;
+    const ph1 = (y1 & ymS) << shS;
+    const row0 = y * w;
+    const row1 = y1 * w;
+    for (let x = 0; x < w; x++) {
+      const x1 = x + 1 < w ? x + 1 : x;
+      const v00 = dst565[row0 + x]!;
+      const v10 = dst565[row0 + x1]!;
+      const v01 = dst565[row1 + x]!;
+      const v11 = dst565[row1 + x1]!;
+      const q00 = (v00 >> 11) & 31;
+      const q10 = (v10 >> 11) & 31;
+      const q01 = (v01 >> 11) & 31;
+      const q11 = (v11 >> 11) & 31;
+      const s00 = (v00 >> 5) & 63;
+      const s10 = (v10 >> 5) & 63;
+      const s01 = (v01 >> 5) & 63;
+      const s11 = (v11 >> 5) & 63;
+      const u00 = v00 & 31;
+      const u10 = v10 & 31;
+      const u01 = v01 & 31;
+      const u11 = v11 & 31;
+      let r0 = (q00 << 3) | (q00 >> 2);
+      let g0 = (s00 << 2) | (s00 >> 4);
+      let b0 = (u00 << 3) | (u00 >> 2);
+      let r1 = (q10 << 3) | (q10 >> 2);
+      let g1 = (s10 << 2) | (s10 >> 4);
+      let b1 = (u10 << 3) | (u10 >> 2);
+      let r2 = (q01 << 3) | (q01 >> 2);
+      let g2 = (s01 << 2) | (s01 >> 4);
+      let b2 = (u01 << 3) | (u01 >> 2);
+      let r3 = (q11 << 3) | (q11 >> 2);
+      let g3 = (s11 << 2) | (s11 >> 4);
+      let b3 = (u11 << 3) | (u11 >> 2);
+      if (subOn) {
+        const d00 = rbS[ph0 | (x & xmS)]!;
+        const d10 = rbS[ph0 | (x1 & xmS)]!;
+        const d01 = rbS[ph1 | (x & xmS)]!;
+        const d11 = rbS[ph1 | (x1 & xmS)]!;
+        const e00 = gS[ph0 | (x & xmS)]!;
+        const e10 = gS[ph0 | (x1 & xmS)]!;
+        const e01 = gS[ph1 | (x & xmS)]!;
+        const e11 = gS[ph1 | (x1 & xmS)]!;
+        r0 = r0 - d00 < 0 ? 0 : r0 - d00 > 255 ? 255 : r0 - d00;
+        g0 = g0 - e00 < 0 ? 0 : g0 - e00 > 255 ? 255 : g0 - e00;
+        b0 = b0 - d00 < 0 ? 0 : b0 - d00 > 255 ? 255 : b0 - d00;
+        r1 = r1 - d10 < 0 ? 0 : r1 - d10 > 255 ? 255 : r1 - d10;
+        g1 = g1 - e10 < 0 ? 0 : g1 - e10 > 255 ? 255 : g1 - e10;
+        b1 = b1 - d10 < 0 ? 0 : b1 - d10 > 255 ? 255 : b1 - d10;
+        r2 = r2 - d01 < 0 ? 0 : r2 - d01 > 255 ? 255 : r2 - d01;
+        g2 = g2 - e01 < 0 ? 0 : g2 - e01 > 255 ? 255 : g2 - e01;
+        b2 = b2 - d01 < 0 ? 0 : b2 - d01 > 255 ? 255 : b2 - d01;
+        r3 = r3 - d11 < 0 ? 0 : r3 - d11 > 255 ? 255 : r3 - d11;
+        g3 = g3 - e11 < 0 ? 0 : g3 - e11 > 255 ? 255 : g3 - e11;
+        b3 = b3 - d11 < 0 ? 0 : b3 - d11 > 255 ? 255 : b3 - d11;
+      }
+      // Direct 2x2-spread gate: identical to passesReconstructionThreshold
+      // (packing p00..p11 then re-extracting is lossless). Unconditional box
+      // when all thresholds are zero.
+      let r: number;
+      let g: number;
+      let b: number;
+      if (gateOff) {
+        r = (r0 + r1 + r2 + r3 + 2) >> 2;
+        g = (g0 + g1 + g2 + g3 + 2) >> 2;
+        b = (b0 + b1 + b2 + b3 + 2) >> 2;
+      } else {
+        const rs = Math.max(r0, r1, r2, r3) - Math.min(r0, r1, r2, r3);
+        if (rs > mdR) {
+          r = r0;
+          g = g0;
+          b = b0;
+        } else {
+          const gs = Math.max(g0, g1, g2, g3) - Math.min(g0, g1, g2, g3);
+          if (gs > mdG) {
+            r = r0;
+            g = g0;
+            b = b0;
+          } else {
+            const bs = Math.max(b0, b1, b2, b3) - Math.min(b0, b1, b2, b3);
+            if (bs > mdB) {
+              r = r0;
+              g = g0;
+              b = b0;
+            } else {
+              r = (r0 + r1 + r2 + r3 + 2) >> 2;
+              g = (g0 + g1 + g2 + g3 + 2) >> 2;
+              b = (b0 + b1 + b2 + b3 + 2) >> 2;
+            }
+          }
+        }
+      }
+      if (lut !== null) {
+        r = lut[r]!;
+        g = lut[g]!;
+        b = lut[b]!;
+      }
+      display[row0 + x] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+    }
+  }
+}
 
 /**
  * Quantise stored 1/z depth to `bits` bits (vd_zbits, default 16):

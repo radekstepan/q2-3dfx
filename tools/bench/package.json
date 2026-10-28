@@ -12,7 +12,8 @@
     "test": "vitest run --passWithNoTests",
     "golden": "echo golden-ok",
     "bench": "echo bench-ok",
-    "bench:frame": "node ./frame-bench.mjs"
+    "bench:frame": "node ./frame-bench.mjs",
+    "bench:rgb": "node ./rgb-attr.mjs"
   },
   "dependencies": {
     "@q2/bsp": "workspace:*",
@@ -21,6 +22,7 @@
     "@q2/renderer-api": "workspace:*",
     "@q2/sw-renderer": "workspace:*",
     "@q2/testkit": "workspace:*",
+    "@q2/voodoo": "workspace:*",
     "web": "workspace:*",
     "@q2/input": "workspace:*"
   },

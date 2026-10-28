@@ -6,7 +6,7 @@
 import type {
   Entity, Framebuffer, FrameStats, Model, ModelHandle, RefDef, Refresh, TextureHandle, WorldModel,
 } from '@q2/renderer-api';
-import { Com_Error, getCVarNumber } from '@q2/config';
+import { Com_Error, getCVarNumber, registerCVar } from '@q2/config';
 import type { MiniLightmap } from './worldNodes.js';import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, buildRGBLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
 import { SurfaceCache, hashLightStyles, RGBLightCache, type RGBCachedBlock, type SurfaceBlock } from './surfaceCache.js';
 import { setupCamera, setupCameraInto, culledByFlatFrustum, type Camera } from './camera.js';
@@ -85,6 +85,37 @@ export function setRGBWorldEnabled(on: boolean): void {
 /** Observability hook for the RGB world flag (default false). */
 export function isRGBWorldEnabled(): boolean {
   return rgbWorldEnabled;
+}
+
+/**
+ * Cvar gating the PERF-2 B classic-skip (default 0 = classic world spanfill
+ * always runs). When set to 1, world-surface batches that also draw an RGB
+ * overlay skip the classic indexed drawSpans call (sky-flat and opaque /
+ * turbulent world batches only — the only call sites an RGB material can
+ * cover; translucent/foreground classic draws always run).
+ *
+ * NOT airtight — left OFF unless an operator explicitly opts in:
+ * - seedRGBBackground expands the classic idx plane for every UNCOVERED
+ *   pixel, so skipping classic writes is only valid where RGB cover is 1;
+ * - RGB window-Z (Uint16, quantised, LESS-wins) and classic zb (float iz,
+ *   strict-greater) are different precisions/orderings, so RGB coverage does
+ *   not prove the classic write would have won — foreground classic depth
+ *   tests (alias/sprites/particles/tracers/translucent blend reads) still
+ *   consume the classic planes;
+ * - the screen-door stipple path (sw_stipplealpha) reads idx and has no RGB
+ *   equivalent, and frame stats intentionally track the classic path.
+ * With the default 0 the renderer is bit-identical with the flag existing.
+ */
+export const SW_RGB_SKIP_CLASSIC_CVAR = 'sw_rgb_skip_classic';
+
+/** True when the operator explicitly enabled the PERF-2 B classic skip. */
+export function skipClassicRequested(): boolean {
+  try {
+    registerCVar(SW_RGB_SKIP_CLASSIC_CVAR, 0, 'skip classic world spanfill where the RGB overlay drew (PERF-2 B, default 0 = off, proof not airtight)');
+    return getCVarNumber(SW_RGB_SKIP_CLASSIC_CVAR) !== 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1448,6 +1479,10 @@ export class SoftwareRenderer implements Refresh {
     // r_translucency = 0 collapses to one loop with translucent surfaces
     // drawn opaque (pre-port behaviour).
     const tMode = translucencyModeFromCvars();
+    // PERF-2 B: operator-gated classic skip (default off — see
+    // SW_RGB_SKIP_CLASSIC_CVAR). Read once per frame like the translucency
+    // mode; applies only where an RGB material is drawn (below).
+    const skipClassicWorld = skipClassicRequested();
     if (this.alphaDeferredSi.length < nvis) {
       this.alphaDeferredSi = new Int32Array(Math.max(16, nvis));
       this.alphaDeferredOrd = new Int32Array(Math.max(16, nvis));
@@ -1551,7 +1586,12 @@ export class SoftwareRenderer implements Refresh {
         sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
         if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = endCount;
-        this.backend.drawSpans(this.spanList, texView, lightView);
+        // PERF-2 B: skip the redundant classic fill only when gated on AND
+        // the RGB overlay drew this batch (proof not airtight — default off,
+        // classic always runs; see SW_RGB_SKIP_CLASSIC_CVAR).
+        if (!(skipClassicWorld && this.rgbOverlayActive())) {
+          this.backend.drawSpans(this.spanList, texView, lightView);
+        }
         if (this.rgbOverlayActive()) {
           this.drawRGBSpans(this.spanList, this.rgbMaterialForFlatSky());
         }
@@ -1664,11 +1704,15 @@ export class SoftwareRenderer implements Refresh {
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
-      // Classic draw always (software planes bit-identical with the flag
-      // on or off); the RGB overlay composites over it in endFrame. Frame
-      // stats intentionally track the classic path only, so numbers stay
-      // comparable across the flag.
-      this.backend.drawSpans(this.spanList, tex, lb);
+      // Classic draw always with the default flag (software planes
+      // bit-identical with the flag on or off); the RGB overlay composites
+      // over it in endFrame. Frame stats intentionally track the classic
+      // path only, so numbers stay comparable across the flag. PERF-2 B:
+      // the gated skip below elides this call only where an RGB material
+      // drew (default off — see SW_RGB_SKIP_CLASSIC_CVAR).
+      if (!(skipClassicWorld && rgbMat)) {
+        this.backend.drawSpans(this.spanList, tex, lb);
+      }
       if (rgbMat) {
         this.drawRGBSpans(this.spanList, rgbMat);
       }
@@ -2125,27 +2169,49 @@ export class SoftwareRenderer implements Refresh {
       // image. Skipped while disabled, so classic output is untouched.
       if (this.rgbUsedThisFrame) this.compositeRGB();
     } else {
-      // palette expand to 0xAABBGGRR (classic / wasm / banded-inline paths)
+      // Palette expand to 0xAABBGGRR (classic / wasm / banded-inline paths).
+      // PERF-2 C fused single pass: pixels the RGB overlay covered expand
+      // from the packed RGB565 authority plane (top-bit replication into
+      // the resolve scratch, exactly like compositeRGB below), everything
+      // else from the indexed plane. Disjoint pixel sets, no cross-pixel
+      // dependencies: bit-identical to expand-then-composite, minus one
+      // full-frame idx+color read/write pass. Skipped cover branch while
+      // disabled, so classic output is untouched.
       const pal = this.palette;
       const n = this.fbW * this.fbH;
-      for (let i = 0; i < n; i++) {
-        const c = this.idx[i]! * 3;
-        const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
-        this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
+      if (!this.rgbUsedThisFrame) {
+        for (let i = 0; i < n; i++) {
+          const c = this.idx[i]! * 3;
+          const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
+          this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
+        }
+      } else {
+        const q = this.rgb565, cover = this.rgbCover, rgb = this.rgbColor;
+        for (let i = 0; i < n; i++) {
+          if (cover[i]) {
+            const v = q[i]!;
+            const r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
+            rgb[i] = (0xff000000 |
+              ((((b5 << 3) | (b5 >> 2)) << 16) |
+                (((g6 << 2) | (g6 >> 4)) << 8) |
+                ((r5 << 3) | (r5 >> 2)))) >>> 0;
+            this.color[i] = rgb[i]!;
+          } else {
+            const c = this.idx[i]! * 3;
+            const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
+            this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
+          }
+        }
       }
-      // RGB composite: pixels any RGB draw wrote this frame expand from
-      // the packed RGB565 authority plane (opaque world, water, sky, glass,
-      // alias, sprites, particles, beams); everything else keeps the indexed
-      // resolve. Skipped while disabled, so classic output is untouched.
-      if (this.rgbUsedThisFrame) this.compositeRGB();
     }
     this.mirrorIndexPlane();
   }
 
   /**
    * Merge the RGB overlay over the resolved color plane wherever the
-   * coverage mask is set (the single global reconstruct for every backend:
-   * serial, banded-inline and pooled all funnel here). The source is the
+   * coverage mask is set (the single global reconstruct for the pooled
+   * backend; the serial/banded-inline paths fuse the identical math into
+   * the endFrame expand pass in one scan — see there). The source is the
    * packed RGB565 authority plane, expanded to 8:8:8 into the resolve
    * scratch (5/6-bit upscale replicates the top bits into the low bits).
    */
@@ -2452,6 +2518,9 @@ export class SoftwareRenderer implements Refresh {
   private emitSkyBox(cam: Camera, order: number, acc: { spans: number; max: number }): void {
     const sky = this.skyTex!;
     const tileH = sky.height / 6;
+    // PERF-2 B: read the gated classic skip once per skybox (up to 6 face
+    // batches below; see SW_RGB_SKIP_CLASSIC_CVAR — default off).
+    const skipClassicSky = skipClassicRequested();
     texView.width = sky.width;
     texView.height = sky.height;
     texView.texels = sky.texels;
@@ -2496,12 +2565,14 @@ export class SoftwareRenderer implements Refresh {
       }
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       this.spanList.count = endCount;
-      this.backend.drawSpans(this.spanList, texView, lightView);
-      if (this.rgbOverlayActive()) {
-        const skyMat = this.rgbMaterialForSky();
-        if (skyMat) {
-          this.drawRGBSpans(this.spanList, skyMat);
-        }
+      // Gated PERF-2 B skip (default off): elide the classic face fill only
+      // where the RGB sky material drew.
+      const skyMat = this.rgbOverlayActive() ? this.rgbMaterialForSky() : null;
+      if (!(skipClassicSky && skyMat)) {
+        this.backend.drawSpans(this.spanList, texView, lightView);
+      }
+      if (skyMat) {
+        this.drawRGBSpans(this.spanList, skyMat);
       }
       this.spanList.count = 0;
       const batch = endCount - start;

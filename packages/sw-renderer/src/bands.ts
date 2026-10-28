@@ -14,8 +14,8 @@
 
 import { Com_Error, getCVarNumber, registerCVar } from '@q2/config';
 import {
-  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SoftwareBackend, RGBWorldBackend,
-  buildTurbTable, drawSpansSoftware, drawSpansTurbulent, drawSpansFlatPerSpan,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SUBDIV, SoftwareBackend, RGBWorldBackend,
+  buildTurbTable,
   runSubdiv16, runSubdivTurbulent, runSpanFlat, sampleLightBlock, textureMasks,
   type LightBlock, type RasterBackend, type RGBMaterial, type RGBWindow, type Span, type SpanList, type Texture,
 } from './spans.js';
@@ -996,7 +996,7 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
     resolveBand(color, palette, this.idx, 0, this.fbH, this.fbW, this.fbH);
   }
 
-  /** Inline chunked spanfill with the lazy-clear guard (shared fallback). */
+  /** Inline single-pass spanfill (PERF-2 A fused core). */
   private runInline(list: SpanList, tex: Texture, light: LightBlock): void {
 
     if (this.dispatcher) {
@@ -1007,31 +1007,86 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
         this.clearedFrame = f;
       }
     }
-    // Inline banded: partition each chunk by row band, reuse the reference
-    // loops. Zero allocation (scratch + bandList are backend-owned).
+    // Single kind-dispatched scan over the batch: replaces the old band
+    // pre-filter scan plus the opaque/turbulent/flat triple scan per band.
+    // Per-span setup mirrors
+    // drawSpansSoftware/drawSpansTurbulent/drawSpansFlatPerSpan op-for-op
+    // (clip, light resolve, skip-adjusted perspective start, 16-px
+    // subdivision chain), so output is identical for the homogeneous
+    // per-surface batches the frame loop emits, and matches the pooled
+    // rasterizePackedRange list order otherwise. Bands need no partition
+    // here: planes are shared, writes are depth-guarded, and spans on one
+    // row keep list order exactly like the per-band filtered path.
+    const idx = this.idx, zb = this.zb, fbW = this.fbW, fbH = this.fbH;
+    const colormap = this.colormap;
+    const texels = tex.texels;
+    const { wshift, wmask, hmask } = textureMasks(tex);
+    const turbTable = this.turbTable;
+    const tmask = turbTable.length - 1;
+    const phase = ((this.time * 64) | 0) & tmask;
     const spans = list.spans;
     const total = list.count < spans.length ? list.count : spans.length;
-    const nb = this.bands.length;
-    let base = 0;
-    while (base < total) {
-      const end = Math.min(total, base + BAND_CHUNK);
-      for (let b = 0; b < nb; b++) {
-        const band = this.bands[b]!;
-        let m = 0;
-        for (let i = base; i < end; i++) {
-          const s = spans[i]!;
-          if (s.y >= band.y0 && s.y < band.y1) this.scratch[m++] = s;
-        }
-        if (m === 0) continue;
-        this.bandList.count = m;
-        const a = drawSpansSoftware(this.idx, this.zb, this.fbW, this.fbH, this.bandList, tex, light, this.colormap);
-        const t = drawSpansTurbulent(this.idx, this.zb, this.fbW, this.fbH, this.bandList, tex, this.colormap, this.turbTable, this.time);
-        const f = drawSpansFlatPerSpan(this.idx, this.zb, this.fbW, this.fbH, this.bandList);
-        this.spansDrawn += a.spans + t.spans + f.spans;
-        this.pixelsDrawn += a.pixels + t.pixels + f.pixels;
+    let pixels = 0;
+    let drawn = 0;
+    for (let si = 0; si < total; si++) {
+      const s = spans[si]!;
+      const kind = s.kind;
+      if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT && kind !== SPAN_FLAT) continue;
+      if (s.y < 0 || s.y >= fbH) continue;
+      let x0 = s.x0, x1 = s.x1;
+      if (x0 < 0) x0 = 0;
+      if (x1 > fbW) x1 = fbW;
+      const count = x1 - x0;
+      if (count <= 0) continue;
+      if (kind === SPAN_FLAT) {
+        // Flat fill mirrors drawSpansFlatPerSpan (sky index in s.light).
+        runSpanFlat(idx, zb, s.y * fbW + x0, count, s.iz + s.diz * (x0 - s.x0), s.diz, s.light & 255);
+        pixels += count;
+        drawn++;
+        continue;
       }
-      base = end;
+      const skip = x0 - s.x0;
+      let iz = s.iz + s.diz * skip;
+      let uz = s.uz + s.duz * skip;
+      let vz = s.vz + s.dvz * skip;
+      let u0 = uz / iz, v0 = vz / iz;
+      let o = s.y * fbW + x0;
+      let remaining = count;
+      if (kind === SPAN_OPAQUE) {
+        let lz = s.light, dlz = s.dlight;
+        if (s.lv >= 0) {
+          const l0 = sampleLightBlock(light, s.lu, s.lv);
+          const l1 = sampleLightBlock(light, s.lu + s.dlu * count, s.lv);
+          lz = l0;
+          dlz = (l1 - l0) / count;
+        }
+        while (remaining > 0) {
+          const m = remaining >= SUBDIV ? SUBDIV : remaining;
+          const r = runSubdiv16(idx, zb, o, m, iz, s.diz, uz, s.duz, vz, s.dvz,
+            u0, v0, lz, dlz, texels, wshift, wmask, hmask, colormap);
+          iz = r.iz; lz = r.light;
+          uz += s.duz * m; vz += s.dvz * m;
+          u0 = r.u1; v0 = r.v1;
+          o += m; remaining -= m;
+        }
+      } else {
+        let lz = s.light;
+        const tphase = (phase + s.turb) & tmask;
+        while (remaining > 0) {
+          const m = remaining >= SUBDIV ? SUBDIV : remaining;
+          const r = runSubdivTurbulent(idx, zb, o, m, iz, s.diz, uz, s.duz, vz, s.dvz,
+            u0, v0, lz, s.dlight, texels, wshift, wmask, hmask, colormap, turbTable, tphase);
+          iz = r.iz; lz = r.light;
+          uz += s.duz * m; vz += s.dvz * m;
+          u0 = r.u1; v0 = r.v1;
+          o += m; remaining -= m;
+        }
+      }
+      pixels += count;
+      drawn++;
     }
+    this.spansDrawn += drawn;
+    this.pixelsDrawn += pixels;
     this.bandList.count = 0;
   }
 
@@ -1047,41 +1102,36 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
   }
 
   /**
-   * RGB span pass over the bands (perf-2 lane): partitions each chunk by row
-   * band and routes it through the same monomorphic RGB loop as the serial
-   * path. Absolute screen coords are preserved (s.y rides the span, x runs
-   * from the absolute x0), so the Bayer mip-dither phase and band-seam rows
-   * are bit-identical to serial. Bands are disjoint rows; opaque writes are
-   * depth-guarded and blend writes never cross a band boundary, so chunk and
-   * band order cannot affect any pixel. Runs inline on the calling thread
-   * (workers only handle the indexed planes); the single global composite in
-   * endFrame merges the planes afterwards. Zero allocation (scratch +
-   * bandList are backend-owned, shared with runInline, never re-entered).
+   * RGB span pass over the bands (perf-2 lane): one kind-dispatched scan per
+   * band through the same monomorphic RGB loop as the serial path (the row
+   * range rides the call — no pre-filter scan). Absolute screen coords are
+   * preserved (s.y rides the span, x runs from the absolute x0), so the
+   * Bayer mip-dither phase and band-seam rows are bit-identical to serial.
+   * Bands are disjoint rows; opaque writes are depth-guarded and blend
+   * writes never cross a band boundary, so band order cannot affect any
+   * pixel. Runs inline on the calling thread (workers only handle the
+   * indexed planes); the single global composite in endFrame merges the
+   * planes afterwards. Zero allocation.
    */
   drawSpansRGB(list: SpanList, mat: RGBMaterial, win?: RGBWindow | null): void {
     if (this.bandCount <= 1 || this.fbH <= 0) {
       this.rgb.drawSpansRGB(list, mat, win ?? null);
       return;
     }
-    const spans = list.spans;
-    const total = list.count < spans.length ? list.count : spans.length;
-    const nb = this.bands.length;
-    let base = 0;
-    while (base < total) {
-      const end = Math.min(total, base + BAND_CHUNK);
-      for (let b = 0; b < nb; b++) {
-        const band = this.bands[b]!;
-        let m = 0;
-        for (let i = base; i < end; i++) {
-          const s = spans[i]!;
-          if (s.y >= band.y0 && s.y < band.y1) this.scratch[m++] = s;
-        }
-        if (m === 0) continue;
-        this.bandList.count = m;
-        this.rgb.drawSpansRGB(this.bandList, mat, win ?? null);
-      }
-      base += end;
+    // One kind-dispatched scan per band (PERF-2 A): the y-range rides the
+    // call, so each band's pass both filters and draws — no pre-filter
+    // scan plus second dispatch scan. Absolute screen coords are preserved
+    // (s.y rides the span, x runs from the absolute x0), so the Bayer
+    // mip-dither phase and band-seam rows are bit-identical to serial.
+    // Bands are disjoint rows; opaque writes are depth-guarded and blend
+    // writes never cross a band boundary, so band order cannot affect any
+    // pixel. Runs inline on the calling thread (workers only handle the
+    // indexed planes); the single global composite in endFrame merges the
+    // planes afterwards. Zero allocation.
+    const w = win ?? null;
+    for (let b = 0; b < this.bands.length; b++) {
+      const band = this.bands[b]!;
+      this.rgb.drawSpansRGB(list, mat, w, band.y0, band.y1);
     }
-    this.bandList.count = 0;
   }
 }

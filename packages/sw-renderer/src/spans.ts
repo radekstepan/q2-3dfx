@@ -1079,6 +1079,50 @@ export function windowDepthQ16FromIz(iz: number, near: number, far: number, bits
   return windowDepthQ16(windowDepth01(iz, near, far), bits);
 }
 
+// --- Window-Z constant memo (PERF-2 C) ---
+//
+// The four RGB span loops (repeat/clamp/generic/flat) derive the same three
+// values from (win, zbits) once per 16-px subdivision: the projection
+// mapping winA/winB (2 divisions) and the zbits-validity flag. The window
+// is frame-constant and zbits batch-constant, so a subdivision almost always
+// recomputes identical doubles. The memo below hoists that derivation out
+// of the subdiv call: same inputs -> bitwise-identical outputs, one call
+// replaced by three float compares on the hot path. Module scratch only,
+// no allocation; single-threaded RGB use (workers handle indexed planes),
+// so no cross-thread staleness. Keyed on the EXACT derivation inputs,
+// including the near/far defaulting rules (null win, near <= 0).
+let _wcNear = 0;
+let _wcFar = 0;
+let _wcZbits = -1;
+let _wcA = 0;
+let _wcB = 0;
+let _wcOff = false;
+
+/**
+ * Refresh the window-Z memo for (win, zbits) and return nothing; read the
+ * results from the module scratch via winMemoA/B/Off. The derivation is
+ * op-for-op the loop prologue it replaces (same defaults, same flops).
+ */
+function winMemoSync(win: RGBWindow | null | undefined, zbits: number): void {
+  const n = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
+  const f = win !== null && win !== undefined && win.far > n ? win.far : DEFAULT_RGB_FAR;
+  if (n !== _wcNear || f !== _wcFar || zbits !== _wcZbits) {
+    _wcNear = n;
+    _wcFar = f;
+    _wcZbits = zbits;
+    _wcA = f / (f - n);
+    _wcB = (f * n) / (f - n);
+    _wcOff = !Number.isInteger(zbits) || zbits < 1 || zbits > 23;
+  }
+}
+
+/** Test hook: reset the window-Z memo (forces re-derivation on next sync). */
+export function testResetWinMemo(): void {
+  _wcNear = 0;
+  _wcFar = 0;
+  _wcZbits = -1;
+}
+
 /** Scratch for 565 expand/blend (module-scope, never the per-pixel alloc). */
 const _qExpand = new Uint8Array(3);
 
@@ -1456,12 +1500,13 @@ export function runSubdivRGBRepeat(
   // Window-Z depth (Voodoo3 hardware model): per-fragment depth01 from the
   // projection window, quantised to mat.zbits steps (0 = full-precision
   // float compare, legacy escape hatch). Integer LESS, ties keep stored.
-  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
-  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
-  const winA = winF / (winF - winN);
-  const winB = (winF * winN) / (winF - winN);
+  // PERF-2: winA/winB/zOff come from the memo (same derivation, hoisted out
+  // of the subdiv call — bitwise-identical for identical inputs).
+  winMemoSync(win, mat.zbits);
+  const winA = _wcA;
+  const winB = _wcB;
   const zbw = mat.zbits;
-  const zOff = !Number.isInteger(zbw) || zbw < 1 || zbw > 23;
+  const zOff = _wcOff;
   const z1 = 1 / (iz + diz * n);
   const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
   let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
@@ -1721,12 +1766,12 @@ export function runSubdivRGBClamp(
   // Window-Z depth (Voodoo3 hardware model): per-fragment depth01 from the
   // projection window, quantised to mat.zbits steps (0 = full-precision
   // float compare, legacy escape hatch). Integer LESS, ties keep stored.
-  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
-  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
-  const winA = winF / (winF - winN);
-  const winB = (winF * winN) / (winF - winN);
+  // PERF-2: memoised (see runSubdivRGBRepeat).
+  winMemoSync(win, mat.zbits);
+  const winA = _wcA;
+  const winB = _wcB;
   const zbw = mat.zbits;
-  const zOff = !Number.isInteger(zbw) || zbw < 1 || zbw > 23;
+  const zOff = _wcOff;
   const z1 = 1 / (iz + diz * n);
   const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
   let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
@@ -1948,12 +1993,12 @@ export function runSubdivRGBGeneric(
   // Window-Z depth (Voodoo3 hardware model): per-fragment depth01 from the
   // projection window, quantised to mat.zbits steps (0 = full-precision
   // float compare, legacy escape hatch). Integer LESS, ties keep stored.
-  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
-  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
-  const winA = winF / (winF - winN);
-  const winB = (winF * winN) / (winF - winN);
+  // PERF-2: memoised (see runSubdivRGBRepeat).
+  winMemoSync(win, mat.zbits);
+  const winA = _wcA;
+  const winB = _wcB;
   const zbw = mat.zbits;
-  const zOff = !Number.isInteger(zbw) || zbw < 1 || zbw > 23;
+  const zOff = _wcOff;
   const wrapS = mat.addressS === 'repeat';
   const wrapT = mat.addressT === 'repeat';
   const writeDepth = blend === 'opaque' ? mat.depthWrite : false;
@@ -2134,11 +2179,11 @@ export function runSpanFlatRGB(
   win?: RGBWindow | null,
   zbits = 0,
 ): number {
-  const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
-  const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
-  const winA = winF / (winF - winN);
-  const winB = (winF * winN) / (winF - winN);
-  const zOff = !Number.isInteger(zbits) || zbits < 1 || zbits > 23;
+  // PERF-2: window derivation memoised (see runSubdivRGBRepeat).
+  winMemoSync(win, zbits);
+  const winA = _wcA;
+  const winB = _wcB;
+  const zOff = _wcOff;
   const q = packRGB565(r, g, b);
   let z = iz;
   for (let i = 0, o = o0; i < n; i++, o++) {
@@ -2207,6 +2252,16 @@ export function drawSpansRGB(
   win?: RGBWindow | null,
   dudy?: number,
   dvdy?: number,
+  /**
+   * Optional row-band restriction [yLo, yHi) (PERF-2 A): the banded backend
+   * passes its band so one scan both filters and draws (no pre-filter scan
+   * + second dispatch scan). Omitted (serial path) the range is the whole
+   * frame, which reproduces the original `s.y < 0 || s.y >= fbH` guard
+   * exactly. Bands are subsets of [0, fbH), so in-band spans keep the
+   * identical guard outcome and out-of-band spans are skipped either way.
+   */
+  yLo?: number,
+  yHi?: number,
 ): { pixels: number; spans: number } {
   const blend = mat.blend;
   if (blend !== 'opaque' && blend !== 'alpha' && blend !== 'additive') {
@@ -2221,6 +2276,8 @@ export function drawSpansRGB(
   const alphaQ = Math.round(mat.alpha * 256);
   const spans = list.spans;
   const n = list.count < spans.length ? list.count : spans.length;
+  const yA = yLo ?? 0;
+  const yB = yHi ?? fbH;
   let pixels = 0;
   let drawn = 0;
   for (let si = 0; si < n; si++) {
@@ -2230,7 +2287,7 @@ export function drawSpansRGB(
       kind !== SPAN_TRANS33 && kind !== SPAN_TRANS66 && kind !== SPAN_FLAT) {
       Com_Error('error', 'drawSpansRGB: unsupported span kind (step-3 coverage pending)');
     }
-    if (s.y < 0 || s.y >= fbH) continue;
+    if (s.y < yA || s.y >= yB) continue;
     let x0 = s.x0, x1 = s.x1;
     if (x0 < 0) x0 = 0;
     if (x1 > fbW) x1 = fbW;
@@ -2381,9 +2438,10 @@ export class RGBWorldBackend {
   }
 
   /** RGB world/effect pass (counts mirror SoftwareBackend accounting). */
-  drawSpansRGB(list: SpanList, mat: RGBMaterial, win?: RGBWindow | null): { pixels: number; spans: number } {
+  drawSpansRGB(list: SpanList, mat: RGBMaterial, win?: RGBWindow | null, yLo?: number, yHi?: number): { pixels: number; spans: number } {
     const r = drawSpansRGB(
       this.rgb565, this.cover, this.rgbDepth, this.fbW, this.fbH, list, mat, win ?? this.win,
+      undefined, undefined, yLo, yHi,
     );
     this.spansDrawn += r.spans;
     this.pixelsDrawn += r.pixels;

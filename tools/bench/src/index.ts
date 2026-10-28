@@ -16,6 +16,12 @@ export {
   swRendererEsmPath, BASE1_VIEWS,
   type AttribView, type FrameWorld, type PhaseRow, type PoolRow,
 } from './frame.js';
+export {
+  runRgbAttr, loadRgbAttrWorld, pinPerfCvars, fixedEntities,
+  RGB_ATTR_RESS, RGB_ATTR_SCENES,
+  type RgbAttrScene, type RgbAttrEntities, type RgbAttrMode,
+  type RgbAttrWorld, type RgbAttrOptions, type AttrRow,
+} from './rgbattr.js';
 export { playBench, type PlayBenchRow } from './playbench.js';
 
 export async function runBenchTool(opts: BenchOptions = {}): Promise<string> {

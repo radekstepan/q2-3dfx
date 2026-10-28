@@ -18,7 +18,7 @@ export {
   rgbModulate, expandPaletteRGB, buildRGBMaterial, buildRGBChain,
   quantiseIz, quantiseIzInt,
   packRGB565, expandRGB565, rgbBlendPixel565,
-  windowDepth01, windowDepthQ16, windowDepthQ16FromIz,
+  windowDepth01, windowDepthQ16, windowDepthQ16FromIz, testResetWinMemo,
   DEFAULT_RGB_NEAR, DEFAULT_RGB_FAR, DEFAULT_RGB_WINDOW,
   rgbWrapCoord, rgbBlendPixel,
   runSubdivRGBRepeat, runSubdivRGBClamp, runSubdivRGBGeneric, runSpanFlatRGB,
@@ -129,6 +129,7 @@ export {
 export {
   SoftwareRenderer, sortBatchByRow, nextPot, MAX_SPANS,
   setRGBWorldEnabled, isRGBWorldEnabled,
+  SW_RGB_SKIP_CLASSIC_CVAR, skipClassicRequested,
   readRGBFidelity, sameRGBFidelity,
   ALIAS_LOD_BIAS_DELTA,
   type RGBFidelity,

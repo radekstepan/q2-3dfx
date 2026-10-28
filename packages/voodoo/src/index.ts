@@ -17,7 +17,7 @@ export * from './resolve.js';
 export * from './sampler.js';
 export * from './upload.js';
 
-import { applyDisplayGamma, applyPostFilter, applyReconstruction2x2, applyReconstruction4x1, expandRGB565, parseDitherMode, parseReconMode, parseRgbMaxDelta, quantiseDepth, resolveRGB565, resolveRGB888 } from './resolve.js';
+import { parseDitherMode, parseReconMode, parseRgbMaxDelta, quantiseDepth, resolveFusedFrame, resolveRGB565, resolveRGB888 } from './resolve.js';
 import { applyFog, capTextureSize, modulateLightmap, samplePalette, sampleRGBTexture } from './sampler.js';
 import type { DitherMode, ReconMode, RgbMaxDelta } from './resolve.js';
 
@@ -128,33 +128,24 @@ export function resolveFrame(
   // dither+quant, reconstruct/box, display gamma. The 'legacy' alias below
   // keeps the unconditional 2x2 box (no subtraction) with the same
   // linear-pack + display-gamma placement.
-  resolveRGB565(src, dst565, w, h, { gamma: 1, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
-  if (display === null) return;
-  // MATCHED RECON ENFORCEMENT: the subtract matrix is forced by the recon
-  // MODE, never by st.dithermode (the write matrix). A mismatch — e.g.
-  // dithermode '2x2' writes under '4x4sub+4x1' scanout — still subtracts the
-  // mode's pattern ('4x4' here): the scanout filter is programmed for the
-  // mode's pattern regardless of the write matrix, so the mismatch is
-  // tolerated deterministically, not an error. vd_dither=0 means no pattern
-  // was added, so subtract is null (subtracting one would corrupt).
-  // The 'legacy' alias keeps the unconditional 2x2 box (no subtraction,
-  // no edge rejection) with the same linear-pack + display-gamma placement.
-  if (!st.postfilter) {
-    // Direct-view path: linear pack -> expand -> display gamma.
-    const n = w * h;
-    for (let i = 0; i < n; i++) display[i] = expandRGB565(dst565[i]!);
-  } else if (st.reconmode === 'legacy') {
-    applyPostFilter(dst565, display, w, h);
-  } else if (st.reconmode === '2x2sub+2x2box') {
-    applyReconstruction2x2(dst565, display, w, h, st.rgbmaxdelta, st.dither ? '2x2' : null);
-  } else {
-    // '4x4sub+4x1' (parseReconMode falls back to '2x2sub+2x2box', handled
-    // above — any other non-legacy value reaching here is the 4x1 mode).
-    applyReconstruction4x1(dst565, display, w, h, st.rgbmaxdelta, st.dither ? '4x4' : null);
+  //
+  // PERF-3: the pack→recon→gamma chain runs fused (resolveFusedFrame):
+  // pack rows into dst565 on demand, reconstruct from the hot rows, gamma
+  // LUT inline. Byte-identical to the manual 3-pass pipeline (pinned by
+  // src/fused.test.ts); the stage functions above stay as the oracle.
+  if (display === null) {
+    resolveRGB565(src, dst565, w, h, { gamma: 1, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
+    return;
   }
-  applyDisplayGamma(display, w, h, st.gamma);
+  resolveFusedFrame(src, dst565, display, w, h, {
+    dither: st.dither,
+    ditherMode: st.dithermode,
+    postfilter: st.postfilter,
+    reconmode: st.reconmode,
+    rgbmaxdelta: st.rgbmaxdelta,
+    gamma: st.gamma,
+  });
 }
-
 /**
  * Cvar-aware depth banding: quantise stored 1/z to st.zbits (vd_zbits).
  * bits >= 24 (or <= 0) is a pass-through.

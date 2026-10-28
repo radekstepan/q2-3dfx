@@ -2,6 +2,7 @@
 import type { Entity, Framebuffer, RefDef, Refresh, WorldModel } from '@q2/renderer-api';
 
 export * from './demo-fallback.js';
+export * from './base1-views.js';
 export * from './demo-determinism.js';
 export * from './sidebyside.js';
 export * from './cache-flythrough.js';
