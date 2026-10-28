@@ -1141,9 +1141,35 @@ export function buildRGBMaterial(
   };
 }
 
-// Module scratch for the RGB pixel loop (serial path only, no allocation).
-const _rgbTex = new Uint8Array(3);
-const _rgbLit = new Uint8Array(3);
+// RGB hot-path internals (step-5 perf, output-bit-identical).
+//
+// The three subdiv loops below inline what used to be five per-pixel
+// helper calls (rgbPickMipLevel, rgbWrapCoord x2, rgbSampleTexture,
+// rgbSampleLightmap, rgbModulate). The inlined integer math reproduces the
+// helpers bit-for-bit (see proofs in docs/perf-ledger.md step-5 row):
+// - POT repeat wrap: `c & (size-1)` equals the old float-modulo wrap
+//   `((c%size)+size)%size` for every integer c (two's-complement floored
+//   mod; the old `-0` multiple case indexes the same slot as `0`).
+// - Bilinear weights: the old `Math.round((uw-x0)*256)` on the wrapped
+//   fraction equals `(low+128)>>8` with `low = tu & 0xffff` (round-half-up
+//   on an exact dyadic), and `(x0+1)` needs no modulo once wrapped.
+// - Level pick: spanLod is constant per span, so the Bayer compare threshold
+//   `f*16` is hoisted; the non-dither pick is loop-invariant.
+// The exported helpers above are UNCHANGED (alias/sprites/tests still call
+// them); only the pixel loops take the inlined path.
+
+/** POT size -> bit mask, else 0 (caller takes the integer-modulo lane). */
+function rgbPotMask(size: number): number {
+  return size > 0 && (size & (size - 1)) === 0 ? size - 1 : 0;
+}
+
+/** Integer repeat wrap (matches rgbWrapCoord(c, size, true) exactly). */
+function rgbWrapInt(c: number, size: number, mask: number): number {
+  if (mask !== 0) return c & mask;
+  let m = c % size;
+  if (m < 0) m += size;
+  return m;
+}
 /** Shared turbulence table for warped RGB spans (same table as software). */
 const _rgbTurb = buildTurbTable();
 
@@ -1179,31 +1205,154 @@ export function runSubdivRGBRepeat(
 ): { iz: number; lux: number; u1: number; v1: number } {
   const levels = mat.levels;
   const lb = mat.light;
-  const overbright = mat.overbright;
+  const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
   const z1 = 1 / (iz + diz * n);
   const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
   let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
   const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
+  // Hoisted spanLod pick (== rgbPickMipLevel(spanLod, x, y, ...) per pixel:
+  // spanLod is span-constant, so n/f/f*16 are computed once).
+  const clampedLod = spanLod < 0 ? 0 : spanLod;
+  const lodN = clampedLod | 0;
+  const lodF = clampedLod - lodN;
+  let baseLevel: number, nextLevel: number;
+  const f16 = lodF * 16;
+  if (!mipDither) {
+    const lv = lodF < 0.5 ? lodN : lodN + 1;
+    baseLevel = nextLevel = lv > maxLevel ? maxLevel : lv;
+  } else {
+    baseLevel = lodN > maxLevel ? maxLevel : lodN;
+    const nx = lodN + 1;
+    nextLevel = nx > maxLevel ? maxLevel : nx;
+  }
+  // Candidate level descriptors (row bases/strides hoisted; the fixed-level
+  // fast path below never touches the second descriptor or the Bayer table).
+  const t0 = levels[baseLevel]!;
+  const d0 = t0.data, w0 = t0.width, h0 = t0.height, mk0 = t0.mask;
+  const wm0 = rgbPotMask(w0), hm0 = rgbPotMask(h0);
+  const t1 = levels[nextLevel]!;
+  const d1 = t1.data, w1 = t1.width, h1 = t1.height, mk1 = t1.mask;
+  const wm1 = rgbPotMask(w1), hm1 = rgbPotMask(h1);
+  const lbS = lb ? lb.samples : null;
+  const lbW = lb ? lb.luxW : 0, lbH = lb ? lb.luxH : 0;
+  const lbMaxU = lbW - 1, lbMaxV = lbH - 1;
+  const bRow = (yAbs | 0) & 3;
+  const fixedLevel = baseLevel === nextLevel;
   let lux = lux0;
+  if (fixedLevel) {
+    for (let i = 0, o = o0; i < n; i++, o++) {
+      if (iz > zb[o]!) {
+        const xi = tu >> 16, yi = tv >> 16;
+        const mx = rgbWrapInt(xi, w0, wm0);
+        const my = rgbWrapInt(yi, h0, hm0);
+        if (mk0[my * w0 + mx]! !== 0) {
+          const fu = ((tu & 0xffff) + 128) >> 8;
+          const fv = ((tv & 0xffff) + 128) >> 8;
+          const x1 = mx + 1 === w0 ? 0 : mx + 1;
+          const y1 = my + 1 === h0 ? 0 : my + 1;
+          const row0 = my * w0, row1 = y1 * w0;
+          const pa = (row0 + mx) * 3;
+          const pb = (row0 + x1) * 3;
+          const pc = (row1 + mx) * 3;
+          const pd = (row1 + x1) * 3;
+          const w00 = (256 - fu) * (256 - fv);
+          const w10 = fu * (256 - fv);
+          const w01 = (256 - fu) * fv;
+          const w11 = fu * fv;
+          let r = (w00 * d0[pa]! + w10 * d0[pb]! + w01 * d0[pc]! + w11 * d0[pd]! + 32768) >> 16;
+          let g = (w00 * d0[pa + 1]! + w10 * d0[pb + 1]! + w01 * d0[pc + 1]! + w11 * d0[pd + 1]! + 32768) >> 16;
+          let b = (w00 * d0[pa + 2]! + w10 * d0[pb + 2]! + w01 * d0[pc + 2]! + w11 * d0[pd + 2]! + 32768) >> 16;
+          if (lbS) {
+            const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
+            const lvc = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
+            const lx0 = luc | 0, ly0 = lvc | 0;
+            const lx1 = lx0 + 1 < lbW ? lx0 + 1 : lx0;
+            const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
+            const lfu = Math.round((luc - lx0) * 256);
+            const lfv = Math.round((lvc - ly0) * 256);
+            const lw00 = (256 - lfu) * (256 - lfv);
+            const lw10 = lfu * (256 - lfv);
+            const lw01 = (256 - lfu) * lfv;
+            const lw11 = lfu * lfv;
+            const lpa = (ly0 * lbW + lx0) * 3;
+            const lpb = (ly0 * lbW + lx1) * 3;
+            const lpc = (ly1 * lbW + lx0) * 3;
+            const lpd = (ly1 * lbW + lx1) * 3;
+            const lr = (lw00 * lbS[lpa]! + lw10 * lbS[lpb]! + lw01 * lbS[lpc]! + lw11 * lbS[lpd]! + 32768) >> 16;
+            const lg = (lw00 * lbS[lpa + 1]! + lw10 * lbS[lpb + 1]! + lw01 * lbS[lpc + 1]! + lw11 * lbS[lpd + 1]! + 32768) >> 16;
+            const lb2 = (lw00 * lbS[lpa + 2]! + lw10 * lbS[lpb + 2]! + lw01 * lbS[lpc + 2]! + lw11 * lbS[lpd + 2]! + 32768) >> 16;
+            r = (((r * lr * mult + 127) / 255) | 0);
+            g = (((g * lg * mult + 127) / 255) | 0);
+            b = (((b * lb2 * mult + 127) / 255) | 0);
+            r = r > 255 ? 255 : r;
+            g = g > 255 ? 255 : g;
+            b = b > 255 ? 255 : b;
+          }
+          zb[o] = iz;
+          color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+          cover[o] = 1;
+        }
+      }
+      tu += dtu; tv += dtv; iz += diz; lux += dlux;
+    }
+    return { iz, lux, u1, v1 };
+  }
   for (let i = 0, o = o0; i < n; i++, o++) {
     if (iz > zb[o]!) {
-      const lvl = rgbPickMipLevel(spanLod, xAbs + i, yAbs, mipDither, maxLevel);
-      const t = levels[lvl]!;
-      // Nearest-tap opacity mask: index-255 holes never write color or
-      // depth (no opaque black fringes). Same wrap convention as the
-      // bilinear tap below so the hole test agrees with the sample.
-      const mxr = rgbWrapCoord(tu >> 16, t.width, true);
-      const myr = rgbWrapCoord(tv >> 16, t.height, true);
-      if (t.mask[myr * t.width + mxr]! !== 0) {
-        rgbSampleTexture(t.data, t.width, t.height, tu / 65536, tv / 65536, _rgbTex, 0, true, true);
-        let r = _rgbTex[0]!, g = _rgbTex[1]!, b = _rgbTex[2]!;
-        if (lb) {
-          rgbSampleLightmap(lb, lux, lv, _rgbLit, 0);
-          rgbModulate(r, g, b, _rgbLit[0]!, _rgbLit[1]!, _rgbLit[2]!, overbright, _rgbLit, 0);
-          r = _rgbLit[0]!;
-          g = _rgbLit[1]!;
-          b = _rgbLit[2]!;
+      // Single-TMU dither pick between the two hoisted descriptors.
+      const use1 = f16 <= RGB_BAYER4[(bRow << 2) | ((xAbs + i) & 3)]! ? 0 : 1;
+      const dd = use1 === 0 ? d0 : d1;
+      const ww = use1 === 0 ? w0 : w1;
+      const hh = use1 === 0 ? h0 : h1;
+      const mk = use1 === 0 ? mk0 : mk1;
+      const wmm = use1 === 0 ? wm0 : wm1;
+      const hmm = use1 === 0 ? hm0 : hm1;
+      const xi = tu >> 16, yi = tv >> 16;
+      const mx = rgbWrapInt(xi, ww, wmm);
+      const my = rgbWrapInt(yi, hh, hmm);
+      if (mk[my * ww + mx]! !== 0) {
+        const fu = ((tu & 0xffff) + 128) >> 8;
+        const fv = ((tv & 0xffff) + 128) >> 8;
+        const x1 = mx + 1 === ww ? 0 : mx + 1;
+        const y1 = my + 1 === hh ? 0 : my + 1;
+        const row0 = my * ww, row1 = y1 * ww;
+        const pa = (row0 + mx) * 3;
+        const pb = (row0 + x1) * 3;
+        const pc = (row1 + mx) * 3;
+        const pd = (row1 + x1) * 3;
+        const w00 = (256 - fu) * (256 - fv);
+        const w10 = fu * (256 - fv);
+        const w01 = (256 - fu) * fv;
+        const w11 = fu * fv;
+        let r = (w00 * dd[pa]! + w10 * dd[pb]! + w01 * dd[pc]! + w11 * dd[pd]! + 32768) >> 16;
+        let g = (w00 * dd[pa + 1]! + w10 * dd[pb + 1]! + w01 * dd[pc + 1]! + w11 * dd[pd + 1]! + 32768) >> 16;
+        let b = (w00 * dd[pa + 2]! + w10 * dd[pb + 2]! + w01 * dd[pc + 2]! + w11 * dd[pd + 2]! + 32768) >> 16;
+        if (lbS) {
+          const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
+          const lvc = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
+          const lx0 = luc | 0, ly0 = lvc | 0;
+          const lx1 = lx0 + 1 < lbW ? lx0 + 1 : lx0;
+          const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
+          const lfu = Math.round((luc - lx0) * 256);
+          const lfv = Math.round((lvc - ly0) * 256);
+          const lw00 = (256 - lfu) * (256 - lfv);
+          const lw10 = lfu * (256 - lfv);
+          const lw01 = (256 - lfu) * lfv;
+          const lw11 = lfu * lfv;
+          const lpa = (ly0 * lbW + lx0) * 3;
+          const lpb = (ly0 * lbW + lx1) * 3;
+          const lpc = (ly1 * lbW + lx0) * 3;
+          const lpd = (ly1 * lbW + lx1) * 3;
+          const lr = (lw00 * lbS[lpa]! + lw10 * lbS[lpb]! + lw01 * lbS[lpc]! + lw11 * lbS[lpd]! + 32768) >> 16;
+          const lg = (lw00 * lbS[lpa + 1]! + lw10 * lbS[lpb + 1]! + lw01 * lbS[lpc + 1]! + lw11 * lbS[lpd + 1]! + 32768) >> 16;
+          const lb2 = (lw00 * lbS[lpa + 2]! + lw10 * lbS[lpb + 2]! + lw01 * lbS[lpc + 2]! + lw11 * lbS[lpd + 2]! + 32768) >> 16;
+          r = (((r * lr * mult + 127) / 255) | 0);
+          g = (((g * lg * mult + 127) / 255) | 0);
+          b = (((b * lb2 * mult + 127) / 255) | 0);
+          r = r > 255 ? 255 : r;
+          g = g > 255 ? 255 : g;
+          b = b > 255 ? 255 : b;
         }
         zb[o] = iz;
         color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
@@ -1245,28 +1394,89 @@ export function runSubdivRGBClamp(
 ): { iz: number; lux: number; u1: number; v1: number } {
   const levels = mat.levels;
   const lb = mat.light;
-  const overbright = mat.overbright;
+  const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
   const z1 = 1 / (iz + diz * n);
   const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
   let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
   const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
+  // Hoisted spanLod pick (same contract as the repeat loop above).
+  const clampedLod = spanLod < 0 ? 0 : spanLod;
+  const lodN = clampedLod | 0;
+  const lodF = clampedLod - lodN;
+  let baseLevel: number, nextLevel: number;
+  const f16 = lodF * 16;
+  if (!mipDither) {
+    const lv = lodF < 0.5 ? lodN : lodN + 1;
+    baseLevel = nextLevel = lv > maxLevel ? maxLevel : lv;
+  } else {
+    baseLevel = lodN > maxLevel ? maxLevel : lodN;
+    const nx = lodN + 1;
+    nextLevel = nx > maxLevel ? maxLevel : nx;
+  }
+  const fixedLevel = baseLevel === nextLevel;
+  const lbS = lb ? lb.samples : null;
+  const lbW = lb ? lb.luxW : 0, lbH = lb ? lb.luxH : 0;
+  const lbMaxU = lbW - 1, lbMaxV = lbH - 1;
+  const bRow = (yAbs | 0) & 3;
   let lux = lux0;
   for (let i = 0, o = o0; i < n; i++, o++) {
     if (iz > zb[o]!) {
-      const lvl = rgbPickMipLevel(spanLod, xAbs + i, yAbs, mipDither, maxLevel);
-      const t = levels[lvl]!;
-      const mxc = rgbWrapCoord(tu >> 16, t.width, false);
-      const myc = rgbWrapCoord(tv >> 16, t.height, false);
-      if (t.mask[myc * t.width + mxc]! !== 0) {
-        rgbSampleTexture(t.data, t.width, t.height, tu / 65536, tv / 65536, _rgbTex, 0, false, false);
-        let r = _rgbTex[0]!, g = _rgbTex[1]!, b = _rgbTex[2]!;
-        if (lb) {
-          rgbSampleLightmap(lb, lux, lv, _rgbLit, 0);
-          rgbModulate(r, g, b, _rgbLit[0]!, _rgbLit[1]!, _rgbLit[2]!, overbright, _rgbLit, 0);
-          r = _rgbLit[0]!;
-          g = _rgbLit[1]!;
-          b = _rgbLit[2]!;
+      // Per-pixel dither pick between the two span-constant levels (the
+      // fixed-level case always selects base: same value rgbPickMipLevel
+      // returns, without the per-pixel call).
+      const use1 = !fixedLevel && f16 > RGB_BAYER4[(bRow << 2) | ((xAbs + i) & 3)]! ? 1 : 0;
+      const t = levels[use1 === 0 ? baseLevel : nextLevel]!;
+      const td = t.data, tw = t.width, th = t.height, tm = t.mask;
+      const twMax = tw - 1, thMax = th - 1;
+      // Clamp addressing inlined (no modulo anywhere on this path): the
+      // float clamp is kept verbatim so edge weights match rgbSampleTexture.
+      const u = tu / 65536, v = tv / 65536;
+      const uc = u < 0 ? 0 : u > twMax ? twMax : u;
+      const vc = v < 0 ? 0 : v > thMax ? thMax : v;
+      const mx = uc | 0, my = vc | 0;
+      if (tm[my * tw + mx]! !== 0) {
+        const fu = Math.round((uc - mx) * 256);
+        const fv = Math.round((vc - my) * 256);
+        const x1 = mx + 1 < tw ? mx + 1 : mx;
+        const y1 = my + 1 < th ? my + 1 : my;
+        const row0 = my * tw, row1 = y1 * tw;
+        const pa = (row0 + mx) * 3;
+        const pb = (row0 + x1) * 3;
+        const pc = (row1 + mx) * 3;
+        const pd = (row1 + x1) * 3;
+        const w00 = (256 - fu) * (256 - fv);
+        const w10 = fu * (256 - fv);
+        const w01 = (256 - fu) * fv;
+        const w11 = fu * fv;
+        let r = (w00 * td[pa]! + w10 * td[pb]! + w01 * td[pc]! + w11 * td[pd]! + 32768) >> 16;
+        let g = (w00 * td[pa + 1]! + w10 * td[pb + 1]! + w01 * td[pc + 1]! + w11 * td[pd + 1]! + 32768) >> 16;
+        let b = (w00 * td[pa + 2]! + w10 * td[pb + 2]! + w01 * td[pc + 2]! + w11 * td[pd + 2]! + 32768) >> 16;
+        if (lbS) {
+          const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
+          const lvc = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
+          const lx0 = luc | 0, ly0 = lvc | 0;
+          const lx1 = lx0 + 1 < lbW ? lx0 + 1 : lx0;
+          const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
+          const lfu = Math.round((luc - lx0) * 256);
+          const lfv = Math.round((lvc - ly0) * 256);
+          const lw00 = (256 - lfu) * (256 - lfv);
+          const lw10 = lfu * (256 - lfv);
+          const lw01 = (256 - lfu) * lfv;
+          const lw11 = lfu * lfv;
+          const lpa = (ly0 * lbW + lx0) * 3;
+          const lpb = (ly0 * lbW + lx1) * 3;
+          const lpc = (ly1 * lbW + lx0) * 3;
+          const lpd = (ly1 * lbW + lx1) * 3;
+          const lr = (lw00 * lbS[lpa]! + lw10 * lbS[lpb]! + lw01 * lbS[lpc]! + lw11 * lbS[lpd]! + 32768) >> 16;
+          const lg = (lw00 * lbS[lpa + 1]! + lw10 * lbS[lpb + 1]! + lw01 * lbS[lpc + 1]! + lw11 * lbS[lpd + 1]! + 32768) >> 16;
+          const lb2 = (lw00 * lbS[lpa + 2]! + lw10 * lbS[lpb + 2]! + lw01 * lbS[lpc + 2]! + lw11 * lbS[lpd + 2]! + 32768) >> 16;
+          r = (((r * lr * mult + 127) / 255) | 0);
+          g = (((g * lg * mult + 127) / 255) | 0);
+          b = (((b * lb2 * mult + 127) / 255) | 0);
+          r = r > 255 ? 255 : r;
+          g = g > 255 ? 255 : g;
+          b = b > 255 ? 255 : b;
         }
         zb[o] = iz;
         color[o] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
@@ -1367,7 +1577,7 @@ export function runSubdivRGBGeneric(
 ): { iz: number; lux: number; u1: number; v1: number } {
   const levels = mat.levels;
   const lb = mat.light;
-  const overbright = mat.overbright;
+  const mult = mat.overbright ? 2 : 1;
   const mipDither = mat.mipDither;
   const wrapS = mat.addressS === 'repeat';
   const wrapT = mat.addressT === 'repeat';
@@ -1377,6 +1587,33 @@ export function runSubdivRGBGeneric(
   let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
   const dtu = (((u1 - u0) / n) * 65536) | 0, dtv = (((v1 - v0) / n) * 65536) | 0;
   const tmask = turbTable ? turbTable.length - 1 : 0;
+  // Hoisted spanLod pick (same contract as the opaque loops above).
+  const clampedLod = spanLod < 0 ? 0 : spanLod;
+  const lodN = clampedLod | 0;
+  const lodF = clampedLod - lodN;
+  let baseLevel: number, nextLevel: number;
+  const f16 = lodF * 16;
+  if (!mipDither) {
+    const lv = lodF < 0.5 ? lodN : lodN + 1;
+    baseLevel = nextLevel = lv > maxLevel ? maxLevel : lv;
+  } else {
+    baseLevel = lodN > maxLevel ? maxLevel : lodN;
+    const nx = lodN + 1;
+    nextLevel = nx > maxLevel ? maxLevel : nx;
+  }
+  const fixedLevel = baseLevel === nextLevel;
+  const t0 = levels[baseLevel]!;
+  const d0 = t0.data, w0 = t0.width, h0 = t0.height, mk0 = t0.mask;
+  const wm0 = wrapS ? rgbPotMask(w0) : 0;
+  const hm0 = wrapT ? rgbPotMask(h0) : 0;
+  const t1 = levels[nextLevel]!;
+  const d1 = t1.data, w1 = t1.width, h1 = t1.height, mk1 = t1.mask;
+  const wm1 = wrapS ? rgbPotMask(w1) : 0;
+  const hm1 = wrapT ? rgbPotMask(h1) : 0;
+  const lbS = lb ? lb.samples : null;
+  const lbW = lb ? lb.luxW : 0, lbH = lb ? lb.luxH : 0;
+  const lbMaxU = lbW - 1, lbMaxV = lbH - 1;
+  const bRow = (yAbs | 0) & 3;
   let lux = lux0;
   for (let i = 0, o = o0; i < n; i++, o++) {
     if (iz > zb[o]!) {
@@ -1387,19 +1624,75 @@ export function runSubdivRGBGeneric(
         fu = wu << 16;
         fv = wv << 16;
       }
-      const lvl = rgbPickMipLevel(spanLod, xAbs + i, yAbs, mipDither, maxLevel);
-      const t = levels[lvl]!;
-      const mx = rgbWrapCoord(fu >> 16, t.width, wrapS);
-      const my = rgbWrapCoord(fv >> 16, t.height, wrapT);
-      if (t.mask[my * t.width + mx]! !== 0) {
-        rgbSampleTexture(t.data, t.width, t.height, fu / 65536, fv / 65536, _rgbTex, 0, wrapS, wrapT);
-        let r = _rgbTex[0]!, g = _rgbTex[1]!, b = _rgbTex[2]!;
-        if (lb) {
-          rgbSampleLightmap(lb, lux, lv, _rgbLit, 0);
-          rgbModulate(r, g, b, _rgbLit[0]!, _rgbLit[1]!, _rgbLit[2]!, overbright, _rgbLit, 0);
-          r = _rgbLit[0]!;
-          g = _rgbLit[1]!;
-          b = _rgbLit[2]!;
+      const use1 = !fixedLevel && f16 > RGB_BAYER4[(bRow << 2) | ((xAbs + i) & 3)]! ? 1 : 0;
+      const dd = use1 === 0 ? d0 : d1;
+      const ww = use1 === 0 ? w0 : w1;
+      const hh = use1 === 0 ? h0 : h1;
+      const mk = use1 === 0 ? mk0 : mk1;
+      const wmm = use1 === 0 ? wm0 : wm1;
+      const hmm = use1 === 0 ? hm0 : hm1;
+      const wMax = ww - 1, hMax = hh - 1;
+      let mx: number, my: number, qfu: number, qfv: number;
+      if (wrapS) {
+        const xi = fu >> 16;
+        mx = rgbWrapInt(xi, ww, wmm);
+        qfu = ((fu & 0xffff) + 128) >> 8;
+      } else {
+        const u = fu / 65536;
+        const uc = u < 0 ? 0 : u > wMax ? wMax : u;
+        mx = uc | 0;
+        qfu = Math.round((uc - mx) * 256);
+      }
+      if (wrapT) {
+        const yi = fv >> 16;
+        my = rgbWrapInt(yi, hh, hmm);
+        qfv = ((fv & 0xffff) + 128) >> 8;
+      } else {
+        const v = fv / 65536;
+        const vc = v < 0 ? 0 : v > hMax ? hMax : v;
+        my = vc | 0;
+        qfv = Math.round((vc - my) * 256);
+      }
+      if (mk[my * ww + mx]! !== 0) {
+        const x1 = wrapS ? (mx + 1 === ww ? 0 : mx + 1) : (mx + 1 < ww ? mx + 1 : mx);
+        const y1 = wrapT ? (my + 1 === hh ? 0 : my + 1) : (my + 1 < hh ? my + 1 : my);
+        const row0 = my * ww, row1 = y1 * ww;
+        const pa = (row0 + mx) * 3;
+        const pb = (row0 + x1) * 3;
+        const pc = (row1 + mx) * 3;
+        const pd = (row1 + x1) * 3;
+        const w00 = (256 - qfu) * (256 - qfv);
+        const w10 = qfu * (256 - qfv);
+        const w01 = (256 - qfu) * qfv;
+        const w11 = qfu * qfv;
+        let r = (w00 * dd[pa]! + w10 * dd[pb]! + w01 * dd[pc]! + w11 * dd[pd]! + 32768) >> 16;
+        let g = (w00 * dd[pa + 1]! + w10 * dd[pb + 1]! + w01 * dd[pc + 1]! + w11 * dd[pd + 1]! + 32768) >> 16;
+        let b = (w00 * dd[pa + 2]! + w10 * dd[pb + 2]! + w01 * dd[pc + 2]! + w11 * dd[pd + 2]! + 32768) >> 16;
+        if (lbS) {
+          const luc = lux < 0 ? 0 : lux > lbMaxU ? lbMaxU : lux;
+          const lvc = lv < 0 ? 0 : lv > lbMaxV ? lbMaxV : lv;
+          const lx0 = luc | 0, ly0 = lvc | 0;
+          const lx1 = lx0 + 1 < lbW ? lx0 + 1 : lx0;
+          const ly1 = ly0 + 1 < lbH ? ly0 + 1 : ly0;
+          const lfu = Math.round((luc - lx0) * 256);
+          const lfv = Math.round((lvc - ly0) * 256);
+          const lw00 = (256 - lfu) * (256 - lfv);
+          const lw10 = lfu * (256 - lfv);
+          const lw01 = (256 - lfu) * lfv;
+          const lw11 = lfu * lfv;
+          const lpa = (ly0 * lbW + lx0) * 3;
+          const lpb = (ly0 * lbW + lx1) * 3;
+          const lpc = (ly1 * lbW + lx0) * 3;
+          const lpd = (ly1 * lbW + lx1) * 3;
+          const lr = (lw00 * lbS[lpa]! + lw10 * lbS[lpb]! + lw01 * lbS[lpc]! + lw11 * lbS[lpd]! + 32768) >> 16;
+          const lg = (lw00 * lbS[lpa + 1]! + lw10 * lbS[lpb + 1]! + lw01 * lbS[lpc + 1]! + lw11 * lbS[lpd + 1]! + 32768) >> 16;
+          const lb2 = (lw00 * lbS[lpa + 2]! + lw10 * lbS[lpb + 2]! + lw01 * lbS[lpc + 2]! + lw11 * lbS[lpd + 2]! + 32768) >> 16;
+          r = (((r * lr * mult + 127) / 255) | 0);
+          g = (((g * lg * mult + 127) / 255) | 0);
+          b = (((b * lb2 * mult + 127) / 255) | 0);
+          r = r > 255 ? 255 : r;
+          g = g > 255 ? 255 : g;
+          b = b > 255 ? 255 : b;
         }
         if (writeDepth) zb[o] = iz;
         rgbBlendPixel(color, o, r, g, b, blend, alphaQ);
@@ -1526,6 +1819,7 @@ export function drawSpansRGB(
       : alphaQ;
     let o = s.y * fbW + x0;
     let remaining = count;
+    let xRun = x0;
     if (!useWarp && useBlend === 'opaque' && mat.depthWrite) {
       // Hot opaque path: monomorphic repeat/clamp loops (mask skip inside).
       while (remaining > 0) {
@@ -1533,12 +1827,12 @@ export function drawSpansRGB(
         let r: { iz: number; lux: number; u1: number; v1: number };
         if (repeat) {
           r = runSubdivRGBRepeat(
-            color, cover, zb, o, m, x0 + (count - remaining), s.y,
+            color, cover, zb, o, m, xRun, s.y,
             iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
             mat, spanLod, maxLevel);
         } else {
           r = runSubdivRGBClamp(
-            color, cover, zb, o, m, x0 + (count - remaining), s.y,
+            color, cover, zb, o, m, xRun, s.y,
             iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
             mat, spanLod, maxLevel);
         }
@@ -1549,6 +1843,7 @@ export function drawSpansRGB(
         u0 = r.u1;
         v0 = r.v1;
         o += m;
+        xRun += m;
         remaining -= m;
       }
     } else {
@@ -1557,7 +1852,7 @@ export function drawSpansRGB(
       while (remaining > 0) {
         const m = remaining >= SUBDIV ? SUBDIV : remaining;
         const r = runSubdivRGBGeneric(
-          color, cover, zb, o, m, x0 + (count - remaining), s.y,
+          color, cover, zb, o, m, xRun, s.y,
           iz, s.diz, uz, s.duz, vz, s.dvz, u0, v0, lux, s.dlu, s.lv,
           mat, spanLod, maxLevel, useBlend, useAlphaQ, turb,
           turb ? (mat.turbPhase + s.turb) & (turb.length - 1) : 0);
@@ -1568,6 +1863,7 @@ export function drawSpansRGB(
         u0 = r.u1;
         v0 = r.v1;
         o += m;
+        xRun += m;
         remaining -= m;
       }
     }

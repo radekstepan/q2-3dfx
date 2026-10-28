@@ -38,6 +38,7 @@ Append a row per bench run. Bench machine: whatever CI reports in `tools/bench/m
 | 2026-10-27 | web-worker-rgb | web serial devroom raster+resolve+scanout, report-only bench | 640×480 | — | 38–82 | 1.00 | full-screen devroom, N=15 medians ×3 runs (loaded box): raster 4.9–8.2 + palette 1.2–2.0 = sw frame 6.1–10.2; voodoo scanout(resolveFrame) 9.3–15.8, vd frame 14.2–25.0; spans ~2110, shaded 307200/307200 px; console block in voodoo-perf.test.ts, no budget assertions |
 
 | 2026-10-27 | 5e13d42 | testkit voodoo working-baseline resolve (serial, Node 22, Ryzen 5 PRO 2400G) | 640×480 | ~88 | ~27 | 1.00 | paint + raw-565 + reconstructed per scene, mean of 5 runs × 7 scenes: ~11.4 ms per resolve (paint amortised in); hashes pinned in `packages/testkit/baseline-manifests/voodoo-baseline.json`, blobs gitignored under `test-output/voodoo-baseline/`; report-only, no budget assertions |
+| 2026-10-27 | step-5 | sw-renderer RGB span hot-path opts (serial devroom, Node 22, Ryzen 5 PRO 2400G×8, best-of-3×15 warmed) | 640×480 | 6.6 | 61.0 | 5.04 | RGB 126.8→61.0ms (~2.1x; 320×240 32.0→15.5, 160×120 8.4→4.3; classic 6.6 untouched): inlined taps (POT-mask wrap, hoisted spanLod/Bayer, folded modulate), 5 helper calls/px gone; frame hash `8372b322` pinned in rgbPerf.test.ts ≡ before; reciprocal-mult tried+reverted (V8 fdiv faster); alias/sprite/particle RGB + lightmap-per-pixel remain |
 
 Budgets (fail the build if exceeded): software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480
 after M8.1, startup ≤2.5 s from cached pak to first frame.
