@@ -60,5 +60,44 @@ quantum per channel).
 4. `vd_overbright` blanket x2 (id `intensity`/`gl_image` staging audit pending).
 5. **Fixtures are synthetic**, not engine renders (except `devroom`, which is
    the procedural NullRefresh serial path): no WAL/MD2/BSP lightmaps, no
-   translucency sorting, no depth test, no HUD. `display` stage == 
-...[truncated 2086 chars]
+   translucency sorting, no depth test, no HUD. `display` stage ==
+   `reconstructed` (fixtures carry no HUD; a strict-HUD path would compose
+   HUD pre-scanout).
+
+## 4. Determinism harness + coverage gaps (DEMO1 tail, 2026-10-27)
+
+Scripted tick sequence: `src/demo-determinism.ts` renders every fixed
+`demoFallbackViews()` camera for 6 ticks at the 10 Hz server tick through
+`SoftwareRenderer` + procedural `createDevroom()` (160x120, warm-ramp
+palette shared with the sw-renderer golden) and records per frame
+`{camera, tick, time, origin, angles, style0, style1, colorHash, indexHash}`.
+`src/demo-determinism.test.ts` proves two fresh runs are identical, pins
+all 18 frame hashes, and proves time advancement (pillar/wide ticks 0 vs 2
+move) and style-0 flicker (ticks 0 vs 1 move on every camera) both change
+the frame. Re-pin procedure: render `runDemoTicks()`, paste the new
+`{camera, tick, colorHash, indexHash}` rows into `PINNED`, re-run
+`yarn workspace @q2/testkit test`. Manifest envelope
+(`demoTickManifest`) is JSON-safe; hashes only, never pixels or blobs.
+
+Manifest completeness is gated programmatically
+(`src/voodoo-baseline.test.ts`): every committed AND freshly generated
+entry must carry map, camera (name/origin/angles/fovX), simTime,
+resolution, the full 15-key profile (12 `vd_*` + dithermode/reconmode/
+rgbmaxDelta), renderer (revision/resolve) and all three stages
+(raw-565/reconstructed/display) with hash + pixel count. Sim-time coverage
+(t=0/1.5/3 via round-robin fallback cameras) is asserted as a set.
+
+Known gaps (no retail assets involved):
+
+- Baseline captures use static `lightStyles = 1`: the `devroom` scene goes
+  through `NullRefresh`, which ignores `RefDef.time` AND `lightStyles`
+  entirely, so baseline simTimes are labels, not animated frames. Flicker
+  coverage lives on the `SoftwareRenderer` determinism path instead.
+- `styles[1]` is unobservable on the asset-free devroom: its only consumer
+  is the turbulent water banner's lightmap, and turbulent spans render
+  unlit (fullbright warp). The tick flicker drives `styles[0]` (the slot
+  every lit surface consumes); `style1` is recorded at 1.0 so a future
+  devroom that lights the banner trips the pins loudly.
+- Real `demo1.dm2` playback needs the retail pak (`maps/base1.bsp`, WAL,
+  MD2) and stays Q2_PAK-gated; `demo1.dm2` itself never ships and no pak
+  bytes are committed, cooked, or fetched by CI.

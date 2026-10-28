@@ -207,6 +207,59 @@ describe('voodoo working baseline', () => {
     }
   });
 
+  it('every manifest entry records map/camera/sim/res/cvars/revision/stage (§6)', async () => {
+    // Astra guide §6: each reference capture is recorded with map/assets,
+    // camera, simulation time, resolution, all cvars, renderer revision and
+    // capture stage. Asserted against BOTH the committed manifest and a
+    // fresh in-memory regen, so neither can silently lose a field.
+    const committed = await readCommittedManifest();
+    const { manifest: fresh } = generateBaseline(W, H, 'test');
+    const expectedProfileKeys = [
+      'vd_16bit', 'vd_dither', 'vd_postfilter', 'vd_bilinear', 'vd_mipdither',
+      'vd_lodbias', 'vd_fog', 'vd_gamma', 'vd_maxtexsize', 'vd_zbits',
+      'vd_palettetex', 'vd_overbright', 'vd_dithermode', 'vd_reconmode',
+      'vd_rgbmaxdelta',
+    ].sort();
+    for (const manifest of [committed, fresh]) {
+      expect(manifest.scenes.length).toBe(BASELINE_SCENES.length);
+      for (const entry of manifest.scenes) {
+        expect(typeof entry.map, `${entry.scene}.map`).toBe('string');
+        expect(entry.map.length).toBeGreaterThan(0);
+        expect(typeof entry.camera.name, `${entry.scene}.camera.name`).toBe('string');
+        expect(entry.camera.name.length).toBeGreaterThan(0);
+        for (const axis of ['origin', 'angles'] as const) {
+          expect(Array.isArray(entry.camera[axis]), `${entry.scene}.camera.${axis}`).toBe(true);
+          expect(entry.camera[axis]).toHaveLength(3);
+          for (const v of entry.camera[axis]) expect(Number.isFinite(v)).toBe(true);
+        }
+        expect(Number.isFinite(entry.camera.fovX), `${entry.scene}.camera.fovX`).toBe(true);
+        expect(Number.isFinite(entry.simTime), `${entry.scene}.simTime`).toBe(true);
+        expect(entry.resolution, entry.scene).toEqual({ width: W, height: H });
+        expect(entry.renderPath, entry.scene).toBe('serial');
+        expect(Object.keys(entry.profile).sort(), `${entry.scene}.profile`).toEqual(expectedProfileKeys);
+        expect(typeof entry.renderer.revision, `${entry.scene}.renderer.revision`).toBe('string');
+        expect(entry.renderer.revision.length).toBeGreaterThan(0);
+        expect(entry.renderer.resolve, entry.scene).toBe('pinned-duplicate@5e13d42');
+        expect(Object.keys(entry.stages).sort(), `${entry.scene}.stages`).toEqual(
+          ['display', 'raw-565', 'reconstructed'],
+        );
+        for (const stage of ['raw-565', 'reconstructed', 'display'] as const) {
+          expect(entry.stages[stage].hash, `${entry.scene}.${stage}`).toMatch(/^[0-9a-f]{8}$/);
+          expect(entry.stages[stage].pixels, `${entry.scene}.${stage}`).toBe(W * H);
+        }
+      }
+    }
+  });
+
+  it('sim-time advancement covers t=0/1.5/3 across scenes', () => {
+    // The three fixed fallback cameras sit at t=0/1.5/3 and scenes take
+    // them round-robin — every capture timestamp must stay represented so a
+    // dropped/renamed camera cannot silently collapse the time axis.
+    const { manifest } = generateBaseline(W, H, 'test');
+    const times = new Set(manifest.scenes.map((s) => s.simTime));
+    for (const t of [0, 1.5, 3]) expect(times.has(t), `simTime ${t}`).toBe(true);
+  });
+
   it('game adapter sanity: web shell hooks exist (feature checks, no apps/* import)', async () => {
     // Renderer-side arm/disarm hook (real dep edge, already allowed).
     expect(typeof setRGBWorldEnabled).toBe('function');
