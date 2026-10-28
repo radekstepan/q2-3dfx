@@ -41,3 +41,43 @@ export function ditherOffsetG(x: number, y: number): number {
 export function bayerThreshold(x: number, y: number): number {
   return BAYER4[((y & 3) << 2) | (x & 3)]!;
 }
+
+// --- 2x2 ordered dither (fbzMode 2x2 mode, vidProcCfg 2x2-sub pairing) --------
+//
+// DETERMINISTIC APPROXIMATION UNTIL HW CAPTURE: the Voodoo3 fbzMode register
+// supports both 2x2 and 4x4 ordered dither, but the exact 2x2 matrix weights,
+// amplitude and phase programmed by the Quake II MiniGL driver are not
+// established from a hardware capture. This table uses the canonical 2x2 Bayer
+// matrix with the SAME +/-0.5 LSB amplitude model as the 4x4 table above
+// (offset = round((b - 1.5) * amp / 2), indexed by (y & 1) * 2 + (x & 1)).
+// RB (amp 4): [-3, +1, +3, -1]; G (amp 2): [-1, +1, +2, 0] — the G asymmetry
+// (+2 vs -1) is JS Math.round half-up on exact .5 fractions, kept verbatim so
+// the table stays a pure function of the stated formula. Select via
+// vd_dithermode ('2x2' | '4x4', default '4x4' = legacy bit-exact path).
+
+// Row-major 2x2 Bayer matrix, values 0..3.
+export const BAYER2: Readonly<Uint8Array> = new Uint8Array([0, 2, 3, 1]);
+
+function buildOffset2(amp: number): Int8Array {
+  const t = new Int8Array(4);
+  for (let p = 0; p < 4; p++) t[p] = Math.round((BAYER2[p]! - 1.5) * amp / 2);
+  return t;
+}
+
+export const DITHER2_RB_POS: Readonly<Int8Array> = buildOffset2(4);
+export const DITHER2_G_POS: Readonly<Int8Array> = buildOffset2(2);
+
+/** Dither offset for the R/B channels at pixel (x, y) in 2x2 mode. */
+export function ditherOffsetRB2(x: number, y: number): number {
+  return DITHER2_RB_POS[((y & 1) << 1) | (x & 1)]!;
+}
+
+/** Dither offset for the G channel at pixel (x, y) in 2x2 mode. */
+export function ditherOffsetG2(x: number, y: number): number {
+  return DITHER2_G_POS[((y & 1) << 1) | (x & 1)]!;
+}
+
+/** Raw Bayer threshold 0..3 at pixel (x, y) for the 2x2 matrix. */
+export function bayerThreshold2(x: number, y: number): number {
+  return BAYER2[((y & 1) << 1) | (x & 1)]!;
+}

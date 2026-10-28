@@ -8,7 +8,7 @@
 // Low-level functions take explicit parameters so unit tests are deterministic
 // without touching global cvars.
 
-import { getCVarNumber } from '@q2/config';
+import { getCVarNumber, getCVarString } from '@q2/config';
 
 export * from './bayer.js';
 export * from './capture.js';
@@ -16,8 +16,9 @@ export * from './resolve.js';
 export * from './sampler.js';
 export * from './upload.js';
 
-import { applyPostFilter, expandRGB565, quantiseDepth, resolveRGB565, resolveRGB888 } from './resolve.js';
+import { applyPostFilter, applyReconstruction2x2, applyReconstruction4x1, expandRGB565, parseDitherMode, parseReconMode, parseRgbMaxDelta, quantiseDepth, resolveRGB565, resolveRGB888 } from './resolve.js';
 import { applyFog, capTextureSize, modulateLightmap, samplePalette, sampleRGBTexture } from './sampler.js';
+import type { DitherMode, ReconMode, RgbMaxDelta } from './resolve.js';
 
 export interface VoodooState {
   gamma: number;
@@ -32,6 +33,12 @@ export interface VoodooState {
   palettetex: boolean;
   maxtexsize: number;
   zbits: number;
+  /** Write-path ordered-dither matrix (vd_dithermode read-path profile). */
+  dithermode: DitherMode;
+  /** Scanout reconstruction profile (vd_reconmode read-path profile). */
+  reconmode: ReconMode;
+  /** Per-component reconstruction rejection thresholds (vd_rgbmaxdelta). */
+  rgbmaxdelta: RgbMaxDelta;
 }
 
 export function defaultVoodooState(): VoodooState {
@@ -48,6 +55,9 @@ export function defaultVoodooState(): VoodooState {
     palettetex: true,
     maxtexsize: 256,
     zbits: 16,
+    dithermode: '4x4',
+    reconmode: 'legacy',
+    rgbmaxdelta: { r: 0, g: 0, b: 0 },
   };
 }
 
@@ -66,16 +76,22 @@ export function readVoodooState(): VoodooState {
     palettetex: getCVarNumber('vd_palettetex') !== 0,
     maxtexsize: getCVarNumber('vd_maxtexsize'),
     zbits: getCVarNumber('vd_zbits'),
+    dithermode: parseDitherMode(getCVarString('vd_dithermode')),
+    reconmode: parseReconMode(getCVarString('vd_reconmode')),
+    rgbmaxdelta: parseRgbMaxDelta(getCVarString('vd_rgbmaxdelta')),
   };
 }
 
 /**
- * Full M4.1 frame resolve: gamma -> dither -> RGB565, then the 2x2 box
- * post filter into display (when enabled and provided). Zero-alloc inner
+ * Full M4.1 frame resolve: gamma -> dither -> RGB565, then the scanout
+ * reconstruction into display (when enabled and provided). Zero-alloc inner
  * loops; pass display = null to skip the postfilter stage.
  *
  * Display contract (astra §2.1/§2.2):
- * - quantise on, postfilter on: display = 2x2 box of the 565 target.
+ * - quantise on, postfilter on: display = scanout reconstruction of the 565
+ *   target per st.reconmode ('legacy' = unconditional 2x2 box, the M4.1
+ *   approximation; '2x2sub+2x2box' / '4x4sub+4x1' = dither-subtract + box
+ *   with rgbMaxDelta edge rejection — deterministic approximations).
  * - quantise on, postfilter off: display = per-pixel expandRGB565 of the
  *   freshly packed target (NEVER stale — every pixel is rewritten).
  * - quantise off (vd_16bit=0 debug bypass): display = resolveRGB888
@@ -93,19 +109,30 @@ export function resolveFrame(
 ): void {
   if (!st.quantise) {
     // Genuine RGB888 debug bypass: gamma stays on, dither/postfilter off.
-    resolveRGB565(src, dst565, w, h, { gamma: st.gamma, dither: st.dither, quantise: st.quantise });
+    resolveRGB565(src, dst565, w, h, { gamma: st.gamma, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
     if (display !== null) resolveRGB888(src, display, w, h, { gamma: st.gamma, dither: false });
     return;
   }
-  resolveRGB565(src, dst565, w, h, { gamma: st.gamma, dither: st.dither, quantise: st.quantise });
+  resolveRGB565(src, dst565, w, h, { gamma: st.gamma, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
   if (display === null) return;
-  if (st.postfilter) {
-    applyPostFilter(dst565, display, w, h);
+  if (!st.postfilter) {
+    // Postfilter off: expand every newly packed pixel — no stale pixels.
+    const n = w * h;
+    for (let i = 0; i < n; i++) display[i] = expandRGB565(dst565[i]!);
     return;
   }
-  // Postfilter off: expand every newly packed pixel — no stale pixels.
-  const n = w * h;
-  for (let i = 0; i < n; i++) display[i] = expandRGB565(dst565[i]!);
+  // Matched scanout reconstruction. The subtract matrix is dictated by the
+  // recon MODE; a null subtract means the write path ran dither-off, so
+  // there is no pattern to remove (subtracting one would corrupt).
+  if (st.reconmode === '2x2sub+2x2box') {
+    applyReconstruction2x2(dst565, display, w, h, st.rgbmaxdelta, st.dither ? '2x2' : null);
+    return;
+  }
+  if (st.reconmode === '4x4sub+4x1') {
+    applyReconstruction4x1(dst565, display, w, h, st.rgbmaxdelta, st.dither ? '4x4' : null);
+    return;
+  }
+  applyPostFilter(dst565, display, w, h);
 }
 
 /**

@@ -216,7 +216,7 @@ describe('resolveRGB888 bypass (astra §2.2)', () => {
     expect(dst[0]).toBe((0xff000000 | (lut[0x40]! << 16) | (lut[0x80]! << 8) | lut[0xc0]!) >>> 0);
   });
   it('defaults to gamma 1.3 with dither off', () => {
-    expect(defaultResolveRGB888Options()).toEqual({ gamma: 1.3, dither: false });
+    expect(defaultResolveRGB888Options()).toEqual({ gamma: 1.3, dither: false, ditherMode: '4x4' });
   });
   it('resolveFrame with quantise:false fills display with RGB888 (dither/postfilter bypassed)', () => {
     const w = 8;
