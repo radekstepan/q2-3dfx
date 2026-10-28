@@ -17,19 +17,23 @@
 import { Com_Warn } from '@q2/config';
 import {
   CTL_COUNT, CTL_DONE, CTL_FBH, CTL_FBW, CTL_FCOUNT, CTL_FRAME, CTL_HMASK, CTL_JOB, CTL_LIGHTH, CTL_LIGHTW,
-  CTL_PIXELS, CTL_READY, CTL_SEQ, CTL_SPANS, CTL_TEXH, CTL_TEXW, CTL_TURBPHASE,
+  CTL_PIXELS, CTL_READY, CTL_RGBCOUNT, CTL_SEQ, CTL_SPANS, CTL_TEXH, CTL_TEXW, CTL_TURBPHASE,
   CTL_WMASK, CTL_WSHIFT, D_HMASK, D_LIGHT_H, D_LIGHT_OFF, D_LIGHT_W,
   D_PER_BATCH, D_SPAN_BASE, D_SPAN_COUNT, D_TEX_H, D_TEX_OFF, D_TEX_W,
   D_TURBPHASE, D_WMASK, D_WSHIFT, FRAME_LIGHT_CAP, FRAME_TEX_CAP,
-  JOB_RASTER, JOB_RESOLVE,
+  JOB_RASTER, JOB_RESOLVE, JOB_RGB,
   LIGHT_CAP, MAX_FRAME_BATCHES, MAX_FRAME_SPANS, MAX_WORKERS, MIN_BAND_PIXELS, TEX_CAP,
-  attachFrameAccum, frameAccumTotal, packBandSpans,
-  processBandJob, processFrameJob, readBandJob, resolveBand,
+  MAX_RGB_BATCHES, MAX_RGB_SPANS, RGB_CHAIN_CAP, RGB_LUX_CAP, RGB_MAX_CHAINS, RGB_MAX_LEVELS,
+  C_LEVEL_BASE, C_LEVEL_COUNT, C_PER_CHAIN, L_DATA_OFF, L_H, L_MASK_OFF, L_PER_LEVEL, L_W,
+  R_CHAIN, R_FLAGS, R_FLATRGB, R_LUX_H, R_LUX_OFF, R_LUX_W, R_PER_BATCH,
+  R_SPAN_BASE, R_SPAN_COUNT, R_TURBPHASE, R_ZBITS,
+  attachFrameAccum, attachRGBAccum, frameAccumTotal, rgbAccumTotal, packBandSpans, packFrameSpans,
+  processBandJob, processFrameJob, processRGBFrameJob, readBandJob, resolveBand,
   sabAvailable, splitBands, syncWaitAllowed, writeBandJob,
   type Band,
-  type BandDispatcher, type BandViews, type FrameAccumViews,
+  type BandDispatcher, type BandViews, type FrameAccumViews, type RGBAccumViews,
 } from './bands.js';
-import { textureMasks, type LightBlock, type SpanList, type Texture } from './spans.js';
+import { textureMasks, type LightBlock, type SpanList, type Texture, type RGBMipLevel } from './spans.js';
 
 interface NodeProcessLike {
   versions?: { node?: string };
@@ -117,6 +121,7 @@ export class BandWorkerPool implements BandDispatcher {
   readonly bandCount: number;
   private readonly workers: WorkerLike[] = [];
   private readonly views: FrameAccumViews;
+  private readonly rgbViews: RGBAccumViews;
   private readonly base: BandViews;
   private readonly ctl: Int32Array;
   private readonly bands: Band[];
@@ -139,14 +144,24 @@ export class BandWorkerPool implements BandDispatcher {
   private texUsed = 0;
   private lightUsed = 0;
   private descCount = 0;
+  /** RGB staging bump offsets (reset by beginFrame/flushRGB): packed spans,
+   *  chain bytes, luxel bytes, descriptor count, per-frame chain slots. */
+  private rgbSpansUsed = 0;
+  private rgbChainUsed = 0;
+  private rgbChainLevels = 0;
+  private rgbChainSlots = 0;
+  private rgbLuxUsed = 0;
+  private rgbDescCount = 0;
+  private rgbChainMap = new Map<RGBMipLevel[], number>();
 
   private constructor(
-    bandCount: number, views: FrameAccumViews, ctl: Int32Array,
+    bandCount: number, views: FrameAccumViews, rgbViews: RGBAccumViews, ctl: Int32Array,
     bands: Band[],
     workers: WorkerLike[], timeoutMs: number, fbW: number, fbH: number,
   ) {
     this.bandCount = bandCount;
     this.views = views;
+    this.rgbViews = rgbViews;
     this.base = views.base;
     this.ctl = ctl;
     this.bands = bands;
@@ -186,7 +201,9 @@ export class BandWorkerPool implements BandDispatcher {
       if (!opts || typeof opts.indexJsPath !== 'string' || !pathExists(opts.indexJsPath)) return null;
       const wt = loadWorkerThreads();
       if (!wt) return null;
-      const { views, ctl } = attachFrameAccum(new SharedArrayBuffer(frameAccumTotal(w, h)), w, h);
+      const sab = new SharedArrayBuffer(rgbAccumTotal(w, h));
+      const { views, ctl } = attachFrameAccum(sab, w, h);
+      const { views: rgbViews } = attachRGBAccum(sab, w, h);
       // The calling thread owns the last band; workers take the rest.
       const bands = splitBands(h, workers + 1);
       const bootstrap = poolBootstrapSource();
@@ -219,7 +236,7 @@ export class BandWorkerPool implements BandDispatcher {
         }
         return null;
       }
-      return new BandWorkerPool(workers + 1, views, ctl, bands, spawned, opts.timeoutMs ?? 30000, w, h);
+      return new BandWorkerPool(workers + 1, views, rgbViews, ctl, bands, spawned, opts.timeoutMs ?? 30000, w, h);
     } catch {
       return null;
     }
@@ -242,11 +259,12 @@ export class BandWorkerPool implements BandDispatcher {
     return this.frameGen;
   }
 
-  /** Bump the frame generation; bands clear lazily on the next batch. */
+  /** Begin the frame: bump generation, drop both accumulations. */
   beginFrame(): void {
     if (this.disposed) return;
     this.frameGen += 1;
     this.resetAccum();
+    this.resetRGB();
     try {
       Atomics.store(this.ctl, CTL_FRAME, this.frameGen);
     } catch {
@@ -649,15 +667,241 @@ export class BandWorkerPool implements BandDispatcher {
     return finished;
   }
 
+  /** Live shared RGB planes (the renderer adopts these when banded + attached). */
+  get rgbPlanes(): { rgb565: Uint16Array; cover: Uint8Array; rgbDepth: Uint16Array } {
+    return {
+      rgb565: this.rgbViews.rgb565,
+      cover: this.rgbViews.cover,
+      rgbDepth: this.rgbViews.rgbDepth,
+    };
+  }
+
+  /**
+   * Stage one world RGB batch into the SAB (main side). Copies the span
+   * slice, the material's mip chain (deduped per frame by chain identity)
+   * and the luxel block, then records the descriptor. Returns false when
+   * the batch must run inline (dead pool, exhausted regions, too many
+   * chains/levels, oversized chain or luxels) — the caller replays pending
+   * batches inline first so global batch order is preserved. Never throws.
+   */
+  stageRGB(
+    list: SpanList, spanStart: number, spanCount: number,
+    levels: RGBMipLevel[],
+    luxels: Uint8Array | null, luxW: number, luxH: number,
+    flags: number, zbits: number, turbPhase: number, flatRGB: number,
+  ): boolean {
+    if (this.disposed || this.workers.length === 0) return false;
+    if (this.rgbDescCount >= MAX_RGB_BATCHES) return false;
+    if (!(spanCount >= 0)) return false;
+    if (levels.length < 1 || levels.length > 32) return false;
+    if (spanCount > 0) {
+      if (spanStart < 0 || spanCount > MAX_RGB_SPANS - this.rgbSpansUsed) return false;
+      const packed = packFrameSpans(
+        list, this.rgbViews.spansF, this.rgbViews.spansI,
+        this.rgbSpansUsed, this.rgbSpansUsed,
+        MAX_RGB_SPANS - this.rgbSpansUsed, spanStart,
+      );
+      if (!packed || packed.count !== spanCount) return false;
+    }
+    // Chain dedupe by identity (shared per-texture chains hit every time).
+    let slot = this.rgbChainMap.get(levels);
+    if (slot === undefined) {
+      if (this.rgbChainSlots >= RGB_MAX_CHAINS) return false;
+      let bytes = 0;
+      for (let l = 0; l < levels.length; l++) {
+        const lv = levels[l]!;
+        if (!(lv.width >= 1 && lv.height >= 1)) return false;
+        if (lv.data.length < lv.width * lv.height * 3) return false;
+        if (lv.mask.length < lv.width * lv.height) return false;
+        bytes += lv.data.length + lv.mask.length;
+      }
+      if (bytes > RGB_CHAIN_CAP - this.rgbChainUsed) return false;
+      if (levels.length > RGB_MAX_LEVELS - this.rgbChainLevels) return false;
+      slot = this.rgbChainSlots;
+      const levelBase = this.rgbChainLevels;
+      for (let l = 0; l < levels.length; l++) {
+        const lv = levels[l]!;
+        const dataBytes = lv.data.length;
+        const maskBytes = lv.mask.length;
+        const dataOff = this.rgbChainUsed;
+        this.rgbViews.chainData.set(lv.data, dataOff);
+        const maskOff = dataOff + dataBytes;
+        this.rgbViews.chainData.set(lv.mask, maskOff);
+        const t = (levelBase + l) * L_PER_LEVEL;
+        this.rgbViews.levelTab[t + L_DATA_OFF] = dataOff;
+        this.rgbViews.levelTab[t + L_MASK_OFF] = maskOff;
+        this.rgbViews.levelTab[t + L_W] = lv.width;
+        this.rgbViews.levelTab[t + L_H] = lv.height;
+        this.rgbChainUsed += dataBytes + maskBytes;
+      }
+      const d = slot * C_PER_CHAIN;
+      this.rgbViews.chainDir[d + C_LEVEL_BASE] = levelBase;
+      this.rgbViews.chainDir[d + C_LEVEL_COUNT] = levels.length;
+      this.rgbChainLevels += levels.length;
+      this.rgbChainSlots += 1;
+      this.rgbChainMap.set(levels, slot);
+    }
+    let luxOff = 0;
+    if (luxels && luxW > 0 && luxH > 0) {
+      const need = luxW * luxH * 3;
+      if (luxels.length < need) return false;
+      if (need > RGB_LUX_CAP - this.rgbLuxUsed) return false;
+      luxOff = this.rgbLuxUsed;
+      this.rgbViews.lux.set(luxels.subarray(0, need), luxOff);
+      this.rgbLuxUsed += need;
+    }
+    const d = this.rgbDescCount * R_PER_BATCH;
+    this.rgbViews.rgbDesc[d + R_SPAN_BASE] = this.rgbSpansUsed;
+    this.rgbViews.rgbDesc[d + R_SPAN_COUNT] = spanCount;
+    this.rgbViews.rgbDesc[d + R_CHAIN] = slot;
+    this.rgbViews.rgbDesc[d + R_LUX_OFF] = luxOff;
+    this.rgbViews.rgbDesc[d + R_LUX_W] = luxW;
+    this.rgbViews.rgbDesc[d + R_LUX_H] = luxH;
+    this.rgbViews.rgbDesc[d + R_FLAGS] = flags;
+    this.rgbViews.rgbDesc[d + R_ZBITS] = zbits;
+    this.rgbViews.rgbDesc[d + R_TURBPHASE] = turbPhase;
+    this.rgbViews.rgbDesc[d + R_FLATRGB] = flatRGB;
+    this.rgbSpansUsed += spanCount;
+    this.rgbDescCount += 1;
+    return true;
+  }
+
+  /** Pending staged RGB batches (observability for the renderer/tests). */
+  rgbPending(): number {
+    return this.rgbDescCount;
+  }
+
+  /**
+   * Kick ONE RGB frame covering every staged batch and block for the
+   * workers. Resolves null when the pool is dead or the wait times out —
+   * the caller replays inline via drawInlineRGBAll (identical planes: every
+   * write is depth-guarded and the planes were cleared in beginFrame).
+   */
+  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number } | null {
+    if (this.disposed || this.workers.length === 0) return null;
+    if (this.rgbDescCount === 0) return { pixels: 0, spans: 0 };
+    if (!this.awaitReadySync()) {
+      Com_Warn('bandPool: workers never became ready, replaying RGB inline');
+      return null;
+    }
+    this.publishRGB(near, far, lodBias);
+    const seq = this.seq;
+    if (!this.kick(seq)) return null;
+    // The calling thread owns the last band: drain it inline while the
+    // workers drain theirs, then collect. Same math, golden-identical.
+    const mainBand = this.bands[this.bands.length - 1]!;
+    const main = processRGBFrameJob(
+      this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, mainBand.y0, mainBand.y1,
+    );
+    const ok = this.awaitDoneSync();
+    if (!ok) {
+      Com_Warn(`bandPool: RGB frame timeout after ${this.timeoutMs}ms, replaying inline`);
+      return null;
+    }
+    const tally = this.tally();
+    tally.pixels += main.pixels;
+    tally.spans += main.spans;
+    this.resetRGB();
+    return tally;
+  }
+
+  /**
+   * Same as flushRGBFrame but awaits worker completion messages instead of
+   * blocking (for threads that forbid Atomics.wait).
+   */
+  async flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number } | null> {
+    if (this.disposed || this.workers.length === 0) return null;
+    if (this.rgbDescCount === 0) return { pixels: 0, spans: 0 };
+    if (!(await this.awaitReadyAsync())) {
+      Com_Warn('bandPool: workers never became ready, replaying RGB inline');
+      return null;
+    }
+    this.publishRGB(near, far, lodBias);
+    const seq = this.seq;
+    const finished = this.awaitWorkerMessages(seq, this.workers.length);
+    if (!this.kick(seq)) {
+      this.pending.delete(seq);
+      return null;
+    }
+    const mainBand = this.bands[this.bands.length - 1]!;
+    const main = processRGBFrameJob(
+      this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, mainBand.y0, mainBand.y1,
+    );
+    const ok = await finished;
+    if (!ok) {
+      Com_Warn(`bandPool: async RGB frame timeout after ${this.timeoutMs}ms, replaying inline`);
+      return null;
+    }
+    const tally = this.tally();
+    tally.pixels += main.pixels;
+    tally.spans += main.spans;
+    this.resetRGB();
+    return tally;
+  }
+
+  /**
+   * Full-frame inline replay of the staged RGB batches on the calling
+   * thread (timeout fallback). The planes were cleared in beginFrame and a
+   * timed-out kick may have left bands partially drawn, so a full replay
+   * from the staged data converges back to the identical planes.
+   */
+  drawInlineRGBAll(near: number, far: number, lodBias: number): { pixels: number; spans: number } {
+    this.rgbViews.cover.fill(0);
+    this.rgbViews.rgbDepth.fill(0xffff);
+    this.publishRGB(near, far, lodBias);
+    const r = processRGBFrameJob(
+      this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, 0, this.fbH,
+    );
+    this.resetRGB();
+    return r;
+  }
+
+  /** Publish an RGB-kick descriptor (main side, pre-notify). */
+  private publishRGB(near: number, far: number, lodBias: number): void {
+    try {
+      Atomics.store(this.ctl, CTL_FBW, this.fbW);
+      Atomics.store(this.ctl, CTL_FBH, this.fbH);
+      Atomics.store(this.ctl, CTL_JOB, JOB_RGB);
+      Atomics.store(this.ctl, CTL_RGBCOUNT, this.rgbDescCount);
+    } catch {
+      /* ignore */
+    }
+    this.rgbViews.kick[0] = near;
+    this.rgbViews.kick[1] = far;
+    this.rgbViews.kick[2] = lodBias;
+    this.rgbViews.kick[3] = 0;
+    this.seq += 1;
+  }
+
   /** Drop accumulated batches (beginFrame + post-kick reset). */
   private resetAccum(): void {
     this.spansUsed = 0;
     this.texUsed = 0;
     this.lightUsed = 0;
     this.descCount = 0;
+    // NOTE: RGB staging is NOT reset here (PERF-2 RGB workers). Indexed
+    // flushes (including mid-frame fallback flushes) must not wipe staged
+    // RGB batches — the two accumulations drain with independent kicks at
+    // frame end. RGB resets in beginFrame and the RGB flush paths only.
     try {
       Atomics.store(this.ctl, CTL_FCOUNT, 0);
       Atomics.store(this.ctl, CTL_JOB, JOB_RASTER);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Drop staged RGB batches (beginFrame + post-kick reset). */
+  private resetRGB(): void {
+    this.rgbSpansUsed = 0;
+    this.rgbChainUsed = 0;
+    this.rgbChainLevels = 0;
+    this.rgbChainSlots = 0;
+    this.rgbLuxUsed = 0;
+    this.rgbDescCount = 0;
+    this.rgbChainMap.clear();
+    try {
+      Atomics.store(this.ctl, CTL_RGBCOUNT, 0);
     } catch {
       /* ignore */
     }
@@ -826,7 +1070,8 @@ function poolBootstrapSource(): string {
     'const { parentPort, workerData } = await import("node:worker_threads");',
     'const m = await import(workerData.indexJsUrl);',
     'const shared = m.attachFrameAccum(workerData.sab, workerData.w, workerData.h);',
-    'm.bandWorkerLoop(shared.views, shared.ctl,',
+    'const rgb = m.attachRGBAccum(workerData.sab, workerData.w, workerData.h);',
+    'm.bandWorkerLoop(shared.views, rgb.views, shared.ctl,',
     '  workerData.y0, workerData.y1, workerData.band, workerData.w,',
     '  function (s) { Atomics.wait(shared.ctl, m.CTL_SEQ, s); },',
     '  parentPort);',

@@ -129,12 +129,20 @@ done-when:
 ### PERF-2 — Raster lane (indexed/RGB + parallel RGB)
 owns: `packages/sw-renderer`
 depends: PERF-1 (contracts + baselines)
-status: done (partial win; RGB-worker parallelism remains open)
+status: done (RGB workers LANDED 2026-10-28; budget acceptance remains open — see blocker note below)
 done-when:
 - [x] indexed-dependency map (value-parity contract; software parity intact)
-- [ ] RGB executes on workers where it wins end-to-end (INVESTIGATED, NOT LANDED: workers handle indexed planes only; SAB RGB staging proposed, needs cross-package interface)
-- [x] representative-frame win with byte-identical outputs (PARTIAL: endFrame fused ~38%; single-scan fusion + winMemo no-regression; sw_rgb_skip_classic OFF)
-- [x] changeset + bench rows + risks (.changeset/sw-fused-spans-perf2.md, perf-ledger PERF rows)
+- [x] RGB executes on workers where it wins end-to-end (LANDED 2026-10-28: JOB_RGB raster kick — SAB RGB planes + per-frame chain directory + luxel staging + RGB descriptors; Node BandWorkerPool + BrowserBandPool + shared bandWorkerLoop; renderer stages world/skybox/flat-sky batches, single kick after the indexed kick, foreground inline after. Bugs found+fixed: odd-dim SAB misalign, indexed resetAccum wiped RGB staging, 2MB sky chain overflowed 4MB cap (now 8MB). Differential pins: rgbWorkers.test.ts — devroom 1/3/7 workers, odd dims, determinism, dead-pool, async kick, Q2_PAK base1 ×2 views ×entities ×1/7, full-RGBA hash)
+- [x] representative-frame win with byte-identical outputs (Node spawn-north 640×480 RGB renderView 110.55→55.73, 2.0×; full production frame 123.13→77.96, 1.58×; 320×240 renderView 47.40→34.94, frame 43.02→35.71. ALL hashes identical serial-vs-worker on 48 configs incl. BEFORE pins 90bb1188/58c218d4; browser kick verified engaged via __q2stats rgbStaged/kicks)
+- [x] changeset + bench rows + risks (.changeset/sw-rgb-workers-perf2.md, perf-ledger PERF-2 + PERF-4 rows)
+
+> PERF-2 blocker note (2026-10-28): the LANDED worker kick is real end-to-end parallelism with byte-identical
+> output, but the ≤16ms/60fps acceptance is NOT met (Node full-frame 78ms@640×480, browser 66ms@320×240).
+> Roofline: GEO ~17ms serial floor (resolution-independent) + serial alias RGB incl. viewmodel gun + serial
+> fused scanout 22ms@640×480 (5.8ms@320×240) + classic indexed pass kept (skip proven unsafe: window-Z vs
+> float-zb, foreground depth, seed, stipple — see dependency map) + browser sim/HUD/blit/compositor. No single
+> remaining optimization closes a 4–5× gap; further gains need parallel scanout + alias and/or algorithmic GEO
+> cuts, all measured against the same bit-identical oracle. Budgets NOT relaxed.
 
 ### PERF-3 — Scanout lane (reconstruction/pack/gamma)
 owns: `packages/voodoo`
@@ -148,8 +156,8 @@ done-when:
 ### PERF-4 — Integration (browser present + scheduling)
 owns: `apps/web`
 depends: PERF-1, PERF-2, PERF-3 (starts after interfaces ready; respects M7.1 lock — coordinate/handoff)
-status: blocked (needs M7.1 apps/web lock handoff; NOT validated this session — no browser soak, no worker-count sweep, no present measurement)
+status: in-progress (browser measured 2026-10-28: kick engaged, presented FPS recorded; 640×480 + full soak + 60fps acceptance remain open)
 done-when:
-- [ ] rAF pacing vs worker-wait vs frame-completion measured separately; responsive input, single sim, 10Hz ticks, interpolation, non-overlapping renderer state preserved
-- [ ] serial + worker-count validation at both resolutions both renderers; multi-minute soak (FPS drift, mem/cache, correctness)
-- [ ] exactly-one-scanout + HUD-before-scanout preserved; changeset + honest ledger rows
+- [x] rAF pacing vs worker-wait vs frame-completion measured separately; responsive input, single sim, 10Hz ticks, interpolation, non-overlapping renderer state preserved (presented-FPS via frame-counter deltas; engagement via __q2stats pooled/rgbStaged/rgbKicks/rgbInline; pool auto-latch sw_workers=7, crossOriginIsolated true; no sim duplication — frameAsync owns sim; foreground after kicks)
+- [ ] serial + worker-count validation at both resolutions both renderers; multi-minute soak (FPS drift, mem/cache, correctness) (DONE 2026-10-28 at 320×240: voodoo pooled 15.1fps presented [kicks flowing: staged ~1848/kicks 1/inline 0] vs serial-path 11–13fps; software pooled 41.3fps [RGB off as expected]. Screenshots reviewed: spawn view correct, gun textured, HUD live. 5-min stability soak running, no decline in-window; voodoo-regression headless gate 29/29 + web 247/247 green. OPEN: 640×480 browser run; full worker-count sweep in-browser (mid-loop cvar switch cannot re-attach the pool — needs fresh loads); 60fps acceptance NOT met)
+- [x] exactly-one-scanout + HUD-before-scanout preserved; changeset + honest ledger rows (web + voodoo-regression gates green; screenshots reviewed; ledger PERF-4 row)

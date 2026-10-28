@@ -17,7 +17,9 @@ import {
   SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SUBDIV, SoftwareBackend, RGBWorldBackend,
   buildTurbTable,
   runSubdiv16, runSubdivTurbulent, runSpanFlat, sampleLightBlock, textureMasks,
-  type LightBlock, type RasterBackend, type RGBMaterial, type RGBWindow, type Span, type SpanList, type Texture,
+  runSubdivRGBRepeat, runSubdivRGBClamp, runSubdivRGBGeneric, runSpanFlatRGB,
+  rgbMipLevel,
+  type LightBlock, type RasterBackend, type RGBLightmap, type RGBMaterial, type RGBMipLevel, type RGBWindow, type Span, type SpanList, type Texture,
 } from './spans.js';
 import { COLORMAP_SIZE } from './colormap.js';
 
@@ -70,13 +72,24 @@ export const CTL_PIXELS = 13; // base; +MAX_WORKERS per-worker pixel counts
 export const CTL_SPANS = CTL_PIXELS + MAX_WORKERS; // base; +MAX_WORKERS span counts
 export const CTL_READY = CTL_SPANS + MAX_WORKERS; // workers entered the wait loop
 export const CTL_FCOUNT = CTL_READY + 1; // frame-accum descriptors for the current kick (0 = single-batch job)
-export const CTL_JOB = CTL_FCOUNT + 1; // kick type: 0 = rasterise, 1 = resolve (palette expand)
+export const CTL_JOB = CTL_FCOUNT + 1; // kick type: 0 = rasterise, 1 = resolve (palette expand), 2 = RGB raster
 export const CTL_FRAME = CTL_JOB + 1; // frame generation (lazy per-band clear)
-export const CTL_LEN = CTL_FRAME + 1;
+export const CTL_RGBCOUNT = CTL_FRAME + 1; // RGB descriptors for the current kick (JOB_RGB only)
+export const CTL_LEN = CTL_RGBCOUNT + 1;
 
-/** Kick types for CTL_JOB ( rasterise spans vs resolve the color plane). */
+/** Kick types for CTL_JOB ( rasterise spans vs resolve the color plane vs RGB rasterise). */
 export const JOB_RASTER = 0;
 export const JOB_RESOLVE = 1;
+/**
+ * RGB raster kick (PERF-2 RGB workers): every RGB descriptor staged this
+ * frame, drained by all bands in order. Workers write the shared RGB
+ * planes (rgb565/cover/rgbDepth); the main thread adopts the same views,
+ * so the serial clear in beginFrame + seed/composite stay valid. Output is
+ * bit-identical to the inline banded RGB path: bands are disjoint row
+ * ranges, descriptors run sequentially in pack order within a band, every
+ * write is depth-guarded, and dither/LOD use absolute screen coords.
+ */
+export const JOB_RGB = 2;
 
 /** Clamped worker/band count requested by the operator (0 = classic path). */
 export function workersRequestedByCvar(): number {
@@ -343,6 +356,175 @@ export function attachFrameAccum(
   };
 }
 
+// --- RGB worker staging (PERF-2 RGB workers) --------------------------------
+//
+// World RGB batches (opaque/turbulent world spans, textured skybox faces,
+// flat sky fills) are staged per frame into these SAB regions and drained by
+// ONE worker kick (JOB_RGB), in descriptor order per band. Foreground RGB
+// (alias, sprites, particles, tracers, translucent alpha) stays inline on
+// the calling thread after the kick (same ordering rule as the indexed
+// foreground deferral), so this staging covers exactly the serial DRAW bulk.
+//
+// Staging (main thread, per frame):
+// - Spans: copied from the emitted SpanList slice into rgbSpansF/I (a
+//   private bump region — never aliased with the indexed fSpansF/I, whose
+//   bump counters reset on indexed flushes mid-frame).
+// - Chains: each used RGBMaterial's mip levels copied ONCE per frame into
+//   the chain bump region (deduped by the stager via chain identity), with a
+//   directory entry per chain + per-level (offset, w, h). Base1's working
+//   set (~2.4MB) fits RGB_CHAIN_CAP with headroom; overflow falls back to
+//   the inline path (identical output).
+// - Luxels: per-batch RGB luxel blocks copied into the lux bump region.
+// - Descriptors: one fixed-size record per batch (span range, chain slot,
+//   luxel range, packed flags). Only repeat/clamp-addressed opaque materials
+//   are staged (the world + sky materials); anything else runs inline.
+// Workers resolve chain levels as subarray views (no copy) and run the same
+// subdiv cores as the serial path (runSubdivRGBRepeat/Clamp/Generic,
+// runSpanFlatRGB) with absolute screen coords, so dither phase, LOD,
+// band seams and same-row order are bit-identical to serial.
+//
+// Planes (rgb565/cover/rgbDepth) live in the SAB when pooled (adopted by
+// the renderer like idx/zb/color) and are cleared serially in beginFrame —
+// no lazy-clear generation protocol, no worker-side clearing.
+
+/** Bump-region cap for per-frame staged RGB mip chains (base1 ~2.4MB
+ * world + ~2MB skybox strip; the packed sky strip is the in-engine case
+ * the indexed path refuses to stage — RGB stages it, so the cap covers
+ * both with headroom. Overflow falls back to the inline path). */
+export const RGB_CHAIN_CAP = 8 * 1024 * 1024;
+/** Bump-region cap for per-frame staged RGB luxel blocks (live frames). */
+export const RGB_LUX_CAP = 2 * 1024 * 1024;
+/** Max RGB batches staged per frame kick (live gameplay opens more surfaces than frozen benchmarks). */
+export const MAX_RGB_BATCHES = 4096;
+/** Max chains addressable per frame (directory). */
+export const RGB_MAX_CHAINS = 256;
+/** Max mip levels addressable per frame (level table). */
+export const RGB_MAX_LEVELS = 2048;
+
+/** Int32 fields per RGB batch descriptor. */
+export const R_SPAN_BASE = 0; // base into rgbSpansF/I
+export const R_SPAN_COUNT = 1; // packed span count
+export const R_CHAIN = 2; // chain directory slot
+export const R_LUX_OFF = 3; // byte offset into the lux region
+export const R_LUX_W = 4;
+export const R_LUX_H = 5;
+export const R_FLAGS = 6; // bitmask (see R_FLAG_* below)
+export const R_ZBITS = 7;
+export const R_TURBPHASE = 8;
+export const R_FLATRGB = 9; // packed 0xRRGGBB (valid when R_FLAG_FLAT)
+export const R_PER_BATCH = 10;
+
+/** R_FLAGS bits. */
+export const R_FLAG_WARP = 1; // turbulent water (generic effect path)
+export const R_FLAG_BILINEAR = 2; // vd_bilinear point-sample off when clear
+export const R_FLAG_MIPDITHER = 4; // single-TMU mip dithering
+export const R_FLAG_OVERBRIGHT = 8; // x2 modulate + clamp
+export const R_FLAG_DEPTHWRITE = 16; // depth writes (always set for staged)
+/** Addressing is repeat (world); clear = clamp (skybox). */
+export const R_FLAG_REPEAT = 32;
+/** Staged batch carries an RGB luxel block (clear = unlit, e.g. sky). */
+export const R_FLAG_LIGHT = 64;
+/** SPAN_FLAT solid fill (flatColor in R_FLATRGB). */
+export const R_FLAG_FLAT = 128;
+
+/** Int32 fields per chain directory entry. */
+export const C_LEVEL_BASE = 0; // base into the level table
+export const C_LEVEL_COUNT = 1;
+export const C_PER_CHAIN = 2;
+
+/** Int32 fields per level table entry. */
+export const L_DATA_OFF = 0; // byte offset of RGB triplets in the chain region
+export const L_MASK_OFF = 1; // byte offset of the opacity mask in the chain region
+export const L_W = 2;
+export const L_H = 3;
+export const L_PER_LEVEL = 4;
+
+/** Max flat-packed RGB spans per frame (mirrors MAX_FRAME_SPANS; live frames exceed frozen-benchmark counts). */
+export const MAX_RGB_SPANS = 131072;
+
+export interface RGBAccumLayout {
+  total: number;
+  rgb565Off: number;
+  coverOff: number;
+  rgbDepthOff: number;
+  spansFOff: number;
+  spansIOff: number;
+  chainOff: number;
+  chainDirOff: number;
+  levelOff: number;
+  luxOff: number;
+  rgbDescOff: number;
+  kickOff: number; // Float64 kick params (near, far, lodBias)
+}
+
+/** Byte layout of the RGB worker regions appended after frameAccumTotal. */
+export function rgbAccumLayout(w: number, h: number): RGBAccumLayout {
+  const n = Math.max(1, Math.floor(w) * Math.floor(h));
+  const base = (frameAccumTotal(w, h) + 7) & ~7;
+  const rgb565Off = base;
+  const coverOff = rgb565Off + n * 2;
+  const rgbDepthOff = (coverOff + n + 1) & ~1;
+  const spansFOff = (rgbDepthOff + n * 2 + 7) & ~7;
+  const spansIOff = spansFOff + MAX_RGB_SPANS * F_PER_SPAN * 8;
+  const chainOff = spansIOff + MAX_RGB_SPANS * I_PER_SPAN * 4;
+  const chainDirOff = chainOff + RGB_CHAIN_CAP;
+  const levelOff = chainDirOff + RGB_MAX_CHAINS * C_PER_CHAIN * 4;
+  const luxOff = levelOff + RGB_MAX_LEVELS * L_PER_LEVEL * 4;
+  const rgbDescOff = luxOff + RGB_LUX_CAP;
+  const kickOff = (rgbDescOff + MAX_RGB_BATCHES * R_PER_BATCH * 4 + 7) & ~7;
+  const total = kickOff + 4 * 8;
+  return {
+    total, rgb565Off, coverOff, rgbDepthOff, spansFOff, spansIOff,
+    chainOff, chainDirOff, levelOff, luxOff, rgbDescOff, kickOff,
+  };
+}
+
+/** Total SAB bytes for a pool backing planes + frame-accum + RGB regions. */
+export function rgbAccumTotal(w: number, h: number): number {
+  return rgbAccumLayout(w, h).total;
+}
+
+export interface RGBAccumViews {
+  rgb565: Uint16Array;
+  cover: Uint8Array;
+  rgbDepth: Uint16Array;
+  spansF: Float64Array;
+  spansI: Int32Array;
+  chainData: Uint8Array;
+  chainDir: Int32Array;
+  levelTab: Int32Array;
+  lux: Uint8Array;
+  rgbDesc: Int32Array;
+  /** Per-kick float params: [near, far, lodBias, reserved]. */
+  kick: Float64Array;
+}
+
+/** Attach RGB worker views to a SAB sized by rgbAccumTotal(w, h). */
+export function attachRGBAccum(
+  sab: SharedArrayBuffer, w: number, h: number,
+): { views: RGBAccumViews } {
+  const n = Math.max(1, Math.floor(w) * Math.floor(h));
+  const layout = rgbAccumLayout(w, h);
+  if (sab.byteLength < layout.total) {
+    Com_Error('drop', `attachRGBAccum: SAB ${sab.byteLength} < ${layout.total} for ${w}x${h}`);
+  }
+  return {
+    views: {
+      rgb565: new Uint16Array(sab, layout.rgb565Off, n),
+      cover: new Uint8Array(sab, layout.coverOff, n),
+      rgbDepth: new Uint16Array(sab, layout.rgbDepthOff, n),
+      spansF: new Float64Array(sab, layout.spansFOff, MAX_RGB_SPANS * F_PER_SPAN),
+      spansI: new Int32Array(sab, layout.spansIOff, MAX_RGB_SPANS * I_PER_SPAN),
+      chainData: new Uint8Array(sab, layout.chainOff, RGB_CHAIN_CAP),
+      chainDir: new Int32Array(sab, layout.chainDirOff, RGB_MAX_CHAINS * C_PER_CHAIN),
+      levelTab: new Int32Array(sab, layout.levelOff, RGB_MAX_LEVELS * L_PER_LEVEL),
+      lux: new Uint8Array(sab, layout.luxOff, RGB_LUX_CAP),
+      rgbDesc: new Int32Array(sab, layout.rgbDescOff, MAX_RGB_BATCHES * R_PER_BATCH),
+      kick: new Float64Array(sab, layout.kickOff, 4),
+    },
+  };
+}
+
 /** Serialize the raster-relevant spans of a batch into flat SAB staging. */
 export function packBandSpans(
   list: SpanList, F: Float64Array, I: Int32Array,
@@ -353,17 +535,19 @@ export function packBandSpans(
 /**
  * Offset-capable packer (single-batch and frame-accum share this loop, so
  * both pack paths produce identical flat data). Appends at (fBase, iBase),
- * refuses when the batch would exceed cap spans past the base.
+ * refuses when the batch would exceed cap spans past the base. `start`
+ * skips the first spans (RGB staging packs an emitted slice of the shared
+ * pool); defaults to 0 (whole list, the indexed path).
  */
 export function packFrameSpans(
   list: SpanList, F: Float64Array, I: Int32Array,
-  fBase: number, iBase: number, cap: number,
+  fBase: number, iBase: number, cap: number, start = 0,
 ): { count: number; est: number } | null {
   const spans = list.spans;
   const total = list.count < spans.length ? list.count : spans.length;
   let p = 0;
   let est = 0;
-  for (let i = 0; i < total; i++) {
+  for (let i = start; i < total; i++) {
     const s = spans[i]!;
     if (s.kind !== SPAN_OPAQUE && s.kind !== SPAN_TURBULENT && s.kind !== SPAN_FLAT) continue;
     if (p >= cap) return null; // oversize -> inline fallback
@@ -542,6 +726,298 @@ export function processBandJob(v: BandViews, job: BandJob): { pixels: number; sp
   );
 }
 
+// --- worker-side RGB raster core (PERF-2 RGB workers) ------------------------
+//
+// rasterizePackedRGBRange mirrors drawSpansRGB (spans.ts) op-for-op over
+// flat-packed spans: same kind dispatch, clip, skip-adjusted perspective
+// start, per-span LOD (rgbMipLevel over the packed dudy/dvdy), the same
+// hot-opaque vs effect-path split, and the same subdiv cores with the same
+// arguments. The ONLY additions are the y-range band filter and the
+// material resolved from staged SAB data instead of a JS object — both
+// provably output-neutral (bands partition rows; the material views alias
+// the identical bytes). Differentially pinned vs the serial path
+// (rgbWorkers.test.ts: worker kick vs inline banded vs serial).
+
+/** Worker-resolved RGB material (views into SAB staging, no copies). */
+export interface RGBWorkerMaterial {
+  levels: RGBMipLevel[];
+  light: RGBLightmap | null;
+  overbright: boolean;
+  lodBias: number;
+  mipDither: boolean;
+  bilinear: boolean;
+  zbits: number;
+  blend: 'opaque';
+  alpha: number;
+  warp: boolean;
+  turbPhase: number;
+  flatColor: Uint8Array | null;
+  depthWrite: boolean;
+  repeat: boolean;
+}
+
+/** Adapt a worker material to the shared RGBMaterial shape (subdiv input). */
+export function workerMaterialToRGB(m: RGBWorkerMaterial): RGBMaterial {
+  return {
+    levels: m.levels,
+    addressS: m.repeat ? 'repeat' : 'clamp',
+    addressT: m.repeat ? 'repeat' : 'clamp',
+    light: m.light,
+    overbright: m.overbright,
+    lodBias: m.lodBias,
+    mipDither: m.mipDither,
+    bilinear: m.bilinear,
+    zbits: m.zbits,
+    blend: m.blend,
+    alpha: m.alpha,
+    warp: m.warp,
+    turbPhase: m.turbPhase,
+    flatColor: m.flatColor,
+    alphaTest: null,
+    depthWrite: m.depthWrite,
+  };
+}
+
+const rgbTurbTable = buildTurbTable();
+
+/**
+ * Draw one band's share of flat-packed RGB spans [start, start+count).
+ * Mirrors drawSpansRGB exactly (same order, same args, same chaining).
+ */
+export function rasterizePackedRGBRange(
+  rgb565: Uint16Array, cover: Uint8Array, rgbDepth: Uint16Array,
+  fbW: number, fbH: number,
+  spansF: Float64Array, spansI: Int32Array, start: number, count: number,
+  mat: RGBMaterial,
+  repeat: boolean,
+  warp: boolean,
+  turbPhase: number,
+  winNear: number, winFar: number,
+  y0: number, y1: number,
+): { pixels: number; spans: number } {
+  const levels = mat.levels;
+  if (levels.length < 1) {
+    Com_Error('error', 'rasterizePackedRGBRange: material has no mip levels');
+  }
+  const maxLevel = levels.length - 1;
+  const win = matWin;
+  win.near = winNear;
+  win.far = winFar;
+  let pixels = 0;
+  let drawn = 0;
+  for (let i = start; i < start + count; i++) {
+    const q = i * I_PER_SPAN;
+    const kind = spansI[q]!;
+    const y = spansI[q + 1]!;
+    const origX0 = spansI[q + 2]!;
+    const origX1 = spansI[q + 3]!;
+    const turb = spansI[q + 4]!;
+    if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT && kind !== SPAN_FLAT) {
+      Com_Error('error', 'rasterizePackedRGBRange: unsupported span kind in RGB worker kick');
+    }
+    if (y < y0 || y >= y1) continue;
+    if (y < 0 || y >= fbH) continue;
+    let x0 = origX0, x1 = origX1;
+    if (x0 < 0) x0 = 0;
+    if (x1 > fbW) x1 = fbW;
+    const n = x1 - x0;
+    if (n <= 0) continue;
+    if (kind === SPAN_FLAT) {
+      const fc = mat.flatColor;
+      if (!fc) {
+        Com_Error('error', 'rasterizePackedRGBRange: FLAT span without flatColor');
+      }
+      const o = i * F_PER_SPAN;
+      runSpanFlatRGB(rgb565, cover, rgbDepth, y * fbW + x0, n,
+        spansF[o]! + spansF[o + 1]! * (x0 - origX0), spansF[o + 1]!,
+        fc[0]!, fc[1]!, fc[2]!, mat.depthWrite, win, mat.zbits);
+      pixels += n;
+      drawn++;
+      continue;
+    }
+    const o = i * F_PER_SPAN;
+    const sDiz = spansF[o + 1]!;
+    const sDuz = spansF[o + 3]!;
+    const sDvz = spansF[o + 5]!;
+    const sDlu = spansF[o + 10]!;
+    const skip = x0 - origX0;
+    let iz = spansF[o]! + sDiz * skip;
+    let uz = spansF[o + 2]! + sDuz * skip;
+    let vz = spansF[o + 4]! + sDvz * skip;
+    let lux = spansF[o + 8]! + sDlu * skip;
+    const sLv = spansF[o + 9]!;
+    let u0 = uz / iz, v0 = vz / iz;
+    const sDudy = spansF[o + 11]!;
+    const sDvdy = spansF[o + 12]!;
+    const dudx = (sDuz - u0 * sDiz) / iz;
+    const dvdx = (sDvz - v0 * sDiz) / iz;
+    let rho = dudx < 0 ? -dudx : dudx;
+    const avd = dvdx < 0 ? -dvdx : dvdx;
+    if (avd > rho) rho = avd;
+    const audy = sDudy < 0 ? -sDudy : sDudy;
+    if (audy > rho) rho = audy;
+    const avdy = sDvdy < 0 ? -sDvdy : sDvdy;
+    if (avdy > rho) rho = avdy;
+    const spanLod = rgbMipLevel(rho, mat.lodBias, maxLevel);
+    const useWarp = kind === SPAN_TURBULENT && warp;
+    let oo = y * fbW + x0;
+    let remaining = n;
+    let xRun = x0;
+    if (!useWarp) {
+      while (remaining > 0) {
+        const m = remaining >= SUBDIV ? SUBDIV : remaining;
+        let r: { iz: number; lux: number; u1: number; v1: number };
+        if (repeat) {
+          r = runSubdivRGBRepeat(
+            rgb565, cover, rgbDepth, oo, m, xRun, y,
+            iz, sDiz, uz, sDuz, vz, sDvz, u0, v0, lux, sDlu, sLv,
+            mat, spanLod, maxLevel, win);
+        } else {
+          r = runSubdivRGBClamp(
+            rgb565, cover, rgbDepth, oo, m, xRun, y,
+            iz, sDiz, uz, sDuz, vz, sDvz, u0, v0, lux, sDlu, sLv,
+            mat, spanLod, maxLevel, win);
+        }
+        iz = r.iz;
+        lux = r.lux;
+        uz += sDuz * m;
+        vz += sDvz * m;
+        u0 = r.u1;
+        v0 = r.v1;
+        oo += m;
+        xRun += m;
+        remaining -= m;
+      }
+    } else {
+      const turbT = rgbTurbTable;
+      while (remaining > 0) {
+        const m = remaining >= SUBDIV ? SUBDIV : remaining;
+        const r = runSubdivRGBGeneric(
+          rgb565, cover, rgbDepth, oo, m, xRun, y,
+          iz, sDiz, uz, sDuz, vz, sDvz, u0, v0, lux, sDlu, sLv,
+          mat, spanLod, maxLevel, 'opaque', 256, turbT,
+          (turbPhase + turb) & (turbT.length - 1),
+          win);
+        iz = r.iz;
+        lux = r.lux;
+        uz += sDuz * m;
+        vz += sDvz * m;
+        u0 = r.u1;
+        v0 = r.v1;
+        oo += m;
+        xRun += m;
+        remaining -= m;
+      }
+    }
+    pixels += n;
+    drawn++;
+  }
+  return { pixels, spans: drawn };
+}
+
+/** Reused window record for the worker RGB core (workers are single-threaded). */
+const matWin: RGBWindow = { near: 4, far: 32768 };
+
+/**
+ * Drain one band's share of an RGB frame kick: every RGB descriptor in
+ * order, each with its staged chain + luxels. Bands are disjoint row
+ * ranges so cross-band order cannot affect any pixel; within a band the
+ * descriptors run sequentially in pack order, exactly like the serial
+ * drawSpansRGB calls the staging replaced. Bit-identical to serial.
+ */
+export function processRGBFrameJob(
+  rgb: RGBAccumViews,
+  fbW: number, fbH: number, descCount: number,
+  y0: number, y1: number,
+): { pixels: number; spans: number } {
+  const near = rgb.kick[0]!;
+  const far = rgb.kick[1]!;
+  const lodBias = rgb.kick[2]!;
+  // Per-kick chain-slot -> level-view cache (subarray views, no copies).
+  const chainCache = new Map<number, RGBMipLevel[]>();
+  const levelFor = (slot: number): RGBMipLevel[] => {
+    const hit = chainCache.get(slot);
+    if (hit) return hit;
+    const d = slot * C_PER_CHAIN;
+    const levelBase = rgb.chainDir[d + C_LEVEL_BASE]!;
+    const levelCount = rgb.chainDir[d + C_LEVEL_COUNT]!;
+    const levels: RGBMipLevel[] = [];
+    for (let l = 0; l < levelCount; l++) {
+      const t = (levelBase + l) * L_PER_LEVEL;
+      const dataOff = rgb.levelTab[t + L_DATA_OFF]!;
+      const maskOff = rgb.levelTab[t + L_MASK_OFF]!;
+      const w = rgb.levelTab[t + L_W]!;
+      const h = rgb.levelTab[t + L_H]!;
+      levels.push({
+        data: rgb.chainData.subarray(dataOff, dataOff + w * h * 3),
+        width: w,
+        height: h,
+        mask: rgb.chainData.subarray(maskOff, maskOff + w * h),
+      });
+    }
+    chainCache.set(slot, levels);
+    return levels;
+  };
+  let pixels = 0;
+  let drawn = 0;
+  for (let b = 0; b < descCount; b++) {
+    const d = b * R_PER_BATCH;
+    const spanBase = rgb.rgbDesc[d + R_SPAN_BASE]!;
+    const spanCount = rgb.rgbDesc[d + R_SPAN_COUNT]!;
+    if (spanCount <= 0) continue;
+    const slot = rgb.rgbDesc[d + R_CHAIN]!;
+    const luxOff = rgb.rgbDesc[d + R_LUX_OFF]!;
+    const luxW = rgb.rgbDesc[d + R_LUX_W]!;
+    const luxH = rgb.rgbDesc[d + R_LUX_H]!;
+    const flags = rgb.rgbDesc[d + R_FLAGS]!;
+    const zbits = rgb.rgbDesc[d + R_ZBITS]!;
+    const turbPhase = rgb.rgbDesc[d + R_TURBPHASE]!;
+    const flatRGB = rgb.rgbDesc[d + R_FLATRGB]!;
+    const hasLight = (flags & R_FLAG_LIGHT) !== 0;
+    const hasFlat = (flags & R_FLAG_FLAT) !== 0;
+    const light: RGBLightmap | null = hasLight
+      ? {
+        samples: rgb.lux.subarray(luxOff, luxOff + luxW * luxH * 3),
+        luxW, luxH,
+      }
+      : null;
+    const flatColor = hasFlat
+      ? new Uint8Array([(flatRGB >> 16) & 255, (flatRGB >> 8) & 255, flatRGB & 255])
+      : null;
+    const mat: RGBMaterial = {
+      levels: levelFor(slot),
+      addressS: (flags & R_FLAG_REPEAT) !== 0 ? 'repeat' : 'clamp',
+      addressT: (flags & R_FLAG_REPEAT) !== 0 ? 'repeat' : 'clamp',
+      light,
+      overbright: (flags & R_FLAG_OVERBRIGHT) !== 0,
+      lodBias,
+      mipDither: (flags & R_FLAG_MIPDITHER) !== 0,
+      bilinear: (flags & R_FLAG_BILINEAR) !== 0,
+      zbits,
+      blend: 'opaque',
+      alpha: 1,
+      warp: (flags & R_FLAG_WARP) !== 0,
+      turbPhase,
+      flatColor,
+      alphaTest: null,
+      depthWrite: (flags & R_FLAG_DEPTHWRITE) !== 0,
+    };
+    const r = rasterizePackedRGBRange(
+      rgb.rgb565, rgb.cover, rgb.rgbDepth, fbW, fbH,
+      rgb.spansF, rgb.spansI, spanBase, spanCount,
+      mat,
+      (flags & R_FLAG_REPEAT) !== 0,
+      (flags & R_FLAG_WARP) !== 0,
+      turbPhase,
+      near, far,
+      y0, y1,
+    );
+    pixels += r.pixels;
+    drawn += r.spans;
+  }
+  return { pixels, spans: drawn };
+}
+
 /**
  * Rasterise one band's share of a frame kick: every descriptor in order,
  * each with its own staged (tex, light) setup. Bands are disjoint row
@@ -625,9 +1101,14 @@ export interface BandPort {
  * band, publishes per-band counts, and wakes the dispatcher. All shared
  * state lives in the SAB; `waitSeq` is injected so the same loop serves
  * Atomics.wait (Node) and waitAsync/message-driven (browser) dispatch.
+ *
+ * `rgb` carries the RGB worker views (null when the SAB predates the RGB
+ * regions — only pools created via rgbAccumTotal kick JOB_RGB, so a null
+ * here with a raster/resolve kick is fine; a JOB_RGB kick with null views
+ * is a loud Com_Error, never a silent fallback).
  */
 export function bandWorkerLoop(
-  fav: FrameAccumViews, ctl: Int32Array,
+  fav: FrameAccumViews, rgb: RGBAccumViews | null, ctl: Int32Array,
   y0: number, y1: number, band: number, fbW: number,
   waitSeq: (seq: number) => void,
   port: BandPort,
@@ -669,7 +1150,9 @@ export function bandWorkerLoop(
     // generation — clearing here would wipe the finished frame (the browser
     // doll-house: black world + surviving foreground). Freshness is owned by
     // raster kicks and main-thread full clears, never by the resolve.
-    if (frame !== lastFrame && job !== JOB_RESOLVE) {
+    // RGB kicks must never clear either: they run AFTER the indexed world
+    // kick whose planes the foreground seed still reads.
+    if (frame !== lastFrame && job !== JOB_RESOLVE && job !== JOB_RGB) {
       views.idx.fill(0, y0 * fbW, y1 * fbW);
       views.zb.fill(0, y0 * fbW, y1 * fbW);
       lastFrame = frame;
@@ -682,6 +1165,17 @@ export function bandWorkerLoop(
       const pal = fav.fPal;
       resolveBand(fav.fColor, pal, views.idx, y0, y1, fbWNow, fbHNow);
       r = { pixels: 0, spans: 0 };
+    } else if (job === JOB_RGB) {
+      // RGB raster kick (PERF-2 RGB workers): drain every staged RGB
+      // descriptor for this band. No lazy clear: beginFrame clears the RGB
+      // planes serially on the main thread (planes adopted, kick runs
+      // after), so every band starts clean without a parallel clear.
+      if (!rgb) {
+        Com_Error('error', 'bandWorkerLoop: JOB_RGB without RGB views');
+      }
+      r = processRGBFrameJob(
+        rgb, fbWNow, fbHNow, Atomics.load(ctl, CTL_RGBCOUNT), y0, y1,
+      );
     } else {
       const fcount = Atomics.load(ctl, CTL_FCOUNT);
       r = fcount > 0
@@ -751,6 +1245,37 @@ export interface BandDispatcher {
   resolveFrame(): boolean;
   /** Same as resolveFrame but message-driven (browser async completion). */
   resolveFrameAsync(): Promise<boolean>;
+
+  // --- RGB worker staging (PERF-2 RGB workers) ---
+  //
+  // World RGB batches (opaque/turbulent world spans, skybox faces, flat
+  // sky) stage here per frame and drain in ONE worker kick (JOB_RGB).
+  // Staging copies: spans (from the emitted SpanList slice), the material's
+  // mip chain (deduped per frame), and the luxel block. Only
+  // repeat/clamp-addressed opaque materials stage (the world + sky
+  // materials); foreground RGB stays inline after the kick.
+  /** Live shared RGB planes (adopted by the renderer when this pool is attached). */
+  readonly rgbPlanes: { rgb565: Uint16Array; cover: Uint8Array; rgbDepth: Uint16Array } | null;
+  /**
+   * Stage one world RGB batch (spans + chain + luxels + flags). Returns
+   * false when the batch must run inline immediately (no pool, regions
+   * exhausted, unsupported material) — the caller replays pending batches
+   * inline first so global batch order is preserved.
+   */
+  stageRGB(
+    list: SpanList, spanStart: number, spanCount: number,
+    levels: import('./spans.js').RGBMipLevel[],
+    luxels: Uint8Array | null, luxW: number, luxH: number,
+    flags: number, zbits: number, turbPhase: number, flatRGB: number,
+  ): boolean;
+  /** Pending staged RGB batches. */
+  rgbPending(): number;
+  /** Kick one RGB frame covering every staged batch (blocking). Null = replay inline. */
+  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number } | null;
+  /** Same as flushRGBFrame but message-driven (browser async completion). */
+  flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number } | null>;
+  /** Full-frame inline replay of the staged RGB batches (fallback). */
+  drawInlineRGBAll(near: number, far: number, lodBias: number): { pixels: number; spans: number };
 }
 
 const BAND_CHUNK = 4096;

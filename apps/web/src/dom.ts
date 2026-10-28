@@ -1174,12 +1174,30 @@ export function startPlayLoop(
     // Headless/browser-soak observability (no behavior change): publish the
     // loop's fps EMA + frame counter for CDP-driven measurement (the
     // in-canvas glyphs are not machine-readable). Single reused record, one
-    // store per frame, never allocated in steady state.
+    // store per frame, never allocated in steady state. Pool/RGB worker
+    // engagement rides along so soaks can verify the real worker path
+    // executes (staged batches + kicks per frame) instead of inferring it
+    // from a nonzero sw_workers value.
     try {
-      const g = globalThis as unknown as { __q2stats?: { fps: number; frame: number } };
-      const rec = g.__q2stats ?? (g.__q2stats = { fps: 0, frame: 0 });
+      const g = globalThis as unknown as {
+        __q2stats?: { fps: number; frame: number; pooled: boolean; rgbStaged: number; rgbKicks: number; rgbInline: number };
+      };
+      const rec = g.__q2stats ?? (g.__q2stats = { fps: 0, frame: 0, pooled: false, rgbStaged: 0, rgbKicks: 0, rgbInline: 0 });
       rec.fps = fps;
       rec.frame = frame;
+      try {
+        const ws = boot.refresh.testWorkerStats();
+        const rs = boot.refresh.testRGBWorkerStats();
+        rec.pooled = ws.pooled;
+        rec.rgbStaged = rs.staged;
+        rec.rgbKicks = rs.kicks;
+        rec.rgbInline = rs.inline;
+      } catch {
+        rec.pooled = false;
+        rec.rgbStaged = 0;
+        rec.rgbKicks = 0;
+        rec.rgbInline = 0;
+      }
     } catch {
       /* non-DOM/shimmed runtimes stay silent */
     }

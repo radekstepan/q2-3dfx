@@ -10,6 +10,7 @@
 import {
   CTL_SEQ,
   attachFrameAccum,
+  attachRGBAccum,
   bandWorkerLoop,
 } from '@q2/sw-renderer';
 
@@ -86,8 +87,10 @@ scope.onmessage = (ev: MessageEvent): void => {
   }
   if (init.voodoo !== undefined) latestVoodoo = init.voodoo;
   const shared = attachFrameAccum(init.sab, init.w, init.h);
+  const rgb = attachRGBAccum(init.sab, init.w, init.h);
   bandWorkerLoop(
     shared.views,
+    rgb.views,
     shared.ctl,
     init.y0,
     init.y1,

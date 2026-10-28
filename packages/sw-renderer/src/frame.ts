@@ -32,6 +32,8 @@ import { WasmSpanBackend, wasmRequestedByCvar } from './wasmSpans.js';
 import {
   BandedSoftwareBackend, createBandBuffers, sabAvailable, workersRequestedByCvar,
   accumRequestedByCvar,
+  R_FLAG_BILINEAR, R_FLAG_DEPTHWRITE, R_FLAG_FLAT, R_FLAG_LIGHT,
+  R_FLAG_MIPDITHER, R_FLAG_OVERBRIGHT, R_FLAG_REPEAT, R_FLAG_WARP,
   type BandDispatcher,
 } from './bands.js';
 import {
@@ -409,6 +411,27 @@ export class SoftwareRenderer implements Refresh {
    */
   private rgbDepth16: Uint16Array = new Uint16Array(0);
   /**
+   * Renderer-owned RGB plane backups (init-sized): attachWorkerPool
+   * repoints the live fields at pool SAB views; detach/disable restores
+   * these so the serial clear never writes a dead pool's buffer.
+   */
+  private rgbOwned565: Uint16Array = new Uint16Array(0);
+  private rgbOwnedCover: Uint8Array = new Uint8Array(0);
+  private rgbOwnedDepth: Uint16Array = new Uint16Array(0);
+  /**
+   * RGB inline-rest latch (PERF-2 RGB workers): once an RGB batch goes
+   * inline in a staged frame (staging miss, unsuitable material), the
+   * deferred RGB kick must never run — its planes already hold inline
+   * writes. Every later world RGB batch goes inline and the final flush
+   * finds nothing pending. Depth-guarded convergence: identical output.
+   * Reset per frame in beginFrame (pooled path).
+   */
+  private rgbInlineRest = false;
+  /** RGB worker observability counters (reset per frame in beginFrame). */
+  private rgbStagedBatches = 0;
+  private rgbInlineBatches = 0;
+  private rgbKicks = 0;
+  /**
    * EndFrame resolve scratch only (expanded from rgb565 where covered).
    * Nothing blends against it mid-frame.
    */
@@ -629,6 +652,9 @@ export class SoftwareRenderer implements Refresh {
     this.rgbCover = new Uint8Array(fb.width * fb.height);
     this.rgbDepth16 = new Uint16Array(fb.width * fb.height);
     this.rgbColor = new Uint32Array(fb.width * fb.height);
+    this.rgbOwned565 = this.rgb565;
+    this.rgbOwnedCover = this.rgbCover;
+    this.rgbOwnedDepth = this.rgbDepth16;
     this.rgbBackend.attach(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
     this.pickSkyIndex();
     for (let i = 0; i < MAX_SPANS; i++) this.pool.push(createSpan());
@@ -737,10 +763,17 @@ export class SoftwareRenderer implements Refresh {
    * the renderer adopts the pool's shared planes (zero copy); the pool must
    * have been created for this W×H or the attach is ignored. Unsuitable
    * batches still run inline, so output stays bit-identical either way.
+   * RGB planes are adopted alongside the indexed planes when the pool
+   * exposes them (PERF-2 RGB workers); the serial beginFrame clear then
+   * owns them exactly like the renderer-owned buffers.
    */
   attachWorkerPool(pool: BandDispatcher | null): void {
     this.bandBackend.dispatcher = pool;
-    if (pool && pool.planes && this.isWorkersActive()) {
+    if (!pool) {
+      this.restoreOwnedRGBPlanes();
+      return;
+    }
+    if (pool.planes && this.isWorkersActive()) {
       const p = pool.planes;
       if (p.idx.length === this.fbW * this.fbH && p.zb.length === this.fbW * this.fbH &&
         p.color.length === this.fbW * this.fbH &&
@@ -749,6 +782,15 @@ export class SoftwareRenderer implements Refresh {
         this.zb = p.zb;
         this.color = p.color;
         this.bandBackend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
+        const rp = pool.rgbPlanes;
+        if (rp && rp.rgb565.length === this.fbW * this.fbH &&
+          rp.cover.length === this.fbW * this.fbH &&
+          rp.rgbDepth.length === this.fbW * this.fbH &&
+          rp.rgb565.buffer === rp.cover.buffer) {
+          this.rgb565 = rp.rgb565;
+          this.rgbCover = rp.cover;
+          this.rgbDepth16 = rp.rgbDepth;
+        }
       }
     }
   }
@@ -762,6 +804,29 @@ export class SoftwareRenderer implements Refresh {
       spans: this.bandBackend.spansDrawn,
       pixels: this.bandBackend.pixelsDrawn,
     };
+  }
+
+  /**
+   * Observability for RGB worker execution (PERF-2): batches staged for
+   * the worker kick vs batches drawn inline, and worker kicks completed,
+   * since the last beginFrame. `staged` counts batches routed to the pool;
+   * `inline` counts world batches drawn inline (unpooled or fallback);
+   * `kicks` counts completed RGB kicks (sync or async). A pooled Voodoo
+   * frame shows staged > 0 and kicks > 0; serial shows staged = kicks = 0.
+   * Read-only, zero behavior change.
+   */
+  testRGBWorkerStats(): { staged: number; inline: number; kicks: number } {
+    return {
+      staged: this.rgbStagedBatches,
+      inline: this.rgbInlineBatches,
+      kicks: this.rgbKicks,
+    };
+  }
+
+  /** Pending staged RGB batches (observability for the browser soak). */
+  testRGBPending(): number {
+    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    return pool ? pool.rgbPending() : 0;
   }
 
   private enableBanded(n: number): void {
@@ -786,6 +851,22 @@ export class SoftwareRenderer implements Refresh {
         this.color = this.hostFb.color;
         this.backend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
       }
+      this.restoreOwnedRGBPlanes();
+    }
+  }
+
+  /**
+   * Restore the renderer-owned RGB planes after a pool detach (adoption in
+   * attachWorkerPool repoints the live fields at SAB views; the owned
+   * buffers stay allocated and are simply re-adopted here).
+   */
+  private restoreOwnedRGBPlanes(): void {
+    if (this.rgbOwned565.length === this.fbW * this.fbH &&
+      this.rgbOwnedCover.length === this.fbW * this.fbH &&
+      this.rgbOwnedDepth.length === this.fbW * this.fbH) {
+      this.rgb565 = this.rgbOwned565;
+      this.rgbCover = this.rgbOwnedCover;
+      this.rgbDepth16 = this.rgbOwnedDepth;
     }
   }
 
@@ -1132,6 +1213,151 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
+   * Stage one world RGB batch for the worker kick (PERF-2 RGB workers).
+   * Only opaque, depth-writing world materials stage (the world + sky
+   * materials: repeat or uniform-clamp addressing, always with a mip
+   * chain); everything else (including any future translucent world use)
+   * runs inline. Returns true when staged; false means the caller must
+   * draw inline (no pool, inline-rest latch, staging miss, unsupported
+   * material). On the first miss with batches already pending, pending
+   * work replays inline first so global batch order is preserved, then
+   * the rest of the frame stays inline (rgbInlineRest). All writes stay
+   * depth-guarded: identical output either way. Never throws.
+   */
+  private stageRGBSpans(list: SpanList, mat: RGBMaterial): boolean {
+    this.rgbUsedThisFrame = true;
+    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    if (!pool || this.rgbInlineRest) {
+      this.drawRGBSpans(list, mat);
+      return false;
+    }
+    if (mat.blend !== 'opaque' || !mat.depthWrite) {
+      this.drawInlineRGBRest(list, mat);
+      return false;
+    }
+    const repeatS = mat.addressS === 'repeat';
+    const repeatT = mat.addressT === 'repeat';
+    if (repeatS !== repeatT) {
+      this.drawInlineRGBRest(list, mat);
+      return false;
+    }
+    let flags = 0;
+    if (mat.warp) flags |= R_FLAG_WARP;
+    if (mat.bilinear !== false) flags |= R_FLAG_BILINEAR;
+    if (mat.mipDither) flags |= R_FLAG_MIPDITHER;
+    if (mat.overbright) flags |= R_FLAG_OVERBRIGHT;
+    flags |= R_FLAG_DEPTHWRITE;
+    if (repeatS) flags |= R_FLAG_REPEAT;
+    let luxels: Uint8Array | null = null;
+    let luxW = 0, luxH = 0;
+    if (mat.light) {
+      luxels = mat.light.samples;
+      luxW = mat.light.luxW;
+      luxH = mat.light.luxH;
+      if (!(luxW > 0 && luxH > 0) || luxels.length < luxW * luxH * 3) {
+        this.drawInlineRGBRest(list, mat);
+        return false;
+      }
+      flags |= R_FLAG_LIGHT;
+    }
+    let flatRGB = 0;
+    if (mat.flatColor) {
+      if (mat.flatColor.length < 3) {
+        this.drawInlineRGBRest(list, mat);
+        return false;
+      }
+      flags |= R_FLAG_FLAT;
+      flatRGB = ((mat.flatColor[0]! & 255) << 16) | ((mat.flatColor[1]! & 255) << 8) | (mat.flatColor[2]! & 255);
+    }
+    const count = list.count < list.spans.length ? list.count : list.spans.length;
+    const ok = pool.stageRGB(
+      list, 0, count, mat.levels, luxels, luxW, luxH,
+      flags, mat.zbits, mat.turbPhase, flatRGB,
+    );
+    if (!ok) {
+      this.drawInlineRGBRest(list, mat);
+      return false;
+    }
+    this.rgbStagedBatches++;
+    return true;
+  }
+
+  /**
+   * Inline fallback for a world RGB batch that could not stage: replay any
+   * pending staged work inline first (ordering), draw this batch inline,
+   * and latch the rest of the frame inline (the deferred kick must not
+   * wipe these direct plane writes). Identical output via depth-guarded
+   * convergence.
+   */
+  private drawInlineRGBRest(list: SpanList, mat: RGBMaterial): void {
+    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    if (pool && pool.rgbPending() > 0) {
+      const q = pool.drawInlineRGBAll(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
+      this.rgbBackend.spansDrawn += q.spans;
+      this.rgbBackend.pixelsDrawn += q.pixels;
+    }
+    this.rgbInlineRest = true;
+    this.rgbInlineBatches++;
+    this.drawRGBSpans(list, mat);
+  }
+
+  /**
+   * Complete the staged RGB frame (blocking): one worker kick, tallied
+   * into the RGB backend counters for observability. Timeout/pool failure
+   * replays inline via the dispatcher (identical). No-op without staged
+   * work or once the inline-rest latch tripped. Frame stats intentionally
+   * track the classic path only, so counters here are observability-only.
+   */
+  private flushRGB(): void {
+    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    if (!pool || this.rgbInlineRest || pool.rgbPending() === 0) return;
+    const r = pool.flushRGBFrame(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
+    if (r) {
+      this.rgbBackend.spansDrawn += r.spans;
+      this.rgbBackend.pixelsDrawn += r.pixels;
+      this.rgbKicks++;
+      return;
+    }
+    const q = pool.drawInlineRGBAll(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
+    this.rgbBackend.spansDrawn += q.spans;
+    this.rgbBackend.pixelsDrawn += q.pixels;
+  }
+
+  /**
+   * Same as flushRGB but message-driven (browser async completion: no
+   * Atomics.wait on the calling thread). Falls back to inline replay.
+   */
+  private async flushRGBAsync(): Promise<void> {
+    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    if (!pool || this.rgbInlineRest || pool.rgbPending() === 0) return;
+    const r = await pool.flushRGBFrameAsync(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
+    if (r) {
+      this.rgbBackend.spansDrawn += r.spans;
+      this.rgbBackend.pixelsDrawn += r.pixels;
+      this.rgbKicks++;
+      return;
+    }
+    const q = pool.drawInlineRGBAll(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
+    this.rgbBackend.spansDrawn += q.spans;
+    this.rgbBackend.pixelsDrawn += q.pixels;
+  }
+
+  /**
+   * World RGB batch route (PERF-2 RGB workers): stage for the worker kick
+   * when pooled, draw inline otherwise. Foreground RGB always uses
+   * drawRGBSpans directly (inline after the kick completes).
+   */
+  private drawWorldRGBSpans(list: SpanList, mat: RGBMaterial): void {
+    const pooled = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    if (pooled) {
+      this.stageRGBSpans(list, mat);
+      return;
+    }
+    this.rgbInlineBatches++;
+    this.drawRGBSpans(list, mat);
+  }
+
+  /**
    * Seed the packed RGB565 plane from the indexed framebuffer (palette
    * expand + 8:8:8 -> 565 quantise) before any RGB foreground/alpha draws.
    * Alpha/additive RGB composites read the STORED 565 quantum as their
@@ -1307,6 +1533,7 @@ export class SoftwareRenderer implements Refresh {
       // A new frame stages from empty regions: the deferred inline-rest
       // latch from any previous frame must not leak into this one.
       this.bandBackend.deferredInlineRest = false;
+      this.rgbInlineRest = false;
     } else {
       this.idx.fill(0);
       this.zb.fill(0);
@@ -1322,6 +1549,9 @@ export class SoftwareRenderer implements Refresh {
     this.rgbBackend.spansDrawn = 0;
     this.rgbBackend.pixelsDrawn = 0;
     this.rgbUsedThisFrame = false;
+    this.rgbStagedBatches = 0;
+    this.rgbInlineBatches = 0;
+    this.rgbKicks = 0;
     if (rgbWorldEnabled) {
       this.rgbBackend.attach(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
       this.rgbCover.fill(0);
@@ -1593,7 +1823,7 @@ export class SoftwareRenderer implements Refresh {
           this.backend.drawSpans(this.spanList, texView, lightView);
         }
         if (this.rgbOverlayActive()) {
-          this.drawRGBSpans(this.spanList, this.rgbMaterialForFlatSky());
+          this.drawWorldRGBSpans(this.spanList, this.rgbMaterialForFlatSky());
         }
         if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = 0;
@@ -1714,7 +1944,7 @@ export class SoftwareRenderer implements Refresh {
         this.backend.drawSpans(this.spanList, tex, lb);
       }
       if (rgbMat) {
-        this.drawRGBSpans(this.spanList, rgbMat);
+        this.drawWorldRGBSpans(this.spanList, rgbMat);
       }
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
@@ -1736,6 +1966,19 @@ export class SoftwareRenderer implements Refresh {
       this.bandBackend.accumEnabled && !this.bandBackend.flushDeferred) {
       if (ph) pt = phaseNow();
       this.bandBackend.flushAccum();
+      if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
+    }
+    // RGB worker kick (PERF-2): drain staged world RGB batches before any
+    // direct RGB plane write. The foreground seed reads the indexed planes
+    // (finished above) and writes rgb565 for uncovered pixels; foreground
+    // RGB draws inline after it. Unpooled / nothing staged / inline-rest:
+    // no-op, batches already drew inline. Deferred in the async path (the
+    // async driver awaits flushRGBAsync after the indexed kick instead —
+    // a blocking kick here would serialize the browser main thread).
+    if (this.rgbUsedThisFrame &&
+      !(this.backend === this.bandBackend && this.bandBackend.flushDeferred)) {
+      if (ph) pt = phaseNow();
+      this.flushRGB();
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
     }
     candidatePixels = this.backend.pixelsDrawn - pixelsBase;
@@ -2137,6 +2380,11 @@ export class SoftwareRenderer implements Refresh {
     }
     if (banded && banded.dispatcher && banded.accumEnabled) {
       await banded.flushAccumAsync();
+    }
+    // RGB worker kick (message-driven): staged world RGB batches drain
+    // before the foreground seed + inline foreground RGB draws below.
+    if (this.rgbUsedThisFrame) {
+      await this.flushRGBAsync();
     }
     // World kick complete (planes valid) — now the direct plane writes.
     const fgCam = this.fgCam;
@@ -2572,7 +2820,7 @@ export class SoftwareRenderer implements Refresh {
         this.backend.drawSpans(this.spanList, texView, lightView);
       }
       if (skyMat) {
-        this.drawRGBSpans(this.spanList, skyMat);
+        this.drawWorldRGBSpans(this.spanList, skyMat);
       }
       this.spanList.count = 0;
       const batch = endCount - start;
