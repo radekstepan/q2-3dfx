@@ -7,6 +7,8 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
+> **Current direction (2026-10-28): execute GPU-PROOF-1–5 in §8. The CPU
+> optimization campaign is paused. Prove a small WebGL2 renderer before expanding it.**
 
 ---
 
@@ -14,7 +16,7 @@
 
 1. `corepack enable && yarn install`
 2. `yarn turbo run build typecheck test --filter=...[origin/main]`
-3. Pick **one** task card from §8 (or from a task list pasted in-session) that is `status: ready`.
+3. Follow the current-direction queue first. Pick **one** task card from §8 (or from a task list pasted in-session) that is `status: ready`.
    Claim it by setting `status: in-progress` + your agent id.
 4. Work **only inside the packages listed in that card's `owns:` field.**
 5. Before you finish: `yarn verify` must be green, and you must add a changeset (`yarn changeset`).
@@ -42,14 +44,20 @@ Rebuild Quake II so that it:
 
 - **Renders in software.** Faithful port of `ref_soft` — 8-bit palettised framebuffer, 64-level
   colormap shading, perspective-correct spans subdivided every 16 pixels, surface cache,
-  edge/span rasteriser, affine alias models. No GPU required.
+  edge/span rasteriser, affine alias models. Preserve this CPU-only reference/fallback;
+  do not require a GPU for its Node tests or change its goldens for the new backend.
 - **Renders in "3dfx Voodoo 3 3000" mode.** Emulation of `ref_gl`-on-Voodoo3: RGB565 + 4×4
   ordered dither, 2×2 "22-bit" post filter, bilinear, mip LOD with mip-dithering, 64-entry
   table fog, LOD bias, 256×256 max texture size, 16-bit depth, ~1.3 Glide gamma lift.
   Full checklist + cvars: `docs/renderers.md`. RGB mip sampling scales UVs
   into the picked level (`1/(1<<lvl)`); alias tracks the shared `vd_lodbias`
   (`ALIAS_LOD_BIAS_DELTA = 0`, reassessed post-fix — see VOODOO-REPAIR-2 note).
-- **Runs in a browser** at ≥60 fps at 640×480, and in Node for headless tests.
+- **Adds a WebGL2 browser backend** for fast gameplay with a reviewed Voodoo-style
+  appearance. This is an authorized independent renderer, not a replacement for
+  the software reference. Cross-backend pixel identity is not assumed (see §8).
+- **Targets ≥60 fps at 640×480 in a hardware-backed browser** through the new
+  backend. Preserve Node headless software testing. CPU performance goals remain
+  recorded, but are not prerequisites for the WebGL2 proof.
 - **Plays shareware map end to end** (`base1`): movement, collision, doors, buttons, lifts,
   triggers, items, two monster types, three weapons.
 
@@ -84,6 +92,11 @@ host ← {server, client} · apps/web ← host
 - **Nothing** imports from `apps/*`.
 - `sw-renderer` must not import `dom` types; it writes into a handed `ArrayBuffer`.
 - `voodoo` is a post-process + sampling policy, not a second renderer.
+- Authorized addition: `packages/webgl-renderer`, a browser GPU renderer with an
+  explicit injected WebGL2 context; only this backend and browser integration may
+  depend on browser graphics types. Keep sw-renderer/math/bsp/renderer-api DOM-free.
+  Reuse lower-level assets/math/BSP and shared policy; never import apps/web.
+  Add the package/dependency rules explicitly when implemented; do not bypass checks.
 
 ---
 
@@ -95,7 +108,10 @@ host ← {server, client} · apps/web ← host
   is a float of seconds; never use wall-clock in game logic.
 - **Texture mapping:** `u = dot(p, texinfo.s)/scale + s_off` in *texels*. Lightmap luxels are every
   **16 texels**. Keep the `LUXEL = 16` constant in `@q2/math`.
-- **Colour:** software path never leaves 8-bit until resolve. Voodoo path rasters
+- **Colour:** the following exact rules apply to the existing CPU reference. The new
+  GPU backend follows the explicit fidelity contract in GPU-PROOF-1, with reviewed
+  tolerances for documented rasterization differences.
+  Software path never leaves 8-bit until resolve. Voodoo path rasters
   authoritatively to RGB565 + window-Z (16-bit depth) planes and scanout
   reconstructs from that target (matched `2x2sub+2x2box` by default; `vd_16bit=0`
   is an RGB888 debug bypass). No path uses floats per channel in the inner loop.
@@ -189,7 +205,7 @@ A task card looks like this (same shape for §8 cards and any list pasted in-ses
 ### M7.1 — Web app shell
 owns: `apps/web`
 depends: M6.1
-status: ready            # ready | in-progress(@agent) | review | done
+status: ready            # ready | in-progress(@agent) | review | done | paused | blocked
 done-when:
 - [ ] 60 fps at 640×480 software on the bench machine
 ```
@@ -216,7 +232,10 @@ Rules for **any** card, whether from §8 or pasted in:
     suggested changeset text, and does NOT commit. The integrator runs `yarn verify` +
     bench on the merged tree, writes the changesets + ledger rows, ticks the boxes, and
     commits. Full protocol: `docs/process.md` §12.
-10. Pasted lists are authoritative for the session: `status: ready` = eligible,
+10. `paused` cards are not eligible until explicitly resumed or their card-specific
+    authorized activation condition passes; `blocked` cards record
+    the concrete missing prerequisite. Never treat either as done.
+11. Pasted lists are authoritative for the session: `status: ready` = eligible,
     `depends:` must be `done` before starting, update `status`/`done-when` in place.
 
 Spawn prompt: read BRAIN.md §§1–7 + the card; modify only `owns:`; follow §4–§5 exactly —
@@ -231,41 +250,124 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ## 8. Active tasks (everything else is DONE — see `docs/tasks-archive.md`)
 
-### Performance follow-through — authoritative queue after review of `4631ca2` (2026-10-28)
+### Current direction — bounded WebGL2 proof, then conditional expansion
 
-These cards supersede stale performance completion claims below and in `TASK.md`.
-Existing RGB-authoritative rendering, true band subranges, shared ESM/CJS config,
-RGB-first preparation and exact model/gun worker rasterization must be preserved.
-The recorded 48.84 ms Node combat frame is NOT a controlled commit speedup or
-browser acceptance. No new final-code browser soak has established 60 FPS.
+User decision (2026-10-28): prioritize a fast playable game with the Voodoo look.
+Stop the open-ended CPU optimization campaign. Preserve completed engine work and
+unfinished changes; do not delete or rewrite the software renderer. GPU-PROOF cards
+supersede contradictory CPU-only/no-GPU and “keep optimizing until accepted”
+instructions in older cards, TASK.md and process/performance documents for this work.
+The last documented controlled CPU comparison was 51.32 → 47.22 ms for Node combat;
+that result is useful but does not establish browser performance or a viable 16 ms path.
 
-Execution contract for this queue:
-- The integrator continuously selects eligible cards, delegates independent work to
-  subagents under §7, integrates, validates and commits, then picks the next card.
-  Do not stop after infrastructure, tests, a partial speedup, or one completed card.
-  No pushing. Preserve unrelated user changes. Subagents do not commit.
-- `ready` means unclaimed; ALL dependencies must be done before implementation.
-  A package has only one writer, including when multiple ready cards name it.
-  Integrator owns BRAIN.md, shared tracking, ledger and changesets; workers report
-  evidence to the integrator instead of editing shared tracking concurrently.
-  Assign/transfer ownership explicitly; ownership is not an external blocker.
-- Agree interfaces before dependent work; apply §5/§7 contract rules. A card owning
-  several packages may be split into disjoint subagent assignments with one owner
-  per package. Coordinate interface changes before parallel implementation.
-- Every card records four separate outcomes: implementation / correctness /
-  performance measurement / target acceptance, each with evidence or explicit N/A.
-  `done` requires every applicable done-when box and evidence links/commands.
-  Unit-test success is not proof of production wiring, race safety or speed.
-- Keep these cards and completion evidence here until PERF-NEXT-8 is done; then
-  archive together. Do not erase an unresolved checkbox by moving/rewording it.
-- Benchmarks run sequentially on a quiet machine. No lower resolution, disabled
-  effects/entities, changed goldens hiding differences, GPU replacement, relaxed
-  budgets, or mock-only production proof. Preserve full-RGBA and depth/coverage.
-- A failed performance gate is a failure, never success “by design”. If acceptance
-  fails, reopen/add a concrete optimization card and continue the profile/change/
-  compare loop. Only a genuine external blocker permits stopping: record the exact
-  missing resource, attempted remedies and dependent cards left open. Slow code,
-  package ownership and unfinished integration are not external blockers.
+Execution rules:
+- Implement GPU-PROOF-1–5, in order, autonomously with validated changesets/commits;
+  no push. Use subagents only for disjoint package ownership under §7. The integrator
+  owns BRAIN/docs/changesets and commits. Keep expensive measurements sequential.
+- First reconcile active agent ownership and preserve any in-flight/uncommitted CPU
+  work. Do not reset, stash away, overwrite or commit unrelated user changes. Do not
+  continue the old optimization backlog as a dependency of this proof.
+- Keep the prototype selectable/experimental; retain the working CPU default until
+  GPU-EXPAND-1 passes. Do not rewrite gameplay, asset parsing or the whole engine.
+- Use a few deep modules with small interfaces: scene preparation, GPU rendering,
+  appearance policy and software reference. Each owns its data/lifetime/invariants.
+  No generic graphics framework, backend-per-call wrappers, or speculative extraction
+  of all renderer internals before a real scene works.
+- Budget the proof by scope: one real base1 scene plus a moving/combat route, real
+  viewmodel, lightmaps and representative transparency. At most TWO measured
+  optimization iterations after the first complete GPU-PROOF-5 run. Record each
+  hypothesis and result. If the gate still fails, stop expansion and report a concrete
+  architectural recommendation; do not start another unlimited optimization queue.
+- Unit tests establish deterministic contracts. Actual shader compilation/draws,
+  GPU image tests and real-browser measurements establish GPU correctness/speed.
+  Mocks, synthetic triangles alone and software-emulated WebGL cannot close the gate.
+- Preserve durable commands, raw results, screenshots, build/commit identity and
+  machine/browser/graphics-backend identity. Hardware-backed browser access is a
+  real prerequisite for performance acceptance: if unavailable, finish independent
+  work, leave GPU-PROOF-5 blocked, and state exactly what environment is needed.
+- Keep implementation/correctness/performance/acceptance outcomes separate. A GPU
+  submission timer is not completed GPU work; report GPU timing separately where
+  supported and do not force GPU readbacks/finishes into the normal frame loop.
+
+### GPU-PROOF-1 — Preserve baseline and define fidelity contract
+owns: `docs`, `BRAIN.md`, `tools/bench`, `packages/testkit`
+depends: none
+status: ready
+done-when:
+- [ ] Record the actual starting commit and dirty files; preserve the software reference and available baseline evidence. Pause competing CPU agents via the authorized coordination mechanism or obtain a clean ownership handoff before editing overlapping files.
+- [ ] Define a fixed real base1 camera and a deterministic short movement/combat route with gun, lightmaps, dynamic light, opaque geometry and overlapping transparent surfaces. Reuse assets/gameplay rather than inventing a synthetic acceptance scene.
+- [ ] Write the GPU fidelity contract BEFORE implementation: exact asset/UV orientation, scene content, transforms, effect order and required cvar behavior; explicit tolerances for raster edges/depth ties and GPU sampling. Keep CPU-to-CPU parity exact.
+- [ ] Specify RGB565 quantization, dither phase, reconstruction, fog, mip/LOD policy, gamma and HUD placement. Explain that final-frame quantization does NOT reproduce RGB565 rounding between translucent draws; document the prototype's chosen approximation and test scenes. Do not claim hardware-accurate Voodoo emulation without an oracle.
+- [ ] Save CPU reference captures for fixed frames and define image-difference metrics/tolerances before seeing GPU results. Require visual review of gun, silhouettes, seams, fog and transparency; never auto-approve unexplained differences by loosening thresholds.
+- [ ] Fix performance acceptance before optimization: 640×480 internal resolution, normal fidelity, same real scene/route, hardware-backed browser; ≤16 ms median complete-frame work and ≥60 Hz-class completed-frame cadence (≥59 FPS on a nominal 60 Hz display), p95 frame interval ≤20 ms per workload. Record refresh rate/vsync and dropped frames. No CPU fallback counted as GPU success.
+
+### GPU-PROOF-2 — Minimal scene/backend boundary and resource ownership
+owns: `packages/renderer-api`, `packages/webgl-renderer`, `packages/config`, `apps/web`, `packages/testkit`, `docs`, build/dependency configuration (integrator)
+depends: GPU-PROOF-1
+status: ready
+done-when:
+- [ ] Agree and add the smallest necessary types in a separate interface-first commit; update §5 and major changeset if a frozen contract changes. Do not force a GPU backend to populate a CPU framebuffer or read pixels back every frame just to satisfy Refresh.
+- [ ] Scene preparation reuses asset handles, BSP/PVS and model data, exposing visible surfaces/transforms/material references; GPU input is persistent triangles/vertices, NOT CPU-generated scanline/pixel spans. Avoid per-frame rebuilding/uploading static geometry.
+- [ ] Establish explicit GPU resource lifetime: upload/update, resize, dispose and context loss/restoration. Browser glue owns canvas/context acquisition; GPU backend owns buffers, textures, programs and render targets. No DOM dependencies leak into CPU packages.
+- [ ] Add an experimental renderer selection and explicit capability/failure reporting; preserve CPU operation and Node tests. No silent CPU fallback during benchmarks.
+- [ ] Test scene selection/transforms/order and resource lifecycle invariants. Keep interfaces narrow; defer general-purpose abstractions until the real-scene proof needs them.
+
+### GPU-PROOF-3 — Render the representative scene on WebGL2
+owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
+depends: GPU-PROOF-2
+status: ready
+done-when:
+- [ ] Draw the real base1 world with textures/lightmaps, depth testing and culling from persistent GPU resources; batch by compatible material/state without changing transparent ordering.
+- [ ] Draw the real textured animated viewmodel and representative entities, preserving interpolation, gun depth handling, near clipping, dynamic light and transparent draw order needed by the route.
+- [ ] Integrate with existing gameplay/camera and HUD presentation. Verify movement/combat work and that GPU drawing does not still invoke CPU world span rasterization in parallel.
+- [ ] Actual browser integration tests compile production shaders and render the scene; check geometry/gun presence, occlusion and transparency. Frame capture/readback is allowed in tests, not normal rendering.
+- [ ] Record initial end-to-end browser timings now, before embellishment. Do not treat a blank/partial scene or unlit triangle benchmark as success.
+
+### GPU-PROOF-4 — Implement and validate the Voodoo appearance
+owns: `packages/webgl-renderer`, `packages/voodoo`, `apps/web`, `packages/testkit`
+depends: GPU-PROOF-3
+status: ready
+done-when:
+- [ ] Implement the GPU appearance contract from GPU-PROOF-1: required sampling/mip policy, fog, RGB565 quantization, ordered dither, reconstruction and gamma, with correct HUD ordering. Use render targets/shader passes; keep output resident on GPU through presentation.
+- [ ] Reuse or extract pure shared policy/constants only where useful; do not rewrite the CPU reference or couple it to WebGL. Explain any GPU-specific interpretation of existing cvars.
+- [ ] Unit-test deterministic math/policy and run real-GPU fixtures for ramps/dither phase, fog, mip transitions, transparent overlap and depth. Compare fixed real-scene captures using the predeclared tolerances.
+- [ ] Review captures side by side for textured gun, geometry, transparency, dark areas and minification. Report all approximation differences explicitly; if human sign-off is needed, leave that acceptance pending rather than inventing approval.
+
+### GPU-PROOF-5 — Measure the complete prototype and make the decision
+owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`, `BRAIN.md`
+depends: GPU-PROOF-4
+status: ready
+done-when:
+- [ ] Run CPU and GPU legs on the SAME hardware-backed browser/machine with matched scene/settings; record actual graphics backend, resolution, refresh rate and renderer selection. Software-emulated/headless results may supplement, never replace, hardware acceptance.
+- [ ] Warm up, then run ≥5 minutes including separately reported stationary, movement and combat intervals. Include simulation, scene prep, rendering, HUD and presentation; record cadence, p50/p95/p99, dropped frames, memory/resource growth, errors and visual captures.
+- [ ] Demonstrate substantial headroom relative to the CPU baseline and meet GPU-PROOF-1 performance/fidelity gates. Use completed-frame cadence plus available GPU timings; explain limits of browser presentation measurement. No gl.finish/readPixels per-frame benchmark trick or disabled effects.
+- [ ] If needed, make at most two targeted measured optimization iterations under explicit package ownership. Record rejected attempts too. If still failing, mark the gate failed/blocked, preserve the prototype and STOP expansion with findings and a recommendation.
+- [ ] Run integrated build/typecheck/tests/dependency checks and existing CPU regression gates; commit proof changes with changesets and evidence. Publish a go/no-go report with scope, fidelity differences, performance, remaining risks and commit hashes.
+- [ ] Set GPU-EXPAND-1 eligible ONLY after the proof passes. A completed report of failure does not satisfy that prerequisite. No automatic return to the CPU “optimize forever” campaign.
+
+### GPU-EXPAND-1 — Complete gameplay coverage only after successful proof
+owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`, `tools/bench`, `packages/config`, `docs`, `BRAIN.md`
+depends: GPU-PROOF-5 AND explicit recorded PASS of its performance/fidelity gates
+status: paused (automatically eligible when the proof gates pass; otherwise no expansion)
+done-when:
+- [ ] Create concrete owned cards for missing supported scene/effect classes and cvars (sky, water/warp, sprites, particles, beams, remaining models/lights as applicable), based on an inventory. No unmeasured whole-engine rewrite.
+- [ ] Verify full base1 gameplay and regression scenes, renderer switching, resize, context loss/restoration and explicit unsupported-device fallback; retain CPU reference/Node support.
+- [ ] Repeat the hardware-backed movement/combat acceptance after coverage expansion, with bounded memory and reviewed fidelity. Any remaining visual approximation is documented, not called bit-exact emulation.
+- [ ] Promote the GPU option/default only after complete coverage and acceptance; update UI descriptions and architecture docs accurately. Preserve the software option and its existing goldens.
+
+### Paused CPU campaign — historical evidence, not the current work queue
+
+PERF-NEXT-6/7/8 and PERF-FINISH-A/B/C are paused by the user-directed architecture
+pivot. Completed cards/evidence below remain useful. No unresolved CPU budget is
+being marked satisfied. Revisit CPU WASM/SIMD only as a separately authorized,
+bounded investigation if CPU-only performance becomes a product requirement again.
+
+### Previous CPU performance campaign (superseded execution policy)
+
+Preserve existing results and correctness fixes. The former instruction to keep
+optimizing until every CPU budget passes is withdrawn. GPU-PROOF above now governs
+work selection, stop conditions, fidelity and acceptance. Historical entries below
+are retained for traceability and do not authorize resuming paused work.
 
 ### PERF-NEXT-1 — Establish reproducible baseline and evidence storage
 owns: `tools/bench`, `packages/testkit`
@@ -370,13 +472,13 @@ residual: quarantine also clears indexed planes; post-quarantine seed reads them
 ### PERF-NEXT-6 — Optimize measured barriers and remaining frame cost
 owns: `packages/sw-renderer`, `packages/voodoo`, `apps/web`, `tools/bench`, `packages/testkit`
 depends: PERF-NEXT-3, PERF-NEXT-4, PERF-NEXT-5
-status: in-progress(@integrator — round 1 integrated 2026-10-29, gate NOT met, iterating)
+status: paused (superseded by GPU-PROOF queue; acceptance remains unresolved)
 done-when:
 - [ ] Audit all three foreground flush barriers now that exact model/gun work is staged. Combine ordered jobs where safe; retain only barriers required by actual inline/dependency boundaries. Measure kick overhead and tiny jobs; test mixed primitive order and fallback after any batching change.
 - [ ] Use measured per-band compute and idle time to select worker counts/band scheduling; do not assume seven workers is fastest. Compare production browser and Node with the same workload.
 - [ ] Profile and implement the largest remaining whole-frame reductions in RGB span shading/lightmaps, material/descriptor preparation, geometry emission, load imbalance and scanout. Historical GEO ~12–13 ms / DRAW ~34 ms / scanout ~7 ms are leads, not a current additive frame breakdown.
 - [ ] For each candidate record hotspot evidence, changed behavior, controlled before/after whole-frame results and fidelity checks. Reject/revert measured regressions; keep investigating the next hotspot. Exact arithmetic parallelism and justified CPU WASM/SIMD remain available; no GPU substitution.
-- [ ] Achieve the existing ≤16 ms production-frame gate at 640×480 under the defined acceptance workloads, with software unchanged or improved and normal Voodoo fidelity. Gate failure keeps this card open and triggers another concrete optimization iteration.
+- [ ] Achieve the existing ≤16 ms production-frame gate at 640×480 under the defined acceptance workloads, with software unchanged or improved and normal Voodoo fidelity. Historical target remains open; this paused card does not trigger further iterations.
 round-1 (2026-10-29, integrated — gate NOT met, card open):
 - cuts: sw-renderer dlight memo (cache rebuilds ~100→0/frame, GEO cache phase ~4.6–6.9→~3–4ms) + FG fusion (fgKicks 2→1, empty s47 kick gone, 2 RGB groups) + pooled scanout tables (scanout pooled med 6.74→5.78); voodoo serial fused tables (serial scanout 25→17.9, −28%); harness (GEO/kicks/A-B, `bench:ab`, sweep procedure); browser (kickStats probe halved, detach() serial leg, empty-flush elision pinned).
 - controlled pair (accept, sequential same box): base A 20.72 / B 123.97 / C 51.32 vs head A 20.58 / B 120.55 / C 47.22 (−8% C; parity PASS; hashes identical; budgets NOT relaxed).
@@ -389,17 +491,17 @@ evidence: `tools/bench/evidence/node-accept-5c2b8ec-2026-10-29T02-35-49.manifest
 ### PERF-NEXT-7 — Final-code browser acceptance and stability
 owns: `apps/web`, `tools/bench`, `packages/testkit`
 depends: PERF-NEXT-6
-status: ready
+status: paused (superseded by GPU-PROOF queue; acceptance remains unresolved)
 done-when:
 - [ ] Run a NEW ≥5-minute final-code 640×480 browser soak covering stationary, movement and combat with real assets/viewmodel, for software and Voodoo. Old 15 FPS stationary captures and Node tests cannot close this card.
 - [ ] Report completed-frame cadence (not rAF callbacks), frame-time percentiles, exact resolution/cvars, worker count, corrected execution/replay/fallback counters, timing diagnostics, memory/cache trends and screenshots/visual checks. Preserve raw samples and workload intervals.
 - [ ] Demonstrate ≥60 presented FPS for each representative workload with normal fidelity and no sustained decline, missing entities, incomplete frames or unexplained fallback. Distinguish browser/compositor conditions and include simulation, HUD and presentation costs.
-- [ ] If any target fails, leave acceptance open, feed the measured bottleneck back into PERF-NEXT-6 (or a new owned card), implement and repeat final-code validation. No “all tasks done except performance” completion.
+- [ ] CPU target remains unaccepted; further optimization/validation is paused in favor of GPU-PROOF. Do not restart this loop without resuming the card.
 
 ### PERF-NEXT-8 — Integrate, reconcile evidence and commit completion
 owns: `BRAIN.md`, `docs`, `.changeset` (integrator only)
 depends: PERF-NEXT-1, PERF-NEXT-2, PERF-NEXT-3, PERF-NEXT-4, PERF-NEXT-5, PERF-NEXT-6, PERF-NEXT-7
-status: ready
+status: paused (superseded by GPU-PROOF queue; acceptance remains unresolved)
 done-when:
 - [ ] Integrator reviews all code and runs yarn verify, yarn deps:check, real-asset base1-gate, Voodoo regression, focused recovery/model/counter/timing/config suites and full-frame acceptance on the integrated tree. Missing assets/skipped required gates are unresolved, not passes.
 - [ ] Preserve full-RGBA, RGB565/depth/coverage parity, odd dimensions, 0/1/3/7-worker coverage and software goldens; investigate every difference rather than repinning unexplained output.
@@ -412,7 +514,7 @@ done-when:
 ### PERF-FINISH-A — RGB-authoritative Voodoo + worker ranges + foreground (renderer)
 owns: `packages/sw-renderer`
 depends: VOODOO-REPAIR-2
-status: review
+status: paused (superseded by GPU-PROOF queue; acceptance remains unresolved)
 done-when:
 - [x] Voodoo production skips duplicate classic world+foreground by default with counters proving skipped work; software unchanged
 - [x] Indexed+RGB workers use true per-band span subranges (R_ORDERED/D_ORDERED staged proofs; workers binary-search owned subranges via lowerBoundRow, CTL_SCAN inspected counts; unordered/legacy full-scan fallback identical); 0/1/3/7 scaling measured
@@ -424,7 +526,7 @@ done-when:
 ### PERF-FINISH-B — browser critical path + acceptance (web)
 owns: `apps/web`
 depends: VOODOO-REPAIR-2
-status: in-progress
+status: paused (superseded by GPU-PROOF queue; acceptance remains unresolved)
 done-when:
 - [x] Per-stage browser critical path measured (sim/GEO/staging/raster/fg/scanout/blit/gaps), worker wait per band, fallback counts
 - [x] Representative 640x480 presented-FPS + 5-min soak on new code: 640×480 fresh-boot voodoo pooled-7 soak 66 samples/326s, presented med 15.00fps (cadence 15.00/s, monotonic), fgStaged 10/fgWorker 10/fgKicks 1 every sample (production FG worker proof NEW), rgbStaged 2071/kicks 1/inline 0, 0 fallbacks/quarantine, canvas row-reads full-frame paint, start/end screenshots pixel-identical (see perf-ledger). 60fps acceptance still OPEN (need ≤16.7ms; at ~4× over)
@@ -434,7 +536,7 @@ done-when:
 ### PERF-FINISH-C — trustworthy measurement (bench/testkit)
 owns: `tools/bench`, `packages/testkit`
 depends: VOODOO-REPAIR-2
-status: review
+status: paused (superseded by GPU-PROOF queue; acceptance remains unresolved)
 done-when:
 - [x] Quiet-machine parent-vs-HEAD controlled before/after, identical workloads (a7b753b vs HEAD, same command, sequential — see perf-ledger)
 - [x] Full-RGBA serial-vs-pooled raster+display parity (blue/alpha fail), RGB execution proof, Voodoo fallback races, fixed translucent test, sky+world same skip policy
