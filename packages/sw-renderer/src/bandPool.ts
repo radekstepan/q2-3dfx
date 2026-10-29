@@ -20,7 +20,7 @@ import {
   CTL_PIXELS, CTL_READY, CTL_RGBCOUNT, CTL_SEQ, CTL_SPANS, CTL_TEXH, CTL_TEXW, CTL_TURBPHASE,
   CTL_WMASK, CTL_WSHIFT, D_HMASK, D_LIGHT_H, D_LIGHT_OFF, D_LIGHT_W,
   D_PER_BATCH, D_SPAN_BASE, D_SPAN_COUNT, D_TEX_H, D_TEX_OFF, D_TEX_W,
-  D_TURBPHASE, D_WMASK, D_WSHIFT, FRAME_LIGHT_CAP, FRAME_TEX_CAP,
+  D_TURBPHASE, D_WMASK, D_WSHIFT, D_YMAX, D_YMIN, FRAME_LIGHT_CAP, FRAME_TEX_CAP,
   JOB_RASTER, JOB_RESOLVE, JOB_RGB, JOB_SCANOUT,
   LIGHT_CAP, MAX_FRAME_BATCHES, MAX_FRAME_SPANS, MAX_WORKERS, MIN_BAND_PIXELS, TEX_CAP,
   MAX_RGB_BATCHES, MAX_RGB_SPANS, RGB_CHAIN_CAP, RGB_LUX_CAP, RGB_MAX_CHAINS, RGB_MAX_LEVELS,
@@ -526,6 +526,22 @@ export class BandWorkerPool implements BandDispatcher {
     fv.desc[d + D_WMASK] = masks.wmask;
     fv.desc[d + D_HMASK] = masks.hmask;
     fv.desc[d + D_TURBPHASE] = phase;
+    // Worker-owned band-cull range (PERF-FINISH-A item B): one integer pass
+    // over this batch's staged spans at staging time. The emitter writes
+    // strictly increasing y, so this is a pure bound read; every worker
+    // then rejects non-overlapping descriptors BEFORE material/view setup
+    // with no rescan. Zero range would mean "unknown" (never staged here —
+    // spanCount > 0 always reaches this point).
+    let ymin = 0x7fffffff;
+    let ymax = -0x80000000;
+    for (let s = 0; s < spanCount; s++) {
+      const y = fv.fSpansI[(spanBase + s) * I_PER_SPAN + 1]!;
+      if (y < ymin) ymin = y;
+      if (y + 1 > ymax) ymax = y + 1;
+    }
+    if (!(ymax > ymin)) { ymin = 0; ymax = 0; }
+    fv.desc[d + D_YMIN] = ymin;
+    fv.desc[d + D_YMAX] = ymax;
     this.spansUsed += spanCount;
     this.texUsed += texBytes;
     this.lightUsed += lightBytes;

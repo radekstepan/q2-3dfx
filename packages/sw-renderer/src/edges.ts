@@ -64,11 +64,22 @@ export function projectClippedPoly(
   const ox = cam.origin[0]!, oy = cam.origin[1]!, oz = cam.origin[2]!;
   const f = cam.forward, r = cam.right, u = cam.up;
   // to view space (vx = right, vy = up, vz = forward depth)
+  // PERF-FINISH-A item D: track the all-inside case (every vert in front
+  // of the near plane) while transforming — the common case for world
+  // polys. The Sutherland-Hodgman clip below is an exact copy for
+  // all-inside polys (kept verts move with no arithmetic), so skipping it
+  // and projecting straight from the view + attribute scratch is
+  // bit-identical while saving a full copy/interp pass.
+  let allIn = true;
   for (let i = 0; i < n; i++) {
     const px = verts[i * 3]! - ox, py = verts[i * 3 + 1]! - oy, pz = verts[i * 3 + 2]! - oz;
-    scratch.view[i * 3] = px * r[0]! + py * r[1]! + pz * r[2]!;
-    scratch.view[i * 3 + 1] = px * u[0]! + py * u[1]! + pz * u[2]!;
-    scratch.view[i * 3 + 2] = px * f[0]! + py * f[1]! + pz * f[2]!;
+    const vx = px * r[0]! + py * r[1]! + pz * r[2]!;
+    const vy = px * u[0]! + py * u[1]! + pz * u[2]!;
+    const vz = px * f[0]! + py * f[1]! + pz * f[2]!;
+    scratch.view[i * 3] = vx;
+    scratch.view[i * 3 + 1] = vy;
+    scratch.view[i * 3 + 2] = vz;
+    if (vz < cam.near) allIn = false;
   }
   // near clip: keep vz >= near (Sutherland-Hodgman on view-space polygon,
   // interpolating uvs/lux linearly along cut edges)
@@ -79,18 +90,36 @@ export function projectClippedPoly(
     scratch.attrA[i * 4 + 2] = lux[i * 2]!;
     scratch.attrA[i * 4 + 3] = lux[i * 2 + 1]!;
   }
+  if (allIn) {
+    return projectViewScratch(
+      scratch.view, scratch.attrA, n, cam, width, height, scratch.poly,
+    );
+  }
   const count = clipNearPlane(
     scratch.view, scratch.attrA, n, near, scratch.clipped, scratch.attrB,
   );
   if (count < 3) return 0;
+  return projectViewScratch(
+    scratch.clipped, scratch.attrB, count, cam, width, height, scratch.poly,
+  );
+}
+
+/**
+ * Project view-space positions + attributes to screen space (the shared
+ * tail of projectClippedPoly): 1/z perspective divide, viewport reject.
+ * Pure function of its inputs — the all-inside fast path and the clipped
+ * path converge here with identical arithmetic, so output is identical.
+ */
+function projectViewScratch(
+  pos: Float32Array, attr: Float32Array, count: number,
+  cam: Camera, width: number, height: number,
+  inv: ProjectedVert[],
+): number {
   // project
-  const a = scratch.clipped;
-  const attr = scratch.attrB;
-  const inv = scratch.poly;
   let out = 0;
   for (let i = 0; i < count; i++) {
-    const vx = a[i * 3]!, vy = a[i * 3 + 1]!, vz = a[i * 3 + 2]!;
-    if (vz < near * 0.5) return 0; // safety: should not happen post-clip
+    const vx = pos[i * 3]!, vy = pos[i * 3 + 1]!, vz = pos[i * 3 + 2]!;
+    if (vz < cam.near * 0.5) return 0; // safety: should not happen post-clip
     const iz = 1 / vz;
     const uu = attr[i * 4]!, vv = attr[i * 4 + 1]!;
     const p = inv[out++]!;

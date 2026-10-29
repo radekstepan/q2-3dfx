@@ -10,7 +10,10 @@
 //   they replace on every fuzzed input.
 import { afterEach, describe, expect, it } from 'vitest';
 import { createFramebuffer } from '@q2/renderer-api';
-import { SoftwareRenderer, setRGBWorldEnabled } from './frame.js';
+import { resetCVars, setCVar } from '@q2/config';
+import {
+  SoftwareRenderer, setRGBWorldEnabled, SW_RGB_SKIP_CLASSIC_CVAR,
+} from './frame.js';
 import { createDevroom, DEVROOM_CAMERA } from './devroom.js';
 import {
   rgbPickMipLevel,
@@ -20,6 +23,7 @@ import {
 
 afterEach(() => {
   setRGBWorldEnabled(false);
+  resetCVars();
 });
 
 function fnvU8(a: Uint8Array): string {
@@ -105,12 +109,31 @@ describe('step-5 RGB output hash pin (byte-identical before/after)', () => {
     // bias-sensitive gutter collapse, so alias tracks the shared bias like
     // world). Devroom critter/world minified texels sample correctly;
     // index untouched.
+    // Authoritative-skip re-pin (was 58e0ecf1, now b952d9c5):
+    // PERF-FINISH-A item A makes the RGB overlay the production authority
+    // by default: classic world/foreground spanfill is elided where the RGB
+    // overlay drew, so the index plane keeps only uncovered pixels. The
+    // color pin above is UNCHANGED — covered pixels resolve from the RGB
+    // planes either way, which is the display-identity proof. The cvar-0
+    // oracle below pins the old index hash (classic always drew there).
     expect(a.colorHash).toBe('68b22dea');
-    expect(a.indexHash).toBe('58e0ecf1');
+    expect(a.indexHash).toBe('b952d9c5');
     // second frame is stable (cache hits serve identical color)
     const b = renderRGB160();
     expect(b.colorHash).toBe(a.colorHash);
     expect(b.indexHash).toBe(a.indexHash);
+  });
+
+  it('cvar-0 oracle preserves the pre-skip index plane (classic always drew)', () => {
+    setCVar(SW_RGB_SKIP_CLASSIC_CVAR, 0);
+    try {
+      const a = renderRGB160();
+      expect(a.cover).toBe(160 * 120);
+      expect(a.colorHash).toBe('68b22dea');
+      expect(a.indexHash).toBe('58e0ecf1');
+    } finally {
+      resetCVars();
+    }
   });
 });
 

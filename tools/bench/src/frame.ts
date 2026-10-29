@@ -15,7 +15,7 @@ import { loadBsp } from '@q2/bsp';
 import { parsePCX, parseWAL } from '@q2/formats';
 import { createFramebuffer } from '@q2/renderer-api';
 import { resetCVars, setCVar } from '@q2/config';
-import { machineJson } from '@q2/testkit';
+import { machineJson, hashColorFull } from '@q2/testkit';
 import {
   SoftwareRenderer, BandWorkerPool, bspToMiniWorld,
   SW_WORKERS_CVAR, SW_ACCUM_CVAR,
@@ -42,6 +42,10 @@ const require = createRequire(process.cwd() + '/');
  * Resolve the built @q2/sw-renderer ESM bundle (worker bootstrap source).
  * Goes through the workspace symlink (`main` is the CJS bundle; the ESM
  * bundle sits alongside it) so no relative-path surgery is needed.
+ * NOTE: `require` is used for PATH RESOLUTION ONLY (require.resolve never
+ * loads the module). Loading the CJS bundle would instantiate the second
+ * @q2/config store (see packages/testkit config-store.test.ts) — workers
+ * and all bench code must stay on the ESM graph (index.mjs below).
  */
 export function swRendererEsmPath(): string {
   const cjs = require.resolve('@q2/sw-renderer');
@@ -178,6 +182,8 @@ export interface PoolRow {
   ms: number;
   idxHash: string;
   colorHash: string;
+  /** Full-RGBA authority (the R+G colorHash is blind to blue/alpha). */
+  colorFull: string;
 }
 
 /** Pooled A/B for one view: classic vs per-batch vs frame-accum (pools disposed per mode). */
@@ -217,12 +223,12 @@ export async function poolCompareView(
     const g = r.getFramebuffer();
     out.push({
       view: view.label, mode, ms: median(times),
-      idxHash: hashIdx(g.index!), colorHash: hashColor(g.color),
+      idxHash: hashIdx(g.index!), colorHash: hashColor(g.color), colorFull: hashColorFull(g.color),
     });
     if (pool) await pool.dispose();
   }
   for (const row of out) {
-    console.log(`${row.view} ${row.mode}: ${row.ms.toFixed(2)}ms idx=${row.idxHash} color=${row.colorHash}`);
+    console.log(`${row.view} ${row.mode}: ${row.ms.toFixed(2)}ms idx=${row.idxHash} color=${row.colorHash} full=${row.colorFull}`);
   }
   return out;
 }

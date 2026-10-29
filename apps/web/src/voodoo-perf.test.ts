@@ -7,6 +7,7 @@
 // with sane output. Copy the console block into docs/perf-ledger.md.
 import { describe, expect, it, afterEach } from 'vitest';
 import { getCVarNumber, setCVar } from '@q2/config';
+import { SW_RGB_SKIP_CLASSIC_CVAR, skipClassicRequested } from '@q2/sw-renderer';
 import {
   applyRendererCvar,
   bootPlay,
@@ -44,6 +45,16 @@ function sandbox(): void {
   setCVar('r_brightness', 1.0);
   setCVar('cl_showfps', 0);
   setCVar('cl_showpos', 0);
+  // Classic oracle (PERF-FINISH-A defensive): frame stats intentionally track
+  // the classic path, which the authoritative RGB skip elides where the
+  // overlay drew. Pin the oracle so raster throughput stays measurable and
+  // comparable across skip defaults; resolved output is identical either
+  // way (covered pixels composite from the RGB planes in endFrame). Saved
+  // via the honest probe (never an absent-vs-0 leak) and restored above.
+  if (!SAVED.has(SW_RGB_SKIP_CLASSIC_CVAR)) {
+    SAVED.set(SW_RGB_SKIP_CLASSIC_CVAR, skipClassicRequested() ? 1 : 0);
+  }
+  setCVar(SW_RGB_SKIP_CLASSIC_CVAR, 0);
 }
 afterEach(() => {
   for (const [name, value] of SAVED) setCVar(name, value);

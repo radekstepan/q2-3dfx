@@ -18,7 +18,7 @@ import {
   attachFrameAccum, frameAccumTotal,
   D_PER_BATCH, D_SPAN_BASE, D_SPAN_COUNT,
   D_TEX_OFF, D_TEX_W, D_TEX_H, D_LIGHT_OFF, D_LIGHT_W, D_LIGHT_H,
-  D_WSHIFT, D_WMASK, D_HMASK, D_TURBPHASE,
+  D_WSHIFT, D_WMASK, D_HMASK, D_TURBPHASE, D_YMIN, D_YMAX,
   processFrameJob, F_PER_SPAN, I_PER_SPAN,
   R_FLAG_OPAQUE,
   type FrameAccumViews,
@@ -216,7 +216,7 @@ describe('item 2: per-band work ranges for the indexed frame kick', () => {
       views.fSpansI[q] = SPAN_OPAQUE; views.fSpansI[q + 1] = y;
       views.fSpansI[q + 2] = 0; views.fSpansI[q + 3] = W; views.fSpansI[q + 4] = 0;
     };
-    const putDesc = (b: number, base: number, count: number) => {
+    const putDesc = (b: number, base: number, count: number, ymin = 0, ymax = 0) => {
       const d = b * D_PER_BATCH;
       views.desc[d + D_SPAN_BASE] = base;
       views.desc[d + D_SPAN_COUNT] = count;
@@ -224,13 +224,15 @@ describe('item 2: per-band work ranges for the indexed frame kick', () => {
       views.desc[d + D_LIGHT_OFF] = 0; views.desc[d + D_LIGHT_W] = 1; views.desc[d + D_LIGHT_H] = 1;
       views.desc[d + D_WSHIFT] = 0; views.desc[d + D_WMASK] = 0; views.desc[d + D_HMASK] = 0;
       views.desc[d + D_TURBPHASE] = 0;
+      views.desc[d + D_YMIN] = ymin;
+      views.desc[d + D_YMAX] = ymax;
     };
     // Batch 0: rows 2..5. Batch 1: rows H-6..H-3. Batch 2: empty.
     for (let y = 2; y <= 5; y++) putSpan(y - 2, y);
-    putDesc(0, 0, 4);
+    putDesc(0, 0, 4, 2, 6);
     const H1 = H - 6;
     for (let y = H1; y <= H1 + 3; y++) putSpan(4 + (y - H1), y);
-    putDesc(1, 4, 4);
+    putDesc(1, 4, 4, H1, H1 + 4);
     putDesc(2, 8, 0);
     return { views, yA: 5, yB: H1 };
   }
@@ -245,6 +247,16 @@ describe('item 2: per-band work ranges for the indexed frame kick', () => {
       // Middle band holds no staged rows: zero work, no crash.
       expect(mid.spans).toBe(0);
       expect(mid.pixels).toBe(0);
+      // Staged bounds reject pre-setup: the middle band visits nothing,
+      // the side bands visit exactly their own batch.
+      expect(mid.descs).toBe(0);
+      expect(mid.spansStaged).toBe(0);
+      expect(lo.descs).toBe(1);
+      expect(lo.spansStaged).toBe(4);
+      expect(hi.descs).toBe(1);
+      expect(hi.spansStaged).toBe(4);
+      expect(full.descs).toBe(2);
+      expect(full.spansStaged).toBe(8);
       // Disjoint bands partition the work exactly.
       expect(lo.spans + hi.spans).toBe(full.spans);
       expect(lo.pixels + hi.pixels).toBe(full.pixels);
@@ -254,12 +266,88 @@ describe('item 2: per-band work ranges for the indexed frame kick', () => {
       const ref = { idx: views.base.idx.slice(), zb: views.base.zb.slice() };
       views.base.idx.fill(0);
       views.base.zb.fill(0);
-      processFrameJob(views, W, H, 3, 0, yA + 1);
-      processFrameJob(views, W, H, 3, yA + 1, yB);
-      processFrameJob(views, W, H, 3, yB, H);
+      const b0 = processFrameJob(views, W, H, 3, 0, yA + 1);
+      const b1 = processFrameJob(views, W, H, 3, yA + 1, yB);
+      const b2 = processFrameJob(views, W, H, 3, yB, H);
       expect(views.base.idx).toEqual(ref.idx);
       expect(views.base.zb).toEqual(ref.zb);
+      // Total visited across all bands: both batches visited exactly once
+      // each (middle band visited nothing); no per-worker rescan anywhere.
+      expect(b0.descs + b1.descs + b2.descs).toBe(2);
+      expect(b0.spansStaged + b1.spansStaged + b2.spansStaged).toBe(8);
     }
+  });
+
+  it('unknown (zero) ranges fall back to full visits with identical output', () => {
+    // Legacy / manual descriptors (e.g. an older browser pool that only
+    // writes the first 12 fields) carry ymin == ymax == 0: bands must NOT
+    // cull them — every band visits them and the raster core's own per-span
+    // y filter restricts the pixels, so output matches the ranged path.
+    for (const [W, H] of [[64, 64], [61, 37]] as Array<[number, number]>) {
+      const staged = stagedFrame(W, H);
+      const { views, yA, yB } = staged;
+      // Wipe the staged bounds back to the legacy zero range.
+      for (let b = 0; b < 2; b++) {
+        const d = b * D_PER_BATCH;
+        views.desc[d + D_YMIN] = 0;
+        views.desc[d + D_YMAX] = 0;
+      }
+      const full = processFrameJob(views, W, H, 3, 0, H);
+      const lo = processFrameJob(views, W, H, 3, 0, yA + 1);
+      const hi = processFrameJob(views, W, H, 3, yB, H);
+      const mid = processFrameJob(views, W, H, 3, yA + 1, yB);
+      // No cull without bounds: every band visits both batches...
+      expect(full.descs).toBe(2);
+      expect(lo.descs).toBe(2);
+      expect(hi.descs).toBe(2);
+      expect(mid.descs).toBe(2);
+      // ...but the drawn pixels partition exactly as before.
+      expect(mid.spans).toBe(0);
+      expect(mid.pixels).toBe(0);
+      expect(lo.spans + hi.spans).toBe(full.spans);
+      expect(full.spans).toBe(8);
+      expect(full.pixels).toBe(8 * W);
+    }
+  });
+
+  it('unordered spans still draw identically (fallback never reorders)', () => {
+    // The band-cull only skips whole descriptors; within a band the order
+    // is pack order. Shuffled-y spans with a covering range draw the same
+    // pixels as the ranged path — culling is order-agnostic.
+    const W = 64, H = 64;
+    const sab = new SharedArrayBuffer(frameAccumTotal(W, H));
+    const { views } = attachFrameAccum(sab, W, H);
+    views.fTex[0] = 7;
+    views.fLight[0] = 63;
+    const rows = [9, 3, 7, 3, 12, 5];
+    rows.forEach((y, slot) => {
+      const o = slot * F_PER_SPAN;
+      views.fSpansF[o] = 1; views.fSpansF[o + 6] = 63; views.fSpansF[o + 9] = -1;
+      const q = slot * I_PER_SPAN;
+      views.fSpansI[q] = SPAN_OPAQUE; views.fSpansI[q + 1] = y;
+      views.fSpansI[q + 2] = 0; views.fSpansI[q + 3] = W; views.fSpansI[q + 4] = 0;
+    });
+    const put = (ymin: number, ymax: number) => {
+      views.desc[D_SPAN_BASE] = 0;
+      views.desc[D_SPAN_COUNT] = rows.length;
+      views.desc[D_TEX_OFF] = 0; views.desc[D_TEX_W] = 1; views.desc[D_TEX_H] = 1;
+      views.desc[D_LIGHT_OFF] = 0; views.desc[D_LIGHT_W] = 1; views.desc[D_LIGHT_H] = 1;
+      views.desc[D_WSHIFT] = 0; views.desc[D_WMASK] = 0; views.desc[D_HMASK] = 0;
+      views.desc[D_TURBPHASE] = 0;
+      views.desc[D_YMIN] = ymin;
+      views.desc[D_YMAX] = ymax;
+    };
+    put(3, 13);
+    const ranged = processFrameJob(views, W, H, 1, 0, H);
+    const refIdx = views.base.idx.slice();
+    views.base.idx.fill(0);
+    views.base.zb.fill(0);
+    put(0, 0);
+    const legacy = processFrameJob(views, W, H, 1, 0, H);
+    expect(legacy.pixels).toBe(ranged.pixels);
+    expect(legacy.spans).toBe(ranged.spans);
+    expect(views.base.idx).toEqual(refIdx);
+    expect(ranged.descs).toBe(1);
   });
 });
 
@@ -593,7 +681,7 @@ describe('item 8: RGB-authoritative production path', () => {
     expect(d).toBeGreaterThan(1000);
   });
 
-  it('translucent frames keep the classic path (gate disarms the skip)', () => {
+  it('translucent frames keep the classic path in software mode (skip never arms with RGB off)', () => {
     setCVar(TRANSLUCENCY_CVAR, 1); // tMode 1: alpha loop live
     const plain = (() => {
       const fb = createFramebuffer(160, 120, true);
@@ -615,5 +703,17 @@ describe('item 8: RGB-authoritative production path', () => {
     r.endFrame();
     // Software mode unchanged: flag on + RGB off never skips.
     expect(fnvU8(r.getFramebuffer().index!)).toBe(plain);
+  });
+
+  it('translucent frames disarm the skip with RGB enabled (no silent translucency loss)', () => {
+    setCVar(TRANSLUCENCY_CVAR, 1); // tMode 1: alpha loop live
+    const off = renderRGB(160, 120, false);
+    const on = renderRGB(160, 120, true);
+    expect(on.used).toBe(true);
+    // The production composite is identical with the skip on or off: no
+    // translucent contribution is lost where the overlay drew, and the
+    // alpha loop still runs its classic draws (skip only elides classic
+    // writes landing on RGB-covered pixels).
+    expect(on.color).toBe(off.color);
   });
 });

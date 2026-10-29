@@ -1,10 +1,14 @@
-// PERF-2 B: gated classic-skip (sw_rgb_skip_classic, default OFF).
+// PERF-FINISH-A item A: authoritative RGB skip (sw_rgb_skip_classic,
+// default ON).
 //
-// - Default state is off and byte-identical (existing goldens prove it).
-// - Flag ON + RGB OFF: the software path is untouched (same index hash as
-//   flag OFF) — the skip only applies where an RGB material drew.
-// - Flag ON + RGB ON: the frame completes with RGB coverage (smoke only —
-//   output intentionally differs, so no golden pin here).
+// - Default state is on (skipClassicRequested() true with fresh cvars).
+// - Cvar 0 is the classic oracle: RGB output identical to the old
+//   always-classic path (existing RGB pins prove it).
+// - Flag OFF (oracle) with RGB OFF leaves the software index plane
+//   untouched (existing goldens prove it).
+// - Flag ON (default) with RGB ON completes with coverage, eliminates
+//   classic work (counters > 0), and leaves software mode alone.
+// - Software (RGB off) never skips: counters stay zero with the flag on.
 import { afterEach, describe, expect, it } from 'vitest';
 import { createFramebuffer } from '@q2/renderer-api';
 import { resetCVars, setCVar } from '@q2/config';
@@ -29,7 +33,10 @@ function testPalette(): Uint8Array {
   return pal;
 }
 
-function renderDevroom(W: number, H: number): { idxHash: string; cover: number; used: boolean } {
+function renderDevroom(W: number, H: number): {
+  idxHash: string; cover: number; used: boolean;
+  classicSpansSkipped: number; classicFgSkipped: number; skipArmed: boolean;
+} {
   const fb = createFramebuffer(W, H, true);
   const r = new SoftwareRenderer();
   r.init(fb);
@@ -51,29 +58,61 @@ function renderDevroom(W: number, H: number): { idxHash: string; cover: number; 
     h = Math.imul(h, 16777619);
   }
   const st = r.testRGBStats();
-  return { idxHash: (h >>> 0).toString(16).padStart(8, '0'), cover: st.coverPixels, used: st.used };
+  const sk = r.testClassicSkipStats();
+  return {
+    idxHash: (h >>> 0).toString(16).padStart(8, '0'),
+    cover: st.coverPixels, used: st.used,
+    classicSpansSkipped: sk.classicSpansSkipped,
+    classicFgSkipped: sk.classicFgSkipped,
+    skipArmed: sk.skipArmed,
+  };
 }
 
-describe('PERF-2 B gated classic skip', () => {
-  it('defaults to off', () => {
+describe('PERF-FINISH-A authoritative classic skip', () => {
+  it('defaults to on', () => {
     resetCVars();
-    expect(skipClassicRequested()).toBe(false);
+    expect(skipClassicRequested()).toBe(true);
   });
 
-  it('flag ON with RGB OFF leaves the software index plane untouched', () => {
+  it('flag OFF (oracle) with RGB OFF leaves the software index plane untouched', () => {
+    setCVar(SW_RGB_SKIP_CLASSIC_CVAR, 0);
+    expect(skipClassicRequested()).toBe(false);
     const off = renderDevroom(160, 120);
+    expect(off.classicSpansSkipped).toBe(0);
+    expect(off.classicFgSkipped).toBe(0);
+    expect(off.skipArmed).toBe(false);
+    expect(off.used).toBe(false);
     setCVar(SW_RGB_SKIP_CLASSIC_CVAR, 1);
     expect(skipClassicRequested()).toBe(true);
     const on = renderDevroom(160, 120);
+    // Software mode never arms the skip: identical planes, zero counters.
     expect(on.idxHash).toBe(off.idxHash);
+    expect(on.classicSpansSkipped).toBe(0);
+    expect(on.classicFgSkipped).toBe(0);
     expect(on.used).toBe(false);
   });
 
-  it('flag ON with RGB ON still completes with coverage (smoke, no golden)', () => {
-    setCVar(SW_RGB_SKIP_CLASSIC_CVAR, 1);
+  it('default ON with RGB ON completes with coverage and eliminates classic work', () => {
     setRGBWorldEnabled(true);
     const on = renderDevroom(160, 120);
+    expect(skipClassicRequested()).toBe(true);
     expect(on.used).toBe(true);
     expect(on.cover).toBeGreaterThan(0);
+    expect(on.skipArmed).toBe(true);
+    // Devroom draws world spans + world-placed alias critters: both the
+    // world-span and foreground-draw counters must prove eliminated work.
+    expect(on.classicSpansSkipped).toBeGreaterThan(0);
+    expect(on.classicFgSkipped).toBeGreaterThan(0);
+  });
+
+  it('oracle (cvar 0) with RGB ON draws everything classically (counters zero)', () => {
+    setCVar(SW_RGB_SKIP_CLASSIC_CVAR, 0);
+    setRGBWorldEnabled(true);
+    const oracle = renderDevroom(160, 120);
+    expect(oracle.used).toBe(true);
+    expect(oracle.cover).toBeGreaterThan(0);
+    expect(oracle.classicSpansSkipped).toBe(0);
+    expect(oracle.classicFgSkipped).toBe(0);
+    expect(oracle.skipArmed).toBe(false);
   });
 });

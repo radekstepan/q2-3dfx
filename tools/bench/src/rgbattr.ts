@@ -30,9 +30,10 @@
 //     applyDisplayGamma on a COPIED buffer) are kept for attribution only
 //     and labeled non-production: they run more passes than the fused
 //     production path executes.
-//   - Hashes: index-plane FNV + color-plane R+G FNV (same scheme as the
-//     frame.ts harness: R byte then G byte per pixel) + presented-plane
-//     display hash (serial vs pooled scanout parity). Software planes are
+//   - Hashes: index-plane FNV + legacy color-plane R+G FNV (ledger
+//     continuity; BLIND to blue-only/alpha-only corruption) + full-RGBA
+//     color/display FNV (`hashColorFull` — the PARITY authority for
+//     serial-vs-pooled raster and final display). Software planes are
 //     bit-identical with the RGB flag on or off by construction.
 // Modes: serial (workers=0) plus pooled worker configs via
 // RGB_BENCH_WORKERS (e.g. "0,1,3,7"); the Node BandWorkerPool runs real RGB
@@ -60,7 +61,7 @@ import {
   type BspTexelSource, type FramePhases, type MiniWorld,
   type DynamicLight, type ScanoutBandOptions,
 } from '@q2/sw-renderer';
-import { base1RefDef, base1Views, machineJson } from '@q2/testkit';
+import { base1RefDef, base1Views, hashColorFull, machineJson } from '@q2/testkit';
 import {
   applyDisplayGamma, applyReconstruction2x2, readVoodooState, resolveRGB565,
   resolveFrame,
@@ -72,6 +73,10 @@ const require = createRequire(process.cwd() + '/');
 /**
  * Resolve the built @q2/sw-renderer ESM bundle (worker bootstrap source).
  * Goes through the workspace symlink so no relative-path surgery is needed.
+ * NOTE: `require` is used for PATH RESOLUTION ONLY (require.resolve never
+ * loads the module). Loading the CJS bundle would instantiate the second
+ * @q2/config store (see packages/testkit config-store.test.ts) — workers
+ * and all bench code must stay on the ESM graph (index.mjs below).
  */
 export function swRendererEsmPath(): string {
   const cjs = require.resolve('@q2/sw-renderer');
@@ -275,7 +280,13 @@ function hashIdx(idx: Uint8Array): string {
   return (h >>> 0).toString(16).padStart(8, '0');
 }
 
-/** Color-plane R+G FNV-1a (matches the frame.ts harness hashColor). */
+/**
+ * Color-plane R+G FNV-1a (matches the frame.ts harness hashColor).
+ * LEGACY: blind to blue-only and alpha-only corruption (pinned by
+ * packages/testkit parity-integrity.test.ts). Kept for ledger continuity;
+ * parity gates MUST use `hashColorFull` (@q2/testkit) for serial-vs-pooled
+ * raster AND final display.
+ */
 function hashColorRG(color: Uint32Array): string {
   let h = 2166136261;
   for (let i = 0; i < color.length; i++) {
@@ -436,9 +447,27 @@ export interface AttrRow {
   frameSerialP95: number | null;
   spans: number; pixels: number; overdraw: number;
   idxHash: string; colorHash: string;
+  /** Full-RGBA parity authorities (serial-vs-pooled raster + display). */
+  colorFull: string;
   /** Presented-plane hash: serial resolve display vs pooled scanout buffers. */
   displayHash: string | null;
   displaySerialHash: string | null;
+  /** Full-RGBA presented-plane hashes (parity authority for scanout). */
+  displayFull: string | null;
+  displaySerialFull: string | null;
+  /**
+   * Execution proof (PERF-FINISH-C §2): RGB used + coverage this frame
+   * (testRGBStats), batches staged/inline + completed kicks since the
+   * last beginFrame (testRGBWorkerStats). A pooled RGB row MUST show
+   * staged > 0 and kicks > 0 — pool existence alone proves nothing.
+   */
+  rgbUsed: boolean;
+  rgbCover: number;
+  rgbStaged: number;
+  rgbInline: number;
+  rgbKicks: number;
+  /** Pooled scanout kicks that reported failure (serial fallback legs). */
+  scanoutFallbacks: number;
 }
 
 export async function runAttrConfig(
@@ -573,6 +602,9 @@ export async function runAttrConfig(
   let frameMs: number | null = null, frameP95: number | null = null;
   let frameSerialMs: number | null = null, frameSerialP95: number | null = null;
   let displayHash: string | null = null, displaySerialHash: string | null = null;
+  let displayFull: string | null = null, displaySerialFull: string | null = null;
+  let rgbUsed = false, rgbCover = 0, rgbStaged = 0, rgbInline = 0, rgbKicks = 0;
+  let scanoutFallbacks = 0;
   if (!rgb) {
     const fr: number[] = [];
     for (let i = 0; i < reps; i++) {
@@ -599,6 +631,7 @@ export async function runAttrConfig(
     }
     fusedMs = med(fs);
     displaySerialHash = hashColorRG(serialDisp);
+    displaySerialFull = hashColorFull(serialDisp);
     if (pool) {
       // PRODUCTION pooled scanout, interleaved A/B with the serial control
       // on the same live frame (shared thermal state per rep).
@@ -625,6 +658,7 @@ export async function runAttrConfig(
         scanoutSerialMs = med(ctrl);
         pooledDisp = pool.scanoutPlanes.scanDisplay.slice(0, W * H);
         displayHash = hashColorRG(pooledDisp);
+        displayFull = hashColorFull(pooledDisp);
       } else {
         // Kick failed: production falls back to serial (identical by
         // contract) — labeled, not silent.
@@ -632,6 +666,8 @@ export async function runAttrConfig(
         scanoutMs = med(ctrl);
         scanoutSerialMs = med(ctrl);
         displayHash = hashColorRG(serialDisp);
+        displayFull = hashColorFull(serialDisp);
+        scanoutFallbacks = reps;
       }
       // Full production frames (begin+render+end+pooled scanout together).
       const fr: number[] = [];
@@ -642,9 +678,16 @@ export async function runAttrConfig(
         r.renderView(view, worldArg, entities);
         r.endFrame();
         if (!pool.flushScanout(opts)) {
+          scanoutFallbacks++;
           resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
         }
         fr.push(Number(process.hrtime.bigint() - t) / 1e6);
+        if (i === reps - 1) {
+          const stRGB = r.testRGBStats();
+          const wst = r.testRGBWorkerStats();
+          rgbUsed = stRGB.used; rgbCover = stRGB.coverPixels;
+          rgbStaged = wst.staged; rgbInline = wst.inline; rgbKicks = wst.kicks;
+        }
       }
       frameMs = med(fr); frameP95 = p95(fr);
       // Full frames with the serial control (same workload, labeled).
@@ -659,12 +702,19 @@ export async function runAttrConfig(
         frs.push(Number(process.hrtime.bigint() - t) / 1e6);
       }
       frameSerialMs = med(frs); frameSerialP95 = p95(frs);
+      // Refresh the serial display snapshot from the final live frame so
+      // pooled-vs-serial display parity compares the same workload state
+      // (untimed; all timed loops are done).
+      resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
+      displaySerialHash = hashColorRG(serialDisp);
+      displaySerialFull = hashColorFull(serialDisp);
     } else {
       // Serial production = the fused control itself.
       scanoutKind = 'serial';
       scanoutMs = med(fs);
       scanoutSerialMs = med(fs);
       displayHash = hashColorRG(serialDisp);
+      displayFull = displaySerialFull;
       const fr: number[] = [];
       for (let i = 0; i < reps; i++) {
         pump();
@@ -674,6 +724,12 @@ export async function runAttrConfig(
         r.endFrame();
         resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
         fr.push(Number(process.hrtime.bigint() - t) / 1e6);
+        if (i === reps - 1) {
+          const stRGB = r.testRGBStats();
+          const wst = r.testRGBWorkerStats();
+          rgbUsed = stRGB.used; rgbCover = stRGB.coverPixels;
+          rgbStaged = wst.staged; rgbInline = wst.inline; rgbKicks = wst.kicks;
+        }
       }
       frameMs = med(fr); frameP95 = p95(fr);
     }
@@ -695,9 +751,15 @@ export async function runAttrConfig(
     frameMs, frameP95, frameSerialMs, frameSerialP95,
     spans, pixels, overdraw,
     idxHash: hashIdx(g.index!), colorHash: hashColorRG(g.color),
-    displayHash, displaySerialHash,
+    colorFull: hashColorFull(g.color),
+    displayHash, displaySerialHash, displayFull, displaySerialFull,
+    rgbUsed, rgbCover, rgbStaged, rgbInline, rgbKicks, scanoutFallbacks,
   };
   const rs = (v: number | null): string => v === null ? '—' : v.toFixed(2);
+  const dispFullPart = row.displayFull !== null && row.displayFull !== undefined ? `/full=${row.displayFull}` : '';
+  const rgbPart = mode === 'rgb'
+    ? ` rgb[used=${rgbUsed} cover=${rgbCover} staged=${rgbStaged} inline=${rgbInline} kicks=${rgbKicks} fb=${scanoutFallbacks}]`
+    : '';
   console.log(
     `${row.scene} ${row.res} ent=${ent} ${mode} w=${workers}: ` +
     `renderView=${row.renderViewMs.toFixed(2)}(p95 ${row.renderViewP95.toFixed(2)}) ` +
@@ -707,7 +769,7 @@ export async function runAttrConfig(
     `scanout[${row.scanoutKind ?? 'n/a'}]=${rs(scanoutMs)} serialCtl=${rs(scanoutSerialMs)} ` +
     `frame=${rs(frameMs)}(p95 ${rs(frameP95)}) frameSerial=${rs(frameSerialMs)}(p95 ${rs(frameSerialP95)}) ` +
     `spans=${spans} px=${pixels} ov=${overdraw.toFixed(2)} ` +
-    `idx=${row.idxHash} color=${row.colorHash} disp=${row.displayHash ?? '—'}`,
+    `idx=${row.idxHash} color=${row.colorHash} full=${row.colorFull} disp=${row.displayHash ?? '—'}${dispFullPart}${rgbPart}`,
   );
   return row;
 }
@@ -778,10 +840,14 @@ export async function runRgbAttr(pakPath: string, opts: RgbAttrOptions = {}): Pr
     commit = cp.execSync('git rev-parse --short HEAD', { encoding: 'utf8' }).trim();
   } catch { /* offline */ }
   const machine = await machineJson().catch(() => ({ node: process.version }));
-  // Cross-mode self-check per (scene, res, entities, workers): software
-  // planes must be bit-identical with the RGB flag on or off (idx equal);
-  // the RGB composite must change at least one pixel (color differs) or
-  // the overlay drew nothing and the row is not a real RGB run.
+  // Cross-mode self-check per (scene, res, entities, workers): the RGB
+  // composite must change at least one pixel (color differs) AND the RGB
+  // execution proof must hold (used + cover) or the row is not a real RGB
+  // run. NOTE: software-vs-RGB idx identity is NOT required — under the
+  // default-on RGB-authoritative skip the classic index plane is
+  // intentionally not drawn (stale by design); idx is reported for
+  // information only. Serial-vs-pooled full-RGBA parity below is the real
+  // equivalence gate.
   const byKey = new Map<string, AttrRow[]>();
   for (const row of rows) {
     const k = `${row.scene} ${row.res} ent=${row.entities} w=${row.workers}`;
@@ -792,16 +858,20 @@ export async function runRgbAttr(pakPath: string, opts: RgbAttrOptions = {}): Pr
   for (const [k, pair] of byKey) {
     const a = pair.find((r) => r.mode === 'software')!;
     const b = pair.find((r) => r.mode === 'rgb')!;
-    const idxOk = a.idxHash === b.idxHash;
+    const idxNote = a.idxHash === b.idxHash ? 'IDENTICAL' : 'DIFFERS (expected under authoritative skip: classic idx not drawn)';
     const colorDiff = a.colorHash !== b.colorHash;
+    const proofOk = b.rgbUsed && b.rgbCover > 0;
     console.log(
       `check ${k}: ` +
-      `idx software=rgb ${idxOk ? 'IDENTICAL' : `MISMATCH ${a.idxHash} vs ${b.idxHash}`} / ` +
-      `color ${colorDiff ? 'DIFFERS (overlay drew)' : 'IDENTICAL (overlay drew nothing?)'}`,
+      `idx software-vs-rgb ${idxNote} / ` +
+      `color ${colorDiff ? 'DIFFERS (overlay drew)' : 'IDENTICAL (overlay drew nothing?)'} / ` +
+      `rgb-exec ${proofOk ? `PROVEN used cover=${b.rgbCover}` : 'MISSING (overlay drew nothing?)'}`,
     );
   }
   // Worker-vs-serial equivalence per (scene, res, entities, mode), and
-  // pooled-vs-serial scanout parity on the presented plane.
+  // pooled-vs-serial scanout parity on the presented plane. Full-RGBA
+  // hashes (colorFull/displayFull) are the parity authority; the legacy
+  // R+G hashes are reported for ledger continuity only.
   const serialByKey = new Map<string, AttrRow>();
   for (const row of rows) {
     if (row.workers === 0) serialByKey.set(`${row.scene} ${row.res} ent=${row.entities} ${row.mode}`, row);
@@ -810,18 +880,25 @@ export async function runRgbAttr(pakPath: string, opts: RgbAttrOptions = {}): Pr
     if (row.workers === 0) continue;
     const s = serialByKey.get(`${row.scene} ${row.res} ent=${row.entities} ${row.mode}`);
     if (!s) continue;
-    const ok = s.idxHash === row.idxHash && s.colorHash === row.colorHash;
-    const dispOk = s.displaySerialHash !== null && row.displaySerialHash !== null
-      ? s.displaySerialHash === row.displaySerialHash
+    const ok = s.idxHash === row.idxHash && s.colorFull === row.colorFull;
+    const legacyOk = s.colorHash === row.colorHash;
+    const dispOk = s.displaySerialFull !== null && row.displaySerialFull !== null
+      ? s.displaySerialFull === row.displaySerialFull
       : true;
-    const poolOk = row.displayHash !== null && row.displaySerialHash !== null
-      ? row.displayHash === row.displaySerialHash
+    const poolOk = row.displayFull !== null && row.displaySerialFull !== null
+      ? row.displayFull === row.displaySerialFull
       : true;
+    const fbOk = row.scanoutFallbacks === 0;
+    const execOk = row.mode !== 'rgb' || row.workers === 0 ||
+      (row.rgbUsed && row.rgbCover > 0 && row.rgbStaged > 0 && row.rgbKicks > 0);
     console.log(
       `workers ${row.scene} ${row.res} ent=${row.entities} ${row.mode} w=${row.workers}: ` +
-      `${ok ? 'IDENTICAL to serial' : `MISMATCH vs serial idx ${s.idxHash}/${row.idxHash} color ${s.colorHash}/${row.colorHash}`} / ` +
-      `scanout pooled=serial ${poolOk ? 'IDENTICAL' : `MISMATCH ${row.displayHash}/${row.displaySerialHash}`} / ` +
-      `serial-scanout vs w=0 ${dispOk ? 'IDENTICAL' : 'MISMATCH'}`,
+      `${ok ? 'IDENTICAL to serial' : `MISMATCH vs serial idx ${s.idxHash}/${row.idxHash} full ${s.colorFull}/${row.colorFull}`} ` +
+      `(legacyRG ${legacyOk ? 'same' : 'DIFFERS'}) / ` +
+      `scanout pooled=serial ${poolOk ? 'IDENTICAL' : `MISMATCH ${row.displayFull}/${row.displaySerialFull}`} / ` +
+      `serial-scanout vs w=0 ${dispOk ? 'IDENTICAL' : 'MISMATCH'} / ` +
+      `fallbacks=${row.scanoutFallbacks}${fbOk ? '' : ' (SERIAL FALLBACK — pooled kick failed)'} / ` +
+      `exec ${execOk ? `PROVEN staged=${row.rgbStaged} kicks=${row.rgbKicks}` : 'MISSING (pool existed, nothing staged?)'}`,
     );
   }
   console.log(JSON.stringify({ machine, node: process.version, commit, warmup, reps, workerSets, ents, distFresh: fresh.fresh }, null, 2));

@@ -16,3 +16,9 @@ declare module 'os' {
   export function arch(): string;
   export function cpus(): Array<{ model: string }>;
 }
+declare module 'node:module' {
+  export function createRequire(id: string): {
+    (id: string): unknown;
+    resolve(id: string): string;
+  };
+}

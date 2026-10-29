@@ -4381,3 +4381,179 @@ export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: numb
   await boot.refresh.endFrameAsync();
   return resolveDisplayAsync(boot, hud, frameState);
 }
+
+/* --- PERF-FINISH-B instrumented stage capture (never the production loop).
+ * `measureFrameStages` twins `frameAsync` with per-stage probes; the rAF
+ * tick never calls it. Harnesses only (tests, `__q2bench.measure`). */
+
+/** One instrumented frame's per-stage wall times + frame counters. */
+export interface StageReport {
+  pumpsMs: number;
+  simMs: number;
+  viewMs: number;
+  beginMs: number;
+  renderMs: number;
+  /** Renderer-internal renderView clock (FrameStats.ms: GEO+DRAW, no await). */
+  renderInternalMs: number;
+  endMs: number;
+  resolveMs: number;
+  /** Post-resolve HUD draw (0 when HUD rode pre-scanout: strict voodoo). */
+  hudMs: number;
+  /** Optional blit stage (0 when no blit callback was passed). */
+  blitMs: number;
+  spans: number;
+  pixels: number;
+  overdraw: number;
+  /** RGB worker execution proof (staged/kicks per frame, inline fallbacks). */
+  staged: number;
+  inline: number;
+  kicks: number;
+  pooled: boolean;
+  bands: number;
+  /** Bytes staged for the frame kick (pool probe; -1 when unpooled). */
+  stageBytes: number;
+  /**
+   * Staging breakdown (null when unpooled): transient = per-frame uploads
+   * (spans/tex/light/lux/descriptors, freed after the kick); chains =
+   * persistent chain-cache residency (copy-on-first-use, NOT re-uploaded
+   * per frame — the steady-state upload is transient only).
+   */
+  stageDetail: { transientBytes: number; chainBytes: number } | null;
+  /** Pooled-scanout kick deltas across the resolve stage. */
+  scanoutKicks: number;
+  scanoutFallbacks: number;
+  /**
+   * Authoritative-skip detail (null when the hook is absent): whether the
+   * skip armed + classic world/foreground spans elided where the RGB twin
+   * drew. Under the skip, FrameStats.pixels/overdraw (classic-tracked) go
+   * quiet — these counters + staged/kicks are the execution proof instead.
+   */
+  skip: { armed: boolean; classicSkipped: number; classicFgSkipped: number } | null;
+  /** Rank-ordered worker completion times for the slowest kick, if armed. */
+  diag: { kicks: number; mainMs: number; arrivals: number[]; slowestMs: number } | null;
+  resolveOrder: ResolveOrder;
+  voodooPath: VoodooBandPath | 'none';
+}
+
+/**
+ * Run one frame exactly like `frameAsync`, timing each stage. Call from
+ * harnesses only (tests, `__q2bench.measure`); never from the rAF tick.
+ * Mutates exactly like `frameAsync` plus the optional post-resolve HUD
+ * draw (mirrors `finishFrame`: skipped when HUD rode pre-scanout) and the
+ * optional `blit` callback (the harness blits the resolved target to the
+ * real canvas to time presentation; production never passes it).
+ */
+export async function measureFrameStages(
+  boot: PlayBoot, st: AsyncLoopState, nowMs: number, hud?: HudState,
+  blit?: (target: Uint32Array) => void,
+): Promise<StageReport> {
+  const t00 = performance.now();
+  const frameState = getCVarString('vid_renderer') === 'voodoo' ? snapshotVoodooState() : undefined;
+  if (frameState !== undefined) broadcastBandVoodoo(boot, frameState);
+  pumpMuzzleLight(boot);
+  pumpExplosionLights(boot);
+  pumpTracers(boot);
+  const t01 = performance.now();
+  stepAsyncSim(boot.host, st, nowMs);
+  const t02 = performance.now();
+  const { view, renderables } = buildAsyncView(boot.host, st.serverAcc);
+  const t03 = performance.now();
+  boot.refresh.beginFrame();
+  const t04 = performance.now();
+  const stats = await boot.refresh.renderViewAsync(view, boot.host.world, renderables);
+  const t05 = performance.now();
+  await boot.refresh.endFrameAsync();
+  const t06 = performance.now();
+  const kicksBefore = boot.statScanoutKicks;
+  const fallbacksBefore = boot.statScanoutFallbacks;
+  const target = await resolveDisplayAsync(boot, hud, frameState);
+  const t07 = performance.now();
+  let hudMs = 0;
+  if (hud !== undefined && !hudComposedPreScanout(boot)) {
+    const t08 = performance.now();
+    drawPlayHud(
+      { width: boot.host.fb.width, height: boot.host.fb.height, color: target },
+      boot, hud,
+    );
+    hudMs = performance.now() - t08;
+  }
+  let blitMs = 0;
+  if (blit !== undefined) {
+    const t09 = performance.now();
+    blit(target);
+    blitMs = performance.now() - t09;
+  }
+  let staged = 0, inline = 0, kicks = 0, pooled = false, bands = 1;
+  try {
+    const rs = boot.refresh.testRGBWorkerStats();
+    staged = rs.staged; inline = rs.inline; kicks = rs.kicks;
+  } catch { /* renderer without RGB stats: zeros stand */ }
+  try {
+    const ws = boot.refresh.testWorkerStats();
+    pooled = ws.pooled; bands = ws.bands;
+  } catch { /* single-threaded fallback: defaults stand */ }
+  let stageBytes = -1;
+  let stageDetail: StageReport['stageDetail'] = null;
+  try {
+    const pool = boot.browserPool as unknown as {
+      kickBytes?: () => {
+        total: number; idxSpans: number; idxTex: number; idxLight: number;
+        rgbSpans: number; rgbLux: number; rgbChains: number;
+      } | null;
+      stagingBytes?: () => {
+        total: number; idxSpans: number; idxTex: number; idxLight: number;
+        rgbSpans: number; rgbLux: number; rgbChains: number;
+      };
+    } | null;
+    // Prefer the frozen last-kick snapshot (post-kick live offsets read
+    // zeros — the drain resets them); fall back to the live view.
+    const sb = (pool && typeof pool.kickBytes === 'function' && pool.kickBytes()) ||
+      (pool && typeof pool.stagingBytes === 'function' ? pool.stagingBytes() : null);
+    if (sb) {
+      stageBytes = sb.total;
+      stageDetail = {
+        transientBytes: sb.idxSpans + sb.idxTex + sb.idxLight + sb.rgbSpans + sb.rgbLux,
+        chainBytes: sb.rgbChains,
+      };
+    }
+  } catch { /* unpooled: -1/null stand */ }
+  let diag: StageReport['diag'] = null;
+  try {
+    const pool = boot.browserPool as unknown as {
+      diagSnapshot?: () => StageReport['diag'];
+    } | null;
+    if (pool && typeof pool.diagSnapshot === 'function') {
+      diag = pool.diagSnapshot();
+    }
+  } catch { /* disarmed: null stands */ }
+  let skip: StageReport['skip'] = null;
+  try {
+    const hook = (boot.refresh as unknown as {
+      testClassicSkipStats?: () => {
+        classicSpansSkipped: number; classicFgSkipped: number; skipArmed: boolean;
+      };
+    }).testClassicSkipStats;
+    if (typeof hook === 'function') {
+      const sk = hook.call(boot.refresh);
+      skip = {
+        armed: sk.skipArmed === true,
+        classicSkipped: sk.classicSpansSkipped,
+        classicFgSkipped: sk.classicFgSkipped,
+      };
+    }
+  } catch { /* hook absent: null stands */ }
+  return {
+    pumpsMs: t01 - t00, simMs: t02 - t01, viewMs: t03 - t02,
+    beginMs: t04 - t03, renderMs: t05 - t04,
+    renderInternalMs: stats.ms, endMs: t06 - t05,
+    resolveMs: t07 - t06, hudMs, blitMs,
+    spans: stats.spans, pixels: stats.pixels, overdraw: stats.overdraw,
+    staged, inline, kicks, pooled, bands, stageBytes, stageDetail,
+    scanoutKicks: boot.statScanoutKicks - kicksBefore,
+    scanoutFallbacks: boot.statScanoutFallbacks - fallbacksBefore,
+    skip,
+    diag,
+    resolveOrder: boot.lastResolveOrder,
+    voodooPath: boot.lastVoodooPath,
+  };
+}

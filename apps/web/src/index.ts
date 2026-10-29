@@ -4,8 +4,16 @@
 // auto-boot below additionally wires canvas, drop zone, loop + HUD.
 import { setCVarFromString } from '@q2/config';
 import { bootToFirstFrame } from './devroom.js';
-import { applyRendererCvar, bootPlay, getMapSource } from './play.js';
-import type { PlayBoot, RendererKind } from './play.js';
+import {
+  applyRendererCvar,
+  attachBrowserPool,
+  bootPlay,
+  createAsyncLoopState,
+  getMapSource,
+  measureFrameStages,
+} from './play.js';
+import type { AsyncLoopState, PlayBoot, RendererKind, StageReport } from './play.js';
+import { blitToCanvas } from './dom.js';
 import { pakHasMaps } from './pak.js';
 import type { WebPak } from './pak.js';
 import { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
@@ -25,9 +33,10 @@ export {
   buildAsyncView,
   createAsyncLoopState,
   frameAsync,
+  measureFrameStages,
   stepAsyncSim,
 } from './play.js';
-export type { AsyncLoopState } from './play.js';
+export type { AsyncLoopState, HudState, StageReport } from './play.js';
 export { BrowserBandPool, browserPoolAvailable, defaultBrowserWorkers, BROWSER_POOL_TIMEOUT_MS, selectVoodooBandPath, voodooStateToScanoutOpts } from './render-workers.js';
 export type { BrowserPoolOptions, VoodooBandPath, ScanoutBandOptions } from './render-workers.js';
 
@@ -69,6 +78,159 @@ export function bootWeb(opts: BootOptions = {}): BootResult {
   const first = bootToFirstFrame(boot.host, opts.nowMs ?? 0);
   const pakEntries = opts.pak?.entries.length;
   return { host: boot.host, renderer, pixels: first.pixels, hash: first.hash, source: boot.source, pakEntries, boot };
+}
+
+/**
+ * Install the instrumented browser-measurement hook (`window.__q2bench`).
+ * Headless-safe (no-op without `window`). See the call site for the
+ * instrumented-only contract: the production tick never touches this.
+ */
+export function installBenchHook(
+  canvas: HTMLCanvasElement | null,
+  getBoot: () => PlayBoot | null,
+  stopLoop: () => void,
+): void {
+  try {
+    const w = typeof window !== 'undefined' ? window : undefined;
+    if (!w) return;
+    let benchSt: AsyncLoopState | null = null;
+    let benchNow = 0;
+    const hook = {
+      /** Boot geometry + renderer + source (null before the first boot). */
+      info(): Record<string, unknown> {
+        const boot = getBoot();
+        if (!boot) return { booted: false };
+        return {
+          booted: true,
+          w: boot.host.fb.width, h: boot.host.fb.height,
+          renderer: boot.renderer, source: boot.source,
+        };
+      },
+      /** Stop the live rAF loop (idempotent). Required before measure(). */
+      stopLoop(): void {
+        try {
+          stopLoop();
+        } finally {
+          benchSt = null;
+        }
+      },
+      /**
+       * Fresh pool for harness-driven frames (call after stopLoop):
+       * disposes the loop's pool and attaches a new one sized from
+       * `sw_workers` (bands = cvar; omit `workers` for the cvar default).
+       * An explicit count ALSO writes the cvar first, so renderer bands
+       * and pool bands always match (a mismatched pool would still cover
+       * the frame, but tallies/geometry stay comparable only when
+       * matched). Never throws (false = sync fallback, identical pixels).
+       */
+      reattach(workers?: number): { pooled: boolean; bands: number } {
+        const boot = getBoot();
+        if (!boot) return { pooled: false, bands: 1 };
+        try {
+          if (workers !== undefined) {
+            const n = Math.max(1, Math.min(7, Math.floor(workers)));
+            if (Number.isFinite(n)) setCVarFromString('sw_workers', String(n + 1));
+          }
+          const old = boot.browserPool as unknown as { dispose?: () => Promise<void> } | null;
+          if (old && typeof old.dispose === 'function') {
+            void old.dispose().catch(() => undefined);
+          }
+        } catch { /* a dead pool must not block measurement */ }
+        benchSt = createAsyncLoopState();
+        benchNow = performance.now();
+        const pool = attachBrowserPool(boot, workers);
+        if (!pool) return { pooled: false, bands: 1 };
+        return { pooled: true, bands: pool.bandCount };
+      },
+      /**
+       * Drive scenario input directly (angles in degrees, buttons bitmask,
+       * forward = hold +forward). Safe on a live loop too (same fields the
+       * input layer writes); measurement uses it after stopLoop().
+       */
+      setInput(o: { yaw?: number; pitch?: number; buttons?: number; forward?: boolean }): void {
+        const boot = getBoot();
+        if (!boot) return;
+        try {
+          if (typeof o.yaw === 'number') boot.host.input.angles[1] = o.yaw;
+          if (typeof o.pitch === 'number') boot.host.input.angles[0] = o.pitch;
+          if (typeof o.buttons === 'number') boot.host.input.buttons = o.buttons;
+          if (o.forward !== undefined) {
+            if (o.forward) boot.host.input.keys.add('forward');
+            else boot.host.input.keys.delete('forward');
+          }
+        } catch { /* input shape mismatch: ignore */ }
+      },
+      /**
+       * Run `frames` instrumented frames (requires stopLoop + reattach
+       * first) and return per-frame stage reports. `yawStep` advances the
+       * camera per frame (moving-camera scenario), `buttons` holds fire
+       * (combat scenario, viewmodel + muzzle + tracers), `diag` arms the
+       * pool per-band timing around the run, `blit` times presenting each
+       * frame to the live canvas. Allocates (diag path only).
+       */
+      async measure(
+        frames: number,
+        o: { yawStep?: number; buttons?: number; forward?: boolean; diag?: boolean; blit?: boolean } = {},
+      ): Promise<StageReport[]> {
+        const boot = getBoot();
+        if (!boot || !benchSt) throw new Error('__q2bench.measure: call stopLoop() + reattach() first');
+        const n = Math.max(1, Math.min(600, Math.floor(frames)));
+        const pool = boot.browserPool as unknown as {
+          enableDiag?: () => void; disableDiag?: () => void;
+        } | null;
+        const armed = o.diag === true && pool !== null && typeof pool?.enableDiag === 'function';
+        try {
+          if (armed && pool !== null) pool.enableDiag?.();
+          if (o.buttons !== undefined) boot.host.input.buttons = o.buttons;
+          if (o.forward !== undefined) {
+            if (o.forward) boot.host.input.keys.add('forward');
+            else boot.host.input.keys.delete('forward');
+          }
+          const out: StageReport[] = [];
+          for (let f = 0; f < n; f++) {
+            if (typeof o.yawStep === 'number') boot.host.input.angles[1] += o.yawStep;
+            benchNow += 1000 / 60;
+            const blit = o.blit === true && canvas
+              ? (target: Uint32Array): void => {
+                blitToCanvas(canvas, {
+                  width: boot.host.fb.width, height: boot.host.fb.height,
+                  color: target,
+                  index: boot.host.fb.index, depth: boot.host.fb.depth,
+                });
+              }
+              : undefined;
+            out.push(await measureFrameStages(boot, benchSt, benchNow, { fps: 0, frame: f }, blit));
+          }
+          return out;
+        } finally {
+          try {
+            if (armed && pool !== null && typeof pool.disableDiag === 'function') pool.disableDiag();
+          } catch { /* disarm best-effort */ }
+        }
+      },
+      /**
+       * Live stats snapshot (the `__q2stats` record copy) + JS heap when
+       * exposed (Chromium `performance.memory`) + canvas box.
+       */
+      stats(): Record<string, unknown> {
+        const g = globalThis as unknown as { __q2stats?: Record<string, unknown> };
+        let memory = -1;
+        try {
+          const mem = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
+          if (mem) memory = mem.usedJSHeapSize;
+        } catch { /* non-Chromium: -1 stands */ }
+        return {
+          ...(g.__q2stats ?? {}),
+          memory,
+          canvasW: canvas?.width ?? -1,
+          canvasH: canvas?.height ?? -1,
+        };
+      },
+    };
+    (w as unknown as { __q2bench?: unknown }).__q2bench = hook;
+  } catch {
+    /* a failed hook install must never break the boot */
+  }
 }
 
 // Browser auto-boot: only runs when a DOM is present. Keeps
@@ -170,6 +332,20 @@ if (typeof document !== 'undefined') {
       });
     }
     renderCvars();
+    // PERF-FINISH-B instrumented stage capture (`window.__q2bench`).
+    //
+    // Instrumented-only: installing this hook costs the production loop
+    // nothing (one property store at boot, never read by the tick). The
+    // harness (CDP stage capture) stops the live loop, re-attaches a fresh
+    // pool, drives input scenarios, and runs `measureFrameStages` frames —
+    // the SAME engine/workers/canvas as production, but explicitly
+    // instrumented. Acceptance FPS always comes from the uninstrumented
+    // loop (`__q2stats.frame` deltas), never from these numbers.
+    installBenchHook(
+      canvas as HTMLCanvasElement | null,
+      () => currentBoot,
+      () => { current?.stop(); current = null; },
+    );
     // Static faceplate footer buttons (present in index.html): revert just
     // re-renders the panel, clear drops the cached pak and latches devroom.
     const clearBtn = document.querySelector('#q2-clear-pak');

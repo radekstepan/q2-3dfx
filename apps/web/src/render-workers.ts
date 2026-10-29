@@ -40,6 +40,9 @@ import {
   D_TURBPHASE,
   D_WMASK,
   D_WSHIFT,
+  D_YMAX,
+  D_YMIN,
+  F_PER_SPAN,
   FRAME_LIGHT_CAP,
   FRAME_TEX_CAP,
   JOB_RASTER,
@@ -160,11 +163,37 @@ export class BrowserBandPool implements BandDispatcher {
   private seq = 0;
   private lastColormap: Uint8Array | null = null;
   private lastPalette: Uint8Array | null = null;
-  private readonly pending = new Map<number, () => void>();
+  private readonly pending = new Map<number, (ok: boolean) => void>();
   private readyCount = 0;
   private frameGen = 0;
   private mainLastGen = 0;
   private disposed = false;
+  /* --- opt-in kick diagnostics (PERF-FINISH-B, instrumented-only) ---------
+   *
+   * All fields below are written ONLY while `diagOn` is true (harness /
+   * CDP measurement). Production acceptance runs with it false: the only
+   * steady-state cost is one boolean check per kick/message. No
+   * per-frame allocation in either mode (fixed-size arrival array allocated
+   * once at construction).
+   *
+   * `diagArrivals` records, per kick, the rank-ordered worker completion
+   * times in ms since the kick fan-out (arrival[0] = first worker done).
+   * Messages carry no band index (renderer protocol), so attribution is by
+   * rank, not by band — enough to prove worker execution and expose
+   * stragglers (slowest-band wait = last arrival). `diagMainMs` is the
+   * calling thread's own band work for the same kick. */
+  private diagOn = false;
+  private readonly diagArrivals: Float64Array;
+  private diagKickStart = 0;
+  private diagMainMs = -1;
+  private diagArrivalsSeen = 0;
+  private diagKicks = 0;
+  /** Last completed kick's staging snapshot (see kickBytes). */
+  private lastKick: {
+    idxSpans: number; idxTex: number; idxLight: number; idxDescs: number;
+    rgbSpans: number; rgbChains: number; rgbLux: number; rgbDescs: number;
+    total: number;
+  } | null = null;
   /** Frame-accum bump offsets (reset by beginFrame/flush): packed spans,
    *  staged texels/light, descriptor count. Main thread only. */
   private spansUsed = 0;
@@ -193,15 +222,20 @@ export class BrowserBandPool implements BandDispatcher {
     this.timeoutMs = timeoutMs;
     this.fbW = fbW;
     this.fbH = fbH;
-    for (const w of workers) {
-      this.workers.push(w);
+    this.diagArrivals = new Float64Array(Math.max(1, workers.length));
+    for (let i = 0; i < workers.length; i++) {
+      this.workers.push(workers[i]!);
+      const w = workers[i]!;
       w.onmessage = (ev: MessageEvent): void => {
         const msg = ev.data as { seq?: unknown; ready?: unknown };
         if (!msg || typeof msg !== 'object') return;
         if (msg.ready === true) this.readyCount += 1;
         if (typeof msg.seq === 'number') {
+          if (this.diagOn && this.diagArrivalsSeen < this.diagArrivals.length) {
+            this.diagArrivals[this.diagArrivalsSeen++] = performance.now() - this.diagKickStart;
+          }
           const done = this.pending.get(msg.seq);
-          if (done) done();
+          if (done) done(true);
         }
       };
     }
@@ -341,6 +375,23 @@ export class BrowserBandPool implements BandDispatcher {
     fv.desc[dd + D_WMASK] = masks.wmask;
     fv.desc[dd + D_HMASK] = masks.hmask;
     fv.desc[dd + D_TURBPHASE] = phase;
+    // Worker-owned band-cull range (mirrors Node BandPool.packBatched):
+    // one integer pass over this batch's staged spans at staging time.
+    // The emitter writes strictly increasing y, so this is a pure bound
+    // read; workers reject non-overlapping descriptors BEFORE material/view
+    // setup with no rescan. Zero range = unknown/legacy (correct fallback:
+    // visit everywhere), never staged here since spanCount > 0 always
+    // reaches this point.
+    let ymin = 0x7fffffff;
+    let ymax = -0x80000000;
+    for (let s = 0; s < spanCount; s++) {
+      const y = fv.fSpansI[(spanBase + s) * I_PER_SPAN + 1]!;
+      if (y < ymin) ymin = y;
+      if (y + 1 > ymax) ymax = y + 1;
+    }
+    if (!(ymax > ymin)) { ymin = 0; ymax = 0; }
+    fv.desc[dd + D_YMIN] = ymin;
+    fv.desc[dd + D_YMAX] = ymax;
     this.spansUsed += spanCount;
     this.texUsed += texBytes;
     this.lightUsed += lightBytes;
@@ -372,6 +423,7 @@ export class BrowserBandPool implements BandDispatcher {
     if (this.disposed || this.workers.length === 0) return null;
     if (this.descCount === 0) return { pixels: 0, spans: 0 };
     if (!(await this.awaitReadyAsync())) return null;
+    this.snapKick();
     this.publishFrame();
     const seq = this.seq;
     const finished = this.awaitWorkerMessages(seq, this.workers.length);
@@ -383,9 +435,11 @@ export class BrowserBandPool implements BandDispatcher {
     // drain theirs, then await the workers. Same math, golden-identical.
     const mainBand = this.bands[this.bands.length - 1]!;
     this.clearMainBand(mainBand, this.fbW);
+    const diagT0 = this.diagOn ? performance.now() : 0;
     const main = processFrameJob(
       this.views, this.fbW, this.fbH, this.descCount, mainBand.y0, mainBand.y1,
     );
+    if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
     const ok = await finished;
     if (!ok) return null;
     const tally = this.tally();
@@ -427,7 +481,9 @@ export class BrowserBandPool implements BandDispatcher {
       return false;
     }
     const mainBand = this.bands[this.bands.length - 1]!;
+    const diagT0 = this.diagOn ? performance.now() : 0;
     resolveBandFused(this.views.fColor, this.views.fPal, this.base.idx, this.rgbViews.rgb565, this.rgbViews.cover, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
+    if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
     return finished;
   }
 
@@ -469,10 +525,12 @@ export class BrowserBandPool implements BandDispatcher {
       return false;
     }
     const mainBand = this.bands[this.bands.length - 1]!;
+    const diagT0 = this.diagOn ? performance.now() : 0;
     processScanoutBand(
       this.views.fColor, this.rgbViews.scan565, this.rgbViews.scanDisplay,
       this.fbW, this.fbH, opts, mainBand.y0, mainBand.y1,
     );
+    if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
     return finished;
   }
 
@@ -618,6 +676,105 @@ export class BrowserBandPool implements BandDispatcher {
     return this.rgbDescCount;
   }
 
+  /* --- PERF-FINISH-B kick diagnostics (instrumented-only) ----------------
+   *
+   * `enableDiag` arms per-kick timing; `disableDiag` (default state)
+   * leaves the production path untouched — a single boolean check per
+   * kick/message, zero steady-state allocation. The harness (CDP stage
+   * capture, Node report-only benches) enables it around measured frames
+   * only; acceptance FPS is always measured with it off.
+   *
+   * Worker messages carry no band index (renderer protocol), so arrivals
+   * are rank-ordered: arrivals[0] = first worker done, arrivals[last] =
+   * slowest-band wait for the kick.
+   *
+   * `stagingBytes` reads the live bump offsets (mid-frame view);
+   * `kickBytes` returns the snapshot each indexed/RGB flush takes BEFORE
+   * draining (the drain resets the offsets, so post-kick live reads are
+   * zeros). Both are pure integer reads — safe on the hot path, no
+   * allocation. The snapshot splits the per-frame transient upload
+   * (spans/tex/light/lux, freed after the kick) from the persistent chain
+   * cache (copy-on-first-use; steady-state upload is transient only). */
+
+  /** Arm per-kick timing (harness only; production stays disarmed). */
+  enableDiag(): void {
+    this.diagOn = true;
+    this.diagArrivalsSeen = 0;
+    this.diagMainMs = -1;
+    this.diagKicks = 0;
+  }
+
+  /** Disarm per-kick timing (production state). */
+  disableDiag(): void {
+    this.diagOn = false;
+  }
+
+  /** True while per-kick timing is armed. */
+  diagActive(): boolean {
+    return this.diagOn;
+  }
+
+  /**
+   * Last-kick diagnostic snapshot (null when disarmed or no kick ran yet).
+   * Allocates (diag path only, never the production frame).
+   */
+  diagSnapshot(): {
+    kicks: number;
+    mainMs: number;
+    arrivals: number[];
+    slowestMs: number;
+  } | null {
+    if (!this.diagOn || this.diagKicks === 0) return null;
+    const arrivals: number[] = [];
+    for (let i = 0; i < this.diagArrivalsSeen; i++) arrivals.push(this.diagArrivals[i]!);
+    return {
+      kicks: this.diagKicks,
+      mainMs: this.diagMainMs,
+      arrivals,
+      slowestMs: arrivals.length > 0 ? arrivals[arrivals.length - 1]! : -1,
+    };
+  }
+
+  /**
+   * Bytes staged for the current (unflushed) frame kick, both lanes.
+   * Pure reads — safe to sample per frame with no behavior change.
+   * Span slots are F_PER_SPAN f64 + I_PER_SPAN i32 (124 B); tex/light/lux
+   * are exact bump bytes; chains are exact chain-region bytes.
+   * NOTE: post-kick the offsets are reset, so this reads zeros then — use
+   * `kickBytes()` for the last completed kick.
+   */
+  stagingBytes(): {
+    idxSpans: number; idxTex: number; idxLight: number; idxDescs: number;
+    rgbSpans: number; rgbChains: number; rgbLux: number; rgbDescs: number;
+    total: number;
+  } {
+    return snapshotStaging(
+      this.spansUsed, this.texUsed, this.lightUsed, this.descCount,
+      this.rgbSpansUsed, this.rgbChainUsed, this.rgbLuxUsed, this.rgbDescCount,
+    );
+  }
+
+  /**
+   * Last completed kick's staging snapshot (null until the first
+   * indexed/RGB flush). Same shape as `stagingBytes`; frozen at flush
+   * time, so post-kick sampling still reports the real per-frame upload.
+   */
+  kickBytes(): {
+    idxSpans: number; idxTex: number; idxLight: number; idxDescs: number;
+    rgbSpans: number; rgbChains: number; rgbLux: number; rgbDescs: number;
+    total: number;
+  } | null {
+    return this.lastKick;
+  }
+
+  /** Freeze the current staging offsets as the last-kick snapshot. */
+  private snapKick(): void {
+    this.lastKick = snapshotStaging(
+      this.spansUsed, this.texUsed, this.lightUsed, this.descCount,
+      this.rgbSpansUsed, this.rgbChainUsed, this.rgbLuxUsed, this.rgbDescCount,
+    );
+  }
+
   /**
    * Sync RGB flush is unsupported in the browser (would block): always
    * null, so the caller replays inline via drawInlineRGBAll. The async
@@ -637,6 +794,7 @@ export class BrowserBandPool implements BandDispatcher {
     if (this.disposed || this.workers.length === 0) return null;
     if (this.rgbDescCount === 0) return { pixels: 0, spans: 0 };
     if (!(await this.awaitReadyAsync())) return null;
+    this.snapKick();
     this.publishRGB(near, far, lodBias);
     const seq = this.seq;
     const finished = this.awaitWorkerMessages(seq, this.workers.length);
@@ -647,9 +805,11 @@ export class BrowserBandPool implements BandDispatcher {
     // Calling thread owns the last band: drain it inline while the workers
     // drain theirs, then await the workers. Same math, golden-identical.
     const mainBand = this.bands[this.bands.length - 1]!;
+    const diagT0 = this.diagOn ? performance.now() : 0;
     const main = processRGBFrameJob(
       this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, mainBand.y0, mainBand.y1,
     );
+    if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
     const ok = await finished;
     if (!ok) return null;
     const tally = this.tally();
@@ -717,9 +877,21 @@ export class BrowserBandPool implements BandDispatcher {
     return sent;
   }
 
-  /** Shut workers down; safe to call twice. */
+  /** Shut workers down; safe to call twice.
+   *
+   * In-flight kicks resolve `false` immediately (callers fall back to the
+   * identical inline replay) instead of hanging until the kick timeout:
+   * reboot/stop between frames can never wedge the loop for `timeoutMs`. */
   async dispose(): Promise<void> {    if (this.disposed) return;
     this.disposed = true;
+    for (const done of this.pending.values()) {
+      try {
+        done(false);
+      } catch {
+        /* a throwing waiter must not block teardown */
+      }
+    }
+    this.pending.clear();
     try {
       Atomics.store(this.ctl, CTL_SEQ, -1);
       try {
@@ -783,17 +955,19 @@ export class BrowserBandPool implements BandDispatcher {
   /** Await every worker's completion message for one kick (async path). */
   private awaitWorkerMessages(seq: number, need: number): Promise<boolean> {
     let seen = 0;
+    let failed = false;
     return new Promise<boolean>((resolve) => {
       const timer = window.setTimeout(() => {
         this.pending.delete(seq);
         resolve(false);
       }, this.timeoutMs);
-      this.pending.set(seq, () => {
+      this.pending.set(seq, (ok: boolean) => {
+        if (!ok) failed = true;
         seen += 1;
         if (seen >= need) {
           this.pending.delete(seq);
           window.clearTimeout(timer);
-          resolve(true);
+          resolve(!failed);
         }
       });
     });
@@ -886,6 +1060,12 @@ export class BrowserBandPool implements BandDispatcher {
     } catch {
       return false;
     }
+    if (this.diagOn) {
+      this.diagKickStart = performance.now();
+      this.diagArrivalsSeen = 0;
+      this.diagMainMs = -1;
+      this.diagKicks += 1;
+    }
     try {
       Atomics.notify(this.ctl, CTL_SEQ, this.workers.length);
     } catch {
@@ -904,6 +1084,33 @@ export class BrowserBandPool implements BandDispatcher {
     }
     return { pixels, spans };
   }
+}
+
+/**
+ * Build a staging-bytes snapshot from bump offsets (shared by the live
+ * `stagingBytes` view and the frozen per-kick `kickBytes` snapshot).
+ * Span slots are F_PER_SPAN f64 + I_PER_SPAN i32 (124 B).
+ */
+function snapshotStaging(
+  spansUsed: number, texUsed: number, lightUsed: number, descCount: number,
+  rgbSpansUsed: number, rgbChainUsed: number, rgbLuxUsed: number, rgbDescCount: number,
+): {
+  idxSpans: number; idxTex: number; idxLight: number; idxDescs: number;
+  rgbSpans: number; rgbChains: number; rgbLux: number; rgbDescs: number;
+  total: number;
+} {
+  const perSpan = F_PER_SPAN * 8 + I_PER_SPAN * 4;
+  const idxSpans = spansUsed * perSpan;
+  const rgbSpans = rgbSpansUsed * perSpan;
+  const total = idxSpans + texUsed + lightUsed +
+    rgbSpans + rgbChainUsed + rgbLuxUsed;
+  return {
+    idxSpans, idxTex: texUsed, idxLight: lightUsed,
+    idxDescs: descCount,
+    rgbSpans, rgbChains: rgbChainUsed, rgbLux: rgbLuxUsed,
+    rgbDescs: rgbDescCount,
+    total,
+  };
 }
 
 /* --- V2d voodoo band contract (astra §5) ---------------------------------

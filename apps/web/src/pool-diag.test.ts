@@ -109,6 +109,10 @@ describe('publishQ2Stats (window.__q2stats contract)', () => {
     expect(s.scanoutKicks).toBe(0);
     expect(s.scanoutFallbacks).toBe(0);
     expect(s.asyncFallbacks).toBe(0);
+    // Skip-hook fields: software boot never arms the skip (zeros), and the
+    // hook-absent fallback is identical (older renderer safe).
+    expect(s.classicSkipped).toBe(0);
+    expect(s.skipArmed).toBe(false);
     // After one software resolve the path records the passthrough branch.
     resolveDisplay(boot);
     expect(publishQ2Stats(boot, 60, 7).resolveOrder).toBe('software-passthrough');

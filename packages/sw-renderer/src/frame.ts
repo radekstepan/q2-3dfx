@@ -90,33 +90,42 @@ export function isRGBWorldEnabled(): boolean {
 }
 
 /**
- * Cvar gating the PERF-2 B classic-skip (default 0 = classic world spanfill
- * always runs). When set to 1, world-surface batches that also draw an RGB
- * overlay skip the classic indexed drawSpans call (sky-flat and opaque /
- * turbulent world batches only — the only call sites an RGB material can
- * cover; translucent/foreground classic draws always run).
+ * Cvar gating the PERF-FINISH-A authoritative RGB skip (default 1 = on):
+ * world-surface batches that draw an RGB overlay skip the redundant classic
+ * indexed drawSpans call (sky-flat, opaque / turbulent world batches,
+ * skybox faces), and the entity foreground skips its redundant classic
+ * draws (alias, sprites, particles, tracer beams, deferred alpha) wherever
+ * the RGB twin drew. The RGB planes (packed 565 + window-Z + coverage) are
+ * the production authority in Voodoo mode; the classic planes then carry
+ * only what the RGB path did not cover, for the uncovered-pixel composite
+ * in endFrame.
  *
- * NOT airtight — left OFF unless an operator explicitly opts in:
- * - seedRGBBackground expands the classic idx plane for every UNCOVERED
- *   pixel, so skipping classic writes is only valid where RGB cover is 1;
- * - RGB window-Z (Uint16, quantised, LESS-wins) and classic zb (float iz,
- *   strict-greater) are different precisions/orderings, so RGB coverage does
- *   not prove the classic write would have won — foreground classic depth
- *   tests (alias/sprites/particles/tracers/translucent blend reads) still
- *   consume the classic planes;
- * - the screen-door stipple path (sw_stipplealpha) reads idx and has no RGB
- *   equivalent, and frame stats intentionally track the classic path.
- * With the default 0 the renderer is bit-identical with the flag existing.
+ * Why this is sound (no translucency/stipple/depth carve-outs needed):
+ * - Every skipped classic write lands on a pixel the RGB overlay covered,
+ *   and endFrame resolves covered pixels from the RGB planes — the classic
+ *   value there is never displayed.
+ * - Every classic *read* of the skipped planes (foreground depth tests,
+ *   translucent blend background, stipple source) is skipped together with
+ *   the write: the foreground RGB twins depth-test against the RGB
+ *   window-Z plane and blend against the seeded RGB background, so no
+ *   skipped classic value is ever consumed.
+ * - The residual vs the classic oracle (cvar 0): float-1/z vs quantised
+ *   window-Z can disagree on depth-tie pixels, so a pixel the RGB path
+ *   rejects but classic would accept composites background instead of the
+ *   classic foreground texel. Measured tiny on real base1 views (see
+ *   PERF-FINISH-A report); the cvar-0 oracle path is kept for comparison.
+ * With RGB disabled (software mode) the skip never arms — software output
+ * is bit-identical with the flag on or off.
  */
 export const SW_RGB_SKIP_CLASSIC_CVAR = 'sw_rgb_skip_classic';
 
-/** True when the operator explicitly enabled the PERF-2 B classic skip. */
+/** True unless the operator explicitly restored the classic oracle (cvar 0). */
 export function skipClassicRequested(): boolean {
   try {
-    registerCVar(SW_RGB_SKIP_CLASSIC_CVAR, 0, 'skip classic world spanfill where the RGB overlay drew (PERF-2 B, default 0 = off, proof not airtight)');
+    registerCVar(SW_RGB_SKIP_CLASSIC_CVAR, 1, 'skip redundant classic spanfill where the RGB overlay drew (PERF-FINISH-A authoritative default 1 = on, 0 = classic oracle)');
     return getCVarNumber(SW_RGB_SKIP_CLASSIC_CVAR) !== 0;
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -286,19 +295,19 @@ export function sortBatchByRow(
 }
 
 /**
- * Emitter-order fast path (perf remediation item 3): emitSpansForPoly
- * emits strictly increasing y with one span per row, which is exactly the
- * order the row z-sort establishes — so for batches that came straight
- * from the emitter the sort is a proven no-op. This single linear pass
- * confirms the invariant (strictly increasing y) and the caller skips the
- * counting sort entirely: no rowBase fill, no counting pass. Anything else
- * (multi-face skybox batches are still per-face ordered; manual spans,
- * translucent reordering) fails the check and falls through to the exact
- * legacy sortBatchByRow above — output is identical in all cases. Clipping
- * preserves the invariant (it only drops rows, never reorders). Call
- * sites: single-poly world batches (opaque, sky-flat, skybox faces). The
- * deferred translucent alpha loop keeps the general sorter (back-to-front
- * ordering must be established, not assumed).
+ * Emitter-order validator (perf remediation item 3, PERF-FINISH-A item D):
+ * emitSpansForPoly emits strictly increasing y with one span per row, which
+ * is exactly the order the row z-sort establishes — so the world / sky-fill
+ * / skybox call sites in renderView trust the invariant with ZERO scans
+ * (no validation, no sort). This function is retained as the guard for
+ * that trust: emitOrder.test.ts fuzzes the emitter (convex polys, near
+ * clip, viewport clip, degenerate inputs) and asserts every emitted batch
+ * satisfies it, and the deferred translucent alpha loop keeps the general
+ * sorter (back-to-front ordering must be established, not assumed).
+ * Anything non-emitter-ordered fails the check and must go through
+ * sortBatchByRow — output is identical in all cases. Clipping preserves
+ * the invariant (it only drops rows, never reorders). Single linear pass,
+ * no allocation.
  */
 export function spansBatchIsRowOrdered(pool: Span[], start: number, count: number): boolean {
   if (count <= 1) return true;
@@ -725,12 +734,23 @@ export class SoftwareRenderer implements Refresh {
    */
   private skipForeground = false;
   /**
-   * Stashed authoritative-skip decision for the async path (perf
-   * remediation item 8): phase-1 renderView records it with the other
-   * foreground inputs; phase-2 (after flushRGBAsync) applies the zb
-   * backfill from the same decision so both halves agree.
+   * Stashed authoritative-skip decision for the async path (PERF-FINISH-A
+   * item A): phase-1 renderView records it with the other foreground
+   * inputs; phase-2 drawForeground applies the same foreground classic
+   * skips so both halves agree.
    */
   private fgSkipClassic = false;
+  /**
+   * PERF-FINISH-A item A observability: classic work eliminated by the
+   * authoritative skip this frame. `classicSpansSkipped` counts world /
+   * sky / skybox / deferred-alpha spans whose classic draw was elided
+   * where the RGB overlay drew; `classicFgSkipped` counts entity
+   * foreground classic draws elided (alias / sprite / particle / tracer
+   * calls). Reset in beginFrame, read via testClassicSkipStats. Software
+   * mode (RGB off) leaves both at zero — the skip never arms there.
+   */
+  private classicSpansSkipped = 0;
+  private classicFgSkipped = 0;
   private fgCam: Camera | null = null;  private fgWorld: MiniWorld | null = null;
   private fgDyn: DynamicLight[] | null = null;
   private fgTMode = 0;
@@ -1386,30 +1406,6 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
-   * Restore the classic 1/z plane from the RGB window-Z quanta (perf
-   * remediation item 8): exact inverse of the windowDepth01 mapping the
-   * RGB loops quantised on write (iz = (winA - d01) / winB), applied to
-   * every RGB-covered pixel the authoritative skip left unwritten. The
-   * foreground (alias/sprites/particles/tracers) then depth-tests as if
-   * the world had drawn classically. Uncovered pixels are untouched (they
-   * hold classic values). Quantisation ties vs float-z are the documented
-   * residual (measured, tiny, opaque-scenes-only by the tMode gate).
-   */
-  private backfillZbFromRGB(): void {
-    const near = this.rgbWin.near, far = this.rgbWin.far;
-    if (!(far > near) || !(near > 0)) return;
-    const winA = far / (far - near);
-    const winB = (far * near) / (far - near);
-    const cover = this.rgbCover, q = this.rgbDepth16, zb = this.zb;
-    const n = cover.length < zb.length ? cover.length : zb.length;
-    for (let i = 0; i < n; i++) {
-      if (cover[i]) {
-        zb[i] = (winA - q[i]! / 65535) / winB;
-      }
-    }
-  }
-
-  /**
    * Stage one world RGB batch for the worker kick (PERF-2 RGB workers).
    * Only opaque, depth-writing world materials stage (the world + sky
    * materials: repeat or uniform-clamp addressing, always with a mip
@@ -1751,6 +1747,8 @@ export class SoftwareRenderer implements Refresh {
     this.rgbStagedBatches = 0;
     this.rgbInlineBatches = 0;
     this.rgbKicks = 0;
+    this.classicSpansSkipped = 0;
+    this.classicFgSkipped = 0;
     if (rgbWorldEnabled) {
       this.rgbBackend.attach(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
       this.rgbCover.fill(0);
@@ -1913,27 +1911,19 @@ export class SoftwareRenderer implements Refresh {
     // r_translucency = 0 collapses to one loop with translucent surfaces
     // drawn opaque (pre-port behaviour).
     const tMode = translucencyModeFromCvars();
-    // PERF-2 B authoriative gate (perf remediation item 8): the operator
-    // cvar only takes effect in all-opaque frames (tMode === 0). That
-    // resolves every dependency the old "proof not airtight" comment
-    // warned about, by construction rather than by audit:
-    // - translucency/stipple: with tMode === 0 no surface ever reaches the
-    //   deferred alpha loop (nAlpha === 0 guaranteed), so no blend or
-    //   screen-door read of the classic index plane can observe a skip;
-    // - foreground depth: backfillZbFromRGB restores the classic 1/z plane
-    //   from the RGB window-Z quanta (exact inverse mapping) for every
-    //   RGB-covered pixel before drawForeground runs, so alias/sprite/
-    //   particle/tracer depth tests behave as if the world had drawn;
-    // - uncovered seeding: uncovered pixels keep their classic index
-    //   values (skips happen only where an RGB material drew), so
-    //   seedRGBBackground still sees the exact software background.
-    // The residual (documented, measured in skipClassic tests): float-z
-    // vs quantised window-Z can disagree on depth-tie pixels, so a few
-    // pixels may composite from the seed where classic would have drawn
-    // a surface. Default OFF: software mode is untouched. Frame stats
-    // intentionally still track the classic path, so they undercount
-    // while the skip is armed (integrator: docs/tests invariant update).
-    const skipClassicWorld = skipClassicRequested() && tMode === 0;
+    // PERF-FINISH-A item A (authoritative RGB skip, default on): elide the
+    // redundant classic world spanfill wherever the RGB overlay drew. The
+    // gate is the overlay itself, not the translucency mode: every skipped
+    // classic write lands on an RGB-covered pixel (resolved from the RGB
+    // planes in endFrame), and every classic *read* of the skipped planes
+    // is skipped together with it (the foreground RGB twins test against
+    // the RGB window-Z plane and blend against the seeded RGB background;
+    // covered in detail on SW_RGB_SKIP_CLASSIC_CVAR). Per-batch: classic
+    // still runs wherever no RGB material drew (unusable lightmap), so
+    // uncovered pixels keep exact classic values. Software mode (overlay
+    // off) never skips. Frame stats intentionally still track the classic
+    // path, so they undercount while the skip is armed.
+    const skipClassicWorld = skipClassicRequested() && this.rgbOverlayActive();
     this.fgSkipClassic = skipClassicWorld;
     if (this.alphaDeferredSi.length < nvis) {
       this.alphaDeferredSi = new Int32Array(Math.max(16, nvis));
@@ -2035,20 +2025,21 @@ export class SoftwareRenderer implements Refresh {
           }
         }
         if (ph) { ph.emit += phaseNow() - pt; pt = phaseNow(); }
-        // Emitter-order fast path (perf remediation item 3): the sky fill
-        // batch came straight from emitSpansForPoly (one span per row,
-        // ascending), so the counting sort is a proven no-op — one linear
-        // confirmation pass replaces the min/max + counting + fill. The
-        // fallback keeps bit-identical output for any other order.
-        if (!spansBatchIsRowOrdered(this.pool, start, endCount - start)) {
-          sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
-        }
+        // PERF-FINISH-A item D (zero-scan): the sky fill batch came straight
+        // from emitSpansForPoly (one span per row, strictly ascending y —
+        // the emitter invariant, guarded by the fuzz test in
+        // emitOrder.test.ts), which is exactly the order the row z-sort
+        // establishes. No validation scan, no sort: both were proven
+        // no-ops here. The general sorter (sortBatchByRow) is retained for
+        // non-emitter batches (deferred alpha loop, manual spans).
         if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = endCount;
-        // PERF-2 B: skip the redundant classic fill only when gated on AND
-        // the RGB overlay drew this batch (proof not airtight — default off,
-        // classic always runs; see SW_RGB_SKIP_CLASSIC_CVAR).
-        if (!(skipClassicWorld && this.rgbOverlayActive())) {
+        // Authoritative skip (item A): elide the redundant classic fill
+        // where the RGB overlay drew (always does here — flat sky always
+        // builds its material); count the eliminated spans.
+        if (skipClassicWorld) {
+          this.classicSpansSkipped += endCount - start;
+        } else {
           this.backend.drawSpans(this.spanList, texView, lightView);
         }
         if (this.rgbOverlayActive()) {
@@ -2064,12 +2055,15 @@ export class SoftwareRenderer implements Refresh {
         }
         continue;
       }
-      const dist = Math.sqrt(
+      // PERF-FINISH-A item D: squared-distance mip select — sqrt is
+      // strictly monotonic on [0, inf), so `d2 < T*T` selects exactly the
+      // same mip as `sqrt(d2) < T` (boundary equality included), while
+      // saving one sqrt per admitted surface (~8K/frame on base1).
+      const d2 =
         (surf.center[0]! - view.origin[0]!) ** 2 +
         (surf.center[1]! - view.origin[1]!) ** 2 +
-        (surf.center[2]! - view.origin[2]!) ** 2,
-      );
-      const mip = dist < 320 ? 0 : dist < 640 ? 1 : dist < 1280 ? 2 : 3;
+        (surf.center[2]! - view.origin[2]!) ** 2;
+      const mip = d2 < 102400 ? 0 : d2 < 409600 ? 1 : d2 < 1638400 ? 2 : 3;
       const lightId = surf.lightId % worldData.lightmaps.length;
       const lm = worldData.lightmaps[lightId]!;
       // Style-hash memo: the hash depends only on (lightId, this frame's
@@ -2160,19 +2154,18 @@ export class SoftwareRenderer implements Refresh {
         }
       }
       if (ph) { ph.emit += phaseNow() - pt; pt = phaseNow(); }
-      // Emitter-order fast path (item 3, see the sky-fill call site above).
-      if (!spansBatchIsRowOrdered(this.pool, start, endCount - start)) {
-        sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
-      }
+      // PERF-FINISH-A item D (zero-scan): single-poly world batch straight
+      // from emitSpansForPoly — emitter-ordered by construction, no
+      // validation scan, no sort (see the sky-fill site above).
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
-      // Classic draw always with the default flag (software planes
-      // bit-identical with the flag on or off); the RGB overlay composites
-      // over it in endFrame. Frame stats intentionally track the classic
-      // path only, so numbers stay comparable across the flag. PERF-2 B:
-      // the gated skip below elides this call only where an RGB material
-      // drew (default off — see SW_RGB_SKIP_CLASSIC_CVAR).
-      if (!(skipClassicWorld && rgbMat)) {
+      // Authoritative skip (item A): elide the classic draw only where an
+      // RGB material drew (unusable lightmaps fall back to classic, so
+      // uncovered pixels keep exact values); count eliminated spans.
+      // Frame stats intentionally track the classic path only.
+      if (skipClassicWorld && rgbMat) {
+        this.classicSpansSkipped += endCount - start;
+      } else {
         this.backend.drawSpans(this.spanList, tex, lb);
       }
       if (rgbMat) {
@@ -2207,14 +2200,14 @@ export class SoftwareRenderer implements Refresh {
     // no-op, batches already drew inline. Deferred in the async path (the
     // async driver awaits flushRGBAsync after the indexed kick instead —
     // a blocking kick here would serialize the browser main thread).
+    // No zb backfill: under the authoritative skip (item A) no classic
+    // read of the skipped planes survives — the foreground RGB twins test
+    // against the RGB window-Z plane — so the lossy quantised->float
+    // reconstruction is gone, not just unused.
     if (this.rgbUsedThisFrame &&
       !(this.backend === this.bandBackend && this.bandBackend.flushDeferred)) {
       if (ph) pt = phaseNow();
       this.flushRGB();
-      // Authoritative skip (item 8): the classic world plane holds holes
-      // where the RGB overlay drew — restore 1/z from the window-Z quanta
-      // so the foreground depth-tests below behave classically.
-      if (skipClassicWorld) this.backfillZbFromRGB();
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
     }
     candidatePixels = this.backend.pixelsDrawn - pixelsBase;
@@ -2274,18 +2267,27 @@ export class SoftwareRenderer implements Refresh {
     // before any RGB foreground write. Opaque RGB writes overwrite it.
     const rgbActive = this.rgbOverlayActive();
     if (rgbActive) this.seedRGBBackground();
+    // Authoritative skip (item A): the foreground RGB twins below are the
+    // displayed values in Voodoo mode, so the redundant classic draws are
+    // elided and counted. The RGB depth tests run against the RGB
+    // window-Z plane and blends against the seeded background — no skipped
+    // classic value is ever read.
+    const fgSkip = this.fgSkipClassic && rgbActive;
     for (let a = this.fgAlphaCount - 1; a >= 0; a--) {
       const si = this.alphaDeferredSi[a]!;
       const order = this.alphaDeferredOrd[a]!;
       const surf = worldData.surfaces[si]!;
       const trRaw = surf.translucent ?? 0;
       const tr = trRaw === 2 ? 2 : trRaw === 1 ? 1 : 0;
-      const dist = Math.sqrt(
+      // PERF-FINISH-A item D: squared-distance mip select — sqrt is
+      // strictly monotonic on [0, inf), so `d2 < T*T` selects exactly the
+      // same mip as `sqrt(d2) < T` (boundary equality included), while
+      // saving one sqrt per admitted surface (~8K/frame on base1).
+      const d2 =
         (surf.center[0]! - view.origin[0]!) ** 2 +
         (surf.center[1]! - view.origin[1]!) ** 2 +
-        (surf.center[2]! - view.origin[2]!) ** 2,
-      );
-      const mip = dist < 320 ? 0 : dist < 640 ? 1 : dist < 1280 ? 2 : 3;
+        (surf.center[2]! - view.origin[2]!) ** 2;
+      const mip = d2 < 102400 ? 0 : d2 < 409600 ? 1 : d2 < 1638400 ? 2 : 3;
       const lightId = surf.lightId % worldData.lightmaps.length;
       const lm = worldData.lightmaps[lightId]!;
       let stylesHash: number;
@@ -2340,37 +2342,47 @@ export class SoftwareRenderer implements Refresh {
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
-      this.ensureAlphamap();
-      const tb = this.tsBackend;
-      if (this.backend !== tb) tb.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
-      const t = drawSpansTranslucent(this.idx, this.zb, this.fbW, this.fbH, this.spanList,
-        tex, lb, this.colormap, this.alpha33, this.alpha66,
-        surf.turbulent ? tb.turbTable : null, view.time, this.fgTMode === 2);
       // RGB overlay (step 3): same spans, true alpha blend (never the
       // screen-door stipple — the RGB path has no stipple), warped when
       // the surface is turbulent, never depth-writing. Reverse traversal
-      // order is preserved (back-to-front over-blend).
+      // order is preserved (back-to-front over-blend). Resolved first so
+      // the authoritative skip below can test coverage.
+      let alphaRgbMat: RGBMaterial | null = null;
       if (this.rgbOverlayActive()) {
         const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 1);
-        let rgbMat = rgbHit
+        alphaRgbMat = rgbHit
           ? rgbHit.material
           : this.buildRGBEntry(
             worldData, surf, block, stylesHash, mip,
             view.lightStyles, dyn, this.alphaDeferredBits[a]!,
             { blend: 'alpha', depthWrite: false, variant: 1 },
           );
-        if (rgbMat) {
-          if (rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-          this.drawRGBSpans(this.spanList, rgbMat);
+        if (alphaRgbMat) {
+          if (alphaRgbMat.warp) alphaRgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
+          this.drawRGBSpans(this.spanList, alphaRgbMat);
         }
       }
-      this.transSpans += t.spans;
-      if (this.backend === tb) {
-        tb.spansDrawn += t.spans;
-        tb.pixelsDrawn += t.pixels;
+      // Authoritative skip (item A): elide the redundant classic blend
+      // where the RGB overlay drew (its blend is the displayed value);
+      // count the eliminated spans. Falls back to classic when no RGB
+      // material exists (degenerate lightmap), so output shape is kept.
+      if (this.fgSkipClassic && alphaRgbMat) {
+        this.classicSpansSkipped += endCount - start;
       } else {
-        this.backend.spansDrawn += t.spans;
-        this.backend.pixelsDrawn += t.pixels;
+        this.ensureAlphamap();
+        const tb = this.tsBackend;
+        if (this.backend !== tb) tb.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
+        const t = drawSpansTranslucent(this.idx, this.zb, this.fbW, this.fbH, this.spanList,
+          tex, lb, this.colormap, this.alpha33, this.alpha66,
+          surf.turbulent ? tb.turbTable : null, view.time, this.fgTMode === 2);
+        this.transSpans += t.spans;
+        if (this.backend === tb) {
+          tb.spansDrawn += t.spans;
+          tb.pixelsDrawn += t.pixels;
+        } else {
+          this.backend.spansDrawn += t.spans;
+          this.backend.pixelsDrawn += t.pixels;
+        }
       }
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
@@ -2403,11 +2415,15 @@ export class SoftwareRenderer implements Refresh {
         continue;
       }
       this.fgDrawn++;
-      drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
-        mesh, origin: pa.origin, angles: pa.angles,
-        frameA: pa.frameA, frameB: pa.frameB, lerp: pa.lerp,
-        lightAngle: ((pa.angles[1]! * 256) / 360) & 255,
-      }, skin, cam, this.anorms, this.shadeDots, this.colormap);
+      if (fgSkip) {
+        this.classicFgSkipped++;
+      } else {
+        drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
+          mesh, origin: pa.origin, angles: pa.angles,
+          frameA: pa.frameA, frameB: pa.frameB, lerp: pa.lerp,
+          lightAngle: ((pa.angles[1]! * 256) / 360) & 255,
+        }, skin, cam, this.anorms, this.shadeDots, this.colormap);
+      }
       if (rgbActive) {
         this.rgbBackend.pixelsDrawn += drawAliasInstanceRGB(
           this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, {
@@ -2430,10 +2446,14 @@ export class SoftwareRenderer implements Refresh {
         continue;
       }
       this.fgDrawn++;
-      drawSprite(this.idx, this.zb, this.fbW, this.fbH,
-        { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
-        [{ width: tex.width, height: tex.height, texels: tex.texels }],
-        emptyLight, this.colormap, cam, this.spriteScratch, 1024);
+      if (fgSkip) {
+        this.classicFgSkipped++;
+      } else {
+        drawSprite(this.idx, this.zb, this.fbW, this.fbH,
+          { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
+          [{ width: tex.width, height: tex.height, texels: tex.texels }],
+          emptyLight, this.colormap, cam, this.spriteScratch, 1024);
+      }
       if (rgbActive) {
         this.rgbBackend.pixelsDrawn += drawSpriteRGB(
           this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
@@ -2457,7 +2477,11 @@ export class SoftwareRenderer implements Refresh {
         cam.xCenter, cam.yCenter, cam.focalX, cam.focalY, cam.near,
         this.partPool,
       );
-      drawParticles(this.idx, this.zb, this.fbW, this.fbH, this.partPool, 0, np);
+      if (fgSkip) {
+        this.classicFgSkipped++;
+      } else {
+        drawParticles(this.idx, this.zb, this.fbW, this.fbH, this.partPool, 0, np);
+      }
       if (rgbActive) {
         this.rgbBackend.pixelsDrawn += drawParticlesRGB(
           this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
@@ -2505,15 +2529,19 @@ export class SoftwareRenderer implements Refresh {
           continue;
         }
         this.fgDrawn++;
-        drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
-          mesh: m.data, origin: e.origin, angles: e.angles,
-          frameA: frA, frameB: fr, lerp,
-          lightAngle: ((e.angles[1]! * 256) / 360) & 255,
-          // First-person viewmodel (Entity.depthHack = RF_DEPTHHACK):
-          // bias stored 1/z so the eye-anchored gun wins vs nearby walls.
-          depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
-          alpha: alpha >= 1 ? undefined : alpha,
-        }, skin, cam, this.anorms, this.shadeDots, this.colormap);
+        if (fgSkip) {
+          this.classicFgSkipped++;
+        } else {
+          drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
+            mesh: m.data, origin: e.origin, angles: e.angles,
+            frameA: frA, frameB: fr, lerp,
+            lightAngle: ((e.angles[1]! * 256) / 360) & 255,
+            // First-person viewmodel (Entity.depthHack = RF_DEPTHHACK):
+            // bias stored 1/z so the eye-anchored gun wins vs nearby walls.
+            depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
+            alpha: alpha >= 1 ? undefined : alpha,
+          }, skin, cam, this.anorms, this.shadeDots, this.colormap);
+        }
         // RGB overlay (step 3): perspective-correct twin — same traversal,
         // frame lerp and depthHack scale, true alpha blend for fading
         // explosions (no screen-door stipple in the RGB path).
@@ -2540,9 +2568,13 @@ export class SoftwareRenderer implements Refresh {
           continue;
         }
         this.fgDrawn++;
-        drawSprite(this.idx, this.zb, this.fbW, this.fbH,
-          { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
-          [skin], emptyLight, this.colormap, cam, this.spriteScratch, 1024);
+        if (fgSkip) {
+          this.classicFgSkipped++;
+        } else {
+          drawSprite(this.idx, this.zb, this.fbW, this.fbH,
+            { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
+            [skin], emptyLight, this.colormap, cam, this.spriteScratch, 1024);
+        }
         if (rgbActive) {
           this.rgbBackend.pixelsDrawn += drawSpriteRGB(
             this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
@@ -2575,12 +2607,16 @@ export class SoftwareRenderer implements Refresh {
           }
           this.fgDrawn++;
         }
-        drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
-          e.origin[0]!, e.origin[1]!, e.origin[2]!,
-          e.origin[0]! + this.tracerFwd[0]! * len,
-          e.origin[1]! + this.tracerFwd[1]! * len,
-          e.origin[2]! + this.tracerFwd[2]! * len,
-          col);
+        if (fgSkip) {
+          this.classicFgSkipped++;
+        } else {
+          drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
+            e.origin[0]!, e.origin[1]!, e.origin[2]!,
+            e.origin[0]! + this.tracerFwd[0]! * len,
+            e.origin[1]! + this.tracerFwd[1]! * len,
+            e.origin[2]! + this.tracerFwd[2]! * len,
+            col);
+        }
         if (rgbActive) {
           this.rgbBackend.pixelsDrawn += drawTracerBeamRGB(
             this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, cam,
@@ -2615,10 +2651,14 @@ export class SoftwareRenderer implements Refresh {
         }
         this.fgDrawn++;
       }
-      drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
-        this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
-        this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
-        this.tracerColors[ti]!, this.tracerCores[ti]!);
+      if (fgSkip) {
+        this.classicFgSkipped++;
+      } else {
+        drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
+          this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
+          this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
+          this.tracerColors[ti]!, this.tracerCores[ti]!);
+      }
       if (rgbActive) {
         this.rgbBackend.pixelsDrawn += drawTracerBeamRGB(
           this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, cam,
@@ -2691,11 +2731,10 @@ export class SoftwareRenderer implements Refresh {
     }
     // RGB worker kick (message-driven): staged world RGB batches drain
     // before the foreground seed + inline foreground RGB draws below.
+    // No zb backfill (item A): the foreground classic reads are skipped
+    // with the writes, so nothing consumes the skipped planes.
     if (this.rgbUsedThisFrame) {
       await this.flushRGBAsync();
-      // Authoritative skip (item 8, same decision as phase 1): backfill
-      // before the foreground draws below.
-      if (this.fgSkipClassic) this.backfillZbFromRGB();
     }
     // World kick complete (planes valid) — now the direct plane writes.
     const fgCam = this.fgCam;
@@ -2856,6 +2895,26 @@ export class SoftwareRenderer implements Refresh {
    * view sees no TRANS33/66 glass; observability for the glass golden). */
   testTranslucentSpans(): number {
     return this.transSpans;
+  }
+
+  /**
+   * PERF-FINISH-A item A observability: classic work eliminated by the
+   * authoritative skip in the last renderView. `classicSpansSkipped`
+   * counts world / sky / skybox / deferred-alpha spans whose classic draw
+   * was elided where the RGB overlay drew; `classicFgSkipped` counts
+   * elided entity-foreground classic draws (alias / sprite / particle /
+   * tracer calls). Both are zero with the cvar-0 oracle or in software
+   * mode (RGB off) — the skip never arms there. `skipArmed` reports the
+   * phase-1 decision for the last frame.
+   */
+  testClassicSkipStats(): {
+    classicSpansSkipped: number; classicFgSkipped: number; skipArmed: boolean;
+  } {
+    return {
+      classicSpansSkipped: this.classicSpansSkipped,
+      classicFgSkipped: this.classicFgSkipped,
+      skipArmed: this.fgSkipClassic,
+    };
   }
 
   /**
@@ -3073,9 +3132,10 @@ export class SoftwareRenderer implements Refresh {
   private emitSkyBox(cam: Camera, order: number, acc: { spans: number; max: number }): void {
     const sky = this.skyTex!;
     const tileH = sky.height / 6;
-    // PERF-2 B: read the gated classic skip once per skybox (up to 6 face
-    // batches below; see SW_RGB_SKIP_CLASSIC_CVAR — default off).
-    const skipClassicSky = skipClassicRequested();
+    // Authoritative skip (item A): same unified gate as the world pass
+    // (fgSkipClassic is set by renderView before any skybox emission; the
+    // world tMode gate is gone, so sky and world share one policy).
+    const skipClassicSky = this.fgSkipClassic;
     texView.width = sky.width;
     texView.height = sky.height;
     texView.texels = sky.texels;
@@ -3118,16 +3178,16 @@ export class SoftwareRenderer implements Refresh {
           sp.lv = -1;
         }
       }
-      // Emitter-order fast path (item 3): each skybox face is one
-      // emitSpansForPoly batch (one span per row, ascending).
-      if (!spansBatchIsRowOrdered(this.pool, start, endCount - start)) {
-        sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
-      }
+      // PERF-FINISH-A item D (zero-scan): each skybox face is one
+      // emitSpansForPoly batch (one span per row, ascending) — no scan,
+      // no sort (see the sky-fill site in renderView).
       this.spanList.count = endCount;
-      // Gated PERF-2 B skip (default off): elide the classic face fill only
-      // where the RGB sky material drew.
+      // Authoritative skip (item A): elide the classic face fill where the
+      // RGB sky material drew; count the eliminated spans.
       const skyMat = this.rgbOverlayActive() ? this.rgbMaterialForSky() : null;
-      if (!(skipClassicSky && skyMat)) {
+      if (skipClassicSky && skyMat) {
+        this.classicSpansSkipped += endCount - start;
+      } else {
         this.backend.drawSpans(this.spanList, texView, lightView);
       }
       if (skyMat) {

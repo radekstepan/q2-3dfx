@@ -232,6 +232,39 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 ## 8. Active tasks (everything else is DONE — see `docs/tasks-archive.md`)
 
 ```
+### PERF-FINISH-A — RGB-authoritative Voodoo + worker ranges + foreground (renderer)
+owns: `packages/sw-renderer`
+depends: VOODOO-REPAIR-2
+status: review
+done-when:
+- [x] Voodoo production skips duplicate classic world+foreground by default with counters proving skipped work; software unchanged
+- [x] Indexed+RGB workers use precomputed bounded ranges, no per-worker full-span rescan; fallback intact; 0/1/3/7 scaling measured
+- [ ] Foreground rasterizer measurably faster + worker-staged with ordering; serial fallback (DEFERRED: per-pixel barycentric→incremental rejected — changed coverage/ties; setup sharing kept; needs worker-staged foreground protocol, new card)
+- [x] Emitter order-validation scans removed at proven sites; GEO re-profiled
+```
+
+```
+### PERF-FINISH-B — browser critical path + acceptance (web)
+owns: `apps/web`
+depends: VOODOO-REPAIR-2
+status: in-progress
+done-when:
+- [x] Per-stage browser critical path measured (sim/GEO/staging/raster/fg/scanout/blit/gaps), worker wait per band, fallback counts
+- [x] Representative 640x480 presented-FPS + 5-min soak on new code (320×240 voodoo soak med 21fps, 0 fallbacks, results in perf-ledger; 640×480 browser FPS still open)
+```
+
+```
+### PERF-FINISH-C — trustworthy measurement (bench/testkit)
+owns: `tools/bench`, `packages/testkit`
+depends: VOODOO-REPAIR-2
+status: review
+done-when:
+- [x] Quiet-machine parent-vs-HEAD controlled before/after, identical workloads (a7b753b vs HEAD, same command, sequential — see perf-ledger)
+- [x] Full-RGBA serial-vs-pooled raster+display parity (blue/alpha fail), RGB execution proof, Voodoo fallback races, fixed translucent test, sky+world same skip policy
+- [x] ESM/CJS config-store pinned + regression-tested; instrumented vs uninstrumented vs presented separated; serial independently required (acceptance states it). OPEN: dual-store split needs a `packages/config` owner (single-instance rule) — test documents it as contract need
+```
+
+```
 ### VOODOO-REPAIR-2 — black areas on MD2s (barrels, enemies, bolts, gun fringe)
 owns: `packages/sw-renderer` (gates: `packages/sw-renderer` unit pins; release: `apps/web` voodoo-regression)
 depends: VOODOO-REPAIR

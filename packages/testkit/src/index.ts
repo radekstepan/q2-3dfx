@@ -22,6 +22,29 @@ export function hashFrame(color: Uint32Array): string {
   return (h >>> 0).toString(16).padStart(8, '0');
 }
 
+/**
+ * Full-RGBA FNV-1a (all 4 bytes per pixel, R+G+B+A order). The bench
+ * R+G harness hash (`hashColorRG` in tools/bench) is blind to blue-only
+ * and alpha-only corruption — parity gates MUST use this (or hashFrame)
+ * for serial-vs-pooled raster AND final display. Byte-wise (not
+ * word-wise) so endianness can never hide a channel.
+ */
+export function hashColorFull(color: Uint32Array): string {
+  let h = 2166136261;
+  for (let i = 0; i < color.length; i++) {
+    const px = color[i]!;
+    h ^= px & 0xff;
+    h = Math.imul(h, 16777619);
+    h ^= (px >>> 8) & 0xff;
+    h = Math.imul(h, 16777619);
+    h ^= (px >>> 16) & 0xff;
+    h = Math.imul(h, 16777619);
+    h ^= (px >>> 24) & 0xff;
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+
 /** Count differing pixels; `lsb` allows per-channel tolerance (voodoo). */
 export function pngDiff(a: Uint32Array, b: Uint32Array, lsb = 0): number {
   if (a.length !== b.length) return Math.max(a.length, b.length);

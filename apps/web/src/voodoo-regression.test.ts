@@ -16,6 +16,7 @@
 // below fails the run when Q2_PAK is absent. Never commit game assets.
 import { describe, expect, it, afterEach } from 'vitest';
 import { setCVar } from '@q2/config';
+import { SW_RGB_SKIP_CLASSIC_CVAR, skipClassicRequested } from '@q2/sw-renderer';
 import {
   applyRendererCvar,
   bootPlay,
@@ -54,7 +55,19 @@ function resetCvars(): void {
       /* absent cvar: sandbox best-effort */
     }
   }
+  // Classic-oracle pin restore (see the stats test): null = never pinned.
+  if (savedSkip !== null) {
+    try {
+      setCVar(SW_RGB_SKIP_CLASSIC_CVAR, savedSkip);
+    } catch {
+      /* absent cvar: sandbox best-effort */
+    }
+    savedSkip = null;
+  }
 }
+
+/** Pre-test skip-flag value saved by the stats test (null = unpinned). */
+let savedSkip: number | null = null;
 
 afterEach(() => {
   resetCvars();
@@ -82,6 +95,16 @@ describe('voodoo release-gate availability', () => {
 describe.runIf(!!WEB_Q2_PAK)('voodoo regression release gate (base1, 640x480)', () => {
   it('world, entities, gun and HUD render through the full application path', { timeout: 240000 }, async () => {
     const boot = await bootBase1();
+    // Classic oracle (PERF-FINISH-A defensive): the stats below assert the
+    // voodoo leg admits the same geometry as software (stats intentionally
+    // track the classic path, which the authoritative RGB skip elides where
+    // the overlay drew). Pin the oracle for the comparison; resolved output
+    // is identical either way (covered pixels composite from the RGB planes
+    // in endFrame), so the gun/HUD assertions below still gate production
+    // behavior. Saved honestly, restored in resetCvars (afterEach, even on
+    // failure).
+    savedSkip = skipClassicRequested() ? 1 : 0;
+    setCVar(SW_RGB_SKIP_CLASSIC_CVAR, 0);
     // hermetic HUD gates (afterEach(resetCvars) disables these; defaults
     // would pass by luck of test order — pin them explicitly)
     setCVar('cl_showfps', 1);

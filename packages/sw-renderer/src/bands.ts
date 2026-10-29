@@ -289,7 +289,20 @@ export const D_WSHIFT = 8;
 export const D_WMASK = 9;
 export const D_HMASK = 10;
 export const D_TURBPHASE = 11;
-export const D_PER_BATCH = 12;
+/**
+ * Staged span y-range, inclusive min / exclusive max row (worker-owned
+ * band-cull, PERF-FINISH-A item B). Written once at staging time by
+ * packBatched (one integer pass over the batch's staged spans — the
+ * emitter already guarantees row order, so this is a pure bound read),
+ * read by every worker BEFORE any material/view setup. The zero range
+ * (ymax <= ymin) means "unknown" — legacy descriptors (older browser
+ * pools), manual writers and empty batches fall through to the raster
+ * core's own per-span y filter, so output is identical with or without
+ * staged bounds.
+ */
+export const D_YMIN = 12;
+export const D_YMAX = 13;
+export const D_PER_BATCH = 14;
 
 /** Palette bytes staged for worker-side resolve (8-bit RGB palette). */
 export const PALETTE_BYTES = 768;
@@ -1365,7 +1378,7 @@ export function processRGBFrameJob(
   rgb: RGBAccumViews,
   fbW: number, fbH: number, descCount: number,
   y0: number, y1: number,
-): { pixels: number; spans: number } {
+): { pixels: number; spans: number; descs: number; spansStaged: number } {
   const near = rgb.kick[0]!;
   const far = rgb.kick[1]!;
   const lodBias = rgb.kick[2]!;
@@ -1420,6 +1433,8 @@ export function processRGBFrameJob(
   };
   let pixels = 0;
   let drawn = 0;
+  let descs = 0;
+  let spansStaged = 0;
   for (let b = 0; b < descCount; b++) {
     const d = b * R_PER_BATCH;
     const spanCount = rgb.rgbDesc[d + R_SPAN_COUNT]!;
@@ -1431,6 +1446,8 @@ export function processRGBFrameJob(
     const ymin = rgb.rgbDesc[d + R_YMIN]!;
     const ymax = rgb.rgbDesc[d + R_YMAX]!;
     if (ymax > ymin && (ymax <= y0 || ymin >= y1)) continue;
+    descs++;
+    spansStaged += spanCount;
     const spanBase = rgb.rgbDesc[d + R_SPAN_BASE]!;
     const slot = rgb.rgbDesc[d + R_CHAIN]!;
     const luxOff = rgb.rgbDesc[d + R_LUX_OFF]!;
@@ -1484,7 +1501,7 @@ export function processRGBFrameJob(
     pixels += r.pixels;
     drawn += r.spans;
   }
-  return { pixels, spans: drawn };
+  return { pixels, spans: drawn, descs, spansStaged };
 }
 
 /**
@@ -1493,62 +1510,44 @@ export function processRGBFrameJob(
  * ranges so cross-band order cannot affect any pixel; within a band the
  * descriptors run sequentially in pack order, exactly like the equivalent
  * per-batch kicks. Bit-identical to the single-threaded path.
- */
-/**
- * Rasterise one band's share of a frame kick: every descriptor in order,
- * each with its own staged (tex, light) setup. Bands are disjoint row
- * ranges so cross-band order cannot affect any pixel; within a band the
- * descriptors run sequentially in pack order, exactly like the equivalent
- * per-batch kicks. Bit-identical to the single-threaded path.
  *
- * Perf remediation item 2: the first pass derives each descriptor's staged
- * span y-range into scratch (one integer pass over the frame's flat spans),
- * and the drain pass skips descriptors with no overlap for this band BEFORE
- * any material/view setup (no texel/light subarray views, no mask math).
- * Order is preserved (skips only touch rows this band never draws); legacy
- * empty batches (spanCount <= 0) still `continue` exactly as before, and
- * the full-frame inline replay overlaps everything so it culls nothing.
+ * PERF-FINISH-A item B (worker-owned ranges): each descriptor carries its
+ * staged span y-range (D_YMIN/D_YMAX, written once at staging time by
+ * packBatched). Bands with no overlap skip material + view setup entirely
+ * BEFORE touching texel/light views — no per-worker rescan of the frame's
+ * spans. A zero range (ymax <= ymin) means "unknown" (legacy / manual
+ * descriptors) and falls through to the raster core's own per-span y
+ * filter, so output is identical either way. Tallies add band-cull
+ * observability: `descs` counts descriptors actually visited (material
+ * resolved), `spansStaged` sums their staged span counts, so
+ * `descCount - descs` (minus empties) were rejected pre-setup.
  */
-const jobRangeScratch = new Int32Array(MAX_FRAME_BATCHES * 2);
-
 export function processFrameJob(
   fv: FrameAccumViews, fbW: number, fbH: number, descCount: number,
   y0: number, y1: number,
-): { pixels: number; spans: number } {
+): { pixels: number; spans: number; descs: number; spansStaged: number } {
   const { base, fSpansF, fSpansI, fTex, fLight, desc } = fv;
   const colormap = base.colormap;
   const turbTable = base.turb;
   const total = descCount < MAX_FRAME_BATCHES ? descCount : MAX_FRAME_BATCHES;
-  // Range pass: staged spans are row-ordered per batch (the emitter writes
-  // strictly increasing y), but batches interleave arbitrarily, so derive
-  // [ymin, ymax) per descriptor with one scan instead of trusting layout.
-  for (let b = 0; b < total; b++) {
-    const d = b * D_PER_BATCH;
-    const spanBase = desc[d + D_SPAN_BASE]!;
-    const spanCount = desc[d + D_SPAN_COUNT]!;
-    let ymin = 0x7fffffff;
-    let ymax = -0x80000000;
-    for (let s = 0; s < spanCount; s++) {
-      const y = fSpansI[(spanBase + s) * I_PER_SPAN + 1]!;
-      if (y < ymin) ymin = y;
-      if (y + 1 > ymax) ymax = y + 1;
-    }
-    jobRangeScratch[b * 2] = ymin;
-    jobRangeScratch[b * 2 + 1] = ymax;
-  }
   let pixels = 0;
   let drawn = 0;
+  let descs = 0;
+  let spansStaged = 0;
   for (let b = 0; b < total; b++) {
     const d = b * D_PER_BATCH;
     const spanBase = desc[d + D_SPAN_BASE]!;
     const spanCount = desc[d + D_SPAN_COUNT]!;
     if (spanCount <= 0) continue;
-    // Band-cull: no staged row belongs to [y0, y1) — skip material + view
-    // setup entirely. Empty-range sentinels (no spans scanned) never reach
-    // here (spanCount <= 0 continued above), so ymax > ymin always holds.
-    const ymin = jobRangeScratch[b * 2]!;
-    const ymax = jobRangeScratch[b * 2 + 1]!;
-    if (ymax <= y0 || ymin >= y1) continue;
+    // Worker-owned band-cull: staged bounds reject non-overlapping
+    // descriptors BEFORE material + view setup. Unknown (zero) ranges
+    // never cull — the raster core's per-span y filter below still
+    // restricts them to the band, so output is identical.
+    const ymin = desc[d + D_YMIN]!;
+    const ymax = desc[d + D_YMAX]!;
+    if (ymax > ymin && (ymax <= y0 || ymin >= y1)) continue;
+    descs++;
+    spansStaged += spanCount;
     const texOff = desc[d + D_TEX_OFF]!;
     const texW = desc[d + D_TEX_W]!;
     const texH = desc[d + D_TEX_H]!;
@@ -1574,7 +1573,7 @@ export function processFrameJob(
     pixels += r.pixels;
     drawn += r.spans;
   }
-  return { pixels, spans: drawn };
+  return { pixels, spans: drawn, descs, spansStaged };
 }
 
 /**

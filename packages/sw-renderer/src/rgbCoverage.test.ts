@@ -1,10 +1,17 @@
 // astra step 3: full RGB material coverage (models, viewmodel depth-hack,
 // sprites, particles, sky, beams, turbulent water, translucent ordering).
-// The classic indexed path always draws underneath, so software pixels stay
-// bit-identical with the flag on or off; the RGB overlay composites over it.
+// PERF-FINISH-A item A: the RGB overlay is the production authority, so the
+// redundant classic draws underneath are skipped by default — the classic
+// index plane is NO LONGER bit-identical with the flag on (only the
+// displayed RGB composite is). The cvar-0 oracle path preserves the old
+// software identity exactly; these tests pin oracle-vs-software identity
+// AND authoritative-vs-oracle display identity.
 import { afterEach, describe, expect, it } from 'vitest';
 import { createFramebuffer, type Entity } from '@q2/renderer-api';
-import { SoftwareRenderer, setRGBWorldEnabled } from './frame.js';
+import { resetCVars, setCVar } from '@q2/config';
+import {
+  SoftwareRenderer, setRGBWorldEnabled, SW_RGB_SKIP_CLASSIC_CVAR,
+} from './frame.js';
 import { createDevroom, DEVROOM_CAMERA } from './devroom.js';
 import { setupCamera } from './camera.js';
 import {
@@ -24,6 +31,7 @@ import type { MiniSurf, MiniWorld } from './worldNodes.js';
 
 afterEach(() => {
   setRGBWorldEnabled(false);
+  resetCVars();
 });
 
 function grayPalette(): Uint8Array {
@@ -459,73 +467,104 @@ function quadView(time = 0): {
 }
 
 describe('frame-level RGB: water, sky, software identity', () => {
-  function renderAll(world: MiniWorld, W: number, H: number, rgb: boolean, pal: Uint8Array): {
-    idxHash: string; coverPixels: number; used: boolean;
+  function renderAll(world: MiniWorld, W: number, H: number, rgb: boolean, pal: Uint8Array, skip = true): {
+    idxHash: string; colorHash: string; coverPixels: number; used: boolean;
+    classicSpansSkipped: number; classicFgSkipped: number;
   } {
     const fb = createFramebuffer(W, H, true);
     const r = new SoftwareRenderer();
     r.init(fb);
     r.setPalette(pal);
+    setCVar(SW_RGB_SKIP_CLASSIC_CVAR, skip ? 1 : 0);
     setRGBWorldEnabled(rgb);
     r.beginFrame();
     r.renderView(quadView(), { name: 'quad', data: world }, []);
     r.endFrame();
     const st = r.testRGBStats();
-    return { idxHash: fnv(fb.index!), coverPixels: st.coverPixels, used: st.used };
+    const sk = r.testClassicSkipStats();
+    const live = r.getFramebuffer();
+    return {
+      idxHash: fnv(fb.index!),
+      colorHash: fnv(new Uint8Array(live.color.buffer, live.color.byteOffset, W * H * 4)),
+      coverPixels: st.coverPixels, used: st.used,
+      classicSpansSkipped: sk.classicSpansSkipped, classicFgSkipped: sk.classicFgSkipped,
+    };
   }
 
-  it('turbulent water draws warped RGB and keeps software pixels identical', () => {
+  it('turbulent water draws warped RGB; oracle keeps software identity, authoritative keeps display identity', () => {
     const pal = testPalette();
     const world = singleQuadWorld(facingQuad({ turbulent: true }));
     const off = renderAll(world, 160, 120, false, pal);
+    const oracle = renderAll(world, 160, 120, true, pal, false);
     const on = renderAll(world, 160, 120, true, pal);
+    // Oracle (cvar 0): classic draws underneath, software identity holds.
+    expect(oracle.used).toBe(true);
+    expect(oracle.idxHash).toBe(off.idxHash);
+    expect(oracle.classicSpansSkipped).toBe(0);
+    // Authoritative (default): display-identical, classic work eliminated.
     expect(on.used).toBe(true);
     expect(on.coverPixels).toBeGreaterThan(1000);
-    expect(on.idxHash).toBe(off.idxHash);
+    expect(on.colorHash).toBe(oracle.colorHash);
+    expect(on.classicSpansSkipped).toBeGreaterThan(0);
   });
 
-  it('glass draws blended RGB (no stipple) and keeps software pixels identical', () => {
+  it('glass draws blended RGB (no stipple); oracle keeps software identity, authoritative keeps display identity', () => {
     const pal = testPalette();
     const world = singleQuadWorld(facingQuad({ translucent: 2 }));
     const off = renderAll(world, 160, 120, false, pal);
+    const oracle = renderAll(world, 160, 120, true, pal, false);
     const on = renderAll(world, 160, 120, true, pal);
+    expect(oracle.used).toBe(true);
+    expect(oracle.idxHash).toBe(off.idxHash);
     expect(on.used).toBe(true);
     expect(on.coverPixels).toBeGreaterThan(1000);
-    expect(on.idxHash).toBe(off.idxHash);
+    expect(on.colorHash).toBe(oracle.colorHash);
+    expect(on.classicSpansSkipped).toBeGreaterThan(0);
   });
 
-  it('textured skybox draws clamped RGB and keeps software pixels identical', () => {
+  it('textured skybox draws clamped RGB; oracle keeps software identity, authoritative keeps display identity', () => {
     const pal = testPalette();
     const world = singleQuadWorld(facingQuad({ sky: true }));
     const W = 160, H = 120;
     // valid packed strip: 64 wide, 6 x 64 tiles
     const sky = { texels: new Uint8Array(64 * 384).fill(77), width: 64, height: 384 };
-    const run = (rgb: boolean): { idxHash: string; coverPixels: number } => {
+    const run = (rgb: boolean, skip: boolean): { idxHash: string; colorHash: string; coverPixels: number; classicSpansSkipped: number } => {
       const fb = createFramebuffer(W, H, true);
       const r = new SoftwareRenderer();
       r.init(fb);
       r.setPalette(pal);
       r.setSkyTexture(sky);
+      setCVar(SW_RGB_SKIP_CLASSIC_CVAR, skip ? 1 : 0);
       setRGBWorldEnabled(rgb);
       r.beginFrame();
       r.renderView(quadView(), { name: 'skyquad', data: world }, []);
       r.endFrame();
-      return { idxHash: fnv(fb.index!), coverPixels: r.testRGBStats().coverPixels };
+      const live = r.getFramebuffer();
+      return {
+        idxHash: fnv(fb.index!),
+        colorHash: fnv(new Uint8Array(live.color.buffer, live.color.byteOffset, W * H * 4)),
+        coverPixels: r.testRGBStats().coverPixels,
+        classicSpansSkipped: r.testClassicSkipStats().classicSpansSkipped,
+      };
     };
-    const off = run(false);
-    const on = run(true);
+    const off = run(false, true);
+    const oracle = run(true, false);
+    const on = run(true, true);
+    expect(oracle.idxHash).toBe(off.idxHash);
     expect(on.coverPixels).toBeGreaterThan(1000);
-    expect(on.idxHash).toBe(off.idxHash);
+    expect(on.colorHash).toBe(oracle.colorHash);
+    expect(on.classicSpansSkipped).toBeGreaterThan(0);
   });
 
-  it('devroom index plane is bit-identical with the flag on or off', () => {
+  it('devroom: oracle index plane matches software; authoritative RGB matches oracle display', () => {
     const pal = testPalette();
     const styles = new Float32Array(256).fill(1);
-    const run = (rgb: boolean): string => {
+    const run = (rgb: boolean, skip: boolean): { idx: string; color: string } => {
       const fb = createFramebuffer(160, 120, true);
       const r = new SoftwareRenderer();
       r.init(fb);
       r.setPalette(pal);
+      setCVar(SW_RGB_SKIP_CLASSIC_CVAR, skip ? 1 : 0);
       setRGBWorldEnabled(rgb);
       r.beginFrame();
       r.renderView(
@@ -534,11 +573,19 @@ describe('frame-level RGB: water, sky, software identity', () => {
         [],
       );
       r.endFrame();
-      return fnv(fb.index!);
+      const live = r.getFramebuffer();
+      return {
+        idx: fnv(fb.index!),
+        color: fnv(new Uint8Array(live.color.buffer, live.color.byteOffset, 160 * 120 * 4)),
+      };
     };
-    const off = run(false);
-    expect(off).toBeTruthy();
-    expect(run(true)).toBe(off);
+    const off = run(false, true);
+    const oracle = run(true, false);
+    const on = run(true, true);
+    expect(off.idx).toBeTruthy();
+    expect(oracle.idx).toBe(off.idx);
+    expect(on.color).toBe(oracle.color);
+    expect(on.idx).not.toBe(off.idx);
   });
 });
 
@@ -552,8 +599,9 @@ describe('frame-level RGB: filtered explosions (no stipple)', () => {
     return { texels: t, width: 32, height: 32 };
   }
 
-  function renderExplosion(rgb: boolean): {
-    idxHash: string; coverPixels: number; entityBoxCover: number; entityBoxArea: number;
+  function renderExplosion(rgb: boolean, skip = true): {
+    idxHash: string; colorHash: string; coverPixels: number; entityBoxCover: number; entityBoxArea: number;
+    classicFgSkipped: number;
   } {
     const W = 160, H = 120;
     const fb = createFramebuffer(W, H, true);
@@ -573,6 +621,7 @@ describe('frame-level RGB: filtered explosions (no stipple)', () => {
       alpha: 0.5,
     };
     const styles = new Float32Array(256).fill(1);
+    setCVar(SW_RGB_SKIP_CLASSIC_CVAR, skip ? 1 : 0);
     setRGBWorldEnabled(rgb);
     r.beginFrame();
     r.renderView(
@@ -594,16 +643,20 @@ describe('frame-level RGB: filtered explosions (no stipple)', () => {
     const x0 = Math.max(0, Math.floor(px - 7)), x1 = Math.min(W - 1, Math.ceil(px + 7));
     const y0 = Math.max(0, Math.floor(py - 7)), y1 = Math.min(H - 1, Math.ceil(py + 7));
     const st = r.testRGBStats();
+    const sk = r.testClassicSkipStats();
     const boxCover = rgb ? r.testRGBBoxCover(x0, y0, x1, y1) : 0;
+    const live = r.getFramebuffer();
     return {
       idxHash: fnv(fb.index!),
+      colorHash: fnv(new Uint8Array(live.color.buffer, live.color.byteOffset, W * H * 4)),
       coverPixels: st.coverPixels,
       entityBoxCover: boxCover,
       entityBoxArea: (x1 - x0 + 1) * (y1 - y0 + 1),
+      classicFgSkipped: sk.classicFgSkipped,
     };
   }
 
-  it('explosion entity is visible classically and covered densely in RGB', () => {
+  it('explosion entity: oracle keeps classical visibility, authoritative keeps RGB display', () => {
     // visibility pre-check: the entity changes indexed pixels vs no entity
     const pal = testPalette();
     const styles = new Float32Array(256).fill(1);
@@ -622,10 +675,16 @@ describe('frame-level RGB: filtered explosions (no stipple)', () => {
       return fnv(fb.index!);
     };
     const bare = runBare();
+    const oracle = renderExplosion(true, false);
     const on = renderExplosion(true);
     const off = renderExplosion(false);
     expect(off.idxHash).not.toBe(bare);
-    expect(on.idxHash).toBe(off.idxHash);
+    // Oracle (cvar 0): classic entity draw preserved exactly.
+    expect(oracle.idxHash).toBe(off.idxHash);
+    expect(oracle.classicFgSkipped).toBe(0);
+    // Authoritative (default): display-identical, classic entity draw gone.
+    expect(on.colorHash).toBe(oracle.colorHash);
+    expect(on.classicFgSkipped).toBeGreaterThan(0);
     expect(on.coverPixels).toBeGreaterThan(1000);
     // dense alpha-blended cover in the entity box: stipple would leave
     // holes (alpha 0.5 keeps ~50%); smooth RGB fills the silhouette.

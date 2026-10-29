@@ -521,7 +521,7 @@ export function cvarNeedsReboot(name: string): boolean {
 }
 
 /** UI cvars persisted across page reloads (localStorage, DOM-guarded). */
-const PERSISTED_CVARS = ['vid_renderer', 'skill', 'vid_resolution', 'map_source', 'r_brightness'] as const;
+const PERSISTED_CVARS = ['vid_renderer', 'skill', 'vid_resolution', 'map_source', 'r_brightness', 'sw_workers'] as const;
 const PERSIST_KEY = 'q2ts.cvars.v1';
 
 /** Save menu cvars to localStorage. No-op without DOM. */
@@ -1064,6 +1064,15 @@ function blip(ctx: AudioContext, master: GainNode, freq: number, dur: number, wh
  * - `pooled`/`rgbStaged`/`rgbKicks`/`rgbInline`: the RGB raster worker path
  *   executed this frame (staged batches + completed kicks + inline
  *   fallbacks, per-frame since the last beginFrame).
+ * - `bands`/`poolSpans`/`poolPixels`: pool geometry (bands = workers + the
+ *   main-thread band; 1 when unpooled) + the indexed-lane tally the pool
+ *   drained this frame (spans/pixels drawn across all bands).
+ * - `rgbPending`/`stageBytes`: batches still staged at present time
+ *   (healthy: 0 — every kick flushed) + bytes staged for the frame kick
+ *   (indexed spans/tex/light + RGB spans/chains/luxels; -1 when unpooled).
+ * - `fgInline`: entity-foreground batches drawn inline after the kick
+ *   (foreground always rides inline today; -1 = renderer has no foreground
+ *   counter yet — see the PERF-FINISH-B contract note in publishQ2Stats).
  * - `voodooPath`/`resolveOrder`: which scanout path the last resolve took
  *   (`worker` = pooled Track A kick, `serial` = main-thread resolve,
  *   `none` = software mode) and the HUD ordering. Proves the pooled
@@ -1081,6 +1090,26 @@ export interface Q2Stats {
   rgbStaged: number;
   rgbKicks: number;
   rgbInline: number;
+  bands: number;
+  poolSpans: number;
+  poolPixels: number;
+  rgbPending: number;
+  stageBytes: number;
+  /**
+   * Foreground classic spans elided where the RGB twin drew (-1 = the
+   * renderer publishes no foreground counter — see the PERF-FINISH-B
+   * contract note in publishQ2Stats). Under the authoritative RGB skip the
+   * displayed foreground is the RGB twin, so a healthy pooled voodoo frame
+   * shows this > 0 alongside rgbKicks = 1.
+   */
+  fgInline: number;
+  /**
+   * Authoritative-skip observability (PERF-FINISH-A): classic world spans
+   * elided where the RGB overlay drew + whether the skip armed this frame.
+   * 0/false when the hook is absent (older renderer) or the oracle pinned.
+   */
+  classicSkipped: number;
+  skipArmed: boolean;
   voodooPath: string;
   resolveOrder: string;
   scanoutKicks: number;
@@ -1090,6 +1119,8 @@ export interface Q2Stats {
 
 const Q2STATS_ZERO: Q2Stats = {
   fps: 0, frame: 0, pooled: false, rgbStaged: 0, rgbKicks: 0, rgbInline: 0,
+  bands: 1, poolSpans: 0, poolPixels: 0, rgbPending: 0, stageBytes: -1,
+  fgInline: -1, classicSkipped: 0, skipArmed: false,
   voodooPath: 'none', resolveOrder: 'none',
   scanoutKicks: 0, scanoutFallbacks: 0, asyncFallbacks: 0,
 };
@@ -1100,10 +1131,16 @@ const Q2STATS_ZERO: Q2Stats = {
  * the record (a copy headless, for unit pins). Never throws: worker-stat
  * probes are guarded so a throwing/future renderer can never break the
  * production present path. Production instrumentation is limited to these
- * counters — no per-phase `performance.now()` runs in the loop, so the
+ * counters — no per-frame `performance.now()` runs in the loop, so the
  * accepted (presented) FPS is never perturbed by measurement; phase
- * breakdowns live in instrumented test harnesses only (voodoo-perf,
- * bench), clearly labeled report-only.
+ * breakdowns live in instrumented harnesses only (measureFrameStages +
+ * pool diag, clearly labeled report-only).
+ *
+ * Contract note (PERF-FINISH-B → renderer lane): `fgInline` reads the
+ * renderer's `testClassicSkipStats` hook (`{ classicFgSkipped }`) when
+ * present — foreground classic spans elided where the RGB twin drew — and
+ * reports -1 when the hook is absent (older renderer), never a guess.
+ * `classicSkipped`/`skipArmed` carry the world-span twin of the same hook.
  */
 export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2Stats {
   const snap: Q2Stats = { ...Q2STATS_ZERO, fps, frame };
@@ -1116,14 +1153,58 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
       const ws = boot.refresh.testWorkerStats();
       const rs = boot.refresh.testRGBWorkerStats();
       rec.pooled = ws.pooled;
+      rec.bands = ws.bands;
+      rec.poolSpans = ws.spans;
+      rec.poolPixels = ws.pixels;
       rec.rgbStaged = rs.staged;
       rec.rgbKicks = rs.kicks;
       rec.rgbInline = rs.inline;
     } catch {
       rec.pooled = false;
+      rec.bands = 1;
+      rec.poolSpans = 0;
+      rec.poolPixels = 0;
       rec.rgbStaged = 0;
       rec.rgbKicks = 0;
       rec.rgbInline = 0;
+    }
+    try {
+      const pool = boot.browserPool as unknown as {
+        rgbPending?: () => number;
+        kickBytes?: () => { total: number } | null;
+        stagingBytes?: () => { total: number };
+      } | null;
+      rec.rgbPending = pool && typeof pool.rgbPending === 'function'
+        ? pool.rgbPending() : 0;
+      // Frozen last-kick snapshot first (post-kick live offsets are zeros).
+      const kb = pool && typeof pool.kickBytes === 'function' ? pool.kickBytes() : null;
+      rec.stageBytes = kb !== null && kb !== undefined ? kb.total
+        : pool && typeof pool.stagingBytes === 'function'
+          ? pool.stagingBytes().total : -1;
+    } catch {
+      rec.rgbPending = 0;
+      rec.stageBytes = -1;
+    }
+    try {
+      const fg = (boot.refresh as unknown as {
+        testClassicSkipStats?: () => {
+          classicSpansSkipped: number; classicFgSkipped: number; skipArmed: boolean;
+        };
+      }).testClassicSkipStats;
+      if (typeof fg === 'function') {
+        const sk = fg.call(boot.refresh);
+        rec.fgInline = sk.classicFgSkipped;
+        rec.classicSkipped = sk.classicSpansSkipped;
+        rec.skipArmed = sk.skipArmed === true;
+      } else {
+        rec.fgInline = -1;
+        rec.classicSkipped = 0;
+        rec.skipArmed = false;
+      }
+    } catch {
+      rec.fgInline = -1;
+      rec.classicSkipped = 0;
+      rec.skipArmed = false;
     }
     rec.voodooPath = boot.lastVoodooPath;
     rec.resolveOrder = boot.lastResolveOrder;

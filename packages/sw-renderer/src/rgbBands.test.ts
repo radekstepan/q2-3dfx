@@ -136,8 +136,12 @@ describe('banded vs serial RGB equivalence (dither phase + seam rows)', () => {
     // Mip-UV-scale + bias-removal re-pin (was 206e1dad): RGB samplers scale
     // UVs into the picked mip and alias tracks the shared bias (delta 0);
     // see rgbPerf.test.ts. Index pin unchanged.
+    // Authoritative-skip re-pin (was 58e0ecf1, now b952d9c5):
+    // PERF-FINISH-A item A elides classic spanfill where the RGB overlay
+    // drew (default on); the color pin above is unchanged (display
+    // identity). See rgbPerf.test.ts for the cvar-0 oracle pin.
     expect(a.colorHash).toBe('68b22dea');
-    expect(a.indexHash).toBe('58e0ecf1');
+    expect(a.indexHash).toBe('b952d9c5');
   });
 
   it('banded-inline matches serial for 2..8 bands at 160x120', async () => {
@@ -229,8 +233,11 @@ describe('banded vs serial RGB equivalence (dither phase + seam rows)', () => {
         expect(f.colorHash).toBe(serial.colorHash);
         expect(f.indexHash).toBe(serial.indexHash);
       }
-      // software planes stay pinned under pooling too
-      expect(withAccum.indexHash).toBe('8f61c755');
+      // software planes stay pinned under pooling too (authoritative-skip
+      // re-pin, was 8f61c755: classic spanfill is elided where the RGB
+      // overlay drew; colorHash above already proved pooled≡serial display
+      // identity — see rgbPerf.test.ts for the cvar-0 oracle pin)
+      expect(withAccum.indexHash).toBe('6ad58dc5');
     } finally {
       resetCVars();
     }
