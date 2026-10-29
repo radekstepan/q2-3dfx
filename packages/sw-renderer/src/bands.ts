@@ -2451,8 +2451,11 @@ export interface BandDispatcher {
   // renderer feature-detects them: pools without them keep the legacy
   // behaviour (reset-on-flush, full replay of the pending set). Legacy
   // partial-failure recovery still destroys already-flushed world work —
-  // that gap closes when the browser pool mirrors this protocol. Never
-  // change raster math — transport and recovery only.
+  // that gap closes when the browser pool mirrors this protocol. PLUS the
+  // PERF-NEXT-9 fence: a recovery after quarantine isolation must replay
+  // the FULL retained range (the applied prefix died with the abandoned
+  // buffer) — a suffix-only replay over cleared planes silently drops the
+  // prefix. Never change raster math — transport and recovery only.
   //
   // --- end retained-frame recovery protocol ---
   //
@@ -2478,11 +2481,15 @@ export interface BandDispatcher {
    * blends, selective by suffix content — an opaque-only unapplied suffix
    * replays in place (no clear, preserving non-retained inline writes);
    * a blend-carrying suffix clears, replays the world prefix, runs
-   * `seed`, then replays the suffix. Infallible; the pool must already be
-   * quarantined when writes may have been in flight (the timeout paths
-   * quarantine before returning null — never replay while workers can
-   * still write). Ends with flushed == descCount. Returns the replay
-   * tally.
+   * `seed`, then replays the suffix. PERF-NEXT-9: after quarantine
+   * isolation the applied prefix is gone with the abandoned buffer, so a
+   * recovery with the isolation fence set replays the FULL retained range
+   * [0, descCount) instead (opaque-only full ranges in place,
+   * blend-carrying full ranges via clear + prefix + seed + suffix).
+   * Infallible; the pool must already be quarantined when writes may have
+   * been in flight (the timeout paths quarantine before returning null —
+   * never replay while workers can still write). Ends with flushed ==
+   * descCount. Returns the replay tally.
    */
   recoverInlineRGBAll?(seed: () => void, near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; tris?: number };
 

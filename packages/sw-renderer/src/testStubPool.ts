@@ -57,6 +57,7 @@ export function stubPool(W: number, H: number, opts?: { readyBands?: number; tim
   pool['rgbFlushedCount'] = 0;
   pool['rgbFailure'] = null;
   pool['quarantined'] = false;
+  pool['rgbNeedsFullReplay'] = false;
   pool['sabEpoch'] = 0;
   pool['quarantineSettled'] = null;
   pool['timingEnabled'] = true;

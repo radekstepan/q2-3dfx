@@ -685,6 +685,14 @@ export class BrowserBandPool implements BandDispatcher {
   private rgbChainMap = new Map<RGBMipLevel[], number>();
   /** Retained-frame watermark: descriptors [0, flushed) hold plane writes. */
   private rgbFlushedCount = 0;
+  /**
+   * Post-quarantine full-replay fence (PERF-NEXT-9, mirrors the Node pool):
+   * set when quarantine isolation abandons the planes onto a cleared
+   * replacement SAB, taking every applied prefix write with it. The next
+   * recoverInlineRGBAll consumes it and replays the FULL retained range
+   * instead of the suffix alone. Cleared by resetRGB. Main thread only.
+   */
+  private rgbNeedsFullReplay = false;
   /** Last RGB flush outcome: 'clean' = refused/clean-failure (staging
    *  refusal, checkpoint allocation failure, never-ready, declined or
    *  pre-dispatch dispose — nothing was dispatched), 'partial' =
@@ -2399,6 +2407,10 @@ export class BrowserBandPool implements BandDispatcher {
       // not skip this generation.
       this.mainLastGen = this.frameGen;
       this.sabEpoch = (typeof this.sabEpoch === 'number' ? this.sabEpoch : 0) + 1;
+      // PERF-NEXT-9: the cleared replacement planes hold none of the
+      // applied prefix [0, flushed) — the next recovery must replay the
+      // full retained range, never just the suffix.
+      this.rgbNeedsFullReplay = true;
     } catch {
       /* terminate-only fallback */
     }
@@ -2438,6 +2450,7 @@ export class BrowserBandPool implements BandDispatcher {
     this.rgbTriUsed = 0;
     this.rgbFlushedCount = 0;
     this.rgbFailure = null;
+    this.rgbNeedsFullReplay = false;
     try {
       Atomics.store(this.ctl, CTL_RGBCOUNT, 0);
       Atomics.store(this.ctl, CTL_RGBBASE, 0);
@@ -2573,12 +2586,17 @@ export class BrowserBandPool implements BandDispatcher {
   /**
    * Complete-frame recovery replay (mirrors Node pool): selective by suffix.
    * Opaque-only suffix replays in place (no clear); blend suffix clears,
-   * replays prefix, runs seed, replays suffix. Must be called only after
-   * quarantine when writes may have been in flight - the timeout path
-   * quarantines (shutdown signal + replacement-buffer isolation +
-   * termination) and the renderer re-adopts the pool's current planes
-   * before this runs, so the replay targets the live buffer, never the
-   * abandoned one a live worker may still be scribbling.
+   * replays prefix, runs seed, replays suffix. PERF-NEXT-9: after quarantine
+   * isolation the applied prefix is gone with the abandoned buffer, so a
+   * recovery with the isolation fence set replays the FULL retained range
+   * [0, descCount) instead (opaque-only full ranges in place,
+   * blend-carrying full ranges via clear + prefix + seed + suffix).
+   * Must be called only after quarantine when writes may have been in
+   * flight - the timeout path quarantines (shutdown signal +
+   * replacement-buffer isolation + termination) and the renderer re-adopts
+   * the pool's current planes before this runs, so the replay targets the
+   * live buffer, never the abandoned one a live worker may still be
+   * scribbling.
    *
    * Attribution: the returned totals carry NO worker fields (see
    * BrowserRGBFlush) — absent worker fields mean this work ran on the
@@ -2590,6 +2608,10 @@ export class BrowserBandPool implements BandDispatcher {
     const flushed = this.rgbFlushedCount < 0 ? 0
       : this.rgbFlushedCount > this.rgbDescCount ? this.rgbDescCount
       : this.rgbFlushedCount;
+    // PERF-NEXT-9: consume the post-quarantine full-replay fence (set by
+    // isolation when the applied prefix died with the abandoned buffer).
+    const fullReplay = this.rgbNeedsFullReplay;
+    this.rgbNeedsFullReplay = false;
     let suffixBlends = false;
     const desc = this.rgbViews.rgbDesc;
     for (let b = flushed; b < this.rgbDescCount; b++) {
@@ -2597,9 +2619,31 @@ export class BrowserBandPool implements BandDispatcher {
       if ((f & (R_FLAG_BLEND_ALPHA | R_FLAG_ADDITIVE)) !== 0) { suffixBlends = true; break; }
     }
     this.publishRGBFull(near, far, lodBias);
-    if (!suffixBlends) {
+    if (!suffixBlends && !fullReplay) {
       const r = this.rgbDescCount > flushed
         ? processRGBFrameJob(this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, 0, this.fbH, flushed)
+        : { pixels: 0, spans: 0, scanned: 0, tris: 0 };
+      this.discardSnapshot();
+      this.rgbFlushedCount = this.rgbDescCount;
+      this.rgbFailure = null;
+      return r;
+    }
+    // Full-range blend scan (PERF-NEXT-9): a fenced post-quarantine replay
+    // covers the prefix too, so a blend anywhere in [0, descCount) forces
+    // the clear shape.
+    let rangeBlends = suffixBlends;
+    if (!rangeBlends && fullReplay) {
+      for (let b = 0; b < flushed; b++) {
+        const f = desc[b * R_PER_BATCH + R_FLAGS]!;
+        if ((f & (R_FLAG_BLEND_ALPHA | R_FLAG_ADDITIVE)) !== 0) { rangeBlends = true; break; }
+      }
+    }
+    if (!rangeBlends) {
+      // No blends anywhere: re-apply the full range in place. Post-
+      // quarantine the planes are already clear (isolation cleared them);
+      // exactly once: each descriptor runs a single time over empty planes.
+      const r = this.rgbDescCount > 0
+        ? processRGBFrameJob(this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, 0, this.fbH)
         : { pixels: 0, spans: 0, scanned: 0, tris: 0 };
       this.discardSnapshot();
       this.rgbFlushedCount = this.rgbDescCount;

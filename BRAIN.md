@@ -356,14 +356,16 @@ residuals: see PERF-NEXT-9 (recovery double-replay divergence) + parallel-turbo 
 ### PERF-NEXT-9 — Fix frame-level recovery double-replay divergence
 owns: `packages/sw-renderer`
 depends: PERF-NEXT-5
-status: ready
-starting-points: `frame.ts: recoverRetainedRGB/recoverInlineRGBAll callers`; Lane C probe `/tmp/opencode/probe-fgc.mjs` (frame-level, timeoutMs:1 storm, devroom 640×480)
+status: done(@integrator 2026-10-29)
 done-when:
-- [ ] Commit a deterministic fail-before reproduction (no /tmp-only scripts): timeout-storm frame-level recovery yields full-RGBA-identical output to serial across N frames, or fails for the documented reason. Intermittent-only proof does not close this card.
-- [ ] Root-cause the double recovery (signature: `recoveryCount>=2`, `fgkicks==0`, pixels `65cf87ee`/`3c53a7c5` vs serial `f674729a`): two recovery replays overlap or a second replay runs over already-replayed planes (blends/seed applied twice?). Fix, don't mask: exactly-once alpha/additive must hold on every recovery path, including back-to-back timeouts.
-- [ ] Prove the fix under the storm loop (≥30 frames, zero divergence) AND the normal suites (`yarn verify`, base1-gate, voodoo-regression, all recovery/adversarial tests). Counter truthfulness must survive the fix (reconcile clean on every path).
-- [ ] Evaluate Lane A's pool-level translucent-combo report (unreproduced in 2 integrator probes — likely same root at frame level): either reproduce + fix or document why it cannot occur, with a test pinning the conclusion.
-- [ ] Publish before/after storm-loop results + a ledger row. `main` stays green throughout (feature-flag in `@q2/config` if the fix can't land cleanly at once).
+- [x] Commit a deterministic fail-before reproduction (no /tmp-only scripts): timeout-storm frame-level recovery yields full-RGBA-identical output to serial across N frames, or fails for the documented reason. Intermittent-only proof does not close this card.
+- [x] Root-cause the double recovery (signature: `recoveryCount>=2`, `fgkicks==0`, pixels `65cf87ee`/`3c53a7c5` vs serial `f674729a`): two recovery replays overlap or a second replay runs over already-replayed planes (blends/seed applied twice?). Fix, don't mask: exactly-once alpha/additive must hold on every recovery path, including back-to-back timeouts.
+- [x] Prove the fix under the storm loop (≥30 frames, zero divergence) AND the normal suites (`yarn verify`, base1-gate, voodoo-regression, all recovery/adversarial tests). Counter truthfulness must survive the fix (reconcile clean on every path).
+- [x] Evaluate Lane A's pool-level translucent-combo report (unreproduced in 2 integrator probes — likely same root at frame level): either reproduce + fix or document why it cannot occur, with a test pinning the conclusion.
+- [x] Publish before/after storm-loop results + a ledger row. `main` stays green throughout (feature-flag in `@q2/config` if the fix can't land cleanly at once).
+completion: root cause = prefix loss after quarantine isolation (NOT double-blend): first timeout after a healthy recovery quarantines onto cleared planes, then opaque-suffix recovery replayed [flushed,descCount) in place, dropping prefix [0,flushed). Fix = `rgbNeedsFullReplay` fence (isolation sets, first recovery consumes → full retained range exactly once, resetRGB clears). Mechanism: at most one post-quarantine recovery carries work; back-to-back timeouts refuse after the first full replay. Deterministic pool tests (opaque + translucent/gun, pre-fix fail) + 30-frame storm (pre 2/30+6/30 → post 30/30) + /tmp 80/80 post-fix on integrated tree. Lane A combo: unreproduced at pool level (converge), same frame-level root, invariant pinned (world pass never stages blends). Browser mirror applied by integrator (same fence in `BrowserBandPool.recoverInlineRGBAll`); web 228 green, no test pinned the buggy shape.
+evidence: `tools/bench/evidence/node-accept-c909b83-2026-10-29T01-49-35.manifest.json` (+ ledger PERF-NEXT-9 row). Changeset: `.changeset/sw-renderer-recovery-prefix.md` (web ignored).
+residual: quarantine also clears indexed planes; post-quarantine seed reads them (invisible in full-coverage scenes; sky/uncovered-pixel scenes later).
 
 ### PERF-NEXT-6 — Optimize measured barriers and remaining frame cost
 owns: `packages/sw-renderer`, `packages/voodoo`, `apps/web`, `tools/bench`, `packages/testkit`

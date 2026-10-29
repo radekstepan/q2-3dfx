@@ -20,6 +20,7 @@
 //  - counters: serial FG draws are visible inline; worker execution is
 //    visible as completed; staged-but-failed work is never completed.
 import { afterEach, describe, expect, it } from 'vitest';
+import { existsSync } from 'fs';
 import { createFramebuffer } from '@q2/renderer-api';
 import type { Entity } from '@q2/renderer-api';
 import { resetCVars, setCVar } from '@q2/config';
@@ -28,15 +29,16 @@ import { createDevroom, DEVROOM_CAMERA } from './devroom.js';
 import { BandWorkerPool } from './bandPool.js';
 import {
   processRGBFrameJob,
-  R_FLAG_BLEND_ALPHA, R_FLAG_DEPTHWRITE, R_FLAG_LIGHT, R_FLAG_OPAQUE, R_FLAG_REPEAT,
+  R_FLAG_BLEND_ALPHA, R_FLAG_DEPTHWRITE, R_FLAG_LIGHT, R_FLAG_OPAQUE, R_FLAG_REPEAT, R_FLAG_TRI,
   RGB_MAX_CHAINS, splitBands, SW_ACCUM_CVAR, SW_WORKERS_CVAR,
   type RGBAccumViews,
 } from './bands.js';
 import {
-  SPAN_OPAQUE, SPAN_TRANS66, createSpan,
+  SPAN_OPAQUE, SPAN_TRANS66, buildRGBMaterial, createSpan,
   type RGBMipLevel, type Span, type SpanList,
 } from './spans.js';
-import { createGunMesh } from './alias.js';
+import { buildANorms, buildShadeDots, createGunMesh, emitAliasTris } from './alias.js';
+import { setupCamera } from './camera.js';
 import type { MiniWorld } from './index.js';
 
 afterEach(() => {
@@ -651,5 +653,266 @@ describe('retained-frame protocol: watermark + commit ownership', () => {
     expect(p.rgbPending()).toBe(0);
     expect(p.stageRGB(list, 0, 1, chain, LUX, 1, 1, WORLD_FLAGS, 0, 0, 0)).toBe(true);
     expect(p.rgbPending()).toBe(1);
+  });
+});
+
+// --- PERF-NEXT-9: frame-level recovery double-replay ------------------------
+//
+// Root cause pinned by the timeout-storm probe (frame-level SoftwareRenderer
+// + real BandWorkerPool, timeoutMs:1, devroom 640x480): a divergent run shows
+// `recoveryCount>=2, fgkicks==0` because the FIRST recovery runs while the
+// pool is healthy (flushed 0->W, planes intact) and the SECOND runs after a
+// later flush timed out and quarantined. Quarantine abandons the planes onto
+// a cleared replacement SAB — but the opaque-suffix fast path replayed only
+// [flushed, descCount), silently dropping the applied prefix [0, flushed).
+// A blend suffix masks the bug (clear + full replay converges), which is why
+// the committed partial-failure test above (blend suffix, flushed==0) stayed
+// green while production diverged intermittently.
+//
+// Fix contract (bandPool.recoverInlineRGBAll): after quarantine isolation the
+// recovery replays the FULL retained range [0, descCount) — opaque-only full
+// ranges in place, blend-carrying full ranges via clear + prefix + seed +
+// suffix — exactly once. Healthy-pool recoveries keep their existing shapes
+// (suffix-only opaque replay preserves non-retained inline writes; see the
+// marker test above).
+describe('PERF-NEXT-9: post-quarantine recovery replays the full retained range', () => {
+  /** Stage one full-frame opaque world batch (descriptor 0). */
+  function stageOpaqueWorld(pool: BandWorkerPool, W: number, H: number): void {
+    const world: Span[] = [];
+    for (let y = 0; y < H; y++) world.push(makeSpan(y, W, SPAN_OPAQUE, 0.2));
+    expect(pool.stageRGB({ spans: world, count: world.length }, 0, world.length,
+      tinyChain(7), LUX, 1, 1, WORLD_FLAGS, 0, 0, 0)).toBe(true);
+  }
+
+  /** Stage one opaque foreground batch (rows 16..48, in front of the world). */
+  function stageOpaqueFG(pool: BandWorkerPool, W: number, H: number): void {
+    const fg: Span[] = [];
+    for (let y = 16; y < 48; y++) fg.push(makeSpan(y, W, SPAN_OPAQUE, 0.24));
+    expect(pool.stageRGB({ spans: fg, count: fg.length }, 0, fg.length,
+      tinyChain(200), LUX, 1, 1, WORLD_FLAGS, 0, 0, 0)).toBe(true);
+  }
+
+  /** Stage one translucent foreground batch (blend suffix content). */
+  function stageBlendFG(pool: BandWorkerPool, W: number, H: number): void {
+    const fg: Span[] = [];
+    for (let y = Math.floor(H / 4); y < Math.floor((3 * H) / 4); y++) {
+      fg.push(makeSpan(y, W, SPAN_TRANS66, 0.24));
+    }
+    expect(pool.stageRGB({ spans: fg, count: fg.length }, 0, fg.length,
+      tinyChain(200), LUX, 1, 1, FG_FLAGS, 0, 0, 0)).toBe(true);
+  }
+
+  /** Stage one opaque gun-tri batch (R_FLAG_TRI, no blend flags). */
+  function stageGunTris(pool: BandWorkerPool, W: number, H: number): void {
+    const anorms = buildANorms();
+    const shadeDots = buildShadeDots(anorms);
+    const cam = setupCamera(new Float32Array([0, 0, 64]), new Float32Array([0, 0, 0]), 90, W, H);
+    const mat = buildRGBMaterial(new Uint8Array(64 * 64).fill(120), 64, 64, testPalette(), null, {
+      addressS: 'clamp', addressT: 'clamp', overbright: false, lodBias: 0,
+      mipDither: false, bilinear: false, zbits: 0, opaqueMask: true,
+    });
+    const cursor = pool.triCursor!();
+    if (!cursor) throw new Error('no tri cursor');
+    const n = emitAliasTris(
+      {
+        mesh: createGunMesh(), origin: new Float32Array([0, 0, 60]), angles: new Float32Array([0, 0, 0]),
+        frameA: 0, frameB: 0, lerp: 0, lightAngle: 0,
+      },
+      cam, anorms, shadeDots, null, cursor.F, cursor.I, cursor.base, cursor.base + cursor.cap,
+    );
+    if (n < 0) throw new Error('emit overflow');
+    const triCount = n - cursor.base;
+    expect(triCount).toBeGreaterThan(0);
+    expect(pool.stageTriBatch!(cursor.base, triCount, mat.levels, R_FLAG_TRI | R_FLAG_DEPTHWRITE, 0, 256)).toBe(true);
+  }
+
+  function prepViews(pool: BandWorkerPool): void {
+    const v = stubViewsOf(pool);
+    v.kick[0] = 4; v.kick[1] = 32768; v.kick[2] = 0;
+    v.rgbDepth.fill(0xffff);
+  }
+
+  it('healthy recovery then quarantine: opaque suffix replays prefix + suffix, not the suffix alone', () => {
+    const W = 64, H = 64;
+    // Reference: world + opaque FG, uninterrupted full run over a seed.
+    const ref = stubPool(W, H);
+    stageOpaqueWorld(ref, W, H);
+    stageOpaqueFG(ref, W, H);
+    prepViews(ref);
+    seedForTest(ref, 0x8410);
+    const full = processRGBFrameJob(stubViewsOf(ref), W, H, 2, 0, H);
+    expect(full.spans).toBeGreaterThan(0);
+    const expected = snapPlanes(ref);
+
+    // Production shape: a healthy recovery establishes flushed=1 with valid
+    // planes (staging-refusal replay while the pool is healthy), then a
+    // later flush times out and quarantines (planes abandoned + cleared).
+    const rec = stubPool(W, H);
+    stageOpaqueWorld(rec, W, H);
+    prepViews(rec);
+    seedForTest(rec, 0x8410);
+    const first = rec.recoverInlineRGBAll!(() => seedForTest(rec, 0x8410), 4, 32768, 0);
+    expect(first.spans).toBeGreaterThan(0);
+    expect(rec.rgbFlushed!()).toBe(1);
+    stageOpaqueFG(rec, W, H);
+    // The FG flush timeout: quarantine first (isolation fence, epoch bump,
+    // workers refused), then the recovery replay.
+    rec.quarantineWorkers();
+    expect(rec.recoveryEpoch()).toBe(1);
+    const tally = rec.recoverInlineRGBAll!(() => seedForTest(rec, 0x8410), 4, 32768, 0);
+    // Full-range replay: both batches ran exactly once (not the suffix
+    // alone — the pre-fix shape tallied only the suffix spans).
+    expect(tally.spans).toBe(full.spans);
+    expect(snapPlanes(rec)).toEqual(expected);
+    expect(rec.rgbFlushed!()).toBe(rec.rgbPending());
+    expect(rec.lastRGBFailure!()).toBeNull();
+    // Retention consumed: a repeat recovery is a no-op, not a re-blend.
+    const again = rec.recoverInlineRGBAll!(() => seedForTest(rec, 0x8410), 4, 32768, 0);
+    expect(again.spans).toBe(0);
+    expect(snapPlanes(rec)).toEqual(expected);
+  });
+
+  it('Lane A combo: opaque world + translucent FG + opaque gun suffix replays exactly once after quarantine', () => {
+    // Frame-reachable descriptor order (world pass stages opaque only —
+    // translucent world surfaces defer to the FG alpha pass and never reach
+    // world RGB staging, so the retained prefix is always seed-independent):
+    // [opaque world] [blend alpha] [opaque gun tris]. The gun suffix is
+    // opaque, so the pre-fix fast path replayed it alone over cleared
+    // planes, dropping the world + alpha prefix (the pool-level
+    // translucent-combo report: same root as the frame-level storm).
+    const W = 64, H = 64;
+    // Reference: uninterrupted full run over a seed.
+    const ref = stubPool(W, H);
+    stageOpaqueWorld(ref, W, H);
+    stageBlendFG(ref, W, H);
+    stageGunTris(ref, W, H);
+    prepViews(ref);
+    seedForTest(ref, 0x8410);
+    const full = processRGBFrameJob(stubViewsOf(ref), W, H, 3, 0, H);
+    expect(full.spans).toBeGreaterThan(0);
+    const expected = snapPlanes(ref);
+    // Mid-state reference: world + alpha only (proves the healthy first
+    // replay converges before the gun suffix + quarantine below).
+    const refMid = stubPool(W, H);
+    stageOpaqueWorld(refMid, W, H);
+    stageBlendFG(refMid, W, H);
+    prepViews(refMid);
+    seedForTest(refMid, 0x8410);
+    processRGBFrameJob(stubViewsOf(refMid), W, H, 2, 0, H);
+    const expectedMid = snapPlanes(refMid);
+
+    // Double-application control (no clear): on a world + alpha-only pool,
+    // re-running the blend descriptor over the complete planes must differ
+    // — proves the test sees double-applied alpha. (Restricted to the blend
+    // desc on a gun-free pool: opaque gun tris would occlude a re-run.)
+    const refDbl = stubPool(W, H);
+    stageOpaqueWorld(refDbl, W, H);
+    stageBlendFG(refDbl, W, H);
+    prepViews(refDbl);
+    seedForTest(refDbl, 0x8410);
+    processRGBFrameJob(stubViewsOf(refDbl), W, H, 2, 0, H);
+    const singleQ = snapPlanes(refDbl).q;
+    const dbl = processRGBFrameJob(stubViewsOf(refDbl), W, H, 2, 0, H, 1);
+    expect(dbl.spans).toBeGreaterThan(0);
+    expect(snapPlanes(refDbl).q).not.toBe(singleQ);
+
+    // Recovery case: healthy replay of world + alpha (flushed=2, blend
+    // shape: clear + prefix + seed + suffix), opaque gun staged after,
+    // then the gun-flush timeout quarantines before the replay.
+    const rec = stubPool(W, H);
+    stageOpaqueWorld(rec, W, H);
+    stageBlendFG(rec, W, H);
+    prepViews(rec);
+    seedForTest(rec, 0x8410);
+    const first = rec.recoverInlineRGBAll!(() => seedForTest(rec, 0x8410), 4, 32768, 0);
+    expect(first.spans).toBeGreaterThan(0);
+    expect(rec.rgbFlushed!()).toBe(2);
+    expect(snapPlanes(rec)).toEqual(expectedMid);
+    stageGunTris(rec, W, H);
+    rec.quarantineWorkers();
+    const tally = rec.recoverInlineRGBAll!(() => seedForTest(rec, 0x8410), 4, 32768, 0);
+    // Full retained range, exactly once: prefix (with its blends) + gun.
+    // (Spans cover span descs only — the tri suffix is pinned by pixels +
+    // tris; the pre-fix shape tallied the gun alone.)
+    expect(tally.pixels).toBe(full.pixels);
+    expect(tally.tris).toBe(full.tris);
+    expect(snapPlanes(rec)).toEqual(expected);
+    expect(rec.rgbFlushed!()).toBe(rec.rgbPending());
+    expect(rec.lastRGBFailure!()).toBeNull();
+  });
+});
+
+// --- PERF-NEXT-9: frame-level timeout storm (real threads) ------------------
+//
+// Deterministic-pass / intermittent-fail: every timeout interleaving must
+// converge to the serial frame (the fix makes all recovery shapes
+// full-range-correct, so the storm passes for any timing; pre-fix it fails
+// whenever a post-quarantine opaque-suffix recovery drops its prefix —
+// ~5-15% of iterations with timeoutMs:1 on the bench machine, i.e. a 30-frame
+// storm fails pre-fix with overwhelming probability). Fresh pool per frame
+// (a quarantined pool refuses all later kicks by design); serial oracle per
+// iteration. Asserts full-RGBA (color) + index identity, zero divergence.
+describe('PERF-NEXT-9: frame-level timeout storm converges to serial', () => {
+  it('timeoutMs:1 storm over 30 devroom frames: pooled full-RGBA-identical to serial', { timeout: 300000 }, async () => {
+    const distUrl = new URL('../dist/index.mjs', import.meta.url);
+    if (!existsSync(distUrl)) {
+      console.log('SKIP timeout storm test: dist not built (run yarn build first)');
+      return;
+    }
+    const W = 640, H = 480, N = 30;
+    const world = { name: 'devroom', data: createDevroom() };
+    const view = {
+      origin: DEVROOM_CAMERA.origin, angles: DEVROOM_CAMERA.angles,
+      fovX: DEVROOM_CAMERA.fovX, time: 1.5, lightStyles: new Float32Array(256).fill(1),
+    };
+    let diverges = 0;
+    let recoveredFrames = 0;
+    let firstDiverge = '';
+    for (let i = 0; i < N; i++) {
+      resetCVars();
+      const fbS = createFramebuffer(W, H, true);
+      const rs = new SoftwareRenderer();
+      rs.init(fbS);
+      rs.setPalette(testPalette());
+      setRGBWorldEnabled(true);
+      rs.beginFrame();
+      rs.renderView(view, world, []);
+      rs.endFrame();
+      setRGBWorldEnabled(false);
+      const liveS = rs.getFramebuffer();
+      const serialColor = fnvU8(new Uint8Array(liveS.color.buffer, liveS.color.byteOffset, liveS.color.byteLength));
+      const serialIndex = fnvU8(liveS.index!);
+      resetCVars();
+      const r = new SoftwareRenderer();
+      r.init(createFramebuffer(W, H, true));
+      r.setPalette(testPalette());
+      setCVar(SW_WORKERS_CVAR, 4);
+      setCVar(SW_ACCUM_CVAR, 1);
+      r.syncWorkersFromCvar();
+      const pool = BandWorkerPool.create(3, W, H, { indexJsPath: distUrl.pathname, timeoutMs: 1 });
+      if (!pool) throw new Error('real pool create failed');
+      r.attachWorkerPool(pool);
+      setRGBWorldEnabled(true);
+      r.beginFrame();
+      r.renderView(view, world, []);
+      r.endFrame();
+      setRGBWorldEnabled(false);
+      const live = r.getFramebuffer();
+      const h = fnvU8(new Uint8Array(live.color.buffer, live.color.byteOffset, live.color.byteLength));
+      const idx = fnvU8(live.index!);
+      const fg = r.testForegroundStats();
+      if (fg.recoveryCount > 0) recoveredFrames++;
+      if (h !== serialColor || idx !== serialIndex) {
+        diverges++;
+        if (!firstDiverge) {
+          firstDiverge = `iter${i}: color ${h} vs ${serialColor} index ${idx} vs ${serialIndex} ` +
+            `wkicks=${r.testRGBWorkerStats().kicks} fgkicks=${fg.kicks} rec=${fg.recoveryCount}`;
+        }
+      }
+      await pool.dispose();
+      resetCVars();
+    }
+    console.log(`storm: ${N} frames, ${diverges} divergent, ${recoveredFrames} with recovery ${firstDiverge}`);
+    expect(diverges).toBe(0);
   });
 });

@@ -217,6 +217,17 @@ export class BandWorkerPool implements BandDispatcher {
    */
   private quarantined = false;
   /**
+   * Post-quarantine full-replay fence (PERF-NEXT-9): set when quarantine
+   * isolation abandons the planes onto a cleared replacement SAB, taking
+   * every applied prefix write [0, flushed) with it. The next
+   * recoverInlineRGBAll consumes it and replays the FULL retained range
+   * [0, descCount) instead of the suffix alone — the opaque fast path's
+   * assume-the-prefix-survived is false on the fresh planes. Cleared by
+   * resetRGB (new frame / commit drop the descriptors, so a stale fence
+   * can never force a redundant replay). Main thread only.
+   */
+  private rgbNeedsFullReplay = false;
+  /**
    * Fence epoch (PERF-NEXT-2): incremented every time quarantine isolates
    * the shared planes onto a fresh SAB. The renderer re-adopts the pool's
    * current planes when this moves, so recovery + inline fallback can never
@@ -1350,6 +1361,13 @@ export class BandWorkerPool implements BandDispatcher {
    *   drawn between kicks are not retained and could never be replayed).
    *   Correct for staging refusal (a: nothing ran), clean failure (b:
    *   nothing ran) and partial opaque failure (c: same values rewritten).
+   *   WRONG after quarantine isolation (PERF-NEXT-9): the prefix died with
+   *   the abandoned buffer, so a fenced recovery replays the FULL
+   *   retained range [0, descCount) instead (opaque-only full ranges in
+   *   place over the already-cleared planes; blend-carrying full ranges
+   *   via the clear + prefix + seed + suffix shape). The fence is consumed
+   *   by the first recovery; healthy-pool recoveries keep the suffix-only
+   *   fast path exactly.
    * - Suffix HAS blends (translucent alpha): clear the planes,
    *   inline-apply the world prefix [0, flushed), run `seed` (renderer
    *   re-seeds the RGB565 background from the final indexed plane for
@@ -1368,6 +1386,10 @@ export class BandWorkerPool implements BandDispatcher {
     const flushed = this.rgbFlushedCount < 0 ? 0
       : this.rgbFlushedCount > this.rgbDescCount ? this.rgbDescCount
       : this.rgbFlushedCount;
+    // PERF-NEXT-9: consume the post-quarantine full-replay fence (set by
+    // isolation when the applied prefix died with the abandoned buffer).
+    const fullReplay = this.rgbNeedsFullReplay;
+    this.rgbNeedsFullReplay = false;
     // Suffix blend scan (one int32 read per descriptor): blends and
     // additives are destination-dependent (re-applying over partial output
     // blends twice / adds twice), opaque writes are idempotent rewrites.
@@ -1381,9 +1403,36 @@ export class BandWorkerPool implements BandDispatcher {
       }
     }
     this.publishRGBFull(near, far, lodBias);
-    if (!suffixBlends) {
+    if (!suffixBlends && !fullReplay) {
       const r = this.rgbDescCount > flushed
         ? processRGBFrameJob(this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, 0, this.fbH, flushed)
+        : { pixels: 0, spans: 0, scanned: 0, tris: 0 };
+      this.rgbFlushedCount = this.rgbDescCount;
+      this.rgbFailure = null;
+      return r;
+    }
+    // Full-range blend scan (PERF-NEXT-9): a fenced post-quarantine replay
+    // covers the prefix too, so a blend anywhere in [0, descCount) forces
+    // the clear shape. Frame-reachable prefixes are always opaque (the
+    // world pass never stages blends — translucent surfaces defer to the
+    // FG alpha pass), so this loop only fires on synthetic pool use.
+    let rangeBlends = suffixBlends;
+    if (!rangeBlends && fullReplay) {
+      for (let b = 0; b < flushed; b++) {
+        const f = desc[b * R_PER_BATCH + R_FLAGS]!;
+        if ((f & (R_FLAG_BLEND_ALPHA | R_FLAG_ADDITIVE)) !== 0) {
+          rangeBlends = true;
+          break;
+        }
+      }
+    }
+    if (!rangeBlends) {
+      // No blends anywhere: re-apply the full range in place. Post-
+      // quarantine the planes are already clear (isolation cleared them);
+      // on healthy planes this is the same idempotent rewrite. Exactly
+      // once: each descriptor runs a single time over empty planes.
+      const r = this.rgbDescCount > 0
+        ? processRGBFrameJob(this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, 0, this.fbH)
         : { pixels: 0, spans: 0, scanned: 0, tris: 0 };
       this.rgbFlushedCount = this.rgbDescCount;
       this.rgbFailure = null;
@@ -1767,6 +1816,10 @@ export class BandWorkerPool implements BandDispatcher {
       }
       this.mainLastGen = this.frameGen;
       this.sabEpoch = (typeof this.sabEpoch === 'number' ? this.sabEpoch : 0) + 1;
+      // PERF-NEXT-9: the cleared replacement planes hold none of the
+      // applied prefix [0, flushed) — the next recovery must replay the
+      // full retained range, never just the suffix.
+      this.rgbNeedsFullReplay = true;
     } catch {
       /* terminate-only fallback */
     }
@@ -1837,6 +1890,7 @@ export class BandWorkerPool implements BandDispatcher {
     this.rgbDescCount = 0;
     this.rgbFlushedCount = 0;
     this.rgbFailure = null;
+    this.rgbNeedsFullReplay = false;
     this.rgbTriUsed = 0;
     try {
       Atomics.store(this.ctl, CTL_RGBBASE, 0);
