@@ -28,7 +28,8 @@
     "@q2/formats": "workspace:*",
     "@q2/math": "workspace:*",
     "@q2/renderer-api": "workspace:*",
-    "@q2/sw-renderer": "workspace:*"
+    "@q2/sw-renderer": "workspace:*",
+    "@q2/webgl-renderer": "workspace:*"
   },
   "devDependencies": {
     "tsup": "^8.3.5",

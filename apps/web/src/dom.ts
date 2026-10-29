@@ -297,7 +297,7 @@ export function attachDropZone(
  * select-vs-input logic without a DOM.
  */
 export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
-  vid_renderer: ['software', 'voodoo'],
+  vid_renderer: ['software', 'voodoo', 'webgl2-experimental'],
   vid_resolution: ['320x240', '640x480', '800x600', '1024x768'],
   skill: ['0', '1', '2', '3'],
   map_source: ['devroom', 'pak'],
@@ -399,6 +399,17 @@ export const RECON_LABELS = ['2×2 matched (default)', '4×4 horizontal', 'Legac
 export const ZBITS_LABELS = ['8-bit (banded)', '16-bit (Voodoo3)'] as const;
 
 /**
+ * Display labels for the vid_renderer dropdown (GPU-PROOF-2): the GPU id is
+ * experimental and capability-gated (incapable boots fall back to software
+ * WITH a warning — see `resolveBootRenderer` in gpu-select.ts).
+ */
+export const VID_RENDERER_LABELS = [
+  'Software (default)',
+  'Voodoo 3 3000 (emulated)',
+  'WebGL2 (experimental)',
+] as const;
+
+/**
  * Whether a pak is available for the map_source dropdown. Set by the boot
  * layer (index.ts) on cache load / drop / clear; the dropdown lists the pak
  * only afterwards. Defaults to false (devroom only) so headless/Node boots
@@ -418,11 +429,12 @@ export function getMapSourceHasPak(): boolean {
 
 /**
  * Display labels for a cvar's options (skill + resolution + map_source +
- * recon + zbits are labeled; other domains show their bare values).
+ * recon + zbits + vid_renderer are labeled; other domains show bare values).
  */
 export function cvarOptionLabels(name: string): readonly string[] | null {
   if (name === 'skill') return SKILL_LABELS;
   if (name === 'vid_resolution') return RESOLUTION_LABELS;
+  if (name === 'vid_renderer') return VID_RENDERER_LABELS;
   if (name === 'map_source') return MAP_SOURCE_LABELS;
   if (name === 'vd_reconmode') return RECON_LABELS;
   if (name === 'vd_zbits') return ZBITS_LABELS;
@@ -466,7 +478,7 @@ export const CVAR_DESCRIPTIONS: Readonly<Record<string, string>> = {
   skill: 'difficulty 0 easy 1 medium 2 hard 3 nightmare (latched at boot)',
   map_source: 'map source: cached pak0.pak game (pak) or built-in devroom (devroom); changing it reboots the level',
   vid_resolution: 'internal framebuffer WxH (latched: changing it reboots the level)',
-  vid_renderer: 'active refresh backend: software | voodoo',
+  vid_renderer: 'active refresh backend: software | voodoo | webgl2-experimental (experimental, needs WebGL2; incapable Falls back to software WITH a warning)',
   vd_16bit: 'quantise 8:8:8 to RGB565 at resolve',
   vd_dither: '4x4 ordered dither before quantise',
   vd_postfilter: '2x2 "22-bit" RAMDAC post filter',
@@ -904,13 +916,17 @@ function renderCvarRow(
   node.appendChild(row);
 }
 
-/** Renderer switcher state (software/voodoo), persisted to cvar. */
+/** Renderer switcher state (software/voodoo/webgl2-experimental), persisted to cvar. */
 export function getRendererChoice(): string {
   return getCVarString('vid_renderer') || 'software';
 }
 
 export function setRendererChoice(kind: string): void {
-  setCVarFromString('vid_renderer', kind === 'voodoo' ? 'voodoo' : 'software');
+  if (kind === 'voodoo' || kind === 'webgl2-experimental') {
+    setCVarFromString('vid_renderer', kind);
+    return;
+  }
+  setCVarFromString('vid_renderer', 'software');
 }
 
 // --- play loop (rAF driver for a booted game; DOM-guarded) ---

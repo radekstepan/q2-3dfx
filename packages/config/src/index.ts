@@ -61,7 +61,7 @@ const DEFAULT_CVARS: ReadonlyArray<[string, CVarValue, string]> = [
   ['sensitivity', 3, 'mouse sensitivity'],
   ['m_yaw', 0.022, 'mouse yaw scale'],
   ['m_pitch', 0.022, 'mouse pitch scale'],
-  ['vid_renderer', 'software', 'active refresh backend: software | voodoo'],
+  ['vid_renderer', 'software', 'active refresh backend: software | voodoo | webgl2-experimental (experimental, needs WebGL2; incapable Falls back to software WITH a warning)'],
 ];
 
 // --- shared store (ESM/CJS unification) ---

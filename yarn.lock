@@ -1013,6 +1013,7 @@ __metadata:
     "@q2/math": "workspace:*"
     "@q2/renderer-api": "workspace:*"
     "@q2/sw-renderer": "workspace:*"
+    "@q2/webgl-renderer": "workspace:*"
     tsup: "npm:^8.3.5"
     typescript: "npm:^5.6.3"
     vitest: "npm:^2.1.8"
@@ -1025,6 +1026,21 @@ __metadata:
   dependencies:
     "@q2/config": "workspace:*"
     "@q2/math": "workspace:*"
+    tsup: "npm:^8.3.5"
+    typescript: "npm:^5.6.3"
+    vitest: "npm:^2.1.8"
+  languageName: unknown
+  linkType: soft
+
+"@q2/webgl-renderer@workspace:*, @q2/webgl-renderer@workspace:packages/webgl-renderer":
+  version: 0.0.0-use.local
+  resolution: "@q2/webgl-renderer@workspace:packages/webgl-renderer"
+  dependencies:
+    "@q2/bsp": "workspace:*"
+    "@q2/config": "workspace:*"
+    "@q2/math": "workspace:*"
+    "@q2/renderer-api": "workspace:*"
+    "@q2/sw-renderer": "workspace:*"
     tsup: "npm:^8.3.5"
     typescript: "npm:^5.6.3"
     vitest: "npm:^2.1.8"
@@ -1476,12 +1492,15 @@ __metadata:
     "@q2/bsp": "workspace:*"
     "@q2/config": "workspace:*"
     "@q2/formats": "workspace:*"
+    "@q2/input": "workspace:*"
     "@q2/renderer-api": "workspace:*"
     "@q2/sw-renderer": "workspace:*"
     "@q2/testkit": "workspace:*"
+    "@q2/voodoo": "workspace:*"
     tsup: "npm:^8.3.5"
     typescript: "npm:^5.6.3"
     vitest: "npm:^2.1.8"
+    web: "workspace:*"
   languageName: unknown
   linkType: soft
 
@@ -3565,7 +3584,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"web@workspace:apps/web":
+"web@workspace:*, web@workspace:apps/web":
   version: 0.0.0-use.local
   resolution: "web@workspace:apps/web"
   dependencies:

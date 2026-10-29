@@ -24,12 +24,12 @@
     "@q2/bsp": "workspace:*",
     "@q2/config": "workspace:*",
     "@q2/formats": "workspace:*",
+    "@q2/input": "workspace:*",
     "@q2/renderer-api": "workspace:*",
     "@q2/sw-renderer": "workspace:*",
     "@q2/testkit": "workspace:*",
     "@q2/voodoo": "workspace:*",
-    "web": "workspace:*",
-    "@q2/input": "workspace:*"
+    "web": "workspace:*"
   },
   "devDependencies": {
     "tsup": "^8.3.5",

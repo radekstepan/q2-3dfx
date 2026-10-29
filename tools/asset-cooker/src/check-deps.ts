@@ -40,6 +40,11 @@ export const ALLOW: Record<string, string[]> = {
   'sw-renderer': ['bsp', 'config', 'formats', 'math', 'renderer-api'],
   // §7: voodoo reuses the same geometry front end (subset used today).
   voodoo: ['bsp', 'config', 'math', 'renderer-api', 'sw-renderer'],
+  // GPU-PROOF-2: WebGL2 boundary implementation. renderer-api (boundary
+  // types it implements), sw-renderer (MiniWorld + camera helpers for scene
+  // selection), bsp (asset loading in tests). Browser graphics types
+  // (WebGL2RenderingContext) may appear ONLY here and in apps/web.
+  'webgl-renderer': ['bsp', 'config', 'math', 'renderer-api', 'sw-renderer'],
   // math: Vec3 types (+config per §5, unused today).
   'renderer-api': ['config', 'math'],
   // formats: WAL/MD2 asset data (real use; §4 lists only math+bsp+config).

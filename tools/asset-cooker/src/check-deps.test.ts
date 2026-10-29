@@ -56,6 +56,7 @@ describe('checkGraph allowlist', () => {
 
   it('every real package has an allowlist entry', () => {
     for (const p of ['config', 'math', 'filesystem', 'formats', 'bsp', 'sw-renderer', 'voodoo',
+      'webgl-renderer',
       'renderer-api', 'game', 'server', 'client', 'host', 'testkit', 'input', 'sound']) {
       expect(ALLOW[p]).toBeDefined();
     }

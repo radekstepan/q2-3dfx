@@ -99,14 +99,25 @@ import type { VoodooState } from '@q2/voodoo';
 import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import { SERVER_DT, getCVar, getCVarNumber, getCVarString, registerCVar } from '@q2/config';
-import type { Entity, RefDef } from '@q2/renderer-api';
+import type { Entity, RefDef, ResolvedBackend } from '@q2/renderer-api';
+import type { GpuCapability } from '@q2/renderer-api';
+
+/**
+ * Renderer selection (GPU-PROOF-2): `software` | `voodoo` |
+ * `webgl2-experimental` (alias of `ResolvedBackend` from
+ * `@q2/renderer-api`, the single source of truth). The GPU id is
+ * experimental and capability-gated — see `resolveBootRenderer` in
+ * `./gpu-select.ts`.
+ */
+export type RendererKind = ResolvedBackend;
+export { detectGpuCapability, getGpuStatus, resolveBootRenderer };
+export type { GpuCapability };
 import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
 import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } from './render-workers.js';
 import type { BrowserForegroundDetail, DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
-
-export type RendererKind = 'software' | 'voodoo';
+import { detectGpuCapability, getGpuStatus, resolveBootRenderer } from './gpu-select.js';
 
 /**
  * Which resolve path the last `resolveDisplay` took (observability for
@@ -2898,6 +2909,14 @@ export interface PlayBoot {
   driver: LocalDriver;
   refresh: SoftwareRenderer;
   renderer: RendererKind;
+  /**
+   * Explicit fallback warning from the last selection resolve (GPU-PROOF-2):
+   * null when the requested `vid_renderer` was honored; non-null explains
+   * every fallback (incapable GPU, unknown value). Recorded by `bootPlay`
+   * and `applyRendererCvar`, which also `console.warn` it — fallbacks are
+   * never silent (see `getGpuStatus` for the read-out).
+   */
+  lastRendererWarning: string | null;
   source: 'devroom' | 'pak';
   display: Uint32Array;
   fb565: Uint16Array;
@@ -3170,8 +3189,17 @@ export function bootPlay(opts: {
   const res = getResolution();
   const width = opts.width ?? res.width;
   const height = opts.height ?? res.height;
-  const renderer = opts.renderer ?? (getCVarString('vid_renderer') === 'voodoo' ? 'voodoo' : 'software');
+  const resolved = resolveBootRenderer(opts.renderer);
+  const renderer = resolved.kind;
+  if (resolved.warning !== null) {
+    console.warn(`[q2ts-web] bootPlay: ${resolved.warning}`);
+  }
   const driver = new LocalDriver(opts.pak ?? null);
+  // PROOF-2 selection/plumbing only (no GPU drawing yet): when
+  // `webgl2-experimental` IS selected and capable the selection above is
+  // real (recorded on the boot, observable via `getGpuStatus`), but the
+  // boot still constructs the working SoftwareRenderer + CPU resolve path
+  // below — the pixels still come from CPU until PROOF-3 lands GPU drawing.
   const refresh = new SoftwareRenderer();
   let mainPalette: Uint8Array | null = null;
   if (opts.pak) {
@@ -3238,7 +3266,7 @@ export function bootPlay(opts: {
   }
   const n = width * height;
   const boot: PlayBoot = {
-    host, driver, refresh, renderer, source: driver.source,
+    host, driver, refresh, renderer, lastRendererWarning: resolved.warning, source: driver.source,
     display: new Uint32Array(n), fb565: new Uint16Array(n),
     strictVoodoo: true, lastResolveOrder: 'none', lastVoodooPath: 'none',
     lastRasterPolicy: { mode: renderer, rgbEnabled: false, hooked: false },
@@ -3271,22 +3299,29 @@ export function rebootPlay(prev: PlayBoot): PlayBoot {
 
 /**
  * Hot-swap the renderer backend in place (vid_renderer menu switch without
- * a reboot): re-latches `boot.renderer` from the cvar and returns it. The
+ * a reboot): re-resolves `boot.renderer` from the cvar via
+ * `resolveBootRenderer` (shared with `bootPlay`) and returns it. The
  * resolve path (resolveDisplay) already reads the cvar every frame, so no
  * Host/LocalDriver/server state is touched — player pos, health, ammo and
- * monsters survive the switch. Pure except for the boot.renderer write;
- * headless-safe.
+ * monsters survive the switch. Records the fallback warning on the boot
+ * (`lastRendererWarning`, null when honored) and `console.warn`s it —
+ * fallbacks are never silent. Headless-safe.
  *
  * V2d raster policy: the switch also arms/disarms the sw-renderer RGB world
- * path (voodoo ON, software OFF) via the optional hooks below, invalidates
- * incompatible texture/light caches, and zeroes the shell-owned scratch
- * planes so the next frame can never show previous-mode pixels.
+ * path (voodoo ON, everything else OFF — see `armRasterPolicy`) via the
+ * optional hooks below, invalidates incompatible texture/light caches, and
+ * zeroes the shell-owned scratch planes so the next frame can never show
+ * previous-mode pixels.
  */
 export function applyRendererCvar(boot: PlayBoot): RendererKind {
-  const next: RendererKind = getCVarString('vid_renderer') === 'voodoo' ? 'voodoo' : 'software';
-  boot.renderer = next;
+  const resolved = resolveBootRenderer();
+  boot.renderer = resolved.kind;
+  boot.lastRendererWarning = resolved.warning;
+  if (resolved.warning !== null) {
+    console.warn(`[q2ts-web] applyRendererCvar: ${resolved.warning}`);
+  }
   armRasterPolicy(boot);
-  return next;
+  return boot.renderer;
 }
 
 /* --- V2d raster-policy hooks (feature-detected, never imported) ---------
@@ -3341,8 +3376,12 @@ function callFirstHook(target: object, names: readonly string[], arg?: boolean):
 
 /**
  * Arm/disarm the raster policy for `boot.renderer` (shared by bootPlay and
- * applyRendererCvar): voodoo arms the sw-renderer RGB world path, software
- * disarms it. Invalidates incompatible texture/light caches when a hook is
+ * applyRendererCvar): voodoo arms the sw-renderer RGB world path, everything
+ * else disarms it. `webgl2-experimental` boots with the RGB path OFF on
+ * purpose: the GPU path does not use the CPU RGB planes (PROOF-2 draws
+ * nothing on the GPU; PROOF-3 will own its own resources), so arming the
+ * CPU RGB world for a GPU selection would only burn CPU raster work the
+ * scanout never reads. Invalidates incompatible texture/light caches when a hook is
  * present (TODO(V2d): no public cache-invalidate hook exists on
  * SoftwareRenderer yet — `surfaceCache.invalidateAll` is internal — so this
  * currently documents the need; the scratch-plane zeroing below is what
@@ -3428,6 +3467,10 @@ export function paintHudPreScanout(boot: PlayBoot, hud: HudState): void {
  * True when the shell composes HUD pre-scanout (strict voodoo): callers
  * (dom finishFrame) must NOT paint HUD again post-resolve — that would
  * double-paint and defeat the strict ordering.
+ *
+ * PROOF-2: `webgl2-experimental` intentionally reads false here (like
+ * software) — HUD composition and the resolve path stay on the CPU until
+ * PROOF-3 lands GPU drawing.
  */
 export function hudComposedPreScanout(boot: PlayBoot): boolean {
   return getCVarString('vid_renderer') === 'voodoo' && boot.strictVoodoo;

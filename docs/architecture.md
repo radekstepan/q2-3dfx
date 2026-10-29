@@ -39,7 +39,8 @@ q2ts/
 │  ├─ bsp/                       ← node/leaf traversal, PVS decompression, trace/clip hulls
 │  ├─ sw-renderer/               ← ref_soft: colormap, surface cache, edges, spans, alias, particles
 │  ├─ voodoo/                    ← Voodoo3/Glide emulation layer (post-processing + sampler rules)
-│  ├─ renderer-api/              ← the Refresh interface both renderers implement
+│  ├─ webgl-renderer/            ← WebGL2 backend (GPU-PROOF-2: scene boundary + resource ownership; draws in PROOF-3)
+│  ├─ renderer-api/              ← the Refresh interface both CPU renderers implement + the additive GPU boundary
 │  ├─ game/                      ← gamex86: entities, pmove, items, doors, monsters, weapons
 │  ├─ server/                    ← SV_: world state, entity spawning, 10 Hz tick
 │  ├─ client/                    ← CL_: prediction, interpolation, view, HUD, console
@@ -56,6 +57,7 @@ q2ts/
 
 ```
 math ← formats ← bsp ← {sw-renderer, voodoo} ← renderer-api ← host
+{renderer-api, sw-renderer, bsp, math, config} ← webgl-renderer (GPU boundary impl)
 filesystem ← formats
 game ← {math, bsp, config}
 server ← {game, bsp}
@@ -69,5 +71,8 @@ apps/web ← host
   what lets it run in a worker and in Node tests.
 - `voodoo` is a *post-process + sampling policy* package, not a second renderer: it reuses the same
   geometry front end. See §7.
+- `webgl-renderer` owns the injected WebGL2 context, GPU buffers/textures/programs/targets and the
+  persistent-upload bookkeeping; browser glue owns canvas/context acquisition and forwards
+  context loss/restoration. Only this package and `apps/web` may depend on browser graphics types.
 
 ---

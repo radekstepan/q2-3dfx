@@ -75,7 +75,7 @@ mission packs, `gamex86.dll` ABI compatibility, demo recording. Demo *playback* 
 q2ts/
 ├─ BRAIN.md · package.json · turbo.json · .changeset/ · tsconfig.base.json
 ├─ apps/web devtools
-├─ packages/math filesystem formats bsp sw-renderer voodoo renderer-api
+├─ packages/math filesystem formats bsp sw-renderer voodoo webgl-renderer renderer-api
 │            game server client sound input host testkit config
 └─ tools/asset-cooker bench
 ```
@@ -84,6 +84,7 @@ Dependency flow (enforced by `yarn deps:check`):
 
 ```
 math ← formats ← bsp ← {sw-renderer, voodoo} ← renderer-api ← host
+{renderer-api, sw-renderer, bsp, math, config} ← webgl-renderer (GPU boundary impl, PROOF-2)
 filesystem ← formats · game ← {math, bsp, config} · server ← {game, bsp}
 client ← {renderer-api, input, sound, config, game (pmove prediction)}
 host ← {server, client} · apps/web ← host
@@ -92,11 +93,13 @@ host ← {server, client} · apps/web ← host
 - **Nothing** imports from `apps/*`.
 - `sw-renderer` must not import `dom` types; it writes into a handed `ArrayBuffer`.
 - `voodoo` is a post-process + sampling policy, not a second renderer.
-- Authorized addition: `packages/webgl-renderer`, a browser GPU renderer with an
+- Implemented (GPU-PROOF-2): `packages/webgl-renderer`, a browser GPU renderer with an
   explicit injected WebGL2 context; only this backend and browser integration may
   depend on browser graphics types. Keep sw-renderer/math/bsp/renderer-api DOM-free.
-  Reuse lower-level assets/math/BSP and shared policy; never import apps/web.
-  Add the package/dependency rules explicitly when implemented; do not bypass checks.
+  Reuses lower-level assets/math/BSP and shared policy (MiniWorld + camera helpers
+  from `@q2/sw-renderer`, PVS from `@q2/bsp`); never imports apps/web.
+  Dependency rule: `{renderer-api, sw-renderer, bsp, math, config} ← webgl-renderer`,
+  enforced by `yarn deps:check`.
 
 ---
 
@@ -312,13 +315,21 @@ completion (2026-10-29, integrated — two disjoint lanes, integrator committed)
 ### GPU-PROOF-2 — Minimal scene/backend boundary and resource ownership
 owns: `packages/renderer-api`, `packages/webgl-renderer`, `packages/config`, `apps/web`, `packages/testkit`, `docs`, build/dependency configuration (integrator)
 depends: GPU-PROOF-1
-status: ready
+status: done(@integrator 2026-10-29)
 done-when:
-- [ ] Agree and add the smallest necessary types in a separate interface-first commit; update §5 and major changeset if a frozen contract changes. Do not force a GPU backend to populate a CPU framebuffer or read pixels back every frame just to satisfy Refresh.
-- [ ] Scene preparation reuses asset handles, BSP/PVS and model data, exposing visible surfaces/transforms/material references; GPU input is persistent triangles/vertices, NOT CPU-generated scanline/pixel spans. Avoid per-frame rebuilding/uploading static geometry.
-- [ ] Establish explicit GPU resource lifetime: upload/update, resize, dispose and context loss/restoration. Browser glue owns canvas/context acquisition; GPU backend owns buffers, textures, programs and render targets. No DOM dependencies leak into CPU packages.
-- [ ] Add an experimental renderer selection and explicit capability/failure reporting; preserve CPU operation and Node tests. No silent CPU fallback during benchmarks.
-- [ ] Test scene selection/transforms/order and resource lifecycle invariants. Keep interfaces narrow; defer general-purpose abstractions until the real-scene proof needs them.
+- [x] Agree and add the smallest necessary types in a separate interface-first commit; update §5 and major changeset if a frozen contract changes. Do not force a GPU backend to populate a CPU framebuffer or read pixels back every frame just to satisfy Refresh.
+- [x] Scene preparation reuses asset handles, BSP/PVS and model data, exposing visible surfaces/transforms/material references; GPU input is persistent triangles/vertices, NOT CPU-generated scanline/pixel spans. Avoid per-frame rebuilding/uploading static geometry.
+- [x] Establish explicit GPU resource lifetime: upload/update, resize, dispose and context loss/restoration. Browser glue owns canvas/context acquisition; GPU backend owns buffers, textures, programs and render targets. No DOM dependencies leak into CPU packages.
+- [x] Add an experimental renderer selection and explicit capability/failure reporting; preserve CPU operation and Node tests. No silent CPU fallback during benchmarks.
+- [x] Test scene selection/transforms/order and resource lifecycle invariants.
+completion (2026-10-29, integrated — interface-first commit + three disjoint lanes, integrator reconciled + committed):
+- interface-first `8063252` (`packages/renderer-api/src/gpu.ts`, additive only): `GpuBackendId`, `GpuCapability`, `resolveRendererSelection` (exact match; every fallback carries an explicit warning, never silent), `GpuMaterialKind`, `GpuSurfaceRef/SceneInput/FrameInput` (persistent-triangle input, never CPU spans), `GpuRenderer<GL>` (opaque generic keeps renderer-api DOM-free), `GpuRendererStatus`. Frozen §5 contracts untouched (no major changeset). `gpu.test.ts` 4/4.
+- new `packages/webgl-renderer` (deps `{renderer-api, sw-renderer, bsp, math, config}`, enforced by deps:check): pure `selectGpuScene` (PVS union via faceLists + frustum `culledByFrustum` + opaque backface cull; sky/turbulent/transparent classification; entity refs with per-entity yaw transforms, transparent bit from alpha; blend pass far→near), `describeGpuCapability`, clear-only `WebGLRenderer` (owns viewport/clear state + upload-generation bookkeeping; `testUploadStats`; loss records+skips, wrong-state throws Com_Error; no readPixels). Tests 16/16 with Q2_PAK (scene/capability/renderer).
+- selection (`apps/web` + `packages/config`): `RendererKind = ResolvedBackend` widened, `detectGpuCapability` headless-safe DOM probe, `resolveBootRenderer` shared by `bootPlay`/`applyRendererCvar`, `PlayBoot.lastRendererWarning` + console.warn on every fallback (spied in tests), `getGpuStatus` with the benchmark rule (GPU-labeled leg with active != webgl2-experimental is VOID); capable webgl2 boots still construct SoftwareRenderer + CPU resolve (pixels until PROOF-3, documented). `vid_renderer` panel options + labels; cvar doc widened. Zero behavior change for software/voodoo (warning-free paths asserted).
+- box-5 tests (`packages/testkit/src/gpu-boundary.test.ts`): live-backend F0/F1 invariants (every world ref re-passes fresh frustum check, blend keys non-increasing with distance, transforms[0] identity, entity refs transformIndex ≥ 1 with kinds/handles, generation-stable snapshots), reference lifecycle double + live `WebGLRenderer` lifecycle (uploads wired via testUploadStats). F0: 173 world opaque + 3 entities; F1: 173 + 4. Zero world TRANS/sky in the spawn-north frustum (transparent overlap rides foreground classes — PROOF-4 input).
+- integrator reconciliations: entity surfaceId negative sentinels (-1-i) + transparent bit independent of material kind (over-strict fixture assertions relaxed); context-loss pinned to record-not-throw (externally induced, frame loop must survive); live probe signature/modelKinds seam.
+- evidence: webgl-renderer 16/16, renderer-api 6/6, config 7/7, web gates 51/51 (base1-gate 23 + voodoo-regression 4 + gpu-select 10 + display), testkit 171/179 + 1 known load flake (fg-recovery, green sequential; identical at clean base); deps:check 596 edges/16 owners ok. Changesets: webgl-renderer-gpu-proof-2 + testkit-gpu-proof-2 + config-gpu-proof-2.
+- PROOF-3 now eligible (depends PROOF-2 done). Keep interfaces narrow; defer general-purpose abstractions until the real-scene proof needs them.
 
 ### GPU-PROOF-3 — Render the representative scene on WebGL2
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
