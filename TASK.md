@@ -1,163 +1,213 @@
-Optimize Q2TS rendering performance while preserving the current software and Voodoo appearance and gameplay. Implement and validate the work using coordinated subagents and changesets.
+Fix the remaining correctness and performance issues after commit 460232d. Implement with subagents, validate, create changesets, update documentation and commit autonomously. Do not push. Preserve unrelated user changes.
 
-Read BRAIN.md fully before editing, followed by docs/architecture.md, docs/renderers.md, docs/process.md, docs/lessons.md and docs/perf-ledger.md. Follow repository instructions and package ownership rules.
+Read BRAIN.md completely, then the relevant renderer, architecture, process, lessons and performance-ledger documentation. Follow package ownership, dependency, frozen-contract and changeset rules.
 
-OBJECTIVE
+Preserve completed improvements: RGB-authoritative rendering, true per-band span subranges, shared ESM/CJS configuration, RGB-first material preparation and full-RGBA parity checks.
 
-The user reports 15–20 FPS even at 320×240, particularly in Voodoo mode. Identify and remove the actual bottlenecks. Preserve BRAIN.md’s ≤16 ms/frame budget at 640×480 and its browser 60 FPS objective; do not weaken budgets or declare success from a synthetic kernel benchmark.
+The target remains ≤16 ms production frames and ≥60 presented FPS at 640×480 with normal fidelity and representative gameplay. No reduced resolution, disabled effects, missing entities or relaxed correctness checks.
 
-Keep the software-first architecture and Node/headless support. A GPU backend is outside this task. Do not replace the renderer with WebGL, change fidelity defaults, lower resolution, or reduce scene complexity to claim a performance improvement.
+Work in the order below. The correctness issue must be fixed before expanding foreground worker execution.
 
-STARTING EVIDENCE — REVERIFY
+1. FIX FOREGROUND RECOVERY
 
-A previous source inspection found:
+Current problem:
+- SoftwareRenderer.flushForegroundRGB() and related fallback paths call drawInlineRGBAll().
+- Both Node and browser implementations clear the entire RGB coverage and depth planes.
+- During foreground recovery, the pending descriptors contain only foreground work, not the previously rendered world.
+- Consequently recovery can destroy world coverage and occlusion.
+- If workers/main-band processing already blended some translucent pixels, replay can blend them again because destination colors are not restored.
+- Quarantining workers prevents later writes; it does not undo writes already completed.
+- Staging-capacity exhaustion also reaches this recovery path.
 
-1. apps/web/src/dom.ts presents a CPU framebuffer using Canvas 2D putImageData.
-2. packages/sw-renderer/src/frame.ts draws the classic indexed world pass even when it subsequently draws RGB spans.
-3. packages/sw-renderer/src/bands.ts partitions RGB spans into bands but executes them on the calling thread; workers handle indexed planes. Its band loop repeatedly scans spans.
-4. packages/sw-renderer/src/spans.ts performs CPU texture and lightmap bilinear sampling, depth tests, modulation and RGB565 writes.
-5. End-frame palette expansion/RGB composition and apps/web/src/play.ts resolveDisplay add serial full-frame work.
+Relevant files:
+- packages/sw-renderer/src/frame.ts
+- packages/sw-renderer/src/bandPool.ts
+- apps/web/src/render-workers.ts
 
-An existing devroom benchmark, run against the package builds available at the time, reported:
-- 320×240: software 2.17 ms; Voodoo raster 15.62 ms, composition 1.08 ms, scanout 7.83 ms.
-- 640×480: software 6.68 ms; Voodoo raster 55.36 ms, composition 4.14 ms, scanout 26.82 ms.
+Implement explicit recovery semantics distinguishing:
+a. Staging refusal before dispatch.
+b. Failure before any writes.
+c. Failure after partial execution.
+d. Disposal or timeout while writes may be in flight.
 
-These are leads, not acceptance baselines: they exclude browser presentation/full gameplay, may use stale builds, and do not establish your machine’s performance. Rebuild dependencies and collect fresh measurements.
+Choose a correct recovery design: checkpoint/restore, complete-frame replay, or safely tracked per-band recovery. Preserve previously rendered world and foreground state, exact blend order, coverage and depth. Do not merely remove the clears: that does not fix partial alpha replay.
 
-PHASE 1 — BASELINE AND CONTRACTS
+Ensure workers cannot mutate buffers while recovery or subsequent frames use them. Handle both Node and browser pools.
 
-Before optimization:
-- Inspect the working tree and preserve unrelated user changes.
-- Use tools/q2-paths.sh to locate real assets; never commit proprietary assets.
-- Establish reproducible fixed-camera/fixed-time baselines for both renderers at 320×240 and 640×480.
-- Include real base1 views and gameplay, not only devroom.
-- Record framebuffer hashes and baseline screenshots/crops covering world, sky, water/glass, entities, viewmodels, sprites, particles, tracers and HUD.
-- Attribute simulation, geometry/culling, projection/span generation/sorting, indexed raster, RGB raster, foreground, composition, scanout, worker staging/waiting and browser presentation.
-- Verify the browser actually uses the intended worker path and internal canvas resolution.
-- Inspect current fidelity tests and normative documentation. BRAIN.md contains historical descriptions that may conflict with later fixes, including quantization and gamma order. Resolve contradictions using current implementation, regression evidence and authoritative renderer docs; do not “restore” an obsolete pipeline.
+Add deterministic fail-before regression tests:
+- Force capacity exhaustion after staging some foreground work.
+- Complete at least one band containing translucent pixels, then fail another.
+- Exercise the calling thread’s completed band plus worker timeout.
+- Verify world occlusion, untouched pixels, RGB565 color, coverage and depth against uninterrupted serial rendering.
+- Verify alpha is applied exactly once.
+- Verify the next frame is correct and no pending job wedges the loop.
 
-Capture the required frame-ordering, buffer-ownership, depth, coverage and fallback invariants before designing changes.
+Mocked workers that never write cannot prove partial-write recovery.
+
+2. IMPLEMENT EXACT MODEL/GUN WORKER RASTERIZATION
+
+The current foreground worker implementation handles deferred translucent spans and world-placed sprites. The expensive MD2 models/viewmodel, particles, entity sprites and tracers remain serial.
+
+Do not defer this again because an incremental barycentric experiment changed pixels. Parallelize the existing exact rasterizer first, retaining its arithmetic and coverage rules.
+
+Prepare transforms, clipping and immutable primitive/material data once where practical. Stage descriptors for disjoint row bands or tiles. Each worker owns its scratch and framebuffer region.
+
+Preserve:
+- World-before-foreground dependencies.
+- Primitive order within every pixel region.
+- Opaque and translucent blending.
+- Window-Z comparisons and ties.
+- RGB565 destination reads/writes.
+- Viewmodel depth hack and near-plane clipping.
+- Texture addressing, mip selection and lighting.
+- Sprites, particles and beams.
+- Software renderer behavior.
+- The recovery guarantees established in item 1.
+
+Do not schedule overlapping primitives as concurrent writers to the same pixels.
+
+Implement Node and browser execution, not just a headless protocol. Make the normal browser Voodoo path use it by default when the pool is available.
+
+Start with model/gun triangles because their recorded serial cost is approximately 15 ms. Then cover the remaining foreground primitive classes or retain narrowly justified inline work with explicit counts and measured cost.
+
+Avoid a separate worker kick per entity or triangle. Preserve order through batched command streams and minimize synchronization barriers.
+
+Required tests:
+- Full-RGBA and relevant depth/coverage equality against exact serial rendering.
+- Multiple overlapping opaque/translucent models.
+- Gun against nearby walls and near-plane intersections.
+- Animated frame interpolation and dynamic lighting.
+- Odd dimensions and band seams.
+- Multiple worker counts.
+- Primitive ordering across triangles, sprites, particles and beams.
+- Partial-job recovery using the new protocol.
+- Actual browser worker execution with the real viewmodel.
+
+3. MAKE FOREGROUND COUNTERS TRUTHFUL
+
+Current fgInlineRgb tracks span batches, not all foreground work. Direct model/particle/tracer draws do not increment it. Thus “fgWorker=10, fgInlineRgb=0” can coexist with expensive serial model rendering.
+
+The browser also derives fgWorker from staged batches whenever any foreground kick completed. Staging is not execution proof.
+
+Replace or clarify these counters:
+- Primitive class: alias/viewmodel triangles, alpha spans, sprites, particles, beams.
+- Prepared/staged work.
+- Actual worker-completed work.
+- Calling-thread band work.
+- Deliberately inline work.
+- Fallback/replayed work.
+- Separate timing for expensive foreground stages.
+
+Count actual completion where possible. Use clear units; do not compare batches with triangles or pixels.
+
+Add tests proving a serial viewmodel is visible in inline counters, successful worker execution is visible in completed counters, and staged-but-failed work is not reported as successfully worker-rendered.
+
+Update browser stats, benchmark output, documentation and tests together. Preserve lightweight production behavior; detailed instrumentation may be optional.
+
+4. MEASURE REAL WORKER EXECUTION AND SYNCHRONIZATION
+
+Current diagnostics identify bands but measure caller-side completion-message arrival. That includes execution, scheduling and delivery delay.
+
+Add worker-local execution duration measurements associated with:
+- Frame/sequence.
+- Job type.
+- Stable worker/band identity.
+- Actual primitive/span/pixel counts.
+
+Keep caller dispatch-to-completion latency separate. Do not subtract timestamps across different time origins without establishing comparability.
+
+Measure:
+- Main-thread geometry/material preparation/staging.
+- Worker world raster.
+- Worker foreground raster.
+- Calling-thread band execution.
+- Idle time and barrier delays.
+- Composition and scanout.
+- Presentation and scheduling gaps.
+- Allocation/GC where material.
+
+Audit the newly introduced foreground flush points. Determine whether extra kicks, tiny jobs, or imbalanced bands offset useful parallelism.
+
+Use measurements to optimize scheduling. Do not assume maximum hardwareConcurrency or more kicks is optimal.
+
+Use instrumentation for attribution and uninstrumented runs for acceptance.
+
+5. OPTIMIZE THE REMAINING CRITICAL PATH
+
+After items 1–4, profile again and implement the largest remaining measured reductions.
+
+Likely candidates:
+- RGB span shading and lightmap sampling.
+- Repeated material/descriptor/view setup.
+- Geometry emission.
+- Uneven band workload.
+- Excess synchronization.
+- Composition/scanout passes and repeated neighborhood expansion.
+
+Preserve sampling, depth, dithering, reconstruction, gamma and HUD semantics. Existing WASM/SIMD infrastructure may be extended if supported by measured evidence and repository rules. Do not substitute a GPU renderer.
+
+Evaluate whole-frame effects, not only microbenchmarks. Reject optimizations that regress production frames or output fidelity.
 
 SUBAGENT ORGANIZATION
 
-Use a primary integrator and up to three concurrent subagents, respecting available slots and ONE writer per package at a time.
+Use parallel subagents with exactly one writer per package:
+- Renderer owner: packages/sw-renderer, sequencing recovery and exact foreground execution.
+- Browser owner: apps/web, corresponding pool/protocol integration, diagnostics and browser validation.
+- Benchmark/test owner: tools/bench and packages/testkit, measurement, adversarial recovery tests and acceptance.
+- Integrator: shared contracts, ownership transfers, documentation, changesets and commits.
 
-Create task cards with owns, depends, status and measurable done-when criteria. Delegate:
-- Raster lane: packages/sw-renderer. Investigate duplicated indexed/RGB work, real parallel RGB execution, span partitioning and pixel-loop costs.
-- Scanout lane: packages/voodoo. Optimize reconstruction, packing and gamma without changing output.
-- Measurement/integration lane: tools/bench and apps/web. Build reproducible attribution and browser validation, then integrate worker/presentation changes after the relevant interfaces are ready.
+Adapt to available slots. Assign any additional packages explicitly.
 
-The primary integrator owns shared documentation and task coordination. Assign packages/config, packages/renderer-api and packages/testkit explicitly when needed; never allow overlapping ownership. Respect existing active task claims.
+Agree on protocol/interface changes before dependent implementation. Follow BRAIN.md’s interface-first and major-changeset rules for frozen contracts.
 
-Before cross-package implementation, agree on interfaces and ordering. Follow BRAIN.md’s separate interface-change process and frozen-contract requirements. Agents request handoffs instead of editing another agent’s packages. Each agent returns changed files, correctness evidence, benchmark results, risks and its changeset.
+Subagents return changed files, tests, before/after evidence, unresolved issues and proposed changeset text. They do not commit or concurrently edit shared tracking files. The integrator commits.
 
-PHASE 2 — MEASURED OPTIMIZATION
+Do not treat package ownership as an external blocker. Transfer or assign ownership when needed.
 
-Prioritize changes by measured frame cost:
+BASELINE AND VALIDATION
 
-A. Remove redundant indexed work where safe.
-Do not simply delete the classic draw. Establish which pixels and consumers still depend on indexed color/depth, background seeding, uncovered pixels, foreground ordering and fallback paths. Preserve all required behavior. If Voodoo-mode internal index-plane parity is only a diagnostic expectation, explicitly resolve that contract before changing it; keep software-mode parity intact.
+Establish a quiet-machine baseline at 460232d. Compare identical workloads and settings on the final tree. Do not reuse earlier serial-versus-pooled comparisons as commit speedups.
 
-B. Implement actual RGB parallelism where it improves end-to-end performance.
-Workers must execute RGB raster work, not merely partition it on the main thread. Define shared plane ownership, material/lightmap lifetime, frame barriers, buffer reuse and ordered foreground composition. Preserve absolute dither coordinates and correct filter access across band boundaries. Exercise worker counts including zero/serial fallback; choose scheduling based on measured overhead, especially at 320×240.
+Recorded results to verify:
+- Browser 640×480 Voodoo soak: approximately 15 presented FPS.
+- Node pooled combat acceptance: approximately 80.5 ms.
+- Earlier combat results were around 68 ms, but the records alone do not establish a controlled regression.
 
-C. Optimize serial RGB and scanout work.
-Remove unnecessary passes, repeated calculations, staging copies and allocations where equivalence can be proven. Investigate reuse of overlapping reconstruction taps. Do not fuse or reorder stages if that changes rounding, quantization, blending or gamma behavior.
+Run expensive benchmarks sequentially, not concurrently across agents.
 
-D. Verify presentation and frame scheduling.
-Measure rAF pacing, worker waits and frame completion separately. Preserve responsive input, single simulation ownership, 10 Hz game ticks, interpolation and non-overlapping renderer state.
+Measure software and Voodoo, serial and 1/3/7 workers. Use stationary, moving-camera and combat workloads with the real viewmodel. 320×240 is diagnostic only; acceptance is 640×480.
 
-Retain only optimizations that improve representative frame performance without correctness regressions. Keep unfinished work disabled behind the required feature flag.
+Use full-channel comparisons and meaningful work counters. Preserve software goldens. Do not update goldens to hide unexplained differences.
 
-FIDELITY AND REGRESSION REQUIREMENTS
+Run:
+- yarn verify
+- yarn deps:check
+- Real-asset base1-gate
+- Voodoo regression gates
+- Relevant renderer, worker, recovery and configuration suites
+- Corrected full-frame acceptance commands
 
-Treat the current corrected appearance as the regression oracle, not as proof of hardware calibration.
+Perform a NEW final-code 640×480 browser soak of at least five minutes covering stationary, movement and combat. Report completed-frame cadence, frame-time percentiles, worker execution, fallback/replay counts, memory/cache trends and visual checks.
 
-Require byte-identical output for unchanged rendering inputs wherever the existing deterministic path permits it. Do not update golden hashes merely to make an optimization pass. Investigate every difference; an intentional visual correction is outside this optimization task unless separately authorized.
+Do not sum separate stage medians and label them actual frame time. State headless versus hardware-backed browser conditions accurately.
 
-Preserve:
-- Software palette/colormap behavior and existing goldens.
-- Texture addressing, mip UV scaling, LOD bias and mip dithering.
-- Texture/lightmap filtering, dynamic lights and light styles.
-- RGB565 write/blend semantics, normalized depth, ties and viewmodel depth handling.
-- Dither phase, reconstruction thresholds, gamma placement and vd_* semantics.
-- MD2 opacity, sprite transparency and the fixed black-gun/missing-geometry behavior.
-- Strict HUD-before-scanout ordering and exactly one scanout.
-- Serial/worker equivalence, band seams, sky, alpha ordering and foreground visibility.
-- Cache bounds, eviction ownership and sustained-performance stability.
+COMPLETION
 
-Use meaningful differential tests for optimized paths, including odd dimensions, band boundaries, relevant cvar combinations and worker fallback/failure behavior. Do not disable tests, weaken assertions, or hide incomplete work by changing baselines.
+Create task cards with separate statuses:
+implementation complete / correctness verified / performance measured / target accepted.
 
-MEASUREMENT AND COMPLETION
+Do not close model/gun parallelism based on alpha-span worker counters.
+Do not close recovery based only on failures before writes.
+Do not close worker timing based only on message arrivals.
+Do not label an unmet budget successful completion “by design”.
 
-Run matched before/after cases with identical cameras, time, entities, cvars, resolution and worker settings. Warm up both versions. Record machine/browser/build information, medians and p95 frame times, repeated runs and variability. Avoid concurrent benchmarks competing for CPU. Report stage timings separately from full-frame latency and actual presented FPS.
+Continue implementing against the measured critical path while the target is missed. If a genuine external blocker prevents progress, identify it precisely and leave the corresponding acceptance item open.
 
-Validate:
-- Devroom and multiple real base1 views.
-- Stationary, moving/turning and sustained-combat scenes.
-- Both resolutions and both renderers.
-- Serial and useful worker-count configurations.
-- A several-minute browser soak for FPS drift, memory/cache growth and correctness.
+The integrator must:
+- Review all changes and run integrated validation.
+- Add valid changesets for changed publishable packages.
+- Update BRAIN.md and docs/perf-ledger.md honestly.
+- Record reproducible controlled before/after results.
+- Commit only intended work autonomously, without pushing or amending unrelated commits.
 
-Synthetic benchmarks cannot close the task. Missing assets or browser access must be reported as missing validation, not counted as passing.
-
-Every logical package change must include an appropriately scoped changeset using the actual package names. Frozen contract changes require BRAIN.md’s major changeset and documentation update. Keep independently reviewable changes separate; do not publish releases.
-
-Before declaring completion:
-- Run focused regression checks, real-asset release gates, yarn deps:check and yarn verify against the integrated final tree.
-- Review before/after screenshots and pixel differences.
-- Append honest measurements to docs/perf-ledger.md.
-- Update task cards, archive completed work, and correct relevant documentation.
-- Report improvements, remaining bottlenecks, fidelity evidence, changesets and any unmet budget.
-
-Continue through implementation and integration rather than stopping at recommendations. Never claim “60 FPS” from kernel throughput or a partial-frame measurement. If the target remains unmet, state the measured shortfall and remaining work explicitly.
-
----
-
-## Task cards (integrator-owned coordination)
-
-### PERF-1 — Baseline attribution + reproducible harness
-owns: `tools/bench`, `packages/testkit`
-depends: none (respects M7.1 `apps/web` lock — read-only there)
-status: done
-done-when:
-- [x] rebuilt deps, fresh 320×240 + 640×480 numbers for software + Voodoo on devroom + ≥2 real base1 views, warmed, medians + p95, machine/build recorded (`yarn bench:rgb`, Ryzen 5 PRO 2400G, Node 22)
-- [x] stage attribution: sim, GEO/cull, project/emit/sort, indexed raster, RGB raster, foreground, composition, scanout, worker staging/wait, browser present separated (worker/rAF/present documented as browser-only gaps)
-- [x] framebuffer hashes + baseline crops recorded; browser worker-path + canvas resolution verified (frameAsync + BrowserBandPool + sw_workers, internal W×H)
-- [x] fidelity-test vs docs contradictions listed with current-implementation resolution (linear-pack → recon → display-gamma; no obsolete restore)
-
-### PERF-2 — Raster lane (indexed/RGB + parallel RGB)
-owns: `packages/sw-renderer`
-depends: PERF-1 (contracts + baselines)
-status: done (RGB workers LANDED 2026-10-28; budget acceptance remains open — see blocker note below)
-done-when:
-- [x] indexed-dependency map (value-parity contract; software parity intact)
-- [x] RGB executes on workers where it wins end-to-end (LANDED 2026-10-28: JOB_RGB raster kick — SAB RGB planes + per-frame chain directory + luxel staging + RGB descriptors; Node BandWorkerPool + BrowserBandPool + shared bandWorkerLoop; renderer stages world/skybox/flat-sky batches, single kick after the indexed kick, foreground inline after. Bugs found+fixed: odd-dim SAB misalign, indexed resetAccum wiped RGB staging, 2MB sky chain overflowed 4MB cap (now 8MB). Differential pins: rgbWorkers.test.ts — devroom 1/3/7 workers, odd dims, determinism, dead-pool, async kick, Q2_PAK base1 ×2 views ×entities ×1/7, full-RGBA hash)
-- [x] representative-frame win with byte-identical outputs (Node spawn-north 640×480 RGB renderView 110.55→55.73, 2.0×; full production frame 123.13→77.96, 1.58×; 320×240 renderView 47.40→34.94, frame 43.02→35.71. ALL hashes identical serial-vs-worker on 48 configs incl. BEFORE pins 90bb1188/58c218d4; browser kick verified engaged via __q2stats rgbStaged/kicks)
-- [x] changeset + bench rows + risks (.changeset/sw-rgb-workers-perf2.md, perf-ledger PERF-2 + PERF-4 rows)
-
-> PERF-2 blocker note (2026-10-28): the LANDED worker kick is real end-to-end parallelism with byte-identical
-> output, but the ≤16ms/60fps acceptance is NOT met (Node full-frame 78ms@640×480, browser 66ms@320×240).
-> Roofline: GEO ~17ms serial floor (resolution-independent) + serial alias RGB incl. viewmodel gun + serial
-> fused scanout 22ms@640×480 (5.8ms@320×240) + classic indexed pass kept (skip proven unsafe: window-Z vs
-> float-zb, foreground depth, seed, stipple — see dependency map) + browser sim/HUD/blit/compositor. No single
-> remaining optimization closes a 4–5× gap; further gains need parallel scanout + alias and/or algorithmic GEO
-> cuts, all measured against the same bit-identical oracle. Budgets NOT relaxed.
-
-### PERF-3 — Scanout lane (reconstruction/pack/gamma)
-owns: `packages/voodoo`
-depends: PERF-1
-status: done (fused resolve landed, bit-identical)
-done-when:
-- [x] reconstruction + packing + gamma profiled + fused (single-pass pack->recon->gamma, 1.10-1.24x, 1920-combo 0-mismatch)
-- [x] vd_* semantics, thresholds, placement unchanged (48-combo + f4ebd424 + odd dims green)
-- [x] changeset + bench rows + risks (.changeset/voodoo-fused-resolve-perf3.md)
-
-### PERF-4 — Integration (browser present + scheduling)
-owns: `apps/web`
-depends: PERF-1, PERF-2, PERF-3 (starts after interfaces ready; respects M7.1 lock — coordinate/handoff)
-status: in-progress (browser measured 2026-10-28: kick engaged, presented FPS recorded; 640×480 + full soak + 60fps acceptance remain open)
-done-when:
-- [x] rAF pacing vs worker-wait vs frame-completion measured separately; responsive input, single sim, 10Hz ticks, interpolation, non-overlapping renderer state preserved (presented-FPS via frame-counter deltas; engagement via __q2stats pooled/rgbStaged/rgbKicks/rgbInline; pool auto-latch sw_workers=7, crossOriginIsolated true; no sim duplication — frameAsync owns sim; foreground after kicks)
-- [ ] serial + worker-count validation at both resolutions both renderers; multi-minute soak (FPS drift, mem/cache, correctness) (DONE 2026-10-28 at 320×240: voodoo pooled 15.1fps presented [kicks flowing: staged ~1848/kicks 1/inline 0] vs serial-path 11–13fps; software pooled 41.3fps [RGB off as expected]. Screenshots reviewed: spawn view correct, gun textured, HUD live. 5-min stability soak running, no decline in-window; voodoo-regression headless gate 29/29 + web 247/247 green. OPEN: 640×480 browser run; full worker-count sweep in-browser (mid-loop cvar switch cannot re-attach the pool — needs fresh loads); 60fps acceptance NOT met)
-- [x] exactly-one-scanout + HUD-before-scanout preserved; changeset + honest ledger rows (web + voodoo-regression gates green; screenshots reviewed; ledger PERF-4 row)
+Finish with commit hashes, changesets, the completion matrix, recovery-test evidence, actual model/gun worker-execution proof, controlled performance results, final 640×480 browser evidence and any genuine remaining blocker.
