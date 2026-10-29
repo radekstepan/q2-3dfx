@@ -27,11 +27,10 @@ import { SoftwareRenderer, setRGBWorldEnabled, SW_RGB_SKIP_CLASSIC_CVAR } from '
 import { createDevroom, DEVROOM_CAMERA } from './devroom.js';
 import { BandWorkerPool } from './bandPool.js';
 import {
-  attachFrameAccum, attachRGBAccum, CTL_READY,
-  frameAccumTotal, processRGBFrameJob,
+  processRGBFrameJob,
   R_FLAG_BLEND_ALPHA, R_FLAG_DEPTHWRITE, R_FLAG_LIGHT, R_FLAG_OPAQUE, R_FLAG_REPEAT,
-  RGB_MAX_CHAINS, rgbAccumTotal, splitBands, SW_ACCUM_CVAR, SW_WORKERS_CVAR,
-  type Band, type RGBAccumViews,
+  RGB_MAX_CHAINS, splitBands, SW_ACCUM_CVAR, SW_WORKERS_CVAR,
+  type RGBAccumViews,
 } from './bands.js';
 import {
   SPAN_OPAQUE, SPAN_TRANS66, createSpan,
@@ -64,60 +63,7 @@ function fnvU8(a: Uint8Array): string {
   return (h >>> 0).toString(16).padStart(8, '0');
 }
 
-/** Scripted pool: REAL staging/kick code, fake workers (no threads). */
-export interface StubPool extends BandWorkerPool {
-  __stubViews: RGBAccumViews;
-}
-export function stubPool(W: number, H: number, opts?: { readyBands?: number; timeoutMs?: number }): StubPool {
-  const full = new SharedArrayBuffer(rgbAccumTotal(W, H));
-  const { views } = attachFrameAccum(full, W, H);
-  const { views: rgbViews } = attachRGBAccum(full, W, H);
-  const fakeWorkers = [{}, {}, {}];
-  const pool = Object.create(BandWorkerPool.prototype) as unknown as Record<string, unknown>;
-  const bands: Band[] = splitBands(H, fakeWorkers.length + 1);
-  pool['bandCount'] = bands.length;
-  pool['workers'] = fakeWorkers;
-  pool['views'] = views;
-  pool['rgbViews'] = rgbViews;
-  pool['base'] = views.base;
-  pool['ctl'] = views.ctl;
-  pool['bands'] = bands;
-  pool['timeoutMs'] = opts?.timeoutMs ?? 10;
-  pool['fbW'] = W;
-  pool['fbH'] = H;
-  pool['seq'] = 0;
-  pool['lastTexels'] = null;
-  pool['lastLight'] = null;
-  pool['lastColormap'] = null;
-  pool['lastPalette'] = null;
-  pool['pending'] = new Map();
-  pool['readyCount'] = 0;
-  pool['frameGen'] = 0;
-  pool['mainLastGen'] = 0;
-  pool['disposed'] = false;
-  pool['spansUsed'] = 0;
-  pool['texUsed'] = 0;
-  pool['lightUsed'] = 0;
-  pool['descCount'] = 0;
-  pool['rgbSpansUsed'] = 0;
-  pool['rgbChainUsed'] = 0;
-  pool['rgbChainLevels'] = 0;
-  pool['rgbChainSlots'] = 0;
-  pool['rgbLuxUsed'] = 0;
-  pool['rgbDescCount'] = 0;
-  pool['rgbChainMap'] = new Map();
-  pool['rgbTriUsed'] = 0;
-  pool['rgbFlushedCount'] = 0;
-  pool['rgbFailure'] = null;
-  pool['quarantined'] = false;
-  // Readiness: fake workers never signal, so preset the counter the
-  // awaitReadySync path polls (ready = kick proceeds, main band runs,
-  // DONE never arrives -> deterministic timeout).
-  views.ctl[CTL_READY] = opts?.readyBands ?? 0;
-  const p = pool as unknown as StubPool;
-  p.__stubViews = rgbViews;
-  return p;
-}
+import { stubPool, type StubPool } from './testStubPool.js';
 
 function stubViewsOf(pool: BandWorkerPool): RGBAccumViews {
   return (pool as unknown as { rgbViews: RGBAccumViews }).rgbViews;
@@ -305,10 +251,15 @@ describe('retained-frame recovery: partial writes replay exactly once', () => {
     expect(p.lastRGBFailure!()).toBe('partial');
     expect((p as unknown as { quarantined: boolean }).quarantined).toBe(true);
     expect((p as unknown as { workers: unknown[] }).workers.length).toBe(0);
+    // Isolation fence: quarantine moved the pool onto a replacement SAB
+    // (epoch bumped, planes re-adopted); the calling-thread band's writes
+    // below are read from the pre-quarantine buffer it ran on.
+    expect(p.recoveryEpoch()).toBe(1);
+    expect(p.planes.color.buffer).not.toBe(p.__stubViews.rgb565.buffer);
     // Calling-thread (last) band really ran before the timeout.
     const mainRows = splitBands(H, 4)[3]!;
     let mainCovered = 0;
-    const cover = planesOf(p).cover;
+    const cover = p.__stubViews.cover;
     for (let y = mainRows.y0; y < mainRows.y1; y++) {
       for (let x = 0; x < W; x++) mainCovered += cover[y * W + x]!;
     }

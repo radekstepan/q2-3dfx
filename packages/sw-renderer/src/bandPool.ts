@@ -121,10 +121,13 @@ export interface PoolOptions {
 export class BandWorkerPool implements BandDispatcher {
   readonly bandCount: number;
   private readonly workers: WorkerLike[] = [];
-  private readonly views: FrameAccumViews;
-  private readonly rgbViews: RGBAccumViews;
-  private readonly base: BandViews;
-  private readonly ctl: Int32Array;
+  // Mutable (not readonly): the PERF-NEXT-2 isolation fence re-points all
+  // four at a replacement SAB when quarantine abandons a buffer that live
+  // workers may still be scribbling.
+  private views: FrameAccumViews;
+  private rgbViews: RGBAccumViews;
+  private base: BandViews;
+  private ctl: Int32Array;
   private readonly bands: Band[];
   private readonly timeoutMs: number;
   private readonly fbW: number;
@@ -175,12 +178,30 @@ export class BandWorkerPool implements BandDispatcher {
   /**
    * Stale-write guard (mirrors the browser pool): a timed-out kick means
    * workers whose SAB writes may still be in flight. The timeout path
-   * terminates every worker BEFORE the caller replays, then refuses all
-   * later kicks fast until the pool is recreated. Explicit refusals (dead
-   * pool, empty batches) and dispose do NOT quarantine — only the timeout
-   * does, since only it implies in-flight writes.
+   * quarantines first — shutdown signal, replacement-buffer isolation
+   * (fresh SAB, epoch bump), termination — and only then does the caller
+   * replay, so no straggler write can race the recovery or any later frame.
+   * All later kicks refuse fast until the pool is recreated. Explicit
+   * refusals (dead pool, empty batches) and dispose do NOT quarantine —
+   * only the timeout does, since only it implies in-flight writes. The
+   * sync path relies on the isolation fence (it cannot await termination);
+   * the async path additionally joins completed termination (bounded).
    */
   private quarantined = false;
+  /**
+   * Fence epoch (PERF-NEXT-2): incremented every time quarantine isolates
+   * the shared planes onto a fresh SAB. The renderer re-adopts the pool's
+   * current planes when this moves, so recovery + inline fallback can never
+   * write the abandoned buffer a live worker may still be scribbling.
+   * Plain counter (no atomics needed — main thread only).
+   */
+  private sabEpoch = 0;
+  /**
+   * Settled-termination promise for the quarantined workers (async-path
+   * join). Null when no quarantine ran or termination needs no join (all
+   * fake/scripted workers). Never rejects.
+   */
+  private quarantineSettled: Promise<void> | null = null;
 
   private constructor(
     bandCount: number, views: FrameAccumViews, rgbViews: RGBAccumViews, ctl: Int32Array,
@@ -436,6 +457,18 @@ export class BandWorkerPool implements BandDispatcher {
     }
     this.workers.length = 0;
     this.pending.clear();
+    // Join any quarantine-termination still in flight (bounded by the
+    // terminate promises themselves — they resolve once the thread stops).
+    // Proves no doomed worker can still write after dispose returns.
+    const settled = this.quarantineSettled;
+    this.quarantineSettled = null;
+    if (settled) {
+      try {
+        await settled;
+      } catch {
+        /* already settled */
+      }
+    }
   }
 
   /** Block until every worker entered its wait loop (first job only). */
@@ -1157,6 +1190,9 @@ export class BandWorkerPool implements BandDispatcher {
     if (!ok) {
       Com_Warn(`bandPool: async RGB frame timeout after ${this.timeoutMs}ms, quarantining + replaying inline`);
       this.quarantineWorkers();
+      // Bounded completion join: isolation already fenced the planes, so
+      // this only proves the doomed workers are gone before we report.
+      await this.quarantineWorkersAsync();
       this.rgbFailure = 'partial';
       return null;
     }
@@ -1287,24 +1323,155 @@ export class BandWorkerPool implements BandDispatcher {
   }
 
   /**
+   * Fence epoch for the shared planes (PERF-NEXT-2): increments whenever
+   * quarantine isolates the planes onto a replacement SAB. The renderer
+   * re-adopts the pool's current planes on recovery, so replay + inline
+   * fallback target the live buffer, never the abandoned one. Monotonic
+   * on the main thread; scripted/stub pools report 0 until they quarantine.
+   */
+  recoveryEpoch(): number {
+    return typeof this.sabEpoch === 'number' ? this.sabEpoch : 0;
+  }
+
+  /**
    * Terminate every worker and refuse all later kicks fast (classes c/d:
    * call BEFORE replaying inline, so no straggler SAB write can race the
    * recovery or any later frame). Safe to call twice; never throws. The
    * pool stays usable only after recreation — beginFrame does NOT clear
    * this (a wedged pool must not silently resume mid-frame).
+   *
+   * PERF-NEXT-2 fence: `void worker.terminate()` alone is NOT a completion
+   * fence — the main thread would replay over shared planes a live worker
+   * may still be writing. So this first isolates the shared planes onto a
+   * fresh SAB (staging/descriptors copied verbatim — workers only read
+   * those — output planes cleared, control reset, epoch bumped), THEN
+   * terminates. Termination of the abandoned buffer's writers is provable
+   * via quarantineWorkersAsync; isolation makes the replay safe immediately,
+   * including on the blocking sync path that cannot await termination.
+   * One extra SAB is retained until the doomed workers exit (bounded: a
+   * pool quarantines at most once).
    */
   quarantineWorkers(): void {
     if (this.quarantined && this.workers.length === 0) return;
     this.quarantined = true;
-    for (const worker of this.workers) {
+    // Cooperative shutdown signal for workers blocked in Atomics.wait:
+    // they observe SEQ < 0 on wake and exit instead of draining a stale
+    // kick. Workers mid-raster cannot observe it — isolation covers them.
+    try {
+      Atomics.store(this.ctl, CTL_SEQ, -1);
       try {
-        void worker.terminate();
+        Atomics.notify(this.ctl, CTL_SEQ, this.workers.length);
       } catch {
-        /* already gone */
+        /* workers may already be awake */
       }
+    } catch {
+      /* ignore */
     }
+    const doomed = this.workers.slice();
     this.workers.length = 0;
     this.pending.clear();
+    // Replacement-buffer fence BEFORE termination: from here on, every pool
+    // view (planes, staging, control) addresses the fresh SAB. Late writes
+    // from doomed workers land on the abandoned buffer only.
+    this.isolateSharedPlanes();
+    try {
+      const terms: Array<Promise<unknown>> = [];
+      for (const worker of doomed) {
+        try {
+          terms.push(worker.terminate());
+        } catch {
+          /* already gone / scripted worker without terminate */
+        }
+      }
+      this.quarantineSettled = Promise.allSettled(terms).then(() => undefined);
+    } catch {
+      this.quarantineSettled = null;
+    }
+  }
+
+  /**
+   * Await completed termination of the quarantined workers (async-path
+   * join): resolves once every doomed worker provably cannot write, or
+   * after a bounded wait (isolation already fences the shared planes, so
+   * the bound only limits cleanup latency, never safety). Never rejects;
+   * safe to call twice or without a prior quarantine (runs it). The sync
+   * path cannot await — it relies on the isolation fence alone.
+   */
+  async quarantineWorkersAsync(timeoutMs?: number): Promise<void> {
+    this.quarantineWorkers();
+    const settled = this.quarantineSettled;
+    if (!settled) return;
+    let bound = typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : this.timeoutMs;
+    if (!(bound > 0)) bound = 5000;
+    if (bound > 30000) bound = 30000;
+    try {
+      await Promise.race([
+        settled,
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, bound);
+        }),
+      ]);
+    } catch {
+      /* bounded join only; isolation already fenced the planes */
+    }
+  }
+
+  /**
+   * Replacement-buffer fence (main thread only, quarantine path): move the
+   * pool onto a fresh SAB, copying the old buffer verbatim, then clearing
+   * the output planes and resetting control in the fresh copy. Workers only
+   * READ staging/descriptors (stable — the main thread never mutates them
+   * mid-kick), so a torn copy of the plane bytes is harmless: recovery
+   * clears + replays deterministically. Never throws; on any failure the
+   * pool keeps the old buffer (termination still proceeds).
+   */
+  private isolateSharedPlanes(): void {
+    try {
+      const oldCtl = this.ctl;
+      if (!oldCtl || !(oldCtl.buffer instanceof SharedArrayBuffer)) return;
+      const oldBuf = oldCtl.buffer as SharedArrayBuffer;
+      const size = rgbAccumTotal(this.fbW, this.fbH);
+      if (!(size > 0) || oldBuf.byteLength < size) return;
+      const fresh = new SharedArrayBuffer(size);
+      new Uint8Array(fresh).set(new Uint8Array(oldBuf));
+      const { views } = attachFrameAccum(fresh, this.fbW, this.fbH);
+      const { views: rgbViews } = attachRGBAccum(fresh, this.fbW, this.fbH);
+      this.views = views;
+      this.rgbViews = rgbViews;
+      this.base = views.base;
+      this.ctl = views.ctl;
+      try {
+        Atomics.store(this.ctl, CTL_SEQ, this.seq);
+        Atomics.store(this.ctl, CTL_DONE, 0);
+        Atomics.store(this.ctl, CTL_READY, 0);
+        Atomics.store(this.ctl, CTL_FRAME, this.frameGen);
+        Atomics.store(this.ctl, CTL_FCOUNT, 0);
+        Atomics.store(this.ctl, CTL_COUNT, 0);
+        Atomics.store(this.ctl, CTL_JOB, JOB_RGB);
+        Atomics.store(this.ctl, CTL_RGBBASE, this.rgbFlushedCount);
+        Atomics.store(this.ctl, CTL_RGBCOUNT, this.rgbDescCount);
+      } catch {
+        /* ignore */
+      }
+      // Discard the copied partial plane writes: recovery replays
+      // deterministically from staging (clear + ordered replay).
+      try {
+        this.base.idx.fill(0);
+        this.base.zb.fill(0);
+        this.views.fColor.fill(0);
+        this.rgbViews.rgb565.fill(0);
+        this.rgbViews.cover.fill(0);
+        this.rgbViews.rgbDepth.fill(0xffff);
+        this.rgbViews.scan565.fill(0);
+        this.rgbViews.scanDisplay.fill(0);
+      } catch {
+        /* ignore */
+      }
+      this.mainLastGen = this.frameGen;
+      this.sabEpoch = (typeof this.sabEpoch === 'number' ? this.sabEpoch : 0) + 1;
+    } catch {
+      /* terminate-only fallback */
+    }
   }
 
   /** Publish an RGB-kick descriptor (main side, pre-notify): suffix [flushed, descCount). */

@@ -255,7 +255,7 @@ describe('worker model/gun rasterization equals exact serial', () => {  it('over
 describe('tri recovery + counters (stub pool, deterministic failures)', () => {  async function renderStub(W: number, H: number, readyBands: number): Promise<{
     frame: FullFrame; fg: ReturnType<SoftwareRenderer['testForegroundStats']>;
   }> {
-    const { stubPool } = await import('./rgbRecovery.test.js');
+    const { stubPool } = await import('./testStubPool.js');
     const { setCVar: set } = await import('@q2/config');
     const { SW_WORKERS_CVAR: SWW, SW_ACCUM_CVAR: SWA } = await import('./bands.js');
     const fb = createFramebuffer(W, H, true);
@@ -343,7 +343,7 @@ describe('tri recovery + counters (stub pool, deterministic failures)', () => { 
   });
 
   it('pool-level: translucent tri suffix applied twice differs (exactly-once sensitivity)', async () => {
-    const { stubPool } = await import('./rgbRecovery.test.js');
+    const { stubPool } = await import('./testStubPool.js');
     const { emitAliasTris, buildANorms, buildShadeDots } = await import('./alias.js');
     const { buildRGBMaterial } = await import('./spans.js');
     const { processRGBFrameJob, splitBands, R_FLAG_TRI, R_FLAG_BLEND_ALPHA, R_FLAG_DEPTHWRITE } = await import('./bands.js');

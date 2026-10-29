@@ -17,6 +17,7 @@
 // null/false — the renderer replays inline; only the Async methods kick.
 
 import {
+  CTL_COUNT,
   CTL_DONE,
   CTL_FBH,
   CTL_FBW,  CTL_FCOUNT,
@@ -136,6 +137,21 @@ export const BROWSER_POOL_TIMEOUT_MS = 30000;
 export type DiagJob = 'raster' | 'rgb' | 'resolve' | 'scanout' | 'unknown';
 
 /**
+ * One kick's terminal outcome (PERF-NEXT-2 outcome vocabulary, internal):
+ * 'completed' (every worker acked — success, flushed advances), 'failed'
+ * (timeout with workers running — partial-failure, quarantined first), or
+ * 'disposed' (teardown aborted the wait — partial-failure, no quarantine:
+ * dispose already tore the workers down). 'refused' outcomes (staging
+ * refusal, checkpoint allocation failure, declined dispatch) never reach a
+ * waiter — nothing was dispatched, so the pending staging is left intact
+ * for the exact inline replay.
+ */
+type KickOutcome = 'completed' | 'failed' | 'disposed';
+
+/** Waiter signal: per-message ack, or abort (teardown). Internal. */
+type KickSignal = 'ack' | 'abort';
+
+/**
  * Last-kick diagnostic snapshot (instrumented-only, never the production
  * frame). All times are main-thread `performance.now()` deltas from the
  * kick fan-out — one clock, always comparable. `arrivals` are
@@ -212,10 +228,13 @@ export interface BrowserPoolOptions {
 export class BrowserBandPool implements BandDispatcher {
   readonly bandCount: number;
   private readonly workers: Worker[] = [];
-  private readonly views: FrameAccumViews;
-  private readonly rgbViews: RGBAccumViews;
-  private readonly base: BandViews;
-  private readonly ctl: Int32Array;
+  // Mutable (not readonly): the PERF-NEXT-2 isolation fence re-points all
+  // four at a replacement SAB when quarantine abandons a buffer that live
+  // workers may still be scribbling (mirrors the Node pool).
+  private views: FrameAccumViews;
+  private rgbViews: RGBAccumViews;
+  private base: BandViews;
+  private ctl: Int32Array;
   private readonly bands: Band[];
   private readonly timeoutMs: number;
   private readonly fbW: number;
@@ -223,7 +242,7 @@ export class BrowserBandPool implements BandDispatcher {
   private seq = 0;
   private lastColormap: Uint8Array | null = null;
   private lastPalette: Uint8Array | null = null;
-  private readonly pending = new Map<number, (ok: boolean) => void>();
+  private readonly pending = new Map<number, (signal: KickSignal) => void>();
   private readyCount = 0;
   private frameGen = 0;
   private mainLastGen = 0;
@@ -298,15 +317,50 @@ export class BrowserBandPool implements BandDispatcher {
   /** Cached CTL_SCAN slot offset, -1 when the build predates it. */
   private scanOff: number | null = null;
   /**
-   * Stale-write guard (worker-failure acceptance): a timed-out async kick
-   * means wedged workers whose late SAB writes could race the inline
-   * fallback replay AND later frames. The timeout path terminates every
-   * worker BEFORE the caller replays, then refuses all later kicks fast
-   * (workers.length === 0) until reboot recreates the pool. Explicit
-   * refusals (dead pool, empty batches) and dispose do NOT quarantine —
-   * only the timeout does, since only it implies in-flight writes.
+   * Stale-write guard (worker-failure acceptance): a timed-out kick means
+   * workers whose shared-plane writes may still be in flight. The timeout
+   * path quarantines FIRST - shutdown signal, replacement-buffer isolation
+   * (fresh SAB, epoch bump), termination - and only then does the caller
+   * restore/replay, so no straggler write can race the recovery or any
+   * later frame. A bare `worker.terminate()` is NOT a completion fence
+   * (fire-and-forget in browsers too), so the fence is the isolation: from
+   * quarantine on, every pool view addresses the fresh SAB and late writes
+   * from doomed workers land on the abandoned buffer only. All later
+   * kicks refuse fast until reboot recreates the pool. Explicit refusals
+   * (dead pool, empty batches) and dispose do NOT quarantine - only the
+   * timeout does, since only it implies in-flight writes. The RGB async
+   * path additionally joins completed termination (bounded, best-effort
+   * proof the doomed workers are gone); other paths rely on the isolation
+   * fence alone.
    */
   private quarantined = false;
+  /**
+   * Fence epoch (PERF-NEXT-2, mirrors the Node pool): incremented every
+   * time quarantine isolates the shared planes onto a fresh SAB. The
+   * renderer re-adopts the pool's current planes when this moves, so
+   * recovery + inline fallback can never write the abandoned buffer a
+   * live worker may still be scribbling. Plain counter, main thread only.
+   */
+  private sabEpoch = 0;
+  /**
+   * Cooperative-exit join state (acknowledged-stop handshake): the worker
+   * entry posts `{ exited: true, band }` when its loop observes the
+   * shutdown signal (CTL_SEQ < 0) and returns. `exitNeed` arms at
+   * quarantine (doomed-worker count), `exitAcks` counts their exits;
+   * quarantineWorkersAsync joins them with a bound (isolation already
+   * fenced the planes, so the bound only limits cleanup latency).
+   */
+  private exitNeed = 0;
+  private exitAcks = 0;
+  /**
+   * Cooperative-exit baseline (PERF-NEXT-2): exitAcks is a lifetime counter
+   * that can include stale exits from before the quarantine (e.g. a worker
+   * that threw on an earlier kick posts exited without any quarantine
+   * armed). The join measures NEW acks only: exitBase snapshots exitAcks
+   * when the join arms, so a stale exit can never satisfy the bound early
+   * while a doomed worker still runs.
+   */
+  private exitBase = 0;
   /** Last completed kick's staging snapshot (see kickBytes). */
   private lastKick: {
     idxSpans: number; idxTex: number; idxLight: number; idxDescs: number;
@@ -330,7 +384,12 @@ export class BrowserBandPool implements BandDispatcher {
   private rgbChainMap = new Map<RGBMipLevel[], number>();
   /** Retained-frame watermark: descriptors [0, flushed) hold plane writes. */
   private rgbFlushedCount = 0;
-  /** Last RGB flush outcome: 'clean' (nothing ran), 'partial' (may have written). */
+  /** Last RGB flush outcome: 'clean' = refused/clean-failure (staging
+   *  refusal, checkpoint allocation failure, never-ready, declined or
+   *  pre-dispatch dispose — nothing was dispatched), 'partial' =
+   *  partial-failure (timeout or mid-flight dispose — writes may have
+   *  landed; quarantined first except the dispose teardown path), null =
+   *  success or no kick yet. Mirrors the Node pool vocabulary. */
   private rgbFailure: 'clean' | 'partial' | null = null;
   /**
    * RGB checkpoint/restore (foreground-recovery design, TASK item 1):
@@ -385,15 +444,27 @@ export class BrowserBandPool implements BandDispatcher {
         const msg = ev.data as {
           seq?: unknown; ready?: unknown;
           band?: unknown; pixels?: unknown; spans?: unknown; execMs?: unknown;
+          exited?: unknown;
         };
         if (!msg || typeof msg !== 'object') return;
         if (msg.ready === true) this.readyCount += 1;
+        // Cooperative-exit ack (acknowledged-stop handshake): the worker
+        // entry posts this when its loop observes the shutdown signal
+        // (CTL_SEQ < 0) and returns. Counts toward the quarantine join;
+        // stale exits (no quarantine armed) are harmlessly counted.
+        if (msg.exited === true) {
+          this.exitAcks += 1;
+          return;
+        }
         if (typeof msg.seq === 'number') {
-          // Stale-completion guard: a late arrival for a kick the pool
+          // Stale-completion guard (the generation/epoch fence for
+          // completion messages): the seq-keyed pending map holds an entry
+          // ONLY for the live kick. A late arrival for a kick the pool
           // already abandoned (timeout quarantined it, dispose tore it
-          // down, or the kick already collected) must not resolve anything
-          // or pollute the armed diag snapshot — ignore it. Live kicks
-          // always have a pending entry (registered before the notify).
+          // down, or the kick already collected) finds no entry and is
+          // ignored - it must not resolve anything or pollute the armed
+          // diag snapshot. Seqs never repeat (monotonic per pool), so no
+          // stale completion can ever resolve a later kick.
           if (!this.pending.has(msg.seq)) return;
           if (this.diagOn && this.diagArrivalsSeen < this.diagArrivals.length) {
             const a = this.diagArrivalsSeen++;
@@ -405,7 +476,7 @@ export class BrowserBandPool implements BandDispatcher {
               ? msg.execMs : -1;
           }
           const done = this.pending.get(msg.seq);
-          if (done) done(true);
+          if (done) done('ack');
         }
       };
     }
@@ -599,7 +670,10 @@ export class BrowserBandPool implements BandDispatcher {
    * Kick ONE frame covering every accumulated batch and await worker
    * completion messages (never Atomics.wait — main-thread safe). Resolves
    * null when the pool is dead or the wait times out; the caller replays
-   * inline via drawInlineAll, converging to identical planes.
+   * inline via drawInlineAll, converging to identical planes. The timeout
+   * path quarantines (shutdown signal + replacement-buffer isolation +
+   * termination) BEFORE the caller replays, so the clear + replay below
+   * runs on planes no live worker can still write.
    */
   async flushFrameAsync(): Promise<{ pixels: number; spans: number } | null> {
     if (this.disposed || this.workers.length === 0) return null;
@@ -623,8 +697,11 @@ export class BrowserBandPool implements BandDispatcher {
       this.views, this.fbW, this.fbH, this.descCount, mainBand.y0, mainBand.y1,
     );
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
-    const ok = await finished;
-    if (!ok) {
+    // Timeout/disposal resolve non-'completed' (the waiter already
+    // quarantined on timeout - isolation fenced the planes before any
+    // caller replay; dispose tore the workers down without quarantining).
+    const outcome = await finished;
+    if (outcome !== 'completed') {
       this.statFallbacks.raster += 1;
       return null;
     }
@@ -676,10 +753,10 @@ export class BrowserBandPool implements BandDispatcher {
     const diagT0 = this.diagOn ? performance.now() : 0;
     resolveBandFused(this.views.fColor, this.views.fPal, this.base.idx, this.rgbViews.rgb565, this.rgbViews.cover, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
-    const ok = await finished;
-    if (ok) this.statKicks.resolve += 1;
+    const outcome = await finished;
+    if (outcome === 'completed') this.statKicks.resolve += 1;
     else this.statFallbacks.resolve += 1;
-    return ok;
+    return outcome === 'completed';
   }
 
   /** Live shared RGB planes (the renderer adopts these when banded + attached). */
@@ -727,10 +804,10 @@ export class BrowserBandPool implements BandDispatcher {
       this.fbW, this.fbH, opts, mainBand.y0, mainBand.y1,
     );
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
-    const ok = await finished;
-    if (ok) this.statKicks.scanout += 1;
+    const outcome = await finished;
+    if (outcome === 'completed') this.statKicks.scanout += 1;
     else this.statFallbacks.scanout += 1;
-    return ok;
+    return outcome === 'completed';
   }
 
   /** Publish a scanout kick (main side, pre-notify). */
@@ -1019,6 +1096,13 @@ export class BrowserBandPool implements BandDispatcher {
    * kick + the calling thread's own band contribution. Staging is never
    * reported as execution — only `workerCompleted: true` proves workers
    * rasterised the kick.
+   *
+   * `epoch` is the fence epoch (see recoveryEpoch): 0 until the first
+   * quarantine isolation moves the pool onto a replacement SAB.
+   *
+   * `exits` counts cooperative worker exits observed (`{ exited: true }`
+   * after the shutdown signal) - the acknowledged-stop proof the bounded
+   * join waits for. 0 until a quarantine arms the join.
    */
   kickStats(): {
     kicks: { raster: number; rgb: number; resolve: number; scanout: number };
@@ -1028,6 +1112,8 @@ export class BrowserBandPool implements BandDispatcher {
     quarantined: boolean;
     refusals: { rgb: number };
     lastRgb: { descs: number; workerCompleted: boolean; mainPixels: number; mainSpans: number } | null;
+    epoch: number;
+    exits: number;
   } {
     return {
       kicks: { ...this.statKicks },
@@ -1037,6 +1123,8 @@ export class BrowserBandPool implements BandDispatcher {
       quarantined: this.quarantined,
       refusals: { rgb: this.statRgbRefusals },
       lastRgb: this.lastRgbKick === null ? null : { ...this.lastRgbKick },
+      epoch: this.recoveryEpoch(),
+      exits: this.exitAcks,
     };
   }
 
@@ -1093,34 +1181,48 @@ export class BrowserBandPool implements BandDispatcher {
    * Kick ONE RGB frame covering every staged batch and await worker
    * completion messages (never Atomics.wait — main-thread safe). Resolves
    * null when the pool is dead or the wait times out; the caller replays
-   * inline via drawInlineRGBAll, converging to identical planes.
+   * inline via recoverInlineRGBAll, converging to identical planes.
    *
-   * Recovery semantics (explicit, mirroring the Node pool):
+   * Recovery semantics (explicit, mirroring the Node pool outcome
+   * vocabulary — 'refused' / 'clean-failure' / 'partial-failure'):
    * (a) refusal before dispatch (dead pool, nothing staged, workers never
-   *     ready, kick declined) — no worker or main-band write happened, so
-   *     the pending staging is left intact for the inline replay;
-   * (b) failure before any writes — same as (a);
+   *     ready, kick declined, checkpoint allocation failure) — no worker
+   *     or main-band write happened, so the pending staging is left intact
+   *     for the inline replay ('clean');
+   * (b) failure before any writes — same as (a) ('clean');
    * (c) failure after partial execution (timeout / lost completion after
-   *     the main band and some workers already wrote) — the pre-kick
-   *     checkpoint is restored first (undoing every partial write of THIS
-   *     kick while keeping committed earlier kicks), the pending staging
-   *     is left intact, and null is returned so the caller replays the
-   *     failed kick exactly once;
-   * (d) timeout/disposal in flight — the timeout path terminates every
-   *     worker BEFORE the caller replays (no straggler SAB write can race
-   *     the replay or later frames); dispose resolves in-flight kicks as
-   *     failures without quarantining (teardown, not wedged workers).
+   *     the main band and some workers already wrote) — the timeout path
+   *     quarantines FIRST (shutdown signal + replacement-buffer isolation
+   *     + termination, so no straggler write can race what follows), the
+   *     async path joins completed termination (bounded), and only then is
+   *     the pre-kick checkpoint restored (undoing every partial write of
+   *     THIS kick on the isolated planes while keeping committed earlier
+   *     kicks). Null is returned so the caller replays the failed kick
+   *     exactly once ('partial');
+   * (d) disposal in flight — the dispose path terminates every worker
+   *     (best-effort kill happens-before the restore below) and resolves
+   *     in-flight kicks as failures WITHOUT quarantining (teardown, not
+   *     wedged workers) ('partial': writes may have landed).
    */
   async flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number } | null> {
     if (this.disposed || this.workers.length === 0 || this.quarantined) { this.rgbFailure = 'clean'; return null; }
     if (this.rgbDescCount <= this.rgbFlushedCount) return { pixels: 0, spans: 0 };
     if (!(await this.awaitReadyAsync())) { this.rgbFailure = 'clean'; return null; }
     this.snapKick();
-    // Checkpoint BEFORE any write of this kick (retained suffix may still
-    // need it if the selective replay races a stale writer — quarantine
-    // below guarantees no race, the snapshot is belt-and-braces).
+    // Checkpoint BEFORE any write of this kick: on a partial failure the
+    // restore undoes this kick's writes while keeping committed earlier
+    // kicks. Allocation failure is a 'refused' outcome selected BEFORE
+    // dispatch - without a checkpoint there is no safe replay over partial
+    // writes, so nothing is dispatched and the pending staging is left
+    // intact for the exact inline replay.
     this.snapshotRGB();
     const descs = this.rgbDescCount;
+    if (!this.rgbSnap || this.rgbSnap.gen !== this.frameGen) {
+      this.discardSnapshot();
+      this.lastRgbKick = { descs, workerCompleted: false, mainPixels: 0, mainSpans: 0 };
+      this.rgbFailure = 'clean';
+      return null;
+    }
     this.publishRGB(near, far, lodBias);
     const seq = this.seq;
     const finished = this.awaitWorkerMessages(seq, this.workers.length);
@@ -1141,11 +1243,20 @@ export class BrowserBandPool implements BandDispatcher {
       this.rgbFlushedCount,
     );
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
-    const ok = await finished;
-    if (!ok) {
+    const outcome = await finished;
+    if (outcome !== 'completed') {
       this.statFallbacks.rgb += 1;
+      // Fence order: writers were already stopped/isolated (timeout
+      // quarantined in the waiter; dispose terminated in teardown) - join
+      // completed termination when the pool is NOT being torn down
+      // (dispose aborts as a failure without quarantining), and only then
+      // restore the checkpoint onto the isolated planes.
+      // Never restore-then-quarantine: live workers could still write the
+      // planes being restored/replayed.
+      if (!this.disposed) {
+        await this.quarantineWorkersAsync();
+      }
       this.restoreSnapshot();
-      this.quarantineWorkers();
       this.lastRgbKick = { descs, workerCompleted: false, mainPixels: main.pixels, mainSpans: main.spans };
       this.rgbFailure = 'partial';
       return null;
@@ -1188,8 +1299,24 @@ export class BrowserBandPool implements BandDispatcher {
     return r;
   }
 
-  /** Checkpoint the shared RGB planes (main thread, pre-kick). Never throws. */
+  /**
+   * Checkpoint the shared RGB planes (main thread, pre-kick). Never throws.
+   * A missing checkpoint after this returns (allocation/copy failure) is a
+   * 'refused' outcome: the kick must NOT be dispatched, because a partial
+   * failure without a checkpoint could never replay exactly once. The
+   * caller (flushRGBFrameAsync) checks and refuses before dispatch.
+   */
   private snapshotRGB(): void {
+    // Deterministic test seam for the checkpoint-allocation-failure path:
+    // set `testDropSnapshot` to force the refused outcome without an OOM.
+    // Same `as unknown as` probe pattern as the play.ts feature-detects;
+    // never set in production (no exported surface, no behavior change).
+    const probe = this as unknown as { testDropSnapshot?: boolean };
+    if (probe.testDropSnapshot === true) {
+      probe.testDropSnapshot = false;
+      this.rgbSnap = null;
+      return;
+    }
     try {
       const n = this.fbW * this.fbH;
       let snap = this.rgbSnap;
@@ -1207,15 +1334,20 @@ export class BrowserBandPool implements BandDispatcher {
       snap.rgbDepth.set(this.rgbViews.rgbDepth);
       snap.gen = this.frameGen;
     } catch {
-      // Allocation/copy failure: drop the checkpoint. Recovery then falls
-      // back to replay-on-top (correct for failures before writes; a
-      // partial-write failure without a checkpoint can double-blend —
-      // counted as a fallback, never silent; see restoreSnapshot).
+      // Allocation/copy failure: drop the checkpoint. The kick is refused
+      // before dispatch (see flushRGBFrameAsync), so no partial-write
+      // failure can ever need the missing checkpoint.
       this.rgbSnap = null;
     }
   }
 
-  /** Restore the pre-kick RGB planes when the generation still matches. */
+  /**
+   * Restore the pre-kick RGB planes when the generation still matches.
+   * Runs on the CURRENT (possibly isolated) pool views, and only AFTER
+   * writers were stopped/isolated (timeout quarantined in the waiter,
+   * dispose terminated in teardown) - never before. Stale generations
+   * (recovery racing the next frame) refuse the restore.
+   */
   private restoreSnapshot(): void {
     const snap = this.rgbSnap;
     if (!snap || snap.gen !== this.frameGen) return;
@@ -1296,14 +1428,18 @@ export class BrowserBandPool implements BandDispatcher {
 
   /** Shut workers down; safe to call twice.
    *
-   * In-flight kicks resolve `false` immediately (callers fall back to the
-   * identical inline replay) instead of hanging until the kick timeout:
-   * reboot/stop between frames can never wedge the loop for `timeoutMs`. */
+   * In-flight kicks resolve as failures immediately (callers fall back to
+   * the identical inline replay) instead of hanging until the kick timeout:
+   * reboot/stop between frames can never wedge the loop for `timeoutMs`.
+   * Dispose terminates WITHOUT quarantining (teardown, not wedged workers):
+   * the in-flight failure path restores its checkpoint onto planes whose
+   * writers were just torn down.
+   */
   async dispose(): Promise<void> {    if (this.disposed) return;
     this.disposed = true;
     for (const done of this.pending.values()) {
       try {
-        done(false);
+        done('abort');
       } catch {
         /* a throwing waiter must not block teardown */
       }
@@ -1371,51 +1507,200 @@ export class BrowserBandPool implements BandDispatcher {
 
   /**
    * Await every worker's completion message for one kick (async path).
-   * Timeout quarantines the pool (see `quarantined`): wedged workers are
-   * terminated BEFORE the caller replays inline, so no straggler SAB
-   * write can race the fallback replay or any later frame. Dispose
-   * resolves in-flight kicks as failures without quarantining (the pool
-   * is already being torn down).
+   * Timeout quarantines the pool FIRST (see `quarantined`: shutdown signal
+   * + replacement-buffer isolation + termination) and only then resolves
+   * the failure - the caller's restore/replay after this runs on planes no
+   * live worker can still write. Dispose aborts in-flight waits as
+   * 'disposed' without quarantining (the pool is already being torn down).
+   * Completions for any other seq are ignored by the stale-completion guard
+   * in onmessage (the seq-keyed pending entry exists only for the live
+   * kick), so a late message can never resolve a later kick.
    */
-  private awaitWorkerMessages(seq: number, need: number): Promise<boolean> {
+  private awaitWorkerMessages(seq: number, need: number): Promise<KickOutcome> {
     let seen = 0;
-    let failed = false;
-    return new Promise<boolean>((resolve) => {
-      const timer = window.setTimeout(() => {
+    return new Promise<KickOutcome>((resolve) => {
+      let timer = 0;
+      const finish = (outcome: KickOutcome): void => {
         this.pending.delete(seq);
-        this.quarantineWorkers();
-        resolve(false);
-      }, this.timeoutMs);
-      this.pending.set(seq, (ok: boolean) => {
-        if (!ok) failed = true;
-        seen += 1;
-        if (seen >= need) {
-          this.pending.delete(seq);
-          window.clearTimeout(timer);
-          resolve(!failed);
+        window.clearTimeout(timer);
+        resolve(outcome);
+      };
+      timer = window.setTimeout(() => {
+        if (this.disposed) {
+          finish('disposed');
+          return;
         }
+        // Fence FIRST: stop/isolate writers before any restore or replay.
+        this.quarantineWorkers();
+        finish('failed');
+      }, this.timeoutMs);
+      this.pending.set(seq, (signal: KickSignal) => {
+        if (signal === 'abort') {
+          finish(this.disposed ? 'disposed' : 'failed');
+          return;
+        }
+        seen += 1;
+        if (seen >= need) finish('completed');
       });
     });
   }
 
   /**
+   * Fence epoch for the shared planes (PERF-NEXT-2, mirrors the Node pool):
+   * increments whenever quarantine isolates the planes onto a replacement
+   * SAB. The renderer re-adopts the pool's current planes when this moves.
+   * Monotonic on the main thread; 0 until the first quarantine.
+   */
+  recoveryEpoch(): number {
+    return typeof this.sabEpoch === 'number' ? this.sabEpoch : 0;
+  }
+
+  /**
+   * Await completed termination of the quarantined workers (bounded join,
+   * mirrors the Node pool): resolves once every doomed worker's
+   * cooperative exit is observed (`{ exited: true }` after the shutdown
+   * signal), or after a bounded wait. Isolation already fenced the shared
+   * planes, so the bound only limits cleanup latency, never safety. Never
+   * rejects; safe to call twice or without a prior quarantine (runs it).
+   * The sync path cannot await - it relies on the isolation fence alone.
+   */
+  async quarantineWorkersAsync(timeoutMs?: number): Promise<void> {
+    this.quarantineWorkers();
+    const target = this.exitBase + this.exitNeed;
+    if (this.exitNeed <= 0 || this.exitAcks >= target) return;
+    let bound = typeof timeoutMs === 'number' && timeoutMs > 0
+      ? timeoutMs
+      : Math.min(this.timeoutMs, 1000);
+    if (!(bound > 0)) bound = 250;
+    if (bound > 5000) bound = 5000;
+    try {
+      const deadline = performance.now() + bound;
+      while (this.exitAcks < target) {
+        if (this.disposed) return;
+        if (performance.now() >= deadline) return;
+        await new Promise<void>((r) => {
+          window.setTimeout(r, 5);
+        });
+      }
+    } catch {
+      /* bounded join only; isolation already fenced the planes */
+    }
+  }
+
+  /**
    * Terminate every worker and refuse all later kicks fast (see
-   * `quarantined`). Called only on kick timeout — the one failure mode
-   * that implies in-flight worker writes. Safe to call twice; never
-   * throws. The caller replays inline after this returns, converging to
-   * identical planes with no live writer left to race it.
+   * `quarantined`). Called on kick timeout - the one failure mode that
+   * implies in-flight worker writes - and by quarantineWorkersAsync.
+   * Safe to call twice; never throws.
+   *
+   * PERF-NEXT-2 fence (mirrors the Node pool): `worker.terminate()` alone
+   * is NOT a completion fence - the main thread would restore/replay over
+   * shared planes a live worker may still be writing. So this first sends
+   * the cooperative shutdown signal (CTL_SEQ < 0 wakes workers blocked in
+   * Atomics.wait so they exit instead of draining a stale kick), then
+   * isolates the shared planes onto a fresh SAB (staging/descriptors copied
+   * verbatim - workers only read those - output planes cleared, control
+   * reset, epoch bumped), and only then terminates. Termination of the
+   * abandoned buffer's writers is observable via quarantineWorkersAsync;
+   * isolation makes the restore/replay safe immediately. One extra SAB is
+   * retained until the doomed workers exit (bounded: a pool quarantines at
+   * most once, and beginFrame never clears the flag).
    */
   private quarantineWorkers(): void {
+    if (this.quarantined && this.workers.length === 0) return;
     this.quarantined = true;
-    for (const worker of this.workers) {
+    // Cooperative shutdown signal for workers blocked in Atomics.wait:
+    // they observe SEQ < 0 on wake and exit instead of draining a stale
+    // kick. Workers mid-raster cannot observe it - isolation covers them.
+    try {
+      Atomics.store(this.ctl, CTL_SEQ, -1);
+      try {
+        Atomics.notify(this.ctl, CTL_SEQ, this.workers.length);
+      } catch {
+        /* workers may already be awake */
+      }
+    } catch {
+      /* ignore */
+    }
+    const doomed = this.workers.slice();
+    this.workers.length = 0;
+    this.pending.clear();
+    // Arm the cooperative-exit join before terminating. Baseline the
+    // lifetime ack counter so only NEW exits satisfy the bound.
+    this.exitNeed = doomed.length;
+    this.exitBase = this.exitAcks;
+    // Replacement-buffer fence BEFORE termination: from here on, every pool
+    // view (planes, staging, control) addresses the fresh SAB. Late writes
+    // from doomed workers land on the abandoned buffer only.
+    this.isolateSharedPlanes();
+    for (const worker of doomed) {
       try {
         worker.terminate();
       } catch {
         /* already gone */
       }
     }
-    this.workers.length = 0;
-    this.pending.clear();
+  }
+
+  /**
+   * Replacement-buffer fence (main thread only, quarantine path; mirrors
+   * the Node pool): move the pool onto a fresh SAB, copying the old buffer
+   * verbatim, then clearing the output planes and resetting control in the
+   * fresh copy. Workers only READ staging/descriptors (stable - the main
+   * thread never mutates them mid-kick), so a torn copy of the plane bytes
+   * is harmless: recovery restores the checkpoint + replays deterministically.
+   * Never throws; on any failure the pool keeps the old buffer (termination
+   * still proceeds - best effort, never silent about the quarantine flag).
+   */
+  private isolateSharedPlanes(): void {
+    try {
+      const oldCtl = this.ctl;
+      if (!oldCtl || !(oldCtl.buffer instanceof SharedArrayBuffer)) return;
+      const oldBuf = oldCtl.buffer as SharedArrayBuffer;
+      const size = rgbAccumTotal(this.fbW, this.fbH);
+      if (!(size > 0) || oldBuf.byteLength < size) return;
+      const fresh = new SharedArrayBuffer(size);
+      new Uint8Array(fresh).set(new Uint8Array(oldBuf));
+      const { views } = attachFrameAccum(fresh, this.fbW, this.fbH);
+      const { views: rgbViews } = attachRGBAccum(fresh, this.fbW, this.fbH);
+      this.views = views;
+      this.rgbViews = rgbViews;
+      this.base = views.base;
+      this.ctl = views.ctl;
+      try {
+        Atomics.store(this.ctl, CTL_SEQ, this.seq);
+        Atomics.store(this.ctl, CTL_DONE, 0);
+        Atomics.store(this.ctl, CTL_READY, 0);
+        Atomics.store(this.ctl, CTL_FRAME, this.frameGen);
+        Atomics.store(this.ctl, CTL_FCOUNT, 0);
+        Atomics.store(this.ctl, CTL_COUNT, 0);
+        Atomics.store(this.ctl, CTL_JOB, JOB_RGB);
+        Atomics.store(this.ctl, CTL_RGBBASE, this.rgbFlushedCount);
+        Atomics.store(this.ctl, CTL_RGBCOUNT, this.rgbDescCount);
+      } catch {
+        /* ignore */
+      }
+      // Discard the copied partial plane writes: recovery restores the
+      // checkpoint + replays deterministically from staging.
+      try {
+        this.base.idx.fill(0);
+        this.base.zb.fill(0);
+        this.views.fColor.fill(0);
+        this.rgbViews.rgb565.fill(0);
+        this.rgbViews.cover.fill(0);
+        this.rgbViews.rgbDepth.fill(0xffff);
+        this.rgbViews.scan565.fill(0);
+        this.rgbViews.scanDisplay.fill(0);
+      } catch {
+        /* ignore */
+      }
+      // The fresh buffer is fully cleared: the lazy main-band clear must
+      // not skip this generation.
+      this.mainLastGen = this.frameGen;
+      this.sabEpoch = (typeof this.sabEpoch === 'number' ? this.sabEpoch : 0) + 1;
+    } catch {
+      /* terminate-only fallback */
+    }
   }
 
   /** Lazily clear the calling thread's band once per frame generation. */
@@ -1574,7 +1859,12 @@ export class BrowserBandPool implements BandDispatcher {
     this.resetRGB();
   }
 
-  /** Last RGB flush outcome. */
+  /**
+   * Last RGB flush outcome: 'clean' = refused/clean-failure (nothing was
+   * dispatched), 'partial' = partial-failure (writes may have landed;
+   * quarantined first except the dispose teardown path), null = success
+   * or no kick yet. Observability only (mirrors the Node pool).
+   */
   lastRGBFailure(): 'clean' | 'partial' | null {
     return this.rgbFailure;
   }
@@ -1583,7 +1873,11 @@ export class BrowserBandPool implements BandDispatcher {
    * Complete-frame recovery replay (mirrors Node pool): selective by suffix.
    * Opaque-only suffix replays in place (no clear); blend suffix clears,
    * replays prefix, runs seed, replays suffix. Must be called only after
-   * quarantine when writes may have been in flight.
+   * quarantine when writes may have been in flight - the timeout path
+   * quarantines (shutdown signal + replacement-buffer isolation +
+   * termination) and the renderer re-adopts the pool's current planes
+   * before this runs, so the replay targets the live buffer, never the
+   * abandoned one a live worker may still be scribbling.
    */
   recoverInlineRGBAll(seed: () => void, near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; tris: number } {
     const flushed = this.rgbFlushedCount < 0 ? 0

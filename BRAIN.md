@@ -287,14 +287,20 @@ follow-ups for later cards (not this card): browser-soak importer resolves relat
 ### PERF-NEXT-2 — Make recovery safe against genuinely live writers
 owns: `packages/sw-renderer`, `apps/web`
 depends: PERF-NEXT-1
-status: ready
-starting-points: `bandPool.ts: quarantineWorkers/flushRGBFrame*`; `render-workers.ts: flushRGBFrameAsync/restoreSnapshot/quarantineWorkers`
+status: done(@integrator 2026-10-28)
 done-when:
-- [ ] Node recovery cannot mutate/reuse shared output until old workers provably cannot write. Current `void worker.terminate()` is not a completion fence. Cover both sync and async paths; use an acknowledged stop, completed termination or isolated replacement buffers as appropriate.
-- [ ] Browser recovery stops/isolates writers BEFORE restoring or replaying shared planes; remove the current restore-before-quarantine ordering. Handle timeout, disposal, rejected dispatch and stale completion messages.
-- [ ] Distinguish staging refusal, failure before writes and partial execution; preserve world, inline foreground, blend order and exactly-once alpha/additive contributions. Checkpoint allocation failure must select a correct fallback before dispatch, not best-effort replay over partial writes.
-- [ ] Add deterministic adversarial tests with a REAL worker continuing writes during timeout/recovery, not only scripted workers that have already stopped. Compare RGB565, depth, coverage and full RGBA to serial, including translucent/additive geometry, main-band completion, capacity refusal and the next frame.
-- [ ] Retain existing parity/recovery tests; demonstrate no hang, late mutation or shared-buffer reuse race. Measure successful-path overhead, not just recovery latency.
+- [x] Node recovery cannot mutate/reuse shared output until old workers provably cannot write. Current `void worker.terminate()` is not a completion fence. Cover both sync and async paths; use an acknowledged stop, completed termination or isolated replacement buffers as appropriate.
+- [x] Browser recovery stops/isolates writers BEFORE restoring or replaying shared planes; remove the current restore-before-quarantine ordering. Handle timeout, disposal, rejected dispatch and stale completion messages.
+- [x] Distinguish staging refusal, failure before writes and partial execution; preserve world, inline foreground, blend order and exactly-once alpha/additive contributions. Checkpoint allocation failure must select a correct fallback before dispatch, not best-effort replay over partial writes.
+- [x] Add deterministic adversarial tests with a REAL worker continuing writes during timeout/recovery, not only scripted workers that have already stopped. Compare RGB565, depth, coverage and full RGBA to serial, including translucent/additive geometry, main-band completion, capacity refusal and the next frame.
+- [x] Retain existing parity/recovery tests; demonstrate no hang, late mutation or shared-buffer reuse race. Measure successful-path overhead, not just recovery latency.
+completion (four outcomes):
+- implementation: Node `quarantineWorkers` fence (shutdown signal + replacement-SAB isolation + epoch bump + terminate) + `quarantineWorkersAsync` bounded join + `readoptQuarantinedPlanes`; browser isolate-before-restore (removed restore-before-quarantine at `flushRGBFrameAsync`), epoch, exit-ack handshake, refused-before-dispatch checkpoint failures. Integrator extras: exit-ack baseline fix (stale exits can't satisfy the join), disposed vocabulary precision (pre- vs mid-flight).
+- correctness: `yarn verify` 76/76, `deps:check` 539 edges ok, base1-gate 23/23 + voodoo-regression 4/4; retained suites green (rgbRecovery 12, fgTris 6, fgSpans 5, browser-lane 19, pool/diag/scanout/worker-rgb/render-async); new adversarial Node 3 + browser 8 tests (REAL writers, RGB565/depth/coverage/full-RGBA vs serial, translucent+additive, capacity refusal, next frame).
+- performance measurement: post-change `bench:accept` A 20.45 (base 20.48), B 126.76 (base 123.59, noise, hashes identical), C 50.39 (base 50.35); parity/exec PASS; success-path overhead zero by construction (fence off the hot path) ±0.2ms noise; browser 15.4KB/checkpoint-kick (640×480: 1.536MB) reported as PERF-NEXT-3 input.
+- target acceptance: N/A (safety card; targets gated by PERF-NEXT-6/7). Budget gates still FAIL by design.
+evidence: `tools/bench/evidence/node-accept-ea4fa40-2026-10-28T23-34-43.manifest.json` (+ ledger PERF-NEXT-2 row). Changeset: `.changeset/sw-renderer-live-writer-recovery.md` (web ignored).
+residual (not this card): Node indexed sync/async timeout paths never had recovery (no terminate/quarantine — legacy 30s wedged-pool scenario, unchanged); all RGB + browser raster/RGB paths fenced. Feeds PERF-NEXT-6.
 
 ### PERF-NEXT-3 — Remove per-kick browser checkpoint allocation churn
 owns: `apps/web`

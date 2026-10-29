@@ -1834,6 +1834,12 @@ export class SoftwareRenderer implements Refresh {
    */
   private recoverRetainedRGB(pool: NonNullable<BandDispatcher>, reason: string): void {
     void reason;
+    // PERF-NEXT-2 fence: a timeout quarantine isolates the pool onto a
+    // replacement SAB (epoch bump) — re-adopt the pool's CURRENT planes
+    // first, so the seed, the recovery replay and every later inline draw
+    // target the live buffer, never the abandoned one a live worker may
+    // still be scribbling. No-op when the pool kept its buffer.
+    this.readoptQuarantinedPlanes(pool);
     const near = this.rgbWin.near, far = this.rgbWin.far, lodBias = this.rgbFidelity.lodBias;
     if (typeof pool.recoverInlineRGBAll === 'function') {
       const q = pool.recoverInlineRGBAll(() => this.seedRGBBackground(), near, far, lodBias);
@@ -1854,6 +1860,42 @@ export class SoftwareRenderer implements Refresh {
     this.fgReplayedPixels += q.pixels;
     this.fgReplayedTris += q.tris ?? 0;
     this.fgRecoveryCount++;
+  }
+
+  /**
+   * Re-adopt the pool's current shared planes after a quarantine (PERF-NEXT-2
+   * fence): the pool may have isolated onto a fresh SAB, in which case the
+   * renderer's adopted views (and both backends' attachments) still point
+   * at the abandoned buffer. Mirrors the attachWorkerPool guards; no-op
+   * when the pool kept its buffer or exposes no planes. Never throws.
+   */
+  private readoptQuarantinedPlanes(pool: BandDispatcher): void {
+    try {
+      const p = pool.planes;
+      if (p && p.idx.length === this.fbW * this.fbH && p.zb.length === this.fbW * this.fbH &&
+        p.color.length === this.fbW * this.fbH &&
+        p.idx.buffer === p.zb.buffer && p.idx.buffer === p.color.buffer) {
+        this.idx = p.idx;
+        this.zb = p.zb;
+        this.color = p.color;
+        this.bandBackend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
+      }
+      const rp = pool.rgbPlanes;
+      if (rp && rp.rgb565.length === this.fbW * this.fbH &&
+        rp.cover.length === this.fbW * this.fbH &&
+        rp.rgbDepth.length === this.fbW * this.fbH &&
+        rp.rgb565.buffer === rp.cover.buffer) {
+        this.rgb565 = rp.rgb565;
+        this.rgbCover = rp.cover;
+        this.rgbDepth16 = rp.rgbDepth;
+        this.rgbBackend.attach(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
+        if (this.backend === this.bandBackend) {
+          this.bandBackend.attachRGB(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
+        }
+      }
+    } catch {
+      /* best effort; the pool-view replay below still targets live planes */
+    }
   }
 
   /**

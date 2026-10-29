@@ -2151,9 +2151,29 @@ export interface BandDispatcher {
   //      order with a background seed between the world prefix and the
   //      foreground suffix — re-blending over partial destinations would
   //      apply alpha twice. Merely skipping the clear is NOT a fix.
-  //   d. Disposal/timeout while writes may be in flight: quarantine
-  //      (terminate every worker, refuse later kicks) BEFORE the replay,
-  //      so no straggler SAB write can race the recovery or later frames.
+  //   d. Disposal/timeout while writes may be in flight: fence (quarantine:
+  //      shutdown signal + replacement-buffer isolation + termination,
+  //      refusing later kicks) BEFORE the replay, so no straggler SAB write
+  //      can race the recovery or later frames. A bare
+  //      `void worker.terminate()` is NOT a completion fence — the sync
+  //      path relies on the isolation fence (fresh SAB + epoch bump; it
+  //      cannot await termination), the async path additionally joins
+  //      completed termination (bounded). Shared output planes/buffers must
+  //      not be mutated or reused until old workers PROVABLY cannot write
+  //      (acknowledged stop, awaited/completed termination, or fence-free
+  //      isolated replacement buffers).
+  //
+  // Outcome vocabulary (both lanes): 'success' (kick applied, flushed
+  // advanced), 'refused' (staging refusal — nothing dispatched, class a),
+  // 'clean-failure' (dispatched but proven no writes landed: never-ready /
+  // declined / pre-dispatch dispose / quarantined — class b), 'partial-failure'
+  // (timeout with workers running, or mid-flight dispose — some writes may
+  // have landed — class c/d, always quarantined first except the dispose
+  // teardown path which already tore the workers down). The pool reports the last outcome via
+  // lastRGBFailure ('clean' = refused/clean-failure, 'partial' =
+  // partial-failure, null = success/none); checkpoint (chain) allocation
+  // failure is a 'refused' outcome selected BEFORE dispatch — never a
+  // best-effort replay over partial writes.
   //
   // Design (chosen): complete-frame replay with retained descriptors,
   // selective by suffix content. Descriptors (spans/chains/luxels) are
@@ -2183,17 +2203,38 @@ export interface BandDispatcher {
   // CTL_RGBBASE, quarantine on timeout — the browser pool already
   // quarantines — retained descriptors until commitRGB, selective recover:
   // opaque-only suffix replays in place, blend suffix clears + replays
-  // prefix + seed + suffix). The renderer feature-detects them: pools
-  // without them keep the legacy behaviour (reset-on-flush, full replay
-  // of the pending set). Legacy partial-failure recovery still destroys
-  // already-flushed world work — that gap closes when the browser pool
-  // mirrors this protocol. Never change raster math — transport and
-  // recovery only.
+  // prefix + seed + suffix). PLUS the PERF-NEXT-2 fence: stop/isolate
+  // writers BEFORE restoring or replaying shared planes (remove any
+  // restore-before-quarantine ordering); handle timeout, disposal,
+  // rejected dispatch and stale completion messages (stale seq completions
+  // must never resolve a later kick); distinguish refused / clean-failure /
+  // partial-failure per the outcome vocabulary above; select the
+  // checkpoint-allocation-failure fallback BEFORE dispatch. Mirror
+  // recoveryEpoch (fence epoch, bumped on every isolation) and
+  // quarantineWorkersAsync (bounded completed-termination join) so the
+  // renderer can re-adopt current planes and prove writers are gone. The
+  // renderer feature-detects them: pools without them keep the legacy
+  // behaviour (reset-on-flush, full replay of the pending set). Legacy
+  // partial-failure recovery still destroys already-flushed world work —
+  // that gap closes when the browser pool mirrors this protocol. Never
+  // change raster math — transport and recovery only.
   //
   // --- end retained-frame recovery protocol ---
   //
   /** Applied prefix length: descriptors [0, flushed) already hold plane writes. Absent = legacy (0 after every flush). */
   rgbFlushed?(): number;
+  /**
+   * Fence epoch (PERF-NEXT-2): increments whenever quarantine isolates the
+   * shared planes onto replacement buffers. Absent = legacy (no isolation).
+   */
+  recoveryEpoch?(): number;
+  /**
+   * Bounded completed-termination join for quarantined workers (async
+   * path): resolves once doomed workers provably cannot write, or after
+   * the bound (isolation already fenced the planes). Never rejects.
+   * Absent = fire-and-forget termination (sync isolation only).
+   */
+  quarantineWorkersAsync?(timeoutMs?: number): Promise<void>;
   /** End-of-frame: drop all retained RGB descriptors (spans/lux/descs/flushed). Chains persist (cross-frame cache). */
   commitRGB?(): void;
   /**

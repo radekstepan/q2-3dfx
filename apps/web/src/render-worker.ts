@@ -97,21 +97,36 @@ scope.onmessage = (ev: MessageEvent): void => {
   if (init.voodoo !== undefined) latestVoodoo = init.voodoo;
   const shared = attachFrameAccum(init.sab, init.w, init.h);
   const rgb = attachRGBAccum(init.sab, init.w, init.h);
-  bandWorkerLoop(
-    shared.views,
-    rgb.views,
-    shared.ctl,
-    init.y0,
-    init.y1,
-    init.band,
-    init.w,
-    (s: number): void => {
-      try {
-        Atomics.wait(shared.ctl, CTL_SEQ, s);
-      } catch {
-        /* dispatcher tore down; the loop exits on the next SEQ check */
-      }
-    },
-    { postMessage: (msg: unknown): void => scope.postMessage(msg) },
-  );
+  // PERF-NEXT-2 acknowledged-stop handshake: the pool quarantines with a
+  // cooperative shutdown signal (CTL_SEQ < 0) before terminating. When the
+  // loop observes it and returns, report the exit so the pool's bounded
+  // completed-termination join can prove this worker is gone. The finally
+  // covers abnormal loop exits too (a throwing loop still cannot write
+  // after it stops). Stale exits (no quarantine armed) are ignored.
+  const band = typeof init.band === 'number' ? init.band : -1;
+  try {
+    bandWorkerLoop(
+      shared.views,
+      rgb.views,
+      shared.ctl,
+      init.y0,
+      init.y1,
+      init.band,
+      init.w,
+      (s: number): void => {
+        try {
+          Atomics.wait(shared.ctl, CTL_SEQ, s);
+        } catch {
+          /* dispatcher tore down; the loop exits on the next SEQ check */
+        }
+      },
+      { postMessage: (msg: unknown): void => scope.postMessage(msg) },
+    );
+  } finally {
+    try {
+      scope.postMessage({ exited: true, band });
+    } catch {
+      /* dispatcher gone */
+    }
+  }
 };
