@@ -1,0 +1,99 @@
+{
+  "manifestVersion": 1,
+  "kind": "browser-soak",
+  "date": "2026-10-28T23:03:27.892Z",
+  "command": {
+    "argv": [
+      "/home/radek/.nvm/versions/node/v22.23.4/bin/node",
+      "/home/radek/dev/q2-3dfx/q2ts/tools/bench/browser-soak.mjs"
+    ],
+    "env": {
+      "BROWSER_SOAK_IN": "/tmp/opencode/perfnext1_voodoo_record.json"
+    },
+    "cwd": "/home/radek/dev/q2-3dfx/q2ts/tools/bench"
+  },
+  "commitShort": "53f7070",
+  "commitFull": "53f7070fb9da50d6670523fd71f7564d10ec310d",
+  "treeDirty": true,
+  "distFresh": {
+    "fresh": true,
+    "distMtimeMs": 1793227817495.4744,
+    "newestSrcMtimeMs": 1793227562608.3586,
+    "newestSrcFile": "/home/radek/dev/q2-3dfx/q2ts/tools/bench/src/node-builtins.d.ts"
+  },
+  "pak": {
+    "path": "(browser-imported)",
+    "bytes": null,
+    "mtimeMs": null,
+    "mtimeIso": null,
+    "missing": true
+  },
+  "machine": {},
+  "node": "v22.23.4",
+  "browser": {
+    "name": "Chromium",
+    "version": "Chromium 156.0.8078.47 for Linux Mint headless --no-sandbox --disable-gpu (SwiftShader compositing)",
+    "headless": true
+  },
+  "compositor": "swiftshader",
+  "loadavg": [
+    2.34,
+    2.87,
+    2.6
+  ],
+  "cpus": 8,
+  "quietOk": true,
+  "fidelity": null,
+  "warmup": null,
+  "reps": 12,
+  "workers": [
+    7
+  ],
+  "resultFile": "/home/radek/dev/q2-3dfx/q2ts/tools/bench/evidence/raw/browser-soak-53f7070-2026-10-28T23-03-27.json",
+  "summary": {
+    "resolution": "640x480",
+    "renderer": "voodoo",
+    "durationS": 60,
+    "samples": 12,
+    "presentedFpsMedian": 14.45536689519847,
+    "frameP50Ms": 69.2,
+    "frameP95Ms": 69.8,
+    "frameMaxMs": 69.8,
+    "hardwareBacked": false,
+    "compositor": "swiftshader"
+  },
+  "soak": {
+    "schemaVersion": 1,
+    "commitShort": "53f7070",
+    "commitFull": "53f7070fb9da50d6670523fd71f7564d10ec310d",
+    "date": "2026-10-28T23:01:27.000Z",
+    "browser": {
+      "name": "Chromium",
+      "version": "Chromium 156.0.8078.47 for Linux Mint headless --no-sandbox --disable-gpu (SwiftShader compositing)",
+      "headless": true
+    },
+    "compositor": "swiftshader",
+    "compositorDetail": "Chromium 156.0.8078.47 for Linux Mint; --disable-gpu SwiftShader 2D-canvas compositing; canvas 640x480 full-frame paint",
+    "hardwareBacked": false,
+    "page": "http://127.0.0.1:5174/",
+    "resolution": "640x480",
+    "width": 640,
+    "height": 480,
+    "renderer": "voodoo",
+    "workers": [
+      7
+    ],
+    "durationS": 60,
+    "samples": 12,
+    "presentedFpsMedian": 14.45536689519847,
+    "frameP50Ms": 69.2,
+    "frameP95Ms": 69.8,
+    "frameMaxMs": 69.8,
+    "workloads": [
+      "stationary-spawn"
+    ],
+    "notes": "PERF-NEXT-1 baseline; fresh 640x480 boot (cvars latched pre-pak), real pak0.pak, voodoo pooled-7; canvas={\"w\": 640, \"h\": 480}",
+    "rawFile": null
+  },
+  "ledgerHint": "| 2026-10-28 | 53f7070 | browser-soak (swiftshader,sw) | 640x480 voodoo presented 14.45536689519847fps p95 69.8ms | evidence: browser-soak-53f7070-2026-10-28T23-03-27.manifest.json |"
+}

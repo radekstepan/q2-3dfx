@@ -16,7 +16,8 @@
     "bench:rgb": "node ./rgb-attr.mjs",
     "bench:accept": "node ./bench-accept.mjs",
     "bench:compare-run": "node ./compare-run.mjs",
-    "bench:compare-diff": "node ./compare-diff.mjs"
+    "bench:compare-diff": "node ./compare-diff.mjs",
+    "bench:browser-soak": "node ./browser-soak.mjs"
   },
   "dependencies": {
     "@q2/bsp": "workspace:*",

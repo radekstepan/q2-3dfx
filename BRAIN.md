@@ -270,12 +270,19 @@ Execution contract for this queue:
 ### PERF-NEXT-1 — Establish reproducible baseline and evidence storage
 owns: `tools/bench`, `packages/testkit`
 depends: none
-status: ready
+status: done(@integrator 2026-10-28)
 done-when:
-- [ ] Capture baseline at `4631ca2` (or explicitly identify any newer starting tree) before implementation benchmarks; use separate checkout/build outputs without disturbing user changes.
-- [ ] Save reproducible commands, commit/build identity, assets, machine/browser versions, fidelity cvars, warmup/reps, load and raw results in durable evidence referenced by the ledger (not only disposable /tmp paths).
-- [ ] Measure matched 640×480 software/Voodoo workloads: stationary, deterministic moving camera, combat with real viewmodel; serial and 1/3/7 workers. Measure whole production frames, full-channel output hashes and fallbacks. 320×240 is diagnostic only.
-- [ ] Record browser baseline separately from Node and distinguish software/headless compositing from hardware-backed browser conditions. Do not infer commit gains from old unmatched ledger rows.
+- [x] Capture baseline at `4631ca2` (or explicitly identify any newer starting tree) before implementation benchmarks; use separate checkout/build outputs without disturbing user changes.
+- [x] Save reproducible commands, commit/build identity, assets, machine/browser versions, fidelity cvars, warmup/reps, load and raw results in durable evidence referenced by the ledger (not only disposable /tmp paths).
+- [x] Measure matched 640×480 software/Voodoo workloads: stationary, deterministic moving camera, combat with real viewmodel; serial and 1/3/7 workers. Measure whole production frames, full-channel output hashes and fallbacks. 320×240 is diagnostic only.
+- [x] Record browser baseline separately from Node and distinguish software/headless compositing from hardware-backed browser conditions. Do not infer commit gains from old unmatched ledger rows.
+completion (four outcomes):
+- implementation: `tools/bench` durable-evidence core (`src/evidence.ts`: manifests + raw blobs, provenance, browser-soak importer w/ compositor validation) + `packages/testkit` baseline harness (`bench-workloads.ts`, `frame-evidence.ts`, `provenance.ts`, `browser-evidence.ts`); disjoint lanes, no renderer/contract changes.
+- correctness: `yarn verify` 76/76 green, `deps:check` 535 edges ok, base1-gate 23/23 + voodoo-regression 4/4 green; pooled≡serial full-RGBA all swept configs + odd-dims + dead-pool fallback, 0 fallbacks, exec proven; no goldens updated, budgets NOT relaxed.
+- performance measurement: Node `node-compare` (640 sw-fixed-serial 21.49ms, rgb-fixed-serial 129.91ms, rgb-combat-pooled-7 50.98ms; moving rgb combat w7 101.0ms) + `node-accept` gates A 20.48 / B 123.59 / C 50.35 (FAIL budget by design, parity PASS); browser fresh-boot 640×480 Chromium 156 SwiftShader (hw=false): voodoo 14.46fps / software 18.42fps presented.
+- target acceptance: N/A (this card establishes the baseline; targets gated by PERF-NEXT-6/7). Starting tree 53f7070 explicitly identified — engine code == 4631ca2 (`git diff 4631ca2 -- packages/sw-renderer packages/voodoo packages/config packages/renderer-api apps/web` empty); harness-only delta.
+evidence: `tools/bench/evidence/node-compare-53f7070-2026-10-28T22-52-47.manifest.json`, `node-accept-53f7070-2026-10-28T22-54-52.manifest.json`, `browser-soak-53f7070-voodoo-640x480.manifest.json`, `browser-soak-53f7070-software-640x480.manifest.json` (+ ledger rows 2026-10-28 PERF-NEXT-1). Changeset: `.changeset/testkit-baseline-harness.md` (bench is changeset-ignored).
+follow-ups for later cards (not this card): browser-soak importer resolves relative manifest paths against the workspace cwd (used absolute-ish repo paths; consider resolving against repoRoot); same-second raw-file stamp collision (worked around with explicit names; consider renderer-tagged default names); testkit combat gun frame 4 vs bench fixedEntities frame 0 + vd_lodbias -0.35 vs reassessed 0 (align both when the profile moves — PERF-NEXT-4/6).
 
 ### PERF-NEXT-2 — Make recovery safe against genuinely live writers
 owns: `packages/sw-renderer`, `apps/web`

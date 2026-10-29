@@ -498,6 +498,8 @@ export interface AttrRow {
   frameP95: number | null;
   /** Critical-path max: slowest production frame (dispatch-to-completion). */
   frameMaxMs: number | null;
+  /** Raw whole-production-frame samples per rep (frameMs is their median). */
+  frameReps: number[];
   /** Full frame with the serial scanout control (pooled configs only). */
   frameSerialMs: number | null;
   frameSerialP95: number | null;
@@ -723,6 +725,8 @@ export async function runAttrConfig(
   let coverPx = 0, classicSpansSkipped = 0, classicFgSkipped = 0, skipArmed = false,
     translucentSpans = 0, cacheHits = 0, cacheMisses = 0, cacheEvictions = 0,
     chainUsedBytes = 0, retainedChainBytes = 0, orphanChainBytes = 0, chainEvictions = 0;
+  /** Raw production-frame samples for this config (one entry per rep). */
+  let frameReps: number[] = [];
   const bandId = formatBandRanges(H, workers);
   const planeBytes = W * H * (4 + 1 + 4);
   const scanBytes = rgb ? W * H * (2 + 4) : null;
@@ -758,6 +762,7 @@ export async function runAttrConfig(
       }
     }
     frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
+    frameReps = fr;
     const sp = summarizeSplits(frameSplits);
     splitBeginMs = sp.begin; splitRenderMs = sp.render; splitEndMs = sp.end;
     splitScanoutMs = null; splitGapMs = sp.gap;
@@ -879,6 +884,7 @@ export async function runAttrConfig(
         }
       }
       frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
+      frameReps = fr;
       {
         const sp = summarizeSplits(frameSplits);
         splitBeginMs = sp.begin; splitRenderMs = sp.render; splitEndMs = sp.end;
@@ -962,6 +968,7 @@ export async function runAttrConfig(
         }
       }
       frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
+      frameReps = fr;
       {
         const sp = summarizeSplits(frameSplits);
         splitBeginMs = sp.begin; splitRenderMs = sp.render; splitEndMs = sp.end;
@@ -989,7 +996,7 @@ export async function runAttrConfig(
     packMs, reconMs, gammaMs, fusedMs,
     scanoutMs, scanoutP95, scanoutMaxMs, scanoutKind, scanoutSerialMs,
     splitBeginMs, splitRenderMs, splitEndMs, splitScanoutMs, splitGapMs,
-    frameMs, frameP95, frameMaxMs, frameSerialMs, frameSerialP95,
+    frameMs, frameP95, frameMaxMs, frameReps, frameSerialMs, frameSerialP95,
     spans, pixels, overdraw,
     idxHash: hashIdx(g.index!), colorHash: hashColorRG(g.color),
     colorFull: hashColorFull(g.color),

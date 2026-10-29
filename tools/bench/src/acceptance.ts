@@ -40,6 +40,8 @@
 // every run, with commit + build freshness + hardware + runtime.
 
 import { createFramebuffer } from '@q2/renderer-api';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { dirname } from 'node:path';
 import {
   SoftwareRenderer, createDevroom, BandWorkerPool,
 } from '@q2/sw-renderer';
@@ -58,12 +60,30 @@ import {
   swRendererEsmPath,
   type AttrRow,
 } from './rgbattr.js';
+import {
+  buildNodeManifest,
+  collectNodeProvenance,
+  defaultManifestPath,
+  defaultResultPath,
+  ledgerHintFor,
+  summarizeAttrRows,
+  writeEvidenceManifest,
+} from './evidence.js';
 import { readVoodooState, resolveFrame } from '@q2/voodoo';
 
 export interface AcceptOptions {
   warmup: number;
   reps: number;
   workers: number[];
+  /**
+   * Durable evidence (PERF-NEXT-1): full rows JSON + committed manifest.
+   * On by default (the gate is a CLI tool); set emitEvidence: false to opt
+   * out. Paths default to tools/bench/evidence/{raw/} (env ACCEPT_OUT /
+   * ACCEPT_MANIFEST_OUT override).
+   */
+  emitEvidence?: boolean;
+  resultPath?: string;
+  manifestPath?: string;
 }
 
 export function acceptWorkers(): number[] {
@@ -202,6 +222,38 @@ async function deadPoolFallback(pakPath: string): Promise<boolean> {
   return ok;
 }
 
+/**
+ * Durable evidence for an acceptance run (PERF-NEXT-1): the full rows
+ * (with raw frameReps per config) go to evidence/raw/ (gitignored), the
+ * committed manifest points at them and carries provenance + summary.
+ * Written for pass AND fail exits — a missed budget is evidence too.
+ */
+async function emitAcceptEvidence(
+  pakPath: string,
+  rows: AttrRow[],
+  ctx: { warmup: number; reps: number; workers: number[]; commit: string; opts: Partial<AcceptOptions> },
+): Promise<{ resultFile: string; manifestFile: string }> {
+  const provenance = await collectNodeProvenance('node-accept', {
+    pakPath, warmup: ctx.warmup, reps: ctx.reps, workers: ctx.workers,
+  });
+  const machine = await machineJson().catch(() => ({ node: process.version }));
+  const resultFile = ctx.opts.resultPath ?? process.env.ACCEPT_OUT ?? defaultResultPath('node-accept', ctx.commit);
+  mkdirSync(dirname(resultFile), { recursive: true });
+  writeFileSync(resultFile, JSON.stringify({ rows, machine, commit: ctx.commit, provenance }, null, 2));
+  const summary = summarizeAttrRows(rows);
+  const manifestOut = ctx.opts.manifestPath
+    ?? process.env.ACCEPT_MANIFEST_OUT
+    ?? defaultManifestPath('node-accept', ctx.commit);
+  const manifest = buildNodeManifest(provenance, {
+    resultFile,
+    summary,
+    ledgerHint: ledgerHintFor('node-accept', ctx.commit, summary, manifestOut),
+  });
+  const manifestFile = writeEvidenceManifest(manifest, manifestOut);
+  console.log(`ledger hint: ${manifest.ledgerHint}`);
+  return { resultFile, manifestFile };
+}
+
 export async function runAcceptance(pakPath: string, opts: Partial<AcceptOptions> = {}): Promise<number> {
   const warmup = opts.warmup ?? Number(process.env.RGB_ACCEPT_WARMUP ?? 5);
   const reps = opts.reps ?? Number(process.env.RGB_ACCEPT_REPS ?? 10);
@@ -268,7 +320,13 @@ export async function runAcceptance(pakPath: string, opts: Partial<AcceptOptions
   }
   const oddOk = await oddDimsSmoke(pakPath, warmup, reps);
   const poolOk = await deadPoolFallback(pakPath);
-  if (!parityOk || !oddOk || !poolOk) {
+  const parityFail = !parityOk || !oddOk || !poolOk;
+  if (opts.emitEvidence !== false) {
+    const ev = await emitAcceptEvidence(pakPath, rows, { warmup, reps, workers, commit, opts });
+    console.log(`acceptance: evidence rows ${ev.resultFile}`);
+    console.log(`acceptance: manifest ${ev.manifestFile}`);
+  }
+  if (parityFail) {
     console.error('FAIL(correctness): parity/execution/fallback mismatch — see PARITY/EXEC FAIL lines above.');
     return 1;
   }

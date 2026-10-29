@@ -1,0 +1,6 @@
+# gitignored: large raw per-rep run JSON (budgets compare medians; the
+# ledger references the committed *.manifest.json next door, which points
+# at these files). The .gitkeep keeps the directory present for runners.
+raw/*
+!raw/.gitkeep
+*.tmp

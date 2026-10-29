@@ -72,9 +72,11 @@ Sequential quiet-machine before/after on identical workloads and settings —
 never concurrent across agents:
 
 - `src/compare.ts` + `compare-run.mjs` + `compare-diff.mjs`.
-- `Q2_PAK=... yarn bench:compare-run` writes `compare-<commit>.json`
-  (`COMPARE_OUT`, `COMPARE_WARMUP=3`, `COMPARE_REPS=5`,
-  `COMPARE_WORKERS="0,1,3,7"`, `COMPARE_YAWSTEP=2`).
+- `Q2_PAK=... yarn bench:compare-run` writes the full run JSON to
+  `evidence/raw/` (gitignored per-rep bulk; `COMPARE_OUT` overrides) plus a
+  committed manifest `evidence/node-compare-<commit>-<ts>.manifest.json`
+  (`COMPARE_MANIFEST_OUT` overrides) carrying command, commit, freshness,
+  pak identity, machine/node/load, fidelity profile, warmup/reps/workers.
 - Copy the file aside, rebuild the other tree, run again, then
   `COMPARE_BASE=compare-base.json COMPARE_HEAD=compare-head.json yarn bench:compare-diff`.
 - Matrix: software + RGB (voodoo) × serial + 1/3/7 workers ×
@@ -88,6 +90,32 @@ never concurrent across agents:
   comparison (exit 1). Budgets compare only whole production frames —
   per-rep splits, kick journals, and stage/byte ledgers ride along as
   diagnostics, never summed into frame totals.
+
+## Durable evidence (PERF-NEXT-1)
+
+Ledger rows reference `tools/bench/evidence/`, never `/tmp`. Full protocol,
+worktree-baseline recipe and the browser-soak schema live in
+`tools/bench/evidence/README.md`.
+
+- `src/evidence.ts` — manifest core: reproducible command + allowlisted env,
+  commit + tree dirtiness, `distFreshness`, pak identity (path/bytes/mtime,
+  never the pak), machine/node/load, full `vd_*` + `sw_*` profile,
+  warmup/reps/workers, summary + `ledgerHint`. Raw per-rep samples ride in
+  the referenced `evidence/raw/` JSON (`frameReps[]` on stationary rows,
+  `frameMs[]` on moving rows); summaries cover 640×480 only (320×240 is
+  diagnostic-only by design).
+- Every runner emits a manifest per run: `compare-run.mjs`, `rgb-attr.mjs`
+  (also persists the full run JSON now), `bench-accept.mjs` (pass AND fail —
+  a missed budget is evidence too). Env overrides: `COMPARE_OUT`,
+  `COMPARE_MANIFEST_OUT`, `RGB_ATTR_OUT`, `RGB_ATTR_MANIFEST_OUT`,
+  `ACCEPT_OUT`, `ACCEPT_MANIFEST_OUT` (or `emitEvidence: false`).
+- Browser baselines are separate records (`browser-soak.mjs` imports a
+  validated soak JSON): Node production-frame-no-present numbers are never
+  diffed against browser presented-FPS. The soak schema forces an explicit
+  `compositor` class (`swiftshader` | `software` | `hardware`; `unknown`
+  rejected) plus `hardwareBacked` agreement, exact browser build, ≥5-min
+  duration, percentiles and workload intervals. Template:
+  `evidence/browser-soak.example.json`.
 
 ## Budget acceptance gate (item-9 checklist)
 

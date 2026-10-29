@@ -32,6 +32,17 @@ export {
   runComparisonMatrix, diffComparison, formatDiff, compareWorkers, checkQuietMachine,
   type CompareMeta, type CompareRun, type DiffLine, type MovingRow,
 } from './compare.js';
+export {
+  EVIDENCE_MANIFEST_VERSION, BROWSER_SOAK_SCHEMA_VERSION, PROVENANCE_ENV_ALLOWLIST,
+  evidenceDir, evidenceRawDir, provenanceEnv, pakIdentity, collectFidelityProfile,
+  collectMachine, collectNodeProvenance, defaultResultPath, defaultManifestPath,
+  buildNodeManifest, writeEvidenceManifest, summarizeAttrRows, summarizeCompare,
+  ledgerHintFor, validateBrowserSoak, importBrowserSoak,
+  type EvidenceKind, type BrowserCompositor, type PakIdentity, type FidelityProfile,
+  type ProvenanceCommand, type BrowserInfo, type AttrLike, type MovingLike,
+  type EvidenceCore, type EvidenceManifest, type BrowserSoakRecord,
+  type SoakImportResult, type SoakImportOpts, type ProvenanceOpts,
+} from './evidence.js';
 
 export async function runBenchTool(opts: BenchOptions = {}): Promise<string> {
   const width = opts.width ?? 640;
