@@ -305,13 +305,18 @@ residual (not this card): Node indexed sync/async timeout paths never had recove
 ### PERF-NEXT-3 — Remove per-kick browser checkpoint allocation churn
 owns: `apps/web`
 depends: PERF-NEXT-2
-status: ready
-starting-points: `render-workers.ts: snapshotRGB/discardSnapshot/flushRGBFrameAsync`
+status: done(@integrator 2026-10-28)
 done-when:
-- [ ] Reuse appropriately sized checkpoint storage across successful kicks/frames if checkpoints remain necessary; separate invalidating snapshot contents from freeing storage. Handle resize/disposal without retaining unbounded buffers.
-- [ ] Measure copied/allocated bytes per kick and frame. Current three planes total 1,536,000 bytes per kick at 640×480, up to 6,144,000 bytes across world plus three nonempty foreground kicks; successful kicks currently discard storage.
-- [ ] Evaluate whether retained replay makes some checkpoints unnecessary, or dirty ranges reduce copies. Keep only reductions preserving PERF-NEXT-2 guarantees; do not remove recovery safety to improve benchmarks.
-- [ ] Verify no steady-state checkpoint allocation per kick and bounded memory during resize/soak; publish controlled browser whole-frame and allocation/GC before/after results.
+- [x] Reuse appropriately sized checkpoint storage across successful kicks/frames if checkpoints remain necessary; separate invalidating snapshot contents from freeing storage. Handle resize/disposal without retaining unbounded buffers.
+- [x] Measure copied/allocated bytes per kick and frame. Current three planes total 1,536,000 bytes per kick at 640×480, up to 6,144,000 bytes across world plus three nonempty foreground kicks; successful kicks currently discard storage.
+- [x] Evaluate whether retained replay makes some checkpoints unnecessary, or dirty ranges reduce copies. Keep only reductions preserving PERF-NEXT-2 guarantees; do not remove recovery safety to improve benchmarks.
+- [x] Verify no steady-state checkpoint allocation per kick and bounded memory during resize/soak; publish controlled browser whole-frame and allocation/GC before/after results.
+completion (four outcomes):
+- implementation: pooled checkpoint spare (`rgbSnapValid` validity flag; `discardSnapshot` invalidates, `freeSnapshot` on dispose only; lazy first-kick alloc; `checkpointStats()` observability); checkpoints retained (load-bearing), copies stay full-frame, dirty ranges rejected with seeded-background divergence evidence.
+- correctness: `yarn verify` 76/76, base1-gate 23/23 + voodoo-regression 4/4; new `checkpoint-pool.test.ts` 4/4; PERF-NEXT-2 adversarial suites preserved (recovery-live-writer 8/8, browser-lane 19, pool-diag 9, scanout-async 2, worker-rgb 8, render-async 4).
+- performance measurement: 1 alloc/pool lifetime, 0/kick (was 3 allocs + 1.536MB copy/kick @640×480); controlled browser A/B (base b8951f4 worktree vs head, sequential, 60s+warmup, SwiftShader): base 13.90fps/heap+2.24MB vs head 14.52fps/heap−4.25MB — no regression, heap bounded both legs.
+- target acceptance: N/A (churn card; targets gated by PERF-NEXT-6/7).
+evidence: `tools/bench/evidence/pn3-ab-base-b8951f4.json` + `pn3-ab-head.json` (+ ledger PERF-NEXT-3 row). No changeset (web ignored).
 
 ### PERF-NEXT-4 — Wire real worker execution timing end to end
 owns: `packages/sw-renderer`, `apps/web`, `packages/testkit`, `tools/bench`

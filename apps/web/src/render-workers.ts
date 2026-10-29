@@ -409,15 +409,63 @@ export class BrowserBandPool implements BandDispatcher {
    * Why not just drop the clear: that alone does not undo partial worker
    * writes (already-blended translucent pixels would blend twice).
    *
+   * Why the checkpoint is retained (PERF-NEXT-3 evaluation): the blend-path
+   * recovery (`recoverInlineRGBAll`) clears cover/depth and replays prefix
+   * + suffix, but it does NOT clear rgb565 — a partial failure leaves
+   * garbage rgb565 under blend regions that the suffix replay reads as its
+   * blend destination. Only the pre-kick checkpoint restores those pixels,
+   * and only the checkpoint makes the opaque-suffix in-place replay (which
+   * replays the suffix alone, relying on committed prefix state) correct
+   * after quarantine cleared the planes. Removing checkpoints would require
+   * re-proving exactly-once alpha/additive across all four recovery paths
+   * for zero steady-state win over pooling (pooled snapshots already cost
+   * zero allocation per kick) — so the checkpoint stays, pooled.
+   *
+   * PERF-NEXT-3 pooling: the snapshot STORAGE is reused across successful
+   * kicks/frames (at most one spare of the pool's fixed size class —
+   * resize is a new pool, dispose frees the spare, so retention is
+   * bounded); only the CONTENTS are invalidated on success/inline-replay/
+   * new-frame (`discardSnapshot` clears validity, never frees).
+   *
+   * The copy stays FULL-FRAME by design (dirty-range evaluation, rejected
+   * with evidence): the quarantine fence CLEARS the planes onto a fresh
+   * SAB, so a partial failure can destroy committed prefix state OUTSIDE
+   * the kicked suffix's rows — and the opaque-suffix recovery replays the
+   * suffix in place, depending on the restore for every other row. A
+   * suffix-window snapshot loses that state (demonstrated by a
+   * seeded-background soak: rows outside the window come back cleared
+   * instead of seeded). Narrowing the copy would trade an implicit
+   * "nothing else ever writes the planes" invariant for zero
+   * steady-state win over pooling (pooled snapshots already cost zero
+   * allocation per kick) — so the window stays full-frame.
+   *
    * `gen` is the frame generation at snapshot time; restore is refused
    * when the generation moved on (stale recovery racing the next frame).
-   * Allocated lazily on the first RGB kick; discarded on beginFrame,
-   * successful kicks, and inline replays.
+   * Storage is allocated lazily on the first RGB kick; allocation/copy
+   * accounting lives in `checkpointStats()` (observability only, no
+   * hot-path cost beyond a few integer stores).
    */
   private rgbSnap: {
     rgb565: Uint16Array; cover: Uint8Array; rgbDepth: Uint16Array;
     gen: number;
   } | null = null;
+  /**
+   * Pooled-checkpoint validity (PERF-NEXT-3): `rgbSnapValid` is the
+   * contents flag `discardSnapshot` clears (storage retained).
+   */
+  private rgbSnapValid = false;
+  /**
+   * Checkpoint accounting (PERF-NEXT-3 observability, main thread only):
+   * storage allocations (spare (re)allocations), snapshot copies taken,
+   * restores applied, total snapshot+restore bytes copied, and the most
+   * recent snapshot's bytes/rows. Read via `checkpointStats()`.
+   */
+  private statSnapAllocs = 0;
+  private statSnapCopies = 0;
+  private statSnapRestores = 0;
+  private statSnapBytes = 0;
+  private lastSnapBytes = 0;
+  private lastSnapRows = 0;
 
   private constructor(
     bandCount: number, views: FrameAccumViews, rgbViews: RGBAccumViews, ctl: Int32Array,
@@ -1217,7 +1265,7 @@ export class BrowserBandPool implements BandDispatcher {
     // intact for the exact inline replay.
     this.snapshotRGB();
     const descs = this.rgbDescCount;
-    if (!this.rgbSnap || this.rgbSnap.gen !== this.frameGen) {
+    if (!this.rgbSnapValid || !this.rgbSnap || this.rgbSnap.gen !== this.frameGen) {
       this.discardSnapshot();
       this.lastRgbKick = { descs, workerCompleted: false, mainPixels: 0, mainSpans: 0 };
       this.rgbFailure = 'clean';
@@ -1305,6 +1353,13 @@ export class BrowserBandPool implements BandDispatcher {
    * 'refused' outcome: the kick must NOT be dispatched, because a partial
    * failure without a checkpoint could never replay exactly once. The
    * caller (flushRGBFrameAsync) checks and refuses before dispatch.
+   *
+   * PERF-NEXT-3: the spare storage is REUSED when it already fits the
+   * frame (no steady-state allocation per kick); only the first kick (or
+   * a size change, only reachable via a new pool) allocates. The copy is
+   * the full frame (see the field comment for why dirty ranges were
+   * rejected). Contents are marked valid for this generation;
+   * `discardSnapshot` invalidates them while retaining the storage.
    */
   private snapshotRGB(): void {
     // Deterministic test seam for the checkpoint-allocation-failure path:
@@ -1315,6 +1370,9 @@ export class BrowserBandPool implements BandDispatcher {
     if (probe.testDropSnapshot === true) {
       probe.testDropSnapshot = false;
       this.rgbSnap = null;
+      this.rgbSnapValid = false;
+      this.lastSnapBytes = 0;
+      this.lastSnapRows = 0;
       return;
     }
     try {
@@ -1328,16 +1386,26 @@ export class BrowserBandPool implements BandDispatcher {
           gen: this.frameGen,
         };
         this.rgbSnap = snap;
+        this.statSnapAllocs += 1;
       }
       snap.rgb565.set(this.rgbViews.rgb565);
       snap.cover.set(this.rgbViews.cover);
       snap.rgbDepth.set(this.rgbViews.rgbDepth);
       snap.gen = this.frameGen;
+      this.rgbSnapValid = true;
+      const bytes = n * (2 + 1 + 2);
+      this.lastSnapBytes = bytes;
+      this.lastSnapRows = this.fbH;
+      this.statSnapCopies += 1;
+      this.statSnapBytes += bytes;
     } catch {
       // Allocation/copy failure: drop the checkpoint. The kick is refused
       // before dispatch (see flushRGBFrameAsync), so no partial-write
       // failure can ever need the missing checkpoint.
       this.rgbSnap = null;
+      this.rgbSnapValid = false;
+      this.lastSnapBytes = 0;
+      this.lastSnapRows = 0;
     }
   }
 
@@ -1346,23 +1414,68 @@ export class BrowserBandPool implements BandDispatcher {
    * Runs on the CURRENT (possibly isolated) pool views, and only AFTER
    * writers were stopped/isolated (timeout quarantined in the waiter,
    * dispose terminated in teardown) - never before. Stale generations
-   * (recovery racing the next frame) refuse the restore.
+   * (recovery racing the next frame) refuse the restore. Full-frame copy
+   * (see the field comment): the opaque-suffix in-place replay depends
+   * on every row outside the kicked suffix too.
    */
   private restoreSnapshot(): void {
     const snap = this.rgbSnap;
-    if (!snap || snap.gen !== this.frameGen) return;
+    if (!snap || !this.rgbSnapValid || snap.gen !== this.frameGen) return;
     try {
       this.rgbViews.rgb565.set(snap.rgb565);
       this.rgbViews.cover.set(snap.cover);
       this.rgbViews.rgbDepth.set(snap.rgbDepth);
+      this.statSnapRestores += 1;
+      this.statSnapBytes += snap.rgb565.length * (2 + 1 + 2);
     } catch {
       /* best effort: the inline replay still converges depth-guarded */
     }
   }
 
-  /** Drop the checkpoint (success, inline replay, or new frame). */
+  /**
+   * Invalidate the checkpoint CONTENTS (success, inline replay, or new
+   * frame) while RETAINING the storage for the next kick (PERF-NEXT-3):
+   * no steady-state allocation per kick. `freeSnapshot` (dispose only)
+   * releases the spare.
+   */
   private discardSnapshot(): void {
+    this.rgbSnapValid = false;
+  }
+
+  /**
+   * Release the retained checkpoint storage (dispose only). The pool holds
+   * at most one spare of its fixed size class, so retention is bounded;
+   * freeing here guarantees no leak across pool lifetimes.
+   */
+  private freeSnapshot(): void {
     this.rgbSnap = null;
+    this.rgbSnapValid = false;
+  }
+
+  /**
+   * Checkpoint accounting (PERF-NEXT-3 observability): storage allocations
+   * (spare (re)allocations over the pool lifetime), snapshot copies taken,
+   * restores applied, total snapshot+restore bytes copied, the most recent
+   * snapshot's bytes/rows, and the currently retained spare bytes (0 once
+   * freed). Fresh small object per call (observability path only).
+   */
+  checkpointStats(): {
+    allocs: number; snapshots: number; restores: number;
+    copiedBytes: number; lastBytes: number; lastRows: number; spareBytes: number;
+  } {
+    const snap = this.rgbSnap;
+    const spareBytes = snap
+      ? snap.rgb565.byteLength + snap.cover.byteLength + snap.rgbDepth.byteLength
+      : 0;
+    return {
+      allocs: this.statSnapAllocs,
+      snapshots: this.statSnapCopies,
+      restores: this.statSnapRestores,
+      copiedBytes: this.statSnapBytes,
+      lastBytes: this.lastSnapBytes,
+      lastRows: this.lastSnapRows,
+      spareBytes,
+    };
   }
 
   /** Publish an RGB-kick descriptor (main side, pre-notify): suffix [flushed, descCount). */
@@ -1464,6 +1577,8 @@ export class BrowserBandPool implements BandDispatcher {
     }
     this.workers.length = 0;
     this.pending.clear();
+    // Release the retained checkpoint spare: bounded retention ends here.
+    this.freeSnapshot();
   }
 
   /** Stage the palette for worker-side resolve (change-detected, 768B). */
