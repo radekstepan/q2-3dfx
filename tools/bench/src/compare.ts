@@ -41,7 +41,10 @@ import {
   collectStageCounters, formatBandRanges, frameSplit, nsToMs, nowNs,
   readBandExecStats, readForegroundAttribution, detailTimingEnabled, summarizeLatencies, summarizeSplits,
   summarizeWorkerImbalance, KickJournal,
+  collectGeoRep, summarizeGeoReps, formatGeoSummary,
+  readKickSizes, readLastKickDescs, formatKickSizes, formatLastKickDescs,
   type FrameSplit, type WorkerExecSample, type WorkerImbalance,
+  type GeoRep, type KickSizeEntry, type KickSizeSummary, type LastKickDescs,
 } from '@q2/testkit';
 import { readVoodooState, resolveFrame } from '@q2/voodoo';
 import {
@@ -95,6 +98,44 @@ export interface MovingRow {
   fgRecoveryCount: number | null;
   heapDeltaKB: number;
   bandId: string;
+  /**
+   * PERF-NEXT-6 GEO phase attribution (instrumented loop, same views and
+   * entities as the production frames below): per-phase medians over reps
+   * (diagnostic, never summed), geoMs = median of the per-rep GEO totals
+   * (reconciled per rep FIRST — never a sum of phase medians), geoGapMs =
+   * median per-rep instrumented-wall gap. 'unavailable' when the producer
+   * hook is absent (software configs without the probe never report zero).
+   */
+  setupMs: number | null;
+  markMs: number | null;
+  traverseMs: number | null;
+  cullMs: number | null;
+  cacheMs: number | null;
+  projectMs: number | null;
+  emitMs: number | null;
+  sortMs: number | null;
+  geoMs: number | null;
+  geoGapMs: number | null;
+  geoDetail: 'measured' | 'unavailable';
+  /**
+   * PERF-NEXT-6 kick-size histogram (last production frame): per-kick
+   * completed spans/pixels/tris with drain order, band counts and exec
+   * maxes (from the producer's per-band execution samples — worker, FG
+   * flushes, resolve and scanout kicks). emptyKicks counts kicks whose
+   * bands all completed zero work (the empty-suffix-kick finding,
+   * first-class: emptyKickIds carries frame:seq:job identity).
+   * Null while the producer publishes nothing (serial/detail-off).
+   */
+  kickSizes: KickSizeEntry[] | null;
+  emptyKicks: number | null;
+  emptyKickIds: string[] | null;
+  /**
+   * Newest kick right after renderView (before endFrame's resolve kick
+   * overwrites the slot): the FG suffix flush's drained descriptor range
+   * (kickBase > 0 marks a foreground-only suffix kick) plus completed
+   * work and the empty flag. Null when unpublished.
+   */
+  suffixKick: LastKickDescs | null;
   /**
    * PERF-NEXT-4: detailed-timing state + per-band worker compute for the
    * production scanout kick (null while the renderer publishes no
@@ -157,6 +198,20 @@ export function compareWorkers(): number[] {
   return out.length > 0 ? out : [0, 1, 3, 7];
 }
 
+/**
+ * One clean report line per worker count in a sweep (PERF-NEXT-6 Lane C):
+ * serial configs name the inline path; pooled configs name the band tiling
+ * with the calling-thread band marked (last band). Pure — the matrix
+ * header and the browser sweep procedure share this vocabulary.
+ */
+export function describeWorkerSweep(workers: number[], h: number): string[] {
+  return workers.map((w) =>
+    w === 0
+      ? `w=0: serial (no pool — inline path, execution proven by construction)`
+      : `w=${w}: ${formatBandRanges(h, w)} (caller owns last band)`,
+  );
+}
+
 async function runMovingConfig(
   fw: RgbAttrWorld, W: number, H: number,
   mode: 'software' | 'rgb', workers: number,
@@ -202,11 +257,27 @@ async function runMovingConfig(
     r.renderView(viewFor(i), worldArg, entitiesFor());
     r.endFrame();
   }
+  // PERF-NEXT-6 GEO attribution: instrumented loop over the same deterministic
+  // views/entities as production (production frames below stay
+  // uninstrumented — the acceptance metric is never probe-armed). Per-rep
+  // GEO totals + gaps reconcile per rep first; summaries are medians over
+  // reps, never sums of phase medians.
+  const geoReps: GeoRep[] = [];
+  for (let i = 0; i < reps; i++) {
+    pumpCombatLights(r, bv.origin, baseYaw);
+    const rec = collectGeoRep(r, i, viewFor(i), worldArg, entitiesFor());
+    if (rec) geoReps.push(rec);
+    r.endFrame();
+  }
+  const geo = summarizeGeoReps(geoReps);
+  const geoDetail: 'measured' | 'unavailable' = geoReps.length > 0 ? 'measured' : 'unavailable';
   const frameMs: number[] = [];
   const splits: FrameSplit[] = [];
   const frameHashes: string[] = [];
   const displayHashes: Array<string | null> = [];
   const journal = new KickJournal();
+  let lastSuffixKick: LastKickDescs | null = null;
+  let kickSummary: KickSizeSummary | null = null;
   let staged = 0, inline = 0, kicks = 0, scanoutFallbacks = 0, coverPx = 0;
   let fgWorkerSpans: number | null = null, fgWorkerPixels: number | null = null,
     fgWorkerTris: number | null = null;
@@ -226,6 +297,16 @@ async function runMovingConfig(
     t = nowNs();
     r.renderView(viewFor(i), worldArg, entitiesFor());
     const rM = nsToMs(nowNs() - t);
+  // PERF-NEXT-6 suffix-kick drain: the newest kick right after renderView
+    // is the frame's last foreground flush (endFrame's resolve kick would
+    // overwrite the slot). Falls into the per-rep gap, never a segment.
+    if (i === reps - 1 && pool) {
+      try {
+        lastSuffixKick = readLastKickDescs(pool);
+      } catch {
+        lastSuffixKick = null;
+      }
+    }
     t = nowNs();
     r.endFrame();
     const eM = nsToMs(nowNs() - t);
@@ -292,6 +373,14 @@ async function runMovingConfig(
       } catch {
         /* corrected split stays null; batch legs above still report */
       }
+      // PERF-NEXT-6 kick-size histogram (last production frame, pooled only):
+      // per-kick completed work + empty-kick counter. Null while the
+      // producer publishes nothing (serial/detail-off) — unknown, never 0.
+      try {
+        kickSummary = pool ? readKickSizes(pool) : null;
+      } catch {
+        kickSummary = null;
+      }
     }
   }
   if (pool) await pool.dispose();
@@ -328,6 +417,13 @@ async function runMovingConfig(
   const execPart = workerComputeMs
     ? ` compute[${workerComputeMs.map((v) => v.toFixed(2)).join('/')}] gap=${workerImbalance!.gapMs.toFixed(2)} straggler=${workerImbalance!.straggler} groups[${workerImbalance!.byGroup.map((g) => `${g.job}s${g.seq}:${g.n}b med=${g.med.toFixed(2)} max=${g.max.toFixed(2)}`).join(' ')}] fenceIdle=${fenceIdleMs!.toFixed(2)}`
     : detail === 'disabled' ? ' compute[detail-off]' : ' compute[unpublished:no-in-worker-timestamps]';
+  const geoPart = geoDetail === 'measured'
+    ? ` ${formatGeoSummary(geo)}`
+    : ' geo[unavailable:no-testMeasurePhases]';
+  const kickSizesSummary = kickSummary
+    ? ` ${formatKickSizes(kickSummary)}`
+    : ' kickSizes[unpublished:serial-or-detail-off]';
+  const suffixPart = lastSuffixKick ? ` ${formatLastKickDescs(lastSuffixKick)}` : '';
   console.log(
     `moving ${W}x${H} ent=combat ${mode} w=${workers}: ` +
     `frame(production,Node)=${scan.med.toFixed(2)}(p95 ${scan.p95.toFixed(2)} max ${scan.max.toFixed(2)}) ` +
@@ -340,8 +436,10 @@ async function runMovingConfig(
     `combined=${fgCombinedSpans ?? '—'}sp/${fgCombinedPixels ?? '—'}px/${fgCombinedTris ?? '—'}tr ` +
     `replayed=${fgReplayedSpans ?? '—'}sp recovery=${fgRecoveryCount ?? '—'}] ` +
     `cover=${coverPx} heapΔ=${(heapKB() - heapBeforeKB).toFixed(0)}KB ${formatBandRanges(H, workers)}` +
-    `${execPart} detail=${detail}`,
+    `${execPart} detail=${detail}${geoPart}${kickSizesSummary}${suffixPart}`,
   );
+  const geoMed = (pick: (r: GeoRep) => number): number | null =>
+    geoDetail === 'measured' ? summarizeLatencies(geoReps.map(pick)).med : null;
   return {
     workload: 'moving', res: `${W}x${H}`, mode, workers,
     frameMs, split: splits, frameHashes, displayHashes,
@@ -353,6 +451,21 @@ async function runMovingConfig(
     heapDeltaKB: heapKB() - heapBeforeKB,
     bandId: formatBandRanges(H, workers),
     timingDetail: detail, workerComputeMs, workerImbalance, fenceIdleMs,
+    setupMs: geoMed((r) => r.phases.setup),
+    markMs: geoMed((r) => r.phases.mark),
+    traverseMs: geoMed((r) => r.phases.traverse),
+    cullMs: geoMed((r) => r.phases.cull),
+    cacheMs: geoMed((r) => r.phases.cache),
+    projectMs: geoMed((r) => r.phases.project),
+    emitMs: geoMed((r) => r.phases.emit),
+    sortMs: geoMed((r) => r.phases.sort),
+    geoMs: geoMed((r) => r.geoTotalMs),
+    geoGapMs: geoMed((r) => r.gapMs),
+    geoDetail,
+    kickSizes: kickSummary ? kickSummary.kicks : null,
+    emptyKicks: kickSummary ? kickSummary.emptyKicks : null,
+    emptyKickIds: kickSummary ? kickSummary.emptyKickIds : null,
+    suffixKick: lastSuffixKick,
   };
 }
 
@@ -376,6 +489,10 @@ export async function runComparisonMatrix(pakPath: string): Promise<CompareRun> 
   console.log(`compare-run: commit=${commit} warmup=${warmup} reps=${reps} workers=${workers.join(',')} yawStep=${yawStepDeg}deg`);
   console.log(JSON.stringify({ machine, node: process.version, load1, cpus, quietOk: ok }, null, 2));
   if (!ok) console.log(`WARN box loaded (load1 ${load1.toFixed(1)} > cpus ${cpus}) — numbers are not a quiet baseline`);
+  // PERF-NEXT-6 worker-count sweep: every count 0..8 parses; report the
+  // band tiling per count so a partial sweep reads cleanly. The browser
+  // lane runs the same list (see tools/bench/README.md sweep procedure).
+  for (const line of describeWorkerSweep(workers, 480)) console.log(`compare-run: sweep ${line}`);
   const fw = loadRgbAttrWorld(pakPath);
   const stationary: AttrRow[] = [];
   for (const [W, H] of [[320, 240], [640, 480]] as Array<[number, number]>) {

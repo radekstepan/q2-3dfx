@@ -30,8 +30,13 @@ export { playBench, type PlayBenchRow } from './playbench.js';
 export { runAcceptance, acceptWorkers, type AcceptOptions } from './acceptance.js';
 export {
   runComparisonMatrix, diffComparison, formatDiff, compareWorkers, checkQuietMachine,
+  describeWorkerSweep,
   type CompareMeta, type CompareRun, type DiffLine, type MovingRow,
 } from './compare.js';
+export {
+  runInterleavedAB, parseABLegSpec, emitABEvidence, abLedgerHint,
+  type ABLegSpec, type ABEmitOptions,
+} from './ab.js';
 export {
   EVIDENCE_MANIFEST_VERSION, BROWSER_SOAK_SCHEMA_VERSION, PROVENANCE_ENV_ALLOWLIST,
   evidenceDir, evidenceRawDir, provenanceEnv, pakIdentity, collectFidelityProfile,

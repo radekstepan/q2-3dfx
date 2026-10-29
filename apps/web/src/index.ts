@@ -143,6 +143,41 @@ export function installBenchHook(
         return { pooled: true, bands: pool.bandCount };
       },
       /**
+       * Detach the worker pool for harness-driven frames (call after
+       * stopLoop): disposes the loop's pool and restores the renderer's
+       * owned planes, so subsequent measure() runs cover the true
+       * single-threaded leg — same band geometry, zero worker fan-out,
+       * bit-identical pixels. Never throws ({ pooled: false } when there
+       * is nothing to detach). Pair with reattach(n) for the 0/1/3/7
+       * worker-count sweep (PERF-NEXT-6 Box 2): reattach() clamps to
+       * >= 1 worker, so detach() is the only pool-less leg; it keeps the
+       * current sw_workers so the serial leg runs the SAME band geometry
+       * as the pooled legs (the control isolates worker parallelism from
+       * banding — bands is reported back so the table stays honest).
+       */
+      detach(): { pooled: boolean; bands: number } {
+        const boot = getBoot();
+        if (!boot) return { pooled: false, bands: 1 };
+        try {
+          const old = boot.browserPool as unknown as { dispose?: () => Promise<void> } | null;
+          if (old && typeof old.dispose === 'function') {
+            void old.dispose().catch(() => undefined);
+          }
+        } catch { /* a dead pool must not block measurement */ }
+        try {
+          boot.browserPool = null;
+          boot.refresh.attachWorkerPool(null);
+        } catch { /* renderer without the hook stays as-is */ }
+        benchSt = createAsyncLoopState();
+        benchNow = performance.now();
+        try {
+          const ws = boot.refresh.testWorkerStats();
+          return { pooled: ws.pooled === true, bands: ws.bands | 0 };
+        } catch {
+          return { pooled: false, bands: 1 };
+        }
+      },
+      /**
        * Drive scenario input directly (angles in degrees, buttons bitmask,
        * forward = hold +forward). Safe on a live loop too (same fields the
        * input layer writes); measurement uses it after stopLoop().

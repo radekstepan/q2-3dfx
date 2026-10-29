@@ -1288,6 +1288,38 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
     const rec = g.__q2stats ?? (g.__q2stats = { ...Q2STATS_ZERO });
     rec.fps = fps;
     rec.frame = frame;
+    // Single kickStats() probe per presented frame (PERF-NEXT-6 Lane B):
+    // the fallback counters and the per-frame worker/main attribution
+    // below previously probed twice (one fresh object per call). This
+    // function is fully synchronous (no awaits between the consumers),
+    // so one snapshot is exactly equivalent and halves the probe
+    // garbage. A foreign pool without the accumulator degrades to the
+    // same sentinels as before (unknown, never a silent zero).
+    let kickSnapshot: {
+      fallbacks: { rgb: number };
+      quarantined: boolean;
+      frameCompleted?: {
+        workerPixels?: unknown; workerSpans?: unknown; workerTris?: unknown;
+        mainPixels?: unknown; mainSpans?: unknown; mainTris?: unknown;
+      };
+    } | null = null;
+    try {
+      const pool = boot.browserPool as unknown as {
+        kickStats?: () => {
+          fallbacks: { rgb: number };
+          quarantined: boolean;
+          frameCompleted?: {
+            workerPixels?: unknown; workerSpans?: unknown; workerTris?: unknown;
+            mainPixels?: unknown; mainSpans?: unknown; mainTris?: unknown;
+          };
+        };
+      } | null;
+      if (pool && typeof pool.kickStats === 'function') {
+        kickSnapshot = pool.kickStats();
+      }
+    } catch {
+      kickSnapshot = null;
+    }
     try {
       const ws = boot.refresh.testWorkerStats();
       const rs = boot.refresh.testRGBWorkerStats();
@@ -1312,10 +1344,6 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
         rgbPending?: () => number;
         kickBytes?: () => { total: number } | null;
         stagingBytes?: () => { total: number };
-        kickStats?: () => {
-          fallbacks: { rgb: number };
-          quarantined: boolean;
-        };
       } | null;
       rec.rgbPending = pool && typeof pool.rgbPending === 'function'
         ? pool.rgbPending() : 0;
@@ -1326,10 +1354,10 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
           ? pool.stagingBytes().total : -1;
       // Pool-level RGB kick outcomes (counted, never silent). A Node-pool
       // stand-in (headless tests) has no kickStats — guarded, stays 0/false.
-      if (pool && typeof pool.kickStats === 'function') {
-        const ks = pool.kickStats();
-        rec.rgbFallbacks = ks.fallbacks.rgb | 0;
-        rec.quarantined = ks.quarantined === true;
+      // Read from the single per-frame snapshot above (never a second probe).
+      if (kickSnapshot !== null) {
+        rec.rgbFallbacks = kickSnapshot.fallbacks.rgb | 0;
+        rec.quarantined = kickSnapshot.quarantined === true;
       } else {
         rec.rgbFallbacks = 0;
         rec.quarantined = false;
@@ -1347,18 +1375,9 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
     // accumulator, or a throwing probe degrades to the -1 unknown
     // sentinels (never worker-completed, never a silent zero). A live
     // pool reporting 0 is the known idle state (no completed kick).
+    // Read from the single per-frame snapshot above (never a second probe).
     try {
-      const pool = boot.browserPool as unknown as {
-        kickStats?: () => {
-          frameCompleted?: {
-            workerPixels?: unknown; workerSpans?: unknown; workerTris?: unknown;
-            mainPixels?: unknown; mainSpans?: unknown; mainTris?: unknown;
-          };
-        };
-      } | null;
-      const fc = pool && typeof pool.kickStats === 'function'
-        ? pool.kickStats().frameCompleted
-        : undefined;
+      const fc = kickSnapshot !== null ? kickSnapshot.frameCompleted : undefined;
       if (fc !== undefined && fc !== null) {
         rec.rgbWorkerSpans = numOr(fc.workerSpans, -1);
         rec.rgbWorkerPixels = numOr(fc.workerPixels, -1);

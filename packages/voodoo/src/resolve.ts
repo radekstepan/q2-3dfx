@@ -385,9 +385,91 @@ export function applyPostFilter(src565: Uint16Array, dst32: Uint32Array, w: numb
 // exactly). Taps are expanded into locals (the old path allocated 4 objects
 // per pixel via expandTap565). No scratch buffers, no per-frame allocation.
 //
+// PERF-NEXT-6 Lane D: the 565→8-bit expand + dither-subtract + clamp sequence
+// (per tap-channel: extract field, expand ((v<<3)|(v>>2)), subtract the phase
+// offset, clamp twice — ~7 integer ops x 12 tap-channels per pixel) runs
+// through small phase-strided fusion tables (EXP_/SUB_ below, ~3.5KB total,
+// L1-resident): one load per tap-channel. The tables are built with the SAME
+// expressions as the loop ops they replace (structural bit-identity — every
+// entry equals expand(clamp(sub))) and selected per frame by pointer swap, so
+// the inner loop carries no mode/subtract branch. The edge gate keeps the
+// Math.max/min spread form (a branchy manual min/max measured SLOWER).
+//
 // Equivalence pins: src/fused.test.ts (cross-product differential vs the
 // manual pipeline + display golden). The exported stage functions above are
 // untouched so the manual pipeline stays available as the oracle.
+
+/** 5-bit -> 8-bit bit-replication expand, flat (R and B channels share it). */
+const V5_TO_8: Readonly<Uint8Array> = (() => {
+  const t = new Uint8Array(32);
+  for (let v = 0; v < 32; v++) t[v] = (v << 3) | (v >> 2);
+  return t;
+})();
+
+/** 6-bit -> 8-bit bit-replication expand (G channel), flat. */
+const V6_TO_8: Readonly<Uint8Array> = (() => {
+  const t = new Uint8Array(64);
+  for (let v = 0; v < 64; v++) t[v] = (v << 2) | (v >> 4);
+  return t;
+})();
+
+/**
+ * Phase-strided plain expand is NOT used in the fused loops: interleaved A/B
+ * showed plain-expand table loads lose to register-only shift/or when there
+ * is no subtract to fuse (8.76ms ALU vs 10.58ms flat LUT on the dither-off
+ * recon). Only the subtract-fusion tables below pay off.
+ */
+
+/**
+ * [phase * 32 + q] = clamp(expand5(q) - DITHER2_RB_POS[phase]): 2x2-subtract
+ * fusion for the R/B channels ('2x2sub+2x2box' scanout). Same expand, same
+ * offset table, same clamp shape as the loop ops this replaces.
+ */
+const SUB2_RB: Readonly<Uint8Array> = (() => {
+  const t = new Uint8Array(4 * 32);
+  for (let ph = 0; ph < 4; ph++)
+    for (let q = 0; q < 32; q++) {
+      const v = V5_TO_8[q]! - DITHER2_RB_POS[ph]!;
+      t[ph * 32 + q] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+  return t;
+})();
+
+/** [phase * 64 + s] = clamp(expand6(s) - DITHER2_G_POS[phase]): G version. */
+const SUB2_G: Readonly<Uint8Array> = (() => {
+  const t = new Uint8Array(4 * 64);
+  for (let ph = 0; ph < 4; ph++)
+    for (let s = 0; s < 64; s++) {
+      const v = V6_TO_8[s]! - DITHER2_G_POS[ph]!;
+      t[ph * 64 + s] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+  return t;
+})();
+
+/**
+ * [phase * 32 + q] = clamp(expand5(q) - DITHER_RB_POS[phase]): 4x4-subtract
+ * fusion for R/B ('4x4sub+4x1' scanout, 16 phases).
+ */
+const SUB4_RB: Readonly<Uint8Array> = (() => {
+  const t = new Uint8Array(16 * 32);
+  for (let ph = 0; ph < 16; ph++)
+    for (let q = 0; q < 32; q++) {
+      const v = V5_TO_8[q]! - DITHER_RB_POS[ph]!;
+      t[ph * 32 + q] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+  return t;
+})();
+
+/** [phase * 64 + s] = clamp(expand6(s) - DITHER_G_POS[phase]): G version. */
+const SUB4_G: Readonly<Uint8Array> = (() => {
+  const t = new Uint8Array(16 * 64);
+  for (let ph = 0; ph < 16; ph++)
+    for (let s = 0; s < 64; s++) {
+      const v = V6_TO_8[s]! - DITHER_G_POS[ph]!;
+      t[ph * 64 + s] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+  return t;
+})();
 
 /** Ingredients for the fused quantise-on path (mirrors VoodooState subset). */
 export interface FusedFrameOptions {
@@ -465,6 +547,10 @@ export function resolveFusedFrame(
   const shW = twoW ? 1 : 2;
 
   // --- Postfilter off: pack -> expand -> display gamma, one row at a time.
+  // NOTE: plain expand stays ALU ops (shift/or): table loads measured SLOWER
+  // than the register-only sequence when there is no subtract to fuse
+  // (Lane D interleaved A/B: 8.76ms ALU vs 10.58ms flat LUT on the 2x2
+  // dither-off recon at 640x480). Tables pay off only fused with subtract.
   if (!o.postfilter) {
     for (let y = 0; y < h; y++) {
       packLinearRow(src, dst565, w, y, dither, rbW, gW, xmW, ymW, shW);
@@ -491,14 +577,12 @@ export function resolveFusedFrame(
 
   // --- '4x4sub+4x1': pack row, then horizontal 4-tap window from the hot row.
   if (o.reconmode === '4x4sub+4x1') {
-    // Subtract matrix is mode-forced to '4x4' (or null when dither is off —
-    // same rule as applyReconstruction4x1's ditherSub parameter).
+    // Subtract fusion tables are mode-forced to the 4x4 pattern (same rule as
+    // applyReconstruction4x1's ditherSub parameter). The dither-on arm loads
+    // expand+subtract+clamp fused; the dither-off arm keeps the ALU expand —
+    // plain-expand table loads measured slower than shift/or (see note above).
+    // Frame-constant arm: perfectly predicted, same shape as the old if(subOn).
     const subOn = dither;
-    const rbS = DITHER_RB_POS;
-    const gS = DITHER_G_POS;
-    const xmS = 3;
-    const ymS = 3;
-    const shS = 2;
     const md = o.rgbmaxdelta;
     const gateOff = md.r === 0 && md.g === 0 && md.b === 0;
     const mdR = md.r;
@@ -507,7 +591,7 @@ export function resolveFusedFrame(
     for (let y = 0; y < h; y++) {
       packLinearRow(src, dst565, w, y, dither, rbW, gW, xmW, ymW, shW);
       const row = y * w;
-      const ph = (y & ymS) << shS;
+      const ph = (y & 3) << 2;
       for (let x = 0; x < w; x++) {
         const xa = x - 1 < 0 ? 0 : x - 1;
         const xb = x;
@@ -529,39 +613,51 @@ export function resolveFusedFrame(
         const qbf = vb & 31;
         const qcf = vc & 31;
         const qdf = vd & 31;
-        let ra = (qa5 << 3) | (qa5 >> 2);
-        let ga = (qa6 << 2) | (qa6 >> 4);
-        let ba = (qaf << 3) | (qaf >> 2);
-        let rb = (qb5 << 3) | (qb5 >> 2);
-        let gb = (qb6 << 2) | (qb6 >> 4);
-        let bb = (qbf << 3) | (qbf >> 2);
-        let rc = (qc5 << 3) | (qc5 >> 2);
-        let gc = (qc6 << 2) | (qc6 >> 4);
-        let bc = (qcf << 3) | (qcf >> 2);
-        let rd = (qd5 << 3) | (qd5 >> 2);
-        let gd = (qd6 << 2) | (qd6 >> 4);
-        let bd = (qdf << 3) | (qdf >> 2);
+        let ra: number;
+        let ga: number;
+        let ba: number;
+        let rb: number;
+        let gb: number;
+        let bb: number;
+        let rc: number;
+        let gc: number;
+        let bc: number;
+        let rd: number;
+        let gd: number;
+        let bd: number;
         if (subOn) {
-          const sa = rbS[ph | (xa & xmS)]!;
-          const sb = rbS[ph | (xb & xmS)]!;
-          const sc = rbS[ph | (xc & xmS)]!;
-          const sd = rbS[ph | (xd & xmS)]!;
-          const ta = gS[ph | (xa & xmS)]!;
-          const tb = gS[ph | (xb & xmS)]!;
-          const tc = gS[ph | (xc & xmS)]!;
-          const td = gS[ph | (xd & xmS)]!;
-          ra = ra - sa < 0 ? 0 : ra - sa > 255 ? 255 : ra - sa;
-          ga = ga - ta < 0 ? 0 : ga - ta > 255 ? 255 : ga - ta;
-          ba = ba - sa < 0 ? 0 : ba - sa > 255 ? 255 : ba - sa;
-          rb = rb - sb < 0 ? 0 : rb - sb > 255 ? 255 : rb - sb;
-          gb = gb - tb < 0 ? 0 : gb - tb > 255 ? 255 : gb - tb;
-          bb = bb - sb < 0 ? 0 : bb - sb > 255 ? 255 : bb - sb;
-          rc = rc - sc < 0 ? 0 : rc - sc > 255 ? 255 : rc - sc;
-          gc = gc - tc < 0 ? 0 : gc - tc > 255 ? 255 : gc - tc;
-          bc = bc - sc < 0 ? 0 : bc - sc > 255 ? 255 : bc - sc;
-          rd = rd - sd < 0 ? 0 : rd - sd > 255 ? 255 : rd - sd;
-          gd = gd - td < 0 ? 0 : gd - td > 255 ? 255 : gd - td;
-          bd = bd - sd < 0 ? 0 : bd - sd > 255 ? 255 : bd - sd;
+          // Expand + mode-forced 4x4 subtract fused per tap-channel (phase =
+          // row phase | tap column phase). Bit-identical to expand-then-
+          // subtract-then-clamp: each load equals that sequence.
+          const fa = ph | (xa & 3);
+          const fb = ph | (xb & 3);
+          const fc = ph | (xc & 3);
+          const fd = ph | (xd & 3);
+          ra = SUB4_RB[fa * 32 + qa5]!;
+          rb = SUB4_RB[fb * 32 + qb5]!;
+          rc = SUB4_RB[fc * 32 + qc5]!;
+          rd = SUB4_RB[fd * 32 + qd5]!;
+          ga = SUB4_G[fa * 64 + qa6]!;
+          gb = SUB4_G[fb * 64 + qb6]!;
+          gc = SUB4_G[fc * 64 + qc6]!;
+          gd = SUB4_G[fd * 64 + qd6]!;
+          ba = SUB4_RB[fa * 32 + qaf]!;
+          bb = SUB4_RB[fb * 32 + qbf]!;
+          bc = SUB4_RB[fc * 32 + qcf]!;
+          bd = SUB4_RB[fd * 32 + qdf]!;
+        } else {
+          ra = (qa5 << 3) | (qa5 >> 2);
+          ga = (qa6 << 2) | (qa6 >> 4);
+          ba = (qaf << 3) | (qaf >> 2);
+          rb = (qb5 << 3) | (qb5 >> 2);
+          gb = (qb6 << 2) | (qb6 >> 4);
+          bb = (qbf << 3) | (qbf >> 2);
+          rc = (qc5 << 3) | (qc5 >> 2);
+          gc = (qc6 << 2) | (qc6 >> 4);
+          bc = (qcf << 3) | (qcf >> 2);
+          rd = (qd5 << 3) | (qd5 >> 2);
+          gd = (qd6 << 2) | (qd6 >> 4);
+          bd = (qdf << 3) | (qdf >> 2);
         }
         // Direct row-spread gate: identical to passesReconstructionThresholdRow
         // (pack/unpack of pa..pd is lossless for 8-bit channels). Per-channel
@@ -661,14 +757,13 @@ export function resolveFusedFrame(
   // 2x2 box with edge rejection. Pack rows one ahead; reconstruct row y from
   // the hot dst565 rows y,y1. (2x2sub is the only remaining mode here: legacy
   // and 4x4sub returned above, and parseReconMode falls back to this default.)
-  const sub: DitherMode | null = dither ? '2x2' : null;
-  const sub2 = sub === '2x2';
-  const rbS = sub2 ? DITHER2_RB_POS : DITHER_RB_POS;
-  const gS = sub2 ? DITHER2_G_POS : DITHER_G_POS;
-  const xmS = sub2 ? 1 : 3;
-  const ymS = sub2 ? 1 : 3;
-  const shS = sub2 ? 1 : 2;
-  const subOn = sub !== null;
+  //
+  // The dither-on arm loads expand+subtract+clamp fused from SUB2_* (one load
+  // per tap-channel replaces extract+expand+subtract+clamp). The dither-off
+  // arm keeps the ALU expand — plain-expand table loads measured SLOWER than
+  // shift/or (Lane D interleaved A/B). Frame-constant arm, same shape as the
+  // old if(subOn).
+  const subOn = dither;
   const md = o.rgbmaxdelta;
   const gateOff = md.r === 0 && md.g === 0 && md.b === 0;
   const mdR = md.r;
@@ -678,8 +773,8 @@ export function resolveFusedFrame(
   for (let y = 0; y < h; y++) {
     if (y + 1 < h) packLinearRow(src, dst565, w, y + 1, dither, rbW, gW, xmW, ymW, shW);
     const y1 = y + 1 < h ? y + 1 : y;
-    const ph0 = (y & ymS) << shS;
-    const ph1 = (y1 & ymS) << shS;
+    const ph0 = (y & 1) << 1;
+    const ph1 = (y1 & 1) << 1;
     const row0 = y * w;
     const row1 = y1 * w;
     for (let x = 0; x < w; x++) {
@@ -700,39 +795,51 @@ export function resolveFusedFrame(
       const u10 = v10 & 31;
       const u01 = v01 & 31;
       const u11 = v11 & 31;
-      let r0 = (q00 << 3) | (q00 >> 2);
-      let g0 = (s00 << 2) | (s00 >> 4);
-      let b0 = (u00 << 3) | (u00 >> 2);
-      let r1 = (q10 << 3) | (q10 >> 2);
-      let g1 = (s10 << 2) | (s10 >> 4);
-      let b1 = (u10 << 3) | (u10 >> 2);
-      let r2 = (q01 << 3) | (q01 >> 2);
-      let g2 = (s01 << 2) | (s01 >> 4);
-      let b2 = (u01 << 3) | (u01 >> 2);
-      let r3 = (q11 << 3) | (q11 >> 2);
-      let g3 = (s11 << 2) | (s11 >> 4);
-      let b3 = (u11 << 3) | (u11 >> 2);
+      let r0: number;
+      let g0: number;
+      let b0: number;
+      let r1: number;
+      let g1: number;
+      let b1: number;
+      let r2: number;
+      let g2: number;
+      let b2: number;
+      let r3: number;
+      let g3: number;
+      let b3: number;
       if (subOn) {
-        const d00 = rbS[ph0 | (x & xmS)]!;
-        const d10 = rbS[ph0 | (x1 & xmS)]!;
-        const d01 = rbS[ph1 | (x & xmS)]!;
-        const d11 = rbS[ph1 | (x1 & xmS)]!;
-        const e00 = gS[ph0 | (x & xmS)]!;
-        const e10 = gS[ph0 | (x1 & xmS)]!;
-        const e01 = gS[ph1 | (x & xmS)]!;
-        const e11 = gS[ph1 | (x1 & xmS)]!;
-        r0 = r0 - d00 < 0 ? 0 : r0 - d00 > 255 ? 255 : r0 - d00;
-        g0 = g0 - e00 < 0 ? 0 : g0 - e00 > 255 ? 255 : g0 - e00;
-        b0 = b0 - d00 < 0 ? 0 : b0 - d00 > 255 ? 255 : b0 - d00;
-        r1 = r1 - d10 < 0 ? 0 : r1 - d10 > 255 ? 255 : r1 - d10;
-        g1 = g1 - e10 < 0 ? 0 : g1 - e10 > 255 ? 255 : g1 - e10;
-        b1 = b1 - d10 < 0 ? 0 : b1 - d10 > 255 ? 255 : b1 - d10;
-        r2 = r2 - d01 < 0 ? 0 : r2 - d01 > 255 ? 255 : r2 - d01;
-        g2 = g2 - e01 < 0 ? 0 : g2 - e01 > 255 ? 255 : g2 - e01;
-        b2 = b2 - d01 < 0 ? 0 : b2 - d01 > 255 ? 255 : b2 - d01;
-        r3 = r3 - d11 < 0 ? 0 : r3 - d11 > 255 ? 255 : r3 - d11;
-        g3 = g3 - e11 < 0 ? 0 : g3 - e11 > 255 ? 255 : g3 - e11;
-        b3 = b3 - d11 < 0 ? 0 : b3 - d11 > 255 ? 255 : b3 - d11;
+        // Expand + mode-forced 2x2 subtract fused per tap-channel (phase =
+        // row phase | tap column phase). Bit-identical to expand-then-
+        // subtract-then-clamp: each load equals that sequence exactly.
+        const f00 = ph0 | (x & 1);
+        const f10 = ph0 | (x1 & 1);
+        const f01 = ph1 | (x & 1);
+        const f11 = ph1 | (x1 & 1);
+        r0 = SUB2_RB[f00 * 32 + q00]!;
+        r1 = SUB2_RB[f10 * 32 + q10]!;
+        r2 = SUB2_RB[f01 * 32 + q01]!;
+        r3 = SUB2_RB[f11 * 32 + q11]!;
+        g0 = SUB2_G[f00 * 64 + s00]!;
+        g1 = SUB2_G[f10 * 64 + s10]!;
+        g2 = SUB2_G[f01 * 64 + s01]!;
+        g3 = SUB2_G[f11 * 64 + s11]!;
+        b0 = SUB2_RB[f00 * 32 + u00]!;
+        b1 = SUB2_RB[f10 * 32 + u10]!;
+        b2 = SUB2_RB[f01 * 32 + u01]!;
+        b3 = SUB2_RB[f11 * 32 + u11]!;
+      } else {
+        r0 = (q00 << 3) | (q00 >> 2);
+        g0 = (s00 << 2) | (s00 >> 4);
+        b0 = (u00 << 3) | (u00 >> 2);
+        r1 = (q10 << 3) | (q10 >> 2);
+        g1 = (s10 << 2) | (s10 >> 4);
+        b1 = (u10 << 3) | (u10 >> 2);
+        r2 = (q01 << 3) | (q01 >> 2);
+        g2 = (s01 << 2) | (s01 >> 4);
+        b2 = (u01 << 3) | (u01 >> 2);
+        r3 = (q11 << 3) | (q11 >> 2);
+        g3 = (s11 << 2) | (s11 >> 4);
+        b3 = (u11 << 3) | (u11 >> 2);
       }
       // Direct 2x2-spread gate: identical to passesReconstructionThreshold
       // (packing p00..p11 then re-extracting is lossless). Unconditional box

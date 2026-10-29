@@ -17,6 +17,7 @@
     "bench:accept": "node ./bench-accept.mjs",
     "bench:compare-run": "node ./compare-run.mjs",
     "bench:compare-diff": "node ./compare-diff.mjs",
+    "bench:ab": "node ./ab-run.mjs",
     "bench:browser-soak": "node ./browser-soak.mjs"
   },
   "dependencies": {

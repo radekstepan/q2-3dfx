@@ -37,6 +37,7 @@ import {
   type SpanList,
 } from '@q2/sw-renderer';
 import { BrowserBandPool } from './render-workers.js';
+import { installBenchHook } from './index.js';
 import { publishQ2Stats } from './dom.js';
 import {
   bootPlay,
@@ -286,6 +287,50 @@ describe('BrowserBandPool kick diagnostics (instrumented-only)', () => {
         pool!.disableDiag();
         expect(pool!.diagActive()).toBe(false);
         expect(pool!.diagSnapshot()).toBeNull();
+      } finally {
+        void pool!.dispose();
+      }
+    } finally {
+      removeFakeDom();
+    }
+  });
+
+  it('empty RGB flush elides the kick: zero result, no dispatch, no checkpoint', async () => {
+    installFakeDom();
+    try {
+      const pool = BrowserBandPool.create(2, 64, 48, { timeoutMs: 5000 });
+      expect(pool).not.toBeNull();
+      try {
+        pool!.beginFrame();
+        pool!.enableDiag();
+        // Nothing staged (the empty FG-suffix shape): the fast path returns
+        // the zero result WITHOUT dispatch — no CTL_SEQ kick, no worker
+        // fan-out, no per-kick checkpoint copy on the main thread, no ledger
+        // entry. PERF-NEXT-6 Lane B barrier audit: an empty foreground flush
+        // costs two integer compares, never a dispatch round-trip.
+        const out = await pool!.flushRGBFrameAsync(1, 1000, 0);
+        expect(out).toEqual({
+          pixels: 0, spans: 0, scanned: 0, tris: 0,
+          workerPixels: 0, workerSpans: 0, workerTris: 0,
+          mainPixels: 0, mainSpans: 0, mainTris: 0,
+        });
+        const ks = pool!.kickStats();
+        expect(ks.kicks.rgb).toBe(0);
+        expect(ks.fallbacks.rgb).toBe(0);
+        expect(ks.quarantined).toBe(false);
+        // No dispatch means no barrier was paid: the per-kick ledger and
+        // the frozen last-kick snapshot stay empty.
+        expect(pool!.kickTimings()).toEqual([]);
+        expect(pool!.diagSnapshot()).toBeNull();
+        // No checkpoint allocated or copied (5 B/px x 64 x 48 = 15360 B on
+        // a real kick): zero main-thread copy bytes on the empty path.
+        const st = pool!.checkpointStats();
+        expect(st.allocs).toBe(0);
+        expect(st.snapshots).toBe(0);
+        expect(st.copiedBytes).toBe(0);
+        expect(pool!.rgbPending()).toBe(0);
+        expect(pool!.lastRGBFailure()).toBeNull();
+        pool!.disableDiag();
       } finally {
         void pool!.dispose();
       }
@@ -1182,6 +1227,62 @@ describe.runIf(!!WEB_Q2_PAK)('base1 foreground kick audit (Q2_PAK, report-only)'
       expect(boot.statScanoutFallbacks).toBe(0);
     } finally {
       await pool.dispose();
+    }
+  });
+});
+
+describe('__q2bench worker-count sweep legs (reattach/detach)', () => {
+  it('reattach(n) arms pooled legs, detach() restores the pool-less serial leg', async () => {
+    installFakeDom();
+    let boot: PlayBoot | null = null;
+    try {
+      sandbox();
+      // Banded renderer BEFORE boot (reattach only sizes the pool; the
+      // renderer latches bands from the cvar at bootPlay).
+      setCVar('sw_workers', 3);
+      boot = bootPlay({ width: 64, height: 48 });
+      expect(boot.refresh.testWorkerStats().active).toBe(true);
+      let stopped = false;
+      installBenchHook(null, () => boot, () => { stopped = true; });
+      const hook = (G['window'] as unknown as { __q2bench?: {
+        stopLoop(): void;
+        reattach(workers?: number): { pooled: boolean; bands: number };
+        detach(): { pooled: boolean; bands: number };
+        measure(frames: number): Promise<Array<{ pooled: boolean; bands: number }>>;
+      } }).__q2bench;
+      expect(hook).toBeDefined();
+      hook!.stopLoop();
+      expect(stopped).toBe(true);
+      // 2-worker pooled leg: renderer bands latch from the cvar (n + 1).
+      const r2 = hook!.reattach(2);
+      expect(r2).toEqual({ pooled: true, bands: 3 });
+      expect(boot.browserPool).not.toBeNull();
+      const m2 = await hook!.measure(2);
+      expect(m2.length).toBe(2);
+      expect(m2[0]!.pooled).toBe(true);
+      expect(m2[0]!.bands).toBe(3);
+      // Serial leg: pool gone, SAME band geometry (the control isolates
+      // worker parallelism from banding), frames still measurable.
+      const d = hook!.detach();
+      expect(d.pooled).toBe(false);
+      expect(boot.browserPool).toBeNull();
+      expect(boot.refresh.testWorkerStats().pooled).toBe(false);
+      const m0 = await hook!.measure(2);
+      expect(m0.length).toBe(2);
+      expect(m0[0]!.pooled).toBe(false);
+      expect(m0[0]!.bands).toBe(d.bands);
+      // Idempotent + re-armable: detach again, then reattach(1).
+      expect(hook!.detach().pooled).toBe(false);
+      const r1 = hook!.reattach(1);
+      expect(r1).toEqual({ pooled: true, bands: 2 });
+      expect(boot.browserPool).not.toBeNull();
+    } finally {
+      try {
+        const p = boot?.browserPool as unknown as { dispose?: () => Promise<void> } | null;
+        if (p && typeof p.dispose === 'function') await p.dispose();
+        if (boot) boot.browserPool = null;
+      } catch { /* ignore */ }
+      removeFakeDom();
     }
   });
 });

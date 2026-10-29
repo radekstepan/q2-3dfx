@@ -85,6 +85,8 @@ import {
   detailTimingEnabled,
   formatBandRanges,
   formatForegroundAttribution,
+  formatKickSizes,
+  formatLastKickDescs,
   formatLatency,
   formatStageCounts,
   formatWorkerImbalance,
@@ -94,6 +96,8 @@ import {
   readBandExecStats,
   readForegroundAttribution,
   readForegroundStats,
+  readKickSizes,
+  readLastKickDescs,
   readMaterialGcMs,
   reconcileForegroundAttribution,
   summarizeLatencies,
@@ -102,6 +106,9 @@ import {
   type ForegroundAttribution as ForegroundTaxonomy,
   type FrameSplit,
   type KickSample,
+  type KickSizeEntry,
+  type KickSizeSummary,
+  type LastKickDescs,
   type WorkerExecSample,
   type WorkerImbalance,
 } from '@q2/testkit';
@@ -666,6 +673,24 @@ export interface AttrRow {
    */
   materialGcMs: number | null;
   /**
+   * PERF-NEXT-6 kick-size histogram (last production frame, pooled only):
+   * per-kick completed spans/pixels/tris with drain order (KickSizeEntry),
+   * the empty-kick counter (all bands zero work) with frame:seq:job
+   * identity, and the FG suffix flush's descriptor drain (suffixKick:
+   * kickBase > 0 marks a foreground-only suffix kick). Null while the
+   * producer publishes nothing (serial/detail-off) — unknown, never zero.
+   */
+  kickSizes: KickSizeEntry[] | null;
+  emptyKicks: number | null;
+  emptyKickIds: string[] | null;
+  suffixKick: LastKickDescs | null;
+  /**
+   * Median per-rep instrumented-wall gap (renderView wall minus all 10
+   * phases, reconciled per rep first — same frameSplit pattern as the
+   * production split). Diagnostic; the acceptance metric stays frameMs.
+   */
+  geoGapMs: number | null;
+  /**
    * Allocator/GC proxy: process heapUsed delta across this whole config
    * (warmup + reps). NOT per-frame allocation (the zero-alloc/frame rule
    * is enforced by code review); a climbing delta across configs flags a
@@ -1064,6 +1089,10 @@ export async function runAttrConfig(
     fgEntityMs: null, materialGcMs: null,
   };
   let execAttr: WorkerExecAttribution = { workerComputeMs: null, workerImbalance: null, fenceIdleMs: null };
+  // PERF-NEXT-6: kick-size histogram + FG suffix-kick descriptor drain
+  // (pooled production legs only; serial/software stay null = unknown).
+  let kickSummary: KickSizeSummary | null = null;
+  let suffixKick: LastKickDescs | null = null;
   if (!rgb) {
     // Software: no scanout stage (the color plane IS the presented frame).
     // Segments timed in the same rep; the gap reconciles per rep.
@@ -1181,6 +1210,17 @@ export async function runAttrConfig(
         t = nowNs();
         r.renderView(view, worldArg, entities);
         const rM = nsToMs(nowNs() - t);
+        // PERF-NEXT-6 suffix-kick drain: the newest kick right after
+        // renderView is the frame's last FG flush (endFrame's resolve kick
+        // would overwrite the slot). Lands in the per-rep gap, never a
+        // segment; microseconds, read once (last rep only).
+        if (i === reps - 1) {
+          try {
+            suffixKick = readLastKickDescs(pool);
+          } catch {
+            suffixKick = null;
+          }
+        }
         t = nowNs();
         r.endFrame();
         const eM = nsToMs(nowNs() - t);
@@ -1217,6 +1257,13 @@ export async function runAttrConfig(
           chainUsedBytes = sc.rgbChainUsedBytes; retainedChainBytes = sc.rgbRetainedChainBytes;
           orphanChainBytes = sc.rgbOrphanChainBytes; chainEvictions = sc.rgbChainEvictions;
           fgAttr = collectForegroundAttribution(r, detail);
+          // PERF-NEXT-6 kick-size histogram for the last production frame
+          // (world + FG flushes + resolve + scanout kicks, drain order).
+          try {
+            kickSummary = readKickSizes(pool);
+          } catch {
+            kickSummary = null;
+          }
         }
       }
       frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
@@ -1329,6 +1376,16 @@ export async function runAttrConfig(
   if (pool) await pool.dispose();
 
   const heapDeltaKB = heapKB() - heapBeforeKB;
+  // PERF-NEXT-6: median per-rep instrumented-wall gap (renderView wall minus
+  // all 10 phases, reconciled per rep first — same frameSplit pattern as
+  // the production split; never a median-of-medians subtraction).
+  const geoGapMs = med(
+    rv.map((wall, i) => {
+      let total = 0;
+      for (const k of Object.keys(acc) as Array<keyof typeof acc>) total += acc[k][i] ?? 0;
+      return wall - total;
+    }),
+  );
   const g = r.getFramebuffer();
   const row: AttrRow = {
     scene, res: `${W}x${H}`, entities: ent, mode, workers,
@@ -1377,6 +1434,11 @@ export async function runAttrConfig(
     fgParticleWorkerSpans: fgAttr.fgParticleWorkerSpans, fgParticleMainSpans: fgAttr.fgParticleMainSpans,
     fgBeamWorkerSpans: fgAttr.fgBeamWorkerSpans, fgBeamMainSpans: fgAttr.fgBeamMainSpans,
     fgEntityMs: fgAttr.fgEntityMs, materialGcMs: fgAttr.materialGcMs,
+    kickSizes: kickSummary ? kickSummary.kicks : null,
+    emptyKicks: kickSummary ? kickSummary.emptyKicks : null,
+    emptyKickIds: kickSummary ? kickSummary.emptyKickIds : null,
+    suffixKick,
+    geoGapMs,
   };
   const rs = (v: number | null): string => v === null ? '—' : v.toFixed(2);
   const dispFullPart = row.displayFull !== null && row.displayFull !== undefined ? `/full=${row.displayFull}` : '';
@@ -1420,6 +1482,9 @@ export async function runAttrConfig(
       `entityMs=${rs(fgAttr.fgEntityMs)} matGcMs=${rs(fgAttr.materialGcMs)}]`
     : '';
   const detailPart = ` detail=${detail}`;
+  const kickPart = kickSummary ? ` ${formatKickSizes(kickSummary)}` : '';
+  const suffixPart = suffixKick ? ` ${formatLastKickDescs(suffixKick)}` : '';
+  const gapPart = ` geoGap=${geoGapMs.toFixed(2)}`;
   const stagePart = mode === 'rgb'
     ? ` ${formatStageCounts({
       rgbUsed, coverPixels: coverPx, stagedBatches: rgbStaged, inlineBatches: rgbInline,
@@ -1433,12 +1498,11 @@ export async function runAttrConfig(
     `${row.scene} ${row.res} ent=${ent} ${mode} w=${workers}: ` +
     `renderView=${row.renderViewMs.toFixed(2)}(p95 ${row.renderViewP95.toFixed(2)}) ` +
     `GEO(sum-of-medians,diagnostic)=${geo.toFixed(2)} DRAW=${row.drawMs.toFixed(2)}(p95 ${row.drawP95.toFixed(2)}) ` +
-    `alias=${row.aliasMs.toFixed(2)}(fg-serial) endFrame=${row.endFrameMs.toFixed(2)}(p95 ${row.endFrameP95.toFixed(2)}) ` +
-    `pack=${rs(packMs)} recon=${rs(reconMs)} gamma=${rs(gammaMs)} fused=${rs(fusedMs)} ` +
+    `alias=${row.aliasMs.toFixed(2)}(fg-serial) endFrame=${row.endFrameMs.toFixed(2)}(p95 ${row.endFrameP95.toFixed(2)}) ` +    `pack=${rs(packMs)} recon=${rs(reconMs)} gamma=${rs(gammaMs)} fused=${rs(fusedMs)} ` +
     `scanout[${row.scanoutKind ?? 'n/a'}]=${rs(scanoutMs)}(p95 ${rs(scanoutP95)} max ${rs(scanoutMaxMs)}) serialCtl=${rs(scanoutSerialMs)} ` +
     `frame(production,Node,no-present)=${rs(frameMs)}(p95 ${rs(frameP95)} max ${rs(frameMaxMs)}) frameSerial=${rs(frameSerialMs)}(p95 ${rs(frameSerialP95)}) ` +
     `spans=${spans} px=${pixels} ov=${overdraw.toFixed(2)} ` +
-    `idx=${row.idxHash} color=${row.colorHash} full=${row.colorFull} disp=${row.displayHash ?? '—'}${dispFullPart}${rgbPart}${scanPart}${splitPart}${fgPart}${stagePart}${detailPart}`,
+    `idx=${row.idxHash} color=${row.colorHash} full=${row.colorFull} disp=${row.displayHash ?? '—'}${dispFullPart}${rgbPart}${scanPart}${splitPart}${fgPart}${kickPart}${suffixPart}${stagePart}${gapPart}${detailPart}`,
   );
   return row;
 }

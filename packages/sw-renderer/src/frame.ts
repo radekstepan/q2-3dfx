@@ -489,6 +489,19 @@ export class SoftwareRenderer implements Refresh {
   /** Reused union scratch for dropTouchedSurfaces (no per-frame allocation). */
   private touchScratch: number[] = [];
   /**
+   * Steady-light fast path for dropTouchedSurfaces (PERF-NEXT-6 lane A):
+   * when the light state AND the affected set are both identical to the
+   * previous frame, the caches already hold exactly the entries a rebuild
+   * would produce, so the union invalidation is a proven no-op and is
+   * skipped. The world-identity gate keeps level changes on the exact
+   * path (surface ids are world-relative). Zero allocation in steady
+   * state (flat signature array reused). Never changes served bytes:
+   * identical lights + identical affected set rebuild bit-identical
+   * entries, so skipping the drop only converts misses into hits.
+   */
+  private lastDropWorld: MiniWorld | null = null;
+  private lastDropSig: number[] = [];
+  /**
    * Serial RGB world pass state (astra V2a/V2c + true-565 window-Z). Planes
    * are sized in init() and re-attached every enabled frame so backend
    * switches (wasm/banded) can never leave a stale depth view behind. All
@@ -1611,6 +1624,65 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
+   * Memoised dropTouchedSurfaces (PERF-NEXT-6 lane A): skip the union
+   * invalidation when the light state, world and affected set are all
+   * identical to the previous frame. markLights still runs every frame
+   * (movers mutate bounds in place, so the affected set is always fresh),
+   * and every dlight lookup below reads that fresh set — only the
+   * redundant drop is skipped. A skipped drop converts rebuild misses
+   * into cache hits serving bit-identical entries (same lights + same
+   * set + same styles/mips rebuild the same bytes). Any difference in
+   * light count/values, world identity or affected set takes the exact
+   * path and re-arms the memo. Zero allocation when the memo hits.
+   */
+  private dropTouchedSurfacesMemo(affected: number[], dyn: DynamicLight[], worldData: MiniWorld): void {
+    const prev = this.lastTouched;
+    if (this.lastDropWorld === worldData && this.lightSigMatches(dyn) && prev.length === affected.length) {
+      let same = true;
+      for (let k = 0; k < affected.length; k++) {
+        if (prev[k] !== affected[k]) { same = false; break; }
+      }
+      if (same) return;
+    }
+    this.dropTouchedSurfaces(affected);
+    this.lastDropWorld = worldData;
+    this.saveLightSig(dyn);
+  }
+
+  /**
+   * Exact light-state comparison against the memoised signature (flat
+   * [count, ox, oy, oz, intensity, r, g, b × count]). Re-pumped lights
+   * with identical values compare equal (same computation, same bits);
+   * any value change — including NaN, which never equals itself — takes
+   * the exact path. Color rides the signature because entry bytes depend
+   * on the light scales, not just the affected set.
+   */
+  private lightSigMatches(dyn: DynamicLight[]): boolean {
+    const s = this.lastDropSig;
+    if (s.length === 0 || s[0] !== dyn.length) return false;
+    let k = 1;
+    for (let i = 0; i < dyn.length; i++) {
+      const l = dyn[i]!;
+      if (s[k++] !== l.origin[0] || s[k++] !== l.origin[1] || s[k++] !== l.origin[2]) return false;
+      if (s[k++] !== l.intensity) return false;
+      const c = l.color;
+      if (s[k++] !== c[0] || s[k++] !== c[1] || s[k++] !== c[2]) return false;
+    }
+    return k === s.length;
+  }
+
+  /** Snapshot the current light state into the reused memo signature. */
+  private saveLightSig(dyn: DynamicLight[]): void {
+    const s = this.lastDropSig;
+    s.length = 0;
+    s.push(dyn.length);
+    for (let i = 0; i < dyn.length; i++) {
+      const l = dyn[i]!;
+      s.push(l.origin[0]!, l.origin[1]!, l.origin[2]!, l.intensity, l.color[0]!, l.color[1]!, l.color[2]!);
+    }
+  }
+
+  /**
    * Refresh the per-frame fidelity snapshot (M4.1): read the vd_* cvars
    * once per renderView; on any change drop the RGB cache + memos so the
    * new policy rebuilds instead of serving stale materials. The shared
@@ -2154,12 +2226,14 @@ export class SoftwareRenderer implements Refresh {
    * Complete staged foreground RGB work (blocking): one worker kick over
    * the batches staged since the last flush, tallied into the RGB backend
    * counters AND the foreground completed breakdown (actual completion).
-   * Called at each point where staged foreground must become visible
-   * before a subsequent inline direct write (alpha before alias,
-   * sprites before particles) — this is what preserves the serial order
-   * with mixed inline/staged foreground. Kick failure replays via the
-   * retained-frame recovery (world + foreground, exactly-once). No-op
-   * without unapplied work.
+   * PERF-NEXT-6 lane A (fused drain): this is the ONLY foreground kick per
+   * frame — the alpha/placed/entity passes all stage into the same ordered
+   * suffix, which executes in pack (serial) order inside this kick.
+   * Staged-before-inline order without intermediate kicks is enforced by
+   * the refusal paths (drawInlineRGBRest/drawInlineTriRest replay the
+   * pending suffix via recoverRetainedRGB before any direct write). Kick
+   * failure replays via the retained-frame recovery (world + foreground,
+   * exactly-once). No-op without unapplied work.
    */
   private flushForegroundRGB(): void {
     const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
@@ -2179,8 +2253,8 @@ export class SoftwareRenderer implements Refresh {
 
   /**
    * Same as flushForegroundRGB but message-driven (browser async
-   * completion: no Atomics.wait on the calling thread), used at the same
-   * three flush points by drawForegroundAsync. The browser pool's sync flush
+   * completion: no Atomics.wait on the calling thread), used for the
+   * single fused drain by drawForegroundAsync. The browser pool's sync flush
    * always declines (null) and its async flush runs the staged batches on
    * workers; the Node pool serves both. Async decline/timeout/failure
    * replays via the retained-frame recovery. No-op without unapplied work.
@@ -2583,8 +2657,10 @@ export class SoftwareRenderer implements Refresh {
     // serial (it would miss for every surface on every bump and leak
     // never-read old-serial entries); completeness of the union is the
     // correctness argument (see the lastTouched field doc). Reused array,
-    // no per-frame allocation beyond markLights' own.
-    this.dropTouchedSurfaces(affected);
+    // no per-frame allocation beyond markLights' own. The memo wrapper
+    // skips the proven-redundant drop when lights, world and affected set
+    // are all unchanged (see dropTouchedSurfacesMemo).
+    this.dropTouchedSurfacesMemo(affected, dyn, worldData);
     const hasRendererLights = savedLights.length > 0;
     const dlightFrameBits = (id: number): number => {
       if (hasRendererLights) return dlState.bitsFor(id);
@@ -3692,16 +3768,14 @@ export class SoftwareRenderer implements Refresh {
   private drawForeground(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[], entities: Entity[]): number {
     const ph = this.phaseArmed ? this.phaseAcc : null;
     const alphaSpans = this.drawForegroundAlphaPass(cam, worldData, view, dyn);
-    // Task 1: staged alpha blends must land before the next inline direct
-    // RGB write (alias entities below) — flush the foreground kick here so
-    // the serial world-alpha-foreground order holds exactly.
-    let pt = ph ? phaseNow() : 0;
-    this.flushForegroundRGB();
-    if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
+    // PERF-NEXT-6 lane A (fused foreground drain): the alpha and placed
+    // passes stage into the same ordered descriptor suffix as the entity
+    // pass below — no intermediate kicks. Staged-before-inline order is
+    // enforced by the refusal paths (drawInlineRGBRest/drawInlineTriRest
+    // replay the pending suffix via recoverRetainedRGB before any direct
+    // write), and the single drain below preserves serial order exactly,
+    // so the eager intermediate kicks were pure dispatch overhead.
     this.drawForegroundPlacedPass(cam, worldData, view, dyn);
-    // Task 1: staged sprite blends must land before the next inline direct
-    // RGB write (particles below) — flush the foreground kick here.
-    this.flushForegroundRGB();
     // Item 3: wall-clock time of the expensive entity-foreground pass
     // (alias incl. viewmodel, entity sprites, tracers, pooled beams).
     // Always on (two clock reads per frame); output-identical.
@@ -3711,8 +3785,10 @@ export class SoftwareRenderer implements Refresh {
     // TASK item 2: the entity pass stages alias tris + sprites + particles
     // + tracers in exact serial order into one kick — flush it here so the
     // staged work lands before endFrame (no inline draws follow, so a
-    // failure recovery here can never discard un-retained work).
-    pt = ph ? phaseNow() : 0;
+    // failure recovery here can never discard un-retained work). This is
+    // the only foreground kick (fused: the alpha + placed passes above
+    // staged into the same suffix).
+    let pt = ph ? phaseNow() : 0;
     this.flushForegroundRGB();
     if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
     return alphaSpans;
@@ -3720,25 +3796,21 @@ export class SoftwareRenderer implements Refresh {
 
   /**
    * Entity foreground orchestrator (async path): the same three segments
-   * in the same order with the same three flush points, but the flushes
-   * are message-driven (no Atomics.wait on the calling thread), so staged
-   * foreground batches execute on workers in the browser instead of
-   * replaying inline. Bit-identical to drawForeground: world-first,
+   * in the same order with a single fused drain (see drawForeground), but
+   * the drain is message-driven (no Atomics.wait on the calling thread),
+   * so staged foreground batches execute on workers in the browser instead
+   * of replaying inline. Bit-identical to drawForeground: world-first,
    * foreground-second, all writes depth-guarded, serial + failure
    * fallbacks intact (see flushForegroundRGBAsync).
    */
   private async drawForegroundAsync(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[], entities: Entity[]): Promise<number> {
     const ph = this.phaseArmed ? this.phaseAcc : null;
     const alphaSpans = this.drawForegroundAlphaPass(cam, worldData, view, dyn);
-    let pt = ph ? phaseNow() : 0;
-    await this.flushForegroundRGBAsync();
-    if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
     this.drawForegroundPlacedPass(cam, worldData, view, dyn);
-    await this.flushForegroundRGBAsync();
     const tEntity = phaseNow();
     this.drawForegroundEntityPass(cam, worldData, view, dyn, entities);
     this.fgEntityMs += phaseNow() - tEntity;
-    pt = ph ? phaseNow() : 0;
+    let pt = ph ? phaseNow() : 0;
     await this.flushForegroundRGBAsync();
     if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
     return alphaSpans;

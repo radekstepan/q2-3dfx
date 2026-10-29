@@ -88,8 +88,84 @@ never concurrent across agents:
   frame medians with Δ%, full-channel parity (index + full-RGBA color +
   full-RGBA display), and execution proof. A settings mismatch voids the
   comparison (exit 1). Budgets compare only whole production frames —
-  per-rep splits, kick journals, and stage/byte ledgers ride along as
-  diagnostics, never summed into frame totals.
+  per-rep splits, kick journals, GEO phases, kick histograms and stage/byte
+  ledgers ride along as diagnostics, never summed into frame totals.
+
+### Worker-count sweep procedure (Node + browser, same list)
+
+PERF-NEXT-6 selects worker counts from MEASURED compute+idle, never from
+assumption — Node and browser run the SAME sweep on the SAME workload:
+
+- Parse: `COMPARE_WORKERS` accepts any 0..8 list in order
+  (`"0,1,2,3,5,6,7"` runs verbatim — verified by `compare.test.ts` sweep
+  pins). The matrix header logs one clean line per count
+  (`describeWorkerSweep`: serial path vs `bands=N:[...]` tiling with the
+  caller-owned last band marked), so partial sweeps read cleanly.
+- Node: `COMPARE_WORKERS="0,1,2,3,5,6,7" Q2_PAK=... yarn bench:compare-run`
+  (sequential, quiet machine). Per-config rows carry the band tiling
+  (`bandId`), per-band compute + straggler (`workerComputeMs` /
+  `workerImbalance`), fence idle, GEO phases and kick histograms — the
+  worker-count decision inputs.
+- Browser: the same list, same spawn-north/combat 640×480 workloads, run
+  sequentially on the same box/condition; record each leg with the
+  browser-soak schema (evidence/README.md: `workers` array, compositor
+  class, percentiles, workload intervals). Never compare browser
+  presented-FPS against Node production-frame numbers — same sweep
+  procedure, separate records.
+- Workload bytes stay identical across every leg (fixed cameras/entity
+  sets/cvars — collectors and orchestration differ, never the workload).
+
+### Interleaved candidate-A/B (same box, same build, two configs)
+
+`src/ab.ts` + `ab-run.mjs`: config X vs config Y back-to-back INTERLEAVED
+in one process (warm up both legs, then alternate A_i/B_i per rep so both
+legs share thermal state rep-by-rep). Complements compare-run/compare-diff
+(base-vs-head across builds): this diffs two CONFIGS (workers 7 vs 3,
+pooled vs serial) of the same build.
+
+- `AB_A="spawn-north,640x480,combat,rgb,7"
+  AB_B="spawn-north,640x480,combat,rgb,3" AB_WARMUP=3 AB_REPS=5
+  Q2_PAK=... yarn bench:ab`
+  (`AB_OUT` / `AB_MANIFEST_OUT` override the evidence paths; kind
+  `node-ab` in the manifest). Leg specs are
+  `"scene,res,entities,mode,workers"`; dimensions and the rep-0 camera
+  must agree or the pair is void.
+- Reports paired per-rep deltas + medians with Δ%, settings MATCH/MISMATCH
+  (dimensions + rep-0 camera + mid-run fidelity drift — a mismatch VOIDS the
+  pair, exit 1), cross-leg output parity (SAME/DIFFER — worker-count legs
+  must stay bit-identical; genuinely different workloads may differ) and
+  per-leg execution proof (a pooled leg that only fell back is UNPROVEN).
+- Pooled-vs-serial is a legitimate A/B (the scanout-leg shape is the
+  experiment, never a mismatch); pooled display hashes stay comparable
+  against the serial leg through the per-rep serial control.
+
+### New row/report fields (PERF-NEXT-6 Lane C)
+
+Stationary `AttrRow` and moving `MovingRow` rows (raw JSON + console) now
+carry, in addition to the existing split/stage/FG/exec fields:
+
+- GEO phases, per rep reconciled (`setupMs/markMs/traverseMs/cullMs/
+  cacheMs/projectMs/emitMs/sortMs` = medians over reps — diagnostic, never
+  summed; `geoMs` = median of the per-rep GEO totals, `geoGapMs` = median
+  per-rep instrumented-wall gap; `geoDetail` = `measured`/`unavailable`).
+  Stationary rows additionally carry `geoGapMs`. Console: `geo[n total=..
+  setup=.. mark=.. ... gap=..]`.
+- Kick-size histogram for the last production frame (`kickSizes[]`: one
+  entry per kick with `{frame,seq,job,order,bands,spans,pixels,tris,
+  execMaxMs,empty}` — `order` is drain order within the frame's job,
+  world kick first, FG flushes after; `emptyKicks` + `emptyKickIds[]` =
+  first-class empty-kick counter with `frame:seq:job` identity).
+  Resolve/scanout kicks never carry spans by construction — they are
+  reported but never flagged empty. Null while the producer publishes
+  nothing (serial/detail-off) — unknown, never zero.
+- FG suffix-kick drain (`suffixKick`: newest kick right after renderView —
+  `kickBase > 0` marks a foreground-only suffix kick — with `kickDescs`
+  drained range, completed spans/pixels/tris and the `empty` flag).
+  Console: `lastKick[f7s30:rgb base=1607 descs=1612 bands=1 ...]`.
+- How to read them: the lane question "which GEO phase dominates" is
+  answered by the GEO medians (never sum them); "how big is each kick / how
+  many run empty" by `kickSizes` + `emptyKicks`; barrier/batch follow-ups
+  join `order` (world vs FG flushes) against `suffixKick.kickBase`.
 
 ## Durable evidence (PERF-NEXT-1)
 

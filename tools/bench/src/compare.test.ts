@@ -6,7 +6,7 @@
 // failure-staged-as-execution void the proof, and rows predating the split
 // skip the check (never defaulted).
 import { describe, expect, it } from 'vitest';
-import { diffComparison, fgReconcileNote, type CompareRun } from './compare.js';
+import { diffComparison, fgReconcileNote, compareWorkers, describeWorkerSweep, type CompareRun } from './compare.js';
 
 function stationaryRow(over: object): Record<string, unknown> {
   return {
@@ -63,8 +63,7 @@ describe('fgReconcileNote', () => {
   });
 });
 
-describe('diffComparison foreground execution proof', () => {
-  it('voids execProof on a misattributed foreground split (hashes still match)', () => {
+describe('diffComparison foreground execution proof', () => {  it('voids execProof on a misattributed foreground split (hashes still match)', () => {
     const base = compareRun([stationaryRow({})]);
     const head = compareRun([stationaryRow({
       fgKicks: 1,
@@ -91,5 +90,55 @@ describe('diffComparison foreground execution proof', () => {
     expect(lines[0]!.parity).toBe(true);
     expect(lines[0]!.execProof).toBe(true);
     expect(lines[0]!.note).toBe('');
+  });
+});
+
+describe('compareWorkers sweep parsing (PERF-NEXT-6 Lane C)', () => {
+  const withEnv = (v: string | undefined, fn: () => void): void => {
+    const prev = process.env.COMPARE_WORKERS;
+    try {
+      if (v === undefined) delete process.env.COMPARE_WORKERS;
+      else process.env.COMPARE_WORKERS = v;
+      fn();
+    } finally {
+      if (prev === undefined) delete process.env.COMPARE_WORKERS;
+      else process.env.COMPARE_WORKERS = prev;
+    }
+  };
+  it('parses the full 0/1/2/3/5/6/7 lane-C sweep in order', () => {
+    withEnv('0,1,2,3,5,6,7', () => {
+      expect(compareWorkers()).toEqual([0, 1, 2, 3, 5, 6, 7]);
+    });
+  });
+  it('clamps to 0..8, dedupes and preserves order', () => {
+    withEnv('7,3,3,9,-1,x,1', () => {
+      expect(compareWorkers()).toEqual([7, 3, 1]);
+    });
+  });
+  it('falls back to the default sweep when unset; empty string means serial', () => {
+    withEnv('', () => {
+      expect(compareWorkers()).toEqual([0]);
+    });
+    withEnv(undefined, () => {
+      expect(compareWorkers()).toEqual([0, 1, 3, 7]);
+    });
+  });
+});
+
+describe('describeWorkerSweep reporting', () => {
+  it('names the serial path and the band tiling per count', () => {
+    const lines = describeWorkerSweep([0, 1, 3], 480);
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toMatch(/w=0: serial/);
+    expect(lines[1]).toMatch(/w=1: bands=2:\[0-240,240-480\]/);
+    expect(lines[1]).toMatch(/caller owns last band/);
+    expect(lines[2]).toMatch(/w=3: bands=4:/);
+  });
+  it('handles the full lane-C sweep without gaps', () => {
+    const lines = describeWorkerSweep([0, 1, 2, 3, 5, 6, 7], 480);
+    expect(lines).toHaveLength(7);
+    for (const [i, w] of [0, 1, 2, 3, 5, 6, 7].entries()) {
+      expect(lines[i]).toMatch(new RegExp(`w=${w}`));
+    }
   });
 });

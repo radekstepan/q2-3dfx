@@ -370,14 +370,21 @@ residual: quarantine also clears indexed planes; post-quarantine seed reads them
 ### PERF-NEXT-6 — Optimize measured barriers and remaining frame cost
 owns: `packages/sw-renderer`, `packages/voodoo`, `apps/web`, `tools/bench`, `packages/testkit`
 depends: PERF-NEXT-3, PERF-NEXT-4, PERF-NEXT-5
-status: ready
-starting-points: `frame.ts: drawForeground/drawForegroundAsync`; RGB span kernels, geometry emission, band scheduling, scanout
+status: in-progress(@integrator — round 1 integrated 2026-10-29, gate NOT met, iterating)
 done-when:
 - [ ] Audit all three foreground flush barriers now that exact model/gun work is staged. Combine ordered jobs where safe; retain only barriers required by actual inline/dependency boundaries. Measure kick overhead and tiny jobs; test mixed primitive order and fallback after any batching change.
 - [ ] Use measured per-band compute and idle time to select worker counts/band scheduling; do not assume seven workers is fastest. Compare production browser and Node with the same workload.
 - [ ] Profile and implement the largest remaining whole-frame reductions in RGB span shading/lightmaps, material/descriptor preparation, geometry emission, load imbalance and scanout. Historical GEO ~12–13 ms / DRAW ~34 ms / scanout ~7 ms are leads, not a current additive frame breakdown.
 - [ ] For each candidate record hotspot evidence, changed behavior, controlled before/after whole-frame results and fidelity checks. Reject/revert measured regressions; keep investigating the next hotspot. Exact arithmetic parallelism and justified CPU WASM/SIMD remain available; no GPU substitution.
-- [ ] Achieve the existing ≤16 ms production-frame gate at 640×480 under the defined acceptance workloads/settings, with software unchanged or improved and normal Voodoo fidelity. Gate failure keeps this card open and triggers another concrete optimization iteration.
+- [ ] Achieve the existing ≤16 ms production-frame gate at 640×480 under the defined acceptance workloads, with software unchanged or improved and normal Voodoo fidelity. Gate failure keeps this card open and triggers another concrete optimization iteration.
+round-1 (2026-10-29, integrated — gate NOT met, card open):
+- cuts: sw-renderer dlight memo (cache rebuilds ~100→0/frame, GEO cache phase ~4.6–6.9→~3–4ms) + FG fusion (fgKicks 2→1, empty s47 kick gone, 2 RGB groups) + pooled scanout tables (scanout pooled med 6.74→5.78); voodoo serial fused tables (serial scanout 25→17.9, −28%); harness (GEO/kicks/A-B, `bench:ab`, sweep procedure); browser (kickStats probe halved, detach() serial leg, empty-flush elision pinned).
+- controlled pair (accept, sequential same box): base A 20.72 / B 123.97 / C 51.32 vs head A 20.58 / B 120.55 / C 47.22 (−8% C; parity PASS; hashes identical; budgets NOT relaxed).
+- worker selection: Node matched sweep → 7 fastest (50.7; 5/6 in noise; serial 121.4). Browser harness sweep → noisy (sim drift + w=3 hiccup); rank 6≈best LOW confidence; default stays 7; drift-controlled reboot-per-leg re-sweep queued for round 2.
+- detail groups post-port (combat RGB w=7): world med 13.06/max 22.22 (band4, gap 9.2); FG 3.48/6.56; resolve 0.42 flat; scanout 4.33/5.36; GEO ~14 (cull ~4, emit ~3.8); fenceIdle 0.00.
+- rejected with evidence: numeric RGB keys (low value), front-to-back sort (output risk), FG/world overlap (plane race), kernel float tricks (not bit-identical), adaptive banding (needs worker restart = cross-lane), WASM-scalar redo, sampler.ts internals (dead code), scanout LUT-without-subtract (slower), manual min/max (slower), pack-side LUT (no gain), 4x4-port scope (kept to 2x2 production path), checkpoint-copy narrowing (PERF-NEXT-2/9 safety), resolve/scanout fusion across pool API, broadcastVoodooState removal, per-entity Float32 churn.
+- iteration-2 leads (ranked): GEO emission wall ~14ms (cull ~4 + emit ~3.8 — structural emission work); world-RGB imbalance gap ~9ms (needs true-cost feedback, NOT pixel proxies); browser drift-controlled worker re-sweep; pooled 4x4 scanout arm (same table transform); pack row 4.5ms (needs an idea).
+evidence: `tools/bench/evidence/node-accept-5c2b8ec-2026-10-29T02-35-49.manifest.json` (base leg) + `node-accept-5c2b8ec-2026-10-29T02-50-08.manifest.json` (head leg) + `browser-sweep-5c2b8ec-head-640x480.json` + `node-compare-5c2b8ec-2026-10-29T02-38-04.manifest.json` (Node sweep) + `node-compare-5c2b8ec-2026-10-29T02-51-02.manifest.json` (post-port per-kick groups) + ledger PERF-NEXT-6 round-1 row. Changesets: `.changeset/sw-renderer-perf6-round1.md` + `.changeset/voodoo-scanout-tables.md` + `.changeset/testkit-measure-harness.md` (bench/web ignored).
 
 ### PERF-NEXT-7 — Final-code browser acceptance and stability
 owns: `apps/web`, `tools/bench`, `packages/testkit`

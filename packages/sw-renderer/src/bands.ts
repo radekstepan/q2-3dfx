@@ -1185,6 +1185,42 @@ const SCAN_G4 = scanOffset4(2);
 const SCAN_RB2 = scanOffset2(4);
 const SCAN_G2 = scanOffset2(2);
 
+/**
+ * Fused expand + dither-subtract + clamp for the 2x2-subtract recon arm
+ * (PERF-NEXT-6): `[phase * 32 + q] = clamp(expand5(q) - SCAN_RB2[phase])`
+ * and the G variant `[phase * 64 + s]`. Same transform as
+ * `@q2/voodoo` resolveFusedFrame's SUB2_RB/SUB2_G (ingredients are this
+ * module's own SCAN tables, value-identical to voodoo's DITHER2 tables;
+ * the enforced dependency rules forbid sw-renderer importing voodoo, so
+ * the 2KB lives here — see the PORT-DIFF note in spans.ts). One load
+ * replaces extract + bit-replicate expand + dither load + subtract +
+ * double-clamp per tap-channel. ~2KB total, L1-resident, zero per-frame
+ * alloc. Bit-identity is gated by the existing scanout parity tests
+ * (fused display hashes + pooled≡serial).
+ */
+const SCAN_SUB2_RB: Readonly<Uint8Array> = (() => {
+  const t = new Uint8Array(4 * 32);
+  for (let ph = 0; ph < 4; ph++)
+    for (let q = 0; q < 32; q++) {
+      const e = (q << 3) | (q >> 2);
+      const v = e - SCAN_RB2[ph]!;
+      t[ph * 32 + q] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+  return t;
+})();
+
+/** G-channel variant: `[phase * 64 + s] = clamp(expand6(s) - SCAN_G2[phase])`. */
+const SCAN_SUB2_G: Readonly<Uint8Array> = (() => {
+  const t = new Uint8Array(4 * 64);
+  for (let ph = 0; ph < 4; ph++)
+    for (let s = 0; s < 64; s++) {
+      const e = (s << 2) | (s >> 4);
+      const v = e - SCAN_G2[ph]!;
+      t[ph * 64 + s] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+  return t;
+})();
+
 let scanGammaCached = Number.NaN;
 let scanGammaLUT: Uint8Array = new Uint8Array(256);
 function scanGamma(gamma: number): Uint8Array {
@@ -1478,35 +1514,49 @@ export function processScanoutBand(
         v01 = dst565[row1 + x]!;
         v11 = dst565[row1 + x1]!;
       }
-      let r0 = (((v00 >> 11) & 31) << 3) | (((v00 >> 11) & 31) >> 2);
-      let g0 = (((v00 >> 5) & 63) << 2) | (((v00 >> 5) & 63) >> 4);
-      let b0 = ((v00 & 31) << 3) | ((v00 & 31) >> 2);
-      let r1 = (((v10 >> 11) & 31) << 3) | (((v10 >> 11) & 31) >> 2);
-      let g1 = (((v10 >> 5) & 63) << 2) | (((v10 >> 5) & 63) >> 4);
-      let b1 = ((v10 & 31) << 3) | ((v10 & 31) >> 2);
-      let r2 = (((v01 >> 11) & 31) << 3) | (((v01 >> 11) & 31) >> 2);
-      let g2 = (((v01 >> 5) & 63) << 2) | (((v01 >> 5) & 63) >> 4);
-      let b2 = ((v01 & 31) << 3) | ((v01 & 31) >> 2);
-      let r3 = (((v11 >> 11) & 31) << 3) | (((v11 >> 11) & 31) >> 2);
-      let g3 = (((v11 >> 5) & 63) << 2) | (((v11 >> 5) & 63) >> 4);
-      let b3 = ((v11 & 31) << 3) | ((v11 & 31) >> 2);
+      let r0: number; let g0: number; let b0: number;
+      let r1: number; let g1: number; let b1: number;
+      let r2: number; let g2: number; let b2: number;
+      let r3: number; let g3: number; let b3: number;
       if (sub2) {
-        const d00 = rbS[ph0 | (x & xmS)]!, d10 = rbS[ph0 | (x1 & xmS)]!;
-        const d01 = rbS[ph1 | (x & xmS)]!, d11 = rbS[ph1 | (x1 & xmS)]!;
-        const e00 = gS[ph0 | (x & xmS)]!, e10 = gS[ph0 | (x1 & xmS)]!;
-        const e01 = gS[ph1 | (x & xmS)]!, e11 = gS[ph1 | (x1 & xmS)]!;
-        r0 = r0 - d00 < 0 ? 0 : r0 - d00 > 255 ? 255 : r0 - d00;
-        g0 = g0 - e00 < 0 ? 0 : g0 - e00 > 255 ? 255 : g0 - e00;
-        b0 = b0 - d00 < 0 ? 0 : b0 - d00 > 255 ? 255 : b0 - d00;
-        r1 = r1 - d10 < 0 ? 0 : r1 - d10 > 255 ? 255 : r1 - d10;
-        g1 = g1 - e10 < 0 ? 0 : g1 - e10 > 255 ? 255 : g1 - e10;
-        b1 = b1 - d10 < 0 ? 0 : b1 - d10 > 255 ? 255 : b1 - d10;
-        r2 = r2 - d01 < 0 ? 0 : r2 - d01 > 255 ? 255 : r2 - d01;
-        g2 = g2 - e01 < 0 ? 0 : g2 - e01 > 255 ? 255 : g2 - e01;
-        b2 = b2 - d01 < 0 ? 0 : b2 - d01 > 255 ? 255 : b2 - d01;
-        r3 = r3 - d11 < 0 ? 0 : r3 - d11 > 255 ? 255 : r3 - d11;
-        g3 = g3 - e11 < 0 ? 0 : g3 - e11 > 255 ? 255 : g3 - e11;
-        b3 = b3 - d11 < 0 ? 0 : b3 - d11 > 255 ? 255 : b3 - d11;
+        // Fused expand + dither-subtract + clamp (PERF-NEXT-6): one table
+        // load replaces extract + bit-replicate expand + dither load +
+        // subtract + double-clamp per tap-channel. Phase = row phase | tap
+        // column phase, same indexing as the code below replaces.
+        // Bit-identical: each load equals that sequence exactly.
+        const q00 = (v00 >> 11) & 31, q10 = (v10 >> 11) & 31;
+        const q01 = (v01 >> 11) & 31, q11 = (v11 >> 11) & 31;
+        const s00 = (v00 >> 5) & 63, s10 = (v10 >> 5) & 63;
+        const s01 = (v01 >> 5) & 63, s11 = (v11 >> 5) & 63;
+        const u00 = v00 & 31, u10 = v10 & 31;
+        const u01 = v01 & 31, u11 = v11 & 31;
+        const f00 = ph0 | (x & xmS), f10 = ph0 | (x1 & xmS);
+        const f01 = ph1 | (x & xmS), f11 = ph1 | (x1 & xmS);
+        r0 = SCAN_SUB2_RB[f00 * 32 + q00]!;
+        r1 = SCAN_SUB2_RB[f10 * 32 + q10]!;
+        r2 = SCAN_SUB2_RB[f01 * 32 + q01]!;
+        r3 = SCAN_SUB2_RB[f11 * 32 + q11]!;
+        g0 = SCAN_SUB2_G[f00 * 64 + s00]!;
+        g1 = SCAN_SUB2_G[f10 * 64 + s10]!;
+        g2 = SCAN_SUB2_G[f01 * 64 + s01]!;
+        g3 = SCAN_SUB2_G[f11 * 64 + s11]!;
+        b0 = SCAN_SUB2_RB[f00 * 32 + u00]!;
+        b1 = SCAN_SUB2_RB[f10 * 32 + u10]!;
+        b2 = SCAN_SUB2_RB[f01 * 32 + u01]!;
+        b3 = SCAN_SUB2_RB[f11 * 32 + u11]!;
+      } else {
+        r0 = (((v00 >> 11) & 31) << 3) | (((v00 >> 11) & 31) >> 2);
+        g0 = (((v00 >> 5) & 63) << 2) | (((v00 >> 5) & 63) >> 4);
+        b0 = ((v00 & 31) << 3) | ((v00 & 31) >> 2);
+        r1 = (((v10 >> 11) & 31) << 3) | (((v10 >> 11) & 31) >> 2);
+        g1 = (((v10 >> 5) & 63) << 2) | (((v10 >> 5) & 63) >> 4);
+        b1 = ((v10 & 31) << 3) | ((v10 & 31) >> 2);
+        r2 = (((v01 >> 11) & 31) << 3) | (((v01 >> 11) & 31) >> 2);
+        g2 = (((v01 >> 5) & 63) << 2) | (((v01 >> 5) & 63) >> 4);
+        b2 = ((v01 & 31) << 3) | ((v01 & 31) >> 2);
+        r3 = (((v11 >> 11) & 31) << 3) | (((v11 >> 11) & 31) >> 2);
+        g3 = (((v11 >> 5) & 63) << 2) | (((v11 >> 5) & 63) >> 4);
+        b3 = ((v11 & 31) << 3) | ((v11 & 31) >> 2);
       }
       let r: number, g: number, b: number;
       if (gateOff) {

@@ -36,7 +36,7 @@ export const EVIDENCE_MANIFEST_VERSION = 1;
 export const BROWSER_SOAK_SCHEMA_VERSION = 1;
 
 /** Node runs vs imported browser soaks — never mix the two in a diff. */
-export type EvidenceKind = 'node-compare' | 'node-rgbattr' | 'node-accept' | 'browser-soak';
+export type EvidenceKind = 'node-compare' | 'node-rgbattr' | 'node-accept' | 'node-ab' | 'browser-soak';
 
 /** Compositor classification for browser runs (must be explicit, never inferred). */
 export type BrowserCompositor = 'swiftshader' | 'software' | 'hardware' | 'unknown';
@@ -175,6 +175,7 @@ export const PROVENANCE_ENV_ALLOWLIST: string[] = [
   'RGB_BENCH_WARMUP', 'RGB_BENCH_REPS', 'RGB_BENCH_WORKERS', 'RGB_BENCH_ENTS',
   'RGB_ATTR_OUT',
   'RGB_ACCEPT_WARMUP', 'RGB_ACCEPT_REPS', 'RGB_ACCEPT_WORKERS',
+  'AB_A', 'AB_B', 'AB_WARMUP', 'AB_REPS', 'AB_OUT', 'AB_MANIFEST_OUT',
   'Q2_DETAIL_TIMING',
   'PLAYBENCH_RENDERER', 'PLAYBENCH_W', 'PLAYBENCH_H', 'PLAYBENCH_ITERS',
   'BROWSER_SOAK_IN',

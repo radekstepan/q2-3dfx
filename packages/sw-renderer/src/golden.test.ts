@@ -91,8 +91,21 @@ describe('devroom golden frame', () => {
     r.beginFrame();
     r.renderView(view, world, []);
     const s2 = r.testCacheStats();
-    expect(s2.misses).toBeGreaterThan(0); // marked surfaces relit, rest cached
+    // PERF-NEXT-6 lane A steady-light memo: the identical light marks the
+    // identical set, so the entries built above stay hot (misses convert to
+    // hits serving bit-identical luxels — the relight is served, not rebuilt).
+    expect(s2.misses).toBe(0);
     expect(s2.hits).toBeGreaterThan(0);
+    // Changed light values still invalidate (memo keys on exact values).
+    r.testClearDynamicLights();
+    r.testAddDynamicLight({
+      origin: new Float32Array([60, 40, 150]), intensity: 260,
+      color: new Float32Array([1, 0.55, 0.25]),
+    });
+    r.testResetCacheStats();
+    r.beginFrame();
+    r.renderView(view, world, []);
+    expect(r.testCacheStats().misses).toBeGreaterThan(0); // value change -> rebuild
     // light gone: one rebuild, then steady hits again
     r.testClearDynamicLights();
     r.beginFrame();
