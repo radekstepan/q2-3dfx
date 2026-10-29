@@ -104,7 +104,7 @@ import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
 import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } from './render-workers.js';
-import type { ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
+import type { DiagSnapshot, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
 
 export type RendererKind = 'software' | 'voodoo';
 
@@ -4414,14 +4414,37 @@ export interface StageReport {
   stageBytes: number;
   /**
    * Staging breakdown (null when unpooled): transient = per-frame uploads
-   * (spans/tex/light/lux/descriptors, freed after the kick); chains =
+   * (spans/tex/light/lux, freed after the kick); chains =
    * persistent chain-cache residency (copy-on-first-use, NOT re-uploaded
-   * per frame — the steady-state upload is transient only).
+   * per frame — the steady-state upload is transient only); descs =
+   * indexed + RGB descriptor count inspected by the kick.
    */
-  stageDetail: { transientBytes: number; chainBytes: number } | null;
+  stageDetail: { transientBytes: number; chainBytes: number; descs: number } | null;
   /** Pooled-scanout kick deltas across the resolve stage. */
   scanoutKicks: number;
   scanoutFallbacks: number;
+  /** Pool RGB-kick failures across this frame's raster stage (0 healthy). */
+  rgbFallbacks: number;
+  /**
+   * Span entries actually inspected by this frame's successful pool kicks
+   * (workers + main band, raster + RGB lanes). -1 when the build exposes
+   * no inspected-span counters (older builds — never mistake 0 for proof;
+   * see kickStats.scannedAvailable). Compare against `stageDetail.descs`
+   * and `spans` to prove ordered subranges skip non-owned rows.
+   */
+  scannedSpans: number;
+  /**
+   * Foreground RGB execution detail (null when the renderer publishes no
+   * foreground counter — this HEAD: foreground always rides inline after
+   * the world kick, so null is healthy; see the Q2Stats contract note).
+   */
+  fg: { staged: number; worker: number; inline: number; kicks: number } | null;
+  /**
+   * JS heap delta across the instrumented frame in MiB (null without
+   * `performance.memory` — Chromium only; harness trend signal, not a
+   * budget gate; production frames never sample it).
+   */
+  heapDeltaMB: number | null;
   /**
    * Authoritative-skip detail (null when the hook is absent): whether the
    * skip armed + classic world/foreground spans elided where the RGB twin
@@ -4429,10 +4452,42 @@ export interface StageReport {
    * quiet — these counters + staged/kicks are the execution proof instead.
    */
   skip: { armed: boolean; classicSkipped: number; classicFgSkipped: number } | null;
-  /** Rank-ordered worker completion times for the slowest kick, if armed. */
-  diag: { kicks: number; mainMs: number; arrivals: number[]; slowestMs: number } | null;
+  /**
+   * Last-kick diagnostic snapshot when armed (see DiagSnapshot: frame/seq
+   * + job identity, rank-ordered dispatch-to-completion arrivals with band
+   * attribution, critical-path slowestMs). Null when disarmed — the
+   * production path never allocates it.
+   */
+  diag: DiagSnapshot | null;
   resolveOrder: ResolveOrder;
   voodooPath: VoodooBandPath | 'none';
+}
+
+/**
+ * Finite-number probe with a 0 fallback (foreground-stat hooks may return
+ * partial shapes on future renderer builds — never NaN into the report).
+ */
+function numOrFinite(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
+}
+
+/** Current JS heap in MiB, or null without Chromium's performance.memory. */
+function heapNowMB(): number | null {
+  try {
+    const mem = (performance as unknown as { memory?: { usedJSHeapSize?: unknown } }).memory;
+    const used = mem?.usedJSHeapSize;
+    if (typeof used === 'number' && Number.isFinite(used)) return used / 1048576;
+  } catch {
+    /* non-Chromium: no heap signal */
+  }
+  return null;
+}
+
+/** Heap delta in MiB since a heapNowMB baseline (null when either is null). */
+function heapDelta(before: number | null): number | null {
+  if (before === null) return null;
+  const after = heapNowMB();
+  return after === null ? null : after - before;
 }
 
 /**
@@ -4448,6 +4503,8 @@ export async function measureFrameStages(
   blit?: (target: Uint32Array) => void,
 ): Promise<StageReport> {
   const t00 = performance.now();
+  // JS heap baseline (Chromium-only; null everywhere else — see heapDelta).
+  const heapBefore = heapNowMB();
   const frameState = getCVarString('vid_renderer') === 'voodoo' ? snapshotVoodooState() : undefined;
   if (frameState !== undefined) broadcastBandVoodoo(boot, frameState);
   pumpMuzzleLight(boot);
@@ -4492,17 +4549,41 @@ export async function measureFrameStages(
     const ws = boot.refresh.testWorkerStats();
     pooled = ws.pooled; bands = ws.bands;
   } catch { /* single-threaded fallback: defaults stand */ }
+  // Pool kick outcomes across the raster stage above (0 healthy).
+  // Sampled before/after the render — resolveDisplayAsync below only adds
+  // scanout outcomes, never RGB ones. `scanned` needs the same before
+  // snapshot (monotonic counters); -1 downstream when unavailable.
+  let rgbFbBefore = 0;
+  let scannedBefore = 0;
+  let scannedAvailBefore = false;
+  try {
+    const pool = boot.browserPool as unknown as {
+      kickStats?: () => {
+        fallbacks: { rgb: number };
+        scanned: { raster: number; rgb: number };
+        scannedAvailable: boolean;
+      };
+    } | null;
+    if (pool && typeof pool.kickStats === 'function') {
+      const ks = pool.kickStats();
+      rgbFbBefore = ks.fallbacks.rgb | 0;
+      scannedBefore = (ks.scanned.raster | 0) + (ks.scanned.rgb | 0);
+      scannedAvailBefore = ks.scannedAvailable === true;
+    }
+  } catch { /* unpooled/foreign pool: zeros stand */ }
   let stageBytes = -1;
   let stageDetail: StageReport['stageDetail'] = null;
   try {
     const pool = boot.browserPool as unknown as {
       kickBytes?: () => {
         total: number; idxSpans: number; idxTex: number; idxLight: number;
-        rgbSpans: number; rgbLux: number; rgbChains: number;
+        idxDescs: number; rgbSpans: number; rgbLux: number; rgbChains: number;
+        rgbDescs: number;
       } | null;
       stagingBytes?: () => {
         total: number; idxSpans: number; idxTex: number; idxLight: number;
-        rgbSpans: number; rgbLux: number; rgbChains: number;
+        idxDescs: number; rgbSpans: number; rgbLux: number; rgbChains: number;
+        rgbDescs: number;
       };
     } | null;
     // Prefer the frozen last-kick snapshot (post-kick live offsets read
@@ -4514,6 +4595,7 @@ export async function measureFrameStages(
       stageDetail = {
         transientBytes: sb.idxSpans + sb.idxTex + sb.idxLight + sb.rgbSpans + sb.rgbLux,
         chainBytes: sb.rgbChains,
+        descs: (sb.idxDescs | 0) + (sb.rgbDescs | 0),
       };
     }
   } catch { /* unpooled: -1/null stand */ }
@@ -4542,6 +4624,64 @@ export async function measureFrameStages(
       };
     }
   } catch { /* hook absent: null stands */ }
+  // Foreground RGB execution detail: prefers the browser-lane hook shape
+  // { staged, worker, inline, kicks }; falls back to the renderer-lane
+  // testForegroundWorkerStats { staged, inline, kicks } with worker derived
+  // as staged-when-a-kick-completed (span-based FG rides the JOB_RGB kick,
+  // so a completed kick means staged batches were worker-rendered).
+  let fg: StageReport['fg'] = null;
+  try {
+    const hooks = boot.refresh as unknown as {
+      testRGBForegroundStats?: () => {
+        staged: number; worker: number; inline: number; kicks: number;
+      };
+      testForegroundWorkerStats?: () => {
+        staged: number; inline: number; kicks: number;
+      };
+    };
+    const hook = hooks.testRGBForegroundStats;
+    const legacy = hooks.testForegroundWorkerStats;
+    if (typeof hook === 'function') {
+      const fs = hook.call(boot.refresh);
+      fg = {
+        staged: numOrFinite(fs.staged),
+        worker: numOrFinite(fs.worker),
+        inline: numOrFinite(fs.inline),
+        kicks: numOrFinite(fs.kicks),
+      };
+    } else if (typeof legacy === 'function') {
+      const fs = legacy.call(boot.refresh);
+      const staged = numOrFinite(fs.staged);
+      const kicks = numOrFinite(fs.kicks);
+      fg = {
+        staged,
+        worker: kicks > 0 ? staged : 0,
+        inline: numOrFinite(fs.inline),
+        kicks,
+      };
+    }
+  } catch { /* hook absent: null stands */ }
+  let rgbFallbacks = 0;
+  let scannedSpans = -1;
+  try {
+    const pool = boot.browserPool as unknown as {
+      kickStats?: () => {
+        fallbacks: { rgb: number };
+        scanned: { raster: number; rgb: number };
+        scannedAvailable: boolean;
+      };
+    } | null;
+    if (pool && typeof pool.kickStats === 'function') {
+      const ks = pool.kickStats();
+      rgbFallbacks = (ks.fallbacks.rgb | 0) - rgbFbBefore;
+      if (scannedAvailBefore || ks.scannedAvailable === true) {
+        scannedSpans = ((ks.scanned.raster | 0) + (ks.scanned.rgb | 0)) - scannedBefore;
+      }
+    }
+  } catch { /* unpooled/foreign pool: 0/-1 stand */ }
+  // JS heap delta (Chromium-only performance.memory; harness trend signal,
+  // never a budget gate; two same-process samples, no cross-clock math).
+  const heapDeltaMB = heapDelta(heapBefore);
   return {
     pumpsMs: t01 - t00, simMs: t02 - t01, viewMs: t03 - t02,
     beginMs: t04 - t03, renderMs: t05 - t04,
@@ -4551,8 +4691,12 @@ export async function measureFrameStages(
     staged, inline, kicks, pooled, bands, stageBytes, stageDetail,
     scanoutKicks: boot.statScanoutKicks - kicksBefore,
     scanoutFallbacks: boot.statScanoutFallbacks - fallbacksBefore,
+    rgbFallbacks,
+    scannedSpans,
     skip,
+    fg,
     diag,
+    heapDeltaMB,
     resolveOrder: boot.lastResolveOrder,
     voodooPath: boot.lastVoodooPath,
   };

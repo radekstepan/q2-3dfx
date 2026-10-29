@@ -25,7 +25,13 @@ export interface Scissor {
  * (drawSpriteRGB) so both rasterise the same quad through the same
  * perspective span math. Returns 0 when fully off-screen/behind near.
  */
-function emitSpriteSpans(
+/**
+ * Emit one camera-facing billboard's spans into `pool` (ascending y, one
+ * span per row). Exported for the foreground worker stager (frame.ts),
+ * which stages the emitted spans into the RGB kick instead of drawing
+ * them inline — identical spans, identical material, identical order.
+ */
+export function emitSpriteSpans(
   sprite: SpriteDef,
   textures: Texture[],
   cam: Camera,

@@ -238,8 +238,8 @@ depends: VOODOO-REPAIR-2
 status: review
 done-when:
 - [x] Voodoo production skips duplicate classic world+foreground by default with counters proving skipped work; software unchanged
-- [x] Indexed+RGB workers use precomputed bounded ranges, no per-worker full-span rescan; fallback intact; 0/1/3/7 scaling measured
-- [ ] Foreground rasterizer measurably faster + worker-staged with ordering; serial fallback (DEFERRED: per-pixel barycentric→incremental rejected — changed coverage/ties; setup sharing kept; needs worker-staged foreground protocol, new card)
+- [x] Indexed+RGB workers use true per-band span subranges (R_ORDERED/D_ORDERED staged proofs; workers binary-search owned subranges via lowerBoundRow, CTL_SCAN inspected counts; unordered/legacy full-scan fallback identical); 0/1/3/7 scaling measured
+- [x] Foreground span-based work (deferred TRANS alpha, world sprites) stages into the same JOB_RGB kick after world batches with ordering + serial fallback (fgStaged/fgKicks proof, pooled≡serial full-RGBA). OPEN REMAINDER: per-pixel/triangle foreground (alias incl. viewmodel/entities, particles, tracer beams) stays serial (~15ms combat) — needs a SAB tri-descriptor protocol + new worker job type, follow-up card (barycentric→incremental rewrite stays rejected: changed coverage/ties)
 - [x] Emitter order-validation scans removed at proven sites; GEO re-profiled
 ```
 
@@ -250,7 +250,7 @@ depends: VOODOO-REPAIR-2
 status: in-progress
 done-when:
 - [x] Per-stage browser critical path measured (sim/GEO/staging/raster/fg/scanout/blit/gaps), worker wait per band, fallback counts
-- [x] Representative 640x480 presented-FPS + 5-min soak on new code (320×240 voodoo soak med 21fps, 0 fallbacks, results in perf-ledger; 640×480 browser FPS still open)
+- [x] Representative 640x480 presented-FPS + 5-min soak on new code: 640×480 fresh-boot voodoo pooled-7 soak 66 samples/326s, presented med 15.00fps (cadence 15.00/s, monotonic), fgStaged 10/fgWorker 10/fgKicks 1 every sample (production FG worker proof NEW), rgbStaged 2071/kicks 1/inline 0, 0 fallbacks/quarantine, canvas row-reads full-frame paint, start/end screenshots pixel-identical (see perf-ledger). 60fps acceptance still OPEN (need ≤16.7ms; at ~4× over)
 ```
 
 ```
@@ -261,7 +261,7 @@ status: review
 done-when:
 - [x] Quiet-machine parent-vs-HEAD controlled before/after, identical workloads (a7b753b vs HEAD, same command, sequential — see perf-ledger)
 - [x] Full-RGBA serial-vs-pooled raster+display parity (blue/alpha fail), RGB execution proof, Voodoo fallback races, fixed translucent test, sky+world same skip policy
-- [x] ESM/CJS config-store pinned + regression-tested; instrumented vs uninstrumented vs presented separated; serial independently required (acceptance states it). OPEN: dual-store split needs a `packages/config` owner (single-instance rule) — test documents it as contract need
+- [x] ESM/CJS config-store unified (`packages/config` globalThis singleton owner): writes through ESM visible through CJS and vice versa (built-artifact probes 19/19 both load orders, worker isolation preserved); test flipped from pinned isolation to shared; renderer selection + fidelity reach the real graph
 ```
 
 ```

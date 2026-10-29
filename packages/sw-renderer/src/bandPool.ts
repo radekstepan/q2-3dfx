@@ -17,16 +17,16 @@
 import { Com_Warn } from '@q2/config';
 import {
   CTL_COUNT, CTL_DONE, CTL_FBH, CTL_FBW, CTL_FCOUNT, CTL_FRAME, CTL_HMASK, CTL_JOB, CTL_LIGHTH, CTL_LIGHTW,
-  CTL_PIXELS, CTL_READY, CTL_RGBCOUNT, CTL_SEQ, CTL_SPANS, CTL_TEXH, CTL_TEXW, CTL_TURBPHASE,
+  CTL_PIXELS, CTL_READY, CTL_RGBCOUNT, CTL_SCAN, CTL_SEQ, CTL_SPANS, CTL_TEXH, CTL_TEXW, CTL_TURBPHASE,
   CTL_WMASK, CTL_WSHIFT, D_HMASK, D_LIGHT_H, D_LIGHT_OFF, D_LIGHT_W,
   D_PER_BATCH, D_SPAN_BASE, D_SPAN_COUNT, D_TEX_H, D_TEX_OFF, D_TEX_W,
-  D_TURBPHASE, D_WMASK, D_WSHIFT, D_YMAX, D_YMIN, FRAME_LIGHT_CAP, FRAME_TEX_CAP,
+  D_TURBPHASE, D_WMASK, D_WSHIFT, D_YMAX, D_YMIN, D_ORDERED, FRAME_LIGHT_CAP, FRAME_TEX_CAP,
   JOB_RASTER, JOB_RESOLVE, JOB_RGB, JOB_SCANOUT,
   LIGHT_CAP, MAX_FRAME_BATCHES, MAX_FRAME_SPANS, MAX_WORKERS, MIN_BAND_PIXELS, TEX_CAP,
   MAX_RGB_BATCHES, MAX_RGB_SPANS, RGB_CHAIN_CAP, RGB_LUX_CAP, RGB_MAX_CHAINS, RGB_MAX_LEVELS,
   C_LEVEL_BASE, C_LEVEL_COUNT, C_PER_CHAIN, L_DATA_OFF, L_H, L_MASK_OFF, L_PER_LEVEL, L_W,
   R_CHAIN, R_FLAGS, R_FLATRGB, R_LUX_H, R_LUX_OFF, R_LUX_W, R_PER_BATCH,
-  R_SPAN_BASE, R_SPAN_COUNT, R_TURBPHASE, R_YMAX, R_YMIN, R_ZBITS,
+  R_SPAN_BASE, R_SPAN_COUNT, R_TURBPHASE, R_YMAX, R_YMIN, R_ORDERED, R_ZBITS,
   attachFrameAccum, attachRGBAccum, frameAccumTotal, rgbAccumTotal, packBandSpans, packFrameSpans,
   processBandJob, processFrameJob, processRGBFrameJob, processScanoutBand, readBandJob, resolveBand, resolveBandFused,
   sabAvailable, splitBands, syncWaitAllowed, writeBandJob, I_PER_SPAN,
@@ -531,17 +531,26 @@ export class BandWorkerPool implements BandDispatcher {
     // strictly increasing y, so this is a pure bound read; every worker
     // then rejects non-overlapping descriptors BEFORE material/view setup
     // with no rescan. Zero range would mean "unknown" (never staged here —
-    // spanCount > 0 always reaches this point).
+    // spanCount > 0 always reaches this point). The same pass records the
+    // row-order proof (D_ORDERED): the emitter + row sorter emit
+    // non-decreasing y, so workers may binary-search owned subranges with
+    // no per-worker validation scan; anything else falls back to the full
+    // scan, output-identical.
     let ymin = 0x7fffffff;
     let ymax = -0x80000000;
+    let ordered = 1;
+    let prevY = -0x80000000;
     for (let s = 0; s < spanCount; s++) {
       const y = fv.fSpansI[(spanBase + s) * I_PER_SPAN + 1]!;
       if (y < ymin) ymin = y;
       if (y + 1 > ymax) ymax = y + 1;
+      if (y < prevY) ordered = 0;
+      prevY = y;
     }
     if (!(ymax > ymin)) { ymin = 0; ymax = 0; }
     fv.desc[d + D_YMIN] = ymin;
     fv.desc[d + D_YMAX] = ymax;
+    fv.desc[d + D_ORDERED] = ordered;
     this.spansUsed += spanCount;
     this.texUsed += texBytes;
     this.lightUsed += lightBytes;
@@ -586,6 +595,7 @@ export class BandWorkerPool implements BandDispatcher {
     const tally = this.tally();
     tally.pixels += main.pixels;
     tally.spans += main.spans;
+    tally.scanned += main.scanned;
     this.resetAccum();
     return tally;
   }
@@ -623,6 +633,7 @@ export class BandWorkerPool implements BandDispatcher {
     const tally = this.tally();
     tally.pixels += main.pixels;
     tally.spans += main.spans;
+    tally.scanned += main.scanned;
     this.resetAccum();
     return tally;
   }
@@ -876,20 +887,27 @@ export class BandWorkerPool implements BandDispatcher {
     this.rgbViews.rgbDesc[d + R_FLATRGB] = flatRGB;
     // Band-cull range: min/max span row staged in this batch. Scans the
     // just-packed flat spans (I_PER_SPAN stride, y at +1); per-batch spans
-    // are few, total cost is one integer pass over the frame's spans.
+    // are few, total cost is one integer pass over the frame's spans. The
+    // same pass records the row-order proof (R_ORDERED) for the worker
+    // subrange search; unordered content keeps the full-scan fallback.
     let ymin = 0, ymax = 0;
+    let rOrdered = 1;
     if (spanCount > 0) {
       ymin = 0x7fffffff;
       ymax = -0x80000000;
+      let prevY = -0x80000000;
       for (let s = 0; s < spanCount; s++) {
         const y = this.rgbViews.spansI[(this.rgbSpansUsed + s) * I_PER_SPAN + 1]!;
         if (y < ymin) ymin = y;
         if (y + 1 > ymax) ymax = y + 1;
+        if (y < prevY) rOrdered = 0;
+        prevY = y;
       }
       if (!(ymax > ymin)) { ymin = 0; ymax = 0; }
     }
     this.rgbViews.rgbDesc[d + R_YMIN] = ymin;
     this.rgbViews.rgbDesc[d + R_YMAX] = ymax;
+    this.rgbViews.rgbDesc[d + R_ORDERED] = spanCount > 0 ? rOrdered : 0;
     this.rgbSpansUsed += spanCount;
     this.rgbDescCount += 1;
     return true;
@@ -930,6 +948,7 @@ export class BandWorkerPool implements BandDispatcher {
     const tally = this.tally();
     tally.pixels += main.pixels;
     tally.spans += main.spans;
+    tally.scanned += main.scanned;
     this.resetRGB();
     return tally;
   }
@@ -964,6 +983,7 @@ export class BandWorkerPool implements BandDispatcher {
     const tally = this.tally();
     tally.pixels += main.pixels;
     tally.spans += main.spans;
+    tally.scanned += main.scanned;
     this.resetRGB();
     return tally;
   }
@@ -1172,14 +1192,16 @@ export class BandWorkerPool implements BandDispatcher {
     return true;
   }
 
-  private tally(): { pixels: number; spans: number } {
+  private tally(): { pixels: number; spans: number; scanned: number } {
     let pixels = 0;
     let spans = 0;
+    let scanned = 0;
     for (let i = 0; i < this.workers.length; i++) {
       pixels += this.ctl[CTL_PIXELS + i]!;
       spans += this.ctl[CTL_SPANS + i]!;
+      scanned += this.ctl[CTL_SCAN + i]!;
     }
-    return { pixels, spans };
+    return { pixels, spans, scanned };
   }
 
   private stage(tex: Texture, light: LightBlock, colormap: Uint8Array): void {

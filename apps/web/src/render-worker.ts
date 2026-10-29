@@ -53,6 +53,15 @@ const scope = self as unknown as {
  * raster loop never reads it — scanout stays global-serial on the main
  * thread so filter taps cross band boundaries.
  *
+ * Forward-compat note (browser lane, Goal A): this entry delegates every
+ * kick to `bandWorkerLoop` unchanged. Unknown future JOB codes fall
+ * through to that loop's ordered raster path (depth-guarded, band-local),
+ * and its completion message already carries `{ seq, band, pixels, spans }`
+ * — the main-thread pool attributes arrivals per band from those fields,
+ * so a future foreground/RGB kick needs no entry change, only the
+ * renderer-side staging protocol. Serial + worker-failure fallbacks live
+ * in the pool (`BrowserBandPool`), never here: this file is transport.
+ *
  * TODO(worker-rgb-backend): consume the envelope in `renderVoodooBand`
  * (worker entry, name assumed) / wasm `voodoo_raster_band` (name assumed)
  * once the backend lands; until then this stash is protocol groundwork

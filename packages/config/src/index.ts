@@ -64,8 +64,63 @@ const DEFAULT_CVARS: ReadonlyArray<[string, CVarValue, string]> = [
   ['vid_renderer', 'software', 'active refresh backend: software | voodoo'],
 ];
 
-const cvars = new Map<string, CVarValue>();
-const cvarDocs = new Map<string, string>();
+// --- shared store (ESM/CJS unification) ---
+//
+// `@q2/config` ships dual-format dist (`dist/index.mjs` for `import`,
+// `dist/index.js` for `require`). Without this, each module universe gets
+// its own module-level `Map`: a cvar set via ESM is invisible via CJS and
+// vice versa (renderer selection, worker cvars, and the vd_* scanout
+// profile would silently disagree between the bench/host path and the
+// renderer path in the same process).
+//
+// The single source of truth is therefore kept on `globalThis` under
+// `__q2_config_store__`, so every ESM/CJS copy of this module in the SAME
+// runtime observes the same configuration state. Separate runtimes
+// (workers, forked processes, Vitest per-file isolates) each have their
+// own `globalThis`, so intentional isolation between them is preserved.
+// Browsers share one `globalThis` per page, which is the desired behavior.
+//
+// Invariants:
+// - The store is seeded with defaults exactly once, when it is created.
+//   Later module evaluations reuse it WITHOUT re-seeding, so a second
+//   universe loading this module never wipes live state.
+// - `resetCVars()` still restores compiled-in defaults (used by tests to
+//   isolate cases within one runtime).
+// - `features` is the same object identity in every universe, so flag
+//   reads can never disagree within a runtime (it is only ever read via
+//   `featureEnabled`, never reassigned).
+interface Q2ConfigSharedState {
+  values: Map<string, CVarValue>;
+  docs: Map<string, string>;
+  features: { workers: boolean; wasmSpans: boolean; voodoo: boolean };
+}
+
+declare global {
+  // Per-runtime singleton; `undefined` until the first `@q2/config` copy
+  // (ESM or CJS) initialises it.
+  var __q2_config_store__: Q2ConfigSharedState | undefined;
+}
+
+function sharedState(): Q2ConfigSharedState {
+  let state = globalThis.__q2_config_store__;
+  if (state === undefined) {
+    state = {
+      values: new Map<string, CVarValue>(),
+      docs: new Map<string, string>(),
+      features: { workers: false, wasmSpans: false, voodoo: true },
+    };
+    for (const [name, value, doc] of DEFAULT_CVARS) {
+      state.values.set(name, value);
+      state.docs.set(name, doc);
+    }
+    globalThis.__q2_config_store__ = state;
+  }
+  return state;
+}
+
+const shared = sharedState();
+const cvars: Map<string, CVarValue> = shared.values;
+const cvarDocs: Map<string, string> = shared.docs;
 
 function loadDefaults(): void {
   cvars.clear();
@@ -75,8 +130,6 @@ function loadDefaults(): void {
     cvarDocs.set(name, doc);
   }
 }
-
-loadDefaults();
 
 /** Restore all cvars to compiled-in defaults (used by tests). */
 export function resetCVars(): void {
@@ -130,11 +183,12 @@ export function listCVars(): CVarDef[] {
 }
 
 // --- feature flags (prime directive: land risky work behind a flag) ---
-export const features = {
-  workers: false,
-  wasmSpans: false,
-  voodoo: true,
-} as const;
+// Shared identity across ESM/CJS copies via the globalThis store (see above).
+export const features: {
+  readonly workers: boolean;
+  readonly wasmSpans: boolean;
+  readonly voodoo: boolean;
+} = shared.features;
 export type FeatureName = keyof typeof features;
 export function featureEnabled(name: FeatureName): boolean {
   return features[name];

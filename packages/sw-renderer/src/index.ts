@@ -40,26 +40,27 @@ export {
   F_PER_SPAN, I_PER_SPAN,
   CTL_SEQ, CTL_COUNT, CTL_TEXW, CTL_TEXH, CTL_LIGHTW, CTL_LIGHTH,
   CTL_WSHIFT, CTL_WMASK, CTL_HMASK, CTL_TURBPHASE, CTL_FBW, CTL_FBH,
-  CTL_DONE, CTL_PIXELS, CTL_SPANS, CTL_READY, CTL_FCOUNT, CTL_JOB, CTL_FRAME, CTL_RGBCOUNT, CTL_LEN,
+  CTL_DONE, CTL_PIXELS, CTL_SPANS, CTL_READY, CTL_FCOUNT, CTL_JOB, CTL_FRAME, CTL_RGBCOUNT, CTL_SCAN, CTL_LEN,
   JOB_RASTER, JOB_RESOLVE, JOB_RGB, JOB_SCANOUT,
   workersRequestedByCvar, accumRequestedByCvar, sabAvailable, syncWaitAllowed,
   splitBands, bandLayout, bandTotal, attachBandShared, createBandBuffers,
   packBandSpans, packFrameSpans, readBandJob, writeBandJob,
   processBandJob, rasterizePackedRange, rasterizePackedRGBRange, processFrameJob, processRGBFrameJob,
+  lowerBoundRow,
   processScanoutBand,
   resolveBand, resolveBandFused, bandWorkerLoop,
   MAX_FRAME_SPANS, FRAME_TEX_CAP, FRAME_LIGHT_CAP, MAX_FRAME_BATCHES, PALETTE_BYTES,
   D_SPAN_BASE, D_SPAN_COUNT, D_TEX_OFF, D_TEX_W, D_TEX_H,
   D_LIGHT_OFF, D_LIGHT_W, D_LIGHT_H, D_WSHIFT, D_WMASK, D_HMASK,
-  D_TURBPHASE, D_YMIN, D_YMAX, D_PER_BATCH,
+  D_TURBPHASE, D_YMIN, D_YMAX, D_ORDERED, D_PER_BATCH,
   frameAccumLayout, frameAccumTotal, attachFrameAccum,
   RGB_CHAIN_CAP, RGB_LUX_CAP, MAX_RGB_BATCHES, MAX_RGB_SPANS, RGB_MAX_CHAINS, RGB_MAX_LEVELS,
   C_LEVEL_BASE, C_LEVEL_COUNT, C_PER_CHAIN,
   L_DATA_OFF, L_MASK_OFF, L_W, L_H, L_PER_LEVEL,
   R_SPAN_BASE, R_SPAN_COUNT, R_CHAIN, R_LUX_OFF, R_LUX_W, R_LUX_H,
-  R_FLAGS, R_ZBITS, R_TURBPHASE, R_FLATRGB, R_YMIN, R_YMAX, R_PER_BATCH,
+  R_FLAGS, R_ZBITS, R_TURBPHASE, R_FLATRGB, R_YMIN, R_YMAX, R_ORDERED, R_PER_BATCH,
   R_FLAG_WARP, R_FLAG_BILINEAR, R_FLAG_MIPDITHER, R_FLAG_OVERBRIGHT,
-  R_FLAG_DEPTHWRITE, R_FLAG_REPEAT, R_FLAG_LIGHT, R_FLAG_FLAT, R_FLAG_OPAQUE,
+  R_FLAG_DEPTHWRITE, R_FLAG_REPEAT, R_FLAG_LIGHT, R_FLAG_FLAT, R_FLAG_OPAQUE, R_FLAG_BLEND_ALPHA,
   rgbAccumLayout, rgbAccumTotal, attachRGBAccum,
   workerMaterialToRGB, SCAN_KICK_LEN,
   BandedSoftwareBackend,
@@ -120,7 +121,7 @@ export {
   type AliasMesh, type AliasInstance, type AliasSkin, type Md2Like,
 } from './alias.js';
 
-export { drawSprite, drawSpriteRGB, type SpriteDef, type Scissor } from './sprites.js';
+export { drawSprite, drawSpriteRGB, emitSpriteSpans, type SpriteDef, type Scissor } from './sprites.js';
 
 export {
   drawTracerBeam, drawTracerBeamRGB,

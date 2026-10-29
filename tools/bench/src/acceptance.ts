@@ -24,6 +24,10 @@
 //      pooled idx/colorFull == serial, on every swept config +
 //      odd-dimensions smoke + execution proof on pooled rows.
 //      Instrumented phase medians (GEO/DRAW/alias) are DIAGNOSTIC ONLY.
+//      Critical-path detail (per-rep scanout-kick dispatch-to-completion
+//      with frame/seq/job/band identity + same-rep main-thread split +
+//      staging/skip/byte counters) is REPORTED for every gate but never
+//      gated: budgets compare only whole production frames.
 //   E. worker-failure fallback: a disposed pool renders serial-identical
 //      (full-RGBA raster AND scanout control) with the kick reporting
 //      failure — fallback, not silent success.
@@ -275,6 +279,29 @@ export async function runAcceptance(pakPath: string, opts: Partial<AcceptOptions
   const gateA = findRow(rows, 'software', 'fixed', 0);
   const gateB = findRow(rows, 'rgb', 'fixed', 0);
   const gateC = findRow(rows, 'rgb', 'combat', maxW);
+  // Critical-path detail per gate (reported, never gated): stable band
+  // identity, same-rep main-thread split + scheduling gap, scanout-kick
+  // dispatch-to-completion (med/p95/max — the max is the scanout critical
+  // path), staging/skip/byte ledger, foreground proof (serial alias +
+  // elided classic fg). Per-worker execution durations need renderer
+  // in-worker timestamps (gap — @q2/testkit critpath); until then the RGB
+  // kick inside renderView is bounded by the render segment, not estimated.
+  for (const [label, row] of [['gate A', gateA], ['gate B', gateB], ['gate C', gateC]] as const) {
+    const rs = (v: number | null): string => v === null ? '—' : v.toFixed(2);
+    console.log(
+      `crit ${label} ${row.res} ${row.mode} ent=${row.entities} w=${row.workers} ${row.bandId}: ` +
+      `split[begin=${rs(row.splitBeginMs)} render=${rs(row.splitRenderMs)} end=${rs(row.splitEndMs)} ` +
+      `scanout=${rs(row.splitScanoutMs)} gap=${rs(row.splitGapMs)}] ` +
+      `scanoutKick[${row.scanoutKind ?? 'n/a'} med=${rs(row.scanoutMs)} p95=${rs(row.scanoutP95)} max=${rs(row.scanoutMaxMs)} serialCtl=${rs(row.scanoutSerialMs)}] ` +
+      `frameMax=${rs(row.frameMaxMs)} ` +
+      `stage[cover=${row.coverPx} staged=${row.rgbStaged} inline=${row.rgbInline} kicks=${row.rgbKicks} fb=${row.scanoutFallbacks} ` +
+      `skipSpans=${row.classicSpansSkipped} skipFg=${row.classicFgSkipped} armed=${row.skipArmed} trans=${row.translucentSpans}] ` +
+      `fg[alias=${rs(row.aliasMs)} serial] ` +
+      `bytes[planes=${row.planeBytes} scan=${row.scanBytes ?? 'n/a'} chain=${row.chainUsedBytes} retained=${row.retainedChainBytes} orphan=${row.orphanChainBytes}] ` +
+      `heapΔ=${row.heapDeltaKB.toFixed(0)}KB`,
+    );
+  }
+  console.log('note: frame() is production-frame-no-present (Node); presented FPS is a browser/CDP soak metric (perf-ledger soak rows). Per-worker exec durations need renderer in-worker timestamps (open).');
   const cA = checkBudget(gateA.frameMs!, PERF_BUDGET_SOFTWARE_640_MS);
   const cB = checkBudget(gateB.frameMs!, PERF_BUDGET_VOODOO_640_MS);
   const cC = checkBudget(gateC.frameMs!, PERF_BUDGET_VOODOO_640_MS);

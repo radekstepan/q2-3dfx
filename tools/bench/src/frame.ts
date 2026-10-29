@@ -168,9 +168,9 @@ export function attributeView(
   const geo = row.setup + row.mark + row.traverse + row.cull + row.cache + row.project + row.emit + row.sort;
   console.log(
     `${row.view}: renderView=${row.renderViewMs.toFixed(2)}ms resolve=${row.resolveMs.toFixed(2)}ms ` +
-    `GEO=${geo.toFixed(2)} (setup ${row.setup.toFixed(2)} mark ${row.mark.toFixed(2)} trav ${row.traverse.toFixed(2)} ` +
+    `GEO(sum-of-medians,diagnostic)=${geo.toFixed(2)} (setup ${row.setup.toFixed(2)} mark ${row.mark.toFixed(2)} trav ${row.traverse.toFixed(2)} ` +
     `cull ${row.cull.toFixed(2)} cache ${row.cache.toFixed(2)} proj ${row.project.toFixed(2)} ` +
-    `emit ${row.emit.toFixed(2)} sort ${row.sort.toFixed(2)}) DRAW=${row.draw.toFixed(2)} alias=${row.alias.toFixed(2)} ` +
+    `emit ${row.emit.toFixed(2)} sort ${row.sort.toFixed(2)}) DRAW=${row.draw.toFixed(2)} alias=${row.alias.toFixed(2)}(fg-serial) ` +
     `spans=${spans} px=${pixels} overdraw=${overdraw.toFixed(2)}`,
   );
   return row;

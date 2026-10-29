@@ -109,6 +109,14 @@ describe('publishQ2Stats (window.__q2stats contract)', () => {
     expect(s.scanoutKicks).toBe(0);
     expect(s.scanoutFallbacks).toBe(0);
     expect(s.asyncFallbacks).toBe(0);
+    // Foreground worker fields: sync software boot stages no foreground
+    // (hook present, healthy zeros), no pool — never guesses.
+    expect(s.fgStaged).toBe(0);
+    expect(s.fgWorker).toBe(0);
+    expect(s.fgInlineRgb).toBe(0);
+    expect(s.fgKicks).toBe(0);
+    expect(s.rgbFallbacks).toBe(0);
+    expect(s.quarantined).toBe(false);
     // Skip-hook fields: software boot never arms the skip (zeros), and the
     // hook-absent fallback is identical (older renderer safe).
     expect(s.classicSkipped).toBe(0);

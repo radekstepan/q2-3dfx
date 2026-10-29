@@ -32,6 +32,7 @@ import {
   D_LIGHT_OFF,
   D_LIGHT_W,
   D_PER_BATCH,
+  D_ORDERED,
   D_SPAN_BASE,
   D_SPAN_COUNT,
   D_TEX_H,
@@ -72,6 +73,7 @@ import {
   R_LUX_H,
   R_LUX_OFF,
   R_LUX_W,
+  R_ORDERED,
   R_PER_BATCH,
   R_SPAN_BASE,
   R_SPAN_COUNT,
@@ -104,12 +106,55 @@ import {
   type Texture,
   type RGBMipLevel,
 } from '@q2/sw-renderer';
+/**
+ * Module-namespace probe for renderer-lane layout additions (CTL_SCAN).
+ * Named static imports are pinned to the built dist typings, which lag
+ * the in-flight renderer source; the namespace probe degrades to
+ * "unavailable" on older builds instead of breaking typecheck. Same
+ * `as unknown as` capability-probe family as the renderer-hook probes in
+ * play.ts/dom.ts. The offset and the SAB region always come from the same
+ * package build at runtime (both via attachFrameAccum's module), so a
+ * present offset is always in-bounds.
+ */
+import * as swRendererNS from '@q2/sw-renderer';
 export type { ScanoutBandOptions } from '@q2/sw-renderer';
 import { readVoodooState } from '@q2/voodoo';
 import type { VoodooState } from '@q2/voodoo';
 
 /** Per-batch wait budget in ms (mirrors the Node pool default). */
 export const BROWSER_POOL_TIMEOUT_MS = 30000;
+
+/** Job kinds the browser pool can kick (labels the diag snapshot). */
+export type DiagJob = 'raster' | 'rgb' | 'resolve' | 'scanout' | 'unknown';
+
+/**
+ * Last-kick diagnostic snapshot (instrumented-only, never the production
+ * frame). All times are main-thread `performance.now()` deltas from the
+ * kick fan-out — one clock, always comparable. `arrivals` are
+ * dispatch-to-completion latencies per worker in arrival order (they
+ * include scheduling + postMessage latency, so they bound but do not
+ * equal in-worker compute: true per-worker compute durations need
+ * worker-side timestamps, which only the renderer lane can add — the
+ * worker loop in `@q2/sw-renderer` owns the compute section. `bandIds`,
+ * `pixels` and `spans` parallel `arrivals` with the band identity +
+ * tallies the worker message carried (-1 when the message omitted them).
+ * `slowestMs` is the critical path (dispatch → last completion).
+ */
+export interface DiagSnapshot {
+  kicks: number;
+  /** Frame generation + message sequence identifying this kick. */
+  frame: number;
+  seq: number;
+  job: DiagJob;
+  /** Band count covered by the kick (workers + the main-thread band). */
+  bands: number;
+  mainMs: number;
+  arrivals: number[];
+  bandIds: number[];
+  pixels: number[];
+  spans: number[];
+  slowestMs: number;
+}
 
 /**
  * Browser-default worker count (M7.1 perf lane): one worker per core minus
@@ -184,10 +229,51 @@ export class BrowserBandPool implements BandDispatcher {
    * calling thread's own band work for the same kick. */
   private diagOn = false;
   private readonly diagArrivals: Float64Array;
+  /** Per-arrival band identity + tallies, parallel to diagArrivals (-1 when
+   *  the worker message carries none — the protocol field exists, older
+   *  stubs may omit it; rank order is still arrival order). */
+  private readonly diagBands: Int32Array;
+  private readonly diagPixels: Float64Array;
+  private readonly diagSpans: Float64Array;
   private diagKickStart = 0;
   private diagMainMs = -1;
   private diagArrivalsSeen = 0;
   private diagKicks = 0;
+  /** Kick identity for the in-flight/last kick (same-clock metadata, always
+   *  comparable: frame generation + message sequence + job type + band
+   *  count, frozen at kick time). */
+  private diagFrame = -1;
+  private diagSeq = -1;
+  private diagJob: DiagJob = 'unknown';
+  private diagBandCount = 0;
+  /** Monotonic kick outcomes per job kind (success = worker completion
+   *  message for every band; anything else = counted fallback, never
+   *  silent). Read via kickStats() for __q2stats / StageReport. */
+  private readonly statKicks = { raster: 0, rgb: 0, resolve: 0, scanout: 0 };
+  private readonly statFallbacks = { raster: 0, rgb: 0, resolve: 0, scanout: 0 };
+  /**
+   * Span entries actually inspected by successful pool kicks (Goal B):
+   * worker-band sums from the CTL_SCAN slots (present post-rebuild —
+   * see ctlScanOff) plus the main band's compute return. Raster + RGB
+   * lanes only; inline fallbacks are counted in rgbInline/fallbacks, not
+   * here. Compare against staged spans (stagingBytes/kickBytes) to prove
+   * ordered subranges skip non-owned rows.
+   */
+  private readonly statScanned = { raster: 0, rgb: 0 };
+  /** True once any scanned count was observed (offset or return field). */
+  private scannedObserved = false;
+  /** Cached CTL_SCAN slot offset, -1 when the build predates it. */
+  private scanOff: number | null = null;
+  /**
+   * Stale-write guard (worker-failure acceptance): a timed-out async kick
+   * means wedged workers whose late SAB writes could race the inline
+   * fallback replay AND later frames. The timeout path terminates every
+   * worker BEFORE the caller replays, then refuses all later kicks fast
+   * (workers.length === 0) until reboot recreates the pool. Explicit
+   * refusals (dead pool, empty batches) and dispose do NOT quarantine —
+   * only the timeout does, since only it implies in-flight writes.
+   */
+  private quarantined = false;
   /** Last completed kick's staging snapshot (see kickBytes). */
   private lastKick: {
     idxSpans: number; idxTex: number; idxLight: number; idxDescs: number;
@@ -223,16 +309,26 @@ export class BrowserBandPool implements BandDispatcher {
     this.fbW = fbW;
     this.fbH = fbH;
     this.diagArrivals = new Float64Array(Math.max(1, workers.length));
+    this.diagBands = new Int32Array(Math.max(1, workers.length));
+    this.diagPixels = new Float64Array(Math.max(1, workers.length));
+    this.diagSpans = new Float64Array(Math.max(1, workers.length));
     for (let i = 0; i < workers.length; i++) {
       this.workers.push(workers[i]!);
       const w = workers[i]!;
       w.onmessage = (ev: MessageEvent): void => {
-        const msg = ev.data as { seq?: unknown; ready?: unknown };
+        const msg = ev.data as {
+          seq?: unknown; ready?: unknown;
+          band?: unknown; pixels?: unknown; spans?: unknown;
+        };
         if (!msg || typeof msg !== 'object') return;
         if (msg.ready === true) this.readyCount += 1;
         if (typeof msg.seq === 'number') {
           if (this.diagOn && this.diagArrivalsSeen < this.diagArrivals.length) {
-            this.diagArrivals[this.diagArrivalsSeen++] = performance.now() - this.diagKickStart;
+            const a = this.diagArrivalsSeen++;
+            this.diagArrivals[a] = performance.now() - this.diagKickStart;
+            this.diagBands[a] = typeof msg.band === 'number' ? msg.band | 0 : -1;
+            this.diagPixels[a] = typeof msg.pixels === 'number' ? msg.pixels : -1;
+            this.diagSpans[a] = typeof msg.spans === 'number' ? msg.spans : -1;
           }
           const done = this.pending.get(msg.seq);
           if (done) done(true);
@@ -381,17 +477,25 @@ export class BrowserBandPool implements BandDispatcher {
     // read; workers reject non-overlapping descriptors BEFORE material/view
     // setup with no rescan. Zero range = unknown/legacy (correct fallback:
     // visit everywhere), never staged here since spanCount > 0 always
-    // reaches this point.
+    // reaches this point. The same pass records the row-order proof
+    // (D_ORDERED): non-decreasing y lets workers binary-search owned
+    // subranges with no per-worker validation scan; anything else keeps the
+    // full-scan fallback, output-identical.
     let ymin = 0x7fffffff;
     let ymax = -0x80000000;
+    let ordered = 1;
+    let prevY = -0x80000000;
     for (let s = 0; s < spanCount; s++) {
       const y = fv.fSpansI[(spanBase + s) * I_PER_SPAN + 1]!;
       if (y < ymin) ymin = y;
       if (y + 1 > ymax) ymax = y + 1;
+      if (y < prevY) ordered = 0;
+      prevY = y;
     }
     if (!(ymax > ymin)) { ymin = 0; ymax = 0; }
     fv.desc[dd + D_YMIN] = ymin;
     fv.desc[dd + D_YMAX] = ymax;
+    fv.desc[dd + D_ORDERED] = ordered;
     this.spansUsed += spanCount;
     this.texUsed += texBytes;
     this.lightUsed += lightBytes;
@@ -427,8 +531,9 @@ export class BrowserBandPool implements BandDispatcher {
     this.publishFrame();
     const seq = this.seq;
     const finished = this.awaitWorkerMessages(seq, this.workers.length);
-    if (!this.kick(seq)) {
+    if (!this.kick(seq, 'raster')) {
       this.pending.delete(seq);
+      this.statFallbacks.raster += 1;
       return null;
     }
     // Calling thread owns the last band: drain it inline while the workers
@@ -441,10 +546,18 @@ export class BrowserBandPool implements BandDispatcher {
     );
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
     const ok = await finished;
-    if (!ok) return null;
+    if (!ok) {
+      this.statFallbacks.raster += 1;
+      return null;
+    }
+    this.statKicks.raster += 1;
     const tally = this.tally();
     tally.pixels += main.pixels;
     tally.spans += main.spans;
+    const mScan = scannedOf(main);
+    if (mScan.present || this.ctlScanOff() >= 0) this.scannedObserved = true;
+    tally.scanned += mScan.value;
+    this.statScanned.raster += tally.scanned;
     this.resetAccum();
     return tally;
   }
@@ -476,15 +589,19 @@ export class BrowserBandPool implements BandDispatcher {
     this.publishResolve();
     const seq = this.seq;
     const finished = this.awaitWorkerMessages(seq, this.workers.length);
-    if (!this.kick(seq)) {
+    if (!this.kick(seq, 'resolve')) {
       this.pending.delete(seq);
+      this.statFallbacks.resolve += 1;
       return false;
     }
     const mainBand = this.bands[this.bands.length - 1]!;
     const diagT0 = this.diagOn ? performance.now() : 0;
     resolveBandFused(this.views.fColor, this.views.fPal, this.base.idx, this.rgbViews.rgb565, this.rgbViews.cover, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
-    return finished;
+    const ok = await finished;
+    if (ok) this.statKicks.resolve += 1;
+    else this.statFallbacks.resolve += 1;
+    return ok;
   }
 
   /** Live shared RGB planes (the renderer adopts these when banded + attached). */
@@ -520,8 +637,9 @@ export class BrowserBandPool implements BandDispatcher {
     this.publishScanout(opts);
     const seq = this.seq;
     const finished = this.awaitWorkerMessages(seq, this.workers.length);
-    if (!this.kick(seq)) {
+    if (!this.kick(seq, 'scanout')) {
       this.pending.delete(seq);
+      this.statFallbacks.scanout += 1;
       return false;
     }
     const mainBand = this.bands[this.bands.length - 1]!;
@@ -531,7 +649,10 @@ export class BrowserBandPool implements BandDispatcher {
       this.fbW, this.fbH, opts, mainBand.y0, mainBand.y1,
     );
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
-    return finished;
+    const ok = await finished;
+    if (ok) this.statKicks.scanout += 1;
+    else this.statFallbacks.scanout += 1;
+    return ok;
   }
 
   /** Publish a scanout kick (main side, pre-notify). */
@@ -560,6 +681,20 @@ export class BrowserBandPool implements BandDispatcher {
    * Stage one world RGB batch into the SAB (main side). Same contract as
    * the Node pool's stageRGB (spans + persistent chain cache + luxels +
    * flags + y-range); false = run inline. Never throws.
+   *
+   * Foreground-protocol note (Goal A): at this HEAD the renderer stages
+   * WORLD batches only (opaque world + skybox/flat-sky) and draws the
+   * entity foreground inline AFTER the kick completes (world-before-
+   * foreground ordering, depth-hack gun, translucent ordering — see
+   * drawForeground in `packages/sw-renderer/src/frame.ts`). If the
+   * renderer lane ever stages foreground work, it arrives through this
+   * same path (same descriptor layout, same JOB_RGB kick, same drain-
+   * before-inline-foreground ordering) or a new BandDispatcher method
+   * this pool will surface with identical serial + worker-failure
+   * fallbacks. Either way this pool never changes raster math — transport
+   * only — and any unrecognised future kick still converges: the worker
+   * loop routes unknown JOB codes to the ordered raster path, and every
+   * flush here falls back to the bit-identical inline replay.
    */
   stageRGB(
     list: SpanList, spanStart: number, spanCount: number,
@@ -654,18 +789,23 @@ export class BrowserBandPool implements BandDispatcher {
     this.rgbViews.rgbDesc[d + R_TURBPHASE] = turbPhase;
     this.rgbViews.rgbDesc[d + R_FLATRGB] = flatRGB;
     let ymin = 0, ymax = 0;
+    let rOrdered = 1;
     if (spanCount > 0) {
       ymin = 0x7fffffff;
       ymax = -0x80000000;
+      let prevY = -0x80000000;
       for (let s = 0; s < spanCount; s++) {
         const y = this.rgbViews.spansI[(this.rgbSpansUsed + s) * I_PER_SPAN + 1]!;
         if (y < ymin) ymin = y;
         if (y + 1 > ymax) ymax = y + 1;
+        if (y < prevY) rOrdered = 0;
+        prevY = y;
       }
       if (!(ymax > ymin)) { ymin = 0; ymax = 0; }
     }
     this.rgbViews.rgbDesc[d + R_YMIN] = ymin;
     this.rgbViews.rgbDesc[d + R_YMAX] = ymax;
+    this.rgbViews.rgbDesc[d + R_ORDERED] = spanCount > 0 ? rOrdered : 0;
     this.rgbSpansUsed += spanCount;
     this.rgbDescCount += 1;
     return true;
@@ -684,9 +824,12 @@ export class BrowserBandPool implements BandDispatcher {
    * capture, Node report-only benches) enables it around measured frames
    * only; acceptance FPS is always measured with it off.
    *
-   * Worker messages carry no band index (renderer protocol), so arrivals
-   * are rank-ordered: arrivals[0] = first worker done, arrivals[last] =
-   * slowest-band wait for the kick.
+   * Worker completion messages carry the band index + tallies (see the
+   * worker loop's postMessage in `@q2/sw-renderer`), so arrivals are BOTH
+   * rank-ordered (arrivals[0] = first worker done, arrivals[last] =
+   * slowest-band wait for the kick) AND band-attributed (bandIds[i] names
+   * the worker that produced arrivals[i]). Unknown stubs that omit the
+   * fields read -1 — rank order still holds.
    *
    * `stagingBytes` reads the live bump offsets (mid-frame view);
    * `kickBytes` returns the snapshot each indexed/RGB flush takes BEFORE
@@ -716,22 +859,63 @@ export class BrowserBandPool implements BandDispatcher {
 
   /**
    * Last-kick diagnostic snapshot (null when disarmed or no kick ran yet).
-   * Allocates (diag path only, never the production frame).
+   * Allocates (diag path only, never the production frame). See
+   * DiagSnapshot for the clock-comparability contract: arrivals are
+   * dispatch-to-completion latencies (scheduling included), NOT in-worker
+   * compute durations.
    */
-  diagSnapshot(): {
-    kicks: number;
-    mainMs: number;
-    arrivals: number[];
-    slowestMs: number;
-  } | null {
+  diagSnapshot(): DiagSnapshot | null {
     if (!this.diagOn || this.diagKicks === 0) return null;
     const arrivals: number[] = [];
-    for (let i = 0; i < this.diagArrivalsSeen; i++) arrivals.push(this.diagArrivals[i]!);
+    const bandIds: number[] = [];
+    const pixels: number[] = [];
+    const spans: number[] = [];
+    for (let i = 0; i < this.diagArrivalsSeen; i++) {
+      arrivals.push(this.diagArrivals[i]!);
+      bandIds.push(this.diagBands[i]!);
+      pixels.push(this.diagPixels[i]!);
+      spans.push(this.diagSpans[i]!);
+    }
     return {
       kicks: this.diagKicks,
+      frame: this.diagFrame,
+      seq: this.diagSeq,
+      job: this.diagJob,
+      bands: this.diagBandCount,
       mainMs: this.diagMainMs,
       arrivals,
+      bandIds,
+      pixels,
+      spans,
       slowestMs: arrivals.length > 0 ? arrivals[arrivals.length - 1]! : -1,
+    };
+  }
+
+  /**
+   * Monotonic kick outcomes per job kind (successes + counted fallbacks)
+   * plus the quarantine flag. Fresh small object per call (observability
+   * path only — publishQ2Stats / StageReport sample it once per frame, not
+   * per pixel). Fallbacks are counted, never silent: any nonzero fallback
+   * with healthy output proves the inline/serial path executed.
+   *
+   * `scanned` accumulates span entries actually inspected by successful
+   * raster/RGB kicks (workers + main band); `scannedAvailable` reports
+   * whether the build exposes the counters at all (false on older
+   * builds — then `scanned` reads 0 and must NOT be mistaken for proof).
+   */
+  kickStats(): {
+    kicks: { raster: number; rgb: number; resolve: number; scanout: number };
+    fallbacks: { raster: number; rgb: number; resolve: number; scanout: number };
+    scanned: { raster: number; rgb: number };
+    scannedAvailable: boolean;
+    quarantined: boolean;
+  } {
+    return {
+      kicks: { ...this.statKicks },
+      fallbacks: { ...this.statFallbacks },
+      scanned: { ...this.statScanned },
+      scannedAvailable: this.scannedObserved,
+      quarantined: this.quarantined,
     };
   }
 
@@ -798,8 +982,9 @@ export class BrowserBandPool implements BandDispatcher {
     this.publishRGB(near, far, lodBias);
     const seq = this.seq;
     const finished = this.awaitWorkerMessages(seq, this.workers.length);
-    if (!this.kick(seq)) {
+    if (!this.kick(seq, 'rgb')) {
       this.pending.delete(seq);
+      this.statFallbacks.rgb += 1;
       return null;
     }
     // Calling thread owns the last band: drain it inline while the workers
@@ -811,10 +996,18 @@ export class BrowserBandPool implements BandDispatcher {
     );
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
     const ok = await finished;
-    if (!ok) return null;
+    if (!ok) {
+      this.statFallbacks.rgb += 1;
+      return null;
+    }
+    this.statKicks.rgb += 1;
     const tally = this.tally();
     tally.pixels += main.pixels;
     tally.spans += main.spans;
+    const mScan = scannedOf(main);
+    if (mScan.present || this.ctlScanOff() >= 0) this.scannedObserved = true;
+    tally.scanned += mScan.value;
+    this.statScanned.rgb += tally.scanned;
     this.resetRGB();
     return tally;
   }
@@ -952,13 +1145,21 @@ export class BrowserBandPool implements BandDispatcher {
     });
   }
 
-  /** Await every worker's completion message for one kick (async path). */
+  /**
+   * Await every worker's completion message for one kick (async path).
+   * Timeout quarantines the pool (see `quarantined`): wedged workers are
+   * terminated BEFORE the caller replays inline, so no straggler SAB
+   * write can race the fallback replay or any later frame. Dispose
+   * resolves in-flight kicks as failures without quarantining (the pool
+   * is already being torn down).
+   */
   private awaitWorkerMessages(seq: number, need: number): Promise<boolean> {
     let seen = 0;
     let failed = false;
     return new Promise<boolean>((resolve) => {
       const timer = window.setTimeout(() => {
         this.pending.delete(seq);
+        this.quarantineWorkers();
         resolve(false);
       }, this.timeoutMs);
       this.pending.set(seq, (ok: boolean) => {
@@ -971,6 +1172,26 @@ export class BrowserBandPool implements BandDispatcher {
         }
       });
     });
+  }
+
+  /**
+   * Terminate every worker and refuse all later kicks fast (see
+   * `quarantined`). Called only on kick timeout — the one failure mode
+   * that implies in-flight worker writes. Safe to call twice; never
+   * throws. The caller replays inline after this returns, converging to
+   * identical planes with no live writer left to race it.
+   */
+  private quarantineWorkers(): void {
+    this.quarantined = true;
+    for (const worker of this.workers) {
+      try {
+        worker.terminate();
+      } catch {
+        /* already gone */
+      }
+    }
+    this.workers.length = 0;
+    this.pending.clear();
   }
 
   /** Lazily clear the calling thread's band once per frame generation. */
@@ -1053,7 +1274,7 @@ export class BrowserBandPool implements BandDispatcher {
   }
 
   /** Wake workers for one kick (Atomics-only: workers block in Atomics.wait). */
-  private kick(seq: number): boolean {
+  private kick(seq: number, job: DiagJob = 'unknown'): boolean {
     try {
       Atomics.store(this.ctl, CTL_DONE, 0);
       Atomics.store(this.ctl, CTL_SEQ, seq);
@@ -1065,6 +1286,10 @@ export class BrowserBandPool implements BandDispatcher {
       this.diagArrivalsSeen = 0;
       this.diagMainMs = -1;
       this.diagKicks += 1;
+      this.diagFrame = this.frameGen;
+      this.diagSeq = seq;
+      this.diagJob = job;
+      this.diagBandCount = this.bands.length;
     }
     try {
       Atomics.notify(this.ctl, CTL_SEQ, this.workers.length);
@@ -1074,16 +1299,60 @@ export class BrowserBandPool implements BandDispatcher {
     return true;
   }
 
-  private tally(): { pixels: number; spans: number } {
+  private tally(): { pixels: number; spans: number; scanned: number } {
     // CTL_PIXELS + i / CTL_SPANS + i per-worker tallies (see bands.ts layout).
+    // CTL_SCAN + i per-worker inspected-span counts (renderer lane task 2):
+    // available only post-rebuild (see ctlScanOff) — 0 otherwise, and the
+    // pool reports scannedAvailable so harnesses never mistake 0 for proof.
     let pixels = 0;
     let spans = 0;
+    let scanned = 0;
+    const off = this.ctlScanOff();
     for (let i = 0; i < this.workers.length; i++) {
       pixels += this.ctl[CTL_PIXELS + i]!;
       spans += this.ctl[CTL_SPANS + i]!;
+      if (off >= 0) {
+        const s = this.ctl[off + i]!;
+        if (typeof s === 'number' && Number.isFinite(s) && s >= 0) scanned += s;
+      }
     }
-    return { pixels, spans };
+    return { pixels, spans, scanned };
   }
+
+  /**
+   * CTL_SCAN slot offset, resolved once via the module-namespace probe
+   * (-1 when the build predates the renderer lane's inspected-span
+   * counters). Never throws; the offset and the SAB region always come
+   * from the same package build at runtime, so a present offset is
+   * always in-bounds.
+   */
+  private ctlScanOff(): number {
+    if (this.scanOff === null) {
+      let off = -1;
+      try {
+        const ns = swRendererNS as unknown as Record<string, unknown>;
+        const v = ns['CTL_SCAN'];
+        if (typeof v === 'number' && Number.isInteger(v) && v > 0) off = v;
+      } catch {
+        /* older build: scanned aggregation stays off */
+      }
+      this.scanOff = off;
+    }
+    return this.scanOff;
+  }
+}
+
+/**
+ * Feature-detected `scanned` on a compute return (renderer lane task 2):
+ * post-rebuild `processFrameJob`/`processRGBFrameJob` returns carry span
+ * entries actually inspected (workers skip non-owned ordered subranges),
+ * older builds return `{ pixels, spans }` only. Never throws.
+ */
+function scannedOf(r: { pixels: number; spans: number }): { value: number; present: boolean } {
+  const s = (r as unknown as { scanned?: unknown }).scanned;
+  return typeof s === 'number' && Number.isFinite(s) && s >= 0
+    ? { value: s, present: true }
+    : { value: 0, present: false };
 }
 
 /**

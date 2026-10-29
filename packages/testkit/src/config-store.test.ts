@@ -1,24 +1,9 @@
-// PERF-FINISH-C ESM/CJS config-store regression (bench/testkit lane).
-//
-// The hazard: `@q2/config` ships dual-format dist (`index.mjs` + 
-// `index.js`) with a per-file module-level `Map`. Node ESM importers get
-// one store, CJS requirers get another: `setCVar` in one universe is
-// invisible in the other (proven below). Renderer selection
-// (`vid_renderer`), worker cvars, and the vd_* scanout profile MUST be
-// observed through ONE store, or the bench rows silently describe a
-// different config than the renderer/host/scanout path executes.
-//
-// Resolution in this lane:
-//   - tools/bench runs ESM-only (dist/index.mjs; `web/dist/index.mjs`
-//     explicitly, never the CJS `web` main; no `createRequire` CJS
-//     touchpoints) — one module universe, one store.
-//   - This test proves shared state across the ESM graph: a cvar set the
-//     way bench sets it is observed on the renderer/host path.
-//   - The CJS isolation below is PINNED, not fixed: unifying the store
-//     (e.g. a globalThis singleton in @q2/config, or single-format dist)
-//     is a CONTRACT NEED for the packages/config lane. When that lands,
-//     the isolation assertion must be flipped to shared — deliberately,
-//     in the same PR.
+// Shared-store contract (packages/config `globalThis` singleton):
+// `@q2/config` ships dual-format dist (`index.mjs` + `index.js`) but keeps
+// ONE registry per runtime, so ESM and CJS consumers in the same process
+// observe the same configuration state. Renderer selection
+// (`vid_renderer`), worker cvars, and the vd_* scanout profile reach the
+// real host/renderer/scanout graph regardless of which universe wrote them.
 import { afterEach, describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 import { createFramebuffer } from '@q2/renderer-api';
@@ -106,11 +91,10 @@ describe('ESM graph shares one config store (bench → renderer/host path)', () 
     expect(stats.spans).toBeGreaterThan(0);
   });
 
-  it('documents the ESM/CJS store split (contract need: packages/config)', () => {
-    // The CJS dist is a SEPARATE module instance with its own Map. This
-    // assertion pins the hazard: if it ever starts SEEING the ESM value,
-    // the config lane unified the store — flip this test to shared in
-    // that PR and remove the bench ESM-only workarounds.
+  it('ESM and CJS universes share one config store (packages/config singleton)', () => {
+    // The dual-format dist (index.mjs + index.js) observes ONE store per
+    // process via the globalThis singleton. Writes through ESM are visible
+    // through CJS and vice versa.
     const require = createRequire(import.meta.url);
     const cjsPath: string = require.resolve('@q2/config');
     expect(cjsPath.endsWith('dist/index.js')).toBe(true);
@@ -118,11 +102,15 @@ describe('ESM graph shares one config store (bench → renderer/host path)', () 
     const cjs = require(cjsPath) as {
       getCVarNumber(n: string): number;
       getCVarString(n: string): string;
+      setCVar(n: string, v: number | string | boolean): void;
     };
-    setCVar('voodoo_probe_sentinel', 987654);
+    // ESM -> CJS.
+    setCVar('shared_probe_sentinel', 987654);
+    expect(cjs.getCVarNumber('shared_probe_sentinel')).toBe(987654);
     setCVarFromString('vid_renderer', 'voodoo');
-    // Same-process, same-package, different universe: invisible.
-    expect(cjs.getCVarNumber('voodoo_probe_sentinel')).toBe(0);
-    expect(cjs.getCVarString('vid_renderer')).toBe('software');
+    expect(cjs.getCVarString('vid_renderer')).toBe('voodoo');
+    // CJS -> ESM (renderer selection + fidelity reach the real graph).
+    cjs.setCVar('vd_gamma', 1.3);
+    expect(getCVarNumber('vd_gamma')).toBe(1.3);
   });
 });

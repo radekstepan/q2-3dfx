@@ -1070,9 +1070,23 @@ function blip(ctx: AudioContext, master: GainNode, freq: number, dur: number, wh
  * - `rgbPending`/`stageBytes`: batches still staged at present time
  *   (healthy: 0 — every kick flushed) + bytes staged for the frame kick
  *   (indexed spans/tex/light + RGB spans/chains/luxels; -1 when unpooled).
- * - `fgInline`: entity-foreground batches drawn inline after the kick
- *   (foreground always rides inline today; -1 = renderer has no foreground
- *   counter yet — see the PERF-FINISH-B contract note in publishQ2Stats).
+ * - `fgInline`: entity-foreground classic spans elided where the RGB twin
+ *   drew (foreground always rides inline today — the RGB twins are the
+ *   displayed values, so a healthy pooled voodoo frame shows this > 0
+ *   alongside rgbKicks = 1; -1 = renderer has no foreground counter yet
+ *   — see the PERF-FINISH-B contract note in publishQ2Stats).
+ * - `fgStaged`/`fgWorker`/`fgInlineRgb`/`fgKicks`: foreground RGB
+ *   execution proof when the renderer publishes it (optional
+ *   `testRGBForegroundStats` hook: batches offered to workers, batches
+ *   actually rasterised on workers, batches drawn inline, kicks
+ *   completed; falls back to the renderer-lane `testForegroundWorkerStats`
+ *   `{ staged, inline, kicks }` with worker derived as staged-when-kicks>0).
+ *   -1 = hook absent (older renderer). Never guessed.
+ * - `rgbFallbacks`: pooled RGB-kick failures this boot (timeout/dead
+ *   worker → inline replay, bit-identical). Healthy: 0.
+ * - `quarantined`: the pool timed out a kick and terminated its workers
+ *   (stale-write guard fired — later kicks refuse fast until reboot).
+ *   Healthy: false.
  * - `voodooPath`/`resolveOrder`: which scanout path the last resolve took
  *   (`worker` = pooled Track A kick, `serial` = main-thread resolve,
  *   `none` = software mode) and the HUD ordering. Proves the pooled
@@ -1104,12 +1118,35 @@ export interface Q2Stats {
    */
   fgInline: number;
   /**
+   * Foreground RGB execution proof (renderer lane owns the hook): batches
+   * offered to workers, batches actually rasterised on workers, batches
+   * drawn inline on the main thread, kicks completed. -1 = the renderer
+   * publishes no foreground counter (this HEAD: foreground always rides
+   * inline after the world kick — absence is healthy; the world-lane
+   * counters plus fgInline > 0 are the foreground proof). Never guessed.
+   */
+  fgStaged: number;
+  fgWorker: number;
+  fgInlineRgb: number;
+  fgKicks: number;
+  /**
    * Authoritative-skip observability (PERF-FINISH-A): classic world spans
    * elided where the RGB overlay drew + whether the skip armed this frame.
    * 0/false when the hook is absent (older renderer) or the oracle pinned.
    */
   classicSkipped: number;
   skipArmed: boolean;
+  /**
+   * Pooled RGB-kick failures this boot (timeout/dead worker → counted
+   * inline replay, bit-identical). 0 = none (healthy, or unpooled).
+   */
+  rgbFallbacks: number;
+  /**
+   * The browser pool timed out a kick and terminated its workers
+   * (stale-write guard fired — later kicks refuse fast until reboot).
+   * False = healthy (or unpooled).
+   */
+  quarantined: boolean;
   voodooPath: string;
   resolveOrder: string;
   scanoutKicks: number;
@@ -1120,10 +1157,21 @@ export interface Q2Stats {
 const Q2STATS_ZERO: Q2Stats = {
   fps: 0, frame: 0, pooled: false, rgbStaged: 0, rgbKicks: 0, rgbInline: 0,
   bands: 1, poolSpans: 0, poolPixels: 0, rgbPending: 0, stageBytes: -1,
-  fgInline: -1, classicSkipped: 0, skipArmed: false,
+  fgInline: -1, fgStaged: -1, fgWorker: -1, fgInlineRgb: -1, fgKicks: -1,
+  classicSkipped: 0, skipArmed: false,
+  rgbFallbacks: 0, quarantined: false,
   voodooPath: 'none', resolveOrder: 'none',
   scanoutKicks: 0, scanoutFallbacks: 0, asyncFallbacks: 0,
 };
+
+/**
+ * Finite-number probe with a sentinel fallback (foreground-stat hooks may
+ * return partial shapes on future renderer builds — never NaN/undefined
+ * into the live record, never a throw).
+ */
+function numOr(v: unknown, fallback: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+}
 
 /**
  * Publish one frame's stats to `globalThis.__q2stats` (single reused
@@ -1141,6 +1189,11 @@ const Q2STATS_ZERO: Q2Stats = {
  * present — foreground classic spans elided where the RGB twin drew — and
  * reports -1 when the hook is absent (older renderer), never a guess.
  * `classicSkipped`/`skipArmed` carry the world-span twin of the same hook.
+ * `fgStaged`/`fgWorker`/`fgInlineRgb`/`fgKicks` read the optional
+ * `testRGBForegroundStats` hook (`{ staged, worker, inline, kicks }`)
+ * the same way (-1 each when absent), falling back to the renderer-lane
+ * `testForegroundWorkerStats` shape (worker derived, documented at the
+ * probe); the renderer lane owns those hooks.
  */
 export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2Stats {
   const snap: Q2Stats = { ...Q2STATS_ZERO, fps, frame };
@@ -1173,6 +1226,10 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
         rgbPending?: () => number;
         kickBytes?: () => { total: number } | null;
         stagingBytes?: () => { total: number };
+        kickStats?: () => {
+          fallbacks: { rgb: number };
+          quarantined: boolean;
+        };
       } | null;
       rec.rgbPending = pool && typeof pool.rgbPending === 'function'
         ? pool.rgbPending() : 0;
@@ -1181,9 +1238,60 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
       rec.stageBytes = kb !== null && kb !== undefined ? kb.total
         : pool && typeof pool.stagingBytes === 'function'
           ? pool.stagingBytes().total : -1;
+      // Pool-level RGB kick outcomes (counted, never silent). A Node-pool
+      // stand-in (headless tests) has no kickStats — guarded, stays 0/false.
+      if (pool && typeof pool.kickStats === 'function') {
+        const ks = pool.kickStats();
+        rec.rgbFallbacks = ks.fallbacks.rgb | 0;
+        rec.quarantined = ks.quarantined === true;
+      } else {
+        rec.rgbFallbacks = 0;
+        rec.quarantined = false;
+      }
     } catch {
       rec.rgbPending = 0;
       rec.stageBytes = -1;
+      rec.rgbFallbacks = 0;
+      rec.quarantined = false;
+    }
+    try {
+      const boot2 = boot.refresh as unknown as {
+        testRGBForegroundStats?: () => {
+          staged: number; worker: number; inline: number; kicks: number;
+        };
+        testForegroundWorkerStats?: () => {
+          staged: number; inline: number; kicks: number;
+        };
+      };
+      const fg = boot2.testRGBForegroundStats;
+      const fgLegacy = boot2.testForegroundWorkerStats;
+      if (typeof fg === 'function') {
+        const fs = fg.call(boot.refresh);
+        rec.fgStaged = numOr(fs.staged, -1);
+        rec.fgWorker = numOr(fs.worker, -1);
+        rec.fgInlineRgb = numOr(fs.inline, -1);
+        rec.fgKicks = numOr(fs.kicks, -1);
+      } else if (typeof fgLegacy === 'function') {
+        // Renderer-lane hook shape: { staged, inline, kicks }. Staged
+        // batches ride the same JOB_RGB kick as the world batches, so a
+        // completed kick means the staged batches were worker-rendered
+        // (worker count derived, not separately measured).
+        const fs = fgLegacy.call(boot.refresh);
+        rec.fgStaged = numOr(fs.staged, -1);
+        rec.fgKicks = numOr(fs.kicks, -1);
+        rec.fgInlineRgb = numOr(fs.inline, -1);
+        rec.fgWorker = rec.fgKicks > 0 ? rec.fgStaged : 0;
+      } else {
+        rec.fgStaged = -1;
+        rec.fgWorker = -1;
+        rec.fgInlineRgb = -1;
+        rec.fgKicks = -1;
+      }
+    } catch {
+      rec.fgStaged = -1;
+      rec.fgWorker = -1;
+      rec.fgInlineRgb = -1;
+      rec.fgKicks = -1;
     }
     try {
       const fg = (boot.refresh as unknown as {

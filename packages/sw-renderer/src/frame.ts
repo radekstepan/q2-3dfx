@@ -32,7 +32,7 @@ import { WasmSpanBackend, wasmRequestedByCvar } from './wasmSpans.js';
 import {
   BandedSoftwareBackend, createBandBuffers, sabAvailable, workersRequestedByCvar,
   accumRequestedByCvar,
-  R_FLAG_BILINEAR, R_FLAG_DEPTHWRITE, R_FLAG_FLAT, R_FLAG_LIGHT,
+  R_FLAG_BILINEAR, R_FLAG_BLEND_ALPHA, R_FLAG_DEPTHWRITE, R_FLAG_FLAT, R_FLAG_LIGHT,
   R_FLAG_MIPDITHER, R_FLAG_OPAQUE, R_FLAG_OVERBRIGHT, R_FLAG_REPEAT, R_FLAG_WARP,
   type BandDispatcher,
 } from './bands.js';
@@ -43,7 +43,7 @@ import { drawAliasInstance } from './alias.js';
 import { drawTracerBeam, drawTracerBeamRGB, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE, TRACER_CORE_COLOR } from './tracer.js';
 import { isValidSkySize, SKY_BOX_CORNERS, SKY_BOX_HALF, skyUvOnFace } from './sky.js';
 import { AngleVectors } from '@q2/math';
-import { drawSprite, drawSpriteRGB } from './sprites.js';
+import { drawSprite, drawSpriteRGB, emitSpriteSpans } from './sprites.js';
 import { drawParticles, drawParticlesRGB, projectParticles, type ScreenParticle } from './particles.js';
 import { buildColormap, buildAlphamapPair, defaultPalette, extractAlphamap33, extractAlphamap66, COLORMAP_PCX_PIXELS } from './colormap.js';
 import { createDevroom, getDevMesh } from './devroom.js';
@@ -532,6 +532,31 @@ export class SoftwareRenderer implements Refresh {
   private rgbInlineBatches = 0;
   private rgbKicks = 0;
   /**
+   * Foreground worker observability (renderer lane task 1): span-based
+   * foreground batches (deferred alpha, world sprites) staged into the
+   * RGB worker kick vs drawn inline, and foreground kicks completed.
+   * Per-pixel/triangle foreground (alias, particles, tracers, entities)
+   * stays inline — see the drawForeground doc.
+   */
+  private fgStagedBatches = 0;
+  private fgInlineBatches = 0;
+  private fgKicks = 0;
+  /**
+   * Classic work avoided by the RGB-first probe (renderer lane task 3):
+   * scalar surface-block builds skipped on RGB cache hits while the
+   * authoritative skip is armed, and the estimated texel+luxel bytes those
+   * builds would have allocated/copied. Reset per frame in beginFrame.
+   */
+  private classicAvoidedBuilds = 0;
+  private classicAvoidedBytes = 0;
+  /**
+   * Worker span entries actually inspected this frame (renderer lane task
+   * 2): summed from every pool kick tally (indexed + world RGB +
+   * foreground RGB), main band included. Compare against staged spans to
+   * prove subranges skip non-owned rows.
+   */
+  private rangeScanned = 0;
+  /**
    * EndFrame resolve scratch only (expanded from rgb565 where covered).
    * Nothing blends against it mid-frame.
    */
@@ -713,6 +738,12 @@ export class SoftwareRenderer implements Refresh {
   /** Reusable per-luxel world-pos grid for dlight falloff (grown on demand). */
   private dluxScratch: Float32Array = new Float32Array(0);
   private styleScratch = new Float32Array(8);
+  /** Reusable style-scale array for the scalar/RGB miss paths (task 6:
+   * the per-miss `scalesCopy`/`scales` allocations showed up as steady
+   * garbage on dlight-churn frames; the builders consume the scales
+   * synchronously and never retain them, so one shared scratch is exact).
+   * Grown on demand, never reallocated in steady state. */
+  private scalesScratch: number[] = [];
   private frameStats: FrameStats = { spans: 0, pixels: 0, overdraw: 0, ms: 0 };
   /**
    * Stats partials stashed by renderView for finishStats() (see above).
@@ -958,6 +989,45 @@ export class SoftwareRenderer implements Refresh {
       inline: this.rgbInlineBatches,
       kicks: this.rgbKicks,
     };
+  }
+
+  /**
+   * Foreground worker observability (renderer lane task 1): span-based
+   * foreground batches (deferred alpha, world sprites) staged for the
+   * worker kick vs drawn inline, and foreground kicks completed, since
+   * the last beginFrame. Per-pixel/triangle foreground (alias, particles,
+   * tracers, entities) always counts inline — it never stages.
+   */
+  testForegroundWorkerStats(): { staged: number; inline: number; kicks: number } {
+    return {
+      staged: this.fgStagedBatches,
+      inline: this.fgInlineBatches,
+      kicks: this.fgKicks,
+    };
+  }
+
+  /**
+   * Classic work avoided by the RGB-first probe (renderer lane task 3):
+   * scalar surface-block builds skipped on RGB cache hits while the
+   * authoritative skip was armed, and the estimated texel+luxel bytes
+   * those builds would have copied, since the last beginFrame. Zero in
+   * software mode and under the classic oracle (cvar 0).
+   */
+  testClassicAvoidStats(): { builds: number; bytes: number } {
+    return {
+      builds: this.classicAvoidedBuilds,
+      bytes: this.classicAvoidedBytes,
+    };
+  }
+
+  /**
+   * Worker span-entry proof (renderer lane task 2): entries actually
+   * inspected by pool kicks (indexed + world RGB + foreground RGB, main
+   * band included) since the last beginFrame. Compare against staged
+   * spans to prove subranges skip non-owned rows.
+   */
+  testWorkerRangeStats(): { scanned: number } {
+    return { scanned: this.rangeScanned };
   }
 
   /** Pending staged RGB batches (observability for the browser soak). */
@@ -1479,21 +1549,25 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
-   * Inline fallback for a world RGB batch that could not stage: replay any
+   * Inline fallback for an RGB batch that could not stage: replay any
    * pending staged work inline first (ordering), draw this batch inline,
    * and latch the rest of the frame inline (the deferred kick must not
    * wipe these direct plane writes). Identical output via depth-guarded
-   * convergence.
+   * convergence. `fg` selects the foreground counters (task 1) instead of
+   * the world counters; the latch is shared (one inline write anywhere
+   * pins the rest of the frame inline).
    */
-  private drawInlineRGBRest(list: SpanList, mat: RGBMaterial): void {
+  private drawInlineRGBRest(list: SpanList, mat: RGBMaterial, fg = false): void {
     const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
     if (pool && pool.rgbPending() > 0) {
       const q = pool.drawInlineRGBAll(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
       this.rgbBackend.spansDrawn += q.spans;
       this.rgbBackend.pixelsDrawn += q.pixels;
+      this.rangeScanned += q.scanned ?? 0;
     }
     this.rgbInlineRest = true;
-    this.rgbInlineBatches++;
+    if (fg) this.fgInlineBatches++;
+    else this.rgbInlineBatches++;
     this.drawRGBSpans(list, mat);
   }
 
@@ -1511,12 +1585,14 @@ export class SoftwareRenderer implements Refresh {
     if (r) {
       this.rgbBackend.spansDrawn += r.spans;
       this.rgbBackend.pixelsDrawn += r.pixels;
+      this.rangeScanned += r.scanned ?? 0;
       this.rgbKicks++;
       return;
     }
     const q = pool.drawInlineRGBAll(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
     this.rgbBackend.spansDrawn += q.spans;
     this.rgbBackend.pixelsDrawn += q.pixels;
+    this.rangeScanned += q.scanned ?? 0;
   }
 
   /**
@@ -1530,12 +1606,14 @@ export class SoftwareRenderer implements Refresh {
     if (r) {
       this.rgbBackend.spansDrawn += r.spans;
       this.rgbBackend.pixelsDrawn += r.pixels;
+      this.rangeScanned += r.scanned ?? 0;
       this.rgbKicks++;
       return;
     }
     const q = pool.drawInlineRGBAll(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
     this.rgbBackend.spansDrawn += q.spans;
     this.rgbBackend.pixelsDrawn += q.pixels;
+    this.rangeScanned += q.scanned ?? 0;
   }
 
   /**
@@ -1551,6 +1629,149 @@ export class SoftwareRenderer implements Refresh {
     }
     this.rgbInlineBatches++;
     this.drawRGBSpans(list, mat);
+  }
+
+  /**
+   * Stage one foreground RGB batch for the worker kick (renderer lane task
+   * 1). Accepts exactly the serial foreground span draws: opaque,
+   * depth-writing batches (world-placed sprites) and alpha-blended,
+   * non-depth-writing batches (deferred TRANS33/66 glass). Addressing must
+   * be uniform (repeat or clamp on both axes — the staged protocol carries
+   * one bit); FLAT fills and per-pixel/triangle foreground (alias,
+   * particles, tracers, entities) stay inline. World-before-foreground
+   * order is preserved by descriptor order per band: the world kick (or
+   * the inline-rest replay) always drains before any foreground stage, and
+   * each foreground group flushes before the next inline direct write (see
+   * drawForeground). Every write stays depth-guarded: identical output
+   * either way. Never throws. Returns true when staged.
+   */
+  private stageForegroundRGBSpans(list: SpanList, mat: RGBMaterial): boolean {
+    this.rgbUsedThisFrame = true;
+    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    if (!pool || this.rgbInlineRest) {
+      this.fgInlineBatches++;
+      this.drawRGBSpans(list, mat);
+      return false;
+    }
+    const blendAlpha = mat.blend === 'alpha';
+    const opaqueOk = mat.blend === 'opaque' && mat.depthWrite;
+    const alphaOk = blendAlpha && !mat.depthWrite;
+    if (!opaqueOk && !alphaOk) {
+      this.drawInlineRGBRest(list, mat, true);
+      return false;
+    }
+    const repeatS = mat.addressS === 'repeat';
+    const repeatT = mat.addressT === 'repeat';
+    if (repeatS !== repeatT) {
+      this.drawInlineRGBRest(list, mat, true);
+      return false;
+    }
+    let flags = 0;
+    if (mat.warp) flags |= R_FLAG_WARP;
+    if (mat.bilinear !== false) flags |= R_FLAG_BILINEAR;
+    if (mat.mipDither) flags |= R_FLAG_MIPDITHER;
+    if (mat.overbright) flags |= R_FLAG_OVERBRIGHT;
+    if (mat.opaqueMask) flags |= R_FLAG_OPAQUE;
+    if (mat.depthWrite) flags |= R_FLAG_DEPTHWRITE;
+    if (repeatS) flags |= R_FLAG_REPEAT;
+    if (blendAlpha) flags |= R_FLAG_BLEND_ALPHA;
+    let luxels: Uint8Array | null = null;
+    let luxW = 0, luxH = 0;
+    if (mat.light) {
+      luxels = mat.light.samples;
+      luxW = mat.light.luxW;
+      luxH = mat.light.luxH;
+      if (!(luxW > 0 && luxH > 0) || luxels.length < luxW * luxH * 3) {
+        this.drawInlineRGBRest(list, mat, true);
+        return false;
+      }
+      flags |= R_FLAG_LIGHT;
+    }
+    if (mat.flatColor) {
+      this.drawInlineRGBRest(list, mat, true);
+      return false;
+    }
+    const count = list.count < list.spans.length ? list.count : list.spans.length;
+    const ok = pool.stageRGB(
+      list, 0, count, mat.levels, luxels, luxW, luxH,
+      flags, mat.zbits, mat.turbPhase, 0,
+    );
+    if (!ok) {
+      this.drawInlineRGBRest(list, mat, true);
+      return false;
+    }
+    this.fgStagedBatches++;
+    return true;
+  }
+
+  /**
+   * Foreground RGB batch route (task 1): stage span-based foreground
+   * (deferred alpha, world sprites) for the worker kick when pooled, draw
+   * inline otherwise. Per-pixel/triangle foreground always draws inline
+   * via drawRGBSpans (alias, particles, tracers, entities).
+   */
+  private drawForegroundRGBSpans(list: SpanList, mat: RGBMaterial): void {
+    const pooled = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    if (pooled) {
+      this.stageForegroundRGBSpans(list, mat);
+      return;
+    }
+    this.fgInlineBatches++;
+    this.drawRGBSpans(list, mat);
+  }
+
+  /**
+   * Complete staged foreground RGB work (blocking): one worker kick over
+   * the batches staged since the last flush, tallied into the RGB backend
+   * counters. Called at each point where staged foreground must become
+   * visible before a subsequent inline direct write (alpha before alias,
+   * sprites before particles) — this is what preserves the serial order
+   * with mixed inline/staged foreground. Timeout/pool failure replays
+   * inline (identical). No-op without staged work or once the inline-rest
+   * latch tripped.
+   */
+  private flushForegroundRGB(): void {
+    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    if (!pool || this.rgbInlineRest || pool.rgbPending() === 0) return;
+    const r = pool.flushRGBFrame(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
+    if (r) {
+      this.rgbBackend.spansDrawn += r.spans;
+      this.rgbBackend.pixelsDrawn += r.pixels;
+      this.rangeScanned += r.scanned ?? 0;
+      this.fgKicks++;
+      return;
+    }
+    const q = pool.drawInlineRGBAll(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
+    this.rgbBackend.spansDrawn += q.spans;
+    this.rgbBackend.pixelsDrawn += q.pixels;
+    this.rangeScanned += q.scanned ?? 0;
+  }
+
+  /**
+   * Same as flushForegroundRGB but message-driven (browser async
+   * completion: no Atomics.wait on the calling thread), used at the same
+   * two flush points by drawForegroundAsync. The browser pool's sync flush
+   * always declines (null) and its async flush runs the staged batches on
+   * workers; the Node pool serves both. Async decline/timeout/failure
+   * falls back to the sync flush (identical inline replay). No-op without
+   * staged work or once the inline-rest latch tripped.
+   */
+  private async flushForegroundRGBAsync(): Promise<void> {
+    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
+    if (!pool || this.rgbInlineRest || pool.rgbPending() === 0) return;
+    try {
+      const r = await pool.flushRGBFrameAsync(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
+      if (r) {
+        this.rgbBackend.spansDrawn += r.spans;
+        this.rgbBackend.pixelsDrawn += r.pixels;
+        this.rangeScanned += r.scanned ?? 0;
+        this.fgKicks++;
+        return;
+      }
+    } catch {
+      /* fall through to the sync flush below */
+    }
+    this.flushForegroundRGB();
   }
 
   /**
@@ -1747,6 +1968,12 @@ export class SoftwareRenderer implements Refresh {
     this.rgbStagedBatches = 0;
     this.rgbInlineBatches = 0;
     this.rgbKicks = 0;
+    this.fgStagedBatches = 0;
+    this.fgInlineBatches = 0;
+    this.fgKicks = 0;
+    this.classicAvoidedBuilds = 0;
+    this.classicAvoidedBytes = 0;
+    this.rangeScanned = 0;
     this.classicSpansSkipped = 0;
     this.classicFgSkipped = 0;
     if (rgbWorldEnabled) {
@@ -2009,7 +2236,9 @@ export class SoftwareRenderer implements Refresh {
         if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
         if (nproj < 3) { if (d) d.clipRejected++; continue; }
         const start = this.spanList.count;
-        const flat = this.flatForEmit(SPAN_FLAT, order, this.skyIndex, 0, null);
+        // Task 3: skip the unused classic flat-span packing when the
+        // classic fill below is elided (RGB stager packs from the objects).
+        const flat = skipClassicWorld ? undefined : this.flatForEmit(SPAN_FLAT, order, this.skyIndex, 0, null);
         const endCount = emitSpansForPoly(
           this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
           flat,
@@ -2087,35 +2316,80 @@ export class SoftwareRenderer implements Refresh {
         this.styleHashStyles = view.lightStyles;
       }
       if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
-      let block = this.cache.get(surf.id, stylesHash, mip);
-      if (!block) {
-        // copy the style scales out of scratch (build is a miss-only path)
-        if (nValid < 0) nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
-        const scalesCopy: number[] = [];
-        for (let k = 0; k < nValid; k++) scalesCopy.push(this.styleScratch[k]!);
-        if (scalesCopy.length === 0) scalesCopy.push(1);
-        block = this.buildSurfaceBlock(worldData, surf, mip, scalesCopy, dyn, dlightFrameBits(surf.id));
-        this.cache.put(surf.id, stylesHash, mip, block);
-      }
-      const tex = texView;
-      tex.width = block.bw;
-      tex.height = block.bh;
-      tex.texels = block.texels;
-      const lb = lightView;
-      lb.width = block.luxW;
-      lb.height = block.luxH;
-      lb.values = block.light;
-      if (ph) { ph.cache += phaseNow() - pt; pt = phaseNow(); }
-      // RGB (voodoo-policy) binding for the world pass. Resolved from the
-      // parallel RGB cache (keyed by surface/style/mip + dlight serial); a
-      // miss builds it from the scalar block's texels plus a fresh RGB
-      // luxel block and caches both. Null (turbulent-free invalid
-      // lightmap, pooled/wasm backend, flag off) falls back to the scalar
-      // backend alone. The classic draw below ALWAYS runs (even when an
-      // RGB material exists): software planes stay bit-identical, and the
-      // RGB overlay composites over them in endFrame.
+      // Task 3 (block-free RGB): while the authoritative skip is armed the
+      // scalar block has no consumer (classic is elided wherever the RGB
+      // material draws), so RGB hits skip it untouched and RGB misses build
+      // the material without it (validation from the source dims; the entry
+      // stores the shared empty scalar sentinel — never rasterised). The
+      // scalar block builds only when RGB fails (classic fallback) or
+      // under the oracle. One scalar lookup per surface either way, so the
+      // cache stats below are not double-counted. Cache keys + invalidation
+      // are unchanged (both caches drop together in dropTouchedSurfaces),
+      // so a later oracle frame simply rebuilds scalar entries the RGB
+      // frames skipped.
+      let block: SurfaceBlock | null = null;
       let rgbMat: RGBMaterial | null = null;
-      if (this.rgbOverlayActive() && !surf.sky) {
+      let scalarFetched = false;
+      if (skipClassicWorld && !surf.sky) {
+        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 0);
+        if (rgbHit) {
+          rgbMat = rgbHit.material;
+          // Warp phase is frame state, not cached state (see below).
+          if (rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
+        } else {
+          block = this.cache.get(surf.id, stylesHash, mip);
+          scalarFetched = true;
+          if (block === null) {
+            rgbMat = this.buildRGBEntry(
+              worldData, surf, null, stylesHash, mip,
+              view.lightStyles, dyn, dlightFrameBits(surf.id),
+              { variant: 0 },
+            );
+            if (rgbMat) {
+              if (rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
+              this.classicAvoidedBuilds++;
+              const srcT = worldData.textures[surf.texId % worldData.textures.length]!;
+              const shift = mip > 3 ? 3 : mip;
+              this.classicAvoidedBytes += Math.max(1, srcT.width >> shift) *
+                Math.max(1, srcT.height >> shift) + lm.luxW * lm.luxH;
+            }
+          } else {
+            rgbMat = this.buildRGBEntry(
+              worldData, surf, block, stylesHash, mip,
+              view.lightStyles, dyn, dlightFrameBits(surf.id),
+              { variant: 0 },
+            );
+            if (rgbMat && rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
+          }
+        }
+      }
+      if (!rgbMat) {
+        if (!scalarFetched) block = this.cache.get(surf.id, stylesHash, mip);
+        if (!block) {
+          // copy the style scales out of scratch (build is a miss-only path;
+          // the shared scratch is exact: buildSurfaceBlock consumes the
+          // scales synchronously and never retains them).
+          if (nValid < 0) nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
+          const scalesCopy = this.scalesScratch;
+          scalesCopy.length = 0;
+          for (let k = 0; k < nValid; k++) scalesCopy.push(this.styleScratch[k]!);
+          if (scalesCopy.length === 0) scalesCopy.push(1);
+          block = this.buildSurfaceBlock(worldData, surf, mip, scalesCopy, dyn, dlightFrameBits(surf.id));
+          this.cache.put(surf.id, stylesHash, mip, block);
+        }
+        texView.width = block.bw;
+        texView.height = block.bh;
+        texView.texels = block.texels;
+        lightView.width = block.luxW;
+        lightView.height = block.luxH;
+        lightView.values = block.light;
+      }
+      if (ph) { ph.cache += phaseNow() - pt; pt = phaseNow(); }
+      // RGB (voodoo-policy) binding for the world pass (oracle order: the
+      // skip-armed path above already resolved or fell back to scalar).
+      // Null (unusable lightmap, pooled/wasm backend, flag off) falls back
+      // to the scalar backend alone.
+      if (!rgbMat && this.rgbOverlayActive() && !surf.sky && block && !skipClassicWorld) {
         const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 0);
         rgbMat = rgbHit
           ? rgbHit.material
@@ -2129,7 +2403,10 @@ export class SoftwareRenderer implements Refresh {
         // freezing on its build frame.
         if (rgbMat && rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
       }
-      // emit
+      // emit (skip the fused classic flat-span packing when the classic
+      // draw below is elided — the RGB stager packs from the span objects,
+      // so the SAB flat copy would be unused staging writes).
+      const willSkipClassic = skipClassicWorld && rgbMat !== null;
       this.polyInput.verts = surf.verts;
       this.polyInput.uvs = surf.uvs;
       this.polyInput.lux = surf.lux;
@@ -2138,7 +2415,7 @@ export class SoftwareRenderer implements Refresh {
       if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
       if (nproj < 3) { if (d) d.clipRejected++; continue; }
       const start = this.spanList.count;
-      const flat = this.flatForEmit(
+      const flat = willSkipClassic ? undefined : this.flatForEmit(
         surf.turbulent ? SPAN_TURBULENT : SPAN_OPAQUE, order, null, null, null,
       );
       const endCount = emitSpansForPoly(
@@ -2166,7 +2443,7 @@ export class SoftwareRenderer implements Refresh {
       if (skipClassicWorld && rgbMat) {
         this.classicSpansSkipped += endCount - start;
       } else {
-        this.backend.drawSpans(this.spanList, tex, lb);
+        this.backend.drawSpans(this.spanList, texView, lightView);
       }
       if (rgbMat) {
         this.drawWorldRGBSpans(this.spanList, rgbMat);
@@ -2190,7 +2467,7 @@ export class SoftwareRenderer implements Refresh {
     if (this.backend === this.bandBackend && this.bandBackend.dispatcher &&
       this.bandBackend.accumEnabled && !this.bandBackend.flushDeferred) {
       if (ph) pt = phaseNow();
-      this.bandBackend.flushAccum();
+      this.rangeScanned += this.bandBackend.flushAccum();
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
     }
     // RGB worker kick (PERF-2): drain staged world RGB batches before any
@@ -2236,18 +2513,13 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
-   * Entity foreground: deferred translucent alpha (R_DrawAlphaSurfaces)
-   * first — it must land after the pool kick (the kick would wipe these
-   * direct plane writes), then world-placed alias / sprites / particles
-   * (M3.4), game entities (MD2 alias incl. the depthHack viewmodel,
-   * sprites, tracer beams) and renderer-owned tracer beams, then dlight
-   * aging. Alpha stays ahead of entities exactly like the old pre-kick
-   * order (relative compositing unchanged); only its position vs the kick
-   * moved. Bit-identical either way: world-first, foreground-second, all
-   * writes depth-guarded. Zero allocation (phase timing uses the armed
-   * scratch). Returns the alpha spans emitted (feeds the stats stash).
+   * Foreground segment 1: RGB background seed + deferred translucent alpha
+   * (R_DrawAlphaSurfaces) pass. Split from drawForeground for async
+   * orchestration (see drawForeground): the body is unchanged, ends
+   * immediately before the alpha flush point. Returns the alpha spans
+   * emitted (feeds the stats stash).
    */
-  private drawForeground(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[], entities: Entity[]): number {
+  private drawForegroundAlphaPass(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[]): number {
     const ph = this.phaseArmed ? this.phaseAcc : null;
     let pt = ph ? phaseNow() : 0;
     const d = this.diagArmed ? this.diagAcc : null;
@@ -2302,23 +2574,65 @@ export class SoftwareRenderer implements Refresh {
         this.styleHashStyles = view.lightStyles;
       }
       if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
-      let block = this.cache.get(surf.id, stylesHash, mip);
-      if (!block) {
-        if (nValid < 0) nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
-        const scalesCopy: number[] = [];
-        for (let k = 0; k < nValid; k++) scalesCopy.push(this.styleScratch[k]!);
-        if (scalesCopy.length === 0) scalesCopy.push(1);
-        block = this.buildSurfaceBlock(worldData, surf, mip, scalesCopy, dyn, this.alphaDeferredBits[a]!);
-        this.cache.put(surf.id, stylesHash, mip, block);
+      // Task 3 (block-free RGB, alpha variant): same contract as the world
+      // pass above — RGB hits skip the scalar block untouched, RGB misses
+      // build the alpha material without it, and the scalar block builds
+      // only when RGB fails (classic fallback) or under the oracle.
+      let block: SurfaceBlock | null = null;
+      let alphaRgbMat: RGBMaterial | null = null;
+      let alphaScalarFetched = false;
+      if (fgSkip) {
+        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 1);
+        if (rgbHit) {
+          alphaRgbMat = rgbHit.material;
+          if (alphaRgbMat.warp) alphaRgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
+        } else {
+          const got = this.cache.get(surf.id, stylesHash, mip);
+          alphaScalarFetched = true;
+          if (got === null) {
+            alphaRgbMat = this.buildRGBEntry(
+              worldData, surf, null, stylesHash, mip,
+              view.lightStyles, dyn, this.alphaDeferredBits[a]!,
+              { blend: 'alpha', depthWrite: false, variant: 1 },
+            );
+            if (alphaRgbMat) {
+              if (alphaRgbMat.warp) alphaRgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
+              this.classicAvoidedBuilds++;
+              const srcT = worldData.textures[surf.texId % worldData.textures.length]!;
+              const shift = mip > 3 ? 3 : mip;
+              this.classicAvoidedBytes += Math.max(1, srcT.width >> shift) *
+                Math.max(1, srcT.height >> shift) + lm.luxW * lm.luxH;
+            }
+          } else {
+            block = got;
+            alphaRgbMat = this.buildRGBEntry(
+              worldData, surf, block, stylesHash, mip,
+              view.lightStyles, dyn, this.alphaDeferredBits[a]!,
+              { blend: 'alpha', depthWrite: false, variant: 1 },
+            );
+            if (alphaRgbMat && alphaRgbMat.warp) alphaRgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
+          }
+        }
       }
-      const tex = texView;
-      tex.width = block.bw;
-      tex.height = block.bh;
-      tex.texels = block.texels;
-      const lb = lightView;
-      lb.width = block.luxW;
-      lb.height = block.luxH;
-      lb.values = block.light;
+      if (!alphaRgbMat) {
+        if (!alphaScalarFetched) block = this.cache.get(surf.id, stylesHash, mip);
+        if (!block) {
+          // Shared scratch (task 6, same contract as the world miss path).
+          if (nValid < 0) nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
+          const scalesCopy = this.scalesScratch;
+          scalesCopy.length = 0;
+          for (let k = 0; k < nValid; k++) scalesCopy.push(this.styleScratch[k]!);
+          if (scalesCopy.length === 0) scalesCopy.push(1);
+          block = this.buildSurfaceBlock(worldData, surf, mip, scalesCopy, dyn, this.alphaDeferredBits[a]!);
+          this.cache.put(surf.id, stylesHash, mip, block);
+        }
+        texView.width = block.bw;
+        texView.height = block.bh;
+        texView.texels = block.texels;
+        lightView.width = block.luxW;
+        lightView.height = block.luxH;
+        lightView.values = block.light;
+      }
       if (ph) { ph.cache += phaseNow() - pt; pt = phaseNow(); }
       this.polyInput.verts = surf.verts;
       this.polyInput.uvs = surf.uvs;
@@ -2342,13 +2656,15 @@ export class SoftwareRenderer implements Refresh {
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
-      // RGB overlay (step 3): same spans, true alpha blend (never the
-      // screen-door stipple — the RGB path has no stipple), warped when
-      // the surface is turbulent, never depth-writing. Reverse traversal
-      // order is preserved (back-to-front over-blend). Resolved first so
-      // the authoritative skip below can test coverage.
-      let alphaRgbMat: RGBMaterial | null = null;
-      if (this.rgbOverlayActive()) {
+      // RGB overlay (oracle order: the skip-armed path above already
+      // resolved or fell back to scalar): same spans, true alpha blend
+      // (never the screen-door stipple — the RGB path has no stipple),
+      // warped when the surface is turbulent, never depth-writing. Reverse
+      // traversal order is preserved (back-to-front over-blend). Resolved
+      // first so the authoritative skip below can test coverage. Staged
+      // into the RGB worker kick when pooled (task 1), drawn inline
+      // otherwise.
+      if (!alphaRgbMat && this.rgbOverlayActive() && block && !fgSkip) {
         const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 1);
         alphaRgbMat = rgbHit
           ? rgbHit.material
@@ -2359,8 +2675,10 @@ export class SoftwareRenderer implements Refresh {
           );
         if (alphaRgbMat) {
           if (alphaRgbMat.warp) alphaRgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-          this.drawRGBSpans(this.spanList, alphaRgbMat);
+          this.drawForegroundRGBSpans(this.spanList, alphaRgbMat);
         }
+      } else if (alphaRgbMat) {
+        this.drawForegroundRGBSpans(this.spanList, alphaRgbMat);
       }
       // Authoritative skip (item A): elide the redundant classic blend
       // where the RGB overlay drew (its blend is the displayed value);
@@ -2373,7 +2691,7 @@ export class SoftwareRenderer implements Refresh {
         const tb = this.tsBackend;
         if (this.backend !== tb) tb.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
         const t = drawSpansTranslucent(this.idx, this.zb, this.fbW, this.fbH, this.spanList,
-          tex, lb, this.colormap, this.alpha33, this.alpha66,
+          texView, lightView, this.colormap, this.alpha33, this.alpha66,
           surf.turbulent ? tb.turbTable : null, view.time, this.fgTMode === 2);
         this.transSpans += t.spans;
         if (this.backend === tb) {
@@ -2392,7 +2710,21 @@ export class SoftwareRenderer implements Refresh {
         if (batchSpans > d.maxBatchSpans) d.maxBatchSpans = batchSpans;
       }
     }
+    return alphaSpans;
+  }
 
+  /**
+   * Foreground segment 2: world-placed alias + world sprites (M3.4).
+   * Identical body, split from drawForeground for async orchestration (see
+   * drawForeground): ends immediately before the sprite flush point. Owns
+   * its own phase-timing cursor; segment time stays in the alias bucket via
+   * the end accumulation (diagnostic-only either way).
+   */
+  private drawForegroundPlacedPass(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[]): void {
+    const ph = this.phaseArmed ? this.phaseAcc : null;
+    let pt = ph ? phaseNow() : 0;
+    const rgbActive = this.rgbOverlayActive();
+    const fgSkip = this.fgSkipClassic && rgbActive;
     // world-placed alias / sprites / particles (M3.4 in the devroom)
     // Pooled path with zero span batches (degenerate frame): planes were
     // never cleared lazily, so fill once before direct plane writes.
@@ -2455,13 +2787,50 @@ export class SoftwareRenderer implements Refresh {
           emptyLight, this.colormap, cam, this.spriteScratch, 1024);
       }
       if (rgbActive) {
-        this.rgbBackend.pixelsDrawn += drawSpriteRGB(
-          this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
-          { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
-          [tex], this.rgbMaterialForSkin(tex), cam, this.spriteScratch, 1024, undefined, this.rgbWin);
-        this.rgbUsedThisFrame = true;
+        const pooledFg = this.backend === this.bandBackend
+          ? this.bandBackend.dispatcher
+          : null;
+        if (pooledFg) {
+          // Task 1: stage the emitted billboard spans into the foreground
+          // RGB kick (ascending-y emission, ordered) instead of drawing
+          // them inline — identical spans, material and order; the flush
+          // after this loop lands them before the particle writes below.
+          const n = emitSpriteSpans(
+            { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
+            [tex], cam, this.fbW, this.fbH, this.spriteScratch, 1024);
+          if (n > 0) {
+            this.spriteScratch.count = n;
+            const fgMat = this.rgbMaterialForSkin(tex);
+            this.stageForegroundRGBSpans(this.spriteScratch, fgMat);
+            this.spriteScratch.count = 0;
+            this.rgbUsedThisFrame = true;
+          }
+        } else {
+          this.fgInlineBatches++;
+          this.rgbBackend.pixelsDrawn += drawSpriteRGB(
+            this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
+            { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
+            [tex], this.rgbMaterialForSkin(tex), cam, this.spriteScratch, 1024, undefined, this.rgbWin);
+          this.rgbUsedThisFrame = true;
+        }
       }
     }
+    if (ph) { ph.alias += phaseNow() - pt; pt = phaseNow(); }
+  }
+
+  /**
+   * Foreground segment 3: particles, game entities (MD2 alias incl. the
+   * depthHack viewmodel, sprites, tracer beams), renderer-owned tracer
+   * beams and dlight aging. Identical body, split from drawForeground for
+   * async orchestration (see drawForeground). Owns its own phase-timing
+   * cursor; the alias bucket total is preserved together with segment 2's
+   * end accumulation (diagnostic-only either way).
+   */
+  private drawForegroundEntityPass(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[], entities: Entity[]): void {
+    const ph = this.phaseArmed ? this.phaseAcc : null;
+    let pt = ph ? phaseNow() : 0;
+    const rgbActive = this.rgbOverlayActive();
+    const fgSkip = this.fgSkipClassic && rgbActive;
     if (worldData.particles.length > 0) {
       const n = Math.min(worldData.particles.length, 256);
       for (let i = 0; i < n; i++) {
@@ -2675,6 +3044,57 @@ export class SoftwareRenderer implements Refresh {
     // re-added expires after DEFAULT_DLIGHT_TTL_FRAMES renders (swept at the
     // top of the next renderView, with one serial bump / one cache rebuild).
     this.dlights.ageFrame();
+  }
+
+  /**
+   * Entity foreground orchestrator (sync path): deferred translucent alpha
+   * (R_DrawAlphaSurfaces) first — it must land after the pool kick (the
+   * kick would wipe these direct plane writes), then world-placed alias /
+   * sprites / particles (M3.4), game entities (MD2 alias incl. the
+   * depthHack viewmodel, sprites, tracer beams) and renderer-owned tracer
+   * beams, then dlight aging. Alpha stays ahead of entities exactly like
+   * the old pre-kick order (relative compositing unchanged); only its
+   * position vs the kick moved. Bit-identical either way: world-first,
+   * foreground-second, all writes depth-guarded. The two flush points
+   * preserve the exact serial order: staged blends land before the next
+   * inline direct RGB write. Zero allocation (phase timing uses the armed
+   * scratch). Returns the alpha spans emitted (feeds the stats stash).
+   */
+  private drawForeground(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[], entities: Entity[]): number {
+    const ph = this.phaseArmed ? this.phaseAcc : null;
+    const alphaSpans = this.drawForegroundAlphaPass(cam, worldData, view, dyn);
+    // Task 1: staged alpha blends must land before the next inline direct
+    // RGB write (alias entities below) — flush the foreground kick here so
+    // the serial world-alpha-foreground order holds exactly.
+    let pt = ph ? phaseNow() : 0;
+    this.flushForegroundRGB();
+    if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
+    this.drawForegroundPlacedPass(cam, worldData, view, dyn);
+    // Task 1: staged sprite blends must land before the next inline direct
+    // RGB write (particles below) — flush the foreground kick here.
+    this.flushForegroundRGB();
+    this.drawForegroundEntityPass(cam, worldData, view, dyn, entities);
+    return alphaSpans;
+  }
+
+  /**
+   * Entity foreground orchestrator (async path): the same three segments
+   * in the same order with the same two flush points, but the flushes are
+   * message-driven (no Atomics.wait on the calling thread), so staged
+   * foreground batches execute on workers in the browser instead of
+   * replaying inline. Bit-identical to drawForeground: world-first,
+   * foreground-second, all writes depth-guarded, serial + failure
+   * fallbacks intact (see flushForegroundRGBAsync).
+   */
+  private async drawForegroundAsync(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[], entities: Entity[]): Promise<number> {
+    const ph = this.phaseArmed ? this.phaseAcc : null;
+    const alphaSpans = this.drawForegroundAlphaPass(cam, worldData, view, dyn);
+    let pt = ph ? phaseNow() : 0;
+    await this.flushForegroundRGBAsync();
+    if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
+    this.drawForegroundPlacedPass(cam, worldData, view, dyn);
+    await this.flushForegroundRGBAsync();
+    this.drawForegroundEntityPass(cam, worldData, view, dyn, entities);
     return alphaSpans;
   }
 
@@ -2727,7 +3147,7 @@ export class SoftwareRenderer implements Refresh {
       if (banded) banded.flushDeferred = prevDefer;
     }
     if (banded && banded.dispatcher && banded.accumEnabled) {
-      await banded.flushAccumAsync();
+      this.rangeScanned += await banded.flushAccumAsync();
     }
     // RGB worker kick (message-driven): staged world RGB batches drain
     // before the foreground seed + inline foreground RGB draws below.
@@ -2741,7 +3161,7 @@ export class SoftwareRenderer implements Refresh {
     const fgWorld = this.fgWorld;
     const fgDyn = this.fgDyn;
     if (fgCam && fgWorld && fgDyn) {
-      this.stSpansEmitted += this.drawForeground(fgCam, fgWorld, view, fgDyn, entities);
+      this.stSpansEmitted += await this.drawForegroundAsync(fgCam, fgWorld, view, fgDyn, entities);
       // The foreground (alpha) tallies into the backend counters after the
       // phase-1 stash: refresh the diag candidate count to match finishStats.
       if (this.diagArmed) this.diagAcc.candidatePixels = this.backend.pixelsDrawn - this.stPixelsBase;
@@ -3139,6 +3559,10 @@ export class SoftwareRenderer implements Refresh {
     texView.width = sky.width;
     texView.height = sky.height;
     texView.texels = sky.texels;
+    // Task 3: resolve once per frame (not per face) and skip the unused
+    // classic flat-span packing when the classic face fill is elided.
+    const skyMatAll = this.rgbOverlayActive() ? this.rgbMaterialForSky() : null;
+    const skipSkyFlat = skipClassicSky && skyMatAll !== null;
     const ox = cam.origin[0]!, oy = cam.origin[1]!, oz = cam.origin[2]!;
     const tmp = this.skyTmp;
     acc.spans = 0;
@@ -3162,7 +3586,7 @@ export class SoftwareRenderer implements Refresh {
       const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
       if (nproj < 3) continue;
       const start = this.spanList.count;
-      const flat = this.flatForEmit(SPAN_OPAQUE, order, 63, 0, -1);
+      const flat = skipSkyFlat ? undefined : this.flatForEmit(SPAN_OPAQUE, order, 63, 0, -1);
       const endCount = emitSpansForPoly(
         this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
         flat,
@@ -3184,14 +3608,13 @@ export class SoftwareRenderer implements Refresh {
       this.spanList.count = endCount;
       // Authoritative skip (item A): elide the classic face fill where the
       // RGB sky material drew; count the eliminated spans.
-      const skyMat = this.rgbOverlayActive() ? this.rgbMaterialForSky() : null;
-      if (skipClassicSky && skyMat) {
+      if (skipClassicSky && skyMatAll) {
         this.classicSpansSkipped += endCount - start;
       } else {
         this.backend.drawSpans(this.spanList, texView, lightView);
       }
-      if (skyMat) {
-        this.drawWorldRGBSpans(this.spanList, skyMat);
+      if (skyMatAll) {
+        this.drawWorldRGBSpans(this.spanList, skyMatAll);
       }
       this.spanList.count = 0;
       const batch = endCount - start;
@@ -3328,9 +3751,17 @@ export class SoftwareRenderer implements Refresh {
    * fidelity snapshot; a cvar change invalidates the per-surface luxels in
    * syncRGBFidelity but keeps the shared chains (fidelity-independent), so
    * the next frame re-links without re-expanding textures.
+   *
+   * `block` may be null (task 3): while the authoritative skip is armed
+   * the scalar block has no consumer (classic is elided, and the cached
+   * entry's scalar copy is never rasterised — it only feeds budget
+   * accounting, which the luxels below already cover), so the miss path
+   * validates against the source dims and stores a shared empty scalar
+   * sentinel. A null RGB result (unusable lightmap/texture) still falls
+   * back to the scalar path, which builds the block on demand.
    */
   private buildRGBEntry(
-    world: MiniWorld, surf: MiniSurf, block: SurfaceBlock,
+    world: MiniWorld, surf: MiniSurf, block: SurfaceBlock | null,
     stylesHash: number, mip: number,
     lightStyles: Float32Array, dyn: DynamicLight[], dlightBits: number,
     extra?: { blend?: 'opaque' | 'alpha' | 'additive'; depthWrite?: boolean; variant?: number },
@@ -3338,7 +3769,9 @@ export class SoftwareRenderer implements Refresh {
     const lm = world.lightmaps[surf.lightId % world.lightmaps.length]!;
     if (!lm || lm.luxW < 1 || lm.luxH < 1) return null;
     if (lm.samples.length < lm.luxW * lm.luxH * 3) return null;
-    if (block.texels.length < block.bw * block.bh || block.bw < 1 || block.bh < 1) return null;
+    if (block) {
+      if (block.texels.length < block.bw * block.bh || block.bw < 1 || block.bh < 1) return null;
+    }
     // Full-res mip source (see doc above): the cache key keeps `mip`, so
     // entries filed under different scalar mips share the identical chain.
     const src = world.textures[surf.texId % world.textures.length]!;
@@ -3356,7 +3789,10 @@ export class SoftwareRenderer implements Refresh {
       luxelPos = this.dluxScratch;
     }
     const nValid = countValidStyles(lm, lightStyles, this.styleScratch);
-    const scales: number[] = [];
+    // Shared scratch (task 6): buildRGBLightMap consumes the scales
+    // synchronously and never retains them (the entry owns the luxels).
+    const scales = this.scalesScratch;
+    scales.length = 0;
     for (let k = 0; k < nValid; k++) scales.push(this.styleScratch[k]!);
     if (scales.length === 0) scales.push(1);
     buildRGBLightMap(
@@ -3390,16 +3826,31 @@ export class SoftwareRenderer implements Refresh {
       flatColor: null,
     };
     const entry: RGBCachedBlock = {
-      block: {
-        texels: block.texels, bw: block.bw, bh: block.bh,
-        light: block.light, luxW: block.luxW, luxH: block.luxH, rgb,
-      },
+      block: block
+        ? {
+          texels: block.texels, bw: block.bw, bh: block.bh,
+          light: block.light, luxW: block.luxW, luxH: block.luxH, rgb,
+        }
+        : {
+          // Task 3 scalar-free entry: no consumer reads the scalar copy
+          // (classic is elided while the skip is armed), so store the
+          // shared empty sentinel. Budget accounting is unchanged: it
+          // counts the owned luxels (`rgb`) plus the entry overhead, like
+          // the scalar-carrying entry above.
+          texels: RGB_EMPTY_BLOCK.texels, bw: 0, bh: 0,
+          light: RGB_EMPTY_BLOCK.light, luxW: lm.luxW, luxH: lm.luxH, rgb,
+        },
       material,
     };
     this.rgbCache.put(surf.id, stylesHash, mip, entry, extra?.variant ?? 0);
     return material;
   }
 }
+
+/** Shared empty scalar copy for scalar-free RGB entries (task 3). */
+const RGB_EMPTY_BLOCK: { texels: Uint8Array; light: Uint8Array } = {
+  texels: new Uint8Array(0), light: new Uint8Array(0),
+};
 
 function getDevMeshSafe(id: number, fallback: AliasMesh): AliasMesh {
   try {

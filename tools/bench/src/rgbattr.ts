@@ -23,6 +23,24 @@
 //         shared scanout buffers — the Node analogue of the browser
 //         resolveDisplayAsync path; falls back to serial resolveFrame,
 //         labeled, on kick failure).
+//     Each production rep is ALSO split into same-rep caller-clock
+//     segments (begin/render/end/scanout walls + per-rep scheduling gap =
+//     frame minus that rep's segments: GC, allocator, fence slack). The
+//     split is a diagnostic decomposition of the measured total —
+//     medians over per-rep reconciled values, never median-of-medians.
+//     Scanout kicks are journaled per rep with frame/sequence + job type
+//     + stable band identity (band tiling is fixed per W×H×workers), as
+//     dispatch-to-completion latencies with med/p95/max: the max is the
+//     critical-path max for the scanout job. Per-worker execution
+//     durations are NOT reported (no renderer in-worker timestamps exist;
+//     message-arrival delays are scheduling, not compute —
+//     @q2/testkit critpath documents the timebase).
+//     Staging/skip/cache/chain-byte counters come from public renderer
+//     test hooks on the last production rep (staged vs inline batches,
+//     composite cover, elided classic work, chain bytes); per-descriptor
+//     luxel/span byte totals need renderer counters (documented gap).
+//     "Presented FPS" is a browser/CDP soak metric, never a Node number:
+//     frameMs here is production-frame-no-present by construction.
 //     Serial scanout stays as a LABELED control (`scanoutSerialMs` /
 //     `frameSerialMs`, interleaved back-to-back with the production kick on
 //     the same live frame so both legs share thermal state).
@@ -62,6 +80,19 @@ import {
   type DynamicLight, type ScanoutBandOptions,
 } from '@q2/sw-renderer';
 import { base1RefDef, base1Views, hashColorFull, machineJson } from '@q2/testkit';
+import {
+  collectStageCounters,
+  formatBandRanges,
+  formatLatency,
+  formatStageCounts,
+  frameSplit,
+  nsToMs,
+  nowNs,
+  summarizeLatencies,
+  summarizeSplits,
+  type FrameSplit,
+  type KickSample,
+} from '@q2/testkit';
 import {
   applyDisplayGamma, applyReconstruction2x2, readVoodooState, resolveRGB565,
   resolveFrame,
@@ -434,14 +465,39 @@ export interface AttrRow {
    * Production scanout per rep (median): pooled flushScanout when a pool is
    * attached and the kick succeeds, else serial resolveFrame. scanoutKind
    * records which ran ('serial' | 'pooled' | 'serial-fallback').
+   * TIMEBASE: dispatch-to-completion on the caller clock (kick → fence).
+   * For pooled kicks execMs is null BY DESIGN (work ran on workers; the
+   * caller only fenced — message arrival is scheduling, not compute).
+   * For serial kicks the work ran on the caller, so exec == latency.
+   * Per-worker execution durations need renderer in-worker timestamps
+   * (gap — see KickSample.execMs); the critical-path max below is the max
+   * DISPATCH-TO-COMPLETION across reps, not a per-band compute max.
    */
   scanoutMs: number | null;
+  scanoutP95: number | null;
+  scanoutMaxMs: number | null;
   scanoutKind: string | null;
   /** Labeled serial-scanout control, interleaved back-to-back per rep. */
   scanoutSerialMs: number | null;
+  /**
+   * Main-thread segment split of the production frame, all segments timed
+   * on the caller clock in the SAME rep (begin/render/end/scanout walls +
+   * per-rep scheduling gap = frame minus that rep's segments: GC,
+   * allocator, fence slack). Medians over reps of per-rep values — never
+   * median-of-medians subtraction. Diagnostic split of the measured total;
+   * the acceptance metric stays frameMs. Null segments = n/a (software
+   * has no scanout stage; scanout lives in scanoutMs there).
+   */
+  splitBeginMs: number | null;
+  splitRenderMs: number | null;
+  splitEndMs: number | null;
+  splitScanoutMs: number | null;
+  splitGapMs: number | null;
   /** Acceptance metric: full PRODUCTION frame measured TOGETHER per rep. */
   frameMs: number | null;
   frameP95: number | null;
+  /** Critical-path max: slowest production frame (dispatch-to-completion). */
+  frameMaxMs: number | null;
   /** Full frame with the serial scanout control (pooled configs only). */
   frameSerialMs: number | null;
   frameSerialP95: number | null;
@@ -468,6 +524,45 @@ export interface AttrRow {
   rgbKicks: number;
   /** Pooled scanout kicks that reported failure (serial fallback legs). */
   scanoutFallbacks: number;
+  /**
+   * Per-frame staging ledger (LAST production rep, public hooks only):
+   * world-RGB batches staged vs inline + kicks, composite cover
+   * (inspected pixels), classic work elided by the authoritative skip,
+   * deferred-alpha spans, surface-cache hits/misses/evictions, RGB chain
+   * bytes (persistent upload cache: used/retained/orphan + evictions).
+   * GAP (integrator, needs renderer counters): per-descriptor luxel/span
+   * byte totals and RGB spans/pixels drawn — staged/admitted counts below
+   * plus cover are reported until the renderer publishes them.
+   */
+  coverPx: number;
+  classicSpansSkipped: number;
+  classicFgSkipped: number;
+  skipArmed: boolean;
+  translucentSpans: number;
+  cacheHits: number;
+  cacheMisses: number;
+  cacheEvictions: number;
+  chainUsedBytes: number;
+  retainedChainBytes: number;
+  orphanChainBytes: number;
+  chainEvictions: number;
+  /**
+   * Bytes admitted per frame (computed from W×H, not estimated):
+   * planeBytes = color + index + depth planes the raster drains into;
+   * scanBytes = shared scanout buffers the scanout kick writes
+   * (565 + display; rgb only, pooled or serial — same bytes either way).
+   */
+  planeBytes: number;
+  scanBytes: number | null;
+  /**
+   * Allocator/GC proxy: process heapUsed delta across this whole config
+   * (warmup + reps). NOT per-frame allocation (the zero-alloc/frame rule
+   * is enforced by code review); a climbing delta across configs flags a
+   * per-frame leak worth chasing with --trace-gc.
+   */
+  heapDeltaKB: number;
+  /** Stable band identity for this W×H×workers config (pool tiling). */
+  bandId: string;
 }
 
 export async function runAttrConfig(
@@ -597,25 +692,75 @@ export async function runAttrConfig(
   //     resolveDisplayAsync path). The serial resolveFrame stays as a
   //     LABELED control, interleaved back-to-back per rep.
   let fusedMs: number | null = null;
-  let scanoutMs: number | null = null, scanoutKind: string | null = null;
+  let scanoutMs: number | null = null, scanoutP95: number | null = null,
+    scanoutMaxMs: number | null = null, scanoutKind: string | null = null;
   let scanoutSerialMs: number | null = null;
-  let frameMs: number | null = null, frameP95: number | null = null;
+  let frameMs: number | null = null, frameP95: number | null = null, frameMaxMs: number | null = null;
   let frameSerialMs: number | null = null, frameSerialP95: number | null = null;
+  let splitBeginMs: number | null = null, splitRenderMs: number | null = null,
+    splitEndMs: number | null = null, splitScanoutMs: number | null = null,
+    splitGapMs: number | null = null;
   let displayHash: string | null = null, displaySerialHash: string | null = null;
   let displayFull: string | null = null, displaySerialFull: string | null = null;
   let rgbUsed = false, rgbCover = 0, rgbStaged = 0, rgbInline = 0, rgbKicks = 0;
   let scanoutFallbacks = 0;
+  // Per-rep kick journal (dispatch-to-completion, caller clock): frame/seq
+  // + job + stable band identity per kick. Scanout kicks are the only jobs
+  // the bench fences directly (the RGB kick lives inside renderView — its
+  // dispatch latency is inseparable without renderer clocks, so the RGB
+  // critical path is bounded by renderViewMs, not estimated here).
+  const kickJournal: KickSample[] = [];
+  const scanoutKickLat: number[] = [];
+  const frameSplits: FrameSplit[] = [];
+  const heapKB = (): number => {
+    try {
+      return process.memoryUsage().heapUsed / 1024;
+    } catch {
+      return 0;
+    }
+  };
+  const heapBeforeKB = heapKB();
+  let coverPx = 0, classicSpansSkipped = 0, classicFgSkipped = 0, skipArmed = false,
+    translucentSpans = 0, cacheHits = 0, cacheMisses = 0, cacheEvictions = 0,
+    chainUsedBytes = 0, retainedChainBytes = 0, orphanChainBytes = 0, chainEvictions = 0;
+  const bandId = formatBandRanges(H, workers);
+  const planeBytes = W * H * (4 + 1 + 4);
+  const scanBytes = rgb ? W * H * (2 + 4) : null;
   if (!rgb) {
+    // Software: no scanout stage (the color plane IS the presented frame).
+    // Segments timed in the same rep; the gap reconciles per rep.
     const fr: number[] = [];
     for (let i = 0; i < reps; i++) {
       pump();
-      const t = process.hrtime.bigint();
+      const tF = nowNs();
+      let t = nowNs();
       r.beginFrame();
+      const bM = nsToMs(nowNs() - t);
+      t = nowNs();
       r.renderView(view, worldArg, entities);
+      const rM = nsToMs(nowNs() - t);
+      t = nowNs();
       r.endFrame();
-      fr.push(Number(process.hrtime.bigint() - t) / 1e6);
+      const eM = nsToMs(nowNs() - t);
+      const fM = nsToMs(nowNs() - tF);
+      fr.push(fM);
+      frameSplits.push(frameSplit(bM, rM, eM, 0, fM));
+      if (i === reps - 1) {
+        const st = collectStageCounters(r);
+        coverPx = st.coverPixels;
+        classicSpansSkipped = st.classicSpansSkipped;
+        classicFgSkipped = st.classicFgSkipped;
+        skipArmed = st.skipArmed;
+        translucentSpans = st.translucentSpans;
+        cacheHits = st.cacheHits; cacheMisses = st.cacheMisses; cacheEvictions = st.cacheEvictions;
+        chainUsedBytes = st.rgbChainUsedBytes; retainedChainBytes = st.rgbRetainedChainBytes;
+        orphanChainBytes = st.rgbOrphanChainBytes; chainEvictions = st.rgbChainEvictions;
+      }
     }
-    frameMs = med(fr); frameP95 = p95(fr);
+    frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
+    const sp = summarizeSplits(frameSplits);
+    splitBeginMs = sp.begin; splitRenderMs = sp.render; splitEndMs = sp.end;
+    splitScanoutMs = null; splitGapMs = sp.gap;
   } else {
     const st = readVoodooState();
     const opts = scanoutOptsFromState(st);
@@ -634,7 +779,11 @@ export async function runAttrConfig(
     displaySerialFull = hashColorFull(serialDisp);
     if (pool) {
       // PRODUCTION pooled scanout, interleaved A/B with the serial control
-      // on the same live frame (shared thermal state per rep).
+      // on the same live frame (shared thermal state per rep). Each kick is
+      // journaled with frame/seq + job + stable band identity; the pooled
+      // kick's execMs stays null (work ran on workers — the caller fenced),
+      // the serial control's execMs equals its latency (work ran here).
+      const bands = workers + 1;
       const prod: number[] = [], ctrl: number[] = [];
       let pooledOk = true;
       let pooledDisp: Uint32Array | null = null;
@@ -644,17 +793,28 @@ export async function runAttrConfig(
         r.renderView(view, worldArg, entities);
         r.endFrame();
         const live = r.getFramebuffer().color;
-        let t = process.hrtime.bigint();
+        const tP = nowNs();
         const ok = pool.flushScanout(opts);
-        prod.push(Number(process.hrtime.bigint() - t) / 1e6);
+        const pM = nsToMs(nowNs() - tP);
+        prod.push(pM);
+        kickJournal.push({
+          frame: i, seq: 0, job: 'scanout', workers, bands, band: 'all',
+          y0: 0, y1: H, latencyMs: pM, ok, execMs: null, pixels: W * H, spans: 0,
+        });
         if (!ok) pooledOk = false;
-        t = process.hrtime.bigint();
+        const tC = nowNs();
         resolveFrame(live, serialDst, serialDisp, W, H, st);
-        ctrl.push(Number(process.hrtime.bigint() - t) / 1e6);
+        const cM = nsToMs(nowNs() - tC);
+        ctrl.push(cM);
+        kickJournal.push({
+          frame: i, seq: 1, job: 'scanout', workers: 0, bands: 1, band: 'all',
+          y0: 0, y1: H, latencyMs: cM, ok: true, execMs: cM, pixels: W * H, spans: 0,
+        });
       }
       if (pooledOk) {
         scanoutKind = 'pooled';
-        scanoutMs = med(prod);
+        const ps = summarizeLatencies(prod);
+        scanoutMs = ps.med; scanoutP95 = ps.p95; scanoutMaxMs = ps.max;
         scanoutSerialMs = med(ctrl);
         pooledDisp = pool.scanoutPlanes.scanDisplay.slice(0, W * H);
         displayHash = hashColorRG(pooledDisp);
@@ -669,27 +829,71 @@ export async function runAttrConfig(
         displayFull = hashColorFull(serialDisp);
         scanoutFallbacks = reps;
       }
-      // Full production frames (begin+render+end+pooled scanout together).
+      // Full production frames (begin+render+end+pooled scanout together),
+      // segments timed in the same rep so the gap reconciles per rep.
       const fr: number[] = [];
       for (let i = 0; i < reps; i++) {
         pump();
-        const t = process.hrtime.bigint();
+        const tF = nowNs();
+        let t = nowNs();
         r.beginFrame();
+        const bM = nsToMs(nowNs() - t);
+        t = nowNs();
         r.renderView(view, worldArg, entities);
+        const rM = nsToMs(nowNs() - t);
+        t = nowNs();
         r.endFrame();
-        if (!pool.flushScanout(opts)) {
+        const eM = nsToMs(nowNs() - t);
+        t = nowNs();
+        const kickOk = pool.flushScanout(opts);
+        let sM = nsToMs(nowNs() - t);
+        if (!kickOk) {
           scanoutFallbacks++;
+          const tS = nowNs();
           resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
+          sM += nsToMs(nowNs() - tS);
         }
-        fr.push(Number(process.hrtime.bigint() - t) / 1e6);
+        const fM = nsToMs(nowNs() - tF);
+        fr.push(fM);
+        frameSplits.push(frameSplit(bM, rM, eM, sM, fM));
+        scanoutKickLat.push(sM);
+        kickJournal.push({
+          frame: reps + i, seq: 0, job: 'scanout', workers, bands,
+          band: 'all', y0: 0, y1: H, latencyMs: sM, ok: kickOk,
+          execMs: null, pixels: W * H, spans: 0,
+        });
         if (i === reps - 1) {
           const stRGB = r.testRGBStats();
           const wst = r.testRGBWorkerStats();
           rgbUsed = stRGB.used; rgbCover = stRGB.coverPixels;
           rgbStaged = wst.staged; rgbInline = wst.inline; rgbKicks = wst.kicks;
+          const sc = collectStageCounters(r);
+          coverPx = sc.coverPixels;
+          classicSpansSkipped = sc.classicSpansSkipped;
+          classicFgSkipped = sc.classicFgSkipped;
+          skipArmed = sc.skipArmed;
+          translucentSpans = sc.translucentSpans;
+          cacheHits = sc.cacheHits; cacheMisses = sc.cacheMisses; cacheEvictions = sc.cacheEvictions;
+          chainUsedBytes = sc.rgbChainUsedBytes; retainedChainBytes = sc.rgbRetainedChainBytes;
+          orphanChainBytes = sc.rgbOrphanChainBytes; chainEvictions = sc.rgbChainEvictions;
         }
       }
-      frameMs = med(fr); frameP95 = p95(fr);
+      frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
+      {
+        const sp = summarizeSplits(frameSplits);
+        splitBeginMs = sp.begin; splitRenderMs = sp.render; splitEndMs = sp.end;
+        splitScanoutMs = sp.scanout; splitGapMs = sp.gap;
+      }
+      {
+        const ks = summarizeLatencies(scanoutKickLat);
+        if (scanoutMs === null) {
+          scanoutMs = ks.med; scanoutP95 = ks.p95; scanoutMaxMs = ks.max;
+        } else {
+          // Both the interleave and the production leg fenced the same
+          // kick: report the production leg (it ran inside whole frames).
+          scanoutMs = ks.med; scanoutP95 = ks.p95; scanoutMaxMs = ks.max;
+        }
+      }
       // Full frames with the serial control (same workload, labeled).
       const frs: number[] = [];
       for (let i = 0; i < reps; i++) {
@@ -709,7 +913,8 @@ export async function runAttrConfig(
       displaySerialHash = hashColorRG(serialDisp);
       displaySerialFull = hashColorFull(serialDisp);
     } else {
-      // Serial production = the fused control itself.
+      // Serial production = the fused control itself. The serial scanout
+      // runs on the caller, so exec == latency (same clock, same thread).
       scanoutKind = 'serial';
       scanoutMs = med(fs);
       scanoutSerialMs = med(fs);
@@ -718,25 +923,60 @@ export async function runAttrConfig(
       const fr: number[] = [];
       for (let i = 0; i < reps; i++) {
         pump();
-        const t = process.hrtime.bigint();
+        const tF = nowNs();
+        let t = nowNs();
         r.beginFrame();
+        const bM = nsToMs(nowNs() - t);
+        t = nowNs();
         r.renderView(view, worldArg, entities);
+        const rM = nsToMs(nowNs() - t);
+        t = nowNs();
         r.endFrame();
+        const eM = nsToMs(nowNs() - t);
+        t = nowNs();
         resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
-        fr.push(Number(process.hrtime.bigint() - t) / 1e6);
+        const sM = nsToMs(nowNs() - t);
+        const fM = nsToMs(nowNs() - tF);
+        fr.push(fM);
+        frameSplits.push(frameSplit(bM, rM, eM, sM, fM));
+        scanoutKickLat.push(sM);
+        kickJournal.push({
+          frame: i, seq: 0, job: 'scanout', workers: 0, bands: 1,
+          band: 'all', y0: 0, y1: H, latencyMs: sM, ok: true,
+          execMs: sM, pixels: W * H, spans: 0,
+        });
         if (i === reps - 1) {
           const stRGB = r.testRGBStats();
           const wst = r.testRGBWorkerStats();
           rgbUsed = stRGB.used; rgbCover = stRGB.coverPixels;
           rgbStaged = wst.staged; rgbInline = wst.inline; rgbKicks = wst.kicks;
+          const sc = collectStageCounters(r);
+          coverPx = sc.coverPixels;
+          classicSpansSkipped = sc.classicSpansSkipped;
+          classicFgSkipped = sc.classicFgSkipped;
+          skipArmed = sc.skipArmed;
+          translucentSpans = sc.translucentSpans;
+          cacheHits = sc.cacheHits; cacheMisses = sc.cacheMisses; cacheEvictions = sc.cacheEvictions;
+          chainUsedBytes = sc.rgbChainUsedBytes; retainedChainBytes = sc.rgbRetainedChainBytes;
+          orphanChainBytes = sc.rgbOrphanChainBytes; chainEvictions = sc.rgbChainEvictions;
         }
       }
-      frameMs = med(fr); frameP95 = p95(fr);
+      frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
+      {
+        const sp = summarizeSplits(frameSplits);
+        splitBeginMs = sp.begin; splitRenderMs = sp.render; splitEndMs = sp.end;
+        splitScanoutMs = sp.scanout; splitGapMs = sp.gap;
+      }
+      {
+        const ks = summarizeLatencies(scanoutKickLat);
+        scanoutP95 = ks.p95; scanoutMaxMs = ks.max;
+      }
     }
   }
 
   if (pool) await pool.dispose();
 
+  const heapDeltaKB = heapKB() - heapBeforeKB;
   const g = r.getFramebuffer();
   const row: AttrRow = {
     scene, res: `${W}x${H}`, entities: ent, mode, workers,
@@ -747,29 +987,55 @@ export async function runAttrConfig(
     drawMs: medAcc('draw'), drawP95: p95(acc.draw), aliasMs: medAcc('alias'),
     endFrameMs: med(ef), endFrameP95: p95(ef),
     packMs, reconMs, gammaMs, fusedMs,
-    scanoutMs, scanoutKind, scanoutSerialMs,
-    frameMs, frameP95, frameSerialMs, frameSerialP95,
+    scanoutMs, scanoutP95, scanoutMaxMs, scanoutKind, scanoutSerialMs,
+    splitBeginMs, splitRenderMs, splitEndMs, splitScanoutMs, splitGapMs,
+    frameMs, frameP95, frameMaxMs, frameSerialMs, frameSerialP95,
     spans, pixels, overdraw,
     idxHash: hashIdx(g.index!), colorHash: hashColorRG(g.color),
     colorFull: hashColorFull(g.color),
     displayHash, displaySerialHash, displayFull, displaySerialFull,
     rgbUsed, rgbCover, rgbStaged, rgbInline, rgbKicks, scanoutFallbacks,
+    coverPx, classicSpansSkipped, classicFgSkipped, skipArmed,
+    translucentSpans, cacheHits, cacheMisses, cacheEvictions,
+    chainUsedBytes, retainedChainBytes, orphanChainBytes, chainEvictions,
+    planeBytes, scanBytes, heapDeltaKB, bandId,
   };
   const rs = (v: number | null): string => v === null ? '—' : v.toFixed(2);
   const dispFullPart = row.displayFull !== null && row.displayFull !== undefined ? `/full=${row.displayFull}` : '';
   const rgbPart = mode === 'rgb'
     ? ` rgb[used=${rgbUsed} cover=${rgbCover} staged=${rgbStaged} inline=${rgbInline} kicks=${rgbKicks} fb=${scanoutFallbacks}]`
     : '';
+  // Main-thread split: same-rep segments (begin/render/end/scanout) + the
+  // per-rep scheduling gap. GEO/DRAW/alias medians above are instrumented
+  // attribution (sums of medians, diagnostic only); frame() is the
+  // uninstrumented production total (Node, no present — browser presented
+  // FPS is a separate soak metric, never this number).
+  // Production-leg dispatch-to-completion only (the interleaved serial
+  // control kicks live in kickJournal for forensics, not in this summary).
+  const kickDist = summarizeLatencies(scanoutKickLat);
+  const scanPart = mode === 'rgb'
+    ? ` scanoutKick[${row.scanoutKind ?? 'n/a'} distrib ${formatLatency('dispatch-to-completion', kickDist)} exec=${row.scanoutKind === 'serial' ? 'on-caller' : 'on-workers(null:caller-only-fenced)'}]`
+    : '';
+  const splitPart = ` split[begin=${rs(splitBeginMs)} render=${rs(splitRenderMs)} end=${rs(splitEndMs)} scanout=${rs(splitScanoutMs)} gap=${rs(splitGapMs)}]`;
+  const stagePart = mode === 'rgb'
+    ? ` ${formatStageCounts({
+      rgbUsed, coverPixels: coverPx, stagedBatches: rgbStaged, inlineBatches: rgbInline,
+      kicks: rgbKicks, pending: 0, classicSpansSkipped, classicFgSkipped, skipArmed,
+      translucentSpans, cacheHits, cacheMisses, cacheEvictions,
+      rgbChainUsedBytes: chainUsedBytes, rgbRetainedChainBytes: retainedChainBytes,
+      rgbOrphanChainBytes: orphanChainBytes, rgbChainEvictions: chainEvictions,
+    })} bytes[planes=${planeBytes} scan=${scanBytes ?? 'n/a'}] heapΔ=${heapDeltaKB.toFixed(0)}KB ${bandId}`
+    : ` cache[hits=${cacheHits} miss=${cacheMisses} evict=${cacheEvictions}] trans=${translucentSpans} heapΔ=${heapDeltaKB.toFixed(0)}KB ${bandId}`;
   console.log(
     `${row.scene} ${row.res} ent=${ent} ${mode} w=${workers}: ` +
     `renderView=${row.renderViewMs.toFixed(2)}(p95 ${row.renderViewP95.toFixed(2)}) ` +
-    `GEO=${geo.toFixed(2)} DRAW=${row.drawMs.toFixed(2)}(p95 ${row.drawP95.toFixed(2)}) ` +
-    `alias=${row.aliasMs.toFixed(2)} endFrame=${row.endFrameMs.toFixed(2)}(p95 ${row.endFrameP95.toFixed(2)}) ` +
+    `GEO(sum-of-medians,diagnostic)=${geo.toFixed(2)} DRAW=${row.drawMs.toFixed(2)}(p95 ${row.drawP95.toFixed(2)}) ` +
+    `alias=${row.aliasMs.toFixed(2)}(fg-serial) endFrame=${row.endFrameMs.toFixed(2)}(p95 ${row.endFrameP95.toFixed(2)}) ` +
     `pack=${rs(packMs)} recon=${rs(reconMs)} gamma=${rs(gammaMs)} fused=${rs(fusedMs)} ` +
-    `scanout[${row.scanoutKind ?? 'n/a'}]=${rs(scanoutMs)} serialCtl=${rs(scanoutSerialMs)} ` +
-    `frame=${rs(frameMs)}(p95 ${rs(frameP95)}) frameSerial=${rs(frameSerialMs)}(p95 ${rs(frameSerialP95)}) ` +
+    `scanout[${row.scanoutKind ?? 'n/a'}]=${rs(scanoutMs)}(p95 ${rs(scanoutP95)} max ${rs(scanoutMaxMs)}) serialCtl=${rs(scanoutSerialMs)} ` +
+    `frame(production,Node,no-present)=${rs(frameMs)}(p95 ${rs(frameP95)} max ${rs(frameMaxMs)}) frameSerial=${rs(frameSerialMs)}(p95 ${rs(frameSerialP95)}) ` +
     `spans=${spans} px=${pixels} ov=${overdraw.toFixed(2)} ` +
-    `idx=${row.idxHash} color=${row.colorHash} full=${row.colorFull} disp=${row.displayHash ?? '—'}${dispFullPart}${rgbPart}`,
+    `idx=${row.idxHash} color=${row.colorHash} full=${row.colorFull} disp=${row.displayHash ?? '—'}${dispFullPart}${rgbPart}${scanPart}${splitPart}${stagePart}`,
   );
   return row;
 }

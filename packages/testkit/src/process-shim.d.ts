@@ -3,5 +3,9 @@
 declare const process: {
   argv: string[];
   version: string;
+  hrtime: {
+    (time?: [number, number]): [number, number];
+    bigint(): bigint;
+  };
   exit(code?: number): never;
 };

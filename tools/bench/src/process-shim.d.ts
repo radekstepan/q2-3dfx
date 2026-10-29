@@ -9,5 +9,6 @@ declare const process: {
     (time?: [number, number]): [number, number];
     bigint(): bigint;
   };
+  memoryUsage(): { heapUsed: number; rss: number };
   exit(code?: number): never;
 };

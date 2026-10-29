@@ -14,7 +14,7 @@
 
 import { Com_Error, getCVarNumber, registerCVar } from '@q2/config';
 import {
-  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SUBDIV, SoftwareBackend, RGBWorldBackend,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SPAN_TRANS33, SPAN_TRANS66, SUBDIV, SoftwareBackend, RGBWorldBackend,
   buildTurbTable,
   runSubdiv16, runSubdivTurbulent, runSpanFlat, sampleLightBlock, textureMasks,
   runSubdivRGBRepeat, runSubdivRGBClamp, runSubdivRGBGeneric, runSpanFlatRGB,
@@ -75,7 +75,9 @@ export const CTL_FCOUNT = CTL_READY + 1; // frame-accum descriptors for the curr
 export const CTL_JOB = CTL_FCOUNT + 1; // kick type: 0 = rasterise, 1 = resolve (palette expand), 2 = RGB raster
 export const CTL_FRAME = CTL_JOB + 1; // frame generation (lazy per-band clear)
 export const CTL_RGBCOUNT = CTL_FRAME + 1; // RGB descriptors for the current kick (JOB_RGB only)
-export const CTL_LEN = CTL_RGBCOUNT + 1;
+export const CTL_SCAN = CTL_RGBCOUNT + 1; // base; +MAX_WORKERS per-worker inspected-span counts (subrange proof)
+/** Control block length (CTL_SCAN owns the trailing MAX_WORKERS slots). */
+export const CTL_LEN = CTL_SCAN + MAX_WORKERS;
 
 /** Kick types for CTL_JOB ( rasterise spans vs resolve the color plane vs RGB rasterise). */
 export const JOB_RASTER = 0;
@@ -302,7 +304,19 @@ export const D_TURBPHASE = 11;
  */
 export const D_YMIN = 12;
 export const D_YMAX = 13;
-export const D_PER_BATCH = 14;
+/**
+ * Staged row-order proof (PERF-FINISH-A item B follow-up, true per-band
+ * subranges): 1 when the batch's staged spans are in non-decreasing y
+ * order (the emitter + row-sorter invariant), 0 otherwise. Recorded once
+ * at staging time inside the existing ymin/ymax scan (one extra compare
+ * per span, no second pass). Workers binary-search [y0, y1) subranges for
+ * ordered batches and only iterate those entries; unordered/manual/legacy
+ * descriptors (0, including zero-initialised SABs and older browser pools
+ * that never wrote this field) take the legacy full-scan fallback, so
+ * output is identical either way.
+ */
+export const D_ORDERED = 14;
+export const D_PER_BATCH = 15;
 
 /** Palette bytes staged for worker-side resolve (8-bit RGB palette). */
 export const PALETTE_BYTES = 768;
@@ -436,7 +450,13 @@ export const R_TURBPHASE = 8;
 export const R_FLATRGB = 9; // packed 0xRRGGBB (valid when R_FLAG_FLAT)
 export const R_YMIN = 10; // inclusive min span row (band-cull, PERF-5)
 export const R_YMAX = 11; // exclusive max span row (band-cull, PERF-5)
-export const R_PER_BATCH = 12;
+/**
+ * Staged row-order proof for RGB batches (same contract as D_ORDERED):
+ * 1 when the staged spans are non-decreasing in y, else the legacy
+ * full-scan fallback. Written by stageRGB inside its band-cull scan.
+ */
+export const R_ORDERED = 12;
+export const R_PER_BATCH = 13;
 
 /** R_FLAGS bits. */
 export const R_FLAG_WARP = 1; // turbulent water (generic effect path)
@@ -457,6 +477,15 @@ export const R_FLAG_FLAT = 128;
  * (mask path, identical output).
  */
 export const R_FLAG_OPAQUE = 256;
+/**
+ * Foreground alpha blend (PERF-FINISH-A renderer lane, task 1): the staged
+ * batch carries SPAN_TRANS33/66 spans blended with a fixed per-kind ratio
+ * (33% = 85/256, 66% = 169/256, mirroring drawSpansRGB's isTrans path),
+ * never depth-writing. Set by the foreground stager for deferred-alpha
+ * (and any future translucent foreground) batches; world batches leave it
+ * clear (opaque path, identical output).
+ */
+export const R_FLAG_BLEND_ALPHA = 512;
 
 /** Int32 fields per chain directory entry. */
 export const C_LEVEL_BASE = 0; // base into the level table
@@ -598,7 +627,12 @@ export function packFrameSpans(
   let est = 0;
   for (let i = start; i < total; i++) {
     const s = spans[i]!;
-    if (s.kind !== SPAN_OPAQUE && s.kind !== SPAN_TURBULENT && s.kind !== SPAN_FLAT) continue;
+    // Opaque/turbulent/flat world spans plus translucent foreground spans
+    // (deferred alpha stages into JOB_RGB after the world batches; the
+    // indexed raster core below skips TRANS kinds, so indexed output is
+    // unchanged by their presence in the pack).
+    if (s.kind !== SPAN_OPAQUE && s.kind !== SPAN_TURBULENT && s.kind !== SPAN_FLAT &&
+      s.kind !== SPAN_TRANS33 && s.kind !== SPAN_TRANS66) continue;
     if (p >= cap) return null; // oversize -> inline fallback
     const o = (fBase + p) * F_PER_SPAN;
     F[o] = s.iz; F[o + 1] = s.diz; F[o + 2] = s.uz; F[o + 3] = s.duz;
@@ -834,7 +868,10 @@ const rgbTurbTable = buildTurbTable();
 
 /**
  * Draw one band's share of flat-packed RGB spans [start, start+count).
- * Mirrors drawSpansRGB exactly (same order, same args, same chaining).
+ * Mirrors drawSpansRGB exactly (same order, same args, same chaining):
+ * opaque spans take the hot repeat/clamp loops, warped or blended
+ * (translucent foreground) spans take the generic effect path with the
+ * same per-kind alpha ratios (TRANS33 = 85/256, TRANS66 = 169/256).
  */
 export function rasterizePackedRGBRange(
   rgb565: Uint16Array, cover: Uint8Array, rgbDepth: Uint16Array,
@@ -864,7 +901,8 @@ export function rasterizePackedRGBRange(
     const origX0 = spansI[q + 2]!;
     const origX1 = spansI[q + 3]!;
     const turb = spansI[q + 4]!;
-    if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT && kind !== SPAN_FLAT) {
+    const isTrans = kind === SPAN_TRANS33 || kind === SPAN_TRANS66;
+    if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT && kind !== SPAN_FLAT && !isTrans) {
       Com_Error('error', 'rasterizePackedRGBRange: unsupported span kind in RGB worker kick');
     }
     if (y < y0 || y >= y1) continue;
@@ -911,11 +949,21 @@ export function rasterizePackedRGBRange(
     const avdy = sDvdy < 0 ? -sDvdy : sDvdy;
     if (avdy > rho) rho = avdy;
     const spanLod = rgbMipLevel(rho, mat.lodBias, maxLevel);
-    const useWarp = kind === SPAN_TURBULENT && warp;
+    // Same kind dispatch as drawSpansRGB's trans path: turbulent water
+    // warps; translucent spans warp only when the material says so and
+    // blend with the fixed per-kind ratio, never depth-writing (the
+    // Generic core derives writeDepth from the blend, like serial).
+    const useWarp = kind === SPAN_TURBULENT ? warp : (isTrans && mat.warp);
+    const useBlend = isTrans
+      ? (mat.blend === 'additive' ? 'additive' : 'alpha')
+      : mat.blend;
+    const useAlphaQ = isTrans && useBlend === 'alpha'
+      ? (kind === SPAN_TRANS66 ? 169 : 85)
+      : Math.round(mat.alpha * 256);
     let oo = y * fbW + x0;
     let remaining = n;
     let xRun = x0;
-    if (!useWarp) {
+    if (!useWarp && useBlend === 'opaque' && mat.depthWrite) {
       while (remaining > 0) {
         const m = remaining >= SUBDIV ? SUBDIV : remaining;
         let r: { iz: number; lux: number; u1: number; v1: number };
@@ -941,14 +989,17 @@ export function rasterizePackedRGBRange(
         remaining -= m;
       }
     } else {
-      const turbT = rgbTurbTable;
+      // Effect path (warped and/or blended spans): same Generic call as
+      // drawSpansRGB's trans path (blend + per-kind ratio, warp table only
+      // when warping, phase from the staged turbPhase + span turb).
+      const turbT = useWarp ? rgbTurbTable : null;
       while (remaining > 0) {
         const m = remaining >= SUBDIV ? SUBDIV : remaining;
         const r = runSubdivRGBGeneric(
           rgb565, cover, rgbDepth, oo, m, xRun, y,
           iz, sDiz, uz, sDuz, vz, sDvz, u0, v0, lux, sDlu, sLv,
-          mat, spanLod, maxLevel, 'opaque', 256, turbT,
-          (turbPhase + turb) & (turbT.length - 1),
+          mat, spanLod, maxLevel, useBlend, useAlphaQ, turbT,
+          turbT ? (turbPhase + turb) & (turbT.length - 1) : 0,
           win);
         iz = r.iz;
         lux = r.lux;
@@ -1373,12 +1424,19 @@ const matWin: RGBWindow = { near: 4, far: 32768 };
  * ranges so cross-band order cannot affect any pixel; within a band the
  * descriptors run sequentially in pack order, exactly like the serial
  * drawSpansRGB calls the staging replaced. Bit-identical to serial.
+ * Ordered batches (R_ORDERED) binary-search their owned subrange, so an
+ * overlapping tall batch costs this band only its own rows; `scanned`
+ * counts the entries actually inspected (vs `spansStaged` nominally
+ * staged). Foreground alpha batches (R_FLAG_BLEND_ALPHA) ride the same
+ * kick after the world batches, preserving world-before-foreground order
+ * per band; they take the generic effect path with the serial per-kind
+ * blend ratios, never depth-writing.
  */
 export function processRGBFrameJob(
   rgb: RGBAccumViews,
   fbW: number, fbH: number, descCount: number,
   y0: number, y1: number,
-): { pixels: number; spans: number; descs: number; spansStaged: number } {
+): { pixels: number; spans: number; descs: number; spansStaged: number; scanned: number } {
   const near = rgb.kick[0]!;
   const far = rgb.kick[1]!;
   const lodBias = rgb.kick[2]!;
@@ -1435,6 +1493,7 @@ export function processRGBFrameJob(
   let drawn = 0;
   let descs = 0;
   let spansStaged = 0;
+  let scanned = 0;
   for (let b = 0; b < descCount; b++) {
     const d = b * R_PER_BATCH;
     const spanCount = rgb.rgbDesc[d + R_SPAN_COUNT]!;
@@ -1446,9 +1505,28 @@ export function processRGBFrameJob(
     const ymin = rgb.rgbDesc[d + R_YMIN]!;
     const ymax = rgb.rgbDesc[d + R_YMAX]!;
     if (ymax > ymin && (ymax <= y0 || ymin >= y1)) continue;
+    const spanBase = rgb.rgbDesc[d + R_SPAN_BASE]!;
+    // True per-band subrange (same contract as the indexed path): ordered
+    // batches binary-search the entries that can touch this band; sparse
+    // rows with an empty intersection skip setup entirely; unordered /
+    // legacy ranges fall back to the full scan, output-identical.
+    let sBase = spanBase, sCount = spanCount;
+    if (rgb.rgbDesc[d + R_ORDERED] === 1) {
+      const yA = y0 < 0 ? 0 : y0;
+      const yB = y1 > fbH ? fbH : y1;
+      if (yB > yA) {
+        const lo = lowerBoundRow(rgb.spansI, spanBase, spanCount, yA);
+        const hi = lowerBoundRow(rgb.spansI, spanBase, spanCount, yB);
+        if (hi <= lo) continue;
+        sBase = spanBase + lo;
+        sCount = hi - lo;
+      } else {
+        continue;
+      }
+    }
     descs++;
     spansStaged += spanCount;
-    const spanBase = rgb.rgbDesc[d + R_SPAN_BASE]!;
+    scanned += sCount;
     const slot = rgb.rgbDesc[d + R_CHAIN]!;
     const luxOff = rgb.rgbDesc[d + R_LUX_OFF]!;
     const luxW = rgb.rgbDesc[d + R_LUX_W]!;
@@ -1488,9 +1566,10 @@ export function processRGBFrameJob(
     }
     reuseMat.depthWrite = (flags & R_FLAG_DEPTHWRITE) !== 0;
     reuseMat.opaqueMask = (flags & R_FLAG_OPAQUE) !== 0;
+    reuseMat.blend = (flags & R_FLAG_BLEND_ALPHA) !== 0 ? 'alpha' : 'opaque';
     const r = rasterizePackedRGBRange(
       rgb.rgb565, rgb.cover, rgb.rgbDepth, fbW, fbH,
-      rgb.spansF, rgb.spansI, spanBase, spanCount,
+      rgb.spansF, rgb.spansI, sBase, sCount,
       reuseMat,
       repeat,
       (flags & R_FLAG_WARP) !== 0,
@@ -1501,7 +1580,26 @@ export function processRGBFrameJob(
     pixels += r.pixels;
     drawn += r.spans;
   }
-  return { pixels, spans: drawn, descs, spansStaged };
+  return { pixels, spans: drawn, descs, spansStaged, scanned };
+}
+
+/**
+ * First index in [base, base+count) whose staged span row is >= target.
+ * Rows must be non-decreasing over the range (the D_ORDERED/R_ORDERED
+ * staging proof); unordered ranges must use the legacy full-scan fallback
+ * instead — binary search on unsorted rows would silently skip spans.
+ * Operates on the flat Int32 staging (y rides slot +1), no allocation.
+ */
+export function lowerBoundRow(
+  spansI: Int32Array, base: number, count: number, target: number,
+): number {
+  let lo = 0, hi = count;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (spansI[(base + mid) * I_PER_SPAN + 1]! < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 /**
@@ -1517,15 +1615,20 @@ export function processRGBFrameJob(
  * BEFORE touching texel/light views — no per-worker rescan of the frame's
  * spans. A zero range (ymax <= ymin) means "unknown" (legacy / manual
  * descriptors) and falls through to the raster core's own per-span y
- * filter, so output is identical either way. Tallies add band-cull
- * observability: `descs` counts descriptors actually visited (material
- * resolved), `spansStaged` sums their staged span counts, so
+ * filter, so output is identical either way. True per-band subranges
+ * (renderer lane task 2): ordered batches (D_ORDERED, staged once — no
+ * per-worker validation) binary-search the entries that can touch the
+ * band, so overlapping batches cost this band only its owned rows, even
+ * with sparse rows; unordered ranges keep the full scan. Tallies add
+ * band-cull observability: `descs` counts descriptors actually visited
+ * (material resolved), `spansStaged` sums their staged span counts, and
+ * `scanned` counts entries actually inspected, so
  * `descCount - descs` (minus empties) were rejected pre-setup.
  */
 export function processFrameJob(
   fv: FrameAccumViews, fbW: number, fbH: number, descCount: number,
   y0: number, y1: number,
-): { pixels: number; spans: number; descs: number; spansStaged: number } {
+): { pixels: number; spans: number; descs: number; spansStaged: number; scanned: number } {
   const { base, fSpansF, fSpansI, fTex, fLight, desc } = fv;
   const colormap = base.colormap;
   const turbTable = base.turb;
@@ -1534,6 +1637,7 @@ export function processFrameJob(
   let drawn = 0;
   let descs = 0;
   let spansStaged = 0;
+  let scanned = 0;
   for (let b = 0; b < total; b++) {
     const d = b * D_PER_BATCH;
     const spanBase = desc[d + D_SPAN_BASE]!;
@@ -1546,8 +1650,28 @@ export function processFrameJob(
     const ymin = desc[d + D_YMIN]!;
     const ymax = desc[d + D_YMAX]!;
     if (ymax > ymin && (ymax <= y0 || ymin >= y1)) continue;
+    // True per-band subrange: ordered batches binary-search the entries
+    // that can touch this band, so a worker inspects only its own rows
+    // instead of rescanning the whole overlapping batch. Sparse rows are
+    // exact (an empty intersection skips setup entirely); unordered /
+    // legacy ranges fall back to the full scan, output-identical.
+    let sBase = spanBase, sCount = spanCount;
+    if (desc[d + D_ORDERED] === 1) {
+      const yA = y0 < 0 ? 0 : y0;
+      const yB = y1 > fbH ? fbH : y1;
+      if (yB > yA) {
+        const lo = lowerBoundRow(fSpansI, spanBase, spanCount, yA);
+        const hi = lowerBoundRow(fSpansI, spanBase, spanCount, yB);
+        if (hi <= lo) continue;
+        sBase = spanBase + lo;
+        sCount = hi - lo;
+      } else {
+        continue;
+      }
+    }
     descs++;
     spansStaged += spanCount;
+    scanned += sCount;
     const texOff = desc[d + D_TEX_OFF]!;
     const texW = desc[d + D_TEX_W]!;
     const texH = desc[d + D_TEX_H]!;
@@ -1564,7 +1688,7 @@ export function processFrameJob(
     jobLight.width = lightW; jobLight.height = lightH;
     jobLight.values = fLight.subarray(lightOff, lightOff + lightW * lightH);
     const r = rasterizePackedRange(
-      base.idx, base.zb, fbW, fbH, fSpansF, fSpansI, spanBase, spanCount,
+      base.idx, base.zb, fbW, fbH, fSpansF, fSpansI, sBase, sCount,
       jobTex, jobLight,
       desc[d + D_WSHIFT]!, desc[d + D_WMASK]!, desc[d + D_HMASK]!,
       colormap, turbTable, desc[d + D_TURBPHASE]!,
@@ -1573,7 +1697,7 @@ export function processFrameJob(
     pixels += r.pixels;
     drawn += r.spans;
   }
-  return { pixels, spans: drawn, descs, spansStaged };
+  return { pixels, spans: drawn, descs, spansStaged, scanned };
 }
 
 /**
@@ -1707,7 +1831,7 @@ export function bandWorkerLoop(
       views.zb.fill(0, y0 * fbW, y1 * fbW);
       lastFrame = frame;
     }
-    let r: { pixels: number; spans: number };
+    let r: { pixels: number; spans: number; scanned?: number };
     if (job === JOB_RESOLVE) {
       // Resolve kick (M8.1 parallel resolve + PERF-5 fused composite): expand
       // the final index plane into the shared color plane, compositing the
@@ -1756,6 +1880,15 @@ export function bandWorkerLoop(
     }
     Atomics.store(ctl, CTL_PIXELS + band, r.pixels);
     Atomics.store(ctl, CTL_SPANS + band, r.spans);
+    // Subrange proof (task 2): entries actually inspected by this band
+    // (ordered subranges visit only owned rows; legacy fallbacks visit the
+    // whole batch). Zero slots stay 0 for resolve/scanout kicks, which do
+    // no spanfill — the dispatcher sums them only for raster/RGB kicks.
+    try {
+      Atomics.store(ctl, CTL_SCAN + band, r.scanned ?? 0);
+    } catch {
+      /* ignore */
+    }
     Atomics.add(ctl, CTL_DONE, 1);
     try {
       Atomics.notify(ctl, CTL_DONE, 1);
@@ -1802,11 +1935,11 @@ export interface BandDispatcher {
   /** Pending accumulated batches. */
   accumPending(): number;
   /** Kick one frame covering every accumulated batch (blocking). */
-  flushFrame(): { pixels: number; spans: number } | null;
+  flushFrame(): { pixels: number; spans: number; scanned?: number } | null;
   /** Same as flushFrame but message-driven (browser async completion). */
-  flushFrameAsync(): Promise<{ pixels: number; spans: number } | null>;
+  flushFrameAsync(): Promise<{ pixels: number; spans: number; scanned?: number } | null>;
   /** Full-frame inline replay of the accumulated batches (fallback). */
-  drawInlineAll(): { pixels: number; spans: number };
+  drawInlineAll(): { pixels: number; spans: number; scanned?: number };
   /** Stage the palette for worker-side resolve (once per frame). */
   stagePalette(palette: Uint8Array): void;
   /**
@@ -1843,11 +1976,11 @@ export interface BandDispatcher {
   /** Pending staged RGB batches. */
   rgbPending(): number;
   /** Kick one RGB frame covering every staged batch (blocking). Null = replay inline. */
-  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number } | null;
+  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number } | null;
   /** Same as flushRGBFrame but message-driven (browser async completion). */
-  flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number } | null>;
+  flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; scanned?: number } | null>;
   /** Full-frame inline replay of the staged RGB batches (fallback). */
-  drawInlineRGBAll(near: number, far: number, lodBias: number): { pixels: number; spans: number };
+  drawInlineRGBAll(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number };
   /** Drop the persistent RGB chain upload cache (palette/world change). */
   clearRGBChains(): void;
 }
@@ -2020,20 +2153,23 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
    * Timeout/pool failure replays inline via the dispatcher (identical).
    * On success the planes are fully drawn, so the lazy-clear guard is
    * marked satisfied (a later inline batch must NOT wipe the kick).
+   * Returns worker span entries actually inspected (task-2 proof; 0 when
+   * nothing was pending).
    */
-  flushAccum(): void {    const d = this.dispatcher;
-    if (!d || !this.accumEnabled || d.accumPending() === 0) return;
+  flushAccum(): number {    const d = this.dispatcher;
+    if (!d || !this.accumEnabled || d.accumPending() === 0) return 0;
     const r = d.flushFrame();
     if (r) {
       this.spansDrawn += r.spans;
       this.pixelsDrawn += r.pixels;
       this.clearedFrame = d.frame();
-      return;
+      return r.scanned ?? 0;
     }
     const q = d.drawInlineAll();
     this.spansDrawn += q.spans;
     this.pixelsDrawn += q.pixels;
     this.clearedFrame = d.frame();
+    return q.scanned ?? 0;
   }
 
   /**
@@ -2055,20 +2191,21 @@ export class BandedSoftwareBackend extends SoftwareBackend implements RasterBack
    * Same as flushAccum but message-driven (browser async-render completion:
    * no Atomics.wait on the calling thread). Falls back to inline replay.
    */
-  async flushAccumAsync(): Promise<void> {
+  async flushAccumAsync(): Promise<number> {
     const d = this.dispatcher;
-    if (!d || !this.accumEnabled || d.accumPending() === 0) return;
+    if (!d || !this.accumEnabled || d.accumPending() === 0) return 0;
     const r = await d.flushFrameAsync();
     if (r) {
       this.spansDrawn += r.spans;
       this.pixelsDrawn += r.pixels;
       this.clearedFrame = d.frame();
-      return;
+      return r.scanned ?? 0;
     }
     const q = d.drawInlineAll();
     this.spansDrawn += q.spans;
     this.pixelsDrawn += q.pixels;
     this.clearedFrame = d.frame();
+    return q.scanned ?? 0;
   }
 
   /**

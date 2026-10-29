@@ -4,7 +4,8 @@
 // - Pool kick diagnostics are instrumented-only (disarmed by default: one
 //   boolean check per kick/message, zero steady-state allocation) and
 //   headless-coverable through a fake in-thread Worker (same SAB +
-//   CTL_SEQ protocol the real DOM workers speak).
+//   CTL_SEQ protocol the real DOM workers speak, including the band-
+//   attributed completion message `{ seq, band, pixels, spans }`).
 // - `measureFrameStages` is the instrumented twin of `frameAsync`
 //   (production tick never calls it): pixel parity + sane counters here.
 // - `publishQ2Stats` extensions (bands/spans/pixels/pending/stageBytes,
@@ -64,20 +65,27 @@ interface FakeMsg {
   h?: number;
   seq?: number;
   ready?: boolean;
+  band?: number;
+  pixels?: number;
+  spans?: number;
 }
 
 /** Minimal DOM-Worker stand-in: ready-acks init, completion-acks kicks by
  * polling the shared CTL_SEQ (never does band work — control flow only,
- * never pixel assertions). */
+ * never pixel assertions). The completion ack mirrors the real worker-loop
+ * message shape (`{ seq, band, pixels, spans }`, honest zero tallies) so
+ * diag band attribution is covered, not just rank order. */
 class FakeWorker {
   onmessage: ((ev: { data: FakeMsg }) => void) | null = null;
   private ctl: Int32Array | null = null;
+  private band = -1;
   private lastSeq = -1;
   private done = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   postMessage(msg: FakeMsg): void {
     if (msg.sab && typeof msg.w === 'number' && typeof msg.h === 'number') {
       this.ctl = attachFrameAccum(msg.sab, msg.w, msg.h).ctl;
+      if (typeof msg.band === 'number') this.band = msg.band;
       const self = this;
       setTimeout(() => {
         if (!self.done) self.onmessage?.({ data: { ready: true } });
@@ -88,8 +96,9 @@ class FakeWorker {
         if (seq !== self.lastSeq && seq > 0) {
           self.lastSeq = seq;
           const s = seq;
+          const b = self.band;
           setTimeout(() => {
-            if (!self.done) self.onmessage?.({ data: { seq: s } });
+            if (!self.done) self.onmessage?.({ data: { seq: s, band: b, pixels: 0, spans: 0 } });
           }, 3);
         }
       }, 2);
@@ -207,6 +216,14 @@ describe('BrowserBandPool kick diagnostics (instrumented-only)', () => {
         expect(pool!.diagActive()).toBe(true);
         const out = await pool!.flushRGBFrameAsync(1, 1000, 0);
         expect(out).not.toBeNull();
+        // The RGB kick succeeded: counted, not silent.
+        expect(pool!.kickStats().kicks.rgb).toBe(1);
+        expect(pool!.kickStats().fallbacks.rgb).toBe(0);
+        expect(pool!.kickStats().quarantined).toBe(false);
+        // Zero-span staged batch: nothing inspected anywhere (0 observed in
+        // both worlds — the stale-dist slot probe stays off, the main band
+        // drew no rows).
+        expect(pool!.kickStats().scanned.rgb).toBe(0);
         const snap = pool!.diagSnapshot();
         expect(snap).not.toBeNull();
         // Two fake workers acked: two rank-ordered arrivals, main-band timed.
@@ -216,6 +233,17 @@ describe('BrowserBandPool kick diagnostics (instrumented-only)', () => {
         expect(snap!.slowestMs).toBe(snap!.arrivals[1]);
         expect(snap!.mainMs).toBeGreaterThanOrEqual(0);
         expect(snap!.kicks).toBe(1);
+        // Kick identity: frame generation + message sequence + job kind +
+        // band count (2 workers + the main-thread band), all same-clock.
+        expect(snap!.job).toBe('rgb');
+        expect(snap!.frame).toBeGreaterThanOrEqual(1);
+        expect(snap!.seq).toBeGreaterThanOrEqual(1);
+        expect(snap!.bands).toBe(3);
+        // Band attribution from the completion messages (arrival order may
+        // vary — both worker bands reported exactly once).
+        expect([...snap!.bandIds].sort((a, b) => a - b)).toEqual([0, 1]);
+        expect(snap!.pixels.length).toBe(2);
+        expect(snap!.spans.length).toBe(2);
         // Frozen last-kick snapshot survives the post-kick offset reset:
         // live descs read drained (0), the snapshot keeps the kick (1).
         // (Chains persist by design — copy-on-first-use — so totals agree.)
@@ -228,6 +256,37 @@ describe('BrowserBandPool kick diagnostics (instrumented-only)', () => {
         pool!.disableDiag();
         expect(pool!.diagActive()).toBe(false);
         expect(pool!.diagSnapshot()).toBeNull();
+      } finally {
+        void pool!.dispose();
+      }
+    } finally {
+      removeFakeDom();
+    }
+  });
+
+  it('kick timeout quarantines the pool: fails counted, later kicks refuse fast', async () => {
+    installFakeDom(SilentWorker);
+    try {
+      const pool = BrowserBandPool.create(2, 64, 48, { timeoutMs: 60 });
+      expect(pool).not.toBeNull();
+      try {
+        pool!.beginFrame();
+        expect(pool!.stageRGB(emptySpans(), 0, 0, tinyChain(), null, 0, 0, 0, 16, 0, 0)).toBe(true);
+        // No worker ever acks: the kick times out, terminates the wedged
+        // workers BEFORE the inline replay (no straggler write can race
+        // it), and counts the failure — never silent.
+        const t0 = Date.now();
+        await expect(pool!.flushRGBFrameAsync(1, 1000, 0)).resolves.toBeNull();
+        expect(Date.now() - t0).toBeLessThan(20000);
+        const ks = pool!.kickStats();
+        expect(ks.fallbacks.rgb).toBe(1);
+        expect(ks.kicks.rgb).toBe(0);
+        expect(ks.quarantined).toBe(true);
+        // Quarantined: the next kick refuses fast (no second 60s hang for
+        // the production loop to absorb).
+        const t1 = Date.now();
+        await expect(pool!.flushRGBFrameAsync(1, 1000, 0)).resolves.toBeNull();
+        expect(Date.now() - t1).toBeLessThan(2000);
       } finally {
         void pool!.dispose();
       }
@@ -279,12 +338,70 @@ describe('publishQ2Stats extensions (bands/spans/staging/fg)', () => {
     expect(s.poolPixels).toBe(0);
     expect(s.rgbPending).toBe(0);
     expect(s.stageBytes).toBe(-1);
+    expect(s.rgbFallbacks).toBe(0);
+    expect(s.quarantined).toBe(false);
     // Foreground counter comes from the renderer's skip hook when present
     // (classicFgSkipped, 0 with the skip disarmed), -1 on older renderers
     // — the shell never guesses.
     expect(s.fgInline).toBe(expectedFg(boot));
+    // Foreground worker hook is always present on this renderer build
+    // (testForegroundWorkerStats): unpooled software stages nothing, so
+    // staged/worker/inline/kicks are healthy zeros — the shell never guesses.
+    expect(s.fgStaged).toBe(0);
+    expect(s.fgWorker).toBe(0);
+    expect(s.fgInlineRgb).toBe(0);
+    expect(s.fgKicks).toBe(0);
     expect(s.classicSkipped).toBe(0);
     expect(s.skipArmed).toBe(false);
+  });
+
+  it('foreground RGB hook surfaces when present, -1 when throwing', () => {
+    sandbox();
+    setCVarFromString('vid_renderer', 'voodoo');
+    const boot = bootPlay({ width: 32, height: 24 });
+    const rec = boot.refresh as unknown as Record<string, unknown>;
+    rec['testRGBForegroundStats'] = () => ({
+      staged: 12, worker: 10, inline: 2, kicks: 1,
+    });
+    const s = publishQ2Stats(boot, 60, 3);
+    expect(s.fgStaged).toBe(12);
+    expect(s.fgWorker).toBe(10);
+    expect(s.fgInlineRgb).toBe(2);
+    expect(s.fgKicks).toBe(1);
+    // A throwing future hook degrades to the absent sentinel, never a
+    // broken present path.
+    rec['testRGBForegroundStats'] = (): never => {
+      throw new Error('simulated future-renderer hook failure');
+    };
+    const t = publishQ2Stats(boot, 60, 4);
+    expect(t.fgStaged).toBe(-1);
+    expect(t.fgWorker).toBe(-1);
+    expect(t.fgInlineRgb).toBe(-1);
+    expect(t.fgKicks).toBe(-1);
+  });
+
+  it('pool RGB fallback counts + quarantine surface through __q2stats', () => {
+    sandbox();
+    const boot = bootPlay({ width: 32, height: 24 });
+    (boot as unknown as Record<string, unknown>).browserPool = {
+      rgbPending: () => 0,
+      kickBytes: () => null,
+      kickStats: () => ({
+        kicks: { raster: 1, rgb: 2, resolve: 0, scanout: 0 },
+        fallbacks: { raster: 0, rgb: 1, resolve: 0, scanout: 0 },
+        quarantined: true,
+      }),
+    };
+    const s = publishQ2Stats(boot, 60, 3);
+    expect(s.rgbFallbacks).toBe(1);
+    expect(s.quarantined).toBe(true);
+    // A foreign/older pool without kickStats degrades to healthy zeros.
+    (boot as unknown as Record<string, unknown>).browserPool = {
+      rgbPending: () => 0,
+    };
+    const t = publishQ2Stats(boot, 60, 4);
+    expect(t.rgbFallbacks).toBe(0);
+    expect(t.quarantined).toBe(false);
   });
 
   it('throws-safe when all probes throw (never breaks the present path)', () => {
@@ -297,11 +414,20 @@ describe('publishQ2Stats extensions (bands/spans/staging/fg)', () => {
     rec['testClassicSkipStats'] = (): never => {
       throw new Error('simulated future-renderer hook failure');
     };
+    rec['testRGBForegroundStats'] = (): never => {
+      throw new Error('simulated future-renderer hook failure');
+    };
     const s = publishQ2Stats(boot, 60, 3);
     expect(s.bands).toBe(1);
     expect(s.poolSpans).toBe(0);
     expect(s.rgbStaged).toBe(0);
     expect(s.fgInline).toBe(-1);
+    expect(s.fgStaged).toBe(-1);
+    expect(s.fgWorker).toBe(-1);
+    expect(s.fgInlineRgb).toBe(-1);
+    expect(s.fgKicks).toBe(-1);
+    expect(s.rgbFallbacks).toBe(0);
+    expect(s.quarantined).toBe(false);
     expect(s.classicSkipped).toBe(0);
     expect(s.skipArmed).toBe(false);
   });
@@ -404,6 +530,14 @@ describe('measureFrameStages (instrumented twin of frameAsync)', () => {
       expect(rep.bands).toBe(1);
       expect(rep.stageBytes).toBe(-1);
       expect(rep.diag).toBeNull();
+      // The foreground worker hook is always present (zeros when nothing
+      // stages): staged/worker/inline/kicks 0 is the healthy state. No RGB
+      // kick ran, so no RGB fallback. Heap sampling is Chromium-only.
+      // No pool, so no inspected-span counters either (-1, not 0).
+      expect(rep.fg).toEqual({ staged: 0, worker: 0, inline: 0, kicks: 0 });
+      expect(rep.rgbFallbacks).toBe(0);
+      expect(rep.scannedSpans).toBe(-1);
+      expect(rep.heapDeltaMB === null || typeof rep.heapDeltaMB === 'number').toBe(true);
       expect(rep.voodooPath).toBe('none');
       expect(rep.renderMs).toBeGreaterThanOrEqual(0);
       expect(rep.resolveMs).toBeGreaterThanOrEqual(0);
