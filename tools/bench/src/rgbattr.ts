@@ -82,16 +82,24 @@ import {
 import { base1RefDef, base1Views, hashColorFull, machineJson } from '@q2/testkit';
 import {
   collectStageCounters,
+  detailTimingEnabled,
   formatBandRanges,
   formatLatency,
   formatStageCounts,
+  formatWorkerImbalance,
   frameSplit,
   nsToMs,
   nowNs,
+  readBandExecStats,
+  readForegroundStats,
+  readMaterialGcMs,
   summarizeLatencies,
   summarizeSplits,
+  summarizeWorkerImbalance,
   type FrameSplit,
   type KickSample,
+  type WorkerExecSample,
+  type WorkerImbalance,
 } from '@q2/testkit';
 import {
   applyDisplayGamma, applyReconstruction2x2, readVoodooState, resolveRGB565,
@@ -557,6 +565,67 @@ export interface AttrRow {
   planeBytes: number;
   scanBytes: number | null;
   /**
+   * Detailed-timing state for this config (PERF-NEXT-4 done-when 5):
+   * 'enabled' collects per-band worker exec + imbalance + material-GC ms;
+   * 'disabled' skips them (null below) — acceptance always runs disabled.
+   */
+  timingDetail: 'enabled' | 'disabled';
+  /**
+   * Per-band worker-local execution durations for the production kick
+   * (ms, band order) when the producer publishes them AND detail is on —
+   * null while the renderer publishes no in-worker timestamps (current
+   * production state) or detail is off. Epoch-free durations: comparable
+   * across bands/clocks, never subtracted from cross-clock arrivals.
+   */
+  workerComputeMs: number[] | null;
+  /**
+   * Max-vs-median straggler analysis over workerComputeMs (PERF-NEXT-6
+   * input): worst within-group max-minus-median + straggler identity.
+   * Null when no exec samples (see workerComputeMs). Independent medians
+   * are never summed — the gap is computed within one group.
+   */
+  workerImbalance: {
+    groups: number; bands: number; bandMed: number; bandMax: number;
+    critMax: number; gapMs: number; ratio: number | null;
+    straggler: string | null;
+    byGroup: Array<{ job: string; seq: number; n: number; med: number; max: number }>;
+  } | null;
+  /**
+   * Fence-idle estimate (ms): dispatch-to-completion max minus compute
+   * max for the same kick — scheduling/wakeup/wait slack, NOT worker
+   * compute. Both terms are same-window durations (epoch-free), so the
+   * difference is valid; null when exec samples are unavailable.
+   */
+  fenceIdleMs: number | null;
+  /**
+   * Foreground flush attribution (all three flush points of
+   * drawForeground: alpha pass, placed pass, entity pass — fgKicks counts
+   * EXECUTED flushes: the flush is a no-op without unapplied work, so an
+   * empty pass contributes no kick). Per-class counters map to passes:
+   * alpha spans → alpha-pass flush; sprite spans staged → placed-pass
+   * flush (world sprites); staged tris → placed + entity alias; inline
+   * draws + entityMs → entity-pass work (alias incl. viewmodel, entity
+   * sprites, particles, tracer beams). Null when the hook is absent
+   * (software configs report null — no foreground kick exists there).
+   */
+  fgKicks: number | null;
+  fgStaged: number | null;
+  fgInline: number | null;
+  fgAlphaSpans: number | null;
+  fgSpriteSpans: number | null;
+  fgTrisStaged: number | null;
+  fgAliasDrawsInline: number | null;
+  fgParticlesInline: number | null;
+  fgBeamsInline: number | null;
+  /** Wall time of the entity-foreground pass (alias incl. viewmodel). */
+  fgEntityMs: number | null;
+  /**
+   * Material-cache GC cost (ms) when the renderer publishes it; the byte +
+   * eviction counters above are the always-on proxy. Null = unpublished
+   * (reported as unknown, never zero).
+   */
+  materialGcMs: number | null;
+  /**
    * Allocator/GC proxy: process heapUsed delta across this whole config
    * (warmup + reps). NOT per-frame allocation (the zero-alloc/frame rule
    * is enforced by code review); a climbing delta across configs flags a
@@ -565,6 +634,102 @@ export interface AttrRow {
   heapDeltaKB: number;
   /** Stable band identity for this W×H×workers config (pool tiling). */
   bandId: string;
+}
+
+/** Foreground + material-GC attribution for one AttrRow (nullable = unpublished). */
+export interface ForegroundAttribution {
+  fgKicks: number | null;
+  fgStaged: number | null;
+  fgInline: number | null;
+  fgAlphaSpans: number | null;
+  fgSpriteSpans: number | null;
+  fgTrisStaged: number | null;
+  fgAliasDrawsInline: number | null;
+  fgParticlesInline: number | null;
+  fgBeamsInline: number | null;
+  fgEntityMs: number | null;
+  materialGcMs: number | null;
+}
+
+export function collectForegroundAttribution(
+  r: SoftwareRenderer, detail: 'enabled' | 'disabled',
+): ForegroundAttribution {
+  const none: ForegroundAttribution = {
+    fgKicks: null, fgStaged: null, fgInline: null,
+    fgAlphaSpans: null, fgSpriteSpans: null, fgTrisStaged: null,
+    fgAliasDrawsInline: null, fgParticlesInline: null, fgBeamsInline: null,
+    fgEntityMs: null, materialGcMs: null,
+  };
+  try {
+    const wst = r.testForegroundWorkerStats();
+    none.fgStaged = wst.staged;
+    none.fgInline = wst.inline;
+    none.fgKicks = wst.kicks;
+  } catch {
+    return none;
+  }
+  try {
+    const fg = readForegroundStats(r);
+    if (fg) {
+      none.fgAlphaSpans = fg.alphaSpansStaged;
+      none.fgSpriteSpans = fg.spriteSpansStaged;
+      none.fgTrisStaged = fg.trisStaged ?? null;
+      none.fgAliasDrawsInline = fg.aliasDrawsInline;
+      none.fgParticlesInline = fg.particlesInline;
+      none.fgBeamsInline = fg.beamDrawsInline;
+      none.fgEntityMs = fg.entityMs;
+    }
+  } catch {
+    /* per-class breakdown stays null; batch legs above still report */
+  }
+  if (detail === 'enabled') {
+    const gcMs = readMaterialGcMs(r);
+    if (gcMs !== null) none.materialGcMs = gcMs;
+  }
+  return none;
+}
+
+/** Per-band worker exec + imbalance for one AttrRow (nullable = unpublished). */
+export interface WorkerExecAttribution {
+  workerComputeMs: number[] | null;
+  workerImbalance: AttrRow['workerImbalance'];
+  fenceIdleMs: number | null;
+}
+
+/**
+ * Worker-local execution attribution for the production kick: per-band
+ * compute list + max-vs-median straggler analysis + fence-idle estimate
+ * (dispatch max minus compute max — same-window durations, epoch-free).
+ * All null while the producer publishes no in-worker timestamps or
+ * detail is off; the caller keeps reporting dispatch-to-completion.
+ */
+export function collectWorkerExecAttribution(
+  pool: BandWorkerPool | null, r: SoftwareRenderer,
+  dispatchLatMs: number[], detail: 'enabled' | 'disabled',
+): WorkerExecAttribution {
+  const none: WorkerExecAttribution = { workerComputeMs: null, workerImbalance: null, fenceIdleMs: null };
+  if (detail !== 'enabled') return none;
+  let samples: WorkerExecSample[] | null = null;
+  try {
+    if (pool) samples = readBandExecStats(pool);
+    if (!samples || samples.length === 0) samples = readBandExecStats(r);
+  } catch {
+    return none;
+  }
+  if (!samples || samples.length === 0) return none;
+  const imb: WorkerImbalance = summarizeWorkerImbalance(samples);
+  const s = imb.straggler;
+  const dispatchMax = dispatchLatMs.length > 0 ? Math.max(...dispatchLatMs) : 0;
+  return {
+    workerComputeMs: samples.map((x) => x.execMs),
+    workerImbalance: {
+      groups: imb.groups, bands: imb.bands, bandMed: imb.bandMed, bandMax: imb.bandMax,
+      critMax: imb.critPathMax, gapMs: imb.imbalanceMs, ratio: imb.imbalanceRatio,
+      straggler: s ? `band${s.band}(${s.job} f${s.frame}s${s.seq} ${s.execMs.toFixed(2)}ms)` : null,
+      byGroup: imb.byGroup.map((g) => ({ job: g.job, seq: g.seq, n: g.n, med: g.med, max: g.max })),
+    },
+    fenceIdleMs: dispatchLatMs.length > 0 ? Math.max(0, dispatchMax - imb.critPathMax) : null,
+  };
 }
 
 export async function runAttrConfig(
@@ -587,7 +752,12 @@ export async function runAttrConfig(
     setCVar('sw_workers', Math.min(8, workers + 1));
     setCVar('sw_accum', 1);
     r.syncWorkersFromCvar();
-    pool = BandWorkerPool.create(workers, W, H, { indexJsPath: swRendererEsmPath() });
+    // PERF-NEXT-4 done-when 5: the accept gate forces Q2_DETAIL_TIMING='0'
+    // (see acceptance.ts) — honor it here so worker-side execMs measurement
+    // is off for acceptance (legacy completion shape, zero clock reads).
+    // Detail runs (compare/rgbattr without the kill-switch) keep it on.
+    const detailOff = typeof process !== 'undefined' && process.env['Q2_DETAIL_TIMING'] === '0';
+    pool = BandWorkerPool.create(workers, W, H, { indexJsPath: swRendererEsmPath(), workerTiming: !detailOff });
     if (!pool) throw new Error('pool unavailable (need worker_threads + SAB + Atomics.wait)');
     r.attachWorkerPool(pool);
   }
@@ -730,6 +900,17 @@ export async function runAttrConfig(
   const bandId = formatBandRanges(H, workers);
   const planeBytes = W * H * (4 + 1 + 4);
   const scanBytes = rgb ? W * H * (2 + 4) : null;
+  // PERF-NEXT-4: detailed timing (per-band worker exec, imbalance,
+  // material-GC ms) is env-gated and OFF for acceptance. Dispatch
+  // fences + counters below are always on — they are the acceptance path.
+  const detail: 'enabled' | 'disabled' = detailTimingEnabled() ? 'enabled' : 'disabled';
+  let fgAttr: ForegroundAttribution = {
+    fgKicks: null, fgStaged: null, fgInline: null,
+    fgAlphaSpans: null, fgSpriteSpans: null, fgTrisStaged: null,
+    fgAliasDrawsInline: null, fgParticlesInline: null, fgBeamsInline: null,
+    fgEntityMs: null, materialGcMs: null,
+  };
+  let execAttr: WorkerExecAttribution = { workerComputeMs: null, workerImbalance: null, fenceIdleMs: null };
   if (!rgb) {
     // Software: no scanout stage (the color plane IS the presented frame).
     // Segments timed in the same rep; the gap reconciles per rep.
@@ -759,6 +940,7 @@ export async function runAttrConfig(
         cacheHits = st.cacheHits; cacheMisses = st.cacheMisses; cacheEvictions = st.cacheEvictions;
         chainUsedBytes = st.rgbChainUsedBytes; retainedChainBytes = st.rgbRetainedChainBytes;
         orphanChainBytes = st.rgbOrphanChainBytes; chainEvictions = st.rgbChainEvictions;
+        fgAttr = collectForegroundAttribution(r, detail);
       }
     }
     frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
@@ -881,6 +1063,7 @@ export async function runAttrConfig(
           cacheHits = sc.cacheHits; cacheMisses = sc.cacheMisses; cacheEvictions = sc.cacheEvictions;
           chainUsedBytes = sc.rgbChainUsedBytes; retainedChainBytes = sc.rgbRetainedChainBytes;
           orphanChainBytes = sc.rgbOrphanChainBytes; chainEvictions = sc.rgbChainEvictions;
+          fgAttr = collectForegroundAttribution(r, detail);
         }
       }
       frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
@@ -900,6 +1083,11 @@ export async function runAttrConfig(
           scanoutMs = ks.med; scanoutP95 = ks.p95; scanoutMaxMs = ks.max;
         }
       }
+      // Per-band worker compute + imbalance for the pooled production kick
+      // (feature-detected; null while the renderer publishes no in-worker
+      // timestamps, or detail is off). Dispatch latencies above are the
+      // always-on fence; these samples are the compute side.
+      execAttr = collectWorkerExecAttribution(pool, r, scanoutKickLat, detail);
       // Full frames with the serial control (same workload, labeled).
       const frs: number[] = [];
       for (let i = 0; i < reps; i++) {
@@ -965,6 +1153,7 @@ export async function runAttrConfig(
           cacheHits = sc.cacheHits; cacheMisses = sc.cacheMisses; cacheEvictions = sc.cacheEvictions;
           chainUsedBytes = sc.rgbChainUsedBytes; retainedChainBytes = sc.rgbRetainedChainBytes;
           orphanChainBytes = sc.rgbOrphanChainBytes; chainEvictions = sc.rgbChainEvictions;
+          fgAttr = collectForegroundAttribution(r, detail);
         }
       }
       frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
@@ -978,6 +1167,9 @@ export async function runAttrConfig(
         const ks = summarizeLatencies(scanoutKickLat);
         scanoutP95 = ks.p95; scanoutMaxMs = ks.max;
       }
+      // Serial leg: the scanout ran on the caller (exec == latency, already
+      // in the journal) — per-band worker exec is a pooled concept, so the
+      // exec side stays null by construction; the split covers the caller.
     }
   }
 
@@ -1006,6 +1198,15 @@ export async function runAttrConfig(
     translucentSpans, cacheHits, cacheMisses, cacheEvictions,
     chainUsedBytes, retainedChainBytes, orphanChainBytes, chainEvictions,
     planeBytes, scanBytes, heapDeltaKB, bandId,
+    timingDetail: detail,
+    workerComputeMs: execAttr.workerComputeMs,
+    workerImbalance: execAttr.workerImbalance,
+    fenceIdleMs: execAttr.fenceIdleMs,
+    fgKicks: fgAttr.fgKicks, fgStaged: fgAttr.fgStaged, fgInline: fgAttr.fgInline,
+    fgAlphaSpans: fgAttr.fgAlphaSpans, fgSpriteSpans: fgAttr.fgSpriteSpans,
+    fgTrisStaged: fgAttr.fgTrisStaged, fgAliasDrawsInline: fgAttr.fgAliasDrawsInline,
+    fgParticlesInline: fgAttr.fgParticlesInline, fgBeamsInline: fgAttr.fgBeamsInline,
+    fgEntityMs: fgAttr.fgEntityMs, materialGcMs: fgAttr.materialGcMs,
   };
   const rs = (v: number | null): string => v === null ? '—' : v.toFixed(2);
   const dispFullPart = row.displayFull !== null && row.displayFull !== undefined ? `/full=${row.displayFull}` : '';
@@ -1019,11 +1220,29 @@ export async function runAttrConfig(
   // FPS is a separate soak metric, never this number).
   // Production-leg dispatch-to-completion only (the interleaved serial
   // control kicks live in kickJournal for forensics, not in this summary).
+  // Worker compute is reported ONLY from in-worker durations (execAttr);
+  // message-arrival delays are scheduling, never compute.
   const kickDist = summarizeLatencies(scanoutKickLat);
+  const execSummary = execAttr.workerComputeMs
+    ? `compute[${execAttr.workerComputeMs.map((v) => v.toFixed(2)).join('/')}] ` +
+      `gap=${rs(execAttr.workerImbalance?.gapMs ?? null)} ` +
+      `straggler=${execAttr.workerImbalance?.straggler ?? '?'} ` +
+      `groups[${(execAttr.workerImbalance?.byGroup ?? []).map((g) => `${g.job}s${g.seq}:${g.n}b med=${g.med.toFixed(2)} max=${g.max.toFixed(2)}`).join(' ')}] ` +
+      `fenceIdle=${rs(execAttr.fenceIdleMs)}`
+    : detail === 'disabled'
+      ? 'compute[detail-off]'
+      : `compute[unpublished:no-in-worker-timestamps${row.scanoutKind === 'serial' ? ';serial=caller-segment' : ''}]`;
   const scanPart = mode === 'rgb'
-    ? ` scanoutKick[${row.scanoutKind ?? 'n/a'} distrib ${formatLatency('dispatch-to-completion', kickDist)} exec=${row.scanoutKind === 'serial' ? 'on-caller' : 'on-workers(null:caller-only-fenced)'}]`
+    ? ` scanoutKick[${row.scanoutKind ?? 'n/a'} distrib ${formatLatency('dispatch-to-completion', kickDist)} ${execSummary}]`
     : '';
   const splitPart = ` split[begin=${rs(splitBeginMs)} render=${rs(splitRenderMs)} end=${rs(splitEndMs)} scanout=${rs(splitScanoutMs)} gap=${rs(splitGapMs)}]`;
+  const fgPart = mode === 'rgb'
+    ? ` fg[kicks=${fgAttr.fgKicks ?? '—'}(alpha+placed+entity flushes) staged=${fgAttr.fgStaged ?? '—'} inline=${fgAttr.fgInline ?? '—'} ` +
+      `alphaSpans=${fgAttr.fgAlphaSpans ?? '—'} spriteSpans=${fgAttr.fgSpriteSpans ?? '—'} tris=${fgAttr.fgTrisStaged ?? '—'} ` +
+      `aliasIn=${fgAttr.fgAliasDrawsInline ?? '—'} partIn=${fgAttr.fgParticlesInline ?? '—'} beamIn=${fgAttr.fgBeamsInline ?? '—'} ` +
+      `entityMs=${rs(fgAttr.fgEntityMs)} matGcMs=${rs(fgAttr.materialGcMs)}]`
+    : '';
+  const detailPart = ` detail=${detail}`;
   const stagePart = mode === 'rgb'
     ? ` ${formatStageCounts({
       rgbUsed, coverPixels: coverPx, stagedBatches: rgbStaged, inlineBatches: rgbInline,
@@ -1042,7 +1261,7 @@ export async function runAttrConfig(
     `scanout[${row.scanoutKind ?? 'n/a'}]=${rs(scanoutMs)}(p95 ${rs(scanoutP95)} max ${rs(scanoutMaxMs)}) serialCtl=${rs(scanoutSerialMs)} ` +
     `frame(production,Node,no-present)=${rs(frameMs)}(p95 ${rs(frameP95)} max ${rs(frameMaxMs)}) frameSerial=${rs(frameSerialMs)}(p95 ${rs(frameSerialP95)}) ` +
     `spans=${spans} px=${pixels} ov=${overdraw.toFixed(2)} ` +
-    `idx=${row.idxHash} color=${row.colorHash} full=${row.colorFull} disp=${row.displayHash ?? '—'}${dispFullPart}${rgbPart}${scanPart}${splitPart}${stagePart}`,
+    `idx=${row.idxHash} color=${row.colorHash} full=${row.colorFull} disp=${row.displayHash ?? '—'}${dispFullPart}${rgbPart}${scanPart}${splitPart}${fgPart}${stagePart}${detailPart}`,
   );
   return row;
 }

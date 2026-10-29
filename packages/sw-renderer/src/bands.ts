@@ -99,8 +99,20 @@ export const CTL_SCAN = CTL_RGBBASE + 1; // base; +MAX_WORKERS per-worker inspec
  * older workers that never write these slots report zero worker tris.
  */
 export const CTL_TRIS = CTL_SCAN + MAX_WORKERS;
-/** Control block length (CTL_TRIS owns the trailing MAX_WORKERS slots). */
-export const CTL_LEN = CTL_TRIS + MAX_WORKERS;
+/**
+ * Base for per-worker compute durations (PERF-NEXT-4 end-to-end timing):
+ * +MAX_WORKERS slots mirroring CTL_PIXELS/CTL_SPANS, holding worker-local
+ * execution milliseconds × 1000 (integer microseconds; -1 = band did not
+ * run this kick). Written by the worker in the timing branch next to the
+ * count slots, so the SYNC path — whose completion messages queue unread
+ * while the main thread blocks in Atomics.wait — harvests the same
+ * measurement from shared memory after the fence instead of depending on
+ * message delivery. Zero-initialised SABs read 0 until the first kick
+ * clears them to -1 (see `BandWorkerPool.kick`).
+ */
+export const CTL_EXEC = CTL_TRIS + MAX_WORKERS;
+/** Control block length (CTL_EXEC owns the trailing MAX_WORKERS slots). */
+export const CTL_LEN = CTL_EXEC + MAX_WORKERS;
 
 /** Kick types for CTL_JOB ( rasterise spans vs resolve the color plane vs RGB rasterise). */
 export const JOB_RASTER = 0;
@@ -1913,6 +1925,128 @@ export interface BandPort {
 }
 
 /**
+ * In-worker execution measurement (PERF-NEXT-4, Lane A: producer side).
+ *
+ * Three latencies, three clocks, never mixed:
+ * - (a) worker compute — `BandExecSample.execMs`, measured INSIDE
+ *   `bandWorkerLoop` around the band's drain for one kick, on ONE
+ *   worker-local clock (`opts.now`, default `defaultBandWorkerNow()`).
+ *   An epoch-free duration: comparable across workers as a duration, but
+ *   NEVER subtracted from a caller-clock latency and never aligned onto
+ *   the caller timeline (no shared epoch exists by design).
+ * - (b) calling-thread band execution — `mainExecMs` on the pool's
+ *   flush/dispatch tallies, measured on the CALLER clock around the
+ *   main-band drain only (the main band runs concurrently with the
+ *   workers, so this is not a critical-path term either).
+ * - (c) caller dispatch-to-completion — measured by the caller around the
+ *   whole kick (fence wait / message join); includes (a) plus scheduling,
+ *   wakeup and delivery. Reported side by side with (a)/(b), never fused.
+ */
+export interface BandWorkerOptions {
+  /**
+   * Worker-local clock (must be monotonic; both endpoints of the measured
+   * region use this same function, so the duration is epoch-free).
+   * Defaults to `defaultBandWorkerNow()`. Injected (not imported) so the
+   * shared loop stays platform-neutral: no DOM or Node types here.
+   */
+  now?: () => number;
+  /**
+   * Measure per-kick execution and post the full `BandExecSample` shape.
+   * Default true. False restores the exact legacy completion shape
+   * `{ seq, band, pixels, spans }` with zero clock reads (acceptance path).
+   */
+  timing?: boolean;
+}
+
+/**
+ * Default worker-local clock: `performance.now` where present (Node 16+
+ * workers, DOM workers) else `Date.now`. Resolved ONCE per loop entry and
+ * used for both endpoints, so a duration never mixes time origins.
+ */
+export function defaultBandWorkerNow(): () => number {
+  try {
+    const g = globalThis as { performance?: { now?: () => number } };
+    const perf = g.performance;
+    // NOTE: keep the bound receiver: a detached `performance.now`
+    // reference throws (needs its Performance receiver).
+    if (perf && typeof perf.now === 'function') {
+      const nowFn: () => number = perf.now.bind(perf);
+      return () => nowFn();
+    }
+  } catch {
+    /* fall through to Date.now */
+  }
+  return () => Date.now();
+}
+
+/**
+ * Wire job label carried on `BandExecSample.job` (and preserved verbatim by
+ * the browser entry stamper). Produced by `bandJobName()` from the CTL_JOB
+ * code at the post site, so every consumer (Node pool stash, browser diag,
+ * testkit parser, bench attribution) reads one vocabulary. The numeric CTL
+ * code stays available in shared memory (`CTL_JOB`) for anyone who needs
+ * it; the message carries the stable label. Unknown codes (forward-compat:
+ * workers ignore kicks they do not understand) map to `'unknown'` — never
+ * throw on a future code.
+ */
+export type BandJobLabel = 'raster' | 'resolve' | 'rgb' | 'scanout' | 'unknown';
+
+/** CTL_JOB code → wire label. */
+export function bandJobName(job: number): BandJobLabel {
+  if (job === JOB_RASTER) return 'raster';
+  if (job === JOB_RESOLVE) return 'resolve';
+  if (job === JOB_RGB) return 'rgb';
+  if (job === JOB_SCANOUT) return 'scanout';
+  return 'unknown';
+}
+
+/**
+ * Worker-local execution sample: the wire shape of the production worker
+ * completion message (posted by `bandWorkerLoop` once per kick per worker
+ * band when timing is enabled) and of the pool-side stash
+ * (`BandDispatcher.lastWorkerExec`).
+ *
+ * - `execMs` is a FINITE number >= 0 for every executed kick, measured
+ *   where the work ran (worker-local clock). Never null here: kicks that
+ *   post no measurement (timing disabled, legacy senders) use the legacy
+ *   `{ seq, band, pixels, spans }` shape instead, which consumers treat as
+ *   "execution unmeasured" rather than zero.
+ * - Identity reuses existing names: `seq` (job generation), `band` (worker
+ *   band index), `job` (wire label from `bandJobName()`: 'raster' =
+ *   indexed-world raster — single batch or frame-accum flush; 'resolve';
+ *   'rgb' = RGB raster — world batches plus foreground suffixes and tris;
+ *   'scanout'), `frame` (CTL_FRAME generation), `y0`/`y1` (the band's row
+ *   range for this kick).
+ * - Work counts are what THIS band drained for THIS kick: `pixels`/`spans`
+ *   (spanfill writes; 0 for resolve/scanout kicks, which still report a
+ *   finite `execMs` for the band work they did), `scanned` (entries
+ *   inspected — ordered subranges visit only owned rows), `tris`
+ *   (screen tris filled), `descs` (descriptors visited).
+ * - `kickBase`/`kickDescs` identify the drained descriptor range so
+ *   consumers can attribute individual flushes (e.g. a foreground-only
+ *   suffix kick has `kickBase` == the previous kick's applied watermark):
+ *   frame kicks drain [0, fcount), RGB kicks drain [rgbBase, rgbCount),
+ *   single-batch raster kicks drain one batch (1/1) or nothing (0/0),
+ *   resolve/scanout drain no descriptors (0/0).
+ */
+export interface BandExecSample {
+  seq: number;
+  band: number;
+  frame: number;
+  job: BandJobLabel;
+  y0: number;
+  y1: number;
+  execMs: number;
+  pixels: number;
+  spans: number;
+  scanned: number;
+  tris: number;
+  descs: number;
+  kickBase: number;
+  kickDescs: number;
+}
+
+/**
  * Worker main loop (runs INSIDE the worker thread). Announces readiness,
  * then blocks on the job generation counter, rasterises this worker's
  * band, publishes per-band counts, and wakes the dispatcher. All shared
@@ -1929,8 +2063,18 @@ export function bandWorkerLoop(
   y0: number, y1: number, band: number, fbW: number,
   waitSeq: (seq: number) => void,
   port: BandPort,
+  opts?: BandWorkerOptions,
 ): void {
   const views = fav.base;
+  // Measurement switch, resolved ONCE per loop entry (not per kick): the
+  // disabled path performs zero clock reads and posts the legacy shape.
+  // The clock is ONE function for both endpoints of every measured region
+  // (default performance.now/Date.now probe, or the injected entry-point
+  // clock), so durations never mix time origins.
+  const measure = opts === undefined || opts.timing !== false;
+  const clock = measure
+    ? (opts !== undefined && typeof opts.now === 'function' ? opts.now : defaultBandWorkerNow())
+    : null;
   // NOTE: seq is sampled BEFORE announcing readiness. The dispatcher only
   // publishes job 1 after every worker is ready, so SEQ is still 0 here by
   // construction — a worker can never miss its first wakeup (missed wakeups
@@ -1976,7 +2120,11 @@ export function bandWorkerLoop(
       views.zb.fill(0, y0 * fbW, y1 * fbW);
       lastFrame = frame;
     }
-    let r: { pixels: number; spans: number; scanned?: number };
+    let drained: {
+      pixels: number; spans: number; scanned: number; tris: number;
+      descs: number; kickBase: number; kickDescs: number;
+    };
+    const t0 = clock !== null ? clock() : 0;
     if (job === JOB_RESOLVE) {
       // Resolve kick (M8.1 parallel resolve + PERF-5 fused composite): expand
       // the final index plane into the shared color plane, compositing the
@@ -1986,7 +2134,7 @@ export function bandWorkerLoop(
       const pal = fav.fPal;
       if (rgb) resolveBandFused(fav.fColor, pal, views.idx, rgb.rgb565, rgb.cover, y0, y1, fbWNow, fbHNow);
       else resolveBand(fav.fColor, pal, views.idx, y0, y1, fbWNow, fbHNow);
-      r = { pixels: 0, spans: 0 };
+      drained = { pixels: 0, spans: 0, scanned: 0, tris: 0, descs: 0, kickBase: 0, kickDescs: 0 };
     } else if (job === JOB_RGB) {
       // RGB raster kick (PERF-2 RGB workers): drain every staged RGB
       // descriptor for this band. No lazy clear: beginFrame clears the RGB
@@ -1995,10 +2143,16 @@ export function bandWorkerLoop(
       if (!rgb) {
         Com_Error('error', 'bandWorkerLoop: JOB_RGB without RGB views');
       }
-      r = processRGBFrameJob(
-        rgb, fbWNow, fbHNow, Atomics.load(ctl, CTL_RGBCOUNT), y0, y1,
-        Atomics.load(ctl, CTL_RGBBASE),
+      const rgbBase = Atomics.load(ctl, CTL_RGBBASE);
+      const rgbCount = Atomics.load(ctl, CTL_RGBCOUNT);
+      const rr = processRGBFrameJob(
+        rgb, fbWNow, fbHNow, rgbCount, y0, y1,
+        rgbBase,
       );
+      drained = {
+        pixels: rr.pixels, spans: rr.spans, scanned: rr.scanned,
+        tris: rr.tris, descs: rr.descs, kickBase: rgbBase, kickDescs: rgbCount,
+      };
     } else if (job === JOB_SCANOUT) {
       // Scanout kick (Track A): fused pack→recon→gamma from the finished
       // shared color plane into shared scanout buffers. Disjoint rows,
@@ -2017,28 +2171,65 @@ export function bandWorkerLoop(
         },
         y0, y1,
       );
-      r = { pixels: 0, spans: 0 };
+      drained = { pixels: 0, spans: 0, scanned: 0, tris: 0, descs: 0, kickBase: 0, kickDescs: 0 };
     } else {
       const fcount = Atomics.load(ctl, CTL_FCOUNT);
-      r = fcount > 0
-        ? processFrameJob(fav, fbWNow, fbHNow, fcount, y0, y1)
-        : processBandJob(views, readBandJob(ctl, y0, y1));
+      if (fcount > 0) {
+        const fr = processFrameJob(fav, fbWNow, fbHNow, fcount, y0, y1);
+        drained = {
+          pixels: fr.pixels, spans: fr.spans, scanned: fr.scanned,
+          tris: 0, descs: fr.descs, kickBase: 0, kickDescs: fcount,
+        };
+      } else {
+        const single = readBandJob(ctl, y0, y1);
+        const br = processBandJob(views, single);
+        // Single packed batch: the core inspects all `count` staged spans
+        // (per-span y filter), so scanned == staged; one descriptor drained
+        // when anything was staged.
+        drained = {
+          pixels: br.pixels, spans: br.spans, scanned: single.count,
+          tris: 0, descs: single.count > 0 ? 1 : 0,
+          kickBase: 0, kickDescs: single.count > 0 ? 1 : 0,
+        };
+      }
     }
-    Atomics.store(ctl, CTL_PIXELS + band, r.pixels);
-    Atomics.store(ctl, CTL_SPANS + band, r.spans);
+    const t1 = clock !== null ? clock() : 0;
+    // Worker compute duration (latency (a)): one worker-local clock, both
+    // endpoints. Non-finite or backward clock steps (Date.now fallback under
+    // NTP) clamp to 0 — still finite, never a cross-clock delta.
+    let execMs = 0;
+    if (clock !== null) {
+      const d = t1 - t0;
+      execMs = Number.isFinite(d) && d >= 0 ? d : 0;
+    }
+    Atomics.store(ctl, CTL_PIXELS + band, drained.pixels);
+    Atomics.store(ctl, CTL_SPANS + band, drained.spans);
+    // Worker-compute duration slot (PERF-NEXT-4): integer microseconds of
+    // the same worker-local interval posted on the completion message, so
+    // the sync path harvests it from shared memory after the fence. -1 is
+    // never written here (the kick clears all slots pre-notify; only an
+    // executed band stores); clamps to int32 range.
+    if (clock !== null) {
+      try {
+        const us = Math.round(execMs * 1000);
+        Atomics.store(ctl, CTL_EXEC + band, us >= 0 && us <= 2147483647 ? us : 0);
+      } catch {
+        /* ignore */
+      }
+    }
     // Subrange proof (task 2): entries actually inspected by this band
     // (ordered subranges visit only owned rows; legacy fallbacks visit the
     // whole batch). Zero slots stay 0 for resolve/scanout kicks, which do
     // no spanfill — the dispatcher sums them only for raster/RGB kicks.
     try {
-      Atomics.store(ctl, CTL_SCAN + band, r.scanned ?? 0);
+      Atomics.store(ctl, CTL_SCAN + band, drained.scanned);
     } catch {
       /* ignore */
     }
     // Completed-screen-tri count for the item-3 worker attribution
     // (TASK item 2; zero for span-only kicks).
     try {
-      Atomics.store(ctl, CTL_TRIS + band, (r as { tris?: number }).tris ?? 0);
+      Atomics.store(ctl, CTL_TRIS + band, drained.tris);
     } catch {
       /* ignore */
     }
@@ -2048,10 +2239,28 @@ export function bandWorkerLoop(
     } catch {
       /* notify is best-effort; the dispatcher also polls on timeout */
     }
-    try {
-      port.postMessage({ seq: s, band, pixels: r.pixels, spans: r.spans });
-    } catch {
-      /* async dispatch unavailable; the sync path already woke via notify */
+    if (clock !== null) {
+      // Production completion (timing enabled): finite worker-compute
+      // duration plus frame/sequence/job/band identity and actual work
+      // counts. Consumers read only the fields they need; unknown fields
+      // are ignored by older pools.
+      const sample: BandExecSample = {
+        seq: s, band, frame, job: bandJobName(job), y0, y1, execMs,
+        pixels: drained.pixels, spans: drained.spans,
+        scanned: drained.scanned, tris: drained.tris, descs: drained.descs,
+        kickBase: drained.kickBase, kickDescs: drained.kickDescs,
+      };
+      try {
+        port.postMessage(sample);
+      } catch {
+        /* async dispatch unavailable; the sync path already woke via notify */
+      }
+    } else {
+      try {
+        port.postMessage({ seq: s, band, pixels: drained.pixels, spans: drained.spans });
+      } catch {
+        /* async dispatch unavailable; the sync path already woke via notify */
+      }
     }
   }
 }
@@ -2073,7 +2282,7 @@ export interface BandDispatcher {
     list: SpanList, tex: Texture, light: LightBlock,
     colormap: Uint8Array, time: number,
     fbW: number, fbH: number, idx: Uint8Array, zb: Float32Array,
-  ): { pixels: number; spans: number } | null;
+  ): { pixels: number; spans: number; mainExecMs?: number } | null;
   /**
    * Frame-accumulation surface (M8.1 async-render step 1): capture one
    * batch into the frame kick (true) or demand an immediate inline run
@@ -2088,9 +2297,9 @@ export interface BandDispatcher {
   /** Pending accumulated batches. */
   accumPending(): number;
   /** Kick one frame covering every accumulated batch (blocking). */
-  flushFrame(): { pixels: number; spans: number; scanned?: number } | null;
+  flushFrame(): { pixels: number; spans: number; scanned?: number; mainExecMs?: number } | null;
   /** Same as flushFrame but message-driven (browser async completion). */
-  flushFrameAsync(): Promise<{ pixels: number; spans: number; scanned?: number } | null>;
+  flushFrameAsync(): Promise<{ pixels: number; spans: number; scanned?: number; mainExecMs?: number } | null>;
   /** Full-frame inline replay of the accumulated batches (fallback). */
   drawInlineAll(): { pixels: number; spans: number; scanned?: number };
   /** Stage the palette for worker-side resolve (once per frame). */
@@ -2129,9 +2338,19 @@ export interface BandDispatcher {
   /** Pending staged RGB batches. */
   rgbPending(): number;
   /** Kick one RGB frame covering every staged batch (blocking). Null = replay inline. */
-  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number } | null;
+  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number; mainExecMs?: number } | null;
   /** Same as flushRGBFrame but message-driven (browser async completion). */
-  flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; scanned?: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number } | null>;
+  flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; scanned?: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number; mainExecMs?: number } | null>;
+  /**
+   * Worker-local execution samples for the most recent kick (latency (a)
+   * per worker band; see `BandExecSample`). Newest kick only: returns null
+   * once a newer kick is issued until its completions arrive, when timing
+   * is disabled, or when no completion posted a measurement (legacy shape).
+   * Worker bands only — the calling-thread band share is `mainExecMs` on
+   * the flush/dispatch tallies (latency (b)). Optional so legacy pools
+   * without completion capture keep compiling.
+   */
+  lastWorkerExec?(): BandExecSample[] | null;
   /** Full-frame inline replay of the staged RGB batches (fallback). */
   drawInlineRGBAll(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; tris?: number };
 

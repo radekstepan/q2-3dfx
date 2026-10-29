@@ -104,7 +104,7 @@ import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
 import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } from './render-workers.js';
-import type { DiagSnapshot, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
+import type { DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
 
 export type RendererKind = 'software' | 'voodoo';
 
@@ -4458,10 +4458,23 @@ export interface StageReport {
   /**
    * Last-kick diagnostic snapshot when armed (see DiagSnapshot: frame/seq
    * + job identity, rank-ordered dispatch-to-completion arrivals with band
-   * attribution, critical-path slowestMs). Null when disarmed — the
-   * production path never allocates it.
+   * attribution, critical-path slowestMs, within-kick worker-compute
+   * max/median/imbalance). Null when disarmed — the production path never
+   * allocates it.
    */
   diag: DiagSnapshot | null;
+  /**
+   * This frame's kick attempts in issue order (empty when disarmed):
+   * per-kick (frame, seq, job) identity + outcome + within-kick worker
+   * max/median + dispatch critical path + inter-kick gap. The rgb
+   * entries beyond the first are the foreground flushes in
+   * drawForegroundAsync order (world flush first, then alpha, placed and
+   * entity flushes) — every foreground flush including the placed pass
+   * carries the same timing fields. Independent medians are never summed
+   * or subtracted across entries: the frame's story is the list, and
+   * cross-rep analysis belongs to the bench/testkit lanes.
+   */
+  kickTimings: KickTiming[];
   resolveOrder: ResolveOrder;
   voodooPath: VoodooBandPath | 'none';
 }
@@ -4518,6 +4531,42 @@ export async function measureFrameStages(
   const t02 = performance.now();
   const { view, renderables } = buildAsyncView(boot.host, st.serverAcc);
   const t03 = performance.now();
+  // Pool kick outcomes + per-kick timing baseline BEFORE the frame's kicks
+  // run (PERF-NEXT-4 true per-frame attribution): the render stage below
+  // is where the indexed/world/foreground RGB kicks happen, so sampling
+  // here — not after — makes the deltas below cover exactly this frame.
+  // resolveDisplayAsync only adds scanout outcomes, never RGB ones.
+  // `scanned` needs the same before snapshot (monotonic counters);
+  // `kickKeysBefore` identifies this frame's ledger entries by
+  // (frame, seq, job, outcome) identity afterward. -1/empty downstream
+  // when unavailable or disarmed.
+  let rgbFbBefore = 0;
+  let scannedBefore = 0;
+  let scannedAvailBefore = false;
+  let kickKeysBefore: Set<string> | null = null;
+  try {
+    const pool = boot.browserPool as unknown as {
+      kickStats?: () => {
+        fallbacks: { rgb: number };
+        scanned: { raster: number; rgb: number };
+        scannedAvailable: boolean;
+      };
+      kickTimings?: () => Array<{
+        frame: number; seq: number; job: string; outcome: string;
+      }>;
+    } | null;
+    if (pool && typeof pool.kickStats === 'function') {
+      const ks = pool.kickStats();
+      rgbFbBefore = ks.fallbacks.rgb | 0;
+      scannedBefore = (ks.scanned.raster | 0) + (ks.scanned.rgb | 0);
+      scannedAvailBefore = ks.scannedAvailable === true;
+    }
+    if (pool && typeof pool.kickTimings === 'function') {
+      kickKeysBefore = new Set(
+        pool.kickTimings().map((k) => `${k.frame}:${k.seq}:${k.job}:${k.outcome}`),
+      );
+    }
+  } catch { /* unpooled/foreign pool: zeros stand */ }
   boot.refresh.beginFrame();
   const t04 = performance.now();
   const stats = await boot.refresh.renderViewAsync(view, boot.host.world, renderables);
@@ -4552,28 +4601,6 @@ export async function measureFrameStages(
     const ws = boot.refresh.testWorkerStats();
     pooled = ws.pooled; bands = ws.bands;
   } catch { /* single-threaded fallback: defaults stand */ }
-  // Pool kick outcomes across the raster stage above (0 healthy).
-  // Sampled before/after the render — resolveDisplayAsync below only adds
-  // scanout outcomes, never RGB ones. `scanned` needs the same before
-  // snapshot (monotonic counters); -1 downstream when unavailable.
-  let rgbFbBefore = 0;
-  let scannedBefore = 0;
-  let scannedAvailBefore = false;
-  try {
-    const pool = boot.browserPool as unknown as {
-      kickStats?: () => {
-        fallbacks: { rgb: number };
-        scanned: { raster: number; rgb: number };
-        scannedAvailable: boolean;
-      };
-    } | null;
-    if (pool && typeof pool.kickStats === 'function') {
-      const ks = pool.kickStats();
-      rgbFbBefore = ks.fallbacks.rgb | 0;
-      scannedBefore = (ks.scanned.raster | 0) + (ks.scanned.rgb | 0);
-      scannedAvailBefore = ks.scannedAvailable === true;
-    }
-  } catch { /* unpooled/foreign pool: zeros stand */ }
   let stageBytes = -1;
   let stageDetail: StageReport['stageDetail'] = null;
   try {
@@ -4669,8 +4696,17 @@ export async function measureFrameStages(
       };
     }
   } catch { /* hook absent: null stands */ }
+  // Pool RGB-kick fallback + inspected-span deltas across this frame's
+  // raster stage (0 healthy): the before baselines above ran pre-render,
+  // so these deltas cover exactly this frame (previously the baseline was
+  // sampled post-render, pinning the fallback delta at 0).
   let rgbFallbacks = 0;
   let scannedSpans = -1;
+  // This frame's kick attempts in issue order (PERF-NEXT-4 per-frame
+  // attribution): ledger entries absent from the pre-render baseline are
+  // this frame's kicks — world flush first, then the foreground flushes
+  // (alpha, placed, entity), then resolve/scanout. Empty when disarmed.
+  let kickTimings: KickTiming[] = [];
   try {
     const pool = boot.browserPool as unknown as {
       kickStats?: () => {
@@ -4678,6 +4714,7 @@ export async function measureFrameStages(
         scanned: { raster: number; rgb: number };
         scannedAvailable: boolean;
       };
+      kickTimings?: () => KickTiming[];
     } | null;
     if (pool && typeof pool.kickStats === 'function') {
       const ks = pool.kickStats();
@@ -4686,7 +4723,13 @@ export async function measureFrameStages(
         scannedSpans = ((ks.scanned.raster | 0) + (ks.scanned.rgb | 0)) - scannedBefore;
       }
     }
-  } catch { /* unpooled/foreign pool: 0/-1 stand */ }
+    if (pool && typeof pool.kickTimings === 'function') {
+      const after = pool.kickTimings();
+      kickTimings = kickKeysBefore === null
+        ? after
+        : after.filter((k) => !kickKeysBefore.has(`${k.frame}:${k.seq}:${k.job}:${k.outcome}`));
+    }
+  } catch { /* unpooled/foreign pool: 0/-1/[] stand */ }
   // JS heap delta (Chromium-only performance.memory; harness trend signal,
   // never a budget gate; two same-process samples, no cross-clock math).
   const heapDeltaMB = heapDelta(heapBefore);
@@ -4704,6 +4747,7 @@ export async function measureFrameStages(
     skip,
     fg,
     diag,
+    kickTimings,
     heapDeltaMB,
     resolveOrder: boot.lastResolveOrder,
     voodooPath: boot.lastVoodooPath,

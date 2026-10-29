@@ -16,7 +16,7 @@
 
 import { Com_Warn } from '@q2/config';
 import {
-  CTL_COUNT, CTL_DONE, CTL_FBH, CTL_FBW, CTL_FCOUNT, CTL_FRAME, CTL_HMASK, CTL_JOB, CTL_LIGHTH, CTL_LIGHTW,
+  CTL_COUNT, CTL_DONE, CTL_EXEC, CTL_FBH, CTL_FBW, CTL_FCOUNT, CTL_FRAME, CTL_HMASK, CTL_JOB, CTL_LIGHTH, CTL_LIGHTW,
   CTL_PIXELS, CTL_READY, CTL_RGBBASE, CTL_RGBCOUNT, CTL_SCAN, CTL_SEQ, CTL_SPANS, CTL_TEXH, CTL_TEXW, CTL_TRIS, CTL_TURBPHASE,
   CTL_WMASK, CTL_WSHIFT, D_HMASK, D_LIGHT_H, D_LIGHT_OFF, D_LIGHT_W,
   D_PER_BATCH, D_SPAN_BASE, D_SPAN_COUNT, D_TEX_H, D_TEX_OFF, D_TEX_W,
@@ -31,7 +31,7 @@ import {
   processBandJob, processFrameJob, processRGBFrameJob, processScanoutBand, readBandJob, resolveBand, resolveBandFused,
   sabAvailable, splitBands, syncWaitAllowed, writeBandJob, I_PER_SPAN,
   type Band,
-  type BandDispatcher, type BandViews, type FrameAccumViews, type RGBAccumViews, type ScanoutBandOptions,
+  type BandDispatcher, type BandExecSample, type BandJobLabel, type BandViews, type FrameAccumViews, type RGBAccumViews, type ScanoutBandOptions,
 } from './bands.js';
 import { textureMasks, type LightBlock, type SpanList, type Texture, type RGBMipLevel } from './spans.js';
 import { TRI_MAX_TRIS, TRI_I_PER_TRI } from './alias.js';
@@ -69,6 +69,25 @@ interface FsLike {
 
 declare function setTimeout(cb: () => void, ms: number): unknown;
 declare function clearTimeout(t: unknown): void;
+
+/**
+ * Caller-side clock for `mainExecMs` (latency (b)): one function per call
+ * site, both endpoints of the measured region. Mirrors the worker-side
+ * default without sharing state across threads.
+ */
+function poolNow(): number {
+  try {
+    const g = globalThis as { performance?: { now?: () => number } };
+    const perf = g.performance;
+    // Keep the method call form: a detached `performance.now` throws.
+    if (perf && typeof perf.now === 'function') {
+      return perf.now();
+    }
+  } catch {
+    /* fall through */
+  }
+  return Date.now();
+}
 
 function loadWorkerThreads(): WorkerThreadsLike | null {
   try {
@@ -112,6 +131,15 @@ export interface PoolOptions {
   indexJsPath: string;
   /** Per-batch wait budget in ms (default 30_000). */
   timeoutMs?: number;
+  /**
+   * In-worker execution measurement (PERF-NEXT-4): forwarded to the worker
+   * loop (`BandWorkerOptions.timing`), so production completion messages
+   * carry a finite `execMs` plus identity/counts. Default true. False
+   * restores the legacy `{ seq, band, pixels, spans }` shape with zero
+   * clock reads in workers (acceptance path) and omits `mainExecMs` on
+   * tallies.
+   */
+  workerTiming?: boolean;
 }
 
 /**
@@ -202,11 +230,45 @@ export class BandWorkerPool implements BandDispatcher {
    * fake/scripted workers). Never rejects.
    */
   private quarantineSettled: Promise<void> | null = null;
+  /**
+   * In-worker execution measurement switch (PERF-NEXT-4): forwarded to the
+   * worker loop at spawn. False also omits pool-side `mainExecMs`.
+   */
+  private readonly timingEnabled: boolean;
+  /**
+   * Newest kick's worker-local execution samples (PERF-NEXT-4 consumer
+   * hook): `execSamples[band]` holds the validated `BandExecSample` that
+   * band posted for `execSeq`, or null when it has not arrived yet.
+   * Replaced (not grown) on every kick — bounded by the worker count.
+   */
+  private execSeq = -1;
+  private execSamples: (BandExecSample | null)[] | null = null;
+  /**
+   * Newest slot-harvested kick (PERF-NEXT-4): `harvestSyncExec` marks the
+   * seq it fed from shared memory so the workers' queued completion posts
+   * — unread while the main thread blocked in Atomics.wait — are dropped
+   * on arrival instead of double-feeding the per-frame accumulation.
+   * Reset per kick in `kick()`; stale marks are harmless (the newest-kick
+   * gate already drops older seqs).
+   */
+  private execSlotHarvested = -1;
+  /**
+   * Per-frame accumulation of validated worker samples (PERF-NEXT-4,
+   * mirrors the browser pool): every validated `noteWorkerExec` sample is
+   * appended here until `beginFrame` resets it. The newest-kick stash
+   * above is too narrow for attribution — a production frame drains many
+   * kicks (world, foreground flushes incl. the placed pass, resolve,
+   * scanout) and later publishes invalidate the newest-kick gate even
+   * when no newer kick ran. Bounded (`FRAME_EXEC_CAP`); oldest-first
+   * order. Empty (not null) when timing is disabled or nothing posted.
+   */
+  private frameExecSamples: BandExecSample[] = [];
 
   private constructor(
     bandCount: number, views: FrameAccumViews, rgbViews: RGBAccumViews, ctl: Int32Array,
     bands: Band[],
     workers: WorkerLike[], timeoutMs: number, fbW: number, fbH: number,
+    timingEnabled: boolean,
   ) {
     this.bandCount = bandCount;
     this.views = views;
@@ -217,6 +279,7 @@ export class BandWorkerPool implements BandDispatcher {
     this.timeoutMs = timeoutMs;
     this.fbW = fbW;
     this.fbH = fbH;
+    this.timingEnabled = timingEnabled;
     for (const w of workers) {
       this.workers.push(w);
       try {
@@ -225,6 +288,7 @@ export class BandWorkerPool implements BandDispatcher {
             const rec = msg as { seq?: unknown; ready?: unknown };
             if (rec.ready === true) this.readyCount += 1;
             if (typeof rec.seq === 'number') {
+              this.noteWorkerExec(rec);
               const done = this.pending.get(rec.seq);
               if (done) done();
             }
@@ -255,6 +319,7 @@ export class BandWorkerPool implements BandDispatcher {
       const { views: rgbViews } = attachRGBAccum(sab, w, h);
       // The calling thread owns the last band; workers take the rest.
       const bands = splitBands(h, workers + 1);
+      const timingEnabled = opts.workerTiming !== false;
       const bootstrap = poolBootstrapSource();
       const spawned: WorkerLike[] = [];
       try {
@@ -266,6 +331,7 @@ export class BandWorkerPool implements BandDispatcher {
               sab: views.ctl.buffer, w, h,
               y0: b.y0, y1: b.y1, band: i,
               indexJsUrl: fileUrlOf(opts.indexJsPath),
+              timing: timingEnabled,
             },
           });
           try {
@@ -285,7 +351,7 @@ export class BandWorkerPool implements BandDispatcher {
         }
         return null;
       }
-      return new BandWorkerPool(workers + 1, views, rgbViews, ctl, bands, spawned, opts.timeoutMs ?? 30000, w, h);
+      return new BandWorkerPool(workers + 1, views, rgbViews, ctl, bands, spawned, opts.timeoutMs ?? 30000, w, h, timingEnabled);
     } catch {
       return null;
     }
@@ -314,6 +380,7 @@ export class BandWorkerPool implements BandDispatcher {
     this.frameGen += 1;
     this.resetAccum();
     this.resetRGB();
+    this.frameExecSamples = [];
     try {
       Atomics.store(this.ctl, CTL_FRAME, this.frameGen);
     } catch {
@@ -349,7 +416,7 @@ export class BandWorkerPool implements BandDispatcher {
     list: SpanList, tex: Texture, light: LightBlock,
     colormap: Uint8Array, time: number,
     fbW: number, fbH: number, idx: Uint8Array, zb: Float32Array,
-  ): { pixels: number; spans: number } | null {
+  ): { pixels: number; spans: number; mainExecMs?: number } | null {
     if (this.disposed || this.workers.length === 0) return null;
     if (idx !== this.base.idx || zb !== this.base.zb) return null;
     const packed = this.pack(list);
@@ -369,7 +436,9 @@ export class BandWorkerPool implements BandDispatcher {
     // workers run theirs, then collect. Same math, golden-identical.
     const mainBand = this.bands[this.bands.length - 1]!;
     this.clearMainBand(mainBand, fbW);
+    const m0 = this.timingEnabled ? poolNow() : 0;
     const main = processBandJob(this.base, readBandJob(this.ctl, mainBand.y0, mainBand.y1));
+    const m1 = this.timingEnabled ? poolNow() : 0;
     const deadline = Date.now() + this.timeoutMs;
     let done = Atomics.load(this.ctl, CTL_DONE);
     while (done < this.workers.length) {
@@ -388,6 +457,10 @@ export class BandWorkerPool implements BandDispatcher {
     const tally = this.tally();
     tally.pixels += main.pixels;
     tally.spans += main.spans;
+    if (this.timingEnabled) tally.mainExecMs = m1 - m0 >= 0 ? m1 - m0 : 0;
+    // Sync-kick exec harvest (PERF-NEXT-4): same worker-local durations
+    // the message path would carry, read from CTL_EXEC after the fence.
+    this.harvestSyncExec(seq, 'raster', 0, 1);
     return tally;
   }
 
@@ -400,7 +473,7 @@ export class BandWorkerPool implements BandDispatcher {
     list: SpanList, tex: Texture, light: LightBlock,
     colormap: Uint8Array, time: number,
     fbW: number, fbH: number, idx: Uint8Array, zb: Float32Array,
-  ): Promise<{ pixels: number; spans: number } | null> {
+  ): Promise<{ pixels: number; spans: number; mainExecMs?: number } | null> {
     if (this.disposed || this.workers.length === 0) return null;
     if (idx !== this.base.idx || zb !== this.base.zb) return null;
     const packed = this.pack(list);
@@ -422,7 +495,9 @@ export class BandWorkerPool implements BandDispatcher {
     // Main-thread band first (sync), then await the workers.
     const mainBand = this.bands[this.bands.length - 1]!;
     this.clearMainBand(mainBand, fbW);
+    const m0 = this.timingEnabled ? poolNow() : 0;
     const main = processBandJob(this.base, readBandJob(this.ctl, mainBand.y0, mainBand.y1));
+    const m1 = this.timingEnabled ? poolNow() : 0;
     const ok = await finished;
     if (!ok) {
       Com_Warn(`bandPool: async batch timeout after ${this.timeoutMs}ms, redrawing inline`);
@@ -431,6 +506,7 @@ export class BandWorkerPool implements BandDispatcher {
     const tally = this.tally();
     tally.pixels += main.pixels;
     tally.spans += main.spans;
+    if (this.timingEnabled) tally.mainExecMs = m1 - m0 >= 0 ? m1 - m0 : 0;
     return tally;
   }
 
@@ -631,7 +707,7 @@ export class BandWorkerPool implements BandDispatcher {
    * wait times out — the caller replays inline via drawInlineAll, which
    * converges to the identical planes (all writes depth-guarded).
    */
-  flushFrame(): { pixels: number; spans: number } | null {
+  flushFrame(): { pixels: number; spans: number; mainExecMs?: number } | null {
     if (this.disposed || this.workers.length === 0) return null;
     if (this.descCount === 0) return { pixels: 0, spans: 0 };
     if (!this.awaitReadySync()) {
@@ -645,9 +721,11 @@ export class BandWorkerPool implements BandDispatcher {
     // workers drain theirs, then collect. Same math, golden-identical.
     const mainBand = this.bands[this.bands.length - 1]!;
     this.clearMainBand(mainBand, this.fbW);
+    const m0 = this.timingEnabled ? poolNow() : 0;
     const main = processFrameJob(
       this.views, this.fbW, this.fbH, this.descCount, mainBand.y0, mainBand.y1,
     );
+    const m1 = this.timingEnabled ? poolNow() : 0;
     const ok = this.awaitDoneSync();
     if (!ok) {
       Com_Warn(`bandPool: frame timeout after ${this.timeoutMs}ms, redrawing inline`);
@@ -657,6 +735,9 @@ export class BandWorkerPool implements BandDispatcher {
     tally.pixels += main.pixels;
     tally.spans += main.spans;
     tally.scanned += main.scanned;
+    if (this.timingEnabled) tally.mainExecMs = m1 - m0 >= 0 ? m1 - m0 : 0;
+    // Sync-kick exec harvest (PERF-NEXT-4); descCount still pre-reset here.
+    this.harvestSyncExec(seq, 'raster', 0, this.descCount);
     this.resetAccum();
     return tally;
   }
@@ -666,7 +747,7 @@ export class BandWorkerPool implements BandDispatcher {
    * blocking (for threads that forbid Atomics.wait — the browser
    * async-render completion path). Resolves null on timeout or dead pool.
    */
-  async flushFrameAsync(): Promise<{ pixels: number; spans: number } | null> {
+  async flushFrameAsync(): Promise<{ pixels: number; spans: number; mainExecMs?: number } | null> {
     if (this.disposed || this.workers.length === 0) return null;
     if (this.descCount === 0) return { pixels: 0, spans: 0 };
     if (!(await this.awaitReadyAsync())) {
@@ -683,9 +764,11 @@ export class BandWorkerPool implements BandDispatcher {
     // Main-thread band first (sync), then await the workers.
     const mainBand = this.bands[this.bands.length - 1]!;
     this.clearMainBand(mainBand, this.fbW);
+    const m0 = this.timingEnabled ? poolNow() : 0;
     const main = processFrameJob(
       this.views, this.fbW, this.fbH, this.descCount, mainBand.y0, mainBand.y1,
     );
+    const m1 = this.timingEnabled ? poolNow() : 0;
     const ok = await finished;
     if (!ok) {
       Com_Warn(`bandPool: async frame timeout after ${this.timeoutMs}ms, redrawing inline`);
@@ -695,6 +778,7 @@ export class BandWorkerPool implements BandDispatcher {
     tally.pixels += main.pixels;
     tally.spans += main.spans;
     tally.scanned += main.scanned;
+    if (this.timingEnabled) tally.mainExecMs = m1 - m0 >= 0 ? m1 - m0 : 0;
     this.resetAccum();
     return tally;
   }
@@ -732,7 +816,10 @@ export class BandWorkerPool implements BandDispatcher {
     if (!this.kick(seq)) return false;
     const mainBand = this.bands[this.bands.length - 1]!;
     resolveBandFused(this.views.fColor, this.views.fPal, this.base.idx, this.rgbViews.rgb565, this.rgbViews.cover, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
-    return this.awaitDoneSync();
+    const okResolve = this.awaitDoneSync();
+    // Sync-kick exec harvest (PERF-NEXT-4): resolve workers measured in-loop.
+    if (okResolve) this.harvestSyncExec(seq, 'resolve', 0, 0);
+    return okResolve;
   }
 
   /**
@@ -791,7 +878,10 @@ export class BandWorkerPool implements BandDispatcher {
       this.views.fColor, this.rgbViews.scan565, this.rgbViews.scanDisplay,
       this.fbW, this.fbH, opts, mainBand.y0, mainBand.y1,
     );
-    return this.awaitDoneSync();
+    const okScanout = this.awaitDoneSync();
+    // Sync-kick exec harvest (PERF-NEXT-4): scanout workers measured in-loop.
+    if (okScanout) this.harvestSyncExec(seq, 'scanout', 0, 0);
+    return okScanout;
   }
 
   /**
@@ -1115,7 +1205,7 @@ export class BandWorkerPool implements BandDispatcher {
    * ready, declined, disposed, quarantined, empty suffix) are class
    * 'clean' — see lastRGBFailure.
    */
-  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; workerSpans: number; workerPixels: number; tris: number; workerTris: number } | null {
+  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; workerSpans: number; workerPixels: number; tris: number; workerTris: number; mainExecMs?: number } | null {
     if (this.disposed || this.workers.length === 0 || this.quarantined) {
       this.rgbFailure = 'clean';
       return null;
@@ -1136,10 +1226,12 @@ export class BandWorkerPool implements BandDispatcher {
     // inline while the workers drain theirs, then collect. Same math,
     // golden-identical.
     const mainBand = this.bands[this.bands.length - 1]!;
+    const m0 = this.timingEnabled ? poolNow() : 0;
     const main = processRGBFrameJob(
       this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, mainBand.y0, mainBand.y1,
       this.rgbFlushedCount,
     );
+    const m1 = this.timingEnabled ? poolNow() : 0;
     const ok = this.awaitDoneSync();
     if (!ok) {
       Com_Warn(`bandPool: RGB frame timeout after ${this.timeoutMs}ms, quarantining + replaying inline`);
@@ -1152,6 +1244,9 @@ export class BandWorkerPool implements BandDispatcher {
     tally.spans += main.spans;
     tally.scanned += main.scanned;
     tally.tris += main.tris;
+    if (this.timingEnabled) tally.mainExecMs = m1 - m0 >= 0 ? m1 - m0 : 0;
+    // Sync-kick exec harvest (PERF-NEXT-4); watermark still pre-advance here.
+    this.harvestSyncExec(seq, 'rgb', this.rgbFlushedCount, this.rgbDescCount);
     this.rgbFlushedCount = this.rgbDescCount;
     this.rgbFailure = null;
     return { ...tally, workerSpans: tally.spans - main.spans, workerPixels: tally.pixels - main.pixels, workerTris: tally.tris - main.tris };
@@ -1162,7 +1257,7 @@ export class BandWorkerPool implements BandDispatcher {
    * blocking (for threads that forbid Atomics.wait). Timeout quarantines
    * first (class 'partial'); pre-dispatch failures are class 'clean'.
    */
-  async flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; workerSpans: number; workerPixels: number; tris: number; workerTris: number } | null> {
+  async flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; workerSpans: number; workerPixels: number; tris: number; workerTris: number; mainExecMs?: number } | null> {
     if (this.disposed || this.workers.length === 0 || this.quarantined) {
       this.rgbFailure = 'clean';
       return null;
@@ -1182,10 +1277,12 @@ export class BandWorkerPool implements BandDispatcher {
       return null;
     }
     const mainBand = this.bands[this.bands.length - 1]!;
+    const m0 = this.timingEnabled ? poolNow() : 0;
     const main = processRGBFrameJob(
       this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, mainBand.y0, mainBand.y1,
       this.rgbFlushedCount,
     );
+    const m1 = this.timingEnabled ? poolNow() : 0;
     const ok = await finished;
     if (!ok) {
       Com_Warn(`bandPool: async RGB frame timeout after ${this.timeoutMs}ms, quarantining + replaying inline`);
@@ -1201,6 +1298,7 @@ export class BandWorkerPool implements BandDispatcher {
     tally.spans += main.spans;
     tally.scanned += main.scanned;
     tally.tris += main.tris;
+    if (this.timingEnabled) tally.mainExecMs = m1 - m0 >= 0 ? m1 - m0 : 0;
     this.rgbFlushedCount = this.rgbDescCount;
     this.rgbFailure = null;
     return { ...tally, workerSpans: tally.spans - main.spans, workerPixels: tally.pixels - main.pixels, workerTris: tally.tris - main.tris };
@@ -1320,6 +1418,194 @@ export class BandWorkerPool implements BandDispatcher {
   /** Last RGB flush outcome: 'clean' (nothing ran), 'partial' (workers may have written), null (success/none). */
   lastRGBFailure(): 'clean' | 'partial' | null {
     return this.rgbFailure;
+  }
+
+  /**
+   * Worker-local execution samples for the most recent kick (PERF-NEXT-4
+   * Node-consumer hook; see `BandDispatcher.lastWorkerExec`). Strictly
+   * newest-kick: null once a newer kick is issued until its completions
+   * arrive, when timing is disabled, or when nothing posted a measurement.
+   * Copies (mutating the result never corrupts the stash).
+   */
+  lastWorkerExec(): BandExecSample[] | null {
+    if (this.execSeq !== this.seq) return null;
+    const samples = this.execSamples;
+    if (!samples) return null;
+    const out: BandExecSample[] = [];
+    for (const s of samples) {
+      if (s !== null) out.push({ ...s });
+    }
+    return out.length > 0 ? out : null;
+  }
+
+  /**
+   * Feature-detected timing hook shared with the browser pool
+   * (`BrowserBandPool.testBandExecStats`, PERF-NEXT-4): the frame's
+   * per-band samples in the consumer vocabulary — worker-local `execMs`,
+   * frame/sequence identity, band rows, work counts — accumulated since
+   * `beginFrame` across EVERY kick (world, foreground flushes incl. the
+   * placed pass, resolve, scanout), oldest-first, bounded (256). Wire
+   * labels map to the shared job names ('raster'→'indexed-frame',
+   * 'resolve'→'indexed-resolve'; 'rgb'/'scanout' direct); 'unknown' kicks
+   * are dropped (raw samples stay on `lastWorkerExec`). Structural shape
+   * only — no testkit import (dependency direction forbids it); consumers
+   * validate field-by-field. Null when timing is disabled or nothing
+   * posted yet this frame. Never throws.
+   */
+  testBandExecStats(): Array<{
+    frame: number; seq: number;
+    job: 'rgb' | 'scanout' | 'indexed-resolve' | 'indexed-frame';
+    worker: number; band: number; y0: number; y1: number;
+    execMs: number; pixels: number; spans: number; tris: number;
+  }> | null {
+    if (!this.timingEnabled || this.frameExecSamples.length === 0) return null;
+    const out: Array<{
+      frame: number; seq: number;
+      job: 'rgb' | 'scanout' | 'indexed-resolve' | 'indexed-frame';
+      worker: number; band: number; y0: number; y1: number;
+      execMs: number; pixels: number; spans: number; tris: number;
+    }> = [];
+    for (const s of this.frameExecSamples) {
+      const job = s.job === 'raster' ? 'indexed-frame'
+        : s.job === 'resolve' ? 'indexed-resolve'
+        : s.job === 'rgb' ? 'rgb'
+        : s.job === 'scanout' ? 'scanout' : null;
+      if (job === null) continue;
+      out.push({
+        frame: s.frame, seq: s.seq, job, worker: s.band, band: s.band,
+        y0: s.y0, y1: s.y1, execMs: s.execMs, pixels: s.pixels,
+        spans: s.spans, tris: s.tris,
+      });
+    }
+    return out.length > 0 ? out : null;
+  }
+
+  /**
+   * Stash one validated worker completion for the newest kick. Newest-kick
+   * only (`seq === this.seq`): a late arrival for an older kick — e.g. a
+   * doomed worker's post-timeout partial — never overwrites a newer kick's
+   * samples. Legacy `{ seq, band, pixels, spans }` messages carry no
+   * `execMs` and are ignored, so the stash holds measured durations only
+   * (never nulls, never synthetic values). Kicks harvested from shared
+   * memory by `harvestSyncExec` drop their (queued, unread) messages here
+   * via the `execSlotHarvested` mark — same samples, never double-fed to
+   * the per-frame accumulation. Identity + `execMs` are strictly
+   * validated; counts coerce to 0 when absent. Never throws.
+   */
+  private noteWorkerExec(msg: { seq?: unknown; ready?: unknown }): void {
+    if (this.disposed || !this.timingEnabled) return;
+    const rec = msg as {
+      seq?: unknown; band?: unknown; frame?: unknown; job?: unknown;
+      y0?: unknown; y1?: unknown; execMs?: unknown; pixels?: unknown;
+      spans?: unknown; scanned?: unknown; tris?: unknown; descs?: unknown;
+      kickBase?: unknown; kickDescs?: unknown;
+    };
+    const seq = rec.seq;
+    // Newest-kick gate: only the kick in flight (`execSeq`, armed by
+    // `kick()`) is accepted — pre-kick (-1) and stale seqs are ignored, so
+    // a synthetic message can never plant samples.
+    if (typeof seq !== 'number' || !Number.isInteger(seq) || seq !== this.execSeq) return;
+    // Slot-harvested kicks already fed the identical samples from shared
+    // memory (the sync path harvests after the fence; the workers' posts
+    // queue unread and arrive later). Drop them — same values, and the
+    // per-frame accumulation must see every band exactly once per kick.
+    if (seq === this.execSlotHarvested) return;
+    this.ingestExecSample(rec);
+  }
+
+  /**
+   * Validate + store one worker sample from either transport (message post
+   * or shared-memory harvest). Shared by `noteWorkerExec` and
+   * `harvestSyncExec`; identical validation, newest-kick stash +
+   * per-frame accumulation. Never throws.
+   */
+  private ingestExecSample(rec: {
+    seq?: unknown; band?: unknown; frame?: unknown; job?: unknown;
+    y0?: unknown; y1?: unknown; execMs?: unknown; pixels?: unknown;
+    spans?: unknown; scanned?: unknown; tris?: unknown; descs?: unknown;
+    kickBase?: unknown; kickDescs?: unknown;
+  }): void {
+    if (this.disposed || !this.timingEnabled) return;
+    const seq = rec.seq;
+    if (typeof seq !== 'number' || !Number.isInteger(seq) || seq !== this.execSeq) return;
+    const samples = this.execSamples;
+    if (!samples) return;
+    const band = rec.band;
+    if (typeof band !== 'number' || !Number.isInteger(band) || band < 0 || band >= samples.length) return;
+    const execMs = rec.execMs;
+    if (typeof execMs !== 'number' || !Number.isFinite(execMs) || execMs < 0) return;
+    const num = (v: unknown): number | null =>
+      typeof v === 'number' && Number.isFinite(v) ? v : null;
+    const frame = num(rec.frame);
+    const jobRaw = rec.job;
+    const job = typeof jobRaw === 'string' &&
+      (jobRaw === 'raster' || jobRaw === 'resolve' || jobRaw === 'rgb' ||
+        jobRaw === 'scanout' || jobRaw === 'unknown') ? jobRaw : null;
+    const y0 = num(rec.y0);
+    const y1 = num(rec.y1);
+    if (
+      frame === null || job === null || y0 === null || y1 === null ||
+      !Number.isInteger(frame) ||
+      !Number.isInteger(y0) || !Number.isInteger(y1)
+    ) return;
+    const count = (v: unknown): number => {
+      const n = num(v);
+      return n !== null && n >= 0 ? Math.floor(n) : 0;
+    };
+    const sample: BandExecSample = {
+      seq, band, frame, job, y0, y1, execMs,
+      pixels: count(rec.pixels), spans: count(rec.spans),
+      scanned: count(rec.scanned), tris: count(rec.tris),
+      descs: count(rec.descs),
+      kickBase: count(rec.kickBase), kickDescs: count(rec.kickDescs),
+    };
+    samples[band] = sample;
+    // Per-frame accumulation for attribution (every kick, not just the
+    // newest): bounded, oldest-first; beginFrame resets. Dropped samples
+    // (cap reached) keep the earliest kicks — the world/FG attribution
+    // that drives PERF-NEXT-6, not the scanout tail.
+    if (this.frameExecSamples.length < 256) this.frameExecSamples.push({ ...sample });
+  }
+
+  /**
+   * Feed one SYNC kick's worker samples from shared memory (PERF-NEXT-4):
+   * the sync path blocks the main thread in Atomics.wait, so completion
+   * messages queue unread — but every executed band wrote its worker-local
+   * duration into CTL_EXEC (+ counts into CTL_PIXELS/SPANS/TRIS/SCAN)
+   * before the DONE fence, on the same worker-local clock as the message
+   * path (never a cross-clock delta). Call immediately after a successful
+   * sync fence with the kick's identity; skipped bands (slot still -1)
+   * contribute nothing. Marks `execSlotHarvested` so the queued posts are
+   * dropped on arrival (same values, exactly-once accumulation). Never
+   * throws. No-op when timing is disabled.
+   */
+  private harvestSyncExec(seq: number, job: BandJobLabel, kickBase: number, kickDescs: number): void {
+    if (this.disposed || !this.timingEnabled) return;
+    if (seq !== this.execSeq) return;
+    const frame = this.frameGen;
+    let fed = false;
+    for (let b = 0; b < this.workers.length; b++) {
+      let us = -1;
+      try {
+        us = Atomics.load(this.ctl, CTL_EXEC + b);
+      } catch {
+        return;
+      }
+      if (!Number.isInteger(us) || us < 0) continue;
+      const band = this.bands[b];
+      if (!band) continue;
+      this.ingestExecSample({
+        seq, band: b, frame, job, y0: band.y0, y1: band.y1,
+        execMs: us / 1000,
+        pixels: this.ctl[CTL_PIXELS + b],
+        spans: this.ctl[CTL_SPANS + b],
+        scanned: this.ctl[CTL_SCAN + b],
+        tris: this.ctl[CTL_TRIS + b],
+        descs: 0, kickBase, kickDescs,
+      });
+      fed = true;
+    }
+    if (fed) this.execSlotHarvested = seq;
   }
 
   /**
@@ -1667,6 +1953,25 @@ export class BandWorkerPool implements BandDispatcher {
   }
 
   private kick(seq: number): boolean {
+    // Newest-kick exec stash (PERF-NEXT-4): replaced per kick, bounded by
+    // the worker count; null when timing is disabled (nothing will post a
+    // measurement). Resolve/scanout kicks reset it too — `lastWorkerExec`
+    // always describes the most recent kick of any job kind.
+    this.execSeq = seq;
+    this.execSamples = this.timingEnabled ? new Array<BandExecSample | null>(this.workers.length).fill(null) : null;
+    this.execSlotHarvested = -1;
+    if (this.timingEnabled) {
+      // Freshness fence for the shared exec slots: -1 = band did not run
+      // this kick. Without the clear, a worker that never runs (or a
+      // wedged kick's leftover) would read back the previous kick's
+      // duration. Cleared pre-notify, so every non-negative slot the
+      // harvester reads was written by THIS kick.
+      try {
+        for (let b = 0; b < this.workers.length; b++) Atomics.store(this.ctl, CTL_EXEC + b, -1);
+      } catch {
+        /* ignore */
+      }
+    }
     // Wakeup is Atomics-only: workers block in Atomics.wait and never
     // unwind their stack inside bandWorkerLoop, so posted messages would
     // queue unread until shutdown. (Completion posts flow worker -> main,
@@ -1685,7 +1990,7 @@ export class BandWorkerPool implements BandDispatcher {
     return true;
   }
 
-  private tally(): { pixels: number; spans: number; scanned: number; tris: number } {
+  private tally(): { pixels: number; spans: number; scanned: number; tris: number; mainExecMs?: number } {
     let pixels = 0;
     let spans = 0;
     let scanned = 0;
@@ -1730,6 +2035,7 @@ function poolBootstrapSource(): string {
     'm.bandWorkerLoop(shared.views, rgb.views, shared.ctl,',
     '  workerData.y0, workerData.y1, workerData.band, workerData.w,',
     '  function (s) { Atomics.wait(shared.ctl, m.CTL_SEQ, s); },',
-    '  parentPort);',
+    '  parentPort,',
+    '  { timing: workerData.timing !== false });',
   ].join('\n');
 }

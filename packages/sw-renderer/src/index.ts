@@ -40,7 +40,7 @@ export {
   F_PER_SPAN, I_PER_SPAN,
   CTL_SEQ, CTL_COUNT, CTL_TEXW, CTL_TEXH, CTL_LIGHTW, CTL_LIGHTH,
   CTL_WSHIFT, CTL_WMASK, CTL_HMASK, CTL_TURBPHASE, CTL_FBW, CTL_FBH,
-  CTL_DONE, CTL_PIXELS, CTL_SPANS, CTL_READY, CTL_FCOUNT, CTL_JOB, CTL_FRAME, CTL_RGBCOUNT, CTL_RGBBASE, CTL_SCAN, CTL_TRIS, CTL_LEN,
+  CTL_DONE, CTL_EXEC, CTL_PIXELS, CTL_SPANS, CTL_READY, CTL_FCOUNT, CTL_JOB, CTL_FRAME, CTL_RGBCOUNT, CTL_RGBBASE, CTL_SCAN, CTL_TRIS, CTL_LEN,
   JOB_RASTER, JOB_RESOLVE, JOB_RGB, JOB_SCANOUT,
   workersRequestedByCvar, accumRequestedByCvar, sabAvailable, syncWaitAllowed,
   splitBands, bandLayout, bandTotal, attachBandShared, createBandBuffers,
@@ -49,6 +49,7 @@ export {
   lowerBoundRow,
   processScanoutBand,
   resolveBand, resolveBandFused, bandWorkerLoop,
+  defaultBandWorkerNow, bandJobName,
   MAX_FRAME_SPANS, FRAME_TEX_CAP, FRAME_LIGHT_CAP, MAX_FRAME_BATCHES, PALETTE_BYTES,
   D_SPAN_BASE, D_SPAN_COUNT, D_TEX_OFF, D_TEX_W, D_TEX_H,
   D_LIGHT_OFF, D_LIGHT_W, D_LIGHT_H, D_WSHIFT, D_WMASK, D_HMASK,
@@ -65,7 +66,8 @@ export {
   workerMaterialToRGB, SCAN_KICK_LEN,
   BandedSoftwareBackend,
   type Band, type BandLayout, type BandViews, type BandJob, type BandPort,
-  type BandDispatcher, type FrameAccumLayout, type FrameAccumViews, type RGBAccumLayout, type RGBAccumViews,
+  type BandDispatcher, type BandExecSample, type BandJobLabel, type BandWorkerOptions,
+  type FrameAccumLayout, type FrameAccumViews, type RGBAccumLayout, type RGBAccumViews,
   type RGBWorkerMaterial, type ScanoutBandOptions,
 } from './bands.js';
 

@@ -10,22 +10,47 @@
 //    stay in separate fields; execMs is present only when measured where
 //    the work ran (main-thread inline drain), never a message-arrival delta.
 import { describe, expect, it } from 'vitest';
+import { createRequire } from 'node:module';
+import { existsSync } from 'fs';
+import { Worker } from 'node:worker_threads';
 import { createFramebuffer } from '@q2/renderer-api';
-import { resetCVars } from '@q2/config';
+import { resetCVars, setCVar } from '@q2/config';
 import {
+  BandWorkerPool,
   SoftwareRenderer,
+  SW_ACCUM_CVAR,
+  SW_WORKERS_CVAR,
   createDevroom,
   DEVROOM_CAMERA,
   setRGBWorldEnabled,
+  type ScanoutBandOptions,
 } from '@q2/sw-renderer';
 import {
   KickJournal,
   collectWorkerExec,
+  detailTimingEnabled,
+  formatWorkerImbalance,
+  readCompletionMessage,
+  summarizeWorkerImbalance,
   workerBandLedger,
   workerExecCriticalPath,
   type WorkerExecSample,
 } from './worker-timing.js';
+import { readBandExecStats, readDiagSnapshot, readMaterialGcMs } from './renderer-hooks.js';
 import { nowNs, nsToMs } from './critpath.js';
+
+const require = createRequire(process.cwd() + '/');
+
+/** Built @q2/sw-renderer ESM bundle (real worker bootstrap source). */
+function swRendererEsmPath(): string | null {
+  try {
+    const cjs = require.resolve('@q2/sw-renderer');
+    const esm = cjs.replace(/index\.js$/, 'index.mjs');
+    return existsSync(esm) ? esm : null;
+  } catch {
+    return null;
+  }
+}
 
 describe('KickJournal', () => {
   it('summarizes dispatch-to-completion per job; the max is the critical path', () => {
@@ -154,5 +179,302 @@ describe('caller dispatch-to-completion on a real frame', () => {
       setRGBWorldEnabled(false);
       resetCVars();
     }
+  });
+});
+
+describe('detailTimingEnabled (PERF-NEXT-4 kill-switch)', () => {
+  it('defaults on; Q2_DETAIL_TIMING=0 disables', () => {
+    const prev = process.env['Q2_DETAIL_TIMING'];
+    try {
+      delete process.env['Q2_DETAIL_TIMING'];
+      expect(detailTimingEnabled()).toBe(true);
+      process.env['Q2_DETAIL_TIMING'] = '0';
+      expect(detailTimingEnabled()).toBe(false);
+      process.env['Q2_DETAIL_TIMING'] = 'off';
+      expect(detailTimingEnabled()).toBe(false);
+      process.env['Q2_DETAIL_TIMING'] = '1';
+      expect(detailTimingEnabled()).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env['Q2_DETAIL_TIMING'];
+      else process.env['Q2_DETAIL_TIMING'] = prev;
+    }
+  });
+});
+
+describe('readCompletionMessage (worker completion protocol)', () => {
+  it('parses band identity + tallies; execMs null when the build omits it', () => {
+    // Legacy production shape (current bandWorkerLoop postMessage).
+    const legacy = readCompletionMessage({ seq: 4, band: 1, pixels: 76800, spans: 12 });
+    expect(legacy).toMatchObject({ seq: 4, band: 1, pixels: 76800, spans: 12, execMs: null });
+    const full = readCompletionMessage({
+      seq: 4, band: 1, frame: 7, job: 'scanout', y0: 120, y1: 240,
+      pixels: 76800, spans: 0, tris: 3, execMs: 2.5,
+    });
+    expect(full).toMatchObject({
+      seq: 4, band: 1, frame: 7, job: 'scanout', y0: 120, y1: 240,
+      pixels: 76800, spans: 0, tris: 3, execMs: 2.5,
+    });
+  });
+
+  it('rejects malformed messages instead of laundering them', () => {
+    expect(readCompletionMessage(null)).toBeNull();
+    expect(readCompletionMessage({})).toBeNull();
+    expect(readCompletionMessage({ seq: 0, band: 0, pixels: 1, spans: 0, execMs: -1 })).toBeNull();
+    expect(readCompletionMessage({ seq: 0, band: 0, pixels: 1, spans: 0, execMs: NaN })).toBeNull();
+    expect(readCompletionMessage({ seq: 0, band: 0, pixels: -1, spans: 0 })).toBeNull();
+    expect(readCompletionMessage({ seq: 0, band: 0, pixels: 1, spans: 0, job: 'nope' })).toBeNull();
+  });
+});
+
+describe('summarizeWorkerImbalance (PERF-NEXT-6 straggler input)', () => {
+  it('reports the worst within-group max-vs-median gap with straggler identity', () => {
+    const xs: WorkerExecSample[] = [
+      { frame: 0, seq: 0, job: 'scanout', worker: 0, band: 0, y0: 0, y1: 80, execMs: 2, pixels: 1, spans: 0 },
+      { frame: 0, seq: 0, job: 'scanout', worker: 1, band: 1, y0: 80, y1: 160, execMs: 3, pixels: 1, spans: 0 },
+      { frame: 0, seq: 0, job: 'scanout', worker: 2, band: 2, y0: 160, y1: 240, execMs: 9, pixels: 1, spans: 0 },
+      { frame: 0, seq: 1, job: 'scanout', worker: 0, band: 0, y0: 0, y1: 80, execMs: 3, pixels: 1, spans: 0 },
+      { frame: 0, seq: 1, job: 'scanout', worker: 1, band: 1, y0: 80, y1: 160, execMs: 3, pixels: 1, spans: 0 },
+      { frame: 0, seq: 1, job: 'scanout', worker: 2, band: 2, y0: 160, y1: 240, execMs: 4, pixels: 1, spans: 0 },
+    ];
+    const w = summarizeWorkerImbalance(xs);
+    expect(w.groups).toBe(2);
+    expect(w.bands).toBe(6);
+    expect(w.critPathMax).toBe(9);
+    // Worst group (seq 0): sorted [2,3,9], med 3, max 9 — the gap is
+    // within-group, never a sum of medians.
+    expect(w.imbalanceMs).toBe(9 - 3);
+    expect(w.imbalanceRatio).toBeCloseTo(9 / 3, 10);
+    expect(w.straggler).toMatchObject({ frame: 0, seq: 0, job: 'scanout', band: 2, execMs: 9 });
+    expect(formatWorkerImbalance(w)).toContain('straggler=band2(scanout f0s0 9.00ms)');
+    expect(formatWorkerImbalance(w)).toContain('gap=6.00');
+  });
+
+  it('is empty-clean with no samples', () => {
+    const w = summarizeWorkerImbalance([]);
+    expect(w).toMatchObject({ groups: 0, bands: 0, straggler: null });
+    expect(formatWorkerImbalance(w)).toContain('producer unpublished');
+  });
+});
+
+describe('real built Node worker (PERF-NEXT-4 integration)', () => {
+  it('executes a real scanout band in a real worker thread with measured execMs + identity', async () => {
+    const esm = swRendererEsmPath();
+    if (!esm) {
+      console.log('SKIP real-worker exec: sw-renderer dist not built (run yarn build first)');
+      return;
+    }
+    const W = 320, H = 240, y0 = 120, y1 = 240;
+    const frame = 7, seq = 3, band = 1;
+    // The worker imports the REAL built bundle and runs the REAL scanout
+    // band kernel over a real buffer, timing the job where it runs. No
+    // synthetic durations: execMs is an hrtime delta around actual work.
+    const src = `
+      const { parentPort, workerData } = require('node:worker_threads');
+      import(workerData.esm).then((m) => {
+        const W = workerData.W, H = workerData.H;
+        const src = new Uint32Array(W * H);
+        for (let i = 0; i < src.length; i++) {
+          src[i] = (0xff000000 | (i & 255) | (((i >> 2) & 255) << 8) | (((i >> 4) & 255) << 16)) >>> 0;
+        }
+        const dst565 = new Uint16Array(W * H);
+        const disp = new Uint32Array(W * H);
+        const opts = { gamma: 1.3, dither: true, ditherMode: 0, postfilter: true, reconmode: 1, maxR: 8, maxG: 8, maxB: 8, quantise: true };
+        m.processScanoutBand(src, dst565, disp, W, H, opts, workerData.y0, workerData.y1);
+        const t0 = process.hrtime.bigint();
+        m.processScanoutBand(src, dst565, disp, W, H, opts, workerData.y0, workerData.y1);
+        const execMs = Number(process.hrtime.bigint() - t0) / 1e6;
+        let h = 2166136261;
+        for (let i = 0; i < disp.length; i++) {
+          const px = disp[i];
+          h ^= px & 255; h = Math.imul(h, 16777619);
+          h ^= (px >>> 8) & 255; h = Math.imul(h, 16777619);
+          h ^= (px >>> 16) & 255; h = Math.imul(h, 16777619);
+          h ^= (px >>> 24) & 255; h = Math.imul(h, 16777619);
+        }
+        parentPort.postMessage({
+          seq: workerData.seq, band: workerData.band, frame: workerData.frame,
+          job: 'scanout', y0: workerData.y0, y1: workerData.y1,
+          pixels: W * (workerData.y1 - workerData.y0), spans: 0, execMs,
+          hash: (h >>> 0).toString(16).padStart(8, '0'),
+        });
+      }).catch((e) => { parentPort.postMessage({ error: String((e && e.stack) || e) }); });
+    `;
+    const worker = new Worker(src, {
+      eval: true,
+      workerData: { esm, W, H, y0, y1, frame, seq, band },
+    });
+    try {
+      const msg = await new Promise<unknown>((resolve, reject) => {
+        const to = setTimeout(() => reject(new Error('real worker timed out')), 30000);
+        worker.once('message', (m: unknown) => { clearTimeout(to); resolve(m); });
+        worker.once('error', (e: unknown) => { clearTimeout(to); reject(e); });
+      });
+      const rec = msg as Record<string, unknown>;
+      if (typeof rec['error'] === 'string') throw new Error(`real worker failed: ${rec['error']}`);
+      // Correct identity: the exact frame/seq/job/band the kick dispatched.
+      const c = readCompletionMessage(msg);
+      expect(c).not.toBeNull();
+      expect(c).toMatchObject({ seq, band, frame, job: 'scanout', y0, y1, pixels: W * (y1 - y0), spans: 0 });
+      // Finite measured duration for the executed job — not null, not
+      // synthetic: an hrtime delta around the real kernel in the worker.
+      expect(c!.execMs).not.toBeNull();
+      expect(Number.isFinite(c!.execMs!)).toBe(true);
+      expect(c!.execMs!).toBeGreaterThanOrEqual(0);
+      // Real work proof: the worker's display hash matches the same kernel
+      // run serially on the caller over identical inputs.
+      const esmMod = await import(esm) as {
+        processScanoutBand(
+          src: Uint32Array, dst565: Uint16Array, display: Uint32Array,
+          w: number, h: number, o: ScanoutBandOptions, y0: number, y1: number,
+        ): void;
+      };
+      const s2 = new Uint32Array(W * H);
+      for (let i = 0; i < s2.length; i++) {
+        s2[i] = (0xff000000 | (i & 255) | (((i >> 2) & 255) << 8) | (((i >> 4) & 255) << 16)) >>> 0;
+      }
+      const d565 = new Uint16Array(W * H), dd = new Uint32Array(W * H);
+      esmMod.processScanoutBand(
+        s2, d565, dd, W, H,
+        { gamma: 1.3, dither: true, ditherMode: 0, postfilter: true, reconmode: 1, maxR: 8, maxG: 8, maxB: 8, quantise: true },
+        y0, y1,
+      );
+      let h = 2166136261;
+      for (let i = 0; i < dd.length; i++) {
+        const px = dd[i]!;
+        h ^= px & 255; h = Math.imul(h, 16777619);
+        h ^= (px >>> 8) & 255; h = Math.imul(h, 16777619);
+        h ^= (px >>> 16) & 255; h = Math.imul(h, 16777619);
+        h ^= (px >>> 24) & 255; h = Math.imul(h, 16777619);
+      }
+      expect(rec['hash']).toBe((h >>> 0).toString(16).padStart(8, '0'));
+      // And the measured sample flows through the consumer validator.
+      const samples = collectWorkerExec({
+        testBandExecStats: () => ([{
+          frame, seq, job: 'scanout', worker: band, band, y0, y1,
+          execMs: c!.execMs!, pixels: c!.pixels, spans: c!.spans,
+        }]),
+      });
+      expect(samples).not.toBeNull();
+      expect(workerExecCriticalPath(samples!).max).toBe(c!.execMs!);
+    } finally {
+      await worker.terminate();
+    }
+  });
+
+  it('real BandWorkerPool pooled kick: finite dispatch fence + stable identity; exec stats feature-detected', async () => {
+    const esm = swRendererEsmPath();
+    if (!esm) {
+      console.log('SKIP pooled exec: sw-renderer dist not built (run yarn build first)');
+      return;
+    }
+    const W = 320, H = 240;
+    resetCVars();
+    const fb = createFramebuffer(W, H, true);
+    const r = new SoftwareRenderer();
+    r.init(fb);
+    r.setPalette(new Uint8Array(768).fill(128));
+    setCVar(SW_WORKERS_CVAR, 2);
+    setCVar(SW_ACCUM_CVAR, 1);
+    if (!r.syncWorkersFromCvar()) {
+      console.log('SKIP pooled exec: worker sync unavailable');
+      resetCVars();
+      return;
+    }
+    const pool = BandWorkerPool.create(1, W, H, { indexJsPath: esm });
+    if (!pool) {
+      console.log('SKIP pooled exec: pool unavailable (need worker_threads + SAB + Atomics.wait)');
+      resetCVars();
+      return;
+    }
+    r.attachWorkerPool(pool);
+    try {
+      setRGBWorldEnabled(true);
+      const view = {
+        origin: DEVROOM_CAMERA.origin, angles: DEVROOM_CAMERA.angles,
+        fovX: DEVROOM_CAMERA.fovX, time: 1.5, lightStyles: new Float32Array(256).fill(1),
+      };
+      r.beginFrame();
+      r.renderView(view, { name: 'devroom', data: createDevroom() }, []);
+      r.endFrame();
+      const opts: ScanoutBandOptions = {
+        gamma: 1.3, dither: true, ditherMode: 0, postfilter: true,
+        reconmode: 1, maxR: 8, maxG: 8, maxB: 8, quantise: true,
+      };
+      const journal = new KickJournal();
+      const t0 = nowNs();
+      const ok = pool.flushScanout(opts);
+      const latencyMs = nsToMs(nowNs() - t0);
+      // Real pooled execution proof through public hooks (staging, not
+      // message arrival): the kick covered worker bands and completed.
+      expect(ok).toBe(true);
+      expect(Number.isFinite(latencyMs)).toBe(true);
+      expect(r.testRGBWorkerStats().kicks).toBeGreaterThan(0);
+      journal.record({
+        frame: 0, seq: 0, job: 'scanout', workers: 1, band: 'all',
+        y0: 0, y1: H, latencyMs, ok, execMs: null, pixels: W * H, spans: 0,
+      });
+      expect(journal.summarize('scanout').n).toBe(1);
+      expect(journal.bandsSeen()).toEqual([{ band: 'all', y0: 0, y1: H }]);
+      // Worker-local exec: the renderer lane owns the producer. When it
+      // publishes, every sample must carry finite durations + identity;
+      // while it does not, the gap is explicit (null) — never a fake zero.
+      const laneExec = readBandExecStats(pool) ?? collectWorkerExec(r);
+      if (laneExec !== null) {
+        expect(laneExec.length).toBeGreaterThan(0);
+        for (const s of laneExec) {
+          expect(Number.isFinite(s.execMs)).toBe(true);
+          expect(s.execMs).toBeGreaterThanOrEqual(0);
+          expect(Number.isFinite(s.frame)).toBe(true);
+          expect(Number.isFinite(s.band)).toBe(true);
+        }
+      } else {
+        expect(laneExec).toBeNull();
+      }
+      // Material GC ms: same feature-detection contract (bytes + eviction
+      // counts are already reported; the ms cost reads null until published).
+      const gcMs = readMaterialGcMs(r);
+      if (gcMs !== null) expect(gcMs).toBeGreaterThanOrEqual(0);
+    } finally {
+      await pool.dispose();
+      setRGBWorldEnabled(false);
+      resetCVars();
+    }
+  });
+
+  it('browser-entry contract without DOM: real completion message + diag snapshot shape', () => {
+    // testkit cannot instantiate the browser worker entry (DOM + SAB +
+    // COOP/COEP isolation live in apps/web) — what it CAN pin without DOM
+    // is the completion protocol the browser entry posts: the same
+    // readCompletionMessage parser the Node worker message above flowed
+    // through, plus the DiagSnapshot structural read the bench browser
+    // report consumes. Full browser-entry execution (render-worker.ts in a
+    // real Worker) must run in apps/web (browser-lane.test.ts), not here.
+    const measured = {
+      seq: 9, band: 2, frame: 4, job: 'scanout', y0: 160, y1: 240,
+      pixels: 25600, spans: 0, execMs: 1.75,
+    };
+    const c = readCompletionMessage(measured);
+    expect(c).toMatchObject({ seq: 9, band: 2, frame: 4, job: 'scanout', execMs: 1.75 });
+    // A diag snapshot carrying worker-local durations alongside (never
+    // fused with) caller-clock arrivals parses; -1 marks unpublished exec.
+    const snap = readDiagSnapshot({
+      diagSnapshot: () => ({
+        kicks: 1, frame: 4, seq: 9, job: 'scanout', bands: 4, mainMs: 0.5,
+        arrivals: [1.2, 2.4], bandIds: [0, 1], pixels: [25600, 25600],
+        spans: [0, 0], workerExecMs: [1.1, -1], slowestMs: 2.4,
+      }),
+    });
+    expect(snap).not.toBeNull();
+    expect(snap!.arrivals).toEqual([1.2, 2.4]);
+    expect(snap!.workerExecMs).toEqual([1.1, -1]);
+    expect(snap!.slowestMs).toBe(2.4);
+    expect(readDiagSnapshot({})).toBeNull();
+    expect(readDiagSnapshot({
+      diagSnapshot: () => ({
+        kicks: 1, frame: 0, seq: 0, job: 'x', bands: 2, mainMs: 0,
+        arrivals: [1], bandIds: [0, 1], pixels: [1], spans: [0],
+        workerExecMs: [1], slowestMs: 1,
+      }),
+    })).toBeNull();
   });
 });

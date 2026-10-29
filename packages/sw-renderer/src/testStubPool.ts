@@ -59,6 +59,10 @@ export function stubPool(W: number, H: number, opts?: { readyBands?: number; tim
   pool['quarantined'] = false;
   pool['sabEpoch'] = 0;
   pool['quarantineSettled'] = null;
+  pool['timingEnabled'] = true;
+  pool['execSeq'] = -1;
+  pool['execSamples'] = null;
+  pool['frameExecSamples'] = [];
   // Readiness: fake workers never signal, so preset the counter the
   // awaitReadySync path polls (ready = kick proceeds, main band runs,
   // DONE never arrives -> deterministic timeout).

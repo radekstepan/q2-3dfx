@@ -34,3 +34,15 @@ declare module 'node:module' {
     resolve(id: string): string;
   };
 }
+declare module 'node:worker_threads' {
+  export interface WorkerOptions {
+    eval?: boolean;
+    workerData?: unknown;
+  }
+  export class Worker {
+    constructor(filename: string | URL, options?: WorkerOptions);
+    once(event: 'message', listener: (value: unknown) => void): this;
+    once(event: 'error', listener: (err: unknown) => void): this;
+    terminate(): Promise<number>;
+  }
+}

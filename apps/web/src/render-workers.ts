@@ -127,14 +127,65 @@ import {
  */
 import * as swRendererNS from '@q2/sw-renderer';
 export type { ScanoutBandOptions } from '@q2/sw-renderer';
+import type { CritJobKind, WorkerExecSample } from '@q2/testkit';
 import { readVoodooState } from '@q2/voodoo';
 import type { VoodooState } from '@q2/voodoo';
 
 /** Per-batch wait budget in ms (mirrors the Node pool default). */
 export const BROWSER_POOL_TIMEOUT_MS = 30000;
 
+/**
+ * Bounded per-kick timing ledger depth (PERF-NEXT-4): oldest-first,
+ * drop-oldest past the cap. A production frame holds at most a handful
+ * of kicks (indexed + world + up to three foreground + resolve +
+ * scanout); 16 keeps several frames of history for harness forensics
+ * with bounded memory.
+ */
+export const KICK_TIMING_CAP = 16;
+
+/**
+ * Per-frame worker-execution sample cap (testBandExecStats): 7 workers ×
+ * ~8 kicks/frame worst case is 56; 256 is headroom that can never fill
+ * in practice (append stops at the cap, documented, never throws).
+ */
+export const FRAME_EXEC_CAP = 256;
+
 /** Job kinds the browser pool can kick (labels the diag snapshot). */
 export type DiagJob = 'raster' | 'rgb' | 'resolve' | 'scanout' | 'unknown';
+
+/**
+ * Map a browser kick label to the shared testkit job vocabulary (for
+ * `testBandExecStats` cross-lane consumption): indexed raster/resolve
+ * kicks are the testkit indexed lanes, RGB/scanout pass through.
+ * 'unknown' has no testkit counterpart (null = unpublished, never a
+ * laundered guess).
+ */
+export function diagJobToCritJob(job: DiagJob): CritJobKind | null {
+  if (job === 'rgb') return 'rgb';
+  if (job === 'scanout') return 'scanout';
+  if (job === 'raster') return 'indexed-frame';
+  if (job === 'resolve') return 'indexed-resolve';
+  return null;
+}
+
+/**
+ * Within-kick worker-compute summary (pure; unit-covered). Inputs are one
+ * kick's per-band durations with -1/unknowns already filtered by the
+ * caller (see `finiteExecOf`); the medians here are over bands of ONE
+ * kick and are never summed across kicks or phases.
+ */
+export function summarizeExec(execMs: number[]): {
+  max: number; med: number; min: number; known: number;
+} {
+  const xs = execMs.filter((v) => typeof v === 'number' && Number.isFinite(v) && v >= 0);
+  if (xs.length === 0) return { max: -1, med: -1, min: -1, known: 0 };
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const med = sorted.length % 2 === 1
+    ? sorted[mid]!
+    : (sorted[mid - 1]! + sorted[mid]!) / 2;
+  return { max: sorted[sorted.length - 1]!, med, min: sorted[0]!, known: xs.length };
+}
 
 /**
  * One kick's terminal outcome (PERF-NEXT-2 outcome vocabulary, internal):
@@ -157,9 +208,8 @@ type KickSignal = 'ack' | 'abort';
  * kick fan-out — one clock, always comparable. `arrivals` are
  * dispatch-to-completion latencies per worker in arrival order (they
  * include scheduling + postMessage latency, so they bound but do not
- * equal in-worker compute: true per-worker compute durations need
- * worker-side timestamps, which only the renderer lane can add — the
- * worker loop in `@q2/sw-renderer` owns the compute section.
+ * equal in-worker compute: true per-worker compute durations arrive as
+ * worker-side timestamps — see `workerExecMs` below.
  * `workerExecMs` carries those worker-local compute durations when the
  * worker build posts them (`execMs` on the completion message — a
  * duration, so it is comparable across time origins without clock
@@ -168,6 +218,16 @@ type KickSignal = 'ack' | 'abort';
  * `arrivals` with the band identity + tallies the worker message carried
  * (-1 when the message omitted them). `slowestMs` is the critical path
  * (dispatch → last completion).
+ *
+ * Straggler fields (`execMaxMs`/`execMedianMs`/`execMinMs`/
+ * `execImbalanceMs`/`arrivalSpreadMs`/`execKnown`/`execUnknown`) are
+ * computed WITHIN this one kick's per-band samples only: max/median/min
+ * over the finite `workerExecMs` entries, the max-minus-min gap, and the
+ * dispatch-latency spread (slowest minus fastest arrival). Independent
+ * medians across kicks or phases are never summed or differenced here —
+ * cross-kick aggregation lives in the `KickTiming` ledger (a list of
+ * per-kick summaries, never a fused total) and cross-rep analysis in the
+ * bench/testkit lanes.
  */
 export interface DiagSnapshot {
   kicks: number;
@@ -185,6 +245,64 @@ export interface DiagSnapshot {
   /** Worker-local compute durations parallel to arrivals (-1 when unposted). */
   workerExecMs: number[];
   slowestMs: number;
+  /** Max finite worker-compute duration across bands (-1 when none known). */
+  execMaxMs: number;
+  /** Median finite worker-compute duration across bands (-1 when none). */
+  execMedianMs: number;
+  /** Min finite worker-compute duration across bands (-1 when none known). */
+  execMinMs: number;
+  /** Worker-compute imbalance: execMaxMs minus execMinMs (-1 when unknown). */
+  execImbalanceMs: number;
+  /** Dispatch-latency spread: slowest minus fastest arrival (-1 when <1). */
+  arrivalSpreadMs: number;
+  /** Finite workerExecMs entries consumed by the straggler fields. */
+  execKnown: number;
+  /** Arrivals without a usable worker-local duration. */
+  execUnknown: number;
+}
+
+/**
+ * One kick's frozen timing summary (PERF-NEXT-4 per-kick/per-frame
+ * attribution). Recorded ONLY while diag is armed (see `enableDiag`) —
+ * the disabled path records nothing. One entry per kick attempt that
+ * reached dispatch identity (completed/failed/disposed) plus
+ * pre-dispatch refusals where staging existed; kicks that never started
+ * (dead pool, nothing staged) record nothing. Entries are
+ * same-clock durations or -1-unknown; independent medians are never
+ * summed or subtracted across entries — a frame's story is the LIST
+ * (world flush first, then foreground flushes in
+ * drawForegroundAsync order: alpha, placed, entity — then resolve and
+ * scanout), and cross-rep medians belong to the bench/testkit lanes.
+ */
+export interface KickTiming {
+  frame: number;
+  seq: number;
+  job: DiagJob;
+  bands: number;
+  outcome: 'completed' | 'failed' | 'disposed' | 'refused';
+  /** Calling-thread band execution for this kick (-1 when it never ran). */
+  mainMs: number;
+  /** Max finite per-band worker-compute duration (-1 when none known). */
+  execMaxMs: number;
+  /** Median finite per-band worker-compute duration (-1 when none known). */
+  execMedianMs: number;
+  /** Min finite per-band worker-compute duration (-1 when none known). */
+  execMinMs: number;
+  /** Dispatch → last completion critical path (-1 when unknown). */
+  slowestMs: number;
+  /** Slowest minus fastest dispatch-to-completion arrival (-1 when <1). */
+  spreadMs: number;
+  /**
+   * Kick fan-out minus the previous kick's completion on the same clock
+   * (main-thread barrier/idle between kicks where measurable: dispatch
+   * gaps, inline-drain overlaps excluded). -1 for the first recorded
+   * kick or when either endpoint is unknown.
+   */
+  gapSincePrevMs: number;
+  /** Finite workerExecMs entries consumed by the exec fields. */
+  execKnown: number;
+  /** Arrivals without a usable worker-local duration. */
+  execUnknown: number;
 }
 
 /**
@@ -274,10 +392,56 @@ export class BrowserBandPool implements BandDispatcher {
   private readonly diagBands: Int32Array;
   private readonly diagPixels: Float64Array;
   private readonly diagSpans: Float64Array;
+  /** Per-arrival message-carried identity, parallel to diagArrivals: the
+   *  worker entry stamps `frame` + `job` onto each completion (see
+   *  stampCompletion in render-worker.ts); the loop's own fields win when
+   *  present. -1/'unknown' when the message omitted them — the kick-level
+   *  diagFrame/diagJob metadata (same clock, frozen at fan-out) is the
+   *  fallback. Kept for `testBandExecStats` per-band identity; the
+   *  seq-keyed pending guard already drops stale-kick completions. */
+  private readonly diagMsgFrame: Float64Array;
+  private readonly diagMsgJob: DiagJob[];
   private diagKickStart = 0;
   private diagMainMs = -1;
   private diagArrivalsSeen = 0;
   private diagKicks = 0;
+  /**
+   * Frozen last-completed-kick snapshot per job kind (PERF-NEXT-4: every
+   * foreground flush — including the placed pass — keeps its own timing
+   * fields instead of being clobbered by a later resolve/scanout kick of
+   * the same frame). Frozen at kick completion (diag path only); the live
+   * per-kick arrays are reused by the next kick. Only completed kicks
+   * freeze — failed kicks are recorded in the ledger + fallback counters.
+   */
+  private readonly diagFrozen: Record<DiagJob, DiagSnapshot | null> = {
+    raster: null, rgb: null, resolve: null, scanout: null, unknown: null,
+  };
+  /** Last completed-or-failed kick's frozen snapshot (any job). Null until
+   *  the first kick end after arming; null whenever disarmed. */
+  private diagFrozenLast: DiagSnapshot | null = null;
+  /**
+   * Bounded per-kick timing ledger (PERF-NEXT-4 per-frame attribution):
+   * one frozen KickTiming per kick attempt that reached dispatch
+   * identity (completed/failed/disposed) plus staged pre-dispatch
+   * refusals, oldest-first, capped at KICK_TIMING_CAP (drop-oldest past
+   * the cap — a frame holds at most a handful of kicks). Recorded ONLY
+   * while diag is armed (see enableDiag); the disabled path records
+   * nothing and `kickTimings()` returns []. Frame/seq/job identity makes
+   * every foreground flush attributable in order (world flush first,
+   * then alpha/placed/entity flushes per drawForegroundAsync).
+   */
+  private readonly kickLedger: KickTiming[] = [];
+  /** Previous kick's completion time (same clock as kick fan-out) for
+   *  gapSincePrevMs barrier/idle measurement (-1 until the first kick). */
+  private diagPrevKickEnd = -1;
+  /**
+   * Per-band worker-local execution samples accumulated since the last
+   * beginFrame (diag path only, capped): the `testBandExecStats()`
+   * cross-lane surface (see @q2/testkit WorkerExecSample). Reset per
+   * frame — a frame's foreground flushes each append their bands with
+   * (frame, seq, job) identity, so world vs FG attribution survives.
+   */
+  private frameExecSamples: WorkerExecSample[] = [];
   /** Kick identity for the in-flight/last kick (same-clock metadata, always
    *  comparable: frame generation + message sequence + job type + band
    *  count, frozen at kick time). */
@@ -485,6 +649,8 @@ export class BrowserBandPool implements BandDispatcher {
     this.diagBands = new Int32Array(Math.max(1, workers.length));
     this.diagPixels = new Float64Array(Math.max(1, workers.length));
     this.diagSpans = new Float64Array(Math.max(1, workers.length));
+    this.diagMsgFrame = new Float64Array(Math.max(1, workers.length)).fill(-1);
+    this.diagMsgJob = new Array<DiagJob>(Math.max(1, workers.length)).fill('unknown');
     for (let i = 0; i < workers.length; i++) {
       this.workers.push(workers[i]!);
       const w = workers[i]!;
@@ -492,6 +658,7 @@ export class BrowserBandPool implements BandDispatcher {
         const msg = ev.data as {
           seq?: unknown; ready?: unknown;
           band?: unknown; pixels?: unknown; spans?: unknown; execMs?: unknown;
+          frame?: unknown; job?: unknown;
           exited?: unknown;
         };
         if (!msg || typeof msg !== 'object') return;
@@ -522,6 +689,14 @@ export class BrowserBandPool implements BandDispatcher {
             this.diagSpans[a] = typeof msg.spans === 'number' ? msg.spans : -1;
             this.diagExec[a] = typeof msg.execMs === 'number' && Number.isFinite(msg.execMs) && msg.execMs >= 0
               ? msg.execMs : -1;
+            // Message-carried identity (the worker entry stamps frame + job
+            // at post time; the loop's own fields win inside stampCompletion
+            // — see render-worker.ts). Kick-level diagFrame/diagJob stay the
+            // fallback for older builds that omit these fields.
+            this.diagMsgFrame[a] = typeof msg.frame === 'number' && Number.isFinite(msg.frame)
+              ? msg.frame : -1;
+            this.diagMsgJob[a] = msg.job === 'raster' || msg.job === 'rgb' ||
+              msg.job === 'resolve' || msg.job === 'scanout' ? msg.job : 'unknown';
           }
           const done = this.pending.get(msg.seq);
           if (done) done('ack');
@@ -589,6 +764,10 @@ export class BrowserBandPool implements BandDispatcher {
     // from the previous frame is stale by construction (generation guard
     // would refuse it anyway — drop it eagerly).
     this.discardSnapshot();
+    // Per-frame execution samples reset here (testBandExecStats covers one
+    // frame: world flush first, then foreground flushes). Length-guarded so
+    // the disarmed production path allocates nothing.
+    if (this.frameExecSamples.length > 0) this.frameExecSamples = [];
     try {
       Atomics.store(this.ctl, CTL_FRAME, this.frameGen);
     } catch {
@@ -726,7 +905,7 @@ export class BrowserBandPool implements BandDispatcher {
   async flushFrameAsync(): Promise<{ pixels: number; spans: number } | null> {
     if (this.disposed || this.workers.length === 0) return null;
     if (this.descCount === 0) return { pixels: 0, spans: 0 };
-    if (!(await this.awaitReadyAsync())) return null;
+    if (!(await this.awaitReadyAsync())) { this.noteRefused('raster'); return null; }
     this.snapKick();
     this.publishFrame();
     const seq = this.seq;
@@ -734,6 +913,7 @@ export class BrowserBandPool implements BandDispatcher {
     if (!this.kick(seq, 'raster')) {
       this.pending.delete(seq);
       this.statFallbacks.raster += 1;
+      this.noteRefused('raster');
       return null;
     }
     // Calling thread owns the last band: drain it inline while the workers
@@ -749,6 +929,7 @@ export class BrowserBandPool implements BandDispatcher {
     // quarantined on timeout - isolation fenced the planes before any
     // caller replay; dispose tore the workers down without quarantining).
     const outcome = await finished;
+    this.freezeKick(outcome);
     if (outcome !== 'completed') {
       this.statFallbacks.raster += 1;
       return null;
@@ -788,13 +969,14 @@ export class BrowserBandPool implements BandDispatcher {
   /** Resolve kick (parallel palette expand + fused RGB composite): message-driven completion. */
   async resolveFrameAsync(): Promise<boolean> {
     if (this.disposed || this.workers.length === 0) return false;
-    if (!(await this.awaitReadyAsync())) return false;
+    if (!(await this.awaitReadyAsync())) { this.noteRefused('resolve'); return false; }
     this.publishResolve();
     const seq = this.seq;
     const finished = this.awaitWorkerMessages(seq, this.workers.length);
     if (!this.kick(seq, 'resolve')) {
       this.pending.delete(seq);
       this.statFallbacks.resolve += 1;
+      this.noteRefused('resolve');
       return false;
     }
     const mainBand = this.bands[this.bands.length - 1]!;
@@ -802,6 +984,7 @@ export class BrowserBandPool implements BandDispatcher {
     resolveBandFused(this.views.fColor, this.views.fPal, this.base.idx, this.rgbViews.rgb565, this.rgbViews.cover, mainBand.y0, mainBand.y1, this.fbW, this.fbH);
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
     const outcome = await finished;
+    this.freezeKick(outcome);
     if (outcome === 'completed') this.statKicks.resolve += 1;
     else this.statFallbacks.resolve += 1;
     return outcome === 'completed';
@@ -836,13 +1019,14 @@ export class BrowserBandPool implements BandDispatcher {
    */
   async flushScanoutAsync(opts: ScanoutBandOptions): Promise<boolean> {
     if (this.disposed || this.workers.length === 0) return false;
-    if (!(await this.awaitReadyAsync())) return false;
+    if (!(await this.awaitReadyAsync())) { this.noteRefused('scanout'); return false; }
     this.publishScanout(opts);
     const seq = this.seq;
     const finished = this.awaitWorkerMessages(seq, this.workers.length);
     if (!this.kick(seq, 'scanout')) {
       this.pending.delete(seq);
       this.statFallbacks.scanout += 1;
+      this.noteRefused('scanout');
       return false;
     }
     const mainBand = this.bands[this.bands.length - 1]!;
@@ -853,6 +1037,7 @@ export class BrowserBandPool implements BandDispatcher {
     );
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
     const outcome = await finished;
+    this.freezeKick(outcome);
     if (outcome === 'completed') this.statKicks.scanout += 1;
     else this.statFallbacks.scanout += 1;
     return outcome === 'completed';
@@ -1049,17 +1234,30 @@ export class BrowserBandPool implements BandDispatcher {
    * capture, Node report-only benches) enables it around measured frames
    * only; acceptance FPS is always measured with it off.
    *
-   * Worker completion messages carry the band index + tallies (see the
-   * worker loop's postMessage in `@q2/sw-renderer`), so arrivals are BOTH
-   * rank-ordered (arrivals[0] = first worker done, arrivals[last] =
-   * slowest-band wait for the kick) AND band-attributed (bandIds[i] names
-   * the worker that produced arrivals[i]). Unknown stubs that omit the
-   * fields read -1 — rank order still holds. `workerExecMs` carries the
-   * worker-local compute durations when the worker build posts them
-   * (`execMs` on the completion message — a duration, comparable across
-   * time origins); -1 per arrival otherwise. Dispatch-to-completion
+   * Worker completion messages carry the band index + tallies + (since
+   * PERF-NEXT-4) the worker-side `execMs` duration and the `frame`/`job`
+   * identity the entry stamped at post time (see stampCompletion in
+   * render-worker.ts; the renderer's in-loop fields win when present), so
+   * arrivals are BOTH rank-ordered (arrivals[0] = first worker done,
+   * arrivals[last] = slowest-band wait for the kick) AND band-attributed
+   * (bandIds[i] names the worker that produced arrivals[i]). Unknown stubs
+   * that omit the fields read -1 — rank order still holds. `workerExecMs`
+   * carries the worker-local compute durations when the worker build posts
+   * them (`execMs` on the completion message — a duration, comparable
+   * across time origins); -1 per arrival otherwise. Dispatch-to-completion
    * latency and worker-local execution are reported side by side, never
    * fused (different clocks, different meaning).
+   *
+   * Within-kick straggler fields (`execMaxMs`/`execMedianMs`/`execMinMs`/
+   * `execImbalanceMs`/`arrivalSpreadMs`) summarize ONE kick's per-band
+   * samples only — never across kicks or phases. `diagSnapshot(job)`
+   * freezes the last kick per job kind (world/foreground rgb flushes —
+   * including the placed pass — survive a later resolve/scanout kick of
+   * the same frame); `kickTimings()` lists every kick attempt with
+   * (frame, seq, job) identity + outcome for per-frame attribution;
+   * `testBandExecStats()` accumulates per-band WorkerExecSample records
+   * since the last beginFrame (completed kicks only) for the shared
+   * @q2/testkit consumer.
    *
    * `stagingBytes` reads the live bump offsets (mid-frame view);
    * `kickBytes` returns the snapshot each indexed/RGB flush takes BEFORE
@@ -1075,6 +1273,15 @@ export class BrowserBandPool implements BandDispatcher {
     this.diagArrivalsSeen = 0;
     this.diagMainMs = -1;
     this.diagKicks = 0;
+    // Fresh session: drop frozen snapshots (a re-arm must not serve the
+    // previous session's kicks). The ledger stays monotonic boot-lifetime
+    // evidence (seq-ordered, sliced per frame by consumers).
+    this.diagFrozenLast = null;
+    this.diagFrozen.raster = null;
+    this.diagFrozen.rgb = null;
+    this.diagFrozen.resolve = null;
+    this.diagFrozen.scanout = null;
+    this.diagFrozen.unknown = null;
   }
 
   /** Disarm per-kick timing (production state). */
@@ -1088,15 +1295,59 @@ export class BrowserBandPool implements BandDispatcher {
   }
 
   /**
-   * Last-kick diagnostic snapshot (null when disarmed or no kick ran yet).
-   * Allocates (diag path only, never the production frame). See
-   * DiagSnapshot for the clock-comparability contract: arrivals are
+   * Last-kick diagnostic snapshot (null when disarmed or no kick ended
+   * yet). With no argument returns the most recent kick of any job (the
+   * historical behavior); with a job returns that job's last kick, so a
+   * later resolve/scanout kick of the same frame never clobbers the
+   * foreground (rgb) flushes — including the placed pass. Frozen at kick
+   * end (diag path only, never the production frame). See DiagSnapshot
+   * for the clock-comparability contract: arrivals are
    * dispatch-to-completion latencies (scheduling included), NOT in-worker
    * compute durations; workerExecMs carries the worker-local durations
-   * when posted (-1 per arrival otherwise).
+   * when posted (-1 per arrival otherwise); the exec and spread fields are
+   * within-kick straggler stats over the finite workerExecMs entries.
    */
-  diagSnapshot(): DiagSnapshot | null {
-    if (!this.diagOn || this.diagKicks === 0) return null;
+  diagSnapshot(job?: DiagJob): DiagSnapshot | null {
+    if (!this.diagOn) return null;
+    if (job === undefined) return this.diagFrozenLast;
+    return this.diagFrozen[job] ?? null;
+  }
+
+  /** Last kick's job kind ('unknown' until the first armed kick). */
+  lastKickJob(): DiagJob {
+    return this.diagOn && this.diagKicks > 0 ? this.diagJob : 'unknown';
+  }
+
+  /**
+   * Bounded per-kick timing ledger, oldest-first (fresh copies,
+   * observability path only). Empty when disarmed. Each entry carries
+   * (frame, seq, job) identity + outcome, so every foreground flush —
+   * world first, then alpha/placed/entity flushes in drawForegroundAsync
+   * order — is attributable per frame without summing medians.
+   */
+  kickTimings(): KickTiming[] {
+    if (!this.diagOn) return [];
+    return this.kickLedger.map((k) => ({ ...k }));
+  }
+
+  /**
+   * Per-band worker-local execution samples accumulated since the last
+   * beginFrame (fresh copies, observability path only). Null when
+   * disarmed (unpublished — the bench keeps fencing dispatch latency);
+   * [] when armed but nothing executed yet. Each sample carries
+   * (frame, seq, job, worker, band, y0, y1) identity plus the measured
+   * worker-side duration and actual work counts — the cross-lane
+   * `WorkerExecSample` contract consumed by @q2/testkit's
+   * `collectWorkerExec` (completed kicks only: partial-failure arrivals
+   * are never execution proof, mirroring lastRgb.workerCompleted).
+   */
+  testBandExecStats(): WorkerExecSample[] | null {
+    if (!this.diagOn) return null;
+    return this.frameExecSamples.map((s) => ({ ...s }));
+  }
+
+  /** Build the frozen snapshot for the kick that just ended (diag-gated). */
+  private buildDiagSnapshot(): DiagSnapshot {
     const arrivals: number[] = [];
     const bandIds: number[] = [];
     const pixels: number[] = [];
@@ -1108,6 +1359,18 @@ export class BrowserBandPool implements BandDispatcher {
       pixels.push(this.diagPixels[i]!);
       spans.push(this.diagSpans[i]!);
       workerExecMs.push(this.diagExec[i]!);
+    }
+    const s = summarizeExec(workerExecMs);
+    let spread = -1;
+    if (arrivals.length > 0) {
+      let lo = arrivals[0]!;
+      let hi = arrivals[0]!;
+      for (let i = 1; i < arrivals.length; i++) {
+        const v = arrivals[i]!;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+      spread = hi - lo;
     }
     return {
       kicks: this.diagKicks,
@@ -1122,7 +1385,107 @@ export class BrowserBandPool implements BandDispatcher {
       spans,
       workerExecMs,
       slowestMs: arrivals.length > 0 ? arrivals[arrivals.length - 1]! : -1,
+      execMaxMs: s.max,
+      execMedianMs: s.med,
+      execMinMs: s.min,
+      execImbalanceMs: s.max >= 0 && s.min >= 0 ? s.max - s.min : -1,
+      arrivalSpreadMs: spread,
+      execKnown: s.known,
+      execUnknown: arrivals.length - s.known,
     };
+  }
+
+  /**
+   * Freeze the kick that just ended: per-job + last-kick snapshots, the
+   * ledger entry and (completed kicks only) the per-band execution
+   * samples. No-op when disarmed — the disabled path records nothing.
+   */
+  private freezeKick(outcome: 'completed' | 'failed' | 'disposed'): void {
+    if (!this.diagOn) return;
+    const snap = this.buildDiagSnapshot();
+    this.diagFrozenLast = snap;
+    this.diagFrozen[this.diagJob] = snap;
+    const now = performance.now();
+    const gap = this.diagPrevKickEnd >= 0 && Number.isFinite(now) ? now - this.diagPrevKickEnd : -1;
+    this.diagPrevKickEnd = Number.isFinite(now) ? now : this.diagPrevKickEnd;
+    const entry: KickTiming = {
+      frame: snap.frame,
+      seq: snap.seq,
+      job: snap.job,
+      bands: snap.bands,
+      outcome,
+      mainMs: snap.mainMs,
+      execMaxMs: snap.execMaxMs,
+      execMedianMs: snap.execMedianMs,
+      execMinMs: snap.execMinMs,
+      slowestMs: snap.slowestMs,
+      spreadMs: snap.arrivalSpreadMs,
+      gapSincePrevMs: gap,
+      execKnown: snap.execKnown,
+      execUnknown: snap.execUnknown,
+    };
+    this.kickLedger.push(entry);
+    if (this.kickLedger.length > KICK_TIMING_CAP) this.kickLedger.splice(0, this.kickLedger.length - KICK_TIMING_CAP);
+    if (outcome === 'completed') this.appendExecSamples(snap);
+  }
+
+  /**
+   * Record a pre-dispatch refusal (staging existed but nothing fanned
+   * out — checkpoint failure, never-ready workers, declined notify).
+   * No arrivals, no main-band work; identity is (frame, pending seq,
+   * job). No-op when disarmed.
+   */
+  private noteRefused(job: DiagJob): void {
+    if (!this.diagOn) return;
+    const now = performance.now();
+    const gap = this.diagPrevKickEnd >= 0 && Number.isFinite(now) ? now - this.diagPrevKickEnd : -1;
+    this.kickLedger.push({
+      frame: this.frameGen,
+      seq: this.seq,
+      job,
+      bands: this.bands.length,
+      outcome: 'refused',
+      mainMs: -1,
+      execMaxMs: -1,
+      execMedianMs: -1,
+      execMinMs: -1,
+      slowestMs: -1,
+      spreadMs: -1,
+      gapSincePrevMs: gap,
+      execKnown: 0,
+      execUnknown: 0,
+    });
+    if (this.kickLedger.length > KICK_TIMING_CAP) this.kickLedger.splice(0, this.kickLedger.length - KICK_TIMING_CAP);
+  }
+
+  /**
+   * Append one completed kick's per-band worker samples to the
+   * per-frame accumulation (diag path only). Bands with unusable
+   * durations or tallies are skipped (unknown is never execution
+   * proof); an unmappable job drops the whole kick (the testkit
+   * consumer rejects malformed jobs, so we never emit them).
+   */
+  private appendExecSamples(snap: DiagSnapshot): void {
+    const crit = diagJobToCritJob(snap.job);
+    if (crit === null) return;
+    for (let i = 0; i < snap.arrivals.length; i++) {
+      if (this.frameExecSamples.length >= FRAME_EXEC_CAP) return;
+      const band = snap.bandIds[i]!;
+      const execMs = snap.workerExecMs[i]!;
+      const pixels = snap.pixels[i]!;
+      const spans = snap.spans[i]!;
+      if (!(band >= 0) || !Number.isInteger(band) || band >= this.bands.length) continue;
+      if (!(execMs >= 0) || !Number.isFinite(execMs)) continue;
+      if (!(pixels >= 0) || !Number.isFinite(pixels)) continue;
+      if (!(spans >= 0) || !Number.isFinite(spans)) continue;
+      const b = this.bands[band]!;
+      const frame = this.diagMsgFrame[i]! >= 0 ? this.diagMsgFrame[i]! : snap.frame;
+      this.frameExecSamples.push({
+        frame, seq: snap.seq, job: crit,
+        worker: band, band, y0: b.y0, y1: b.y1,
+        execMs, pixels, spans,
+      });
+    }
   }
 
   /**
@@ -1255,7 +1618,7 @@ export class BrowserBandPool implements BandDispatcher {
   async flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number } | null> {
     if (this.disposed || this.workers.length === 0 || this.quarantined) { this.rgbFailure = 'clean'; return null; }
     if (this.rgbDescCount <= this.rgbFlushedCount) return { pixels: 0, spans: 0 };
-    if (!(await this.awaitReadyAsync())) { this.rgbFailure = 'clean'; return null; }
+    if (!(await this.awaitReadyAsync())) { this.rgbFailure = 'clean'; this.noteRefused('rgb'); return null; }
     this.snapKick();
     // Checkpoint BEFORE any write of this kick: on a partial failure the
     // restore undoes this kick's writes while keeping committed earlier
@@ -1269,6 +1632,7 @@ export class BrowserBandPool implements BandDispatcher {
       this.discardSnapshot();
       this.lastRgbKick = { descs, workerCompleted: false, mainPixels: 0, mainSpans: 0 };
       this.rgbFailure = 'clean';
+      this.noteRefused('rgb');
       return null;
     }
     this.publishRGB(near, far, lodBias);
@@ -1280,6 +1644,7 @@ export class BrowserBandPool implements BandDispatcher {
       this.discardSnapshot();
       this.lastRgbKick = { descs, workerCompleted: false, mainPixels: 0, mainSpans: 0 };
       this.rgbFailure = 'clean';
+      this.noteRefused('rgb');
       return null;
     }
     // Calling thread owns the last band: drain its share of the SUFFIX
@@ -1292,6 +1657,7 @@ export class BrowserBandPool implements BandDispatcher {
     );
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
     const outcome = await finished;
+    this.freezeKick(outcome);
     if (outcome !== 'completed') {
       this.statFallbacks.rgb += 1;
       // Fence order: writers were already stopped/isolated (timeout

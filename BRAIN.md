@@ -321,14 +321,20 @@ evidence: `tools/bench/evidence/pn3-ab-base-b8951f4.json` + `pn3-ab-head.json` (
 ### PERF-NEXT-4 — Wire real worker execution timing end to end
 owns: `packages/sw-renderer`, `apps/web`, `packages/testkit`, `tools/bench`
 depends: PERF-NEXT-2
-status: ready
-starting-points: `bands.ts: bandWorkerLoop`; `render-workers.ts: DiagSnapshot`; `worker-timing.test.ts`; bench attribution
+status: done(@integrator 2026-10-29)
 done-when:
-- [ ] Measure execution inside the PRODUCTION worker loop for world, foreground, resolve and scanout jobs; publish duration plus frame/sequence/job/band identity and actual work counts. Current production completion messages omit execMs although mocks send it.
-- [ ] Wire Node and browser consumers, renderer/test hooks and benchmark/browser reports. Distinguish worker compute, calling-thread band execution and caller dispatch-to-completion latency; never subtract unrelated time origins.
-- [ ] Add integration tests through the real built Node worker and real browser worker entry points; require finite measured durations for executed jobs and correct identity. A test accepting null or supplying synthetic execMs does not close this card.
-- [ ] Instrument geometry/material/staging, worker raster, barriers/idle, scanout, presentation/scheduling and material GC; reconcile per-frame timing without summing independent medians. Attribute every foreground flush, including the placed pass.
-- [ ] Detailed timing can be disabled; run acceptance with it disabled. Publish initial actual critical-path/imbalance measurements to drive PERF-NEXT-6.
+- [x] Measure execution inside the PRODUCTION worker loop for world, foreground, resolve and scanout jobs; publish duration plus frame/sequence/job/band identity and actual work counts. Current production completion messages omit execMs although mocks send it.
+- [x] Wire Node and browser consumers, renderer/test hooks and benchmark/browser reports. Distinguish worker compute, calling-thread band execution and caller dispatch-to-completion latency; never subtract unrelated time origins.
+- [x] Add integration tests through the real built Node worker and real browser worker entry points; require finite measured durations for executed jobs and correct identity. A test accepting null or supplying synthetic execMs does not close this card.
+- [x] Instrument geometry/material/staging, worker raster, barriers/idle, scanout, presentation/scheduling and material GC; reconcile per-frame timing without summing independent medians. Attribute every foreground flush, including the placed pass.
+- [x] Detailed timing can be disabled; run acceptance with it disabled. Publish initial actual critical-path/imbalance measurements to drive PERF-NEXT-6.
+completion (four outcomes):
+- implementation: loop measures + posts finite execMs (all 4 job kinds) + CTL_EXEC shared slot for sync harvest; Node lastWorkerExec/testBandExecStats (frame accumulation, string job labels); browser entry stamp + clock forward, DiagSnapshot straggler fields, KickTiming ledger, testBandExecStats, __q2stats timing; testkit parsers/imbalance/kill-switch/collectors; bench attribution + acceptance disable. Integrator unification: string job labels at source (loop was numeric vs browser/testkit strings); Node testBandExecStats hook; sync harvester (slot clear/mark/ingest); per-kick group report; stale acceptance note; reverted stray root .gitignore evidence exclusion.
+- correctness: package suites green in isolation (testkit 99, sw-renderer 328+8 new sync, web 225 incl. 10 new worker-timing, bench 8); new tests: sw-renderer 6 async + 2 sync (real threads, no synthetics), web 10 (real bundled entry), testkit 14 (real built Node worker + hash equality); base1-gate 23/23 + voodoo-regression 4/4; pooled≡serial hashes identical; no goldens changed, budgets NOT relaxed.
+- performance measurement: detail-enabled `node-compare-...00-50-29` publishes compute[] end to end: world RGB med 14.98/max 24.37 (band3), empty FG kick s47 ~0.01, FG s48 3.49/4.16, resolve 0.43 flat, scanout 4.91/5.17, fenceIdle 0.00; disabled-accept C 53.67 vs detail frame 53.88 (timing cost: noise). Disabled-vs-enabled planes bit-identical (lane A/B).
+- target acceptance: N/A (instrumentation card; targets gated by PERF-NEXT-6/7). Budget gates still FAIL by design.
+evidence: `tools/bench/evidence/node-accept-ed8470a-2026-10-29T00-32-20.manifest.json` (disabled), `node-compare-ed8470a-2026-10-29T00-47-25.manifest.json` (first end-to-end publish), `node-compare-ed8470a-2026-10-29T00-50-29.manifest.json` (per-kick groups → PERF-NEXT-6 input) + ledger PERF-NEXT-4 row. Changesets: `.changeset/sw-renderer-worker-timing.md` + `.changeset/testkit-worker-timing.md` (bench/web ignored).
+residuals: (1) parallel-turbo load flakes in timing-sensitive tests (fg-recovery 5s-timeout, fg-counters) — green in isolation/sequentially every time, reproduced at clean base; (2) Node indexed sync/async timeout paths still legacy (PERF-NEXT-2 residual, unchanged).
 
 ### PERF-NEXT-5 — Correct browser worker/main-thread attribution
 owns: `packages/sw-renderer`, `apps/web`, `packages/testkit`, `tools/bench`

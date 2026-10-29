@@ -39,9 +39,9 @@ import {
 import {
   base1RefDef, base1Views, hashColorFull, machineJson,
   collectStageCounters, formatBandRanges, frameSplit, nsToMs, nowNs,
-  summarizeLatencies, summarizeSplits,
-  KickJournal,
-  type FrameSplit,
+  readBandExecStats, detailTimingEnabled, summarizeLatencies, summarizeSplits,
+  summarizeWorkerImbalance, KickJournal,
+  type FrameSplit, type WorkerExecSample, type WorkerImbalance,
 } from '@q2/testkit';
 import { readVoodooState, resolveFrame } from '@q2/voodoo';
 import {
@@ -75,6 +75,21 @@ export interface MovingRow {
   coverPx: number;
   heapDeltaKB: number;
   bandId: string;
+  /**
+   * PERF-NEXT-4: detailed-timing state + per-band worker compute for the
+   * production scanout kick (null while the renderer publishes no
+   * in-worker timestamps, or detail is off). Max-vs-median straggler
+   * analysis, never summed medians.
+   */
+  timingDetail: 'enabled' | 'disabled';
+  workerComputeMs: number[] | null;
+  workerImbalance: {
+    groups: number; bands: number; bandMed: number; bandMax: number;
+    critMax: number; gapMs: number; ratio: number | null;
+    straggler: string | null;
+    byGroup: Array<{ job: string; seq: number; n: number; med: number; max: number }>;
+  } | null;
+  fenceIdleMs: number | null;
 }
 
 export interface CompareMeta {
@@ -233,6 +248,36 @@ async function runMovingConfig(
   setRGBWorldEnabled(false);
   const scan = summarizeLatencies(frameMs);
   const sp = summarizeSplits(splits);
+  // PERF-NEXT-4: per-band worker compute for the production scanout kicks
+  // (feature-detected; dispatch latencies above are the always-on fence).
+  const detail: 'enabled' | 'disabled' = detailTimingEnabled() ? 'enabled' : 'disabled';
+  let workerComputeMs: number[] | null = null;
+  let workerImbalance: MovingRow['workerImbalance'] = null;
+  let fenceIdleMs: number | null = null;
+  if (detail === 'enabled' && pool && mode === 'rgb') {
+    let samples: WorkerExecSample[] | null = null;
+    try {
+      samples = readBandExecStats(pool);
+    } catch {
+      samples = null;
+    }
+    if (samples && samples.length > 0) {
+      const imb: WorkerImbalance = summarizeWorkerImbalance(samples);
+      const s = imb.straggler;
+      workerComputeMs = samples.map((x) => x.execMs);
+      workerImbalance = {
+        groups: imb.groups, bands: imb.bands, bandMed: imb.bandMed, bandMax: imb.bandMax,
+        critMax: imb.critPathMax, gapMs: imb.imbalanceMs, ratio: imb.imbalanceRatio,
+        straggler: s ? `band${s.band}(${s.job} f${s.frame}s${s.seq} ${s.execMs.toFixed(2)}ms)` : null,
+        byGroup: imb.byGroup.map((g) => ({ job: g.job, seq: g.seq, n: g.n, med: g.med, max: g.max })),
+      };
+      const kickMax = journal.summarize('scanout').max;
+      fenceIdleMs = Math.max(0, kickMax - imb.critPathMax);
+    }
+  }
+  const execPart = workerComputeMs
+    ? ` compute[${workerComputeMs.map((v) => v.toFixed(2)).join('/')}] gap=${workerImbalance!.gapMs.toFixed(2)} straggler=${workerImbalance!.straggler} groups[${workerImbalance!.byGroup.map((g) => `${g.job}s${g.seq}:${g.n}b med=${g.med.toFixed(2)} max=${g.max.toFixed(2)}`).join(' ')}] fenceIdle=${fenceIdleMs!.toFixed(2)}`
+    : detail === 'disabled' ? ' compute[detail-off]' : ' compute[unpublished:no-in-worker-timestamps]';
   console.log(
     `moving ${W}x${H} ent=combat ${mode} w=${workers}: ` +
     `frame(production,Node)=${scan.med.toFixed(2)}(p95 ${scan.p95.toFixed(2)} max ${scan.max.toFixed(2)}) ` +
@@ -240,7 +285,8 @@ async function runMovingConfig(
     `scanout=${sp.scanout.toFixed(2)} gap=${sp.gap.toFixed(2)}] ` +
     `hash0=${frameHashes[0]} hashN=${frameHashes[frameHashes.length - 1]} ` +
     `stage[staged=${staged} inline=${inline} kicks=${kicks} fb=${scanoutFallbacks}] ` +
-    `cover=${coverPx} heapΔ=${(heapKB() - heapBeforeKB).toFixed(0)}KB ${formatBandRanges(H, workers)}`,
+    `cover=${coverPx} heapΔ=${(heapKB() - heapBeforeKB).toFixed(0)}KB ${formatBandRanges(H, workers)}` +
+    `${execPart} detail=${detail}`,
   );
   return {
     workload: 'moving', res: `${W}x${H}`, mode, workers,
@@ -248,6 +294,7 @@ async function runMovingConfig(
     kicks, staged, inline, scanoutKind, scanoutFallbacks, coverPx,
     heapDeltaKB: heapKB() - heapBeforeKB,
     bandId: formatBandRanges(H, workers),
+    timingDetail: detail, workerComputeMs, workerImbalance, fenceIdleMs,
   };
 }
 

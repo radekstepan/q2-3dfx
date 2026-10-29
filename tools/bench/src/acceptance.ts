@@ -241,6 +241,11 @@ async function emitAcceptEvidence(
   mkdirSync(dirname(resultFile), { recursive: true });
   writeFileSync(resultFile, JSON.stringify({ rows, machine, commit: ctx.commit, provenance }, null, 2));
   const summary = summarizeAttrRows(rows);
+  // PERF-NEXT-4: record that the accept gate ran with detailed timing
+  // disabled (per-band worker exec reads null by design in these rows).
+  summary['timingDetail'] = rows.length > 0 && rows.every((r) => r.timingDetail === 'disabled')
+    ? 'disabled'
+    : 'mixed';
   const manifestOut = ctx.opts.manifestPath
     ?? process.env.ACCEPT_MANIFEST_OUT
     ?? defaultManifestPath('node-accept', ctx.commit);
@@ -258,6 +263,12 @@ export async function runAcceptance(pakPath: string, opts: Partial<AcceptOptions
   const warmup = opts.warmup ?? Number(process.env.RGB_ACCEPT_WARMUP ?? 5);
   const reps = opts.reps ?? Number(process.env.RGB_ACCEPT_REPS ?? 10);
   const workers = opts.workers ?? acceptWorkers();
+  // PERF-NEXT-4 done-when 5: the accept gate ALWAYS runs with detailed
+  // timing disabled — per-band exec/imbalance/material-GC-ms collection is
+  // skipped (null in the rows) and the gate compares only whole
+  // production frames + parity. The disabled state is recorded in the
+  // rows, the console and the evidence manifest.
+  process.env.Q2_DETAIL_TIMING = '0';
   const fresh = distFreshness();
   if (!fresh.fresh) {
     console.error(
@@ -341,25 +352,36 @@ export async function runAcceptance(pakPath: string, opts: Partial<AcceptOptions
   // identity, same-rep main-thread split + scheduling gap, scanout-kick
   // dispatch-to-completion (med/p95/max — the max is the scanout critical
   // path), staging/skip/byte ledger, foreground proof (serial alias +
-  // elided classic fg). Per-worker execution durations need renderer
-  // in-worker timestamps (gap — @q2/testkit critpath); until then the RGB
-  // kick inside renderView is bounded by the render segment, not estimated.
+  // elided classic fg). Per-worker exec durations + imbalance +
+  // material-GC ms need renderer in-worker timestamps AND detail on —
+  // acceptance runs detail OFF, so the rows below read null by design
+  // (the gate budget compares only whole production frames).
+  console.log('timing detail DISABLED for acceptance (PERF-NEXT-4): per-band worker exec/imbalance/material-GC read null by design; budgets compare whole production frames only.');
   for (const [label, row] of [['gate A', gateA], ['gate B', gateB], ['gate C', gateC]] as const) {
     const rs = (v: number | null): string => v === null ? '—' : v.toFixed(2);
+    const fgLine = `fg[kicks=${row.fgKicks ?? '—'}(alpha+placed+entity) staged=${row.fgStaged ?? '—'} inline=${row.fgInline ?? '—'} ` +
+      `alpha=${row.fgAlphaSpans ?? '—'} sprites=${row.fgSpriteSpans ?? '—'} tris=${row.fgTrisStaged ?? '—'} ` +
+      `aliasIn=${row.fgAliasDrawsInline ?? '—'} partIn=${row.fgParticlesInline ?? '—'} beamIn=${row.fgBeamsInline ?? '—'} ` +
+      `entityMs=${rs(row.fgEntityMs)} matGcMs=${rs(row.materialGcMs)}]`;
+    const execLine = row.workerComputeMs
+      ? `workerExec[compute[${row.workerComputeMs.map((v) => v.toFixed(2)).join('/')}] gap=${row.workerImbalance?.gapMs.toFixed(2)} straggler=${row.workerImbalance?.straggler} fenceIdle=${rs(row.fenceIdleMs)}]`
+      : 'workerExec[detail-off:null-by-design]';
     console.log(
-      `crit ${label} ${row.res} ${row.mode} ent=${row.entities} w=${row.workers} ${row.bandId}: ` +
+      `crit ${label} ${row.res} ${row.mode} ent=${row.entities} w=${row.workers} ${row.bandId} detail=${row.timingDetail}: ` +
       `split[begin=${rs(row.splitBeginMs)} render=${rs(row.splitRenderMs)} end=${rs(row.splitEndMs)} ` +
       `scanout=${rs(row.splitScanoutMs)} gap=${rs(row.splitGapMs)}] ` +
       `scanoutKick[${row.scanoutKind ?? 'n/a'} med=${rs(row.scanoutMs)} p95=${rs(row.scanoutP95)} max=${rs(row.scanoutMaxMs)} serialCtl=${rs(row.scanoutSerialMs)}] ` +
       `frameMax=${rs(row.frameMaxMs)} ` +
       `stage[cover=${row.coverPx} staged=${row.rgbStaged} inline=${row.rgbInline} kicks=${row.rgbKicks} fb=${row.scanoutFallbacks} ` +
       `skipSpans=${row.classicSpansSkipped} skipFg=${row.classicFgSkipped} armed=${row.skipArmed} trans=${row.translucentSpans}] ` +
+      `${fgLine} ` +
       `fg[alias=${rs(row.aliasMs)} serial] ` +
+      `${execLine} ` +
       `bytes[planes=${row.planeBytes} scan=${row.scanBytes ?? 'n/a'} chain=${row.chainUsedBytes} retained=${row.retainedChainBytes} orphan=${row.orphanChainBytes}] ` +
       `heapΔ=${row.heapDeltaKB.toFixed(0)}KB`,
     );
   }
-  console.log('note: frame() is production-frame-no-present (Node); presented FPS is a browser/CDP soak metric (perf-ledger soak rows). Per-worker exec durations need renderer in-worker timestamps (open).');
+  console.log('note: frame() is production-frame-no-present (Node); presented FPS is a browser/CDP soak metric (perf-ledger soak rows). Per-band worker exec is measured in-worker (see detail-enabled compare/rgbattr rows); acceptance runs with it disabled by design.');
   const cA = checkBudget(gateA.frameMs!, PERF_BUDGET_SOFTWARE_640_MS);
   const cB = checkBudget(gateB.frameMs!, PERF_BUDGET_VOODOO_640_MS);
   const cC = checkBudget(gateC.frameMs!, PERF_BUDGET_VOODOO_640_MS);

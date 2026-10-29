@@ -59,8 +59,11 @@ export function nsToMs(ns: bigint): number {
   return Number(ns) / 1e6;
 }
 
-/** Job types the bench can kick and fence on the caller (stable per frame). */
-export type CritJobKind = 'rgb' | 'scanout' | 'indexed-resolve' | 'indexed-frame';
+/** Job types the bench can kick and fence on the caller (stable per frame).
+ * PERF-NEXT-4: the production worker loop also runs world, foreground and
+ * resolve jobs — the same vocabulary names them so caller fences and
+ * worker-local execution samples join on (frame, seq, job, band). */
+export type CritJobKind = 'rgb' | 'scanout' | 'indexed-resolve' | 'indexed-frame' | 'world' | 'foreground' | 'resolve';
 
 /**
  * One fenced job: dispatch-to-completion latency measured on the caller.

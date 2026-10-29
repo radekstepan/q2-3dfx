@@ -8,6 +8,9 @@
 // the full shape, and returns null when the hook is absent or malformed.
 // Tests assert strictly when a hook is present and skip clearly when it is
 // not — never silently passing on a missing producer.
+import type { WorkerExecSample } from './worker-timing.js';
+import { collectWorkerExec } from './worker-timing.js';
+
 export interface ForegroundStats {
   stagedBatches: number;
   inlineBatches: number;
@@ -29,6 +32,16 @@ export interface ForegroundStats {
   replayedPixels: number;
   recoveryCount: number;
   entityMs: number;
+  /** Optional newer producer fields (PERF-NEXT-4/5 taxonomy): present only
+   *  when the renderer publishes them — never required, never defaulted to
+   *  a fake zero by the reader (undefined = unpublished). */
+  trisStaged?: number;
+  trisCompleted?: number;
+  trisMainCompleted?: number;
+  trisReplayed?: number;
+  particleSpansStaged?: number;
+  beamSpansStaged?: number;
+  directInlineWrites?: boolean;
 }
 
 const FG_KEYS: Array<keyof ForegroundStats> = [
@@ -64,6 +77,24 @@ export function readForegroundStats(r: object): ForegroundStats | null {
     const v = src[k];
     if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return null;
     out[k] = v;
+  }
+  // Optional newer producer fields: accept when valid, leave undefined
+  // when unpublished. A present-but-malformed optional rejects (never
+  // laundered into a zero that would read as "no work").
+  const FG_OPT_NUM: Array<'trisStaged' | 'trisCompleted' | 'trisMainCompleted' | 'trisReplayed' | 'particleSpansStaged' | 'beamSpansStaged'> = [
+    'trisStaged', 'trisCompleted', 'trisMainCompleted', 'trisReplayed',
+    'particleSpansStaged', 'beamSpansStaged',
+  ];
+  for (const k of FG_OPT_NUM) {
+    const v = src[k];
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return null;
+    out[k] = v;
+  }
+  const diw = src['directInlineWrites'];
+  if (diw !== undefined) {
+    if (typeof diw !== 'boolean') return null;
+    (out as unknown as Record<string, unknown>)['directInlineWrites'] = diw;
   }
   return out as unknown as ForegroundStats;
 }
@@ -135,5 +166,105 @@ export function commitPoolRGB(pool: object): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Per-band worker-local execution samples through the public hook the
+ * renderer/browser lanes publish (PERF-NEXT-4 shape:
+ * `testBandExecStats()` returning WorkerExecSample[] — implemented by the
+ * Node `BandWorkerPool` and the browser `BrowserBandPool`). Feature-detected:
+ * null while the producer publishes nothing (timing disabled, legacy shape,
+ * or no kick yet) — the caller keeps fencing dispatch-to-completion. Never throws.
+ */
+export function readBandExecStats(source: object): WorkerExecSample[] | null {
+  return collectWorkerExec(source);
+}
+
+/**
+ * Browser last-kick diagnostic snapshot (apps/web `DiagSnapshot`):
+ * main-thread `performance.now()` dispatch-to-completion arrivals plus
+ * worker-local `workerExecMs` durations (-1 per arrival when the worker
+ * build omitted `execMs`), band identity and tallies parallel to arrivals.
+ * Structural read for bench browser reports — null when the pool is
+ * disarmed/absent or the shape is malformed. Arrivals and execution stay
+ * in separate fields, never fused (different clocks, different meaning).
+ */
+export interface DiagSnapshotRead {
+  kicks: number;
+  frame: number;
+  seq: number;
+  job: string;
+  bands: number;
+  mainMs: number;
+  arrivals: number[];
+  bandIds: number[];
+  pixels: number[];
+  spans: number[];
+  workerExecMs: number[];
+  slowestMs: number;
+}
+
+/** Parse a browser DiagSnapshot structurally; null when absent/malformed. */
+export function readDiagSnapshot(source: object): DiagSnapshotRead | null {
+  const rec = source as unknown as Record<string, unknown>;
+  if (typeof rec['diagSnapshot'] !== 'function') return null;
+  let raw: unknown;
+  try {
+    raw = (rec['diagSnapshot'] as () => unknown).call(source);
+  } catch {
+    return null;
+  }
+  if (typeof raw !== 'object' || raw === null) return null;
+  const s = raw as Record<string, unknown>;
+  const num = (v: unknown): v is number =>
+    typeof v === 'number' && Number.isFinite(v);
+  if (!num(s['kicks']) || !num(s['frame']) || !num(s['seq']) ||
+    typeof s['job'] !== 'string' || !num(s['bands']) || !num(s['mainMs']) ||
+    !num(s['slowestMs'])) return null;
+  const arr = (v: unknown): number[] | null => {
+    if (!Array.isArray(v)) return null;
+    const out: number[] = [];
+    for (const e of v) {
+      if (!num(e)) return null;
+      out.push(e);
+    }
+    return out;
+  };
+  const arrivals = arr(s['arrivals']);
+  const bandIds = arr(s['bandIds']);
+  const pixels = arr(s['pixels']);
+  const spans = arr(s['spans']);
+  const workerExecMs = arr(s['workerExecMs']);
+  if (!arrivals || !bandIds || !pixels || !spans || !workerExecMs) return null;
+  if (bandIds.length !== arrivals.length || pixels.length !== arrivals.length ||
+    spans.length !== arrivals.length || workerExecMs.length !== arrivals.length) return null;
+  for (const e of workerExecMs) {
+    if (!(e === -1 || e >= 0)) return null;
+  }
+  return {
+    kicks: s['kicks'] as number, frame: s['frame'] as number, seq: s['seq'] as number,
+    job: s['job'] as string, bands: s['bands'] as number, mainMs: s['mainMs'] as number,
+    arrivals, bandIds, pixels, spans, workerExecMs, slowestMs: s['slowestMs'] as number,
+  };
+}
+
+/**
+ * Material-cache GC cost probe (PERF-NEXT-4 assumed shape): the renderer
+ * may publish `testMaterialGcMs()` (ms spent in chain/material eviction
+ * + rebuild accounting this frame window) alongside the byte/eviction
+ * counters `collectStageCounters` already reads. Feature-detected: null
+ * while unpublished — the bench reports chain bytes + eviction counts and
+ * says the ms cost is unknown, never zero.
+ */
+export function readMaterialGcMs(source: object): number | null {
+  const rec = source as unknown as Record<string, unknown>;
+  if (typeof rec['testMaterialGcMs'] !== 'function') return null;
+  try {
+    const v = (rec['testMaterialGcMs'] as () => unknown).call(source);
+    if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return null;
+    return v;
+  } catch {
+    return null;
   }
 }

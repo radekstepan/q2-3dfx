@@ -1084,6 +1084,13 @@ function blip(ctx: AudioContext, master: GainNode, freq: number, dur: number, wh
  *   -1 = hook absent (older renderer). Never guessed.
  * - `rgbFallbacks`: pooled RGB-kick failures this boot (timeout/dead
  *   worker → inline replay, bit-identical). Healthy: 0.
+ * - `lastKickJob`/`rgbMainMs`/`rgbExecMs`/`rgbExecMaxMs`/
+ *   `rgbExecMedianMs`/`rgbImbalanceMs`/`rgbSlowestMs`/
+ *   `scanoutSlowestMs`/`resolveSlowestMs`: instrumented-only worker
+ *   timing (see the field docs): per-band worker compute for the last rgb
+ *   kick, its max-vs-median imbalance, the calling-thread band share and
+ *   the per-lane dispatch-to-completion critical paths. All -1/empty
+ *   unless diag is armed — never medians summed across kicks.
  * - `quarantined`: the pool timed out a kick and terminated its workers
  *   (stale-write guard fired — later kicks refuse fast until reboot).
  *   Healthy: false.
@@ -1143,6 +1150,33 @@ export interface Q2Stats {
   classicSkipped: number;
   skipArmed: boolean;
   /**
+   * Worker-execution timing for the last kicks (PERF-NEXT-4, harness
+   * only): world + foreground rgb flushes share the rgb lane (the last
+   * one is usually a foreground flush — every FG flush including the
+   * placed pass carries the same fields; see the pool's `kickTimings()`
+   * ledger for the per-frame list). `rgbExecMs` holds the last rgb
+   * kick's per-band worker-compute durations (arrival order); `rgbMainMs`
+   * is the calling-thread band's execution for the same kick;
+   * `rgbExecMaxMs`/`rgbExecMedianMs` expose the max-vs-median imbalance
+   * and `rgbImbalanceMs` the max-minus-min gap (within-kick stats only);
+   * `rgbSlowestMs`/`scanoutSlowestMs`/`resolveSlowestMs` are the
+   * dispatch-to-completion critical paths per lane. `lastKickJob` names
+   * the most recent kick ('none' when disarmed or kickless). All -1/empty
+   * when diag is disarmed or the lane never kicked — acceptance runs
+   * disarmed by design, so production __q2stats carries no worker timing
+   * and these fields stay at their sentinels with zero per-frame cost
+   * beyond the guarded probes below.
+   */
+  lastKickJob: string;
+  rgbMainMs: number;
+  rgbExecMs: number[];
+  rgbExecMaxMs: number;
+  rgbExecMedianMs: number;
+  rgbImbalanceMs: number;
+  rgbSlowestMs: number;
+  scanoutSlowestMs: number;
+  resolveSlowestMs: number;
+  /**
    * Pooled RGB-kick failures this boot (timeout/dead worker → counted
    * inline replay, bit-identical). 0 = none (healthy, or unpooled).
    */
@@ -1160,11 +1194,17 @@ export interface Q2Stats {
   asyncFallbacks: number;
 }
 
+/** Shared empty worker-timing list (production sentinel, never mutated). */
+const NO_EXEC_TIMING: number[] = [];
+
 const Q2STATS_ZERO: Q2Stats = {
   fps: 0, frame: 0, pooled: false, rgbStaged: 0, rgbKicks: 0, rgbInline: 0,
   bands: 1, poolSpans: 0, poolPixels: 0, rgbPending: 0, stageBytes: -1,
   fgInline: -1, fgStaged: -1, fgWorker: -1, fgInlineRgb: -1, fgKicks: -1,
   classicSkipped: 0, skipArmed: false,
+  lastKickJob: 'none', rgbMainMs: -1, rgbExecMs: NO_EXEC_TIMING, rgbExecMaxMs: -1,
+  rgbExecMedianMs: -1, rgbImbalanceMs: -1, rgbSlowestMs: -1,
+  scanoutSlowestMs: -1, resolveSlowestMs: -1,
   rgbFallbacks: 0, quarantined: false,
   voodooPath: 'none', resolveOrder: 'none',
   scanoutKicks: 0, scanoutFallbacks: 0, asyncFallbacks: 0,
@@ -1259,6 +1299,73 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
       rec.stageBytes = -1;
       rec.rgbFallbacks = 0;
       rec.quarantined = false;
+    }
+    // Instrumented-only worker timing (PERF-NEXT-4): per-band compute for
+    // the last rgb kick, its max-vs-median imbalance, the calling-thread
+    // band share and the per-lane dispatch-to-completion critical paths.
+    // Guarded probes only (a foreign/older pool degrades to the sentinels,
+    // never a throw, never an allocation on the production path: the
+    // per-band list is assigned — a fresh array — solely when diag is
+    // armed and an rgb kick ran, and the shared frozen empty otherwise).
+    try {
+      const pool = boot.browserPool as unknown as {
+        lastKickJob?: () => unknown;
+        diagSnapshot?: (job?: unknown) => {
+          mainMs?: unknown;
+          workerExecMs?: unknown;
+          execMaxMs?: unknown;
+          execMedianMs?: unknown;
+          execImbalanceMs?: unknown;
+          slowestMs?: unknown;
+        } | null;
+      } | null;
+      const last = pool && typeof pool.lastKickJob === 'function' ? pool.lastKickJob() : 'unknown';
+      rec.lastKickJob = typeof last === 'string' && last !== 'unknown' ? last : 'none';
+      if (pool && typeof pool.diagSnapshot === 'function') {
+        const rgb = pool.diagSnapshot('rgb');
+        if (rgb !== null && rgb !== undefined) {
+          rec.rgbMainMs = numOr(rgb.mainMs, -1);
+          rec.rgbExecMs = Array.isArray(rgb.workerExecMs)
+            ? rgb.workerExecMs.filter((v): v is number =>
+              typeof v === 'number' && Number.isFinite(v) && v >= 0)
+            : NO_EXEC_TIMING;
+          rec.rgbExecMaxMs = numOr(rgb.execMaxMs, -1);
+          rec.rgbExecMedianMs = numOr(rgb.execMedianMs, -1);
+          rec.rgbImbalanceMs = numOr(rgb.execImbalanceMs, -1);
+          rec.rgbSlowestMs = numOr(rgb.slowestMs, -1);
+        } else {
+          rec.rgbMainMs = -1;
+          rec.rgbExecMs = NO_EXEC_TIMING;
+          rec.rgbExecMaxMs = -1;
+          rec.rgbExecMedianMs = -1;
+          rec.rgbImbalanceMs = -1;
+          rec.rgbSlowestMs = -1;
+        }
+        const scan = pool.diagSnapshot('scanout');
+        rec.scanoutSlowestMs = scan !== null && scan !== undefined ? numOr(scan.slowestMs, -1) : -1;
+        const res = pool.diagSnapshot('resolve');
+        rec.resolveSlowestMs = res !== null && res !== undefined ? numOr(res.slowestMs, -1) : -1;
+      } else {
+        rec.lastKickJob = 'none';
+        rec.rgbMainMs = -1;
+        rec.rgbExecMs = NO_EXEC_TIMING;
+        rec.rgbExecMaxMs = -1;
+        rec.rgbExecMedianMs = -1;
+        rec.rgbImbalanceMs = -1;
+        rec.rgbSlowestMs = -1;
+        rec.scanoutSlowestMs = -1;
+        rec.resolveSlowestMs = -1;
+      }
+    } catch {
+      rec.lastKickJob = 'none';
+      rec.rgbMainMs = -1;
+      rec.rgbExecMs = NO_EXEC_TIMING;
+      rec.rgbExecMaxMs = -1;
+      rec.rgbExecMedianMs = -1;
+      rec.rgbImbalanceMs = -1;
+      rec.rgbSlowestMs = -1;
+      rec.scanoutSlowestMs = -1;
+      rec.resolveSlowestMs = -1;
     }
     try {
       const boot2 = boot.refresh as unknown as {
