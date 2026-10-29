@@ -39,7 +39,7 @@ import {
 import {
   base1RefDef, base1Views, hashColorFull, machineJson,
   collectStageCounters, formatBandRanges, frameSplit, nsToMs, nowNs,
-  readBandExecStats, detailTimingEnabled, summarizeLatencies, summarizeSplits,
+  readBandExecStats, readForegroundAttribution, detailTimingEnabled, summarizeLatencies, summarizeSplits,
   summarizeWorkerImbalance, KickJournal,
   type FrameSplit, type WorkerExecSample, type WorkerImbalance,
 } from '@q2/testkit';
@@ -73,6 +73,26 @@ export interface MovingRow {
   scanoutKind: string | null;
   scanoutFallbacks: number;
   coverPx: number;
+  /**
+   * PERF-NEXT-5 corrected foreground split (last rep, nullable = unknown):
+   * worker-band vs calling-thread-band shares of the completed foreground
+   * kick plus the combined totals (combined == worker + main) and the
+   * fallback replay counters. Units: spans/pixels/tris. Serial configs
+   * report real zeros (no kick ran); pooled configs report actuals.
+   */
+  fgWorkerSpans: number | null;
+  fgWorkerPixels: number | null;
+  fgWorkerTris: number | null;
+  fgMainSpans: number | null;
+  fgMainPixels: number | null;
+  fgMainTris: number | null;
+  fgCombinedSpans: number | null;
+  fgCombinedPixels: number | null;
+  fgCombinedTris: number | null;
+  fgReplayedSpans: number | null;
+  fgReplayedPixels: number | null;
+  fgReplayedTris: number | null;
+  fgRecoveryCount: number | null;
   heapDeltaKB: number;
   bandId: string;
   /**
@@ -188,6 +208,14 @@ async function runMovingConfig(
   const displayHashes: Array<string | null> = [];
   const journal = new KickJournal();
   let staged = 0, inline = 0, kicks = 0, scanoutFallbacks = 0, coverPx = 0;
+  let fgWorkerSpans: number | null = null, fgWorkerPixels: number | null = null,
+    fgWorkerTris: number | null = null;
+  let fgMainSpans: number | null = null, fgMainPixels: number | null = null,
+    fgMainTris: number | null = null;
+  let fgCombinedSpans: number | null = null, fgCombinedPixels: number | null = null,
+    fgCombinedTris: number | null = null;
+  let fgReplayedSpans: number | null = null, fgReplayedPixels: number | null = null,
+    fgReplayedTris: number | null = null, fgRecoveryCount: number | null = null;
   let scanoutKind: string | null = mode === 'software' ? null : (pool ? 'pooled' : 'serial');
   for (let i = 0; i < reps; i++) {
     pumpCombatLights(r, bv.origin, baseYaw);
@@ -242,6 +270,28 @@ async function runMovingConfig(
       inline = sc.inlineBatches;
       kicks = sc.kicks;
       coverPx = sc.coverPixels;
+      // PERF-NEXT-5 corrected split (last rep): worker/main/combined plus
+      // replay — null while the producer publishes nothing (unknown).
+      try {
+        const a = readForegroundAttribution(r);
+        if (a) {
+          fgWorkerSpans = a.kick.workerSpans;
+          fgWorkerPixels = a.kick.workerPixels;
+          fgWorkerTris = a.kick.workerTris;
+          fgMainSpans = a.kick.mainSpans;
+          fgMainPixels = a.kick.mainPixels;
+          fgMainTris = a.kick.mainTris;
+          fgCombinedSpans = a.kick.spans;
+          fgCombinedPixels = a.kick.pixels;
+          fgCombinedTris = a.kick.tris;
+          fgReplayedSpans = a.replayedSpans;
+          fgReplayedPixels = a.replayedPixels;
+          fgReplayedTris = a.replayedTris;
+          fgRecoveryCount = a.recoveryCount;
+        }
+      } catch {
+        /* corrected split stays null; batch legs above still report */
+      }
     }
   }
   if (pool) await pool.dispose();
@@ -285,6 +335,10 @@ async function runMovingConfig(
     `scanout=${sp.scanout.toFixed(2)} gap=${sp.gap.toFixed(2)}] ` +
     `hash0=${frameHashes[0]} hashN=${frameHashes[frameHashes.length - 1]} ` +
     `stage[staged=${staged} inline=${inline} kicks=${kicks} fb=${scanoutFallbacks}] ` +
+    `fgExec[worker=${fgWorkerSpans ?? '—'}sp/${fgWorkerPixels ?? '—'}px/${fgWorkerTris ?? '—'}tr ` +
+    `main=${fgMainSpans ?? '—'}sp/${fgMainPixels ?? '—'}px/${fgMainTris ?? '—'}tr ` +
+    `combined=${fgCombinedSpans ?? '—'}sp/${fgCombinedPixels ?? '—'}px/${fgCombinedTris ?? '—'}tr ` +
+    `replayed=${fgReplayedSpans ?? '—'}sp recovery=${fgRecoveryCount ?? '—'}] ` +
     `cover=${coverPx} heapΔ=${(heapKB() - heapBeforeKB).toFixed(0)}KB ${formatBandRanges(H, workers)}` +
     `${execPart} detail=${detail}`,
   );
@@ -292,6 +346,10 @@ async function runMovingConfig(
     workload: 'moving', res: `${W}x${H}`, mode, workers,
     frameMs, split: splits, frameHashes, displayHashes,
     kicks, staged, inline, scanoutKind, scanoutFallbacks, coverPx,
+    fgWorkerSpans, fgWorkerPixels, fgWorkerTris,
+    fgMainSpans, fgMainPixels, fgMainTris,
+    fgCombinedSpans, fgCombinedPixels, fgCombinedTris,
+    fgReplayedSpans, fgReplayedPixels, fgReplayedTris, fgRecoveryCount,
     heapDeltaKB: heapKB() - heapBeforeKB,
     bandId: formatBandRanges(H, workers),
     timingDetail: detail, workerComputeMs, workerImbalance, fenceIdleMs,
@@ -350,9 +408,60 @@ export interface DiffLine {
   note: string;
 }
 
+/**
+ * Minimal structural shape carrying the PERF-NEXT-5 corrected foreground
+ * split (AttrRow and MovingRow both satisfy it; older run JSONs simply
+ * omit the fields and skip the check).
+ */
+export interface FgSplitLike {
+  fgKicks?: number | null;
+  fgWorkerSpans?: number | null;
+  fgWorkerPixels?: number | null;
+  fgWorkerTris?: number | null;
+  fgMainSpans?: number | null;
+  fgMainPixels?: number | null;
+  fgMainTris?: number | null;
+  fgCombinedSpans?: number | null;
+  fgCombinedPixels?: number | null;
+  fgCombinedTris?: number | null;
+}
+
+/**
+ * PERF-NEXT-5 foreground reconcile note for one stationary row: '' when the
+ * corrected split reconciles (combined == worker + main wherever all three
+ * are published; no worker-completed work on zero-kick rows) or when the row
+ * predates the split (fields absent — skipped, never defaulted). Otherwise
+ * a void-execution-proof note.
+ */
+export function fgReconcileNote(h: FgSplitLike): string {
+  const triple = (
+    label: string, combined: number | null | undefined,
+    worker: number | null | undefined, main: number | null | undefined,
+  ): string => {
+    if (combined != null && worker != null && main != null && combined !== worker + main) {
+      return `FG ${label} ${combined} != worker(${worker})+main(${main})`;
+    }
+    return '';
+  };
+  const notes = [
+    triple('spans', h.fgCombinedSpans, h.fgWorkerSpans, h.fgMainSpans),
+    triple('pixels', h.fgCombinedPixels, h.fgWorkerPixels, h.fgMainPixels),
+    triple('tris', h.fgCombinedTris, h.fgWorkerTris, h.fgMainTris),
+  ].filter((s) => s !== '');
+  if (h.fgKicks === 0) {
+    for (const [label, v] of [
+      ['workerSpans', h.fgWorkerSpans],
+      ['workerPixels', h.fgWorkerPixels],
+      ['workerTris', h.fgWorkerTris],
+    ] as Array<[string, number | null | undefined]>) {
+      if (v != null && v !== 0) notes.push(`FG ${label}=${v} with kicks=0`);
+    }
+  }
+  return notes.join('; ');
+}
+
 /** Diff two runs; settings MUST match or the comparison is void. */
-export function diffComparison(base: CompareRun, head: CompareRun): { lines: DiffLine[]; settingsMatch: boolean } {
-  const settingsMatch =
+export function diffComparison(base: CompareRun, head: CompareRun): { lines: DiffLine[]; settingsMatch: boolean } {  const settingsMatch =
     base.meta.warmup === head.meta.warmup &&
     base.meta.reps === head.meta.reps &&
     base.meta.yawStepDeg === head.meta.yawStepDeg &&
@@ -374,11 +483,18 @@ export function diffComparison(base: CompareRun, head: CompareRun): { lines: Dif
       h.rgbUsed && h.rgbCover > 0 && h.rgbStaged > 0 && h.rgbKicks > 0 &&
       h.scanoutFallbacks === 0
     ) || (h.workers === 0);
+    // PERF-NEXT-5: when both rows carry the corrected foreground split,
+    // the combined totals must reconcile (combined == worker + main) and
+    // zero-kick rows must carry no worker-completed work — otherwise the
+    // row's execution proof is void even when hashes match. Rows from older
+    // runs lack the fields and skip this leg (guarded, never defaulted).
+    const fgNote = fgReconcileNote(h);
     const deltaPct = b.frameMs !== null && h.frameMs !== null && b.frameMs > 0
       ? ((h.frameMs - b.frameMs) / b.frameMs) * 100 : null;
     lines.push({
-      key, baseFrame: b.frameMs, headFrame: h.frameMs, deltaPct, parity, execProof,
-      note: parity ? '' : `OUTPUT CHANGED idx ${b.idxHash}/${h.idxHash} full ${b.colorFull}/${h.colorFull}`,
+      key, baseFrame: b.frameMs, headFrame: h.frameMs, deltaPct, parity,
+      execProof: execProof && fgNote === '',
+      note: [parity ? '' : `OUTPUT CHANGED idx ${b.idxHash}/${h.idxHash} full ${b.colorFull}/${h.colorFull}`, fgNote].filter((s) => s !== '').join(' '),
     });
   }
   const hMov = new Map(head.moving.map((r) => [`moving ${r.res} ${r.mode} w=${r.workers}`, r]));

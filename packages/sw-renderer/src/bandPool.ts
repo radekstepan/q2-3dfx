@@ -1205,12 +1205,12 @@ export class BandWorkerPool implements BandDispatcher {
    * ready, declined, disposed, quarantined, empty suffix) are class
    * 'clean' — see lastRGBFailure.
    */
-  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; workerSpans: number; workerPixels: number; tris: number; workerTris: number; mainExecMs?: number } | null {
+  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; workerSpans: number; workerPixels: number; tris: number; workerTris: number; mainSpans: number; mainPixels: number; mainTris: number; mainExecMs?: number } | null {
     if (this.disposed || this.workers.length === 0 || this.quarantined) {
       this.rgbFailure = 'clean';
       return null;
     }
-    if (this.rgbDescCount <= this.rgbFlushedCount) return { pixels: 0, spans: 0, workerSpans: 0, workerPixels: 0, tris: 0, workerTris: 0 };
+    if (this.rgbDescCount <= this.rgbFlushedCount) return { pixels: 0, spans: 0, workerSpans: 0, workerPixels: 0, tris: 0, workerTris: 0, mainSpans: 0, mainPixels: 0, mainTris: 0 };
     if (!this.awaitReadySync()) {
       Com_Warn('bandPool: workers never became ready, replaying RGB inline');
       this.rgbFailure = 'clean';
@@ -1249,7 +1249,13 @@ export class BandWorkerPool implements BandDispatcher {
     this.harvestSyncExec(seq, 'rgb', this.rgbFlushedCount, this.rgbDescCount);
     this.rgbFlushedCount = this.rgbDescCount;
     this.rgbFailure = null;
-    return { ...tally, workerSpans: tally.spans - main.spans, workerPixels: tally.pixels - main.pixels, workerTris: tally.tris - main.tris };
+    // PERF-NEXT-5: worker* = worker bands only (pre-add tally), main* = the
+    // calling-thread band only; combined (pixels/spans/tris) = worker + main.
+    return {
+      ...tally,
+      workerSpans: tally.spans - main.spans, workerPixels: tally.pixels - main.pixels, workerTris: tally.tris - main.tris,
+      mainSpans: main.spans, mainPixels: main.pixels, mainTris: main.tris,
+    };
   }
 
   /**
@@ -1257,12 +1263,12 @@ export class BandWorkerPool implements BandDispatcher {
    * blocking (for threads that forbid Atomics.wait). Timeout quarantines
    * first (class 'partial'); pre-dispatch failures are class 'clean'.
    */
-  async flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; workerSpans: number; workerPixels: number; tris: number; workerTris: number; mainExecMs?: number } | null> {
+  async flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; workerSpans: number; workerPixels: number; tris: number; workerTris: number; mainSpans: number; mainPixels: number; mainTris: number; mainExecMs?: number } | null> {
     if (this.disposed || this.workers.length === 0 || this.quarantined) {
       this.rgbFailure = 'clean';
       return null;
     }
-    if (this.rgbDescCount <= this.rgbFlushedCount) return { pixels: 0, spans: 0, workerSpans: 0, workerPixels: 0, tris: 0, workerTris: 0 };
+    if (this.rgbDescCount <= this.rgbFlushedCount) return { pixels: 0, spans: 0, workerSpans: 0, workerPixels: 0, tris: 0, workerTris: 0, mainSpans: 0, mainPixels: 0, mainTris: 0 };
     if (!(await this.awaitReadyAsync())) {
       Com_Warn('bandPool: workers never became ready, replaying RGB inline');
       this.rgbFailure = 'clean';
@@ -1301,7 +1307,13 @@ export class BandWorkerPool implements BandDispatcher {
     if (this.timingEnabled) tally.mainExecMs = m1 - m0 >= 0 ? m1 - m0 : 0;
     this.rgbFlushedCount = this.rgbDescCount;
     this.rgbFailure = null;
-    return { ...tally, workerSpans: tally.spans - main.spans, workerPixels: tally.pixels - main.pixels, workerTris: tally.tris - main.tris };
+    // PERF-NEXT-5: worker* = worker bands only, main* = calling-thread band
+    // only; combined = worker + main (see the sync path above).
+    return {
+      ...tally,
+      workerSpans: tally.spans - main.spans, workerPixels: tally.pixels - main.pixels, workerTris: tally.tris - main.tris,
+      mainSpans: main.spans, mainPixels: main.pixels, mainTris: main.tris,
+    };
   }
 
   /**

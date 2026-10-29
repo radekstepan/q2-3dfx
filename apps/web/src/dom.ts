@@ -931,7 +931,7 @@ import {
 } from './play.js';
 import type { AsyncLoopState } from './play.js';
 import { browserPoolAvailable, defaultBrowserWorkers } from './render-workers.js';
-import type { BrowserBandPool } from './render-workers.js';
+import type { BrowserBandPool, BrowserForegroundDetail } from './render-workers.js';
 import { attachToCanvas } from '@q2/input/dom';
 import { readPakEntry, findPakSoundEntry } from './pak.js';
 import type { Mixer, MixedChannel } from '@q2/sound';
@@ -1111,6 +1111,33 @@ export interface Q2Stats {
   rgbStaged: number;
   rgbKicks: number;
   rgbInline: number;
+  /**
+   * Worker/main attribution for this frame's COMPLETED RGB kicks (world +
+   * foreground), in native units (PERF-NEXT-5, pool surface):
+   * - `rgbWorkerSpans`/`rgbWorkerPixels`/`rgbWorkerTris`: WORKER-band
+   *   completed work (actual execution, never staging).
+   * - `rgbMainSpans`/`rgbMainPixels`/`rgbMainTris`: the calling-thread
+   *   band's completed share of the same kicks (main-band/inline work,
+   *   never worker-completed).
+   * Combined kick totals reconcile as worker + main per unit. `tris` are
+   * per-band tri executions (viewmodel/alias tris straddling a band
+   * boundary fill disjoint rows in both bands and count once per band, so
+   * completed tris can slightly exceed staged tris). Failed/refused kicks
+   * contribute nothing here — their work is recounted by the renderer's
+   * inline/replay counters (`rgbInline`, `fgInlineRgb`,
+   * `fgDetail.replayed*`), never by the pool.
+   * -1 each when the pool probe is unavailable (unpooled boot, foreign
+   * pool without the accumulator, throwing probe): unavailable
+   * attribution is unknown — never worker-completed, never a silent
+   * zero. 0 with a live pool is the known idle state (no RGB kick
+   * completed this frame); `pooled`/`bands` disambiguate unpooled.
+   */
+  rgbWorkerSpans: number;
+  rgbWorkerPixels: number;
+  rgbWorkerTris: number;
+  rgbMainSpans: number;
+  rgbMainPixels: number;
+  rgbMainTris: number;
   bands: number;
   poolSpans: number;
   poolPixels: number;
@@ -1142,6 +1169,16 @@ export interface Q2Stats {
   fgWorker: number;
   fgInlineRgb: number;
   fgKicks: number;
+  /**
+   * Per-primitive-class foreground audit (renderer lane owns the hook and
+   * its units — see BrowserForegroundDetail): prepared/staged vs
+   * worker-completed vs calling-thread vs inline vs replayed work in
+   * native units (spans, draws, triangles, particles, pixels, kicks, ms —
+   * never mixed). Null when the renderer publishes no breakdown (older
+   * builds) or the probe throws: unknown, never worker-completed, never
+   * a silent zero. Present-hook zeros are known (nothing completed).
+   */
+  fgDetail: BrowserForegroundDetail | null;
   /**
    * Authoritative-skip observability (PERF-FINISH-A): classic world spans
    * elided where the RGB overlay drew + whether the skip armed this frame.
@@ -1199,8 +1236,11 @@ const NO_EXEC_TIMING: number[] = [];
 
 const Q2STATS_ZERO: Q2Stats = {
   fps: 0, frame: 0, pooled: false, rgbStaged: 0, rgbKicks: 0, rgbInline: 0,
+  rgbWorkerSpans: -1, rgbWorkerPixels: -1, rgbWorkerTris: -1,
+  rgbMainSpans: -1, rgbMainPixels: -1, rgbMainTris: -1,
   bands: 1, poolSpans: 0, poolPixels: 0, rgbPending: 0, stageBytes: -1,
   fgInline: -1, fgStaged: -1, fgWorker: -1, fgInlineRgb: -1, fgKicks: -1,
+  fgDetail: null,
   classicSkipped: 0, skipArmed: false,
   lastKickJob: 'none', rgbMainMs: -1, rgbExecMs: NO_EXEC_TIMING, rgbExecMaxMs: -1,
   rgbExecMedianMs: -1, rgbImbalanceMs: -1, rgbSlowestMs: -1,
@@ -1299,6 +1339,99 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
       rec.stageBytes = -1;
       rec.rgbFallbacks = 0;
       rec.quarantined = false;
+    }
+    // Per-frame worker/main attribution (PERF-NEXT-5, pool surface): the
+    // pool accumulates every COMPLETED RGB kick's worker vs calling-thread
+    // split since the last beginFrame (world + foreground kicks). Guarded
+    // probes only: an unpooled boot, a foreign pool without the
+    // accumulator, or a throwing probe degrades to the -1 unknown
+    // sentinels (never worker-completed, never a silent zero). A live
+    // pool reporting 0 is the known idle state (no completed kick).
+    try {
+      const pool = boot.browserPool as unknown as {
+        kickStats?: () => {
+          frameCompleted?: {
+            workerPixels?: unknown; workerSpans?: unknown; workerTris?: unknown;
+            mainPixels?: unknown; mainSpans?: unknown; mainTris?: unknown;
+          };
+        };
+      } | null;
+      const fc = pool && typeof pool.kickStats === 'function'
+        ? pool.kickStats().frameCompleted
+        : undefined;
+      if (fc !== undefined && fc !== null) {
+        rec.rgbWorkerSpans = numOr(fc.workerSpans, -1);
+        rec.rgbWorkerPixels = numOr(fc.workerPixels, -1);
+        rec.rgbWorkerTris = numOr(fc.workerTris, -1);
+        rec.rgbMainSpans = numOr(fc.mainSpans, -1);
+        rec.rgbMainPixels = numOr(fc.mainPixels, -1);
+        rec.rgbMainTris = numOr(fc.mainTris, -1);
+      } else {
+        rec.rgbWorkerSpans = -1;
+        rec.rgbWorkerPixels = -1;
+        rec.rgbWorkerTris = -1;
+        rec.rgbMainSpans = -1;
+        rec.rgbMainPixels = -1;
+        rec.rgbMainTris = -1;
+      }
+    } catch {
+      rec.rgbWorkerSpans = -1;
+      rec.rgbWorkerPixels = -1;
+      rec.rgbWorkerTris = -1;
+      rec.rgbMainSpans = -1;
+      rec.rgbMainPixels = -1;
+      rec.rgbMainTris = -1;
+    }
+    // Per-primitive-class foreground audit (PERF-NEXT-5, renderer surface):
+    // pass-through of the renderer's testForegroundStats hook (which owns
+    // the units: see BrowserForegroundDetail). Null when the hook is
+    // absent or throws (unknown, never worker-completed); present-hook
+    // zeros are known. Per-field -1 guards a partial future shape without
+    // breaking the present path.
+    try {
+      const fg = (boot.refresh as unknown as {
+        testForegroundStats?: () => Record<string, unknown>;
+      }).testForegroundStats;
+      if (typeof fg === 'function') {
+        const fs = fg.call(boot.refresh) as Record<string, unknown>;
+        rec.fgDetail = {
+          stagedBatches: numOr(fs.stagedBatches, -1),
+          inlineBatches: numOr(fs.inlineBatches, -1),
+          kicks: numOr(fs.kicks, -1),
+          alphaSpansStaged: numOr(fs.alphaSpansStaged, -1),
+          alphaSpansInline: numOr(fs.alphaSpansInline, -1),
+          spriteSpansStaged: numOr(fs.spriteSpansStaged, -1),
+          spriteSpansInline: numOr(fs.spriteSpansInline, -1),
+          spriteDrawsInline: numOr(fs.spriteDrawsInline, -1),
+          aliasDrawsStaged: numOr(fs.aliasDrawsStaged, -1),
+          aliasDrawsInline: numOr(fs.aliasDrawsInline, -1),
+          aliasTrisInline: numOr(fs.aliasTrisInline, -1),
+          particleDrawsInline: numOr(fs.particleDrawsInline, -1),
+          particlesInline: numOr(fs.particlesInline, -1),
+          particleSpansInline: numOr(fs.particleSpansInline, -1),
+          beamDrawsInline: numOr(fs.beamDrawsInline, -1),
+          beamSpansInline: numOr(fs.beamSpansInline, -1),
+          workerSpansCompleted: numOr(fs.workerSpansCompleted, -1),
+          workerPixelsCompleted: numOr(fs.workerPixelsCompleted, -1),
+          mainSpansCompleted: numOr(fs.mainSpansCompleted, -1),
+          mainPixelsCompleted: numOr(fs.mainPixelsCompleted, -1),
+          trisStaged: numOr(fs.trisStaged, -1),
+          trisCompleted: numOr(fs.trisCompleted, -1),
+          trisMainCompleted: numOr(fs.trisMainCompleted, -1),
+          trisReplayed: numOr(fs.trisReplayed, -1),
+          particleSpansStaged: numOr(fs.particleSpansStaged, -1),
+          beamSpansStaged: numOr(fs.beamSpansStaged, -1),
+          replayedSpans: numOr(fs.replayedSpans, -1),
+          replayedPixels: numOr(fs.replayedPixels, -1),
+          recoveryCount: numOr(fs.recoveryCount, -1),
+          entityMs: numOr(fs.entityMs, -1),
+          directInlineWrites: fs.directInlineWrites === true,
+        };
+      } else {
+        rec.fgDetail = null;
+      }
+    } catch {
+      rec.fgDetail = null;
     }
     // Instrumented-only worker timing (PERF-NEXT-4): per-band compute for
     // the last rgb kick, its max-vs-median imbalance, the calling-thread

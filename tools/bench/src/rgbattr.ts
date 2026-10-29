@@ -84,6 +84,7 @@ import {
   collectStageCounters,
   detailTimingEnabled,
   formatBandRanges,
+  formatForegroundAttribution,
   formatLatency,
   formatStageCounts,
   formatWorkerImbalance,
@@ -91,11 +92,14 @@ import {
   nsToMs,
   nowNs,
   readBandExecStats,
+  readForegroundAttribution,
   readForegroundStats,
   readMaterialGcMs,
+  reconcileForegroundAttribution,
   summarizeLatencies,
   summarizeSplits,
   summarizeWorkerImbalance,
+  type ForegroundAttribution as ForegroundTaxonomy,
   type FrameSplit,
   type KickSample,
   type WorkerExecSample,
@@ -613,10 +617,46 @@ export interface AttrRow {
   fgInline: number | null;
   fgAlphaSpans: number | null;
   fgSpriteSpans: number | null;
+  fgSpriteSpansInline: number | null;
   fgTrisStaged: number | null;
+  fgAliasDrawsStaged: number | null;
   fgAliasDrawsInline: number | null;
+  fgParticleSpans: number | null;
+  fgParticleSpansInline: number | null;
   fgParticlesInline: number | null;
+  fgBeamSpans: number | null;
+  fgBeamSpansInline: number | null;
   fgBeamsInline: number | null;
+  /**
+   * PERF-NEXT-5 corrected split: worker-band vs calling-thread-band shares
+   * of the completed foreground kick, separately from the combined totals
+   * (combined == worker + main). Units: spans/pixels/tris. Null = unknown.
+   */
+  fgWorkerSpans: number | null;
+  fgWorkerPixels: number | null;
+  fgWorkerTris: number | null;
+  fgMainSpans: number | null;
+  fgMainPixels: number | null;
+  fgMainTris: number | null;
+  fgCombinedSpans: number | null;
+  fgCombinedPixels: number | null;
+  fgCombinedTris: number | null;
+  /** Fallback replay (declined/timed-out/failed kicks). Units: spans/px/tris. */
+  fgReplayedSpans: number | null;
+  fgReplayedPixels: number | null;
+  fgReplayedTris: number | null;
+  fgRecoveryCount: number | null;
+  /** Per-class worker/main completion splits (null = untracked/unknown). */
+  fgAlphaWorkerSpans: number | null;
+  fgAlphaMainSpans: number | null;
+  fgSpriteWorkerSpans: number | null;
+  fgSpriteMainSpans: number | null;
+  fgAliasWorkerTris: number | null;
+  fgAliasMainTris: number | null;
+  fgParticleWorkerSpans: number | null;
+  fgParticleMainSpans: number | null;
+  fgBeamWorkerSpans: number | null;
+  fgBeamMainSpans: number | null;
   /** Wall time of the entity-foreground pass (alias incl. viewmodel). */
   fgEntityMs: number | null;
   /**
@@ -643,10 +683,54 @@ export interface ForegroundAttribution {
   fgInline: number | null;
   fgAlphaSpans: number | null;
   fgSpriteSpans: number | null;
+  fgSpriteSpansInline: number | null;
   fgTrisStaged: number | null;
+  fgAliasDrawsStaged: number | null;
   fgAliasDrawsInline: number | null;
+  fgParticleSpans: number | null;
+  fgParticleSpansInline: number | null;
   fgParticlesInline: number | null;
+  fgBeamSpans: number | null;
+  fgBeamSpansInline: number | null;
   fgBeamsInline: number | null;
+  /**
+   * PERF-NEXT-5 corrected attribution: worker-band vs calling-thread-band
+   * shares of the completed foreground kick, separately from the combined
+   * totals (Node semantics: combined == worker + main). Units: spans /
+   * pixels / screen tris. Null = the producer publishes no such split
+   * (unknown) — never a fake zero, never staged-as-completed. Absent split
+   * fields imply the calling-thread band ran inline (the producer
+   * attributes that work to main, never to worker).
+   */
+  fgWorkerSpans: number | null;
+  fgWorkerPixels: number | null;
+  fgWorkerTris: number | null;
+  fgMainSpans: number | null;
+  fgMainPixels: number | null;
+  fgMainTris: number | null;
+  fgCombinedSpans: number | null;
+  fgCombinedPixels: number | null;
+  fgCombinedTris: number | null;
+  /** Fallback replay (declined/timed-out/failed kicks). Units: spans/px/tris. */
+  fgReplayedSpans: number | null;
+  fgReplayedPixels: number | null;
+  fgReplayedTris: number | null;
+  fgRecoveryCount: number | null;
+  /**
+   * Per-class worker/main completion splits when the producer publishes
+   * them (units noted); null = untracked (unknown). Never inferred from
+   * the staged counters above.
+   */
+  fgAlphaWorkerSpans: number | null;
+  fgAlphaMainSpans: number | null;
+  fgSpriteWorkerSpans: number | null;
+  fgSpriteMainSpans: number | null;
+  fgAliasWorkerTris: number | null;
+  fgAliasMainTris: number | null;
+  fgParticleWorkerSpans: number | null;
+  fgParticleMainSpans: number | null;
+  fgBeamWorkerSpans: number | null;
+  fgBeamMainSpans: number | null;
   fgEntityMs: number | null;
   materialGcMs: number | null;
 }
@@ -656,8 +740,20 @@ export function collectForegroundAttribution(
 ): ForegroundAttribution {
   const none: ForegroundAttribution = {
     fgKicks: null, fgStaged: null, fgInline: null,
-    fgAlphaSpans: null, fgSpriteSpans: null, fgTrisStaged: null,
-    fgAliasDrawsInline: null, fgParticlesInline: null, fgBeamsInline: null,
+    fgAlphaSpans: null, fgSpriteSpans: null, fgSpriteSpansInline: null, fgTrisStaged: null,
+    fgAliasDrawsStaged: null, fgAliasDrawsInline: null, fgParticleSpans: null,
+    fgParticleSpansInline: null, fgParticlesInline: null,
+    fgBeamSpans: null, fgBeamSpansInline: null, fgBeamsInline: null,
+    fgWorkerSpans: null, fgWorkerPixels: null, fgWorkerTris: null,
+    fgMainSpans: null, fgMainPixels: null, fgMainTris: null,
+    fgCombinedSpans: null, fgCombinedPixels: null, fgCombinedTris: null,
+    fgReplayedSpans: null, fgReplayedPixels: null, fgReplayedTris: null,
+    fgRecoveryCount: null,
+    fgAlphaWorkerSpans: null, fgAlphaMainSpans: null,
+    fgSpriteWorkerSpans: null, fgSpriteMainSpans: null,
+    fgAliasWorkerTris: null, fgAliasMainTris: null,
+    fgParticleWorkerSpans: null, fgParticleMainSpans: null,
+    fgBeamWorkerSpans: null, fgBeamMainSpans: null,
     fgEntityMs: null, materialGcMs: null,
   };
   try {
@@ -673,14 +769,59 @@ export function collectForegroundAttribution(
     if (fg) {
       none.fgAlphaSpans = fg.alphaSpansStaged;
       none.fgSpriteSpans = fg.spriteSpansStaged;
+      none.fgSpriteSpansInline = fg.spriteSpansInline ?? null;
       none.fgTrisStaged = fg.trisStaged ?? null;
+      none.fgAliasDrawsStaged = fg.aliasDrawsStaged ?? null;
       none.fgAliasDrawsInline = fg.aliasDrawsInline;
       none.fgParticlesInline = fg.particlesInline;
+      none.fgParticleSpans = fg.particleSpansStaged ?? null;
+      none.fgParticleSpansInline = fg.particleSpansInline ?? null;
       none.fgBeamsInline = fg.beamDrawsInline;
+      none.fgBeamSpans = fg.beamSpansStaged ?? null;
+      none.fgBeamSpansInline = fg.beamSpansInline ?? null;
       none.fgEntityMs = fg.entityMs;
     }
   } catch {
     /* per-class breakdown stays null; batch legs above still report */
+  }
+  // Corrected worker/main/combined split (PERF-NEXT-5 taxonomy): read
+  // through the shared testkit projection — worker shares come only from
+  // actual-completion counters, per-class splits stay null while the
+  // producer publishes none, and combined must reconcile (warn, never
+  // launder, when it does not).
+  try {
+    const a: ForegroundTaxonomy | null = readForegroundAttribution(r);
+    if (a) {
+      none.fgWorkerSpans = a.kick.workerSpans;
+      none.fgWorkerPixels = a.kick.workerPixels;
+      none.fgWorkerTris = a.kick.workerTris;
+      none.fgMainSpans = a.kick.mainSpans;
+      none.fgMainPixels = a.kick.mainPixels;
+      none.fgMainTris = a.kick.mainTris;
+      none.fgCombinedSpans = a.kick.spans;
+      none.fgCombinedPixels = a.kick.pixels;
+      none.fgCombinedTris = a.kick.tris;
+      none.fgReplayedSpans = a.replayedSpans;
+      none.fgReplayedPixels = a.replayedPixels;
+      none.fgReplayedTris = a.replayedTris;
+      none.fgRecoveryCount = a.recoveryCount;
+      none.fgAlphaWorkerSpans = a.alphaSpansWorkerCompleted;
+      none.fgAlphaMainSpans = a.alphaSpansMainCompleted;
+      none.fgSpriteWorkerSpans = a.spriteSpansWorkerCompleted;
+      none.fgSpriteMainSpans = a.spriteSpansMainCompleted;
+      none.fgAliasWorkerTris = a.aliasTrisWorkerCompleted;
+      none.fgAliasMainTris = a.aliasTrisMainCompleted;
+      none.fgParticleWorkerSpans = a.particleSpansWorkerCompleted;
+      none.fgParticleMainSpans = a.particleSpansMainCompleted;
+      none.fgBeamWorkerSpans = a.beamSpansWorkerCompleted;
+      none.fgBeamMainSpans = a.beamSpansMainCompleted;
+      const bad = reconcileForegroundAttribution(a);
+      if (bad.length > 0) {
+        console.log(`WARN fg attribution does not reconcile: ${bad.join('; ')} [${formatForegroundAttribution(a)}]`);
+      }
+    }
+  } catch {
+    /* corrected split stays null; batch legs above still report */
   }
   if (detail === 'enabled') {
     const gcMs = readMaterialGcMs(r);
@@ -906,8 +1047,20 @@ export async function runAttrConfig(
   const detail: 'enabled' | 'disabled' = detailTimingEnabled() ? 'enabled' : 'disabled';
   let fgAttr: ForegroundAttribution = {
     fgKicks: null, fgStaged: null, fgInline: null,
-    fgAlphaSpans: null, fgSpriteSpans: null, fgTrisStaged: null,
-    fgAliasDrawsInline: null, fgParticlesInline: null, fgBeamsInline: null,
+    fgAlphaSpans: null, fgSpriteSpans: null, fgSpriteSpansInline: null, fgTrisStaged: null,
+    fgAliasDrawsStaged: null, fgAliasDrawsInline: null, fgParticleSpans: null,
+    fgParticleSpansInline: null, fgParticlesInline: null,
+    fgBeamSpans: null, fgBeamSpansInline: null, fgBeamsInline: null,
+    fgWorkerSpans: null, fgWorkerPixels: null, fgWorkerTris: null,
+    fgMainSpans: null, fgMainPixels: null, fgMainTris: null,
+    fgCombinedSpans: null, fgCombinedPixels: null, fgCombinedTris: null,
+    fgReplayedSpans: null, fgReplayedPixels: null, fgReplayedTris: null,
+    fgRecoveryCount: null,
+    fgAlphaWorkerSpans: null, fgAlphaMainSpans: null,
+    fgSpriteWorkerSpans: null, fgSpriteMainSpans: null,
+    fgAliasWorkerTris: null, fgAliasMainTris: null,
+    fgParticleWorkerSpans: null, fgParticleMainSpans: null,
+    fgBeamWorkerSpans: null, fgBeamMainSpans: null,
     fgEntityMs: null, materialGcMs: null,
   };
   let execAttr: WorkerExecAttribution = { workerComputeMs: null, workerImbalance: null, fenceIdleMs: null };
@@ -1204,8 +1357,25 @@ export async function runAttrConfig(
     fenceIdleMs: execAttr.fenceIdleMs,
     fgKicks: fgAttr.fgKicks, fgStaged: fgAttr.fgStaged, fgInline: fgAttr.fgInline,
     fgAlphaSpans: fgAttr.fgAlphaSpans, fgSpriteSpans: fgAttr.fgSpriteSpans,
-    fgTrisStaged: fgAttr.fgTrisStaged, fgAliasDrawsInline: fgAttr.fgAliasDrawsInline,
+    fgSpriteSpansInline: fgAttr.fgSpriteSpansInline,
+    fgTrisStaged: fgAttr.fgTrisStaged, fgAliasDrawsStaged: fgAttr.fgAliasDrawsStaged,
+    fgAliasDrawsInline: fgAttr.fgAliasDrawsInline,
     fgParticlesInline: fgAttr.fgParticlesInline, fgBeamsInline: fgAttr.fgBeamsInline,
+    fgParticleSpans: fgAttr.fgParticleSpans, fgParticleSpansInline: fgAttr.fgParticleSpansInline,
+    fgBeamSpans: fgAttr.fgBeamSpans, fgBeamSpansInline: fgAttr.fgBeamSpansInline,
+    fgWorkerSpans: fgAttr.fgWorkerSpans, fgWorkerPixels: fgAttr.fgWorkerPixels,
+    fgWorkerTris: fgAttr.fgWorkerTris,
+    fgMainSpans: fgAttr.fgMainSpans, fgMainPixels: fgAttr.fgMainPixels,
+    fgMainTris: fgAttr.fgMainTris,
+    fgCombinedSpans: fgAttr.fgCombinedSpans, fgCombinedPixels: fgAttr.fgCombinedPixels,
+    fgCombinedTris: fgAttr.fgCombinedTris,
+    fgReplayedSpans: fgAttr.fgReplayedSpans, fgReplayedPixels: fgAttr.fgReplayedPixels,
+    fgReplayedTris: fgAttr.fgReplayedTris, fgRecoveryCount: fgAttr.fgRecoveryCount,
+    fgAlphaWorkerSpans: fgAttr.fgAlphaWorkerSpans, fgAlphaMainSpans: fgAttr.fgAlphaMainSpans,
+    fgSpriteWorkerSpans: fgAttr.fgSpriteWorkerSpans, fgSpriteMainSpans: fgAttr.fgSpriteMainSpans,
+    fgAliasWorkerTris: fgAttr.fgAliasWorkerTris, fgAliasMainTris: fgAttr.fgAliasMainTris,
+    fgParticleWorkerSpans: fgAttr.fgParticleWorkerSpans, fgParticleMainSpans: fgAttr.fgParticleMainSpans,
+    fgBeamWorkerSpans: fgAttr.fgBeamWorkerSpans, fgBeamMainSpans: fgAttr.fgBeamMainSpans,
     fgEntityMs: fgAttr.fgEntityMs, materialGcMs: fgAttr.materialGcMs,
   };
   const rs = (v: number | null): string => v === null ? '—' : v.toFixed(2);
@@ -1238,8 +1408,15 @@ export async function runAttrConfig(
   const splitPart = ` split[begin=${rs(splitBeginMs)} render=${rs(splitRenderMs)} end=${rs(splitEndMs)} scanout=${rs(splitScanoutMs)} gap=${rs(splitGapMs)}]`;
   const fgPart = mode === 'rgb'
     ? ` fg[kicks=${fgAttr.fgKicks ?? '—'}(alpha+placed+entity flushes) staged=${fgAttr.fgStaged ?? '—'} inline=${fgAttr.fgInline ?? '—'} ` +
-      `alphaSpans=${fgAttr.fgAlphaSpans ?? '—'} spriteSpans=${fgAttr.fgSpriteSpans ?? '—'} tris=${fgAttr.fgTrisStaged ?? '—'} ` +
-      `aliasIn=${fgAttr.fgAliasDrawsInline ?? '—'} partIn=${fgAttr.fgParticlesInline ?? '—'} beamIn=${fgAttr.fgBeamsInline ?? '—'} ` +
+      `alphaSpans=${fgAttr.fgAlphaSpans ?? '—'} spriteSpans=${fgAttr.fgSpriteSpans ?? '—'}/${fgAttr.fgSpriteSpansInline ?? '—'}in ` +
+      `tris=${fgAttr.fgTrisStaged ?? '—'} aliasDraws=${fgAttr.fgAliasDrawsStaged ?? '—'}st/${fgAttr.fgAliasDrawsInline ?? '—'}in ` +
+      `partSpans=${fgAttr.fgParticleSpans ?? '—'}/${fgAttr.fgParticleSpansInline ?? '—'}in partIn=${fgAttr.fgParticlesInline ?? '—'}p ` +
+      `beamSpans=${fgAttr.fgBeamSpans ?? '—'}/${fgAttr.fgBeamSpansInline ?? '—'}in beamIn=${fgAttr.fgBeamsInline ?? '—'} ` +
+      `worker=${fgAttr.fgWorkerSpans ?? '—'}sp/${fgAttr.fgWorkerPixels ?? '—'}px/${fgAttr.fgWorkerTris ?? '—'}tr ` +
+      `main=${fgAttr.fgMainSpans ?? '—'}sp/${fgAttr.fgMainPixels ?? '—'}px/${fgAttr.fgMainTris ?? '—'}tr ` +
+      `combined=${fgAttr.fgCombinedSpans ?? '—'}sp/${fgAttr.fgCombinedPixels ?? '—'}px/${fgAttr.fgCombinedTris ?? '—'}tr ` +
+      `replayed=${fgAttr.fgReplayedSpans ?? '—'}sp/${fgAttr.fgReplayedPixels ?? '—'}px/${fgAttr.fgReplayedTris ?? '—'}tr ` +
+      `recovery=${fgAttr.fgRecoveryCount ?? '—'} ` +
       `entityMs=${rs(fgAttr.fgEntityMs)} matGcMs=${rs(fgAttr.materialGcMs)}]`
     : '';
   const detailPart = ` detail=${detail}`;

@@ -642,7 +642,7 @@ describe('retained-frame protocol: watermark + commit ownership', () => {
     // Empty suffix after manual watermark advance is a no-op success.
     (p as unknown as Record<string, unknown>)['rgbFlushedCount'] = 1;
     const r = p.flushRGBFrame(4, 32768, 0);
-    expect(r).toEqual({ pixels: 0, spans: 0, workerSpans: 0, workerPixels: 0, tris: 0, workerTris: 0 });
+    expect(r).toEqual({ pixels: 0, spans: 0, workerSpans: 0, workerPixels: 0, tris: 0, workerTris: 0, mainSpans: 0, mainPixels: 0, mainTris: 0 });
     expect(p.lastRGBFailure!()).toBeNull();
     p.commitRGB!();
     expect(p.rgbPending()).toBe(0);

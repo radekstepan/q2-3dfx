@@ -2337,10 +2337,26 @@ export interface BandDispatcher {
   ): boolean;
   /** Pending staged RGB batches. */
   rgbPending(): number;
-  /** Kick one RGB frame covering every staged batch (blocking). Null = replay inline. */
-  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number; mainExecMs?: number } | null;
+  /**
+   * Kick one RGB frame covering every staged batch (blocking). Null = replay inline.
+   *
+   * PERF-NEXT-5 attribution taxonomy (both lanes): `pixels`/`spans`/`tris`
+   * are the COMBINED kick totals (every band, worker + calling-thread);
+   * `workerSpans`/`workerPixels`/`workerTris` count the WORKER bands only;
+   * `mainSpans`/`mainPixels`/`mainTris` count the CALLING-THREAD band only
+   * (the last band, drained inline while the workers run). Combined ==
+   * worker + main exactly (spans/pixels; tris may exceed staged when one
+   * tri straddles a band boundary and fills disjoint rows in both bands —
+   * documented on the frame read path). Units are explicit per field
+   * (spans vs pixels vs tris — never mixed in one field). Absent
+   * `worker*`/`main*` fields (undefined) mean UNKNOWN (legacy shape without
+   * the split — never 0-implies-nothing-ran and never worker-completed);
+   * consumers map absent to the calling-thread band per the PERF-NEXT-5
+   * interim rule until the pool mirrors the split.
+   */
+  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number; mainSpans?: number; mainPixels?: number; mainTris?: number; mainExecMs?: number } | null;
   /** Same as flushRGBFrame but message-driven (browser async completion). */
-  flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; scanned?: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number; mainExecMs?: number } | null>;
+  flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; scanned?: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number; mainSpans?: number; mainPixels?: number; mainTris?: number; mainExecMs?: number } | null>;
   /**
    * Worker-local execution samples for the most recent kick (latency (a)
    * per worker band; see `BandExecSample`). Newest kick only: returns null

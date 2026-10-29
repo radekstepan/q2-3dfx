@@ -11,6 +11,7 @@ export * from './perf-budget.js';
 export * from './critpath.js';
 export * from './worker-timing.js';
 export * from './renderer-hooks.js';
+export * from './fg-attribution.js';
 export * from './bench-workloads.js';
 export * from './frame-evidence.js';
 export * from './provenance.js';

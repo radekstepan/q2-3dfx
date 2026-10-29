@@ -339,13 +339,31 @@ residuals: (1) parallel-turbo load flakes in timing-sensitive tests (fg-recovery
 ### PERF-NEXT-5 — Correct browser worker/main-thread attribution
 owns: `packages/sw-renderer`, `apps/web`, `packages/testkit`, `tools/bench`
 depends: PERF-NEXT-4
-status: ready
-starting-points: `render-workers.ts: flushRGBFrameAsync/tally`; `frame.ts: noteForegroundCompleted`; browser stats
+status: done(@integrator 2026-10-29)
 done-when:
-- [ ] Browser results return workerSpans/workerPixels/workerTris separately from combined totals, matching Node semantics; do not let absent fields imply that the calling-thread band ran on workers.
-- [ ] Audit every primitive class (alias/viewmodel, alpha spans, sprites, particles, beams): prepared/staged, actually completed, main-band, inline and replayed work have explicit units. Mark unavailable attribution unknown, not worker-completed.
-- [ ] Test a nonempty main band and worker bands with actual execution, staged-but-failed jobs, serial viewmodel and fallback. Combined totals reconcile; failure/replay is not reported as successful worker execution.
-- [ ] Update browser stats, bench output and docs consistently. Real-browser viewmodel execution is demonstrated with corrected counters, not inferred from staged alpha batches or fake worker messages.
+- [x] Browser results return workerSpans/workerPixels/workerTris separately from combined totals, matching Node semantics; absent fields imply the calling-thread band ran inline (never report it as worker-completed).
+- [x] Audit every primitive class (alias/viewmodel, alpha spans, sprites, particles, beams): prepared/staged, actually completed, main-band, inline and replayed work have explicit units. Unavailable attribution is unknown, not worker-completed.
+- [x] Test a nonempty main band and worker bands with actual execution, staged-but-failed jobs, serial viewmodel and fallback. Combined totals reconcile; failure/replay is not reported as successful worker execution.
+- [x] Update browser stats, bench output and docs consistently. Real-browser viewmodel execution is demonstrated with corrected counters, not inferred from staged alpha batches or fake worker messages.
+completion (four outcomes):
+- implementation: sw-renderer pool main*/worker* split + UNKNOWN→main mapping + particle/per-class inline fixes + new counters; browser pool tally split + Q2Stats/StageReport + fgDetail; testkit fg-attribution taxonomy/reader/reconcile/format; bench worker/main/combined rows + reconcile warnings + diff void-on-misattribute.
+- correctness: `yarn verify` 76/76; new tests sw-renderer 7/7 + web 5/5 + testkit 12/12 + bench 7/7 (real threads/entries, no synthetics); base1-gate 23/23 + voodoo-regression 4/4; Q2_PAK viewmodel proof (worker gun tris, cross-lane reconcile); pooled≡serial hashes unchanged; budgets NOT relaxed.
+- performance measurement: counters ride along (no raster change); disabled-accept A 22.61 / B 129.54 / C ~50.5 (FAIL by design, noise band vs baselines 20.48/123.59/50.35).
+- target acceptance: N/A (attribution card; targets gated by PERF-NEXT-6/7).
+evidence: `tools/bench/evidence/node-accept-13eeb85-2026-10-29T01-26-58.manifest.json` (+ ledger PERF-NEXT-5 row). Changesets: `.changeset/sw-renderer-fg-attribution.md` + `.changeset/testkit-fg-attribution.md` (bench/web ignored).
+residuals: see PERF-NEXT-9 (recovery double-replay divergence) + parallel-turbo load-flake pattern (known).
+
+### PERF-NEXT-9 — Fix frame-level recovery double-replay divergence
+owns: `packages/sw-renderer`
+depends: PERF-NEXT-5
+status: ready
+starting-points: `frame.ts: recoverRetainedRGB/recoverInlineRGBAll callers`; Lane C probe `/tmp/opencode/probe-fgc.mjs` (frame-level, timeoutMs:1 storm, devroom 640×480)
+done-when:
+- [ ] Commit a deterministic fail-before reproduction (no /tmp-only scripts): timeout-storm frame-level recovery yields full-RGBA-identical output to serial across N frames, or fails for the documented reason. Intermittent-only proof does not close this card.
+- [ ] Root-cause the double recovery (signature: `recoveryCount>=2`, `fgkicks==0`, pixels `65cf87ee`/`3c53a7c5` vs serial `f674729a`): two recovery replays overlap or a second replay runs over already-replayed planes (blends/seed applied twice?). Fix, don't mask: exactly-once alpha/additive must hold on every recovery path, including back-to-back timeouts.
+- [ ] Prove the fix under the storm loop (≥30 frames, zero divergence) AND the normal suites (`yarn verify`, base1-gate, voodoo-regression, all recovery/adversarial tests). Counter truthfulness must survive the fix (reconcile clean on every path).
+- [ ] Evaluate Lane A's pool-level translucent-combo report (unreproduced in 2 integrator probes — likely same root at frame level): either reproduce + fix or document why it cannot occur, with a test pinning the conclusion.
+- [ ] Publish before/after storm-loop results + a ledger row. `main` stays green throughout (feature-flag in `@q2/config` if the fix can't land cleanly at once).
 
 ### PERF-NEXT-6 — Optimize measured barriers and remaining frame cost
 owns: `packages/sw-renderer`, `packages/voodoo`, `apps/web`, `tools/bench`, `packages/testkit`

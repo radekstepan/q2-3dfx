@@ -382,9 +382,21 @@ describe('real entry execution timing (world + foreground-style flushes)', () =>
         expect(w).not.toBeNull();
         expect(w!.pixels).toBeGreaterThan(0);
         expect(w!.spans).toBeGreaterThan(0);
+        // Worker/main attribution (PERF-NEXT-5): worker bands rasterised
+        // the kick (span batches carry no tris), the calling-thread band
+        // drained rows 32..48 inline (16 x 64 px). Combined totals
+        // reconcile as worker + main per unit.
+        expect(w!.workerPixels).toBeGreaterThan(0);
+        expect(w!.workerSpans).toBe(32);
+        expect(w!.workerTris).toBe(0);
+        expect(w!.pixels).toBe(w!.workerPixels + 16 * REC_W);
+        expect(w!.spans).toBe(w!.workerSpans + 16);
+        expect(w!.tris).toBe(0);
         expect(pool!.kickStats().lastRgb).toEqual({
           descs: 1, workerCompleted: true,
           mainPixels: 16 * REC_W, mainSpans: 16,
+          workerPixels: w!.workerPixels, workerSpans: w!.workerSpans,
+          workerTris: 0, mainTris: 0,
         });
 
         // Raw completion messages from the REAL entry: finite measured

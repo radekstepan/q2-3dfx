@@ -131,6 +131,124 @@ import type { CritJobKind, WorkerExecSample } from '@q2/testkit';
 import { readVoodooState } from '@q2/voodoo';
 import type { VoodooState } from '@q2/voodoo';
 
+/**
+ * RGB flush outcome with Node-matching worker/main attribution
+ * (PERF-NEXT-5): `pixels`/`spans`/`tris` are the COMBINED kick totals
+ * (every band that drew, including the calling thread),
+ * `workerPixels`/`workerSpans`/`workerTris` cover the WORKER bands only,
+ * and `mainPixels`/`mainSpans`/`mainTris` cover the CALLING-THREAD band
+ * only (the last band, drained inline while the workers run — main-band/
+ * inline work, never worker-completed). Combined == worker + main exactly
+ * (spans/pixels; tris may exceed staged when one tri straddles a band
+ * boundary and fills disjoint rows in both bands). Inline fallbacks
+ * (`drawInlineRGBAll`, `recoverInlineRGBAll`) and the indexed
+ * `flushFrameAsync` carry no worker/main fields at all: absent fields mean
+ * the work ran on the calling thread (inline), never on workers.
+ *
+ * Units: `pixels`/`workerPixels`/`mainPixels` are output pixels written;
+ * `spans`/`workerSpans`/`mainSpans` are span entries drawn (span batches
+ * only — tri batches contribute pixels but no spans); `tris`/`workerTris`/
+ * `mainTris` are per-band tri executions. `scanned` is span entries
+ * actually inspected (workers skip non-owned ordered subranges; see
+ * kickStats().scannedAvailable — 0 when the build omits the
+ * counters, never execution proof).
+ */
+export interface BrowserRGBFlush {
+  pixels: number;
+  spans: number;
+  scanned: number;
+  tris: number;
+  workerPixels: number;
+  workerSpans: number;
+  workerTris: number;
+  mainPixels: number;
+  mainSpans: number;
+  mainTris: number;
+}
+
+/**
+ * Per-primitive-class foreground audit (PERF-NEXT-5, browser-lane view).
+ * Mirrors the renderer's `testForegroundStats()` hook field-for-field
+ * (the renderer lane owns the hook and its units — this type is the
+ * shell's pass-through contract, kept in sync by the fgDetail tests):
+ * prepared/staged vs worker-completed vs calling-thread vs inline vs
+ * replayed work in NATIVE units (spans, draws, triangles, particles,
+ * pixels, kicks, ms — never mixed).
+ *
+ * Units (renderer-defined):
+ * - `*Batches`: descriptor batches (world+FG staging/inline/kicks).
+ * - `alphaSpansStaged`/`alphaSpansInline`: deferred TRANS span entries
+ *   staged for workers vs drawn inline (span counts).
+ * - `spriteSpansStaged`: world/entity sprite spans staged for workers
+ *   (spans); `spriteSpansInline`: sprite spans drawn inline on the pooled
+ *   staging-refusal path (spans); `spriteDrawsInline`: sprite draw calls
+ *   run inline (draws — never compared across units).
+ * - `aliasDrawsStaged`: alias instances (incl. the depthHack viewmodel gun,
+ *   which rides the exact alias path with depthScale = DEPTHHACK_SCALE)
+ *   successfully staged; `aliasDrawsInline`: alias instances drawn inline
+ *   (incl. the serial viewmodel) — draws; `aliasTrisInline`: pre-clip mesh
+ *   tris per inline instance (different unit from staged screen tris —
+ *   documented, never summed).
+ * - `particleDrawsInline`/`particlesInline`: particle batches actually
+ *   executed inline (draws) and the particles they drew (particles —
+ *   staged batches are never double-counted here);
+ *   `particleSpansStaged`/`particleSpansInline`: particle span entries
+ *   staged vs drawn inline (spans).
+ * - `beamDrawsInline`: tracer-beam draw calls run inline (draws);
+ *   `beamSpansStaged`/`beamSpansInline`: beam span entries staged vs
+ *   drawn inline (spans).
+ * - `workerSpansCompleted`/`workerPixelsCompleted`: pool-completed
+ *   suffix-kick span/pixel work (actual worker-band completion, never
+ *   staging).
+ * - `mainSpansCompleted`/`mainPixelsCompleted`: the calling-thread band
+ *   share of the same completed kicks (main-band/inline, never worker).
+ * - `trisStaged`: screen tris offered to the kick (alias incl. viewmodel).
+ * - `trisCompleted`/`trisMainCompleted`: completed tri executions split
+ *   into worker bands vs the calling-thread band (per-band executions:
+ *   boundary straddle can slightly exceed staged).
+ * - `trisReplayed`/`replayedSpans`/`replayedPixels`: complete-frame
+ *   recovery replays (staging refusals + kick failures), never worker
+ *   completions. `recoveryCount` counts the replays.
+ * - `particleSpansStaged`/`beamSpansStaged`: particle/beam span entries
+ *   staged for workers.
+ * - `entityMs`: the expensive entity-foreground pass (ms, main thread).
+ * - `directInlineWrites`: un-retained inline writes happened (blend
+ *   staging refuses after that point).
+ */
+export interface BrowserForegroundDetail {
+  stagedBatches: number;
+  inlineBatches: number;
+  kicks: number;
+  alphaSpansStaged: number;
+  alphaSpansInline: number;
+  spriteSpansStaged: number;
+  spriteSpansInline: number;
+  spriteDrawsInline: number;
+  aliasDrawsStaged: number;
+  aliasDrawsInline: number;
+  aliasTrisInline: number;
+  particleDrawsInline: number;
+  particlesInline: number;
+  particleSpansInline: number;
+  beamDrawsInline: number;
+  beamSpansInline: number;
+  workerSpansCompleted: number;
+  workerPixelsCompleted: number;
+  mainSpansCompleted: number;
+  mainPixelsCompleted: number;
+  trisStaged: number;
+  trisCompleted: number;
+  trisMainCompleted: number;
+  trisReplayed: number;
+  particleSpansStaged: number;
+  beamSpansStaged: number;
+  replayedSpans: number;
+  replayedPixels: number;
+  recoveryCount: number;
+  entityMs: number;
+  directInlineWrites: boolean;
+}
+
 /** Per-batch wait budget in ms (mirrors the Node pool default). */
 export const BROWSER_POOL_TIMEOUT_MS = 30000;
 
@@ -461,11 +579,18 @@ export class BrowserBandPool implements BandDispatcher {
   /** Most recent RGB kick outcome (null until the first RGB kick starts).
    *  `descs` = staged batches the kick covered; `workerCompleted` = every
    *  worker acked its band (true only then — staging is never counted as
-   *  execution); `mainPixels`/`mainSpans` = the calling thread's own band
-   *  contribution to the same kick. Lets the shell attribute execution
-   *  without mistaking staging for proof. */
+   *  execution); `workerPixels`/`workerSpans`/`workerTris` = the WORKER
+   *  bands' completed share of this kick (0 unless workerCompleted —
+   *  staged-but-failed work is never reported as worker-completed); the
+   *  calling-thread band share is the kick totals minus the worker share
+   *  (`mainPixels`/`mainSpans`/`mainTris` below). On a partial failure the
+   *  main-band share is the partial execution observed before the fence
+   *  (undone by the checkpoint restore — the inline replay recounts it,
+   *  never the pool). Lets the shell attribute execution without
+   *  mistaking staging for proof. */
   private lastRgbKick: {
     descs: number; workerCompleted: boolean; mainPixels: number; mainSpans: number;
+    workerPixels: number; workerSpans: number; workerTris: number; mainTris: number;
   } | null = null;
   /**
    * Span entries actually inspected by successful pool kicks (Goal B):
@@ -480,6 +605,18 @@ export class BrowserBandPool implements BandDispatcher {
   private scannedObserved = false;
   /** Cached CTL_SCAN slot offset, -1 when the build predates it. */
   private scanOff: number | null = null;
+  /**
+   * Per-frame completed RGB work (world + foreground kicks) since the last
+   * beginFrame, split into the worker bands' share and the calling-thread
+   * band share (PERF-NEXT-5 attribution). Only COMPLETED kicks accumulate
+   * (workerCompleted) — failed/refused kicks contribute nothing here; their
+   * work is recounted by the renderer's inline/replay counters, never by
+   * the pool. Units match BrowserRGBFlush (pixels/spans/tris; tris are
+   * per-band executions and can slightly exceed staged on boundary
+   * straddle). Read via kickStats().frameCompleted.
+   */
+  private frameWorker = { pixels: 0, spans: 0, tris: 0 };
+  private frameMain = { pixels: 0, spans: 0, tris: 0 };
   /**
    * Stale-write guard (worker-failure acceptance): a timed-out kick means
    * workers whose shared-plane writes may still be in flight. The timeout
@@ -766,8 +903,16 @@ export class BrowserBandPool implements BandDispatcher {
     this.discardSnapshot();
     // Per-frame execution samples reset here (testBandExecStats covers one
     // frame: world flush first, then foreground flushes). Length-guarded so
-    // the disarmed production path allocates nothing.
+    // the disarmed production path allocates nothing. The per-frame
+    // completed-work split (frameWorker/frameMain) resets here too — the
+    // frame's story is the completed kicks since this point.
     if (this.frameExecSamples.length > 0) this.frameExecSamples = [];
+    this.frameWorker.pixels = 0;
+    this.frameWorker.spans = 0;
+    this.frameWorker.tris = 0;
+    this.frameMain.pixels = 0;
+    this.frameMain.spans = 0;
+    this.frameMain.tris = 0;
     try {
       Atomics.store(this.ctl, CTL_FRAME, this.frameGen);
     } catch {
@@ -1504,9 +1649,17 @@ export class BrowserBandPool implements BandDispatcher {
    * regions exhausted — pending preserved for the inline replay).
    * `lastRgb` is the most recent RGB kick outcome (null until the first
    * RGB kick): staged-batch count + whether every worker completed the
-   * kick + the calling thread's own band contribution. Staging is never
+   * kick + the worker bands' completed share (`workerPixels`/`workerSpans`/
+   * `workerTris`, 0 unless workerCompleted) + the calling thread's own
+   * band contribution (`mainPixels`/`mainSpans`/`mainTris`). Staging is never
    * reported as execution — only `workerCompleted: true` proves workers
-   * rasterised the kick.
+   * rasterised the kick, and only the worker fields count worker work.
+   *
+   * `frameCompleted` accumulates every COMPLETED RGB kick's split since the
+   * last beginFrame (world + foreground kicks): worker-band totals and
+   * calling-thread-band totals in pixels/spans/tris. Failed/refused kicks
+   * contribute nothing (their work lives in the renderer's inline/replay
+   * counters). Combined kick totals reconcile as worker + main per unit.
    *
    * `epoch` is the fence epoch (see recoveryEpoch): 0 until the first
    * quarantine isolation moves the pool onto a replacement SAB.
@@ -1522,7 +1675,14 @@ export class BrowserBandPool implements BandDispatcher {
     scannedAvailable: boolean;
     quarantined: boolean;
     refusals: { rgb: number };
-    lastRgb: { descs: number; workerCompleted: boolean; mainPixels: number; mainSpans: number } | null;
+    lastRgb: {
+      descs: number; workerCompleted: boolean; mainPixels: number; mainSpans: number;
+      workerPixels: number; workerSpans: number; workerTris: number; mainTris: number;
+    } | null;
+    frameCompleted: {
+      workerPixels: number; workerSpans: number; workerTris: number;
+      mainPixels: number; mainSpans: number; mainTris: number;
+    };
     epoch: number;
     exits: number;
   } {
@@ -1534,6 +1694,14 @@ export class BrowserBandPool implements BandDispatcher {
       quarantined: this.quarantined,
       refusals: { rgb: this.statRgbRefusals },
       lastRgb: this.lastRgbKick === null ? null : { ...this.lastRgbKick },
+      frameCompleted: {
+        workerPixels: this.frameWorker.pixels,
+        workerSpans: this.frameWorker.spans,
+        workerTris: this.frameWorker.tris,
+        mainPixels: this.frameMain.pixels,
+        mainSpans: this.frameMain.spans,
+        mainTris: this.frameMain.tris,
+      },
       epoch: this.recoveryEpoch(),
       exits: this.exitAcks,
     };
@@ -1615,10 +1783,24 @@ export class BrowserBandPool implements BandDispatcher {
    *     in-flight kicks as failures WITHOUT quarantining (teardown, not
    *     wedged workers) ('partial': writes may have landed).
    */
-  async flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number } | null> {
+  async flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<BrowserRGBFlush | null> {
     if (this.disposed || this.workers.length === 0 || this.quarantined) { this.rgbFailure = 'clean'; return null; }
-    if (this.rgbDescCount <= this.rgbFlushedCount) return { pixels: 0, spans: 0 };
-    if (!(await this.awaitReadyAsync())) { this.rgbFailure = 'clean'; this.noteRefused('rgb'); return null; }
+    if (this.rgbDescCount <= this.rgbFlushedCount) {
+      return {
+        pixels: 0, spans: 0, scanned: 0, tris: 0,
+        workerPixels: 0, workerSpans: 0, workerTris: 0,
+        mainPixels: 0, mainSpans: 0, mainTris: 0,
+      };
+    }
+    if (!(await this.awaitReadyAsync())) {
+      this.rgbFailure = 'clean';
+      this.lastRgbKick = {
+        descs: this.rgbDescCount, workerCompleted: false,
+        mainPixels: 0, mainSpans: 0, workerPixels: 0, workerSpans: 0, workerTris: 0, mainTris: 0,
+      };
+      this.noteRefused('rgb');
+      return null;
+    }
     this.snapKick();
     // Checkpoint BEFORE any write of this kick: on a partial failure the
     // restore undoes this kick's writes while keeping committed earlier
@@ -1630,7 +1812,10 @@ export class BrowserBandPool implements BandDispatcher {
     const descs = this.rgbDescCount;
     if (!this.rgbSnapValid || !this.rgbSnap || this.rgbSnap.gen !== this.frameGen) {
       this.discardSnapshot();
-      this.lastRgbKick = { descs, workerCompleted: false, mainPixels: 0, mainSpans: 0 };
+      this.lastRgbKick = {
+        descs, workerCompleted: false,
+        mainPixels: 0, mainSpans: 0, workerPixels: 0, workerSpans: 0, workerTris: 0, mainTris: 0,
+      };
       this.rgbFailure = 'clean';
       this.noteRefused('rgb');
       return null;
@@ -1642,7 +1827,10 @@ export class BrowserBandPool implements BandDispatcher {
       this.pending.delete(seq);
       this.statFallbacks.rgb += 1;
       this.discardSnapshot();
-      this.lastRgbKick = { descs, workerCompleted: false, mainPixels: 0, mainSpans: 0 };
+      this.lastRgbKick = {
+        descs, workerCompleted: false,
+        mainPixels: 0, mainSpans: 0, workerPixels: 0, workerSpans: 0, workerTris: 0, mainTris: 0,
+      };
       this.rgbFailure = 'clean';
       this.noteRefused('rgb');
       return null;
@@ -1671,26 +1859,54 @@ export class BrowserBandPool implements BandDispatcher {
         await this.quarantineWorkersAsync();
       }
       this.restoreSnapshot();
-      this.lastRgbKick = { descs, workerCompleted: false, mainPixels: main.pixels, mainSpans: main.spans };
+      this.lastRgbKick = {
+        descs, workerCompleted: false,
+        mainPixels: main.pixels, mainSpans: main.spans,
+        workerPixels: 0, workerSpans: 0, workerTris: 0,
+        mainTris: mainTrisOf(main),
+      };
       this.rgbFailure = 'partial';
       return null;
     }
     this.statKicks.rgb += 1;
+    // Worker/main attribution (PERF-NEXT-5, Node-matching): tally() sums
+    // the WORKER bands' CTL slots only, so the worker share is frozen
+    // BEFORE the calling-thread band's drain merges into the combined
+    // totals. The main-band drain must never read as worker-completed.
     const tally = this.tally();
-    tally.pixels += main.pixels;
-    tally.spans += main.spans;
     const mScan = scannedOf(main);
     if (mScan.present || this.ctlScanOff() >= 0) this.scannedObserved = true;
+    const workerPixels = tally.pixels;
+    const workerSpans = tally.spans;
+    const workerTris = tally.tris;
+    const mainTris = mainTrisOf(main);
+    tally.pixels += main.pixels;
+    tally.spans += main.spans;
     tally.scanned += mScan.value;
-    const mTris = (main as unknown as { tris?: unknown }).tris;
-    const mainTris = typeof mTris === 'number' && Number.isFinite(mTris) ? mTris : 0;
     tally.tris += mainTris;
     this.statScanned.rgb += tally.scanned;
-    this.lastRgbKick = { descs, workerCompleted: true, mainPixels: main.pixels, mainSpans: main.spans };
+    this.lastRgbKick = {
+      descs, workerCompleted: true,
+      mainPixels: main.pixels, mainSpans: main.spans,
+      workerPixels, workerSpans, workerTris, mainTris,
+    };
+    // Per-frame completed-work split (world + foreground kicks): only
+    // completed kicks accumulate — failures replay inline and are
+    // recounted by the renderer's inline/replay counters, never here.
+    this.frameWorker.pixels += workerPixels;
+    this.frameWorker.spans += workerSpans;
+    this.frameWorker.tris += workerTris;
+    this.frameMain.pixels += main.pixels;
+    this.frameMain.spans += main.spans;
+    this.frameMain.tris += mainTris;
     this.discardSnapshot();
     this.rgbFlushedCount = this.rgbDescCount;
     this.rgbFailure = null;
-    return tally;
+    return {
+      pixels: tally.pixels, spans: tally.spans, scanned: tally.scanned, tris: tally.tris,
+      workerPixels, workerSpans, workerTris,
+      mainPixels: main.pixels, mainSpans: main.spans, mainTris,
+    };
   }
 
   /**
@@ -1701,6 +1917,10 @@ export class BrowserBandPool implements BandDispatcher {
     * descriptors on top converges depth-guarded to the identical planes.
    * (The old unconditional clear destroyed world coverage on foreground
    * recovery and double-blended partial alpha writes.)
+   *
+   * Attribution: the returned totals carry NO worker fields (see
+   * BrowserRGBFlush) — absent worker fields mean this work ran on the
+   * calling thread (inline), never on workers.
    */
   drawInlineRGBAll(near: number, far: number, lodBias: number): { pixels: number; spans: number } {
     this.publishRGB(near, far, lodBias);
@@ -2359,6 +2579,12 @@ export class BrowserBandPool implements BandDispatcher {
    * termination) and the renderer re-adopts the pool's current planes
    * before this runs, so the replay targets the live buffer, never the
    * abandoned one a live worker may still be scribbling.
+   *
+   * Attribution: the returned totals carry NO worker fields (see
+   * BrowserRGBFlush) — absent worker fields mean this work ran on the
+   * calling thread (replayed inline after the fence), never on workers.
+   * The caller (renderer recovery) recounts it in its inline/replay
+   * counters; the pool's per-frame completed-work split ignores it.
    */
   recoverInlineRGBAll(seed: () => void, near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; tris: number } {
     const flushed = this.rgbFlushedCount < 0 ? 0
@@ -2470,6 +2696,10 @@ export class BrowserBandPool implements BandDispatcher {
   private tally(): { pixels: number; spans: number; scanned: number; tris: number } {
     // CTL_PIXELS + i / CTL_SPANS + i per-worker tallies (see bands.ts layout).
     // CTL_SCAN + i per-worker inspected-span counts + CTL_TRIS + i tri counts.
+    // WORKER BANDS ONLY: the loop sums this pool's worker slots (never the
+    // calling-thread band). Callers freeze this worker share BEFORE merging
+    // the main-band drain into the combined totals (see flushRGBFrameAsync),
+    // so the main band can never read as worker-completed.
     let pixels = 0;
     let spans = 0;
     let scanned = 0;
@@ -2511,6 +2741,18 @@ export class BrowserBandPool implements BandDispatcher {
     }
     return this.scanOff;
   }
+}
+
+/**
+ * Feature-detected `tris` on a compute return: post-rebuild
+ * processRGBFrameJob returns per-band tri executions (span batches
+ * contribute pixels/spans but no tris); older shapes return `{ pixels,
+ * spans }` only. Never throws. Absent tris read 0 (no tri work staged),
+ * never a guess.
+ */
+function mainTrisOf(r: { pixels: number; spans: number }): number {
+  const t = (r as unknown as { tris?: unknown }).tris;
+  return typeof t === 'number' && Number.isFinite(t) && t >= 0 ? t : 0;
 }
 
 /**

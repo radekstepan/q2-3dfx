@@ -34,13 +34,48 @@ export interface ForegroundStats {
   entityMs: number;
   /** Optional newer producer fields (PERF-NEXT-4/5 taxonomy): present only
    *  when the renderer publishes them — never required, never defaulted to
-   *  a fake zero by the reader (undefined = unpublished). */
+   *  a fake zero by the reader (undefined = unpublished). PERF-NEXT-5 adds
+   *  the kick-level worker/main tri split plus per-class worker/main
+   *  completion splits; while a split is unpublished the attribution reader
+   *  reports it as unknown (null), never inferred from staged batches. */
   trisStaged?: number;
   trisCompleted?: number;
   trisMainCompleted?: number;
   trisReplayed?: number;
   particleSpansStaged?: number;
   beamSpansStaged?: number;
+  /** Kick-level worker/main tri split (PERF-NEXT-5 corrected taxonomy). */
+  workerTrisCompleted?: number;
+  mainTrisCompleted?: number;
+  /**
+   * PERF-NEXT-5 per-class staged/inline pairs (renderer lane publishes
+   * these; absent on older builds = unknown, never zeroed by the reader):
+   * - `aliasDrawsStaged`: alias instances (incl. the depthHack viewmodel
+   *   gun) successfully staged for the kick. Unit: draws/instances.
+   * - `spriteSpansInline` / `particleSpansInline` / `beamSpansInline`:
+   *   spans drawn inline for the class on the pooled staging-refusal path.
+   *   Unit: spans (matches the staged spans, never mixed with draws).
+   * Per-class worker/main completion splits are NOT published by
+   * construction (one kick mixes alpha + sprite + particle + beam spans
+   * and alias tris; the pool reports only the global split) — per-class
+   * attribution stops at staged/inline, and completion reads unknown.
+   */
+  spriteSpansInline?: number;
+  aliasDrawsStaged?: number;
+  particleSpansInline?: number;
+  beamSpansInline?: number;
+  /** Per-class worker/main completion splits (accepted when published;
+   * the current producer publishes none — see above). */
+  alphaSpansWorkerCompleted?: number;
+  alphaSpansMainCompleted?: number;
+  spriteSpansWorkerCompleted?: number;
+  spriteSpansMainCompleted?: number;
+  aliasTrisWorkerCompleted?: number;
+  aliasTrisMainCompleted?: number;
+  particleSpansWorkerCompleted?: number;
+  particleSpansMainCompleted?: number;
+  beamSpansWorkerCompleted?: number;
+  beamSpansMainCompleted?: number;
   directInlineWrites?: boolean;
 }
 
@@ -81,9 +116,26 @@ export function readForegroundStats(r: object): ForegroundStats | null {
   // Optional newer producer fields: accept when valid, leave undefined
   // when unpublished. A present-but-malformed optional rejects (never
   // laundered into a zero that would read as "no work").
-  const FG_OPT_NUM: Array<'trisStaged' | 'trisCompleted' | 'trisMainCompleted' | 'trisReplayed' | 'particleSpansStaged' | 'beamSpansStaged'> = [
+  const FG_OPT_NUM: Array<'trisStaged' | 'trisCompleted' | 'trisMainCompleted' | 'trisReplayed' |
+    'particleSpansStaged' | 'beamSpansStaged' |
+    'workerTrisCompleted' | 'mainTrisCompleted' |
+    'spriteSpansInline' | 'aliasDrawsStaged' |
+    'particleSpansInline' | 'beamSpansInline' |
+    'alphaSpansWorkerCompleted' | 'alphaSpansMainCompleted' |
+    'spriteSpansWorkerCompleted' | 'spriteSpansMainCompleted' |
+    'aliasTrisWorkerCompleted' | 'aliasTrisMainCompleted' |
+    'particleSpansWorkerCompleted' | 'particleSpansMainCompleted' |
+    'beamSpansWorkerCompleted' | 'beamSpansMainCompleted'> = [
     'trisStaged', 'trisCompleted', 'trisMainCompleted', 'trisReplayed',
     'particleSpansStaged', 'beamSpansStaged',
+    'workerTrisCompleted', 'mainTrisCompleted',
+    'spriteSpansInline', 'aliasDrawsStaged',
+    'particleSpansInline', 'beamSpansInline',
+    'alphaSpansWorkerCompleted', 'alphaSpansMainCompleted',
+    'spriteSpansWorkerCompleted', 'spriteSpansMainCompleted',
+    'aliasTrisWorkerCompleted', 'aliasTrisMainCompleted',
+    'particleSpansWorkerCompleted', 'particleSpansMainCompleted',
+    'beamSpansWorkerCompleted', 'beamSpansMainCompleted',
   ];
   for (const k of FG_OPT_NUM) {
     const v = src[k];

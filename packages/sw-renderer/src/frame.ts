@@ -555,12 +555,20 @@ export class SoftwareRenderer implements Refresh {
   private fgAlphaSpansStaged = 0;
   private fgAlphaSpansInline = 0;
   private fgSpriteSpansStaged = 0;
+  /** Spans drawn inline for the sprite class (pooled staging-refusal path, spans). */
+  private fgSpriteSpansInline = 0;
   private fgSpriteDrawsInline = 0;
+  /** Alias instances successfully staged (draws/instances offered to the kick). */
+  private fgAliasDrawsStaged = 0;
   private fgAliasDrawsInline = 0;
   private fgAliasTrisInline = 0;
   private fgParticleDrawsInline = 0;
   private fgParticlesInline = 0;
+  /** Spans drawn inline for the particle class (pooled staging-refusal path, spans). */
+  private fgParticleSpansInline = 0;
   private fgBeamDrawsInline = 0;
+  /** Spans drawn inline for the beam class (pooled staging-refusal path, spans). */
+  private fgBeamSpansInline = 0;
   private fgWorkerSpansCompleted = 0;
   private fgWorkerPixelsCompleted = 0;
   private fgMainSpansCompleted = 0;
@@ -1087,20 +1095,34 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
-   * Foreground primitive-class breakdown (TASK item 3): prepared/staged
+   * Foreground primitive-class breakdown (TASK item 3, PERF-NEXT-5): prepared/staged
    * vs worker-completed vs calling-thread vs deliberately inline vs
    * fallback/replayed work, in native units (spans, draws, triangles,
-   * particles, pixels, kicks, ms — never mixed). `worker*Completed`
+   * particles, pixels, kicks, ms — never mixed in one field). `worker*Completed`
    * counts pool-completed suffix-kick work only (actual completion, not
-   * staging); `main*Completed` is the calling-thread band share when the
-   * pool reports the split, else zero with everything in `worker*`
-   * (documented per-pool). `trisStaged` counts screen tris offered to the
-   * kick; `trisCompleted` counts per-band tri executions (a tri straddling
-   * a band boundary fills in both bands — disjoint rows, exact pixels —
-   * and counts once per band, so it can slightly exceed staged; spans
-   * behave the same way). `replayedSpans/Pixels` + `recoveryCount`
-   * count complete-frame recovery replays (staging refusals + kick
-   * failures), never worker completions. `entityMs` times the expensive
+   * staging): the WORKER bands' share; `main*Completed` is the calling-thread
+   * band's share from the same kicks (combined kick totals = worker + main,
+   * exactly, per kick). A kick result WITHOUT the split (legacy pool shape:
+   * neither worker* nor main* present) is UNKNOWN attribution and maps to
+   * the calling-thread band (main = combined, worker = 0) — absent fields
+   * imply the calling-thread band ran inline and are NEVER reported as
+   * worker-completed. Per-class worker/main completion is UNKNOWN by
+   * construction (one kick mixes alpha + sprite + particle + beam spans and
+   * alias tris; the pool reports only the global split) — per-class
+   * attribution stops at staged/inline. `trisStaged` counts screen tris
+   * offered to the kick (post-clip); `trisCompleted` counts per-band tri
+   * executions (worker + main: a tri straddling a band boundary fills disjoint
+   * rows in both bands and counts once per band, so completed can slightly
+   * exceed staged; spans behave the same way only across descriptor rows and
+   * reconcile exactly). `aliasTrisInline` counts pre-clip mesh tris per
+   * inline instance (different unit from staged screen tris — documented, never
+   * summed). `aliasDrawsStaged` counts alias instances (incl. the depthHack
+   * viewmodel gun) successfully staged; the viewmodel rides the exact alias
+   * path (depthScale = DEPTHHACK_SCALE) and is attributed identically.
+   * `replayedSpans/Pixels/Tris` + `recoveryCount` count complete-frame recovery
+   * replays (staging refusals + kick failures), never worker completions:
+   * staged-but-failed work is reported as zero worker-completed with the work
+   * in replayed/inline counters. `entityMs` times the expensive
    * entity-foreground pass (alias incl. viewmodel). `directInlineWrites`
    * reports whether un-retained inline writes happened (blend staging
    * refuses after that point). Read-only, zero behavior change.
@@ -1108,10 +1130,10 @@ export class SoftwareRenderer implements Refresh {
   testForegroundStats(): {
     stagedBatches: number; inlineBatches: number; kicks: number;
     alphaSpansStaged: number; alphaSpansInline: number;
-    spriteSpansStaged: number; spriteDrawsInline: number;
-    aliasDrawsInline: number; aliasTrisInline: number;
-    particleDrawsInline: number; particlesInline: number;
-    beamDrawsInline: number;
+    spriteSpansStaged: number; spriteSpansInline: number; spriteDrawsInline: number;
+    aliasDrawsStaged: number; aliasDrawsInline: number; aliasTrisInline: number;
+    particleDrawsInline: number; particlesInline: number; particleSpansInline: number;
+    beamDrawsInline: number; beamSpansInline: number;
     workerSpansCompleted: number; workerPixelsCompleted: number;
     mainSpansCompleted: number; mainPixelsCompleted: number;
     trisStaged: number; trisCompleted: number; trisMainCompleted: number;
@@ -1127,12 +1149,16 @@ export class SoftwareRenderer implements Refresh {
       alphaSpansStaged: this.fgAlphaSpansStaged,
       alphaSpansInline: this.fgAlphaSpansInline,
       spriteSpansStaged: this.fgSpriteSpansStaged,
+      spriteSpansInline: this.fgSpriteSpansInline,
       spriteDrawsInline: this.fgSpriteDrawsInline,
+      aliasDrawsStaged: this.fgAliasDrawsStaged,
       aliasDrawsInline: this.fgAliasDrawsInline,
       aliasTrisInline: this.fgAliasTrisInline,
       particleDrawsInline: this.fgParticleDrawsInline,
       particlesInline: this.fgParticlesInline,
+      particleSpansInline: this.fgParticleSpansInline,
       beamDrawsInline: this.fgBeamDrawsInline,
+      beamSpansInline: this.fgBeamSpansInline,
       workerSpansCompleted: this.fgWorkerSpansCompleted,
       workerPixelsCompleted: this.fgWorkerPixelsCompleted,
       mainSpansCompleted: this.fgMainSpansCompleted,
@@ -1813,6 +1839,7 @@ export class SoftwareRenderer implements Refresh {
     );
     if (!ok) return direct();
     this.fgStagedBatches++;
+    this.fgAliasDrawsStaged++;
     this.fgTrisStaged += triCount;
     return true;
   }
@@ -1901,21 +1928,42 @@ export class SoftwareRenderer implements Refresh {
   /**
    * Attribute one pool-completed suffix kick to the foreground breakdown
    * (actual completion, not staging): worker-band spans/pixels/tris vs the
-   * calling-thread band share. Pools without the split report everything
-   * as worker-completed with the main share at zero (documented on the
-   * read path).
+   * calling-thread band share. PERF-NEXT-5: the pool reports worker* and
+   * main* separately from the combined totals (worker bands only vs the
+   * calling-thread band's drain — never mixed). A result WITHOUT the split
+   * (legacy shape: neither worker* nor main* present) means UNKNOWN, and is
+   * attributed to the calling-thread band (main = combined totals, worker =
+   * 0) — absent fields imply the calling-thread band ran inline and must
+   * NEVER be reported as worker-completed. When only one side of the split
+   * is present, the other is derived (combined - reported). Staged-but-failed
+   * work never reaches here (kicks return null and replay via the retained
+   * recovery, counted in replayed* — never in worker*).
    */
-  private noteForegroundCompleted(r: { pixels: number; spans: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number }): void {
-    const wSpans = typeof r.workerSpans === 'number' ? r.workerSpans : r.spans;
-    const wPixels = typeof r.workerPixels === 'number' ? r.workerPixels : r.pixels;
+  private noteForegroundCompleted(r: { pixels: number; spans: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number; mainSpans?: number; mainPixels?: number; mainTris?: number }): void {
+    const hasWorker = typeof r.workerSpans === 'number' || typeof r.workerPixels === 'number' || typeof r.workerTris === 'number';
+    const hasMain = typeof r.mainSpans === 'number' || typeof r.mainPixels === 'number' || typeof r.mainTris === 'number';
+    let wSpans: number; let wPixels: number; let wTris: number;
+    let mSpans: number; let mPixels: number; let mTris: number;
+    const tris = typeof r.tris === 'number' ? r.tris : 0;
+    if (!hasWorker && !hasMain) {
+      // Legacy shape without the split: UNKNOWN attribution, mapped to the
+      // calling-thread band per PERF-NEXT-5 (never worker-completed).
+      wSpans = 0; wPixels = 0; wTris = 0;
+      mSpans = r.spans; mPixels = r.pixels; mTris = tris;
+    } else {
+      wSpans = typeof r.workerSpans === 'number' ? r.workerSpans : r.spans - (typeof r.mainSpans === 'number' ? r.mainSpans : 0);
+      wPixels = typeof r.workerPixels === 'number' ? r.workerPixels : r.pixels - (typeof r.mainPixels === 'number' ? r.mainPixels : 0);
+      wTris = typeof r.workerTris === 'number' ? r.workerTris : tris - (typeof r.mainTris === 'number' ? r.mainTris : 0);
+      mSpans = typeof r.mainSpans === 'number' ? r.mainSpans : r.spans - wSpans;
+      mPixels = typeof r.mainPixels === 'number' ? r.mainPixels : r.pixels - wPixels;
+      mTris = typeof r.mainTris === 'number' ? r.mainTris : tris - wTris;
+    }
     this.fgWorkerSpansCompleted += wSpans;
     this.fgWorkerPixelsCompleted += wPixels;
-    this.fgMainSpansCompleted += r.spans - wSpans;
-    this.fgMainPixelsCompleted += r.pixels - wPixels;
-    const tris = typeof r.tris === 'number' ? r.tris : 0;
-    const wTris = typeof r.workerTris === 'number' ? r.workerTris : tris;
-    this.fgTrisCompleted += tris;
-    this.fgTrisMainCompleted += tris - wTris;
+    this.fgMainSpansCompleted += mSpans;
+    this.fgMainPixelsCompleted += mPixels;
+    this.fgTrisCompleted += wTris + mTris;
+    this.fgTrisMainCompleted += mTris;
   }
 
   /**
@@ -1994,8 +2042,15 @@ export class SoftwareRenderer implements Refresh {
     this.rgbUsedThisFrame = true;
     const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
     const count = list.count < list.spans.length ? list.count : list.spans.length;
+    // PERF-NEXT-5: every inline span batch counts in its class's inline
+    // spans (spans unit, matching the staged spans) AND, for the draw-based
+    // classes, one inline draw (the refused batch executes as one inline
+    // draw). Staged work is never counted here — only actually-inline work.
     const noteInline = (): void => {
       if (cls === 'alpha') this.fgAlphaSpansInline += count;
+      else if (cls === 'sprite') { this.fgSpriteSpansInline += count; this.fgSpriteDrawsInline++; }
+      else if (cls === 'particle') { this.fgParticleSpansInline += count; this.fgParticleDrawsInline++; }
+      else { this.fgBeamSpansInline += count; this.fgBeamDrawsInline++; }
     };
     const noteStaged = (): void => {
       if (cls === 'alpha') this.fgAlphaSpansStaged += count;
@@ -2393,12 +2448,16 @@ export class SoftwareRenderer implements Refresh {
     this.fgAlphaSpansStaged = 0;
     this.fgAlphaSpansInline = 0;
     this.fgSpriteSpansStaged = 0;
+    this.fgSpriteSpansInline = 0;
     this.fgSpriteDrawsInline = 0;
+    this.fgAliasDrawsStaged = 0;
     this.fgAliasDrawsInline = 0;
     this.fgAliasTrisInline = 0;
     this.fgParticleDrawsInline = 0;
     this.fgParticlesInline = 0;
+    this.fgParticleSpansInline = 0;
     this.fgBeamDrawsInline = 0;
+    this.fgBeamSpansInline = 0;
     this.fgWorkerSpansCompleted = 0;
     this.fgWorkerPixelsCompleted = 0;
     this.fgMainSpansCompleted = 0;
@@ -3294,10 +3353,15 @@ export class SoftwareRenderer implements Refresh {
         cam.xCenter, cam.yCenter, cam.focalX, cam.focalY, cam.near,
         this.partPool,
       );
-      // Item 3: particle work counts one batch draw per frame (inline or
-      // staged — same pixel set either way).
-      this.fgParticleDrawsInline++;
-      this.fgParticlesInline += np;
+      // PERF-NEXT-5: inline particle work counts ONLY when an inline draw
+      // actually executes (serial path, overflow, staging refusal, or the
+      // RGB-off classic path). Staged work counts in particleSpansStaged —
+      // never both (the old unconditional increment double-counted staged
+      // batches as inline).
+      const noteParticlesInline = (): void => {
+        this.fgParticleDrawsInline++;
+        this.fgParticlesInline += np;
+      };
       if (fgSkip) {
         this.classicFgSkipped++;
       } else {
@@ -3312,7 +3376,7 @@ export class SoftwareRenderer implements Refresh {
           const pn = emitParticleSpans(this.partPool, 0, np, this.fbW, this.fbH, this.particleScratch, 4096);
           if (pn < 0) {
             // Overflow (pathological particle count): draw inline.
-            this.fgParticleDrawsInline++;
+            noteParticlesInline();
             this.rgbDirectInlineWrites = true;
             this.rgbBackend.pixelsDrawn += drawParticlesRGB(
               this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
@@ -3320,17 +3384,25 @@ export class SoftwareRenderer implements Refresh {
             this.rgbUsedThisFrame = true;
           } else if (pn > 0) {
             const pmat = this.rgbPaletteMaterials().opaque;
-            this.stageForegroundRGBSpans(this.particleScratch, pmat, 'particle');
+            const staged = this.stageForegroundRGBSpans(this.particleScratch, pmat, 'particle');
             this.particleScratch.count = 0;
+            // Staging refusal draws the batch inline (noteInline already
+            // counted the spans + draw); the offered particle count lands
+            // here so particlesInline counts actually-inline particles only.
+            if (!staged) this.fgParticlesInline += np;
             this.rgbUsedThisFrame = true;
           }
+          // pn == 0: fully clipped — nothing staged, nothing drawn inline.
         } else {
+          noteParticlesInline();
           this.rgbDirectInlineWrites = true;
           this.rgbBackend.pixelsDrawn += drawParticlesRGB(
             this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
             this.partPool, 0, np, this.palette, this.rgbWin);
           this.rgbUsedThisFrame = true;
         }
+      } else {
+        noteParticlesInline();
       }
     }
 

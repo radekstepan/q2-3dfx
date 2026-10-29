@@ -104,7 +104,7 @@ import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
 import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } from './render-workers.js';
-import type { DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
+import type { BrowserForegroundDetail, DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
 
 export type RendererKind = 'software' | 'voodoo';
 
@@ -4410,6 +4410,25 @@ export interface StageReport {
   kicks: number;
   pooled: boolean;
   bands: number;
+  /**
+   * Worker/main attribution for this frame's COMPLETED RGB kicks (world +
+   * foreground), in native units (PERF-NEXT-5, pool surface): worker-band
+   * completed work (`rgbWorker*`: actual execution, never staging) vs the
+   * calling-thread band's completed share (`rgbMain*`: main-band/inline,
+   * never worker). Combined kick totals reconcile as worker + main per
+   * unit; `tris` are per-band tri executions (boundary straddle can
+   * slightly exceed staged). Failed/refused kicks contribute nothing —
+   * their work is recounted by the renderer's inline/replay counters.
+   * -1 each when the pool probe is unavailable (unpooled boot, foreign
+   * pool without the accumulator): unknown, never worker-completed,
+   * never a silent zero. 0 with a live pool is the known idle state.
+   */
+  rgbWorkerSpans: number;
+  rgbWorkerPixels: number;
+  rgbWorkerTris: number;
+  rgbMainSpans: number;
+  rgbMainPixels: number;
+  rgbMainTris: number;
   /** Bytes staged for the frame kick (pool probe; -1 when unpooled). */
   stageBytes: number;
   /**
@@ -4442,6 +4461,14 @@ export interface StageReport {
    * staging is not execution proof).
    */
   fg: { staged: number; worker: number; inline: number; kicks: number } | null;
+  /**
+   * Per-primitive-class foreground audit (renderer lane owns the hook and
+   * its units — see BrowserForegroundDetail): prepared/staged vs
+   * worker-completed vs calling-thread vs inline vs replayed work in
+   * native units. Null when the renderer publishes no breakdown (older
+   * builds) or the probe throws: unknown, never worker-completed.
+   */
+  fgDetail: BrowserForegroundDetail | null;
   /**
    * JS heap delta across the instrumented frame in MiB (null without
    * `performance.memory` — Chromium only; harness trend signal, not a
@@ -4702,6 +4729,62 @@ export async function measureFrameStages(
   // sampled post-render, pinning the fallback delta at 0).
   let rgbFallbacks = 0;
   let scannedSpans = -1;
+  // Per-frame worker/main attribution (PERF-NEXT-5, pool surface): the
+  // pool reset its completed-work split in this frame's beginFrame (called
+  // above), so the post-render read below covers exactly this frame's
+  // completed RGB kicks (world + foreground). -1 when the pool probe is
+  // unavailable (unpooled/foreign pool): unknown, never worker-completed.
+  let rgbWorkerSpans = -1;
+  let rgbWorkerPixels = -1;
+  let rgbWorkerTris = -1;
+  let rgbMainSpans = -1;
+  let rgbMainPixels = -1;
+  let rgbMainTris = -1;
+  let fgDetail: StageReport['fgDetail'] = null;
+  try {
+    const hooks = boot.refresh as unknown as {
+      testForegroundStats?: () => Record<string, unknown>;
+    };
+    const detail = hooks.testForegroundStats;
+    if (typeof detail === 'function') {
+      const fs = detail.call(boot.refresh) as Record<string, unknown>;
+      const pick = (v: unknown): number =>
+        typeof v === 'number' && Number.isFinite(v) ? v : -1;
+      fgDetail = {
+        stagedBatches: pick(fs.stagedBatches),
+        inlineBatches: pick(fs.inlineBatches),
+        kicks: pick(fs.kicks),
+        alphaSpansStaged: pick(fs.alphaSpansStaged),
+        alphaSpansInline: pick(fs.alphaSpansInline),
+        spriteSpansStaged: pick(fs.spriteSpansStaged),
+        spriteSpansInline: pick(fs.spriteSpansInline),
+        spriteDrawsInline: pick(fs.spriteDrawsInline),
+        aliasDrawsStaged: pick(fs.aliasDrawsStaged),
+        aliasDrawsInline: pick(fs.aliasDrawsInline),
+        aliasTrisInline: pick(fs.aliasTrisInline),
+        particleDrawsInline: pick(fs.particleDrawsInline),
+        particlesInline: pick(fs.particlesInline),
+        particleSpansInline: pick(fs.particleSpansInline),
+        beamDrawsInline: pick(fs.beamDrawsInline),
+        beamSpansInline: pick(fs.beamSpansInline),
+        workerSpansCompleted: pick(fs.workerSpansCompleted),
+        workerPixelsCompleted: pick(fs.workerPixelsCompleted),
+        mainSpansCompleted: pick(fs.mainSpansCompleted),
+        mainPixelsCompleted: pick(fs.mainPixelsCompleted),
+        trisStaged: pick(fs.trisStaged),
+        trisCompleted: pick(fs.trisCompleted),
+        trisMainCompleted: pick(fs.trisMainCompleted),
+        trisReplayed: pick(fs.trisReplayed),
+        particleSpansStaged: pick(fs.particleSpansStaged),
+        beamSpansStaged: pick(fs.beamSpansStaged),
+        replayedSpans: pick(fs.replayedSpans),
+        replayedPixels: pick(fs.replayedPixels),
+        recoveryCount: pick(fs.recoveryCount),
+        entityMs: pick(fs.entityMs),
+        directInlineWrites: fs.directInlineWrites === true,
+      };
+    }
+  } catch { /* hook absent/throwing: null stands (unknown) */ }
   // This frame's kick attempts in issue order (PERF-NEXT-4 per-frame
   // attribution): ledger entries absent from the pre-render baseline are
   // this frame's kicks — world flush first, then the foreground flushes
@@ -4713,6 +4796,10 @@ export async function measureFrameStages(
         fallbacks: { rgb: number };
         scanned: { raster: number; rgb: number };
         scannedAvailable: boolean;
+        frameCompleted?: {
+          workerPixels?: unknown; workerSpans?: unknown; workerTris?: unknown;
+          mainPixels?: unknown; mainSpans?: unknown; mainTris?: unknown;
+        };
       };
       kickTimings?: () => KickTiming[];
     } | null;
@@ -4721,6 +4808,17 @@ export async function measureFrameStages(
       rgbFallbacks = (ks.fallbacks.rgb | 0) - rgbFbBefore;
       if (scannedAvailBefore || ks.scannedAvailable === true) {
         scannedSpans = ((ks.scanned.raster | 0) + (ks.scanned.rgb | 0)) - scannedBefore;
+      }
+      const fc = ks.frameCompleted;
+      if (fc !== undefined && fc !== null) {
+        const pick = (v: unknown): number =>
+          typeof v === 'number' && Number.isFinite(v) ? v : -1;
+        rgbWorkerSpans = pick(fc.workerSpans);
+        rgbWorkerPixels = pick(fc.workerPixels);
+        rgbWorkerTris = pick(fc.workerTris);
+        rgbMainSpans = pick(fc.mainSpans);
+        rgbMainPixels = pick(fc.mainPixels);
+        rgbMainTris = pick(fc.mainTris);
       }
     }
     if (pool && typeof pool.kickTimings === 'function') {
@@ -4740,12 +4838,15 @@ export async function measureFrameStages(
     resolveMs: t07 - t06, hudMs, blitMs,
     spans: stats.spans, pixels: stats.pixels, overdraw: stats.overdraw,
     staged, inline, kicks, pooled, bands, stageBytes, stageDetail,
+    rgbWorkerSpans, rgbWorkerPixels, rgbWorkerTris,
+    rgbMainSpans, rgbMainPixels, rgbMainTris,
     scanoutKicks: boot.statScanoutKicks - kicksBefore,
     scanoutFallbacks: boot.statScanoutFallbacks - fallbacksBefore,
     rgbFallbacks,
     scannedSpans,
     skip,
     fg,
+    fgDetail,
     diag,
     kickTimings,
     heapDeltaMB,

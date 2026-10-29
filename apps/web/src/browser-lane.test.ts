@@ -17,8 +17,12 @@ import {
   attachRGBAccum,
   BandWorkerPool,
   CTL_JOB,
+  CTL_PIXELS,
   CTL_RGBCOUNT,
+  CTL_SCAN,
   CTL_SEQ,
+  CTL_SPANS,
+  CTL_TRIS,
   JOB_RGB,
   MAX_RGB_BATCHES,
   processRGBFrameJob,
@@ -670,6 +674,18 @@ class ExecWorker extends FakeWorker {
             const r = processRGBFrameJob(self.xRgb, self.xW, self.xH, count, self.xY0, self.xY1);
             pixels = r.pixels;
             spans = r.spans;
+            // Honest tallies (mirrors the real bandWorkerLoop harvest in
+            // bands.ts): the pool's worker/main split reads these CTL
+            // slots, so a fake that really executes must publish what it
+            // drew — including zero-tri span batches and scanned counts.
+            try {
+              Atomics.store(self.xCtl!, CTL_PIXELS + self.xBand, r.pixels);
+              Atomics.store(self.xCtl!, CTL_SPANS + self.xBand, r.spans);
+              Atomics.store(self.xCtl!, CTL_SCAN + self.xBand, r.scanned);
+              Atomics.store(self.xCtl!, CTL_TRIS + self.xBand, r.tris);
+            } catch {
+              /* control gone; the completion message still carries pixels/spans */
+            }
           }
           const execMs = performance.now() - t0;
           self.execMsLast = execMs;
@@ -777,7 +793,18 @@ describe('RGB foreground recovery (checkpoint/restore, real partial writes)', ()
         expect(pool!.kickStats().lastRgb).toEqual({
           descs: 1, workerCompleted: true,
           mainPixels: 16 * REC_W, mainSpans: 16,
+          workerPixels: w!.workerPixels, workerSpans: w!.workerSpans,
+          workerTris: 0, mainTris: 0,
         });
+        // Capture the completed world kick's worker split: the failed FG
+        // kick below must not add to it (failures never accumulate).
+        const worldSplit = { ...pool!.kickStats().frameCompleted };
+        // Worker/main split reconciles: span batches carry no tris, the
+        // calling-thread band drained the bottom 16 rows inline.
+        expect(w!.workerPixels).toBeGreaterThan(0);
+        expect(w!.workerSpans).toBe(w!.spans - 16);
+        expect(w!.workerTris).toBe(0);
+        expect(w!.tris).toBe(0);
         expectPlanesEqual(pool!, ref!);
         const worldSnap = recPlanes(pool!);
         // Stage the FG batch on both pools (identical pending).
@@ -804,6 +831,15 @@ describe('RGB foreground recovery (checkpoint/restore, real partial writes)', ()
         // Retained descriptors: world (1) + FG (1) = 2 total at failure time.
         expect(ks.lastRgb!.descs).toBe(2);
         expect(ks.lastRgb!.mainPixels).toBeGreaterThan(0);
+        // Staged-but-failed is never reported as worker-completed: the
+        // partial worker writes were fenced (quarantine + checkpoint
+        // restore), so the failed kick's worker share reads zero and the
+        // per-frame completed-work split still holds only the earlier
+        // completed world kick (failures never accumulate).
+        expect(ks.lastRgb!.workerPixels).toBe(0);
+        expect(ks.lastRgb!.workerSpans).toBe(0);
+        expect(ks.lastRgb!.workerTris).toBe(0);
+        expect(ks.frameCompleted).toEqual(worldSplit);
         // Quarantine terminated the wedged workers BEFORE any replay.
         expect(poolWorkers[0]!.terminateCount + poolWorkers[1]!.terminateCount)
           .toBeGreaterThanOrEqual(2);
@@ -950,6 +986,14 @@ describe('RGB foreground recovery (checkpoint/restore, real partial writes)', ()
         expect(ks.lastRgb!.workerCompleted).toBe(false);
         expect(ks.lastRgb!.descs).toBe(1);
         expect(ks.lastRgb!.mainPixels).toBe(16 * REC_W);
+        // Zero worker-completed on timeout (no worker ever acked); the
+        // failed kick contributes nothing to the per-frame split, and the
+        // inline replay carries no worker fields (absent = inline).
+        expect(ks.lastRgb!.workerPixels).toBe(0);
+        expect(ks.lastRgb!.workerSpans).toBe(0);
+        expect(ks.lastRgb!.workerTris).toBe(0);
+        expect(ks.frameCompleted.workerPixels).toBe(0);
+        expect(ks.frameCompleted.mainPixels).toBe(0);
         const snap = pool!.diagSnapshot();
         expect(snap).not.toBeNull();
         expect(snap!.job).toBe('rgb');
@@ -993,6 +1037,19 @@ describe('foreground counters: truthful execution attribution (web side)', () =>
         expect(ks.lastRgb!.workerCompleted).toBe(true);
         expect(ks.lastRgb!.descs).toBe(1);
         expect(ks.lastRgb!.mainPixels).toBe(16 * REC_W);
+        // Worker/main attribution (PERF-NEXT-5): the executing fake
+        // publishes honest CTL tallies, so the worker share is the two
+        // worker bands' work and the combined total reconciles as
+        // worker + main (span batches carry no tris).
+        expect(r!.workerSpans).toBe(r!.spans - 16);
+        expect(r!.workerPixels).toBe(r!.pixels - 16 * REC_W);
+        expect(r!.workerTris).toBe(0);
+        expect(ks.lastRgb!.workerSpans).toBe(r!.workerSpans);
+        expect(ks.lastRgb!.workerPixels).toBe(r!.workerPixels);
+        expect(ks.lastRgb!.workerTris).toBe(0);
+        expect(ks.lastRgb!.mainTris).toBe(0);
+        expect(ks.frameCompleted.workerSpans).toBe(r!.workerSpans);
+        expect(ks.frameCompleted.mainSpans).toBe(16);
         // Worker-local durations attributed per band/seq alongside (not
         // fused with) the caller-side arrival latencies.
         const snap = pool!.diagSnapshot();
