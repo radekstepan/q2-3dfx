@@ -47,6 +47,16 @@ export const SPAN_FLAT = 2;
  */
 export const SPAN_TRANS33 = 3;
 export const SPAN_TRANS66 = 4;
+/**
+ * Additive span kind (TASK item 2: tracer beams as spans). Depth-tested
+ * AND depth-writing like opaque (the beam occludes and is occluded), but
+ * the color ADDS onto the stored quantum (ref_gl "additive" bolt read)
+ * instead of replacing it. Staged for the RGB worker kick with
+ * R_FLAG_ADDITIVE; the inline serial path (drawSpansRGB Generic) and the
+ * pooled worker core apply the identical add. Never staged for the
+ * indexed path (tracers draw indexed via drawTracerBeam, never spans).
+ */
+export const SPAN_ADD = 5;
 
 /** Master switch for the translucent-surface path (default 1 = blend like C). */
 export const TRANSLUCENCY_CVAR = 'r_translucency';
@@ -2062,7 +2072,10 @@ export function runSubdivRGBGeneric(
   const zOff = _wcOff;
   const wrapS = mat.addressS === 'repeat';
   const wrapT = mat.addressT === 'repeat';
-  const writeDepth = blend === 'opaque' ? mat.depthWrite : false;
+  // Depth writes: opaque follows the material; alpha never writes (glass
+  // overdraw must not occlude); additive follows the material (tracer
+  // beams occlude and are occluded exactly like the splatRGB path).
+  const writeDepth = blend === 'opaque' ? mat.depthWrite : blend === 'additive' ? mat.depthWrite : false;
   const z1 = 1 / (iz + diz * n);
   const u1 = (uz + duz * n) * z1, v1 = (vz + dvz * n) * z1;
   let tu = (u0 * 65536) | 0, tv = (v0 * 65536) | 0;
@@ -2361,7 +2374,7 @@ export function drawSpansRGB(
     const s = spans[si]!;
     const kind = s.kind;
     if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT &&
-      kind !== SPAN_TRANS33 && kind !== SPAN_TRANS66 && kind !== SPAN_FLAT) {
+      kind !== SPAN_TRANS33 && kind !== SPAN_TRANS66 && kind !== SPAN_FLAT && kind !== SPAN_ADD) {
       Com_Error('error', 'drawSpansRGB: unsupported span kind (step-3 coverage pending)');
     }
     if (s.y < yA || s.y >= yB) continue;

@@ -9,6 +9,8 @@ export * from './cache-flythrough.js';
 export * from './voodoo-baseline.js';
 export * from './perf-budget.js';
 export * from './critpath.js';
+export * from './worker-timing.js';
+export * from './renderer-hooks.js';
 
 export const GOLDEN_TOLERANCE_SOFTWARE = 0;
 export const GOLDEN_TOLERANCE_VOODOO_LSB = 1;

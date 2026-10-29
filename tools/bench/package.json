@@ -14,7 +14,9 @@
     "bench": "echo bench-ok",
     "bench:frame": "node ./frame-bench.mjs",
     "bench:rgb": "node ./rgb-attr.mjs",
-    "bench:accept": "node ./bench-accept.mjs"
+    "bench:accept": "node ./bench-accept.mjs",
+    "bench:compare-run": "node ./compare-run.mjs",
+    "bench:compare-diff": "node ./compare-diff.mjs"
   },
   "dependencies": {
     "@q2/bsp": "workspace:*",

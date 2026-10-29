@@ -17,6 +17,11 @@ declare module 'node:fs' {
   export function readdirSync(path: string): string[];
 }
 
+declare module 'node:os' {
+  export function loadavg(): number[];
+  export function cpus(): Array<{ model: string }>;
+}
+
 declare module 'node:path' {
   export function join(...parts: string[]): string;
 }

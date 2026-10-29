@@ -8,7 +8,8 @@
 import type { Camera } from './camera.js';
 import {
   packRGB565, windowDepthQ16,
-  DEFAULT_RGB_FAR, DEFAULT_RGB_NEAR, type RGBWindow,
+  SPAN_ADD, createSpan,
+  DEFAULT_RGB_FAR, DEFAULT_RGB_NEAR, type RGBWindow, type SpanList,
 } from './spans.js';
 
 /** Default beam length in world units (entity `frame` overrides). */
@@ -26,6 +27,154 @@ export const TRACER_CORE_COLOR = 215;
 export const TRACER_MAX_STEPS = 2048;
 /** Renderer-owned tracer pool size (spawnTracer ring). */
 export const TRACER_POOL_SIZE = 64;
+
+/**
+ * Projected beam parameters shared by the splat draws and the span
+ * emitter (TASK item 2): view-space transform, near-plane clip, screen
+ * endpoints, 1/z endpoints, DDA step count, dominant axis and palette
+ * indices. `projectTracerBeam` fills the module scratch and returns it
+ * (null when fully behind the near plane); the stepping loops stay in
+ * each caller so both pixel orders stay identical by construction.
+ */
+export interface TracerProjection {
+  x0: number; y0: number; iz0: number;
+  x1: number; y1: number; iz1: number;
+  steps: number;
+  horizontal: boolean;
+  /** Palette indices (0..255): centre core + surrounding glow. */
+  core: number;
+  glow: number;
+}
+
+const tracerProjScratch: TracerProjection = {
+  x0: 0, y0: 0, iz0: 0, x1: 0, y1: 0, iz1: 0,
+  steps: 0, horizontal: true, core: 0, glow: 0,
+};
+
+/**
+ * Project a beam segment to screen space with near-plane clipping.
+ * Returns the shared scratch (null when fully behind the near plane).
+ * Pure function of the inputs; zero allocation.
+ */
+export function projectTracerBeam(
+  cam: Camera,
+  ax: number, ay: number, az: number,
+  bx: number, by: number, bz: number,
+  color: number,
+  core: number = TRACER_CORE_COLOR,
+): TracerProjection | null {
+  const pax = ax - cam.origin[0]!, pay = ay - cam.origin[1]!, paz = az - cam.origin[2]!;
+  const pbx = bx - cam.origin[0]!, pby = by - cam.origin[1]!, pbz = bz - cam.origin[2]!;
+  const adx = pax * cam.right[0]! + pay * cam.right[1]! + paz * cam.right[2]!;
+  const ady = pax * cam.up[0]! + pay * cam.up[1]! + paz * cam.up[2]!;
+  const adz = pax * cam.forward[0]! + pay * cam.forward[1]! + paz * cam.forward[2]!;
+  const bdx = pbx * cam.right[0]! + pby * cam.right[1]! + pbz * cam.right[2]!;
+  const bdy = pbx * cam.up[0]! + pby * cam.up[1]! + pbz * cam.up[2]!;
+  const bdz = pbx * cam.forward[0]! + pby * cam.forward[1]! + pbz * cam.forward[2]!;
+  const near = cam.near;
+  let t0 = 0, t1 = 1;
+  if (adz < near && bdz < near) return null;
+  if (adz < near) t0 = (near - adz) / (bdz - adz);
+  else if (bdz < near) t1 = (near - adz) / (bdz - adz);
+  const s0x = adx + (bdx - adx) * t0;
+  const s0y = ady + (bdy - ady) * t0;
+  const s0z = adz + (bdz - adz) * t0;
+  const s1x = adx + (bdx - adx) * t1;
+  const s1y = ady + (bdy - ady) * t1;
+  const s1z = adz + (bdz - adz) * t1;
+  const p = tracerProjScratch;
+  p.x0 = cam.xCenter + s0x * cam.focalX / s0z;
+  p.y0 = cam.yCenter - s0y * cam.focalY / s0z;
+  p.x1 = cam.xCenter + s1x * cam.focalX / s1z;
+  p.y1 = cam.yCenter - s1y * cam.focalY / s1z;
+  p.iz0 = 1 / s0z;
+  p.iz1 = 1 / s1z;
+  const dx = p.x1 - p.x0, dy = p.y1 - p.y0;
+  p.steps = Math.min(TRACER_MAX_STEPS, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy))));
+  p.horizontal = Math.abs(dx) >= Math.abs(dy);
+  p.core = core & 255;
+  p.glow = color & 255;
+  return p;
+}
+
+/**
+ * Emit a projected beam as 1x1 additive spans into `pool` (TASK item 2:
+ * tracers ride the RGB worker kick exactly like other spans). One span
+ * per splat in the exact splat order (core pass, then halo pass), so the
+ * worker kick resolves same-pixel ties exactly like the serial DDA.
+ * Each span samples the palette chain at (color, 0) and adds (Generic
+ * additive == splatRGB). Returns the emitted span count (pool.count is
+ * set; the caller draws or stages then resets it), or -1 when the beam
+ * does not fit in maxSpans (caller draws inline instead; order is
+ * preserved either way).
+ */
+export function emitTracerSpans(
+  proj: TracerProjection,
+  fbW: number,
+  fbH: number,
+  pool: SpanList,
+  maxSpans: number,
+): number {
+  const spans = pool.spans;
+  let cursor = 0;
+  const put = (x: number, y: number, iz: number, color: number): boolean => {
+    if (cursor >= maxSpans) return false;
+    if (x < 0 || y < 0 || x >= fbW || y >= fbH) return true;
+    while (spans.length <= cursor) spans.push(createSpan());
+    const sq = spans[cursor++]!;
+    sq.kind = SPAN_ADD;
+    sq.y = y;
+    sq.x0 = x;
+    sq.x1 = x + 1;
+    sq.iz = iz;
+    sq.diz = 0;
+    sq.uz = (color + 0.5) * iz;
+    sq.duz = 0;
+    sq.vz = 0.5 * iz;
+    sq.dvz = 0;
+    sq.light = 63;
+    sq.dlight = 0;
+    sq.lu = 0; sq.lv = -1; sq.dlu = 0; sq.ord = 0;
+    sq.dudy = 0; sq.dvdy = 0;
+    sq.turb = 0;
+    return true;
+  };
+  const dx = proj.x1 - proj.x0, dy = proj.y1 - proj.y0;
+  const steps = proj.steps;
+  if (steps <= 0) {
+    const x = Math.round(proj.x0), y = Math.round(proj.y0);
+    const iz = (proj.iz0 + proj.iz1) / 2;
+    if (!put(x, y, iz, proj.core)) { pool.count = 0; return -1; }
+    if (proj.horizontal) {
+      if (!put(x, y - 1, iz, proj.glow)) { pool.count = 0; return -1; }
+      if (!put(x, y + 1, iz, proj.glow)) { pool.count = 0; return -1; }
+    } else {
+      if (!put(x - 1, y, iz, proj.glow)) { pool.count = 0; return -1; }
+      if (!put(x + 1, y, iz, proj.glow)) { pool.count = 0; return -1; }
+    }
+    pool.count = cursor;
+    return cursor;
+  }
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    if (!put(Math.round(proj.x0 + dx * t), Math.round(proj.y0 + dy * t),
+      proj.iz0 + (proj.iz1 - proj.iz0) * t, proj.core)) { pool.count = 0; return -1; }
+  }
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const x = Math.round(proj.x0 + dx * t), y = Math.round(proj.y0 + dy * t);
+    const iz = proj.iz0 + (proj.iz1 - proj.iz0) * t;
+    if (proj.horizontal) {
+      if (!put(x, y - 1, iz, proj.glow)) { pool.count = 0; return -1; }
+      if (!put(x, y + 1, iz, proj.glow)) { pool.count = 0; return -1; }
+    } else {
+      if (!put(x - 1, y, iz, proj.glow)) { pool.count = 0; return -1; }
+      if (!put(x + 1, y, iz, proj.glow)) { pool.count = 0; return -1; }
+    }
+  }
+  pool.count = cursor;
+  return cursor;
+}
 
 /**
  * Draw a beam from a to b. Returns drawn pixel count. Writes nothing when
@@ -197,43 +346,23 @@ export function drawTracerBeamRGB(
   win?: RGBWindow | null,
   zbits = 16,
 ): number {
-  const pax = ax - cam.origin[0]!, pay = ay - cam.origin[1]!, paz = az - cam.origin[2]!;
-  const pbx = bx - cam.origin[0]!, pby = by - cam.origin[1]!, pbz = bz - cam.origin[2]!;
-  const adx = pax * cam.right[0]! + pay * cam.right[1]! + paz * cam.right[2]!;
-  const ady = pax * cam.up[0]! + pay * cam.up[1]! + paz * cam.up[2]!;
-  const adz = pax * cam.forward[0]! + pay * cam.forward[1]! + paz * cam.forward[2]!;
-  const bdx = pbx * cam.right[0]! + pby * cam.right[1]! + pbz * cam.right[2]!;
-  const bdy = pbx * cam.up[0]! + pby * cam.up[1]! + pbz * cam.up[2]!;
-  const bdz = pbx * cam.forward[0]! + pby * cam.forward[1]! + pbz * cam.forward[2]!;
-  const near = cam.near;
   const winN = win !== null && win !== undefined && win.near > 0 ? win.near : DEFAULT_RGB_NEAR;
   const winF = win !== null && win !== undefined && win.far > winN ? win.far : DEFAULT_RGB_FAR;
   const winA = winF / (winF - winN);
   const winB = (winF * winN) / (winF - winN);
   const zOff = !Number.isInteger(zbits) || zbits < 1 || zbits > 23;
   const qn16 = (d01: number): number => windowDepthQ16(d01, zbits);
-  let t0 = 0, t1 = 1;
-  if (adz < near && bdz < near) return 0;
-  if (adz < near) t0 = (near - adz) / (bdz - adz);
-  else if (bdz < near) t1 = (near - adz) / (bdz - adz);
-  const s0x = adx + (bdx - adx) * t0;
-  const s0y = ady + (bdy - ady) * t0;
-  const s0z = adz + (bdz - adz) * t0;
-  const s1x = adx + (bdx - adx) * t1;
-  const s1y = ady + (bdy - ady) * t1;
-  const s1z = adz + (bdz - adz) * t1;
-  const x0 = cam.xCenter + s0x * cam.focalX / s0z;
-  const y0 = cam.yCenter - s0y * cam.focalY / s0z;
-  const x1 = cam.xCenter + s1x * cam.focalX / s1z;
-  const y1 = cam.yCenter - s1y * cam.focalY / s1z;
-  const iz0 = 1 / s0z, iz1 = 1 / s1z;
+  const proj = projectTracerBeam(cam, ax, ay, az, bx, by, bz, colorIdx, coreIdx);
+  if (!proj) return 0;
+  const x0 = proj.x0, y0 = proj.y0, iz0 = proj.iz0;
+  const x1 = proj.x1, y1 = proj.y1, iz1 = proj.iz1;
   const dx = x1 - x0, dy = y1 - y0;
-  const steps = Math.min(TRACER_MAX_STEPS, Math.ceil(Math.max(Math.abs(dx), Math.abs(dy))));
+  const steps = proj.steps;
   const go = (colorIdx & 255) * 3;
   const gr = palette[go] ?? 0, gg = palette[go + 1] ?? 0, gb = palette[go + 2] ?? 0;
   const co = (coreIdx & 255) * 3;
   const cr = palette[co] ?? 0, cg = palette[co + 1] ?? 0, cb = palette[co + 2] ?? 0;
-  const horizontal = Math.abs(dx) >= Math.abs(dy);
+  const horizontal = proj.horizontal;
   if (steps <= 0) {
     const x = Math.round(x0), y = Math.round(y0);
     const iz = (iz0 + iz1) / 2;

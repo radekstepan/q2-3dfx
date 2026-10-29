@@ -1124,6 +1124,12 @@ export interface Q2Stats {
    * publishes no foreground counter (this HEAD: foreground always rides
    * inline after the world kick — absence is healthy; the world-lane
    * counters plus fgInline > 0 are the foreground proof). Never guessed.
+   *
+   * Units are batches (NOT triangles or pixels — do not compare fgStaged
+   * with pixel counters). `fgWorker` is worker-completed batches only:
+   * the legacy-hook fallback reports -1 (unknown) whenever anything
+   * staged, because staging is not execution proof — only the new hook's
+   * separately-measured worker count proves worker rendering.
    */
   fgStaged: number;
   fgWorker: number;
@@ -1273,14 +1279,18 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
         rec.fgKicks = numOr(fs.kicks, -1);
       } else if (typeof fgLegacy === 'function') {
         // Renderer-lane hook shape: { staged, inline, kicks }. Staged
-        // batches ride the same JOB_RGB kick as the world batches, so a
-        // completed kick means the staged batches were worker-rendered
-        // (worker count derived, not separately measured).
+        // batches ride the same JOB_RGB kick as the world batches — but
+        // staging is NOT execution proof (TASK item 3): a completed kick
+        // only proves the batches it covered, and a failed kick replays
+        // inline. Without the testRGBForegroundStats hook the renderer
+        // cannot attribute completions, so worker-completed is unknown
+        // (-1) whenever anything staged, 0 only when nothing staged.
+        // Never derive worker from staged/kicks.
         const fs = fgLegacy.call(boot.refresh);
         rec.fgStaged = numOr(fs.staged, -1);
         rec.fgKicks = numOr(fs.kicks, -1);
         rec.fgInlineRgb = numOr(fs.inline, -1);
-        rec.fgWorker = rec.fgKicks > 0 ? rec.fgStaged : 0;
+        rec.fgWorker = rec.fgStaged > 0 ? -1 : 0;
       } else {
         rec.fgStaged = -1;
         rec.fgWorker = -1;

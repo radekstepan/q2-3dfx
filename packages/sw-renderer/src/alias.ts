@@ -826,7 +826,7 @@ export function fillAffineTri(
 // light interpolation are renderer-side (no voodoo import: dep allowlist
 // keeps sw-renderer on bsp/config/formats/math/renderer-api).
 
-interface PerspVert {
+export interface PerspVert {
   x: number; y: number;
   iz: number; uiz: number; viz: number;
   r: number; g: number; b: number;
@@ -929,6 +929,17 @@ export function fillPerspTriRGB(
   blend: RGBBlend,
   depthWrite: boolean,
   win?: RGBWindow | null,
+  /**
+   * Optional row-band restriction [yLo, yHi) (TASK item 2, worker
+   * rasterization): the worker loop passes its owned band so each band
+   * fills only its rows — bands are disjoint, so concurrent bands never
+   * share a pixel, and the union over bands is bit-identical to the
+   * unrestricted fill (same edge walk, same barycentric math, same
+   * absolute-coordinate dither/LOD). Omitted (serial path) the range is
+   * the whole frame.
+   */
+  yLo?: number,
+  yHi?: number,
 ): number {
   const area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
   if (area <= 0) return 0;
@@ -1002,10 +1013,12 @@ export function fillPerspTriRGB(
   const winB = (winF * winN) / (winF - winN);
   let minY = Math.max(0, Math.ceil(Math.min(a.y, b.y, c.y) - 0.5));
   const maxY = Math.min(fbH - 1, Math.floor(Math.max(a.y, b.y, c.y) - 0.5));
-  if (maxY < minY) return 0;
+  if (yLo !== undefined && yLo > minY) minY = yLo > fbH ? fbH : yLo | 0;
+  const yBandEnd = yHi !== undefined && yHi - 1 < maxY ? (yHi - 1) | 0 : maxY;
+  if (yBandEnd < minY) return 0;
   let pixels = 0;
   const inv = 1 / area;
-  for (let y = minY; y <= maxY; y++) {
+  for (let y = minY; y <= yBandEnd; y++) {
     const yc = y + 0.5;
     let xa = Infinity, xb = -Infinity;
     // Edge walk without the per-row [a,b,c] temp array (perf remediation
@@ -1081,39 +1094,55 @@ export function fillPerspTriRGB(
 }
 
 /**
- * Draw one alias instance into the packed RGB565 plane (perspective-
- * correct twin of drawAliasInstance). Traversal, frame lerp, near-plane
- * clip and depthHack scale are identical; only the filler differs
- * (perspective instead of affine) and Entity.alpha blends instead of
- * stippling. `dlights` tint vertices per channel (red/blue patches keep
- * hues); pass null/[] for unlit-by-dynamics. Writes only the RGB565 +
- * window-Z planes + coverage (the caller hands the RGB-owned planes, never
- * the software ones, so the indexed path stays bit-identical).
+ * Doubles per staged screen-space triangle (TASK item 2, worker
+ * rasterization): 3 verts x (x, y, iz, uiz, viz, r, g, b). The worker
+ * loop rebuilds PerspVert triples from these (no allocation — module
+ * scratch) and runs the exact fillPerspTriRGB restricted to its band.
  */
-export function drawAliasInstanceRGB(
-  rgb565: Uint16Array,
-  cover: Uint8Array,
-  rgbDepth: Uint16Array,
-  fbW: number,
-  fbH: number,
+export const TRI_F_PER_TRI = 24;
+/** Ints per staged triangle: ymin (inclusive) + ymax (exclusive) rows. */
+export const TRI_I_PER_TRI = 2;
+/** Max screen tris addressable per frame kick (upload-sized, overflow runs inline). */
+export const TRI_MAX_TRIS = 16384;
+
+/** Module scratch for the inline emit-then-fill path (grown on demand). */
+let aliasEmitF = new Float64Array(TRI_F_PER_TRI * 1024);
+
+/** Grow the inline emission scratch to hold at least `ntris` tris. */
+function ensureAliasEmit(ntris: number): void {
+  if (ntris * TRI_F_PER_TRI <= aliasEmitF.length) return;
+  aliasEmitF = new Float64Array(ntris * TRI_F_PER_TRI);
+}
+
+/**
+ * Prepare one alias instance for rasterization (TASK item 2): transform,
+ * frame lerp, per-vertex lighting (incl. dynamics), frustum-shared view
+ * verts, near-plane clip + projection — everything short of the fill.
+ * Appends screen-space triangles to `outF` at `outBase` (24 doubles each,
+ * see TRI_F_PER_TRI) and their row bounds to `outI` (ymin/ymax, may be
+ * null for the inline path which never band-culls), returning the new tri
+ * count, or -1 when the instance does not fit in [outBase, capTris)
+ * (caller runs it inline via the direct path instead; order is preserved
+ * either way). Alpha <= 0 instances emit nothing (return outBase). Main
+ * thread only (shares the classic twin's view scratch + clip tables).
+ */
+export function emitAliasTris(
   inst: AliasInstance,
-  mat: RGBMaterial,
   cam: Camera,
   anorms: Float32Array,
   shadeDots: Float32Array,
   dlights: DynamicLight[] | null,
-  win?: RGBWindow | null,
+  outF: Float64Array,
+  outI: Int32Array | null,
+  outBase: number,
+  capTris: number,
 ): number {
   const mesh = inst.mesh;
   const nv = mesh.numVerts;
   ensureAliasScratch(nv);
   ensureAliasLightScratch(nv);
   const alpha = inst.alpha;
-  if (alpha !== undefined && alpha <= 0) return 0;
-  const translucent = alpha !== undefined && Number.isFinite(alpha) && (alpha as number) < 1;
-  const alphaQ = translucent ? Math.round((alpha as number) * 256) : 256;
-  const blend: RGBBlend = translucent ? 'alpha' : 'opaque';
-  const depthWrite = translucent ? false : mat.depthWrite;
+  if (alpha !== undefined && alpha <= 0) return outBase;
   const pitchR = (inst.angles[0]! * Math.PI) / 180;
   const yawR = (inst.angles[1]! * Math.PI) / 180;
   const rollR = (inst.angles[2]! * Math.PI) / 180;
@@ -1192,8 +1221,35 @@ export function drawAliasInstanceRGB(
     aliasLightG[i] = g < 0 ? 0 : g;
     aliasLightB[i] = b < 0 ? 0 : b;
   }
-  let pixels = 0;
+  let emitted = outBase;
   const tv = aliasPersp;
+  // Append one projected screen tri (PerspVert triple) to the flat
+  // emission buffer. Returns false when the instance overflows the cap
+  // (the whole instance then runs inline via the direct path).
+  const appendTri = (ax: number, ay: number, aiz: number, auiz: number, aviz: number, ar: number, ag: number, ab: number,
+    bx: number, by: number, biz: number, buiz: number, bviz: number, br: number, bg: number, bb: number,
+    cx: number, cy: number, ciz: number, cuiz: number, cviz: number, cr: number, cg: number, cb: number): boolean => {
+    if (emitted + 1 > capTris) return false;
+    const o = emitted * TRI_F_PER_TRI;
+    outF[o] = ax; outF[o + 1] = ay; outF[o + 2] = aiz; outF[o + 3] = auiz;
+    outF[o + 4] = aviz; outF[o + 5] = ar; outF[o + 6] = ag; outF[o + 7] = ab;
+    outF[o + 8] = bx; outF[o + 9] = by; outF[o + 10] = biz; outF[o + 11] = buiz;
+    outF[o + 12] = bviz; outF[o + 13] = br; outF[o + 14] = bg; outF[o + 15] = bb;
+    outF[o + 16] = cx; outF[o + 17] = cy; outF[o + 18] = ciz; outF[o + 19] = cuiz;
+    outF[o + 20] = cviz; outF[o + 21] = cr; outF[o + 22] = cg; outF[o + 23] = cb;
+    if (outI) {
+      // Conservative row bounds for the worker band pre-check (superset:
+      // the filler clamps exactly, so over-coverage only costs a check).
+      let mn = ay, mx = ay;
+      if (by < mn) mn = by; if (by > mx) mx = by;
+      if (cy < mn) mn = cy; if (cy > mx) mx = cy;
+      const q = emitted * TRI_I_PER_TRI;
+      outI[q] = Math.floor(mn);
+      outI[q + 1] = Math.ceil(mx) + 1;
+    }
+    emitted++;
+    return true;
+  };
   for (let ti = 0; ti < mesh.numTris; ti++) {
     let allIn = true;
     for (let k = 0; k < 3; k++) {
@@ -1228,8 +1284,10 @@ export function drawAliasInstanceRGB(
         v.g = aliasLightG[vi]!;
         v.b = aliasLightB[vi]!;
       }
-      pixels += fillPerspTriRGB(rgb565, cover, rgbDepth, fbW, fbH,
-        tv[0]!, tv[1]!, tv[2]!, mat, alphaQ, blend, depthWrite, win ?? null);
+      const A = tv[0]!, B = tv[1]!, C = tv[2]!;
+      if (!appendTri(A.x, A.y, A.iz, A.uiz, A.viz, A.r, A.g, A.b,
+        B.x, B.y, B.iz, B.uiz, B.viz, B.r, B.g, B.b,
+        C.x, C.y, C.iz, C.uiz, C.viz, C.r, C.g, C.b)) return -1;
       continue;
     }
     // Straddler: Sutherland clip carries position + uv + RGB light, then
@@ -1252,12 +1310,107 @@ export function drawAliasInstanceRGB(
       c.g = clipOLG[k]!;
       c.b = clipOLB[k]!;
     }
-    pixels += fillPerspTriRGB(rgb565, cover, rgbDepth, fbW, fbH,
-      tv[0]!, tv[1]!, tv[2]!, mat, alphaQ, blend, depthWrite, win ?? null);
+    {
+      const A = tv[0]!, B = tv[1]!, C = tv[2]!;
+      if (!appendTri(A.x, A.y, A.iz, A.uiz, A.viz, A.r, A.g, A.b,
+        B.x, B.y, B.iz, B.uiz, B.viz, B.r, B.g, B.b,
+        C.x, C.y, C.iz, C.uiz, C.viz, C.r, C.g, C.b)) return -1;
+    }
     if (m === 4) {
-      pixels += fillPerspTriRGB(rgb565, cover, rgbDepth, fbW, fbH,
-        tv[0]!, tv[2]!, tv[3]!, mat, alphaQ, blend, depthWrite, win ?? null);
+      const A = tv[0]!, B = tv[2]!, C = tv[3]!;
+      if (!appendTri(A.x, A.y, A.iz, A.uiz, A.viz, A.r, A.g, A.b,
+        B.x, B.y, B.iz, B.uiz, B.viz, B.r, B.g, B.b,
+        C.x, C.y, C.iz, C.uiz, C.viz, C.r, C.g, C.b)) return -1;
     }
   }
+  return emitted;
+}
+
+/** Reused fill triple (avoids per-tri allocation on the inline path). */
+const fillTA: PerspVert = { x: 0, y: 0, iz: 0, uiz: 0, viz: 0, r: 0, g: 0, b: 0 };
+const fillTB: PerspVert = { x: 0, y: 0, iz: 0, uiz: 0, viz: 0, r: 0, g: 0, b: 0 };
+const fillTC: PerspVert = { x: 0, y: 0, iz: 0, uiz: 0, viz: 0, r: 0, g: 0, b: 0 };
+
+function readTri(F: Float64Array, t: number, A: PerspVert, B: PerspVert, C: PerspVert): void {
+  const o = t * TRI_F_PER_TRI;
+  A.x = F[o]!; A.y = F[o + 1]!; A.iz = F[o + 2]!; A.uiz = F[o + 3]!;
+  A.viz = F[o + 4]!; A.r = F[o + 5]!; A.g = F[o + 6]!; A.b = F[o + 7]!;
+  B.x = F[o + 8]!; B.y = F[o + 9]!; B.iz = F[o + 10]!; B.uiz = F[o + 11]!;
+  B.viz = F[o + 12]!; B.r = F[o + 13]!; B.g = F[o + 14]!; B.b = F[o + 15]!;
+  C.x = F[o + 16]!; C.y = F[o + 17]!; C.iz = F[o + 18]!; C.uiz = F[o + 19]!;
+  C.viz = F[o + 20]!; C.r = F[o + 21]!; C.g = F[o + 22]!; C.b = F[o + 23]!;
+}
+
+/**
+ * Fill emitted screen tris [triBase, triBase + triCount) with the
+ * perspective-correct filler (TASK item 2, inline path). Reads the flat
+ * emission buffer (worker or inline scratch), reconstructs the triples
+ * without allocation, and runs the exact fillPerspTriRGB per tri.
+ * Returns the pixel count. Bit-identical to the old direct per-tri fill:
+ * same verts, same order, same material state.
+ */
+export function fillAliasTris(
+  rgb565: Uint16Array,
+  cover: Uint8Array,
+  rgbDepth: Uint16Array,
+  fbW: number,
+  fbH: number,
+  F: Float64Array,
+  triBase: number,
+  triCount: number,
+  mat: RGBMaterial,
+  alphaQ: number,
+  blend: RGBBlend,
+  depthWrite: boolean,
+  win?: RGBWindow | null,
+): number {
+  let pixels = 0;
+  for (let t = triBase; t < triBase + triCount; t++) {
+    readTri(F, t, fillTA, fillTB, fillTC);
+    pixels += fillPerspTriRGB(rgb565, cover, rgbDepth, fbW, fbH,
+      fillTA, fillTB, fillTC, mat, alphaQ, blend, depthWrite, win ?? null);
+  }
   return pixels;
+}
+
+/**
+ * Draw one alias instance into the packed RGB565 plane (perspective-
+ * correct twin of drawAliasInstance). Traversal, frame lerp, near-plane
+ * clip and depthHack scale are identical; only the filler differs
+ * (perspective instead of affine) and Entity.alpha blends instead of
+ * stippling. `dlights` tint vertices per channel (red/blue patches keep
+ * hues); pass null/[] for unlit-by-dynamics. Writes only the RGB565 +
+ * window-Z planes + coverage (the caller hands the RGB-owned planes, never
+ * the software ones, so the indexed path stays bit-identical).
+ *
+ * Implemented as emit-then-fill through the shared preparation
+ * (emitAliasTris) so the worker path stages the identical triangles:
+ * same setup, same order, same fill — output is identical either way.
+ */
+export function drawAliasInstanceRGB(
+  rgb565: Uint16Array,
+  cover: Uint8Array,
+  rgbDepth: Uint16Array,
+  fbW: number,
+  fbH: number,
+  inst: AliasInstance,
+  mat: RGBMaterial,
+  cam: Camera,
+  anorms: Float32Array,
+  shadeDots: Float32Array,
+  dlights: DynamicLight[] | null,
+  win?: RGBWindow | null,
+): number {
+  const alpha = inst.alpha;
+  if (alpha !== undefined && alpha <= 0) return 0;
+  const translucent = alpha !== undefined && Number.isFinite(alpha) && (alpha as number) < 1;
+  const alphaQ = translucent ? Math.round((alpha as number) * 256) : 256;
+  const blend: RGBBlend = translucent ? 'alpha' : 'opaque';
+  const depthWrite = translucent ? false : mat.depthWrite;
+  const cap = Math.max(16, inst.mesh.numTris * 2);
+  ensureAliasEmit(cap);
+  const n = emitAliasTris(inst, cam, anorms, shadeDots, dlights, aliasEmitF, null, 0, cap);
+  if (n < 0) return 0;
+  return fillAliasTris(rgb565, cover, rgbDepth, fbW, fbH,
+    aliasEmitF, 0, n, mat, alphaQ, blend, depthWrite, win ?? null);
 }

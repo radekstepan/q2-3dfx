@@ -4,6 +4,7 @@ declare module 'fs' {
   export function mkdirSync(path: string, opts?: { recursive?: boolean }): void;
   export function writeFileSync(path: string, data: Uint8Array | string): void;
   export function readFileSync(path: string): Uint8Array;
+  export function existsSync(path: string): boolean;
 }
 declare module 'zlib' {
   export function inflateSync(data: Uint8Array): Uint8Array;

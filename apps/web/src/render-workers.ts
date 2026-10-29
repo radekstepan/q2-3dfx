@@ -24,9 +24,11 @@ import {
   CTL_JOB,
   CTL_PIXELS,
   CTL_READY,
+  CTL_RGBBASE,
   CTL_RGBCOUNT,
   CTL_SEQ,
   CTL_SPANS,
+  CTL_TRIS,
   D_HMASK,
   D_LIGHT_H,
   D_LIGHT_OFF,
@@ -69,6 +71,10 @@ import {
   L_W,
   R_CHAIN,
   R_FLAGS,
+  R_FLAG_ADDITIVE,
+  R_FLAG_BLEND_ALPHA,
+  R_FLAG_TRI,
+  R_ALPHAQ,
   R_FLATRGB,
   R_LUX_H,
   R_LUX_OFF,
@@ -105,6 +111,8 @@ import {
   type SpanList,
   type Texture,
   type RGBMipLevel,
+  TRI_I_PER_TRI,
+  TRI_MAX_TRIS,
 } from '@q2/sw-renderer';
 /**
  * Module-namespace probe for renderer-lane layout additions (CTL_SCAN).
@@ -135,10 +143,15 @@ export type DiagJob = 'raster' | 'rgb' | 'resolve' | 'scanout' | 'unknown';
  * include scheduling + postMessage latency, so they bound but do not
  * equal in-worker compute: true per-worker compute durations need
  * worker-side timestamps, which only the renderer lane can add — the
- * worker loop in `@q2/sw-renderer` owns the compute section. `bandIds`,
- * `pixels` and `spans` parallel `arrivals` with the band identity +
- * tallies the worker message carried (-1 when the message omitted them).
- * `slowestMs` is the critical path (dispatch → last completion).
+ * worker loop in `@q2/sw-renderer` owns the compute section.
+ * `workerExecMs` carries those worker-local compute durations when the
+ * worker build posts them (`execMs` on the completion message — a
+ * duration, so it is comparable across time origins without clock
+ * sync); -1 per arrival when the message omitted it (older builds or
+ * control-only stubs). `bandIds`, `pixels` and `spans` parallel
+ * `arrivals` with the band identity + tallies the worker message carried
+ * (-1 when the message omitted them). `slowestMs` is the critical path
+ * (dispatch → last completion).
  */
 export interface DiagSnapshot {
   kicks: number;
@@ -153,6 +166,8 @@ export interface DiagSnapshot {
   bandIds: number[];
   pixels: number[];
   spans: number[];
+  /** Worker-local compute durations parallel to arrivals (-1 when unposted). */
+  workerExecMs: number[];
   slowestMs: number;
 }
 
@@ -229,6 +244,11 @@ export class BrowserBandPool implements BandDispatcher {
    * calling thread's own band work for the same kick. */
   private diagOn = false;
   private readonly diagArrivals: Float64Array;
+  /** Per-arrival worker-local compute durations, parallel to diagArrivals
+   *  (-1 when the completion message carried none). Durations need no
+   *  clock sync (origin-free); they are reported alongside — never fused
+   *  with — the caller-side arrival latencies. */
+  private readonly diagExec: Float64Array;
   /** Per-arrival band identity + tallies, parallel to diagArrivals (-1 when
    *  the worker message carries none — the protocol field exists, older
    *  stubs may omit it; rank order is still arrival order). */
@@ -251,6 +271,19 @@ export class BrowserBandPool implements BandDispatcher {
    *  silent). Read via kickStats() for __q2stats / StageReport. */
   private readonly statKicks = { raster: 0, rgb: 0, resolve: 0, scanout: 0 };
   private readonly statFallbacks = { raster: 0, rgb: 0, resolve: 0, scanout: 0 };
+  /** Staging refusals before dispatch (pool alive, regions exhausted — the
+   *  caller replays pending inline first, so order is preserved). Monotonic;
+   *  read via kickStats().refusals. Dead-pool declines are NOT counted. */
+  private statRgbRefusals = 0;
+  /** Most recent RGB kick outcome (null until the first RGB kick starts).
+   *  `descs` = staged batches the kick covered; `workerCompleted` = every
+   *  worker acked its band (true only then — staging is never counted as
+   *  execution); `mainPixels`/`mainSpans` = the calling thread's own band
+   *  contribution to the same kick. Lets the shell attribute execution
+   *  without mistaking staging for proof. */
+  private lastRgbKick: {
+    descs: number; workerCompleted: boolean; mainPixels: number; mainSpans: number;
+  } | null = null;
   /**
    * Span entries actually inspected by successful pool kicks (Goal B):
    * worker-band sums from the CTL_SCAN slots (present post-rebuild —
@@ -286,14 +319,46 @@ export class BrowserBandPool implements BandDispatcher {
   private texUsed = 0;
   private lightUsed = 0;
   private descCount = 0;
-  /** RGB staging bump offsets (reset by beginFrame/flushRGB). */
+  /** RGB staging bump offsets (reset by beginFrame/commitRGB). */
   private rgbSpansUsed = 0;
   private rgbChainUsed = 0;
   private rgbChainLevels = 0;
   private rgbChainSlots = 0;
   private rgbLuxUsed = 0;
   private rgbDescCount = 0;
+  private rgbTriUsed = 0;
   private rgbChainMap = new Map<RGBMipLevel[], number>();
+  /** Retained-frame watermark: descriptors [0, flushed) hold plane writes. */
+  private rgbFlushedCount = 0;
+  /** Last RGB flush outcome: 'clean' (nothing ran), 'partial' (may have written). */
+  private rgbFailure: 'clean' | 'partial' | null = null;
+  /**
+   * RGB checkpoint/restore (foreground-recovery design, TASK item 1):
+   * owned CPU-side copies of the shared RGB planes taken synchronously on
+   * the main thread BEFORE each RGB kick notifies workers (so no worker
+   * write can precede the snapshot). On kick failure AFTER possible
+   * partial writes (timeout, lost completion) the pool restores the
+   * pre-kick planes, keeps the still-pending descriptors, and returns
+   * null — the caller's `drawInlineRGBAll` then replays the failed kick's
+   * batches exactly once on top of the committed earlier kicks (world
+   * intact, blend order kept, alpha applied once).
+   *
+   * Why a checkpoint instead of replay-all: the pending descriptors cover
+   * only the batches staged since the last successful kick (earlier kicks
+   * already reset the staging), so a plain replay would lose the committed
+   * world; re-running the world would double its cost every recovery.
+   * Why not just drop the clear: that alone does not undo partial worker
+   * writes (already-blended translucent pixels would blend twice).
+   *
+   * `gen` is the frame generation at snapshot time; restore is refused
+   * when the generation moved on (stale recovery racing the next frame).
+   * Allocated lazily on the first RGB kick; discarded on beginFrame,
+   * successful kicks, and inline replays.
+   */
+  private rgbSnap: {
+    rgb565: Uint16Array; cover: Uint8Array; rgbDepth: Uint16Array;
+    gen: number;
+  } | null = null;
 
   private constructor(
     bandCount: number, views: FrameAccumViews, rgbViews: RGBAccumViews, ctl: Int32Array,
@@ -309,6 +374,7 @@ export class BrowserBandPool implements BandDispatcher {
     this.fbW = fbW;
     this.fbH = fbH;
     this.diagArrivals = new Float64Array(Math.max(1, workers.length));
+    this.diagExec = new Float64Array(Math.max(1, workers.length)).fill(-1);
     this.diagBands = new Int32Array(Math.max(1, workers.length));
     this.diagPixels = new Float64Array(Math.max(1, workers.length));
     this.diagSpans = new Float64Array(Math.max(1, workers.length));
@@ -318,17 +384,25 @@ export class BrowserBandPool implements BandDispatcher {
       w.onmessage = (ev: MessageEvent): void => {
         const msg = ev.data as {
           seq?: unknown; ready?: unknown;
-          band?: unknown; pixels?: unknown; spans?: unknown;
+          band?: unknown; pixels?: unknown; spans?: unknown; execMs?: unknown;
         };
         if (!msg || typeof msg !== 'object') return;
         if (msg.ready === true) this.readyCount += 1;
         if (typeof msg.seq === 'number') {
+          // Stale-completion guard: a late arrival for a kick the pool
+          // already abandoned (timeout quarantined it, dispose tore it
+          // down, or the kick already collected) must not resolve anything
+          // or pollute the armed diag snapshot — ignore it. Live kicks
+          // always have a pending entry (registered before the notify).
+          if (!this.pending.has(msg.seq)) return;
           if (this.diagOn && this.diagArrivalsSeen < this.diagArrivals.length) {
             const a = this.diagArrivalsSeen++;
             this.diagArrivals[a] = performance.now() - this.diagKickStart;
             this.diagBands[a] = typeof msg.band === 'number' ? msg.band | 0 : -1;
             this.diagPixels[a] = typeof msg.pixels === 'number' ? msg.pixels : -1;
             this.diagSpans[a] = typeof msg.spans === 'number' ? msg.spans : -1;
+            this.diagExec[a] = typeof msg.execMs === 'number' && Number.isFinite(msg.execMs) && msg.execMs >= 0
+              ? msg.execMs : -1;
           }
           const done = this.pending.get(msg.seq);
           if (done) done(true);
@@ -392,6 +466,10 @@ export class BrowserBandPool implements BandDispatcher {
     this.frameGen += 1;
     this.resetAccum();
     this.resetRGB();
+    // A new frame clears the planes (renderer-owned clear): any checkpoint
+    // from the previous frame is stale by construction (generation guard
+    // would refuse it anyway — drop it eagerly).
+    this.discardSnapshot();
     try {
       Atomics.store(this.ctl, CTL_FRAME, this.frameGen);
     } catch {
@@ -703,17 +781,30 @@ export class BrowserBandPool implements BandDispatcher {
     flags: number, zbits: number, turbPhase: number, flatRGB: number,
   ): boolean {
     if (this.disposed || this.workers.length === 0) return false;
-    if (this.rgbDescCount >= MAX_RGB_BATCHES) return false;
+    // (a) refusal before dispatch: the pool is alive but the regions are
+    // exhausted. Pending staging is untouched — the caller replays it
+    // inline first, so global batch order is preserved. Counted (never
+    // silent) via kickStats().refusals.
+    if (this.rgbDescCount >= MAX_RGB_BATCHES) {
+      this.statRgbRefusals += 1;
+      return false;
+    }
     if (!(spanCount >= 0)) return false;
     if (levels.length < 1 || levels.length > 32) return false;
     if (spanCount > 0) {
-      if (spanStart < 0 || spanCount > MAX_RGB_SPANS - this.rgbSpansUsed) return false;
+      if (spanStart < 0 || spanCount > MAX_RGB_SPANS - this.rgbSpansUsed) {
+        this.statRgbRefusals += 1;
+        return false;
+      }
       const packed = packFrameSpans(
         list, this.rgbViews.spansF, this.rgbViews.spansI,
         this.rgbSpansUsed, this.rgbSpansUsed,
         MAX_RGB_SPANS - this.rgbSpansUsed, spanStart,
       );
-      if (!packed || packed.count !== spanCount) return false;
+      if (!packed || packed.count !== spanCount) {
+        this.statRgbRefusals += 1;
+        return false;
+      }
     }
     let slot = this.rgbChainMap.get(levels);
     if (slot === undefined) {
@@ -761,10 +852,16 @@ export class BrowserBandPool implements BandDispatcher {
         // batches are pending would reuse those slots and corrupt their
         // bytes. Refuse to stage when pending (caller replays inline first);
         // evict-and-retry only when nothing is pending.
-        if (this.rgbDescCount > 0) return false;
+        if (this.rgbDescCount > 0) {
+          this.statRgbRefusals += 1;
+          return false;
+        }
         this.clearRGBChains();
         s = allocChain();
-        if (s === undefined) return false;
+        if (s === undefined) {
+          this.statRgbRefusals += 1;
+          return false;
+        }
       }
       slot = s;
     }
@@ -772,7 +869,10 @@ export class BrowserBandPool implements BandDispatcher {
     if (luxels && luxW > 0 && luxH > 0) {
       const need = luxW * luxH * 3;
       if (luxels.length < need) return false;
-      if (need > RGB_LUX_CAP - this.rgbLuxUsed) return false;
+      if (need > RGB_LUX_CAP - this.rgbLuxUsed) {
+        this.statRgbRefusals += 1;
+        return false;
+      }
       luxOff = this.rgbLuxUsed;
       this.rgbViews.lux.set(luxels.subarray(0, need), luxOff);
       this.rgbLuxUsed += need;
@@ -829,7 +929,12 @@ export class BrowserBandPool implements BandDispatcher {
    * rank-ordered (arrivals[0] = first worker done, arrivals[last] =
    * slowest-band wait for the kick) AND band-attributed (bandIds[i] names
    * the worker that produced arrivals[i]). Unknown stubs that omit the
-   * fields read -1 — rank order still holds.
+   * fields read -1 — rank order still holds. `workerExecMs` carries the
+   * worker-local compute durations when the worker build posts them
+   * (`execMs` on the completion message — a duration, comparable across
+   * time origins); -1 per arrival otherwise. Dispatch-to-completion
+   * latency and worker-local execution are reported side by side, never
+   * fused (different clocks, different meaning).
    *
    * `stagingBytes` reads the live bump offsets (mid-frame view);
    * `kickBytes` returns the snapshot each indexed/RGB flush takes BEFORE
@@ -862,7 +967,8 @@ export class BrowserBandPool implements BandDispatcher {
    * Allocates (diag path only, never the production frame). See
    * DiagSnapshot for the clock-comparability contract: arrivals are
    * dispatch-to-completion latencies (scheduling included), NOT in-worker
-   * compute durations.
+   * compute durations; workerExecMs carries the worker-local durations
+   * when posted (-1 per arrival otherwise).
    */
   diagSnapshot(): DiagSnapshot | null {
     if (!this.diagOn || this.diagKicks === 0) return null;
@@ -870,11 +976,13 @@ export class BrowserBandPool implements BandDispatcher {
     const bandIds: number[] = [];
     const pixels: number[] = [];
     const spans: number[] = [];
+    const workerExecMs: number[] = [];
     for (let i = 0; i < this.diagArrivalsSeen; i++) {
       arrivals.push(this.diagArrivals[i]!);
       bandIds.push(this.diagBands[i]!);
       pixels.push(this.diagPixels[i]!);
       spans.push(this.diagSpans[i]!);
+      workerExecMs.push(this.diagExec[i]!);
     }
     return {
       kicks: this.diagKicks,
@@ -887,6 +995,7 @@ export class BrowserBandPool implements BandDispatcher {
       bandIds,
       pixels,
       spans,
+      workerExecMs,
       slowestMs: arrivals.length > 0 ? arrivals[arrivals.length - 1]! : -1,
     };
   }
@@ -902,6 +1011,14 @@ export class BrowserBandPool implements BandDispatcher {
    * raster/RGB kicks (workers + main band); `scannedAvailable` reports
    * whether the build exposes the counters at all (false on older
    * builds — then `scanned` reads 0 and must NOT be mistaken for proof).
+   *
+   * `refusals.rgb` counts staging refusals before dispatch (pool alive,
+   * regions exhausted — pending preserved for the inline replay).
+   * `lastRgb` is the most recent RGB kick outcome (null until the first
+   * RGB kick): staged-batch count + whether every worker completed the
+   * kick + the calling thread's own band contribution. Staging is never
+   * reported as execution — only `workerCompleted: true` proves workers
+   * rasterised the kick.
    */
   kickStats(): {
     kicks: { raster: number; rgb: number; resolve: number; scanout: number };
@@ -909,6 +1026,8 @@ export class BrowserBandPool implements BandDispatcher {
     scanned: { raster: number; rgb: number };
     scannedAvailable: boolean;
     quarantined: boolean;
+    refusals: { rgb: number };
+    lastRgb: { descs: number; workerCompleted: boolean; mainPixels: number; mainSpans: number } | null;
   } {
     return {
       kicks: { ...this.statKicks },
@@ -916,6 +1035,8 @@ export class BrowserBandPool implements BandDispatcher {
       scanned: { ...this.statScanned },
       scannedAvailable: this.scannedObserved,
       quarantined: this.quarantined,
+      refusals: { rgb: this.statRgbRefusals },
+      lastRgb: this.lastRgbKick === null ? null : { ...this.lastRgbKick },
     };
   }
 
@@ -973,31 +1094,60 @@ export class BrowserBandPool implements BandDispatcher {
    * completion messages (never Atomics.wait — main-thread safe). Resolves
    * null when the pool is dead or the wait times out; the caller replays
    * inline via drawInlineRGBAll, converging to identical planes.
+   *
+   * Recovery semantics (explicit, mirroring the Node pool):
+   * (a) refusal before dispatch (dead pool, nothing staged, workers never
+   *     ready, kick declined) — no worker or main-band write happened, so
+   *     the pending staging is left intact for the inline replay;
+   * (b) failure before any writes — same as (a);
+   * (c) failure after partial execution (timeout / lost completion after
+   *     the main band and some workers already wrote) — the pre-kick
+   *     checkpoint is restored first (undoing every partial write of THIS
+   *     kick while keeping committed earlier kicks), the pending staging
+   *     is left intact, and null is returned so the caller replays the
+   *     failed kick exactly once;
+   * (d) timeout/disposal in flight — the timeout path terminates every
+   *     worker BEFORE the caller replays (no straggler SAB write can race
+   *     the replay or later frames); dispose resolves in-flight kicks as
+   *     failures without quarantining (teardown, not wedged workers).
    */
   async flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number } | null> {
-    if (this.disposed || this.workers.length === 0) return null;
-    if (this.rgbDescCount === 0) return { pixels: 0, spans: 0 };
-    if (!(await this.awaitReadyAsync())) return null;
+    if (this.disposed || this.workers.length === 0 || this.quarantined) { this.rgbFailure = 'clean'; return null; }
+    if (this.rgbDescCount <= this.rgbFlushedCount) return { pixels: 0, spans: 0 };
+    if (!(await this.awaitReadyAsync())) { this.rgbFailure = 'clean'; return null; }
     this.snapKick();
+    // Checkpoint BEFORE any write of this kick (retained suffix may still
+    // need it if the selective replay races a stale writer — quarantine
+    // below guarantees no race, the snapshot is belt-and-braces).
+    this.snapshotRGB();
+    const descs = this.rgbDescCount;
     this.publishRGB(near, far, lodBias);
     const seq = this.seq;
     const finished = this.awaitWorkerMessages(seq, this.workers.length);
     if (!this.kick(seq, 'rgb')) {
       this.pending.delete(seq);
       this.statFallbacks.rgb += 1;
+      this.discardSnapshot();
+      this.lastRgbKick = { descs, workerCompleted: false, mainPixels: 0, mainSpans: 0 };
+      this.rgbFailure = 'clean';
       return null;
     }
-    // Calling thread owns the last band: drain it inline while the workers
-    // drain theirs, then await the workers. Same math, golden-identical.
+    // Calling thread owns the last band: drain its share of the SUFFIX
+    // inline while the workers drain theirs, then await the workers.
     const mainBand = this.bands[this.bands.length - 1]!;
     const diagT0 = this.diagOn ? performance.now() : 0;
     const main = processRGBFrameJob(
       this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, mainBand.y0, mainBand.y1,
+      this.rgbFlushedCount,
     );
     if (this.diagOn) this.diagMainMs = performance.now() - diagT0;
     const ok = await finished;
     if (!ok) {
       this.statFallbacks.rgb += 1;
+      this.restoreSnapshot();
+      this.quarantineWorkers();
+      this.lastRgbKick = { descs, workerCompleted: false, mainPixels: main.pixels, mainSpans: main.spans };
+      this.rgbFailure = 'partial';
       return null;
     }
     this.statKicks.rgb += 1;
@@ -1007,33 +1157,107 @@ export class BrowserBandPool implements BandDispatcher {
     const mScan = scannedOf(main);
     if (mScan.present || this.ctlScanOff() >= 0) this.scannedObserved = true;
     tally.scanned += mScan.value;
+    const mTris = (main as unknown as { tris?: unknown }).tris;
+    const mainTris = typeof mTris === 'number' && Number.isFinite(mTris) ? mTris : 0;
+    tally.tris += mainTris;
     this.statScanned.rgb += tally.scanned;
-    this.resetRGB();
+    this.lastRgbKick = { descs, workerCompleted: true, mainPixels: main.pixels, mainSpans: main.spans };
+    this.discardSnapshot();
+    this.rgbFlushedCount = this.rgbDescCount;
+    this.rgbFailure = null;
     return tally;
   }
 
   /**
-   * Full-frame inline replay of the staged RGB batches on the calling
-   * thread (sync fallback). The planes were cleared in beginFrame; the
-   * replay converges to the identical planes.
+    * Full-frame inline replay of the staged RGB batches on the calling
+    * thread (sync fallback). Never clears: the planes may hold committed
+    * earlier kicks (world) that this replay must preserve, and a failed
+    * kick already restored its checkpoint — so replaying the still-pending
+    * descriptors on top converges depth-guarded to the identical planes.
+   * (The old unconditional clear destroyed world coverage on foreground
+   * recovery and double-blended partial alpha writes.)
    */
   drawInlineRGBAll(near: number, far: number, lodBias: number): { pixels: number; spans: number } {
-    this.rgbViews.cover.fill(0);
-    this.rgbViews.rgbDepth.fill(0xffff);
     this.publishRGB(near, far, lodBias);
     const r = processRGBFrameJob(
-      this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, 0, this.fbH,
+      this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, 0, this.fbH, this.rgbFlushedCount,
     );
-    this.resetRGB();
+    this.discardSnapshot();
+    this.rgbFlushedCount = this.rgbDescCount;
+    this.rgbFailure = null;
     return r;
   }
 
-  /** Publish an RGB-kick descriptor (main side, pre-notify). */
+  /** Checkpoint the shared RGB planes (main thread, pre-kick). Never throws. */
+  private snapshotRGB(): void {
+    try {
+      const n = this.fbW * this.fbH;
+      let snap = this.rgbSnap;
+      if (!snap || snap.rgb565.length !== n) {
+        snap = {
+          rgb565: new Uint16Array(n),
+          cover: new Uint8Array(n),
+          rgbDepth: new Uint16Array(n),
+          gen: this.frameGen,
+        };
+        this.rgbSnap = snap;
+      }
+      snap.rgb565.set(this.rgbViews.rgb565);
+      snap.cover.set(this.rgbViews.cover);
+      snap.rgbDepth.set(this.rgbViews.rgbDepth);
+      snap.gen = this.frameGen;
+    } catch {
+      // Allocation/copy failure: drop the checkpoint. Recovery then falls
+      // back to replay-on-top (correct for failures before writes; a
+      // partial-write failure without a checkpoint can double-blend —
+      // counted as a fallback, never silent; see restoreSnapshot).
+      this.rgbSnap = null;
+    }
+  }
+
+  /** Restore the pre-kick RGB planes when the generation still matches. */
+  private restoreSnapshot(): void {
+    const snap = this.rgbSnap;
+    if (!snap || snap.gen !== this.frameGen) return;
+    try {
+      this.rgbViews.rgb565.set(snap.rgb565);
+      this.rgbViews.cover.set(snap.cover);
+      this.rgbViews.rgbDepth.set(snap.rgbDepth);
+    } catch {
+      /* best effort: the inline replay still converges depth-guarded */
+    }
+  }
+
+  /** Drop the checkpoint (success, inline replay, or new frame). */
+  private discardSnapshot(): void {
+    this.rgbSnap = null;
+  }
+
+  /** Publish an RGB-kick descriptor (main side, pre-notify): suffix [flushed, descCount). */
   private publishRGB(near: number, far: number, lodBias: number): void {
     try {
       Atomics.store(this.ctl, CTL_FBW, this.fbW);
       Atomics.store(this.ctl, CTL_FBH, this.fbH);
       Atomics.store(this.ctl, CTL_JOB, JOB_RGB);
+      Atomics.store(this.ctl, CTL_RGBBASE, this.rgbFlushedCount);
+      Atomics.store(this.ctl, CTL_RGBCOUNT, this.rgbDescCount);
+    } catch {
+      /* ignore */
+    }
+    this.rgbViews.kick[0] = near;
+    this.rgbViews.kick[1] = far;
+    this.rgbViews.kick[2] = lodBias;
+    this.rgbViews.kick[3] = 0;
+    this.seq += 1;
+  }
+
+  /** Publish a full-range RGB descriptor (inline recovery replays [0, descCount) / suffix-aware). */
+  private publishRGBFull(near: number, far: number, lodBias: number): void {
+    try {
+      Atomics.store(this.ctl, CTL_FBW, this.fbW);
+      Atomics.store(this.ctl, CTL_FBH, this.fbH);
+      Atomics.store(this.ctl, CTL_JOB, JOB_RGB);
+      Atomics.store(this.ctl, CTL_RGBBASE, 0);
       Atomics.store(this.ctl, CTL_RGBCOUNT, this.rgbDescCount);
     } catch {
       /* ignore */
@@ -1220,16 +1444,185 @@ export class BrowserBandPool implements BandDispatcher {
     }
   }
 
-  /** Drop staged RGB batches (beginFrame + post-kick reset). */
+  /** Drop staged RGB batches (beginFrame + commitRGB reset). */
   private resetRGB(): void {
     this.rgbSpansUsed = 0;
     this.rgbLuxUsed = 0;
     this.rgbDescCount = 0;
+    this.rgbTriUsed = 0;
+    this.rgbFlushedCount = 0;
+    this.rgbFailure = null;
     try {
       Atomics.store(this.ctl, CTL_RGBCOUNT, 0);
+      Atomics.store(this.ctl, CTL_RGBBASE, 0);
     } catch {
       /* ignore */
     }
+  }
+
+  /** Flat-tri staging cursor (mirrors Node pool): current bump base + cap. */
+  triCursor(): { F: Float64Array; I: Int32Array; base: number; cap: number } | null {
+    if (this.disposed || this.workers.length === 0 || this.quarantined) return null;
+    return {
+      F: this.rgbViews.triF, I: this.rgbViews.triI,
+      base: this.rgbTriUsed, cap: TRI_MAX_TRIS - this.rgbTriUsed,
+    };
+  }
+
+  /** Record one entity's prepared tri batch (mirrors Node pool semantics). */
+  stageTriBatch(
+    triBase: number, triCount: number,
+    levels: RGBMipLevel[],
+    flags: number, zbits: number, alphaQ: number,
+  ): boolean {
+    if (this.disposed || this.workers.length === 0 || this.quarantined) return false;
+    if (this.rgbDescCount >= MAX_RGB_BATCHES) { this.statRgbRefusals += 1; return false; }
+    if (!(triCount >= 0)) return false;
+    if (levels.length < 1 || levels.length > 32) return false;
+    if (triCount > 0) {
+      if (triBase < 0 || triCount > TRI_MAX_TRIS - this.rgbTriUsed) { this.statRgbRefusals += 1; return false; }
+      if (triBase !== this.rgbTriUsed) return false;
+    }
+    let slot = this.rgbChainMap.get(levels);
+    if (slot === undefined) {
+      const allocChain = (): number | undefined => {
+        if (this.rgbChainSlots >= RGB_MAX_CHAINS) return undefined;
+        let bytes = 0;
+        for (let l = 0; l < levels.length; l++) {
+          const lv = levels[l]!;
+          if (!(lv.width >= 1 && lv.height >= 1)) return undefined;
+          if (lv.data.length < lv.width * lv.height * 3) return undefined;
+          if (lv.mask.length < lv.width * lv.height) return undefined;
+          bytes += lv.data.length + lv.mask.length;
+        }
+        if (bytes > RGB_CHAIN_CAP - this.rgbChainUsed) return undefined;
+        if (levels.length > RGB_MAX_LEVELS - this.rgbChainLevels) return undefined;
+        const s = this.rgbChainSlots;
+        const levelBase = this.rgbChainLevels;
+        for (let l = 0; l < levels.length; l++) {
+          const lv = levels[l]!;
+          const dataBytes = lv.data.length;
+          const maskBytes = lv.mask.length;
+          const dataOff = this.rgbChainUsed;
+          this.rgbViews.chainData.set(lv.data, dataOff);
+          const maskOff = dataOff + dataBytes;
+          this.rgbViews.chainData.set(lv.mask, maskOff);
+          const t = (levelBase + l) * L_PER_LEVEL;
+          this.rgbViews.levelTab[t + L_DATA_OFF] = dataOff;
+          this.rgbViews.levelTab[t + L_MASK_OFF] = maskOff;
+          this.rgbViews.levelTab[t + L_W] = lv.width;
+          this.rgbViews.levelTab[t + L_H] = lv.height;
+          this.rgbChainUsed += dataBytes + maskBytes;
+        }
+        const dd = s * C_PER_CHAIN;
+        this.rgbViews.chainDir[dd + C_LEVEL_BASE] = levelBase;
+        this.rgbViews.chainDir[dd + C_LEVEL_COUNT] = levels.length;
+        this.rgbChainLevels += levels.length;
+        this.rgbChainSlots += 1;
+        this.rgbChainMap.set(levels, s);
+        return s;
+      };
+      let s = allocChain();
+      if (s === undefined) {
+        if (this.rgbDescCount > 0) { this.statRgbRefusals += 1; return false; }
+        this.clearRGBChains();
+        s = allocChain();
+        if (s === undefined) { this.statRgbRefusals += 1; return false; }
+      }
+      slot = s;
+    }
+    let ymin = 0, ymax = 0;
+    if (triCount > 0) {
+      ymin = 0x7fffffff;
+      ymax = -0x80000000;
+      for (let t = 0; t < triCount; t++) {
+        const q = (triBase + t) * TRI_I_PER_TRI;
+        const ty0 = this.rgbViews.triI[q]!;
+        const ty1 = this.rgbViews.triI[q + 1]!;
+        if (ty0 < ymin) ymin = ty0;
+        if (ty1 > ymax) ymax = ty1;
+      }
+      if (!(ymax > ymin)) { ymin = 0; ymax = 0; }
+    }
+    const d = this.rgbDescCount * R_PER_BATCH;
+    this.rgbViews.rgbDesc[d + R_SPAN_BASE] = triBase;
+    this.rgbViews.rgbDesc[d + R_SPAN_COUNT] = triCount;
+    this.rgbViews.rgbDesc[d + R_CHAIN] = slot;
+    this.rgbViews.rgbDesc[d + R_LUX_OFF] = 0;
+    this.rgbViews.rgbDesc[d + R_LUX_W] = 0;
+    this.rgbViews.rgbDesc[d + R_LUX_H] = 0;
+    this.rgbViews.rgbDesc[d + R_FLAGS] = flags;
+    this.rgbViews.rgbDesc[d + R_ZBITS] = zbits;
+    this.rgbViews.rgbDesc[d + R_TURBPHASE] = 0;
+    this.rgbViews.rgbDesc[d + R_FLATRGB] = 0;
+    this.rgbViews.rgbDesc[d + R_YMIN] = ymin;
+    this.rgbViews.rgbDesc[d + R_YMAX] = ymax;
+    this.rgbViews.rgbDesc[d + R_ORDERED] = 0;
+    this.rgbViews.rgbDesc[d + R_ALPHAQ] = alphaQ;
+    this.rgbTriUsed += triCount;
+    this.rgbDescCount += 1;
+    return true;
+  }
+
+  /** Applied prefix length: descriptors [0, flushed) already hold plane writes. */
+  rgbFlushed(): number {
+    return this.rgbFlushedCount;
+  }
+
+  /** End-of-frame: drop all retained RGB descriptors (spans/lux/descs/flushed). */
+  commitRGB(): void {
+    this.resetRGB();
+  }
+
+  /** Last RGB flush outcome. */
+  lastRGBFailure(): 'clean' | 'partial' | null {
+    return this.rgbFailure;
+  }
+
+  /**
+   * Complete-frame recovery replay (mirrors Node pool): selective by suffix.
+   * Opaque-only suffix replays in place (no clear); blend suffix clears,
+   * replays prefix, runs seed, replays suffix. Must be called only after
+   * quarantine when writes may have been in flight.
+   */
+  recoverInlineRGBAll(seed: () => void, near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; tris: number } {
+    const flushed = this.rgbFlushedCount < 0 ? 0
+      : this.rgbFlushedCount > this.rgbDescCount ? this.rgbDescCount
+      : this.rgbFlushedCount;
+    let suffixBlends = false;
+    const desc = this.rgbViews.rgbDesc;
+    for (let b = flushed; b < this.rgbDescCount; b++) {
+      const f = desc[b * R_PER_BATCH + R_FLAGS]!;
+      if ((f & (R_FLAG_BLEND_ALPHA | R_FLAG_ADDITIVE)) !== 0) { suffixBlends = true; break; }
+    }
+    this.publishRGBFull(near, far, lodBias);
+    if (!suffixBlends) {
+      const r = this.rgbDescCount > flushed
+        ? processRGBFrameJob(this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, 0, this.fbH, flushed)
+        : { pixels: 0, spans: 0, scanned: 0, tris: 0 };
+      this.discardSnapshot();
+      this.rgbFlushedCount = this.rgbDescCount;
+      this.rgbFailure = null;
+      return r;
+    }
+    this.rgbViews.cover.fill(0);
+    this.rgbViews.rgbDepth.fill(0xffff);
+    const pre = flushed > 0
+      ? processRGBFrameJob(this.rgbViews, this.fbW, this.fbH, flushed, 0, this.fbH)
+      : { pixels: 0, spans: 0, scanned: 0, tris: 0 };
+    try { seed(); } catch { /* seed must not wedge recovery */ }
+    const post = this.rgbDescCount > flushed
+      ? processRGBFrameJob(this.rgbViews, this.fbW, this.fbH, this.rgbDescCount, 0, this.fbH, flushed)
+      : { pixels: 0, spans: 0, scanned: 0, tris: 0 };
+    this.discardSnapshot();
+    this.rgbFlushedCount = this.rgbDescCount;
+    this.rgbFailure = null;
+    return {
+      pixels: pre.pixels + post.pixels,
+      spans: pre.spans + post.spans,
+      scanned: (pre.scanned ?? 0) + (post.scanned ?? 0),
+      tris: (pre.tris ?? 0) + (post.tris ?? 0),
+    };
   }
 
   /** Drop the persistent RGB chain upload cache (palette/world change). */
@@ -1299,14 +1692,13 @@ export class BrowserBandPool implements BandDispatcher {
     return true;
   }
 
-  private tally(): { pixels: number; spans: number; scanned: number } {
+  private tally(): { pixels: number; spans: number; scanned: number; tris: number } {
     // CTL_PIXELS + i / CTL_SPANS + i per-worker tallies (see bands.ts layout).
-    // CTL_SCAN + i per-worker inspected-span counts (renderer lane task 2):
-    // available only post-rebuild (see ctlScanOff) — 0 otherwise, and the
-    // pool reports scannedAvailable so harnesses never mistake 0 for proof.
+    // CTL_SCAN + i per-worker inspected-span counts + CTL_TRIS + i tri counts.
     let pixels = 0;
     let spans = 0;
     let scanned = 0;
+    let tris = 0;
     const off = this.ctlScanOff();
     for (let i = 0; i < this.workers.length; i++) {
       pixels += this.ctl[CTL_PIXELS + i]!;
@@ -1315,8 +1707,12 @@ export class BrowserBandPool implements BandDispatcher {
         const s = this.ctl[off + i]!;
         if (typeof s === 'number' && Number.isFinite(s) && s >= 0) scanned += s;
       }
+      try {
+        const t = this.ctl[CTL_TRIS + i];
+        if (typeof t === 'number' && Number.isFinite(t) && t >= 0) tris += t;
+      } catch { /* older SAB without tri slots */ }
     }
-    return { pixels, spans, scanned };
+    return { pixels, spans, scanned, tris };
   }
 
   /**

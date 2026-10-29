@@ -353,6 +353,8 @@ Budgets: software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480, sta
 cached-pak to first frame. Full history: `docs/perf-ledger.md`.
 Gameplay rules (single-sim, play-verified gate, open/closed lists): `docs/lessons.md`.
 
+> TASK.md remediation 2026-10-28 (items 1–4): implementation complete; correctness verified (`yarn verify` 76/76, pooled≡serial full-RGBA, recovery alpha-once, next-frame); performance measured (Node pooled-7 rgb combat 48.84ms, serial 122ms, sw 20.3ms @640×480; budgets NOT met); target acceptance OPEN (5-min 640×480 browser soak on final code + 60fps/16ms). See `docs/perf-ledger.md` 2026-10-28 TASK row and changesets `sw-renderer-fg-recovery-tris`, `testkit-fg-recovery-harness`.
+
 ---
 
 ## 9. Doc index

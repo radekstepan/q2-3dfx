@@ -14,13 +14,18 @@
 
 import { Com_Error, getCVarNumber, registerCVar } from '@q2/config';
 import {
-  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SPAN_TRANS33, SPAN_TRANS66, SUBDIV, SoftwareBackend, RGBWorldBackend,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SPAN_TRANS33, SPAN_TRANS66, SPAN_ADD, SUBDIV, SoftwareBackend, RGBWorldBackend,
   buildTurbTable,
   runSubdiv16, runSubdivTurbulent, runSpanFlat, sampleLightBlock, textureMasks,
   runSubdivRGBRepeat, runSubdivRGBClamp, runSubdivRGBGeneric, runSpanFlatRGB,
   rgbMipLevel,
   type LightBlock, type RasterBackend, type RGBLightmap, type RGBMaterial, type RGBMipLevel, type RGBWindow, type Span, type SpanList, type Texture,
 } from './spans.js';
+import {
+  fillPerspTriRGB,
+  TRI_F_PER_TRI, TRI_I_PER_TRI, TRI_MAX_TRIS,
+  type PerspVert,
+} from './alias.js';
 import { COLORMAP_SIZE } from './colormap.js';
 
 /** Cvar gating the banded path. 0 = classic single buffer (default); N > 0 = N bands. */
@@ -74,10 +79,28 @@ export const CTL_READY = CTL_SPANS + MAX_WORKERS; // workers entered the wait lo
 export const CTL_FCOUNT = CTL_READY + 1; // frame-accum descriptors for the current kick (0 = single-batch job)
 export const CTL_JOB = CTL_FCOUNT + 1; // kick type: 0 = rasterise, 1 = resolve (palette expand), 2 = RGB raster
 export const CTL_FRAME = CTL_JOB + 1; // frame generation (lazy per-band clear)
-export const CTL_RGBCOUNT = CTL_FRAME + 1; // RGB descriptors for the current kick (JOB_RGB only)
-export const CTL_SCAN = CTL_RGBCOUNT + 1; // base; +MAX_WORKERS per-worker inspected-span counts (subrange proof)
-/** Control block length (CTL_SCAN owns the trailing MAX_WORKERS slots). */
-export const CTL_LEN = CTL_SCAN + MAX_WORKERS;
+export const CTL_RGBCOUNT = CTL_FRAME + 1; // RGB descriptors staged for the current kick (JOB_RGB only)
+/**
+ * First RGB descriptor of the current kick (retained-frame recovery
+ * protocol, TASK item 1): flushes kick the suffix [RGBBASE, RGBCOUNT) —
+ * descriptors the workers have not applied yet — while recovery replays
+ * the full retained range [0, RGBCOUNT). Always 0 on legacy pools (which
+ * reset descriptors on every flush, so suffix == all). Zero-initialised
+ * SABs read 0 here, so older workers that ignore the slot behave exactly
+ * like the legacy full-range kick.
+ */
+export const CTL_RGBBASE = CTL_RGBCOUNT + 1;
+export const CTL_SCAN = CTL_RGBBASE + 1; // base; +MAX_WORKERS per-worker inspected-span counts (subrange proof)
+/**
+ * Base for per-worker completed-tri counts (TASK item 2, worker alias
+ * rasterization): +MAX_WORKERS slots mirroring CTL_PIXELS/CTL_SPANS, so
+ * the pool can attribute worker-completed tris separately from the
+ * calling-thread band (item-3 counters). Zero-initialised SABs read 0 —
+ * older workers that never write these slots report zero worker tris.
+ */
+export const CTL_TRIS = CTL_SCAN + MAX_WORKERS;
+/** Control block length (CTL_TRIS owns the trailing MAX_WORKERS slots). */
+export const CTL_LEN = CTL_TRIS + MAX_WORKERS;
 
 /** Kick types for CTL_JOB ( rasterise spans vs resolve the color plane vs RGB rasterise). */
 export const JOB_RASTER = 0;
@@ -438,8 +461,8 @@ export const RGB_MAX_CHAINS = 256;
 export const RGB_MAX_LEVELS = 2048;
 
 /** Int32 fields per RGB batch descriptor. */
-export const R_SPAN_BASE = 0; // base into rgbSpansF/I
-export const R_SPAN_COUNT = 1; // packed span count
+export const R_SPAN_BASE = 0; // base into rgbSpansF/I (spans) or triF/triI (tris, R_FLAG_TRI)
+export const R_SPAN_COUNT = 1; // packed span count (or tri count for R_FLAG_TRI)
 export const R_CHAIN = 2; // chain directory slot
 export const R_LUX_OFF = 3; // byte offset into the lux region
 export const R_LUX_W = 4;
@@ -456,7 +479,13 @@ export const R_YMAX = 11; // exclusive max span row (band-cull, PERF-5)
  * full-scan fallback. Written by stageRGB inside its band-cull scan.
  */
 export const R_ORDERED = 12;
-export const R_PER_BATCH = 13;
+/**
+ * Per-batch alpha quantum for tri batches (TASK item 2, entity
+ * translucency): 0..256, mirrors the serial alphaQ (256 = opaque).
+ * Span batches reuse the per-kind ratio instead and leave this 0.
+ */
+export const R_ALPHAQ = 13;
+export const R_PER_BATCH = 14;
 
 /** R_FLAGS bits. */
 export const R_FLAG_WARP = 1; // turbulent water (generic effect path)
@@ -486,6 +515,27 @@ export const R_FLAG_OPAQUE = 256;
  * clear (opaque path, identical output).
  */
 export const R_FLAG_BLEND_ALPHA = 512;
+/**
+ * Additive blend (TASK item 2: tracer beams as spans). The batch carries
+ * SPAN_ADD spans that add the sampled texel onto the stored quantum
+ * (mirroring splatRGB) instead of replacing it. Depth-writes like opaque
+ * (R_FLAG_DEPTHWRITE, matching the splat path) when set. Additive writes
+ * are destination-dependent like alpha: the recovery treats them as
+ * blends (suffix scan + blend-after-inline refusal), so they apply
+ * exactly once.
+ */
+export const R_FLAG_ADDITIVE = 1024;
+/**
+ * Triangle batch (TASK item 2, worker model/gun rasterization): the
+ * descriptor carries screen-space triangles (R_FLAG_TRI) instead of
+ * spans. The tri payload lives in the triF/triI regions (see TRI_*), the
+ * material resolves from the chain slot exactly like span batches, and
+ * per-tri alpha rides R_ALPHAQ. Bands are disjoint row ranges, so
+ * concurrent bands never share a pixel; within a band, tris run in
+ * staged (serial) order — opaque + translucent blending, window-Z ties
+ * (first wins) and coverage are bit-identical to the serial fill.
+ */
+export const R_FLAG_TRI = 2048;
 
 /** Int32 fields per chain directory entry. */
 export const C_LEVEL_BASE = 0; // base into the level table
@@ -518,6 +568,8 @@ export interface RGBAccumLayout {
   levelOff: number;
   luxOff: number;
   rgbDescOff: number;
+  triFOff: number;
+  triIOff: number;
   kickOff: number; // Float64 kick params (RGB: near, far, lodBias; scanout: 9 params)
   scan565Off: number; // shared 565 scanout target (Track A)
   scanDisplayOff: number; // shared display scanout plane (Track A)
@@ -537,7 +589,9 @@ export function rgbAccumLayout(w: number, h: number): RGBAccumLayout {
   const levelOff = chainDirOff + RGB_MAX_CHAINS * C_PER_CHAIN * 4;
   const luxOff = levelOff + RGB_MAX_LEVELS * L_PER_LEVEL * 4;
   const rgbDescOff = luxOff + RGB_LUX_CAP;
-  const kickOff = (rgbDescOff + MAX_RGB_BATCHES * R_PER_BATCH * 4 + 7) & ~7;
+  const triFOff = (rgbDescOff + MAX_RGB_BATCHES * R_PER_BATCH * 4 + 7) & ~7;
+  const triIOff = triFOff + TRI_MAX_TRIS * TRI_F_PER_TRI * 8;
+  const kickOff = (triIOff + TRI_MAX_TRIS * TRI_I_PER_TRI * 4 + 7) & ~7;
   // Scanout buffers (Track A parallel scanout): shared 565 target + display
   // plane. The shell adopts these when pooled so workers write the presented
   // frame directly (zero copy); the serial path ignores them.
@@ -546,8 +600,8 @@ export function rgbAccumLayout(w: number, h: number): RGBAccumLayout {
   const total = scanDisplayOff + n * 4;
   return {
     total, rgb565Off, coverOff, rgbDepthOff, spansFOff, spansIOff,
-    chainOff, chainDirOff, levelOff, luxOff, rgbDescOff, kickOff,
-    scan565Off, scanDisplayOff,
+    chainOff, chainDirOff, levelOff, luxOff, rgbDescOff, triFOff, triIOff,
+    kickOff, scan565Off, scanDisplayOff,
   };
 }
 
@@ -567,6 +621,10 @@ export interface RGBAccumViews {
   levelTab: Int32Array;
   lux: Uint8Array;
   rgbDesc: Int32Array;
+  /** Screen-space tri payload (TASK item 2): TRI_MAX_TRIS x TRI_F_PER_TRI f64. */
+  triF: Float64Array;
+  /** Per-tri row bounds (TASK item 2): TRI_MAX_TRIS x TRI_I_PER_TRI i32. */
+  triI: Int32Array;
   /** Per-kick float params (RGB: near/far/lodBias; scanout: 9 params, len 16). */
   kick: Float64Array;
   /** Shared 565 scanout target (Track A parallel scanout). */
@@ -596,6 +654,8 @@ export function attachRGBAccum(
       levelTab: new Int32Array(sab, layout.levelOff, RGB_MAX_LEVELS * L_PER_LEVEL),
       lux: new Uint8Array(sab, layout.luxOff, RGB_LUX_CAP),
       rgbDesc: new Int32Array(sab, layout.rgbDescOff, MAX_RGB_BATCHES * R_PER_BATCH),
+      triF: new Float64Array(sab, layout.triFOff, TRI_MAX_TRIS * TRI_F_PER_TRI),
+      triI: new Int32Array(sab, layout.triIOff, TRI_MAX_TRIS * TRI_I_PER_TRI),
       kick: new Float64Array(sab, layout.kickOff, SCAN_KICK_LEN),
       scan565: new Uint16Array(sab, layout.scan565Off, n),
       scanDisplay: new Uint32Array(sab, layout.scanDisplayOff, n),
@@ -630,9 +690,11 @@ export function packFrameSpans(
     // Opaque/turbulent/flat world spans plus translucent foreground spans
     // (deferred alpha stages into JOB_RGB after the world batches; the
     // indexed raster core below skips TRANS kinds, so indexed output is
-    // unchanged by their presence in the pack).
+    // unchanged by their presence in the pack). Additive tracer spans
+    // ride along for the RGB kick (same transport; the indexed core below
+    // skips them too).
     if (s.kind !== SPAN_OPAQUE && s.kind !== SPAN_TURBULENT && s.kind !== SPAN_FLAT &&
-      s.kind !== SPAN_TRANS33 && s.kind !== SPAN_TRANS66) continue;
+      s.kind !== SPAN_TRANS33 && s.kind !== SPAN_TRANS66 && s.kind !== SPAN_ADD) continue;
     if (p >= cap) return null; // oversize -> inline fallback
     const o = (fBase + p) * F_PER_SPAN;
     F[o] = s.iz; F[o + 1] = s.diz; F[o + 2] = s.uz; F[o + 3] = s.duz;
@@ -902,7 +964,8 @@ export function rasterizePackedRGBRange(
     const origX1 = spansI[q + 3]!;
     const turb = spansI[q + 4]!;
     const isTrans = kind === SPAN_TRANS33 || kind === SPAN_TRANS66;
-    if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT && kind !== SPAN_FLAT && !isTrans) {
+    const isAdd = kind === SPAN_ADD;
+    if (kind !== SPAN_OPAQUE && kind !== SPAN_TURBULENT && kind !== SPAN_FLAT && !isTrans && !isAdd) {
       Com_Error('error', 'rasterizePackedRGBRange: unsupported span kind in RGB worker kick');
     }
     if (y < y0 || y >= y1) continue;
@@ -1016,6 +1079,59 @@ export function rasterizePackedRGBRange(
     drawn++;
   }
   return { pixels, spans: drawn };
+}
+
+// Reused per-tri verts (no per-tri allocation on the worker path — workers
+// are single-threaded, mirroring the jobTex/jobLight pattern).
+const triWA: PerspVert = { x: 0, y: 0, iz: 0, uiz: 0, viz: 0, r: 0, g: 0, b: 0 };
+const triWB: PerspVert = { x: 0, y: 0, iz: 0, uiz: 0, viz: 0, r: 0, g: 0, b: 0 };
+const triWC: PerspVert = { x: 0, y: 0, iz: 0, uiz: 0, viz: 0, r: 0, g: 0, b: 0 };
+// Reused projection window (same matWin pattern as the span core).
+const triWin: { near: number; far: number } = { near: 4, far: 32768 };
+
+/**
+ * Draw one band's share of flat-packed screen tris [start, start+count).
+ * Mirrors the serial alias fill exactly (same fillPerspTriRGB, same args,
+ * same material resolution): the ONLY addition is the y-range band filter
+ * (per-tri staged ymin/ymax) plus the fill's own row clamp — both provably
+ * output-neutral (bands partition rows; the filler is row-independent).
+ * Translucent tris blend with the descriptor's alphaQ and never
+ * depth-write (like the serial entity path); opaque tris depth-write.
+ * No allocation (module scratch triple + window).
+ */
+export function rasterizePackedTRIRange(
+  rgb565: Uint16Array, cover: Uint8Array, rgbDepth: Uint16Array,
+  fbW: number, fbH: number,
+  triF: Float64Array, triI: Int32Array, start: number, count: number,
+  mat: RGBMaterial,
+  alphaQ: number,
+  winNear: number, winFar: number,
+  y0: number, y1: number,
+): { pixels: number; tris: number } {
+  triWin.near = winNear;
+  triWin.far = winFar;
+  const blend = mat.blend === 'alpha' ? 'alpha' : 'opaque';
+  const depthWrite = blend === 'alpha' ? false : mat.depthWrite;
+  let pixels = 0;
+  let drawn = 0;
+  for (let t = start; t < start + count; t++) {
+    const q = t * TRI_I_PER_TRI;
+    const ymin = triI[q]!;
+    const ymax = triI[q + 1]!;
+    if (ymax <= y0 || ymin >= y1) continue;
+    const o = t * TRI_F_PER_TRI;
+    const A = triWA, B = triWB, C = triWC;
+    A.x = triF[o]!; A.y = triF[o + 1]!; A.iz = triF[o + 2]!; A.uiz = triF[o + 3]!;
+    A.viz = triF[o + 4]!; A.r = triF[o + 5]!; A.g = triF[o + 6]!; A.b = triF[o + 7]!;
+    B.x = triF[o + 8]!; B.y = triF[o + 9]!; B.iz = triF[o + 10]!; B.uiz = triF[o + 11]!;
+    B.viz = triF[o + 12]!; B.r = triF[o + 13]!; B.g = triF[o + 14]!; B.b = triF[o + 15]!;
+    C.x = triF[o + 16]!; C.y = triF[o + 17]!; C.iz = triF[o + 18]!; C.uiz = triF[o + 19]!;
+    C.viz = triF[o + 20]!; C.r = triF[o + 21]!; C.g = triF[o + 22]!; C.b = triF[o + 23]!;
+    pixels += fillPerspTriRGB(rgb565, cover, rgbDepth, fbW, fbH,
+      A, B, C, mat, alphaQ, blend, depthWrite, triWin, y0, y1);
+    drawn++;
+  }
+  return { pixels, tris: drawn };
 }
 
 // --- Track A parallel scanout (banded fused pack→recon→gamma) --------------
@@ -1436,7 +1552,8 @@ export function processRGBFrameJob(
   rgb: RGBAccumViews,
   fbW: number, fbH: number, descCount: number,
   y0: number, y1: number,
-): { pixels: number; spans: number; descs: number; spansStaged: number; scanned: number } {
+  descBase = 0,
+): { pixels: number; spans: number; descs: number; spansStaged: number; scanned: number; tris: number; trisStaged: number } {
   const near = rgb.kick[0]!;
   const far = rgb.kick[1]!;
   const lodBias = rgb.kick[2]!;
@@ -1494,7 +1611,10 @@ export function processRGBFrameJob(
   let descs = 0;
   let spansStaged = 0;
   let scanned = 0;
-  for (let b = 0; b < descCount; b++) {
+  let tris = 0;
+  let trisStaged = 0;
+  const b0 = descBase < 0 ? 0 : descBase;
+  for (let b = b0; b < descCount; b++) {
     const d = b * R_PER_BATCH;
     const spanCount = rgb.rgbDesc[d + R_SPAN_COUNT]!;
     if (spanCount <= 0) continue;
@@ -1566,7 +1686,32 @@ export function processRGBFrameJob(
     }
     reuseMat.depthWrite = (flags & R_FLAG_DEPTHWRITE) !== 0;
     reuseMat.opaqueMask = (flags & R_FLAG_OPAQUE) !== 0;
-    reuseMat.blend = (flags & R_FLAG_BLEND_ALPHA) !== 0 ? 'alpha' : 'opaque';
+    reuseMat.blend = (flags & R_FLAG_ADDITIVE) !== 0 ? 'additive'
+      : (flags & R_FLAG_BLEND_ALPHA) !== 0 ? 'alpha' : 'opaque';
+    // Triangle batches (TASK item 2): per-tri ymin/ymax band check, then
+    // the exact alias filler restricted to this band. Material resolves
+    // from the chain slot exactly like span batches; per-batch alpha rides
+    // R_ALPHAQ (entity translucency), depthWrite/blend from flags.
+    if ((flags & R_FLAG_TRI) !== 0) {
+      const triBase = rgb.rgbDesc[d + R_SPAN_BASE]!;
+      const triCount = rgb.rgbDesc[d + R_SPAN_COUNT]!;
+      const alphaQ = rgb.rgbDesc[d + R_ALPHAQ]!;
+      const tr = rasterizePackedTRIRange(
+        rgb.rgb565, rgb.cover, rgb.rgbDepth, fbW, fbH,
+        rgb.triF, rgb.triI, triBase, triCount,
+        reuseMat, alphaQ,
+        near, far,
+        y0, y1,
+      );
+      pixels += tr.pixels;
+      tris += tr.tris;
+      // Unit clarity (item 3): tri batches must not pollute the span
+      // counters — move this descriptor's contribution to trisStaged.
+      // `scanned` counts inspected entries of either kind (documented).
+      spansStaged -= triCount;
+      trisStaged += triCount;
+      continue;
+    }
     const r = rasterizePackedRGBRange(
       rgb.rgb565, rgb.cover, rgb.rgbDepth, fbW, fbH,
       rgb.spansF, rgb.spansI, sBase, sCount,
@@ -1580,7 +1725,7 @@ export function processRGBFrameJob(
     pixels += r.pixels;
     drawn += r.spans;
   }
-  return { pixels, spans: drawn, descs, spansStaged, scanned };
+  return { pixels, spans: drawn, descs, spansStaged, scanned, tris, trisStaged };
 }
 
 /**
@@ -1852,6 +1997,7 @@ export function bandWorkerLoop(
       }
       r = processRGBFrameJob(
         rgb, fbWNow, fbHNow, Atomics.load(ctl, CTL_RGBCOUNT), y0, y1,
+        Atomics.load(ctl, CTL_RGBBASE),
       );
     } else if (job === JOB_SCANOUT) {
       // Scanout kick (Track A): fused pack→recon→gamma from the finished
@@ -1886,6 +2032,13 @@ export function bandWorkerLoop(
     // no spanfill — the dispatcher sums them only for raster/RGB kicks.
     try {
       Atomics.store(ctl, CTL_SCAN + band, r.scanned ?? 0);
+    } catch {
+      /* ignore */
+    }
+    // Completed-screen-tri count for the item-3 worker attribution
+    // (TASK item 2; zero for span-only kicks).
+    try {
+      Atomics.store(ctl, CTL_TRIS + band, (r as { tris?: number }).tris ?? 0);
     } catch {
       /* ignore */
     }
@@ -1976,11 +2129,118 @@ export interface BandDispatcher {
   /** Pending staged RGB batches. */
   rgbPending(): number;
   /** Kick one RGB frame covering every staged batch (blocking). Null = replay inline. */
-  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number } | null;
+  flushRGBFrame(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number } | null;
   /** Same as flushRGBFrame but message-driven (browser async completion). */
-  flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; scanned?: number } | null>;
+  flushRGBFrameAsync(near: number, far: number, lodBias: number): Promise<{ pixels: number; spans: number; scanned?: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number } | null>;
   /** Full-frame inline replay of the staged RGB batches (fallback). */
-  drawInlineRGBAll(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number };
+  drawInlineRGBAll(near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; tris?: number };
+
+  // --- Retained-frame RGB recovery protocol (TASK item 1) ---
+  //
+  // Failure classes (the pool distinguishes, the renderer recovers):
+  //   a. Staging refusal before dispatch (stageRGB false: exhausted
+  //      regions, unsupported material). Nothing staged ran — the suffix
+  //      [flushed, descCount) never executed, so a clear-free ordered
+  //      inline replay of the suffix converges. No quarantine needed.
+  //   b. Failure before any writes (workers never ready, kick declined,
+  //      disposed/quarantined). Same as (a): nothing ran.
+  //   c. Failure after partial execution (kick timeout with workers
+  //      running: some bands blended, incl. translucent alpha whose
+  //      destination pixels are now partially blended). Recovery MUST clear
+  //      the planes and replay the FULL retained range [0, descCount) in
+  //      order with a background seed between the world prefix and the
+  //      foreground suffix — re-blending over partial destinations would
+  //      apply alpha twice. Merely skipping the clear is NOT a fix.
+  //   d. Disposal/timeout while writes may be in flight: quarantine
+  //      (terminate every worker, refuse later kicks) BEFORE the replay,
+  //      so no straggler SAB write can race the recovery or later frames.
+  //
+  // Design (chosen): complete-frame replay with retained descriptors,
+  // selective by suffix content. Descriptors (spans/chains/luxels) are
+  // retained across flushes within a frame — flushes kick only the
+  // unapplied suffix [flushed, descCount) via CTL_RGBBASE and advance
+  // `flushed` on success; commitRGB() at frame end drops the retention.
+  // Recovery replays in exact serial order, ending with flushed ==
+  // descCount, choosing the replay shape by the suffix: an opaque-only
+  // suffix replays in place (no clear — opaque writes are idempotent
+  // under depth-guarded rewrite, and skipping the clear preserves inline
+  // foreground writes that are not retained and could never be replayed:
+  // alias/entities/particles drawn between kicks); a blend-carrying
+  // suffix clears, replays the world prefix, re-seeds the background,
+  // then replays the suffix (re-blending over partial destinations would
+  // apply alpha twice). Checkpoint/restore was rejected (per-flush plane
+  // copies cost more than the rare replay), and per-band recovery cannot
+  // repair blended destinations without the same full replay. All pool
+  // writes stay depth-guarded, so the replay converges to the exact
+  // serial planes: world occlusion, coverage, depth, and exactly-once
+  // alpha. The blend path clears only when no inline write exists: the
+  // renderer refuses to stage blends once direct inline writes happened
+  // (rgbDirectInlineWrites in frame.ts), so the clear can never discard
+  // un-retained work.
+  //
+  // BROWSER MIRROR CONTRACT (browser pool owner): implement the three
+  // optional methods below with the same semantics (suffix kicks via
+  // CTL_RGBBASE, quarantine on timeout — the browser pool already
+  // quarantines — retained descriptors until commitRGB, selective recover:
+  // opaque-only suffix replays in place, blend suffix clears + replays
+  // prefix + seed + suffix). The renderer feature-detects them: pools
+  // without them keep the legacy behaviour (reset-on-flush, full replay
+  // of the pending set). Legacy partial-failure recovery still destroys
+  // already-flushed world work — that gap closes when the browser pool
+  // mirrors this protocol. Never change raster math — transport and
+  // recovery only.
+  //
+  // --- end retained-frame recovery protocol ---
+  //
+  /** Applied prefix length: descriptors [0, flushed) already hold plane writes. Absent = legacy (0 after every flush). */
+  rgbFlushed?(): number;
+  /** End-of-frame: drop all retained RGB descriptors (spans/lux/descs/flushed). Chains persist (cross-frame cache). */
+  commitRGB?(): void;
+  /**
+   * Complete-frame recovery replay on the calling thread (classes a-d):
+   * re-applies the retained descriptors in order with exactly-once
+   * blends, selective by suffix content — an opaque-only unapplied suffix
+   * replays in place (no clear, preserving non-retained inline writes);
+   * a blend-carrying suffix clears, replays the world prefix, runs
+   * `seed`, then replays the suffix. Infallible; the pool must already be
+   * quarantined when writes may have been in flight (the timeout paths
+   * quarantine before returning null — never replay while workers can
+   * still write). Ends with flushed == descCount. Returns the replay
+   * tally.
+   */
+  recoverInlineRGBAll?(seed: () => void, near: number, far: number, lodBias: number): { pixels: number; spans: number; scanned?: number; tris?: number };
+
+  // --- Worker model/gun rasterization (TASK item 2) ---
+  //
+  // Alias (MD2 incl. viewmodel) triangles stage as R_FLAG_TRI batches
+  // into the SAME descriptor table + kick as span batches, in exact serial
+  // order (entity order among descriptors, staged order within). The
+  // worker loop drains them with the exact serial filler
+  // (fillPerspTriRGB) restricted to its band — bit-identical output.
+  // BROWSER MIRROR CONTRACT: implement the two optional methods below
+  // with the same semantics (tri payload regions, same descriptor layout
+  // with R_FLAG_TRI/R_ALPHAQ, same suffix-kick + retained recovery —
+  // processRGBFrameJob already handles TRI descriptors, so only staging
+  // needs mirroring). The renderer feature-detects them and draws inline
+  // when absent (identical output, no workers).
+  //
+  /** Flat-tri staging cursor: current bump base + remaining cap. Null when dead. Never advances (stageTriBatch owns that). */
+  triCursor?(): { F: Float64Array; I: Int32Array; base: number; cap: number } | null;
+  /**
+   * Record one entity's prepared tri batch (triBase/triCount into the
+   * triF/triI regions written via triCursor, chain deduped like span
+   * batches, per-batch alpha for translucency). The pool scans the staged
+   * tri rows for the descriptor y-range union (worker band-cull). Returns
+   * false when the batch must run inline immediately (dead pool,
+   * exhausted regions, too many chains/levels, oversized payload) — the
+   * caller replays pending batches first so global batch order is
+   * preserved. Never throws.
+   */
+  stageTriBatch?(
+    triBase: number, triCount: number,
+    levels: import('./spans.js').RGBMipLevel[],
+    flags: number, zbits: number, alphaQ: number,
+  ): boolean;
   /** Drop the persistent RGB chain upload cache (palette/world change). */
   clearRGBChains(): void;
 }

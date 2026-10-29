@@ -66,6 +66,29 @@ only, so PERF-2/3 can prove wins against it.
 - Fixed cameras also live in `@q2/testkit` (`src/base1-views.ts`) so
   bench, goldens and gates share one definition.
 
+## Controlled comparison (parent-vs-HEAD)
+
+Sequential quiet-machine before/after on identical workloads and settings —
+never concurrent across agents:
+
+- `src/compare.ts` + `compare-run.mjs` + `compare-diff.mjs`.
+- `Q2_PAK=... yarn bench:compare-run` writes `compare-<commit>.json`
+  (`COMPARE_OUT`, `COMPARE_WARMUP=3`, `COMPARE_REPS=5`,
+  `COMPARE_WORKERS="0,1,3,7"`, `COMPARE_YAWSTEP=2`).
+- Copy the file aside, rebuild the other tree, run again, then
+  `COMPARE_BASE=compare-base.json COMPARE_HEAD=compare-head.json yarn bench:compare-diff`.
+- Matrix: software + RGB (voodoo) × serial + 1/3/7 workers ×
+  stationary (spawn-north fixed) + combat (fixed + viewmodel gun + pumped
+  dlights) + moving (deterministic 2°/rep yaw sweep, per-frame hashes stay
+  comparable) × 320×240 (diagnostic) + 640×480 (acceptance).
+- Every run records commit, freshness, machine, node, loadavg, and the full
+  settings; the diff step VERIFIES the settings match and prints per-config
+  frame medians with Δ%, full-channel parity (index + full-RGBA color +
+  full-RGBA display), and execution proof. A settings mismatch voids the
+  comparison (exit 1). Budgets compare only whole production frames —
+  per-rep splits, kick journals, and stage/byte ledgers ride along as
+  diagnostics, never summed into frame totals.
+
 ## Budget acceptance gate (item-9 checklist)
 
 Timing-sensitive budget enforcement lives OUTSIDE vitest (correctness-only

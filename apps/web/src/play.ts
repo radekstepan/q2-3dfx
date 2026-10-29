@@ -4437,6 +4437,9 @@ export interface StageReport {
    * Foreground RGB execution detail (null when the renderer publishes no
    * foreground counter — this HEAD: foreground always rides inline after
    * the world kick, so null is healthy; see the Q2Stats contract note).
+   * Units are batches (not triangles/pixels). `worker` is worker-completed
+   * batches only (legacy-hook fallback: -1 whenever anything staged —
+   * staging is not execution proof).
    */
   fg: { staged: number; worker: number; inline: number; kicks: number } | null;
   /**
@@ -4626,9 +4629,10 @@ export async function measureFrameStages(
   } catch { /* hook absent: null stands */ }
   // Foreground RGB execution detail: prefers the browser-lane hook shape
   // { staged, worker, inline, kicks }; falls back to the renderer-lane
-  // testForegroundWorkerStats { staged, inline, kicks } with worker derived
-  // as staged-when-a-kick-completed (span-based FG rides the JOB_RGB kick,
-  // so a completed kick means staged batches were worker-rendered).
+  // testForegroundWorkerStats { staged, inline, kicks } with worker
+  // reported as unknown (-1) whenever anything staged — staging is not
+  // execution proof, and only the new hook's separately-measured worker
+  // count proves worker rendering (TASK item 3).
   let fg: StageReport['fg'] = null;
   try {
     const hooks = boot.refresh as unknown as {
@@ -4653,9 +4657,13 @@ export async function measureFrameStages(
       const fs = legacy.call(boot.refresh);
       const staged = numOrFinite(fs.staged);
       const kicks = numOrFinite(fs.kicks);
+      // Staging is not execution proof (TASK item 3): report worker as
+      // unknown (-1) whenever anything staged, 0 only when nothing staged.
+      // Only the testRGBForegroundStats hook's separately-measured worker
+      // count proves worker rendering.
       fg = {
         staged,
-        worker: kicks > 0 ? staged : 0,
+        worker: staged > 0 ? -1 : 0,
         inline: numOrFinite(fs.inline),
         kicks,
       };

@@ -3,7 +3,8 @@
 
 import {
   packRGB565, windowDepthQ16,
-  DEFAULT_RGB_FAR, DEFAULT_RGB_NEAR, type RGBWindow,
+  SPAN_OPAQUE, createSpan,
+  DEFAULT_RGB_FAR, DEFAULT_RGB_NEAR, type RGBWindow, type SpanList,
 } from './spans.js';
 
 export interface ScreenParticle {
@@ -142,4 +143,59 @@ export function drawParticlesRGB(
     }
   }
   return drawn;
+}
+
+/**
+ * Emit screen particles as 1x1 opaque spans into `pool` (TASK item 2:
+ * particles ride the RGB worker kick exactly like other spans). Each span
+ * samples the palette chain at (color, 0) with point sampling — the same
+ * quantum drawParticlesRGB writes — and depth-tests/writes identically.
+ * Emission order matches drawParticlesRGB's pixel order, so same-pixel
+ * ties resolve the same way. Returns the emitted span count (pool.count
+ * is set; the caller draws or stages then resets it), or -1 when the
+ * batch does not fit in maxSpans (caller draws inline instead; order is
+ * preserved either way). Unlit, opaque, depth-writing; UVs ride the span
+ * (u = color + 0.5, v = 0.5).
+ */
+export function emitParticleSpans(
+  parts: ScreenParticle[] | { list: ScreenParticle[]; count: number },
+  start: number,
+  end: number,
+  fbW: number,
+  fbH: number,
+  pool: SpanList,
+  maxSpans: number,
+): number {
+  const list = Array.isArray(parts) ? parts : parts.list;
+  const s = Math.max(0, start);
+  const e = Math.min(end, list.length);
+  const spans = pool.spans;
+  let cursor = 0;
+  for (let i = s; i < e; i++) {
+    if (cursor >= maxSpans) { pool.count = 0; return -1; }
+    const p = list[i]!;
+    const x = p.x | 0, y = p.y | 0;
+    if (x < 0 || y < 0 || x >= fbW || y >= fbH) continue;
+    while (spans.length <= cursor) spans.push(createSpan());
+    const q = p.iz;
+    const col = p.color & 255;
+    const sq = spans[cursor++]!;
+    sq.kind = SPAN_OPAQUE;
+    sq.y = y;
+    sq.x0 = x;
+    sq.x1 = x + 1;
+    sq.iz = q;
+    sq.diz = 0;
+    sq.uz = (col + 0.5) * q;
+    sq.duz = 0;
+    sq.vz = 0.5 * q;
+    sq.dvz = 0;
+    sq.light = 63;
+    sq.dlight = 0;
+    sq.lu = 0; sq.lv = -1; sq.dlu = 0; sq.ord = 0;
+    sq.dudy = 0; sq.dvdy = 0;
+    sq.turb = 0;
+  }
+  pool.count = cursor;
+  return cursor;
 }
