@@ -76,6 +76,9 @@ export function createFramebuffer(width: number, height: number, indexed: boolea
   };
 }
 
+// --- GPU scene/backend boundary (GPU-PROOF-2, additive; §6 frozen contracts untouched) ---
+export * from './gpu.js';
+
 // --- Additive glue (M6.1/M7.1 own this file; §6 interfaces above are frozen) ---
 
 /**
