@@ -38,6 +38,16 @@ export {
   type ABLegSpec, type ABEmitOptions,
 } from './ab.js';
 export {
+  GPU_PROOF_WIDTH, GPU_PROOF_HEIGHT, GPU_PROOF_RESOLUTION,
+  GPU_PROOF_VD_KEYS, GPU_PROOF_SW_KEYS, GPU_PROOF_FIDELITY_KEYS, GPU_PROOF_LODBIAS,
+  GPU_PROOF_ORIGIN, GPU_PROOF_YAW_DEG, GPU_PROOF_TIME_S, GPU_PROOF_FOV_X,
+  GPU_PROOF_FRAMES, GPU_PROOF_PERF_FRAMES, GPU_PROOF_PERF_YAW_STEP_DEG,
+  GPU_PROOF_GATE, validateGpuProofBrowserRecord, formatGpuProofGateReport,
+  summarizeGpuProofNode,
+  type GpuProofFrame, type GpuProofGate, type GpuProofBrowserRecord,
+  type GpuProofGateMeasurement, type GpuProofNodeSummary,
+} from './gpu-proof.js';
+export {
   EVIDENCE_MANIFEST_VERSION, BROWSER_SOAK_SCHEMA_VERSION, PROVENANCE_ENV_ALLOWLIST,
   evidenceDir, evidenceRawDir, provenanceEnv, pakIdentity, collectFidelityProfile,
   collectMachine, collectNodeProvenance, defaultResultPath, defaultManifestPath,

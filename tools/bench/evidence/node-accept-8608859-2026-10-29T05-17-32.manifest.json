@@ -1,0 +1,99 @@
+{
+  "manifestVersion": 1,
+  "kind": "node-accept",
+  "date": "2026-10-29T05:17:32.736Z",
+  "command": {
+    "argv": [
+      "/home/radek/.nvm/versions/node/v22.23.4/bin/node",
+      "/home/radek/dev/q2-3dfx/q2ts/tools/bench/bench-accept.mjs"
+    ],
+    "env": {
+      "Q2_PAK": "/home/radek/dev/q2-3dfx/external/q2/baseq2/pak0.pak",
+      "RGB_ACCEPT_WARMUP": "3",
+      "RGB_ACCEPT_REPS": "5",
+      "RGB_ACCEPT_WORKERS": "0,7",
+      "Q2_DETAIL_TIMING": "0"
+    },
+    "cwd": "/home/radek/dev/q2-3dfx/q2ts/tools/bench"
+  },
+  "commitShort": "8608859",
+  "commitFull": "8608859c392a029b258b6c1f0a4c003fc66adb1d",
+  "treeDirty": true,
+  "distFresh": {
+    "fresh": false,
+    "distMtimeMs": 1793250947768.9495,
+    "newestSrcMtimeMs": 1793251042677.1335,
+    "newestSrcFile": "/home/radek/dev/q2-3dfx/q2ts/packages/testkit/src/index.ts"
+  },
+  "pak": {
+    "path": "/home/radek/dev/q2-3dfx/external/q2/baseq2/pak0.pak",
+    "bytes": 183997730,
+    "mtimeMs": 1546741086000,
+    "mtimeIso": "2019-01-06T02:18:06.000Z",
+    "missing": false
+  },
+  "machine": {
+    "platform": "linux",
+    "arch": "x64",
+    "cpus": "8",
+    "cpuModel": "AMD Ryzen 5 PRO 2400G with Radeon Vega Graphics",
+    "node": "v22.23.4",
+    "date": "2026-10-29T05:17:32.743Z",
+    "memTotalMB": "15417",
+    "memFreeMB": "6281",
+    "load1": "7.92",
+    "load5": "6.98",
+    "load15": "6.17",
+    "quietOk": "true"
+  },
+  "node": "v22.23.4",
+  "browser": null,
+  "compositor": null,
+  "loadavg": [
+    7.92,
+    6.98,
+    6.17
+  ],
+  "cpus": 8,
+  "quietOk": true,
+  "fidelity": {
+    "vd": {
+      "vd_gamma": "1.3",
+      "vd_lodbias": "-0.35",
+      "vd_dither": "1",
+      "vd_postfilter": "1",
+      "vd_fog": "1",
+      "vd_16bit": "1",
+      "vd_bilinear": "1",
+      "vd_mipdither": "1",
+      "vd_overbright": "1",
+      "vd_palettetex": "1",
+      "vd_maxtexsize": "256",
+      "vd_zbits": "16",
+      "vd_dithermode": "4x4",
+      "vd_reconmode": "2x2sub+2x2box",
+      "vd_rgbmaxdelta": "8,8,8"
+    },
+    "sw": {
+      "sw_workers": "0",
+      "sw_accum": "0"
+    }
+  },
+  "warmup": 3,
+  "reps": 5,
+  "workers": [
+    0,
+    7
+  ],
+  "resultFile": "/home/radek/dev/q2-3dfx/q2ts/tools/bench/evidence/raw/node-accept-8608859-2026-10-29T05-17-32.json",
+  "summary": {
+    "rows": 16,
+    "maxWorkers": 7,
+    "swFixedSerial640": 31.494448,
+    "rgbFixedSerial640": 175.139353,
+    "rgbCombatPooled640": 66.950747,
+    "timingDetail": "disabled"
+  },
+  "soak": null,
+  "ledgerHint": "| 2026-10-29 | 8608859 | node-accept | 640x480 sw-fixed-serial 31.49ms rgb-fixed-serial 175.14ms rgb-combat-pooled 66.95ms | evidence: /home/radek/dev/q2-3dfx/q2ts/tools/bench/evidence/node-accept-8608859-2026-10-29T05-17-32.manifest.json |"
+}

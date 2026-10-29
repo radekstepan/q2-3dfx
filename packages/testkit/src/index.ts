@@ -19,6 +19,7 @@ export * from './bench-workloads.js';
 export * from './frame-evidence.js';
 export * from './provenance.js';
 export * from './browser-evidence.js';
+export * from './gpu-proof.js';
 
 export const GOLDEN_TOLERANCE_SOFTWARE = 0;
 export const GOLDEN_TOLERANCE_VOODOO_LSB = 1;

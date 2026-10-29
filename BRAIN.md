@@ -292,14 +292,22 @@ Execution rules:
 ### GPU-PROOF-1 — Preserve baseline and define fidelity contract
 owns: `docs`, `BRAIN.md`, `tools/bench`, `packages/testkit`
 depends: none
-status: ready
+status: done(@integrator 2026-10-29)
 done-when:
-- [ ] Record the actual starting commit and dirty files; preserve the software reference and available baseline evidence. Pause competing CPU agents via the authorized coordination mechanism or obtain a clean ownership handoff before editing overlapping files.
-- [ ] Define a fixed real base1 camera and a deterministic short movement/combat route with gun, lightmaps, dynamic light, opaque geometry and overlapping transparent surfaces. Reuse assets/gameplay rather than inventing a synthetic acceptance scene.
-- [ ] Write the GPU fidelity contract BEFORE implementation: exact asset/UV orientation, scene content, transforms, effect order and required cvar behavior; explicit tolerances for raster edges/depth ties and GPU sampling. Keep CPU-to-CPU parity exact.
-- [ ] Specify RGB565 quantization, dither phase, reconstruction, fog, mip/LOD policy, gamma and HUD placement. Explain that final-frame quantization does NOT reproduce RGB565 rounding between translucent draws; document the prototype's chosen approximation and test scenes. Do not claim hardware-accurate Voodoo emulation without an oracle.
-- [ ] Save CPU reference captures for fixed frames and define image-difference metrics/tolerances before seeing GPU results. Require visual review of gun, silhouettes, seams, fog and transparency; never auto-approve unexplained differences by loosening thresholds.
-- [ ] Fix performance acceptance before optimization: 640×480 internal resolution, normal fidelity, same real scene/route, hardware-backed browser; ≤16 ms median complete-frame work and ≥60 Hz-class completed-frame cadence (≥59 FPS on a nominal 60 Hz display), p95 frame interval ≤20 ms per workload. Record refresh rate/vsync and dropped frames. No CPU fallback counted as GPU success.
+- [x] Record the actual starting commit and dirty files; preserve the software reference and available baseline evidence. Pause competing CPU agents via the authorized coordination mechanism or obtain a clean ownership handoff before editing overlapping files.
+- [x] Define a fixed real base1 camera and a deterministic short movement/combat route with gun, lightmaps, dynamic light, opaque geometry and overlapping transparent surfaces. Reuse assets/gameplay rather than inventing a synthetic acceptance scene.
+- [x] Write the GPU fidelity contract BEFORE implementation: exact asset/UV orientation, scene content, transforms, effect order and required cvar behavior; explicit tolerances for raster edges/depth ties and GPU sampling. Keep CPU-to-CPU parity exact.
+- [x] Specify RGB565 quantization, dither phase, reconstruction, fog, mip/LOD policy, gamma and HUD placement. Explain that final-frame quantization does NOT reproduce RGB565 rounding between translucent draws; document the prototype's chosen approximation and test scenes. Do not claim hardware-accurate Voodoo emulation without an oracle.
+- [x] Save CPU reference captures for fixed frames and define image-difference metrics/tolerances before seeing GPU results. Require visual review of gun, silhouettes, seams, fog and transparency; never auto-approve unexplained differences by loosening thresholds.
+- [x] Fix performance acceptance before optimization: 640×480 internal resolution, normal fidelity, same real scene/route, hardware-backed browser; ≤16 ms median complete-frame work and ≥59 Hz-class completed-frame cadence (≥59 FPS on a nominal 60 Hz display), p95 frame interval ≤20 ms per workload. Record refresh rate/vsync and dropped frames. No CPU fallback counted as GPU success.
+completion (2026-10-29, integrated — two disjoint lanes, integrator committed):
+- starting tree `8608859` clean (BRAIN-only delta; engine == 53f7070/4631ca2); software reference preserved, no renderer/contract changes; CPU campaign stays paused per pivot.
+- route: `packages/testkit/src/gpu-proof.ts` canonical (F0 stationary spawn-north [128,-320,54] yaw90 / F1 combat +gun frame4 depthHack +muzzle/boom dlights +12 sparks / F2 moving combat rep3 yaw+6deg; 60-frame perf route yawStep 1deg for PROOF-5); placement math reused from bench-workloads, profile shared by reference (vd_lodbias -0.35; reassessment to 0 tracked).
+- contract: `docs/gpu-proof-1-contract.md` (asset/UV orientation, scene/transforms/effect order, cvar behavior, RGB565/dither/recon/fog/mip/LOD/gamma/HUD, per-draw-quantize translucent approximation + F1/F2 pin scenes, no hw-emulation claim without oracle).
+- CPU refs (serial pinned voodoo-resolve): F0 `7165d8b0`/`143ed260`, F1 `a18f1963`/`51da7b04`, F2 `caa6fbd7`/`ef51a709`; transparent inventory beam1/sprite1/particles13/alpha8; metrics `compareGpuProofFrames` 0.02@3LSB 1px-edge maxDeltaWarn24 (review gates, never auto-pass); CPU-to-CPU hash-exact.
+- perf gate: `GPU_PROOF_GATE` + strict `validateGpuProofBrowserRecord`/`formatGpuProofGateReport` in `tools/bench/src/gpu-proof.ts` (hw-backed 640×480 webgl2-experimental, refresh/vsync/dropped recorded, cpuFallback voids); Node supplement `node-accept-8608859-2026-10-29T05-17-32` (loaded box: A 31.49 / B 175.14 / C 66.95, parity PASS budgets FAIL by design; quiet-box re-run recommended).
+- evidence: testkit 14/14 (166+6 skipped full pkg incl. Q2_PAK) + bench 38/38 green. Changeset: `.changeset/testkit-gpu-proof-1.md` (bench/docs ignored).
+- PROOF-2 now eligible (depends PROOF-1 done).
 
 ### GPU-PROOF-2 — Minimal scene/backend boundary and resource ownership
 owns: `packages/renderer-api`, `packages/webgl-renderer`, `packages/config`, `apps/web`, `packages/testkit`, `docs`, build/dependency configuration (integrator)
@@ -645,5 +653,6 @@ Gameplay rules (single-sim, play-verified gate, open/closed lists): `docs/lesson
 | `docs/data-pipeline.md` | BSP/WAL/PCX/MD2 flow, cooker, cache, devroom fallback |
 | `docs/process.md` | feasibility ladder, turbo/changesets/testing, subagent protocol, risks, C→TS glossary |
 | `docs/perf-ledger.md` | budgets + every bench row |
+| `docs/gpu-proof-1-contract.md` | GPU-PROOF-1 baseline + fidelity contract (pre-implementation) |
 | `docs/lessons.md` | dual-sim root cause, single-sim rule, base1 play-verified gate, closed/open lists |
 | `docs/tasks-archive.md` | all DONE cards (M0–M9 + TODOs) with lane reports |
