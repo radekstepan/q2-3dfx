@@ -231,6 +231,132 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ## 8. Active tasks (everything else is DONE — see `docs/tasks-archive.md`)
 
+### Performance follow-through — authoritative queue after review of `4631ca2` (2026-10-28)
+
+These cards supersede stale performance completion claims below and in `TASK.md`.
+Existing RGB-authoritative rendering, true band subranges, shared ESM/CJS config,
+RGB-first preparation and exact model/gun worker rasterization must be preserved.
+The recorded 48.84 ms Node combat frame is NOT a controlled commit speedup or
+browser acceptance. No new final-code browser soak has established 60 FPS.
+
+Execution contract for this queue:
+- The integrator continuously selects eligible cards, delegates independent work to
+  subagents under §7, integrates, validates and commits, then picks the next card.
+  Do not stop after infrastructure, tests, a partial speedup, or one completed card.
+  No pushing. Preserve unrelated user changes. Subagents do not commit.
+- `ready` means unclaimed; ALL dependencies must be done before implementation.
+  A package has only one writer, including when multiple ready cards name it.
+  Integrator owns BRAIN.md, shared tracking, ledger and changesets; workers report
+  evidence to the integrator instead of editing shared tracking concurrently.
+  Assign/transfer ownership explicitly; ownership is not an external blocker.
+- Agree interfaces before dependent work; apply §5/§7 contract rules. A card owning
+  several packages may be split into disjoint subagent assignments with one owner
+  per package. Coordinate interface changes before parallel implementation.
+- Every card records four separate outcomes: implementation / correctness /
+  performance measurement / target acceptance, each with evidence or explicit N/A.
+  `done` requires every applicable done-when box and evidence links/commands.
+  Unit-test success is not proof of production wiring, race safety or speed.
+- Keep these cards and completion evidence here until PERF-NEXT-8 is done; then
+  archive together. Do not erase an unresolved checkbox by moving/rewording it.
+- Benchmarks run sequentially on a quiet machine. No lower resolution, disabled
+  effects/entities, changed goldens hiding differences, GPU replacement, relaxed
+  budgets, or mock-only production proof. Preserve full-RGBA and depth/coverage.
+- A failed performance gate is a failure, never success “by design”. If acceptance
+  fails, reopen/add a concrete optimization card and continue the profile/change/
+  compare loop. Only a genuine external blocker permits stopping: record the exact
+  missing resource, attempted remedies and dependent cards left open. Slow code,
+  package ownership and unfinished integration are not external blockers.
+
+### PERF-NEXT-1 — Establish reproducible baseline and evidence storage
+owns: `tools/bench`, `packages/testkit`
+depends: none
+status: ready
+done-when:
+- [ ] Capture baseline at `4631ca2` (or explicitly identify any newer starting tree) before implementation benchmarks; use separate checkout/build outputs without disturbing user changes.
+- [ ] Save reproducible commands, commit/build identity, assets, machine/browser versions, fidelity cvars, warmup/reps, load and raw results in durable evidence referenced by the ledger (not only disposable /tmp paths).
+- [ ] Measure matched 640×480 software/Voodoo workloads: stationary, deterministic moving camera, combat with real viewmodel; serial and 1/3/7 workers. Measure whole production frames, full-channel output hashes and fallbacks. 320×240 is diagnostic only.
+- [ ] Record browser baseline separately from Node and distinguish software/headless compositing from hardware-backed browser conditions. Do not infer commit gains from old unmatched ledger rows.
+
+### PERF-NEXT-2 — Make recovery safe against genuinely live writers
+owns: `packages/sw-renderer`, `apps/web`
+depends: PERF-NEXT-1
+status: ready
+starting-points: `bandPool.ts: quarantineWorkers/flushRGBFrame*`; `render-workers.ts: flushRGBFrameAsync/restoreSnapshot/quarantineWorkers`
+done-when:
+- [ ] Node recovery cannot mutate/reuse shared output until old workers provably cannot write. Current `void worker.terminate()` is not a completion fence. Cover both sync and async paths; use an acknowledged stop, completed termination or isolated replacement buffers as appropriate.
+- [ ] Browser recovery stops/isolates writers BEFORE restoring or replaying shared planes; remove the current restore-before-quarantine ordering. Handle timeout, disposal, rejected dispatch and stale completion messages.
+- [ ] Distinguish staging refusal, failure before writes and partial execution; preserve world, inline foreground, blend order and exactly-once alpha/additive contributions. Checkpoint allocation failure must select a correct fallback before dispatch, not best-effort replay over partial writes.
+- [ ] Add deterministic adversarial tests with a REAL worker continuing writes during timeout/recovery, not only scripted workers that have already stopped. Compare RGB565, depth, coverage and full RGBA to serial, including translucent/additive geometry, main-band completion, capacity refusal and the next frame.
+- [ ] Retain existing parity/recovery tests; demonstrate no hang, late mutation or shared-buffer reuse race. Measure successful-path overhead, not just recovery latency.
+
+### PERF-NEXT-3 — Remove per-kick browser checkpoint allocation churn
+owns: `apps/web`
+depends: PERF-NEXT-2
+status: ready
+starting-points: `render-workers.ts: snapshotRGB/discardSnapshot/flushRGBFrameAsync`
+done-when:
+- [ ] Reuse appropriately sized checkpoint storage across successful kicks/frames if checkpoints remain necessary; separate invalidating snapshot contents from freeing storage. Handle resize/disposal without retaining unbounded buffers.
+- [ ] Measure copied/allocated bytes per kick and frame. Current three planes total 1,536,000 bytes per kick at 640×480, up to 6,144,000 bytes across world plus three nonempty foreground kicks; successful kicks currently discard storage.
+- [ ] Evaluate whether retained replay makes some checkpoints unnecessary, or dirty ranges reduce copies. Keep only reductions preserving PERF-NEXT-2 guarantees; do not remove recovery safety to improve benchmarks.
+- [ ] Verify no steady-state checkpoint allocation per kick and bounded memory during resize/soak; publish controlled browser whole-frame and allocation/GC before/after results.
+
+### PERF-NEXT-4 — Wire real worker execution timing end to end
+owns: `packages/sw-renderer`, `apps/web`, `packages/testkit`, `tools/bench`
+depends: PERF-NEXT-2
+status: ready
+starting-points: `bands.ts: bandWorkerLoop`; `render-workers.ts: DiagSnapshot`; `worker-timing.test.ts`; bench attribution
+done-when:
+- [ ] Measure execution inside the PRODUCTION worker loop for world, foreground, resolve and scanout jobs; publish duration plus frame/sequence/job/band identity and actual work counts. Current production completion messages omit execMs although mocks send it.
+- [ ] Wire Node and browser consumers, renderer/test hooks and benchmark/browser reports. Distinguish worker compute, calling-thread band execution and caller dispatch-to-completion latency; never subtract unrelated time origins.
+- [ ] Add integration tests through the real built Node worker and real browser worker entry points; require finite measured durations for executed jobs and correct identity. A test accepting null or supplying synthetic execMs does not close this card.
+- [ ] Instrument geometry/material/staging, worker raster, barriers/idle, scanout, presentation/scheduling and material GC; reconcile per-frame timing without summing independent medians. Attribute every foreground flush, including the placed pass.
+- [ ] Detailed timing can be disabled; run acceptance with it disabled. Publish initial actual critical-path/imbalance measurements to drive PERF-NEXT-6.
+
+### PERF-NEXT-5 — Correct browser worker/main-thread attribution
+owns: `packages/sw-renderer`, `apps/web`, `packages/testkit`, `tools/bench`
+depends: PERF-NEXT-4
+status: ready
+starting-points: `render-workers.ts: flushRGBFrameAsync/tally`; `frame.ts: noteForegroundCompleted`; browser stats
+done-when:
+- [ ] Browser results return workerSpans/workerPixels/workerTris separately from combined totals, matching Node semantics; do not let absent fields imply that the calling-thread band ran on workers.
+- [ ] Audit every primitive class (alias/viewmodel, alpha spans, sprites, particles, beams): prepared/staged, actually completed, main-band, inline and replayed work have explicit units. Mark unavailable attribution unknown, not worker-completed.
+- [ ] Test a nonempty main band and worker bands with actual execution, staged-but-failed jobs, serial viewmodel and fallback. Combined totals reconcile; failure/replay is not reported as successful worker execution.
+- [ ] Update browser stats, bench output and docs consistently. Real-browser viewmodel execution is demonstrated with corrected counters, not inferred from staged alpha batches or fake worker messages.
+
+### PERF-NEXT-6 — Optimize measured barriers and remaining frame cost
+owns: `packages/sw-renderer`, `packages/voodoo`, `apps/web`, `tools/bench`, `packages/testkit`
+depends: PERF-NEXT-3, PERF-NEXT-4, PERF-NEXT-5
+status: ready
+starting-points: `frame.ts: drawForeground/drawForegroundAsync`; RGB span kernels, geometry emission, band scheduling, scanout
+done-when:
+- [ ] Audit all three foreground flush barriers now that exact model/gun work is staged. Combine ordered jobs where safe; retain only barriers required by actual inline/dependency boundaries. Measure kick overhead and tiny jobs; test mixed primitive order and fallback after any batching change.
+- [ ] Use measured per-band compute and idle time to select worker counts/band scheduling; do not assume seven workers is fastest. Compare production browser and Node with the same workload.
+- [ ] Profile and implement the largest remaining whole-frame reductions in RGB span shading/lightmaps, material/descriptor preparation, geometry emission, load imbalance and scanout. Historical GEO ~12–13 ms / DRAW ~34 ms / scanout ~7 ms are leads, not a current additive frame breakdown.
+- [ ] For each candidate record hotspot evidence, changed behavior, controlled before/after whole-frame results and fidelity checks. Reject/revert measured regressions; keep investigating the next hotspot. Exact arithmetic parallelism and justified CPU WASM/SIMD remain available; no GPU substitution.
+- [ ] Achieve the existing ≤16 ms production-frame gate at 640×480 under the defined acceptance workloads/settings, with software unchanged or improved and normal Voodoo fidelity. Gate failure keeps this card open and triggers another concrete optimization iteration.
+
+### PERF-NEXT-7 — Final-code browser acceptance and stability
+owns: `apps/web`, `tools/bench`, `packages/testkit`
+depends: PERF-NEXT-6
+status: ready
+done-when:
+- [ ] Run a NEW ≥5-minute final-code 640×480 browser soak covering stationary, movement and combat with real assets/viewmodel, for software and Voodoo. Old 15 FPS stationary captures and Node tests cannot close this card.
+- [ ] Report completed-frame cadence (not rAF callbacks), frame-time percentiles, exact resolution/cvars, worker count, corrected execution/replay/fallback counters, timing diagnostics, memory/cache trends and screenshots/visual checks. Preserve raw samples and workload intervals.
+- [ ] Demonstrate ≥60 presented FPS for each representative workload with normal fidelity and no sustained decline, missing entities, incomplete frames or unexplained fallback. Distinguish browser/compositor conditions and include simulation, HUD and presentation costs.
+- [ ] If any target fails, leave acceptance open, feed the measured bottleneck back into PERF-NEXT-6 (or a new owned card), implement and repeat final-code validation. No “all tasks done except performance” completion.
+
+### PERF-NEXT-8 — Integrate, reconcile evidence and commit completion
+owns: `BRAIN.md`, `docs`, `.changeset` (integrator only)
+depends: PERF-NEXT-1, PERF-NEXT-2, PERF-NEXT-3, PERF-NEXT-4, PERF-NEXT-5, PERF-NEXT-6, PERF-NEXT-7
+status: ready
+done-when:
+- [ ] Integrator reviews all code and runs yarn verify, yarn deps:check, real-asset base1-gate, Voodoo regression, focused recovery/model/counter/timing/config suites and full-frame acceptance on the integrated tree. Missing assets/skipped required gates are unresolved, not passes.
+- [ ] Preserve full-RGBA, RGB565/depth/coverage parity, odd dimensions, 0/1/3/7-worker coverage and software goldens; investigate every difference rather than repinning unexplained output.
+- [ ] Correct stale PERF-FINISH-A/B/C and TASK completion claims against actual evidence; link baseline/final artifacts and commands in docs/perf-ledger.md. Separate historical data from current measurements and implementation from accepted targets.
+- [ ] Add valid changesets for changed publishable packages and commit intended changes autonomously without pushing; intermediate validated commits are encouraged, do not wait for this final card to commit all work.
+- [ ] Publish commit hashes, changesets, per-card completion matrix, controlled before/after results, live-writer recovery proof, actual worker timing/counter evidence and final browser acceptance. Every review finding is resolved; unresolved items remain visible and cannot be archived as done.
+
+
 ```
 ### PERF-FINISH-A — RGB-authoritative Voodoo + worker ranges + foreground (renderer)
 owns: `packages/sw-renderer`
@@ -239,7 +365,7 @@ status: review
 done-when:
 - [x] Voodoo production skips duplicate classic world+foreground by default with counters proving skipped work; software unchanged
 - [x] Indexed+RGB workers use true per-band span subranges (R_ORDERED/D_ORDERED staged proofs; workers binary-search owned subranges via lowerBoundRow, CTL_SCAN inspected counts; unordered/legacy full-scan fallback identical); 0/1/3/7 scaling measured
-- [x] Foreground span-based work (deferred TRANS alpha, world sprites) stages into the same JOB_RGB kick after world batches with ordering + serial fallback (fgStaged/fgKicks proof, pooled≡serial full-RGBA). OPEN REMAINDER: per-pixel/triangle foreground (alias incl. viewmodel/entities, particles, tracer beams) stays serial (~15ms combat) — needs a SAB tri-descriptor protocol + new worker job type, follow-up card (barycentric→incremental rewrite stays rejected: changed coverage/ties)
+- [x] Foreground span-based work (deferred TRANS alpha, world sprites) stages into the same JOB_RGB kick after world batches with ordering + serial fallback (fgStaged/fgKicks proof, pooled≡serial full-RGBA). UPDATE at 4631ca2: exact alias/model/gun triangles and remaining foreground span classes now stage for workers. Recovery synchronization, production diagnostics and performance acceptance remain open in PERF-NEXT-2 through PERF-NEXT-7; do not reimplement model parallelism
 - [x] Emitter order-validation scans removed at proven sites; GEO re-profiled
 ```
 
@@ -353,7 +479,7 @@ Budgets: software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480, sta
 cached-pak to first frame. Full history: `docs/perf-ledger.md`.
 Gameplay rules (single-sim, play-verified gate, open/closed lists): `docs/lessons.md`.
 
-> TASK.md remediation 2026-10-28 (items 1–4): implementation complete; correctness verified (`yarn verify` 76/76, pooled≡serial full-RGBA, recovery alpha-once, next-frame); performance measured (Node pooled-7 rgb combat 48.84ms, serial 122ms, sw 20.3ms @640×480; budgets NOT met); target acceptance OPEN (5-min 640×480 browser soak on final code + 60fps/16ms). See `docs/perf-ledger.md` 2026-10-28 TASK row and changesets `sw-renderer-fg-recovery-tris`, `testkit-fg-recovery-harness`.
+> Historical TASK.md remediation report at 4631ca2 (not current sign-off): claimed items 1–4 complete; focused correctness suites passed (`yarn verify` 76/76, pooled≡serial full-RGBA, recovery alpha-once, next-frame); performance measured (Node pooled-7 rgb combat 48.84ms, serial 122ms, sw 20.3ms @640×480; budgets NOT met); target acceptance OPEN (5-min 640×480 browser soak on final code + 60fps/16ms). Review found live-writer recovery gaps, per-kick browser checkpoint allocations, absent production worker timings and incorrect browser worker/main attribution; PERF-NEXT-1–8 above govern completion. See `docs/perf-ledger.md` 2026-10-28 TASK row and changesets `sw-renderer-fg-recovery-tris`, `testkit-fg-recovery-harness`.
 
 ---
 
