@@ -1,0 +1,5 @@
+---
+'@q2/webgl-renderer': patch
+---
+
+GPU-FOLLOW-4 (renderer lane): explicit GL lifecycle. Track every owned buffer/texture/FBO/renderbuffer/program and delete same-context objects before replacing ownership (static generations, resize targets, skin/model/sky re-registration, capacity growth, dispose-live) instead of dropping maps and relying on GC; loss/restore/dispose-while-lost drop invalid handles with no GL deletes. Context loss freezes submission (no fallback counted as GPU execution); restoration recompiles programs and replays retained FOLLOW-2A assets. Resize re-syncs viewport, target, camera aspect and status size. Fix first-submit GL 1282: the flat-fill sky pass drew with no texture bound to unit 0 (sampler uMap incomplete on SwiftShader); bind the 1x1 white fallback so the flat fill never draws with an empty unit, with boot-only stage-attributed GL polling isolating future first-submit flags. Adds repeated resize/switch/map/loss cycle tests proving stable live counts and correct output.

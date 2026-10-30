@@ -1,0 +1,5 @@
+---
+'@q2/testkit': patch
+---
+
+GPU-FOLLOW-4: repeated-cycle lifecycle verification (resize/switch/map-replacement/loss-recovery), canvas/listener mirror, switching gate that never counts fallback as GPU execution, and real WEBGL_lose_context browser legs asserting production-canvas GPU identity, frozen submissions while lost, resumed submissions after restore, lifecycle loss/restore counts, restored world/model/skin pixels, single canvas and clean GL. Integrator merge fixes: extension object stashed per-canvas at lose time (re-query on a lost context returns null) and soak reader uses the real `renderer` field; boundary entity-kind pins match by index-stable surfaceId slot (blend sorting breaks positional correspondence); boot GL gate uses fossil discipline (report the sticky first-submit flag, gate on settled cleanliness) with the historical 1282 fixed in-renderer (unbound flat sampler in sky fill); unique per-run browser profile (a fixed dir kept a stale SingletonLock aborting relaunches).

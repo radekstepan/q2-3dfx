@@ -118,7 +118,7 @@ import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
 import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } from './render-workers.js';
 import type { BrowserForegroundDetail, DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
 import { detectGpuCapability, getGpuStatus, resolveBootRenderer } from './gpu-select.js';
-import { acquireGpuCanvas, removeGpuCanvas, setHudTransparent, syncGpuCanvasToHud } from './gpu-canvas.js';
+import { acquireGpuCanvas, attachGpuCanvasLifecycle, hasGpuCanvasLifecycle, removeGpuCanvas, setGpuCanvasSize, setHudTransparent, syncGpuCanvasToHud } from './gpu-canvas.js';
 import { modelKindsForFrame, synthesizeBeamEntities } from './gpu-effects.js';
 import { WebGLRenderer, fullWorldRefs, refreshGpuScene, selectGpuScene } from '@q2/webgl-renderer';
 
@@ -3074,6 +3074,26 @@ export interface GpuBootState {
    * the parallel GL lane lands its setters.
    */
   appearance: GpuAppearanceSnapshot | null;
+  /**
+   * True between `webglcontextlost` and `webglcontextrestored` (GPU-FOLLOW-4):
+   * the GL context is unusable, so `frameGpuPlay` skips submission (returns
+   * null) instead of drawing into a dead context. Set/cleared only by
+   * `notifyGpuContextLost` / `notifyGpuContextRestored`.
+   */
+  contextLost: boolean;
+  /**
+   * Cumulative loss/restore counts (observability for lifecycle tests and
+   * the soak leg): repeated events while already lost/restored never
+   * double-count (see the `notify*` idempotence pins).
+   */
+  lossCount: number;
+  restoreCount: number;
+  /**
+   * Removes the canvas `webglcontextlost`/`webglcontextrestored` listener
+   * pair (null when never wired). Cleared by `unwireGpuLifecycle` before the
+   * backend is disposed so a detached canvas fires nothing.
+   */
+  disposeLifecycle: (() => void) | null;
 }
 
 /**
@@ -3163,10 +3183,10 @@ export function pushGpuAppearance(gpu: object, snapshot: GpuAppearanceSnapshot):
  * - Sprite/particle live-pool mirroring: the renderer supports them and the
  *   page proves them, but the live loop drains only tracer beams per frame
  *   (PROOF-3 report; owner: EXPAND).
- * - Resize handling: boot-time size only; `WebGLRenderer.resize` exists but
- *   the live loop never calls it on canvas change (owner: EXPAND).
- * - Context-loss re-upload: loss records + skips per contract, but the live
- *   loop never re-attaches world/palette/models after restore (owner: EXPAND).
+ * - Context-loss re-upload: loss records + skips per contract, and the live
+ *   loop re-attaches world/palette/models after restore via the retained
+ *   FOLLOW-2A replay (`notifyGpuContextRestored`, GPU-FOLLOW-4 app side).
+ *   Same-context replacement duplication is the GL lane's (renderer.ts).
  * - Hot-swap asset migration: entering webgl2 mid-session attaches world +
  *   palette AND replays the retained MD2/PCX cache under existing handles
  *   (`replayPakAssetsToGpu`, GPU-FOLLOW-2A) — entities no longer stay
@@ -3580,9 +3600,181 @@ function attachGpuBackend(
     } catch {
       /* presentation best-effort: GL scene still submits */
     }
-    return { canvas: acquired.canvas, gl: acquired.gl, gpu, scene, staticScene, loop: createAsyncLoopState(), appearance: null };
+    return { canvas: acquired.canvas, gl: acquired.gl, gpu, scene, staticScene, loop: createAsyncLoopState(), appearance: null, contextLost: false, lossCount: 0, restoreCount: 0, disposeLifecycle: null };
   } catch {
     return null;
+  }
+}
+
+/* --- GPU-FOLLOW-4 app-side lifecycle (owns: apps/web) ----------------------
+ *
+ * Canvas events, safe submission gating, retained-asset restore replay,
+ * backend resize sync and fallback labelling. The backend owns GL
+ * resources (same-context teardown/replacement is the GL lane's); this
+ * layer only drives its committed `handleContextLost` / `handleContextRestored`
+ * / `resize` / `dispose` entry points and replays the FOLLOW-2A retained
+ * cache — asset migration is never rebuilt here.
+ */
+
+/**
+ * Wire the canvas `webglcontextlost`/`webglcontextrestored` pair for a live
+ * GPU boot (GPU-FOLLOW-4 (1)): the lost handler `preventDefault`s (restoration
+ * opt-in) and stops submission via `notifyGpuContextLost`; the restored
+ * handler replays retained assets and resumes via `notifyGpuContextRestored`.
+ * Exactly-once per canvas (re-wire replaces the pair — see
+ * `attachGpuCanvasLifecycle`), so repeated boot/switch cycles never stack
+ * listeners. Returns false (no-op) without a GPU backend. Never throws.
+ */
+export function wireGpuLifecycle(boot: PlayBoot): boolean {
+  const g = boot.gpu;
+  if (!g) return false;
+  try {
+    if (g.disposeLifecycle) {
+      try {
+        g.disposeLifecycle();
+      } catch {
+        /* stale pair removal is best-effort */
+      }
+      g.disposeLifecycle = null;
+    }
+    g.disposeLifecycle = attachGpuCanvasLifecycle(g.canvas, {
+      onLost: () => {
+        notifyGpuContextLost(boot);
+      },
+      onRestored: () => {
+        notifyGpuContextRestored(boot);
+      },
+    });
+    return hasGpuCanvasLifecycle(g.canvas) || g.disposeLifecycle !== null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Remove the canvas lifecycle pair (GPU→CPU switch / teardown): the disposed
+ * backend and removed canvas must fire nothing afterwards. No-op without a
+ * GPU backend. Never throws.
+ */
+export function unwireGpuLifecycle(boot: PlayBoot): void {
+  const g = boot.gpu;
+  if (!g) return;
+  try {
+    if (g.disposeLifecycle) {
+      try {
+        g.disposeLifecycle();
+      } catch {
+        /* removal is best-effort */
+      }
+    }
+  } catch {
+    /* best-effort only */
+  }
+  g.disposeLifecycle = null;
+}
+
+/**
+ * Record a real canvas `webglcontextlost` (or a test-injected equivalent):
+ * mark the boot lost and tell the backend to record + skip. Idempotent —
+ * repeated events while already lost never double-count. Returns false
+ * without a GPU backend or when already lost. Never throws.
+ */
+export function notifyGpuContextLost(boot: PlayBoot): boolean {
+  const g = boot.gpu;
+  if (!g || g.contextLost) return false;
+  g.contextLost = true;
+  g.lossCount++;
+  try {
+    g.gpu.handleContextLost();
+  } catch {
+    /* the backend records loss per contract; the shell flag still gates */
+  }
+  return true;
+}
+
+/**
+ * Recover from a real canvas `webglcontextrestored` (or a test-injected
+ * equivalent): re-create owned targets on the restored context, replay the
+ * retained FOLLOW-2A MD2/PCX cache under the SAME handles (no asset
+ * migration rebuild — `replayPakAssetsToGpu` only re-registers the data the
+ * backend already retains CPU-side), then re-sync the HUD overlay and clear
+ * the lost gate so submission resumes. Idempotent — restores without a
+ * preceding loss (or without a GPU backend) return false and change nothing.
+ * Never throws.
+ */
+export function notifyGpuContextRestored(boot: PlayBoot): boolean {
+  const g = boot.gpu;
+  if (!g || !g.contextLost) return false;
+  try {
+    g.gpu.handleContextRestored(g.gl as unknown as WebGL2RenderingContext);
+  } catch {
+    return false;
+  }
+  // FOLLOW-2A replay reuse: SAME handles, explicit path/handle warnings on
+  // failure (never silent), skipped entries keep their backend warning.
+  if (boot.models) replayPakAssetsToGpu(boot.models, g.gpu);
+  try {
+    syncGpuCanvasToHud(undefined);
+    setHudTransparent(undefined, true);
+  } catch {
+    /* presentation best-effort: the backend still resumes */
+  }
+  g.contextLost = false;
+  g.restoreCount++;
+  return true;
+}
+
+/**
+ * Resize the live GPU drawing surface (GPU-FOLLOW-4 (4)): canvas backing
+ * store + backend viewport/render targets + HUD CSS pair, in that order.
+ * Camera aspect follows the host framebuffer every frame in `frameGpuPlay`,
+ * so callers keep the backend size at the same aspect as the fb. Returns
+ * false (no-op) without a GPU backend or for non-positive integer sizes.
+ * Never throws.
+ */
+export function resizeGpuBackend(boot: PlayBoot, width: number, height: number): boolean {
+  const g = boot.gpu;
+  if (!g) return false;
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return false;
+  try {
+    setGpuCanvasSize(g.canvas, width, height);
+    g.gpu.resize(width, height);
+    syncGpuCanvasToHud(undefined);
+    setHudTransparent(undefined, true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Explicit unsupported-device fallback label (GPU-FOLLOW-4 (2)): non-null
+ * exactly when a `webgl2-experimental` request fell back to a CPU renderer
+ * (the recorded `lastRendererWarning` naming webgl2). Null when the GPU path
+ * is live or was never requested. Never throws.
+ */
+export function gpuFallbackLabel(boot: PlayBoot): string | null {
+  try {
+    if (boot.renderer === 'webgl2-experimental') return null;
+    const w = boot.lastRendererWarning;
+    if (w === null || !w.includes('webgl2')) return null;
+    return w;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * GPU frames submitted on this boot (0 when no GPU backend is attached).
+ * Fallback legs never count as GPU execution: gate benchmark legs on this
+ * (or `getGpuStatus`) instead of the requested cvar alone. Never throws.
+ */
+export function gpuFramesSubmitted(boot: PlayBoot): number {
+  try {
+    const n = boot.gpu?.gpu.getStatus().framesSubmitted;
+    return typeof n === 'number' && Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
   }
 }
 
@@ -3715,6 +3907,9 @@ export function bootPlay(opts: {
   // Arm the raster policy the cvar selects (RGB path on for voodoo, off for
   // software) so a voodoo boot never starts on the wrong backend.
   armRasterPolicy(boot);
+  // GPU-FOLLOW-4 (1): wire the real canvas contextlost/restored pair now that
+  // the boot exists (no-op without a GPU backend; exactly-once per canvas).
+  if (boot.gpu) wireGpuLifecycle(boot);
   // GPU-PROOF-3 live-loop hookup: the backend needs the world + palette for
   // static uploads. GPU-FOLLOW-2A: the retained MD2/PCX cache replays under
   // the SAME handles right after (cold boot shares the hot-swap path).
@@ -3787,6 +3982,9 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
     const attached = attachGpuBackend(boot.driver, boot.host.fb.width, boot.host.fb.height, boot.models);
     if (attached) {
       boot.gpu = attached;
+      // Wire the canvas lifecycle pair for the fresh attach (exactly-once:
+      // re-wiring replaces any stale pair from an undisposed canvas reuse).
+      wireGpuLifecycle(boot);
       // World + palette for the static upload, then the retained MD2/PCX
       // cache replays under the SAME handles (GPU-FOLLOW-2A): no CPU
       // re-registration (no handle drift), no reboot, no reset of the
@@ -3814,6 +4012,10 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
       }
     }
   } else if (kind !== 'webgl2-experimental' && boot.gpu) {
+    // GPU-FOLLOW-4: unwire the canvas lifecycle pair BEFORE disposing so the
+    // detached backend/canvas fire nothing afterwards (no listener leaks
+    // across repeated switch cycles).
+    unwireGpuLifecycle(boot);
     try {
       boot.gpu.gpu.dispose();
     } catch {
@@ -5107,6 +5309,15 @@ export function installGpuWorkConveyor(): () => GpuWorkSplits {
 export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus | null {
   const g = boot.gpu;
   if (!g) return null;
+  // GPU-FOLLOW-4 (1): a lost context submits nothing (safe stop). The sim
+  // clock freezes with it — frames resume via notifyGpuContextRestored.
+  if (g.contextLost) return null;
+  try {
+    if (g.gpu.getStatus().contextLost) return null;
+  } catch {
+    /* a throwing status probe never submits either */
+    return null;
+  }
   const tDrain0 = performance.now();
   // GPU-side dynamic drains (mirror pumpMuzzleLight/pumpExplosionLights/
   // pumpBoltLights/pumpTracers mappings; one-shot queues, so the CPU pumps

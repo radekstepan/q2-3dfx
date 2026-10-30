@@ -273,12 +273,12 @@ correctness. Expensive validation runs sequentially.
 ### GPU-FOLLOW-4 — Finish and validate the uncommitted lifecycle bundle
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`, `packages/config`, `.changeset`
 depends: none (FOLLOW-3 implementation landed in `8fde77f`; appearance defects below)
-status: review (implementation present, focused tests pass; acceptance incomplete)
+status: done (validated 2026-10-30: hermetic 6+16+8+5 green, real-browser 2-cycle loss/restore green with Q2_PAK, typecheck/lint/build + deps:check green)
 done-when:
-- [ ] Review the existing diff/tests/changesets listed in the review document. Verify same-context resource deletion, invalid-handle handling after loss, retained replay, listener cleanup, resize/aspect/HUD alignment and explicit fallback. Correct any actual defects; do not recreate landed machinery.
-- [ ] Strengthen the real-browser test on the production game canvas: assert GPU identity before/after, submissions frozen after the loss event and advancing after restoration, lifecycle counts, and correct restored world/model/skin pixels. A throwaway probe or unchanged renderer label is insufficient. Check repeated resize/switch/map/loss cycles for bounded resources and duplicate canvases/listeners.
-- [ ] Run asset-backed and actual-browser lifecycle gates with Q2_PAK; record browser/device and skips honestly. Isolate the historical first-submit GL 1282 at its originating operation; fix application errors or provide a minimal independently supported driver explanation. Do not hide errors by clearing the queue.
-- [ ] Run `yarn verify` and `yarn deps:check`; reconcile package changesets and commit only the validated lifecycle bundle. Record known sky/water defects separately; this commit is not final renderer acceptance.
+- [x] Review the existing diff/tests/changesets listed in the review document. Verify same-context resource deletion, invalid-handle handling after loss, retained replay, listener cleanup, resize/aspect/HUD alignment and explicit fallback. Correct any actual defects; do not recreate landed machinery.
+- [x] Strengthen the real-browser test on the production game canvas: assert GPU identity before/after, submissions frozen after the loss event and advancing after restoration, lifecycle counts, and correct restored world/model/skin pixels. Throwaway probe or unchanged renderer label is insufficient. Check repeated resize/switch/map/loss cycles for bounded resources and duplicate canvases/listeners.
+- [x] Run asset-backed and actual-browser lifecycle gates with Q2_PAK; record browser/device and skips honestly. Isolate the historical first-submit GL 1282 at its originating operation; fix application errors or provide a minimal independently supported driver explanation. Do not hide errors by clearing the queue.
+- [x] Run `yarn verify` and `yarn deps:check`; reconcile package changesets and commit only the validated lifecycle bundle. Record known sky/water defects separately; this commit is not final renderer acceptance.
 
 ### GPU-FOLLOW-3A — Wire the production sky asset into the GPU renderer
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`

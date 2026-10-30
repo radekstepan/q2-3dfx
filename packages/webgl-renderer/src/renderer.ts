@@ -67,12 +67,20 @@
 //   - small per-frame CPU garbage is accepted (lerp/scratch arrays for the
 //   handful of dynamic entities; static geometry never re-uploads).
 //
-// Lifecycle/status/loss/restore/dispose semantics are EXACTLY the PROOF-2
-// pins (driveLifecycleContract): renderFrame before init throws Com_Error;
-// loss records + skips; empty world (no attached MiniWorld/palette) still
-// clears + submits so the boundary contract holds without assets.
+// Lifecycle/status/loss/restore/dispose semantics (FOLLOW-4 pins):
+// renderFrame before init throws Com_Error; loss records + skips with zero
+// submissions; empty world (no attached MiniWorld/palette) still clears +
+// submits so the boundary contract holds without assets. Same-context
+// replacement (uploadStatic generations, resize targets, registry
+// re-registration, capacity growth) deletes the obsolete GL objects via
+// gl.delete* BEFORE dropping ownership — never drop-and-GC. After context
+// loss every handle is invalid: loss/restore/dispose-while-lost drop without
+// GL deletes (never counted); dispose with a live context deletes everything.
 // Target (re)creation is NOT a texture upload: testUploadStats() counts only
 // static-generation uploads (the upload contract stays pinned).
+// framesSubmitted is the ONLY GPU-execution counter: a lost frame never
+// submits, and the CPU software fallback (outside this backend) never
+// touches it — never count fallback as GPU execution.
 //
 // Normal rendering never reads pixels back (no readPixels anywhere in src/).
 
@@ -331,6 +339,20 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private pointCol: WebGLBuffer | null = null;
   private pointCount = 0;
 
+  // --- FOLLOW-4 explicit GL ownership (same-context deletes, never GC) ---
+  // Every buffer/texture/FBO/renderbuffer/program the renderer creates is
+  // tracked here so replacement (uploadStatic/resize/map switch) deletes the
+  // obsolete same-context object via gl.delete* BEFORE dropping the handle.
+  // After context loss every handle is invalid: loss paths drop the sets
+  // WITHOUT issuing GL deletes (checked via `lost`). All delete* calls are
+  // typeof-guarded so minimal stubs without them stay green.
+  private ownedTex = new Set<WebGLTexture>();
+  private ownedBuf = new Set<WebGLBuffer>();
+  private ownedFbo = new Set<WebGLFramebuffer>();
+  private ownedRb = new Set<WebGLRenderbuffer>();
+  private ownedProg = new Set<WebGLProgram>();
+  private deleteCounts = { textures: 0, buffers: 0, framebuffers: 0, renderbuffers: 0, programs: 0 };
+
   init(gl: WebGL2RenderingContext, width: number, height: number): void {
     this.gl = gl;
     this.width = width;
@@ -340,20 +362,33 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.ready = true;
     this.lost = false;
     this.error = null;
-    // Fresh context => fresh targets: drop previous upload bookkeeping.
+    // Fresh context boundary: previous handles belong to the OLD context and
+    // are invalid here, so drop them WITHOUT GL deletes (never delete one
+    // context's objects through another context's handle).
     this.scene = null;
     this.uploadedGeneration = null;
-    this.clearGLCaches();
+    this.dropGLCaches();
   }
 
   resize(width: number, height: number): void {
     if (width === this.width && height === this.height) return; // no-op
     this.width = width;
     this.height = height;
-    if (this.gl !== null) this.gl.viewport(0, 0, width, height);
-    // The scene target is size-matched: drop it; the next real renderFrame
-    // re-creates it at the new size (no GL calls here — minimal-stub safe).
-    this.target = null;
+    // Viewport + drawing-buffer size stay synchronized here; camera aspect
+    // (setupCamera/buildProjectionMatrix) and the size-matched scene target
+    // re-derive from width/height on the next renderFrame. HUD overlay layout
+    // is owned by apps/web (outside this package): it reads the same size
+    // via getStatus(); see the FOLLOW-4 report for the wiring note.
+    if (this.gl !== null && !this.lost) this.gl.viewport(0, 0, width, height);
+    // Size-matched target: delete the obsolete same-context FBO set BEFORE
+    // dropping it; the next renderFrame re-creates it at the new size. When
+    // lost (handles invalid) or contextless, just drop without GL calls.
+    if (this.target !== null) {
+      const gl = this.gl;
+      if (gl !== null && !this.lost) this.freeTargetObjects(gl, this.target);
+      else this.untrackTarget(this.target);
+      this.target = null;
+    }
   }
 
   setScene(scene: GpuSceneInput): void {
@@ -417,7 +452,10 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       }
     }
     this.models.set(handle, { kind, mesh });
-    this.modelGL.delete(handle);
+    // FOLLOW-4: delete the obsolete same-context uv/index buffers BEFORE
+    // dropping the cache entry (never rely on GC). After loss the handles
+    // are invalid, so just drop.
+    this.freeModelGL(handle);
   }
 
   /**
@@ -439,6 +477,9 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       return false;
     }
     this.skyStrip = { pixels: texels.slice(), tileW, tileH };
+    // FOLLOW-4: delete the obsolete same-context strip texture before
+    // dropping it; the next sky draw re-uploads exactly once.
+    this.freeTexture(this.skyStripTex);
     this.skyStripTex = null;
     return true;
   }
@@ -454,10 +495,14 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       pixels.length !== width * height) {
       this.warn(`registerSkinPixels: invalid ${width}x${height} for handle ${handle} (white fallback)`);
       this.skins.delete(handle);
+      // FOLLOW-4: an invalid re-registration must not leak a live texture.
+      this.freeSkinTex(handle);
       return handle;
     }
     this.skins.set(handle, { texels: pixels.slice(), width, height });
-    this.skinTex.delete(handle);
+    // FOLLOW-4: delete the obsolete same-context texture before dropping the
+    // cache entry; the next draw re-uploads exactly once.
+    this.freeSkinTex(handle);
     return handle;
   }
 
@@ -481,7 +526,9 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     // and only viewport/clear/clearColor run — minimal-stub safe).
     if (this.world && this.palette && (this.scene ?? input.scene)) {
       this.ensurePrograms(gl);
+      this.noteGlErrorAt(gl, 'ensurePrograms');
       if (this.staticDirty) this.uploadStatic(gl, input);
+      this.noteGlErrorAt(gl, 'uploadStatic');
       // Light-style flicker re-bakes the atlas texels only (no re-upload).
       const sig = styleSignature(input.view.lightStyles);
       if (!this.staticDirty && this.atlasTex && this.atlas && sig !== this.styleSig && this.world) {
@@ -502,12 +549,16 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   }
 
   dispose(): void {
-    // Idempotent: releasing twice is safe and never throws. No GL calls
-    // (stub-safe; the context may already be gone).
+    // Idempotent: releasing twice is safe and never throws. When the context
+    // is live (same-context, not lost) delete every owned GL object BEFORE
+    // dropping the handles; after loss (or with no context) the handles are
+    // invalid/gone, so just drop. All delete* calls are typeof-guarded.
+    const gl = this.gl;
+    if (gl !== null && !this.lost) this.freeAllGL();
+    else this.dropGLCaches();
     this.gl = null;
     this.ready = false;
     this.scene = null;
-    this.clearGLCaches();
   }
 
   getStatus(): GpuRendererStatus {
@@ -522,17 +573,29 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   }
 
   handleContextLost(): void {
+    // Stop submission safely: renderFrame checks `lost` and submits nothing
+    // (framesSubmitted frozen, lastError records the loss). Every GL handle
+    // is invalid from here until restoration, so drop the caches WITHOUT GL
+    // deletes — deleting invalid handles would misattribute driver errors.
+    // Retained assets (world/palette/models/skins/entities/scene/registry)
+    // are kept: restoration replays them (FOLLOW-2A), no migration rebuild.
     this.lost = true;
+    this.error = 'WebGLRenderer: context lost (no submit)';
+    this.dropGLCaches();
+    this.staticDirty = true;
   }
 
   handleContextRestored(gl: WebGL2RenderingContext): void {
     this.gl = gl;
     this.lost = false;
-    // Re-create owned targets: re-apply viewport + clear state. Upload
-    // bookkeeping is kept (PROOF-3 re-uploads from the stored scene).
+    // Re-create owned targets: re-apply viewport + clear state. Retained
+    // assets replay on the next renderFrame (ensurePrograms recompiles the
+    // world/model/skin/appearance programs; uploadStatic re-uploads the
+    // stored world + atlas + sky; lazy diffuse/skin/model caches rebuild on
+    // first draw from the retained registries — the FOLLOW-2A replay path).
     gl.viewport(0, 0, this.width, this.height);
     gl.clearColor(CLEAR_R, CLEAR_G, CLEAR_B, CLEAR_A);
-    this.clearGLCaches();
+    this.dropGLCaches();
     this.staticDirty = true;
     this.error = null;
   }
@@ -639,6 +702,28 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     return { diffuseTextures: diffuse, skinTextures: skins, atlas: this.atlasTex !== null, warnings: this.warnings.length };
   }
 
+  /**
+   * FOLLOW-4 test hooks: live owned GL objects (stable across repeated
+   * resize/switch/map/loss cycles) and cumulative same-context deletes.
+   * `framesSubmitted` (getStatus) is the ONLY GPU-execution counter: the
+   * clear-only path submits on GL, a lost frame never submits, and the CPU
+   * software fallback lives outside this backend and never touches it.
+   */
+  testLiveResources(): { textures: number; buffers: number; framebuffers: number; renderbuffers: number; programs: number } {
+    return {
+      textures: this.ownedTex.size,
+      buffers: this.ownedBuf.size,
+      framebuffers: this.ownedFbo.size,
+      renderbuffers: this.ownedRb.size,
+      programs: this.ownedProg.size,
+    };
+  }
+
+  /** Cumulative same-context deletes (loss-drops never count: invalid handles). */
+  testDeleteCounts(): { textures: number; buffers: number; framebuffers: number; renderbuffers: number; programs: number } {
+    return { ...this.deleteCounts };
+  }
+
   private warn(msg: string): void {
     if (!this.warnings.includes(msg)) this.warnings.push(msg);
   }
@@ -648,7 +733,151 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     Com_Error('error', message);
   }
 
-  private clearGLCaches(): void {
+  // --- FOLLOW-4 ownership primitives (all deletes typeof-guarded) ---
+
+  private trackBuf(buf: WebGLBuffer): WebGLBuffer {
+    this.ownedBuf.add(buf);
+    return buf;
+  }
+
+  private trackTex(tex: WebGLTexture): WebGLTexture {
+    this.ownedTex.add(tex);
+    return tex;
+  }
+
+  private trackFbo(fbo: WebGLFramebuffer): WebGLFramebuffer {
+    this.ownedFbo.add(fbo);
+    return fbo;
+  }
+
+  private trackRb(rb: WebGLRenderbuffer): WebGLRenderbuffer {
+    this.ownedRb.add(rb);
+    return rb;
+  }
+
+  private trackProg(prog: WebGLProgram): WebGLProgram {
+    this.ownedProg.add(prog);
+    return prog;
+  }
+
+  /** Same-context buffer delete (no-op when lost/contextless/missing fn). */
+  private freeBuffer(buf: WebGLBuffer | null): void {
+    if (!buf) return;
+    const tracked = this.ownedBuf.has(buf);
+    if (tracked) this.ownedBuf.delete(buf);
+    if (this.lost) return; // invalid handle: drop, never delete, never count
+    const gl = this.gl;
+    if (gl !== null && typeof gl.deleteBuffer === 'function' && tracked) {
+      try {
+        gl.deleteBuffer(buf);
+      } catch {
+        /* delete is best-effort */
+      }
+    }
+    if (tracked) this.deleteCounts.buffers++;
+  }
+
+  /** Same-context texture delete (drops texLevels; no-op when lost). */
+  private freeTexture(tex: WebGLTexture | null): void {
+    if (!tex) return;
+    this.texLevels.delete(tex);
+    const tracked = this.ownedTex.has(tex);
+    if (tracked) this.ownedTex.delete(tex);
+    if (this.lost) return;
+    const gl = this.gl;
+    if (gl !== null && typeof gl.deleteTexture === 'function' && tracked) {
+      try {
+        gl.deleteTexture(tex);
+      } catch {
+        /* delete is best-effort */
+      }
+    }
+    if (tracked) this.deleteCounts.textures++;
+  }
+
+  private freeProgram(prog: WebGLProgram | null): void {
+    if (!prog) return;
+    const tracked = this.ownedProg.has(prog);
+    if (tracked) this.ownedProg.delete(prog);
+    if (this.lost) return;
+    const gl = this.gl;
+    if (gl !== null && typeof gl.deleteProgram === 'function' && tracked) {
+      try {
+        gl.deleteProgram(prog);
+      } catch {
+        /* delete is best-effort */
+      }
+    }
+    if (tracked) this.deleteCounts.programs++;
+  }
+
+  /** Delete one target's FBO set (same-context only; loss path untracks). */
+  private freeTargetObjects(gl: WebGL2RenderingContext, target: SceneTarget): void {
+    if (this.ownedFbo.has(target.fbo)) {
+      this.ownedFbo.delete(target.fbo);
+      if (typeof gl.deleteFramebuffer === 'function') {
+        try {
+          gl.deleteFramebuffer(target.fbo);
+        } catch {
+          /* best-effort */
+        }
+      }
+      this.deleteCounts.framebuffers++;
+    }
+    if (this.ownedTex.has(target.tex)) {
+      this.ownedTex.delete(target.tex);
+      if (typeof gl.deleteTexture === 'function') {
+        try {
+          gl.deleteTexture(target.tex);
+        } catch {
+          /* best-effort */
+        }
+      }
+      this.deleteCounts.textures++;
+    }
+    if (this.ownedRb.has(target.depth)) {
+      this.ownedRb.delete(target.depth);
+      if (typeof gl.deleteRenderbuffer === 'function') {
+        try {
+          gl.deleteRenderbuffer(target.depth);
+        } catch {
+          /* best-effort */
+        }
+      }
+      this.deleteCounts.renderbuffers++;
+    }
+  }
+
+  /** Loss/context-boundary untrack (handles invalid: no GL, no counts). */
+  private untrackTarget(target: SceneTarget): void {
+    this.ownedFbo.delete(target.fbo);
+    this.ownedTex.delete(target.tex);
+    this.ownedRb.delete(target.depth);
+  }
+
+  /** Delete one model cache entry's buffers (same-context; loss just drops). */
+  private freeModelGL(handle: number): void {
+    const entry = this.modelGL.get(handle);
+    if (!entry) return;
+    this.freeBuffer(entry.uvBuf);
+    this.freeBuffer(entry.idxBuf);
+    this.modelGL.delete(handle);
+  }
+
+  /** Delete one skin cache entry's texture (same-context; loss just drops). */
+  private freeSkinTex(handle: number): void {
+    const entry = this.skinTex.get(handle);
+    if (entry === undefined) return;
+    if (entry) this.freeTexture(entry.tex);
+    this.skinTex.delete(handle);
+  }
+
+  /**
+   * Drop every GL cache WITHOUT deletes: context boundary (init), context
+   * loss (handles invalid) and restoration (already empty). Retained assets
+   * (world/palette/models/skins/entities/scene/registry + uploadCount) stay.
+   */
+  private dropGLCaches(): void {
     this.progs = null;
     this.postProg = null;
     this.target = null;
@@ -689,12 +918,90 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.pointPos = null;
     this.pointCol = null;
     this.pointCount = 0;
+    this.ownedTex = new Set();
+    this.ownedBuf = new Set();
+    this.ownedFbo = new Set();
+    this.ownedRb = new Set();
+    this.ownedProg = new Set();
+  }
+
+  /**
+   * Delete every owned GL object via the live same-context handle (dispose
+   * path only: caller guarantees gl !== null && !lost), then drop caches.
+   */
+  private freeAllGL(): void {
+    for (const tex of [...this.diffuseTex.values()]) if (tex) this.freeTexture(tex);
+    for (const entry of [...this.skinTex.values()]) if (entry) this.freeTexture(entry.tex);
+    for (const handle of [...this.modelGL.keys()]) this.freeModelGL(handle);
+    this.freeTexture(this.whiteTex);
+    this.freeTexture(this.atlasTex);
+    this.freeTexture(this.skyStripTex);
+    this.freeBuffer(this.worldPosBuf);
+    this.freeBuffer(this.worldUVBuf);
+    this.freeBuffer(this.worldLUVBuf);
+    this.freeBuffer(this.worldAlphaBuf);
+    this.freeBuffer(this.worldIdxBuf);
+    this.freeBuffer(this.skyPosBuf);
+    this.freeBuffer(this.skyColBuf);
+    this.freeBuffer(this.skyIdxBuf);
+    this.freeBuffer(this.onesBuf);
+    this.freeBuffer(this.dynPos);
+    this.freeBuffer(this.dynShade);
+    this.freeBuffer(this.flatPos);
+    this.freeBuffer(this.flatCol);
+    this.freeBuffer(this.flatUV);
+    this.freeBuffer(this.flatIdx);
+    this.freeBuffer(this.pointPos);
+    this.freeBuffer(this.pointCol);
+    if (this.target && this.gl !== null) this.freeTargetObjects(this.gl, this.target);
+    if (this.progs) {
+      this.freeProgram(this.progs.lit.prog);
+      this.freeProgram(this.progs.alias.prog);
+      this.freeProgram(this.progs.flat.prog);
+    }
+    if (this.postProg) this.freeProgram(this.postProg.prog);
+    this.dropGLCaches();
+  }
+
+  /**
+   * Delete the previous static generation's objects BEFORE uploadStatic
+   * replaces them (same-context; caller guarantees a live context).
+   */
+  private freeStaticGL(): void {
+    for (const tex of [...this.diffuseTex.values()]) if (tex) this.freeTexture(tex);
+    this.diffuseTex = new Map();
+    for (const entry of [...this.skinTex.values()]) if (entry) this.freeTexture(entry.tex);
+    this.skinTex = new Map();
+    for (const handle of [...this.modelGL.keys()]) this.freeModelGL(handle);
+    this.modelGL = new Map();
+    this.freeTexture(this.whiteTex);
+    this.whiteTex = null;
+    this.freeBuffer(this.onesBuf);
+    this.onesBuf = null;
+    this.freeBuffer(this.worldPosBuf);
+    this.freeBuffer(this.worldUVBuf);
+    this.freeBuffer(this.worldLUVBuf);
+    this.freeBuffer(this.worldAlphaBuf);
+    this.freeBuffer(this.worldIdxBuf);
+    this.worldPosBuf = null;
+    this.worldUVBuf = null;
+    this.worldLUVBuf = null;
+    this.worldAlphaBuf = null;
+    this.worldIdxBuf = null;
+    this.freeBuffer(this.skyPosBuf);
+    this.freeBuffer(this.skyColBuf);
+    this.freeBuffer(this.skyIdxBuf);
+    this.skyPosBuf = null;
+    this.skyColBuf = null;
+    this.skyIdxBuf = null;
+    this.freeTexture(this.atlasTex);
+    this.atlasTex = null;
   }
 
   private ensurePrograms(gl: WebGL2RenderingContext): void {
     if (this.progs && this.postProg) return;
     const locs = (vs: string, fs: string): ProgLocs => {
-      const prog = compileProgram(gl, vs, fs);
+      const prog = this.trackProg(compileProgram(gl, vs, fs));
       const L = (name: string): WebGLUniformLocation | null => gl.getUniformLocation(prog, name);
       return {
         prog,
@@ -729,7 +1036,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
         this.progs = { lit: locs(VS_LIT, FS_LIT), alias: locs(VS_ALIAS, FS_ALIAS), flat: locs(VS_FLAT, FS_FLAT) };
       }
       if (!this.postProg) {
-        const prog = compileProgram(gl, VS_POST, FS_APPEARANCE);
+        const prog = this.trackProg(compileProgram(gl, VS_POST, FS_APPEARANCE));
         const L = (name: string): WebGLUniformLocation | null => gl.getUniformLocation(prog, name);
         this.postProg = {
           prog,
@@ -759,13 +1066,9 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const world = this.world;
     const palette = this.palette;
     if (!world || !palette) return;
-    // Fresh GL objects for this generation (same-context re-upload leaks by
-    // design — generations change on map switch only).
-    this.diffuseTex = new Map();
-    this.skinTex = new Map();
-    this.modelGL = new Map();
-    this.whiteTex = null;
-    this.onesBuf = null;
+    // Map replacement: delete the previous generation's same-context objects
+    // BEFORE replacing ownership (never drop maps/targets and rely on GC).
+    this.freeStaticGL();
 
     // Full inventory: every triangulable surface id (selection-independent).
     const allIds: number[] = [];
@@ -818,13 +1121,16 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     }
     this.skyColBuf = this.createStaticBuffer(gl, skyCol);
     this.skyIdxBuf = this.createStaticIndexBuffer(gl, store.sky.indices);
+    this.noteGlErrorAt(gl, 'uploadStatic-buffers');
     this.atlasTex = this.uploadTexture(gl, atlas.pixels, atlas.width, atlas.height);
+    this.noteGlErrorAt(gl, 'uploadStatic-atlas');
     this.staticDirty = false;
   }
 
   private createStaticBuffer(gl: WebGL2RenderingContext, data: Float32Array): WebGLBuffer {
     const buf = gl.createBuffer();
     if (!buf) this.fail('WebGLRenderer.uploadStatic: createBuffer returned null');
+    this.trackBuf(buf);
     gl.bindBuffer(gl.ARRAY_BUFFER, buf);
     gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
     return buf;
@@ -833,9 +1139,36 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private createStaticIndexBuffer(gl: WebGL2RenderingContext, data: Uint32Array): WebGLBuffer {
     const buf = gl.createBuffer();
     if (!buf) this.fail('WebGLRenderer.uploadStatic: createBuffer returned null');
+    this.trackBuf(buf);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buf);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, data, gl.STATIC_DRAW);
     return buf;
+  }
+
+  /**
+   * First-submit GL error isolation (FOLLOW-4): poll one error flag after a
+   * named stage during the boot frames only (uploadCount<=1, submitted<3).
+   * Records a stage-attributed warning instead of letting the flag surface
+   * later as a "pre-existing" mystery at the first texture upload. Steady
+   * state never polls (no per-frame getError cost).
+   */
+  private noteGlErrorAt(gl: WebGL2RenderingContext, stage: string): void {
+    if (this.uploadCount > 1 || this.submitted >= 3) return;
+    if (typeof (gl as unknown as { getError?: unknown }).getError !== 'function') return;
+    try {
+      // Drain-loop (not a single poll): GL implementations may hold several
+      // pending flags and getError clears only one per call. A single poll
+      // would leave backlog that a later poll misattributes, so report every
+      // drained flag with this stage and clear the queue fully.
+      for (let i = 0; i < 8; i++) {
+        const err = gl.getError();
+        if (err === 0) break;
+        this.warn(`first-submit GL error ${err} at ${stage} (isolated, drained here)`);
+        if (i === 7) this.warn(`first-submit GL error queue overflow at ${stage} (8+ flags pending)`);
+      }
+    } catch {
+      /* best-effort */
+    }
   }
 
   /**
@@ -936,6 +1269,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   ): WebGLTexture {
     const tex = gl.createTexture();
     if (!tex) this.fail('WebGLRenderer.uploadStatic: createTexture returned null');
+    this.trackTex(tex);
     const ap = this.apFrame;
     const linear = ap ? ap.bilinear : true;
     const min = linear ? gl.LINEAR : gl.NEAREST;
@@ -1074,6 +1408,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     if (!this.onesBuf) {
       this.onesBuf = gl.createBuffer();
       if (!this.onesBuf) return null;
+      this.trackBuf(this.onesBuf);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.onesBuf);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(4096).fill(1), gl.STATIC_DRAW);
     }
@@ -1111,6 +1446,9 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       this.uploadPixels(gl, 0, atlas.width, atlas.height, atlas.pixels);
       this.atlas.pixels = atlas.pixels;
     } else {
+      // Size change: delete the obsolete same-context atlas texture BEFORE
+      // replacing ownership (in-place texel path above reuses the object).
+      this.freeTexture(this.atlasTex);
       this.atlasTex = this.uploadTexture(gl, atlas.pixels, atlas.width, atlas.height);
       this.atlas = atlas;
     }
@@ -1142,6 +1480,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     // resolves it to the canvas. Without FBO support (minimal stubs) fall
     // back to direct rendering (documented stub-compat path).
     const useTarget = this.ensureTargets(gl);
+    this.noteGlErrorAt(gl, 'drawScene-targets');
     const target = useTarget ? this.target : null;
     if (target) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
@@ -1152,6 +1491,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LESS);
+    this.noteGlErrorAt(gl, 'drawScene-clear');
 
     // FOLLOW-2: draw the SUBMITTED selection (input.scene), not a baked batch
     // set. The play layer refreshes this every frame the camera moves, so
@@ -1170,6 +1510,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       if (flat.uPointSize) gl.uniform1f(flat.uPointSize, 1);
       if (flat.uTextured) gl.uniform1i(flat.uTextured, 0);
       gl.depthMask(false);
+      this.noteGlErrorAt(gl, 'drawScene-sky-setup');
       const hasSky = scene.surfaces.some((r) => r.material === 'sky' && r.transformIndex === 0);
       const strip = hasSky ? this.skyStripFor(gl) : null;
       if (strip && this.skyStrip) {
@@ -1188,6 +1529,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       }
       gl.depthMask(true);
     }
+    this.noteGlErrorAt(gl, 'drawScene-sky');
 
     // Opaque pass in scene order (world ranges + opaque entities; depth
     // test on, depth write on). Beams always ride the blend pass below, and
@@ -1199,6 +1541,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       this.setLights(gl, lit, lights);
       this.setVoodooPolicy(gl, lit);
       this.bindLightmap(gl, lit);
+      this.noteGlErrorAt(gl, 'drawScene-opaque-setup');
       gl.depthMask(true);
       for (const ref of scene.surfaces) {
         if (ref.transparent || ref.material === 'sky') continue;
@@ -1340,9 +1683,10 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     if (this.target && this.target.w === this.width && this.target.h === this.height && this.target.float === wantFloat) {
       return true;
     }
-    // (Re)create at the current size. Old GL objects die with the context
-    // semantics here: same-context recreates leak by design (resize/map
-    // change only); contexts themselves are dropped on dispose/restore.
+    // (Re)create at the current size: delete the obsolete same-context FBO
+    // set BEFORE replacing ownership (resize path already freed its target;
+    // this covers capability flips and first creation where target is null).
+    if (this.target) this.freeTargetObjects(gl, this.target);
     const tex = gl.createTexture();
     const depth = gl.createRenderbuffer();
     const fbo = gl.createFramebuffer();
@@ -1374,6 +1718,9 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       this.fail(`WebGLRenderer.ensureTargets: framebuffer incomplete (${status})`);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.trackTex(tex);
+    this.trackRb(depth);
+    this.trackFbo(fbo);
     this.target = { fbo, tex, depth, w: this.width, h: this.height, float: wantFloat };
     return true;
   }
@@ -1628,6 +1975,15 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const range = this.skyRanges.get(surfaceId);
     if (!range) return;
     if (!this.skyPosBuf || !this.skyColBuf || !this.skyIdxBuf) return;
+    // FOLLOW-4 first-submit isolation: the flat sampler (uMap on unit 0)
+    // must see a complete texture even when uTextured==0 — an unbound unit
+    // raises INVALID_OPERATION (1282) on SwiftShader at draw time. Bind the
+    // 1x1 white fallback so the flat fill never draws with an empty unit.
+    const white = this.whiteFor(gl);
+    if (white) {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, white);
+    }
     this.bindAttrib(gl, 0, this.skyPosBuf, 3);
     this.bindAttrib(gl, 1, this.skyColBuf, 4);
     this.bindAttrib(gl, 2, this.onesFor(gl), 2);
@@ -1739,9 +2095,15 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
 
   private ensureDynCapacity(gl: WebGL2RenderingContext, nv: number): void {
     if (!this.dynPos || !this.dynShade || this.dynSize < nv) {
+      // Growth replaces the pair: delete the obsolete same-context buffers
+      // BEFORE replacing ownership (per-frame growth must stay bounded).
+      this.freeBuffer(this.dynPos);
+      this.freeBuffer(this.dynShade);
       this.dynPos = gl.createBuffer();
       this.dynShade = gl.createBuffer();
       if (!this.dynPos || !this.dynShade) this.fail('WebGLRenderer: createBuffer returned null');
+      this.trackBuf(this.dynPos);
+      this.trackBuf(this.dynShade);
       this.dynSize = Math.max(nv, 64);
     }
   }
@@ -1749,6 +2111,10 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private ensureFlatCapacity(gl: WebGL2RenderingContext, nverts: number, nidx: number): void {
     if (!this.flatPos || !this.flatCol || !this.flatUV || !this.flatIdx ||
       this.flatSize < nverts || this.flatIdxSize < nidx) {
+      this.freeBuffer(this.flatPos);
+      this.freeBuffer(this.flatCol);
+      this.freeBuffer(this.flatUV);
+      this.freeBuffer(this.flatIdx);
       this.flatPos = gl.createBuffer();
       this.flatCol = gl.createBuffer();
       this.flatUV = gl.createBuffer();
@@ -1756,6 +2122,10 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       if (!this.flatPos || !this.flatCol || !this.flatUV || !this.flatIdx) {
         this.fail('WebGLRenderer: createBuffer returned null');
       }
+      this.trackBuf(this.flatPos);
+      this.trackBuf(this.flatCol);
+      this.trackBuf(this.flatUV);
+      this.trackBuf(this.flatIdx);
       this.flatSize = Math.max(nverts, 16);
       this.flatIdxSize = Math.max(nidx, 16);
     }
@@ -1763,9 +2133,13 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
 
   private ensurePointCapacity(gl: WebGL2RenderingContext, n: number): void {
     if (!this.pointPos || !this.pointCol || this.pointCount < n) {
+      this.freeBuffer(this.pointPos);
+      this.freeBuffer(this.pointCol);
       this.pointPos = gl.createBuffer();
       this.pointCol = gl.createBuffer();
       if (!this.pointPos || !this.pointCol) this.fail('WebGLRenderer: createBuffer returned null');
+      this.trackBuf(this.pointPos);
+      this.trackBuf(this.pointCol);
       this.pointCount = Math.max(n, 16);
     }
   }
@@ -1777,6 +2151,8 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const uvBuf = gl.createBuffer();
     const idxBuf = gl.createBuffer();
     if (!uvBuf || !idxBuf) this.fail('WebGLRenderer: createBuffer returned null');
+    this.trackBuf(uvBuf);
+    this.trackBuf(idxBuf);
     // UVs stay in MD2 texel units here; uUVScale normalizes per draw by the
     // bound skin dims. Indices widen to Uint32 (drawElements UNSIGNED_INT).
     const entry: ModelGL = { uvBuf, idxBuf, count: mesh.tris.length, nv: mesh.numVerts };

@@ -182,6 +182,114 @@ export function listCVars(): CVarDef[] {
   return [...cvars.entries()].map(([name, value]) => ({ name, value, doc: cvarDocs.get(name) ?? '' }));
 }
 
+// --- vid_renderer selection states + unsupported-device fallback labels ---
+//
+// GPU-FOLLOW-4, additive/label-only: the default stays 'software' and the GPU
+// backend stays experimental until final evidence (GPU-FOLLOW-7) decides
+// otherwise. Canonical selection *resolution* lives in `@q2/renderer-api`
+// (`resolveRendererSelection`); the declarations below are the config-side
+// cvar vocabulary + human labels for that same contract, mirrored BY VALUE
+// so this leaf package never imports `@q2/renderer-api` (dependency rule:
+// config is imported by renderer consumers, never the reverse).
+
+/** Every renderer id the `vid_renderer` cvar accepts (cvar vocabulary). */
+export type VidRendererId = 'software' | 'voodoo' | 'webgl2-experimental';
+
+/** Compiled-in `vid_renderer` default: software. Never promoted by this module. */
+export const VID_RENDERER_DEFAULT: VidRendererId = 'software';
+
+/** The only GPU backend id (experimental until final FOLLOW-7 evidence). */
+export const GPU_EXPERIMENTAL_BACKEND: VidRendererId = 'webgl2-experimental';
+
+/**
+ * GPU-experimental pin: true while the WebGL2 backend is pre-acceptance.
+ * GPU-FOLLOW-7 flips this only with all gates evidenced; nothing here
+ * changes selection behavior (label + gate only).
+ */
+export const GPU_EXPERIMENTAL = true as const;
+
+/** True for an exact known `vid_renderer` value (no coercion, no aliases). */
+export function isKnownRendererId(name: string): name is VidRendererId {
+  return name === 'software' || name === 'voodoo' || name === 'webgl2-experimental';
+}
+
+/** True only for the experimental GPU backend id (never for software/voodoo). */
+export function isExperimentalRenderer(name: string): boolean {
+  return name === GPU_EXPERIMENTAL_BACKEND;
+}
+
+/**
+ * Labelled selection outcome: mirrors the `resolveRendererSelection`
+ * vocabulary in `@q2/renderer-api` BY VALUE (same honored/fallback mapping).
+ * Pure, additive, no behavior change: unknown ids and incapable-GPU requests
+ * resolve to software WITH a warning (never a silent CPU fallback).
+ */
+export interface VidRendererSelection {
+  /** Raw `vid_renderer` request as written. */
+  requested: string;
+  /** Backend that actually runs. */
+  active: VidRendererId;
+  /** True whenever the request was not honored (every fallback warns). */
+  fallback: boolean;
+  /** True only when the ACTIVE backend is the experimental GPU one. */
+  experimental: boolean;
+  /** Null when honored; non-null explains every fallback (never silent). */
+  warning: string | null;
+}
+
+/**
+ * Describe a `vid_renderer` request against GPU capability. Capability false
+ * always carries the blocking reason into the warning. GPU honored only when
+ * capable; everything unhonorable stays on software with a warning.
+ */
+export function describeRendererSelection(
+  requested: string,
+  gpuAvailable: boolean,
+  gpuReason = 'no WebGL2 context',
+): VidRendererSelection {
+  if (requested === 'software' || requested === 'voodoo') {
+    return { requested, active: requested, fallback: false, experimental: false, warning: null };
+  }
+  if (requested === GPU_EXPERIMENTAL_BACKEND) {
+    if (gpuAvailable) {
+      return { requested, active: requested, fallback: false, experimental: true, warning: null };
+    }
+    return {
+      requested,
+      active: 'software',
+      fallback: true,
+      experimental: false,
+      warning: `webgl2-experimental requested but unavailable (${gpuReason}); staying on software`,
+    };
+  }
+  return {
+    requested,
+    active: 'software',
+    fallback: true,
+    experimental: false,
+    warning: `unknown vid_renderer ${JSON.stringify(requested)}; staying on software`,
+  };
+}
+
+/** The fallback warning for a selection (null when the request was honored). */
+export function rendererFallbackWarning(sel: VidRendererSelection): string | null {
+  return sel.fallback ? sel.warning : null;
+}
+
+/**
+ * One-line human label for logs/overlays, e.g.
+ * `vid_renderer="webgl2-experimental" -> software (FALLBACK: <reason>)`.
+ * Experimental activity is tagged `[EXPERIMENTAL]`; fallback is always
+ * explicit, never a silent rename.
+ */
+export function rendererSelectionLabel(sel: VidRendererSelection): string {
+  const exp = sel.experimental ? ' [EXPERIMENTAL]' : '';
+  if (!sel.fallback) return `vid_renderer=${JSON.stringify(sel.requested)} -> ${sel.active}${exp}`;
+  return (
+    `vid_renderer=${JSON.stringify(sel.requested)} -> ${sel.active} (FALLBACK${exp}: ${sel.warning ?? 'unexplained'})`
+  );
+}
+
 // --- feature flags (prime directive: land risky work behind a flag) ---
 // Shared identity across ESM/CJS copies via the globalThis store (see above).
 export const features: {

@@ -22,6 +22,7 @@ export * from './browser-evidence.js';
 export * from './gpu-proof.js';
 export * from './gpu-acceptance.js';
 export * from './gpu-follow-2a.js';
+export * from './gpu-follow-4.js';
 export * from './gpu-scene-semantics.js';
 export * from './gpu-effects-semantics.js';
 

@@ -17,7 +17,7 @@ import { readLiveEffects } from './gpu-effects.js';
 import type { LiveEffects } from './gpu-effects.js';
 import { startPlayLoop } from './dom.js';
 import type { PlayBoot } from './play.js';
-import { bootPlay, buildAsyncView, getGpuStatus, playerPosText } from './play.js';
+import { bootPlay, buildAsyncView, getGpuStatus, gpuFallbackLabel, gpuFramesSubmitted, playerPosText } from './play.js';
 import { ingestPak } from './pak.js';
 
 /** Soak framebuffer geometry (GPU-PROOF-1 gate resolution, both legs). */
@@ -241,6 +241,11 @@ declare global {
     __q2soakState?: () => SoakState;
     __q2soakCvars?: () => Record<string, string>;
     __q2soakRoute?: () => SoakRouteSnapshot | null;
+    /**
+     * GPU-FOLLOW-4 additive lifecycle reader (optional: old readers ignore
+     * it; the FOLLOW-2C `__q2soakRoute` shape above is untouched).
+     */
+    __q2soakLifecycle?: () => SoakGpuLifecycle | null;
   }
 }
 
@@ -524,6 +529,65 @@ export function readSoakRoute(): SoakRouteSnapshot | null {
 /** The live boot behind the soak readers (module-scoped, soak-mode only). */
 let soakBoot: PlayBoot | null = null;
 
+/**
+ * GPU lifecycle snapshot for the FOLLOW-4 soak leg (additive reader: new
+ * `__q2soakLifecycle` global only — `SoakState`/`SoakRouteSnapshot` shapes
+ * are untouched). Null before the soak boot lands. Never throws: every
+ * section degrades to its null/zero sentinel so a probe fault cannot break
+ * the game loop or the runner poll.
+ */
+export interface SoakGpuLifecycle {
+  gpuActive: boolean;
+  contextLost: boolean;
+  lossCount: number;
+  restoreCount: number;
+  framesSubmitted: number;
+  uploads: number | null;
+  /** Explicit unsupported-device fallback label (null when GPU is live). */
+  fallback: string | null;
+  width: number;
+  height: number;
+}
+
+/**
+ * Read the live GPU lifecycle snapshot (FOLLOW-4 leg observability): loss
+ * counts, submission freeze, fallback label and backend dims next to each
+ * composed-page screenshot. Null before the soak boot lands.
+ */
+export function readSoakGpuLifecycle(): SoakGpuLifecycle | null {
+  const boot = soakBoot;
+  if (!boot) return null;
+  try {
+    const g = boot.gpu;
+    let uploads: number | null = null;
+    let width = boot.host.fb.width;
+    let height = boot.host.fb.height;
+    try {
+      if (g) {
+        uploads = g.gpu.testUploadStats().uploads;
+        const st = g.gpu.getStatus();
+        width = st.width;
+        height = st.height;
+      }
+    } catch {
+      uploads = null;
+    }
+    return {
+      gpuActive: g !== null,
+      contextLost: g?.contextLost ?? false,
+      lossCount: g?.lossCount ?? 0,
+      restoreCount: g?.restoreCount ?? 0,
+      framesSubmitted: gpuFramesSubmitted(boot),
+      uploads,
+      fallback: gpuFallbackLabel(boot),
+      width,
+      height,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Read the live soak state (input echo + renderer proof for the runner). */
 function readSoakState(status: SoakStatus): SoakState {
   const g = globalThis as unknown as {
@@ -663,6 +727,7 @@ export async function runSoakBoot(params: SoakParams): Promise<void> {
         win.__q2soakState = () => readSoakState(status);
         win.__q2soakCvars = () => readSoakCvarSnapshot(SOAK_CVAR_SNAPSHOT_KEYS);
         win.__q2soakRoute = () => readSoakRoute();
+        win.__q2soakLifecycle = () => readSoakGpuLifecycle();
       }
     } catch {
       /* readers best-effort */

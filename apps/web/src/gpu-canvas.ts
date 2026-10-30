@@ -407,3 +407,154 @@ export function removeGpuCanvas(doc?: unknown): boolean {
 export function hideGpuCanvas(doc?: unknown): boolean {
   return removeGpuCanvas(doc);
 }
+
+/* --- GPU-FOLLOW-4 context lifecycle (apps/web only) -----------------------
+ *
+ * The canvas owns the `webglcontextlost` / `webglcontextrestored` events;
+ * the backend owns GL resources; the play layer owns the retained assets
+ * and the replay (see `wireGpuLifecycle` in play.ts). This module only
+ * attaches/detaches the DOM listeners, exactly once per canvas:
+ * re-attaching replaces the previous pair (remove-then-add), so repeated
+ * boot/hot-swap/loss cycles can never stack duplicate listeners, and
+ * `dispose` removes the pair so a detached canvas fires nothing.
+ * Headless-safe, never throws.
+ */
+
+/** DOM event names for GL context lifecycle (unprefixed standard). */
+export const GPU_CONTEXT_LOST_EVENT = 'webglcontextlost';
+export const GPU_CONTEXT_RESTORED_EVENT = 'webglcontextrestored';
+
+/**
+ * Hooks invoked on real canvas context lifecycle events. Called
+ * synchronously from the DOM event; hook faults are contained (never break
+ * the event dispatch or each other).
+ */
+export interface GpuCanvasLifecycleHooks {
+  onLost: () => void;
+  onRestored: () => void;
+}
+
+/** Minimal structural contract for a canvas event target (real or stub). */
+interface CanvasEventsLike {
+  addEventListener?: ((type: string, listener: (ev: unknown) => void, opts?: unknown) => void) | undefined;
+  removeEventListener?: ((type: string, listener: (ev: unknown) => void, opts?: unknown) => void) | undefined;
+}
+
+/** Active listener pair per canvas (replace-on-attach, removed on dispose). */
+const lifecycleByCanvas = new WeakMap<object, () => void>();
+
+function canvasEventTarget(canvas: unknown): CanvasEventsLike | null {
+  if (typeof canvas !== 'object' || canvas === null) return null;
+  const t = canvas as CanvasEventsLike;
+  if (typeof t.addEventListener !== 'function' || typeof t.removeEventListener !== 'function') return null;
+  return t;
+}
+
+/**
+ * Attach `webglcontextlost`/`webglcontextrestored` listeners to a GL canvas.
+ * Exactly-once per canvas: attaching over an existing pair disposes it
+ * first (remove-then-add), so repeated cycles never stack duplicates.
+ * The lost handler calls `preventDefault()` (restoration opt-in where the
+ * platform supports it) before `onLost`. Returns a dispose closure that
+ * removes the pair (idempotent); a canvas without an event-target shape
+ * yields a no-op dispose. Never throws.
+ */
+export function attachGpuCanvasLifecycle(
+  canvas: unknown,
+  hooks: GpuCanvasLifecycleHooks,
+): () => void {
+  const noop = (): void => {
+    /* no event target: nothing to detach */
+  };
+  try {
+    if (typeof canvas !== 'object' || canvas === null) return noop;
+    const prev = lifecycleByCanvas.get(canvas);
+    if (prev) {
+      try {
+        prev();
+      } catch {
+        /* stale pair removal is best-effort */
+      }
+    }
+    const t = canvasEventTarget(canvas);
+    if (!t) return noop;
+    const onLost = (ev: unknown): void => {
+      try {
+        const e = ev as { preventDefault?: () => void } | null;
+        if (e !== null && e !== undefined && typeof e.preventDefault === 'function') e.preventDefault();
+      } catch {
+        /* restoration opt-in is best-effort on exotic targets */
+      }
+      try {
+        hooks.onLost();
+      } catch {
+        /* hook faults never break the event */
+      }
+    };
+    const onRestored = (): void => {
+      try {
+        hooks.onRestored();
+      } catch {
+        /* hook faults never break the event */
+      }
+    };
+    t.addEventListener?.(GPU_CONTEXT_LOST_EVENT, onLost, false);
+    t.addEventListener?.(GPU_CONTEXT_RESTORED_EVENT, onRestored, false);
+    const dispose = (): void => {
+      try {
+        lifecycleByCanvas.delete(canvas);
+      } catch {
+        /* map removal is best-effort */
+      }
+      try {
+        t.removeEventListener?.(GPU_CONTEXT_LOST_EVENT, onLost, false);
+      } catch {
+        /* removal is best-effort */
+      }
+      try {
+        t.removeEventListener?.(GPU_CONTEXT_RESTORED_EVENT, onRestored, false);
+      } catch {
+        /* removal is best-effort */
+      }
+    };
+    lifecycleByCanvas.set(canvas, dispose);
+    return dispose;
+  } catch {
+    return noop;
+  }
+}
+
+/**
+ * True when a live lifecycle listener pair is attached to the canvas
+ * (observability for lifecycle tests; false for detached/never-attached).
+ * Never throws.
+ */
+export function hasGpuCanvasLifecycle(canvas: unknown): boolean {
+  try {
+    if (typeof canvas !== 'object' || canvas === null) return false;
+    return lifecycleByCanvas.has(canvas);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Set an acquired GL canvas backing size (drawing buffer). Applies only
+ * positive integer sizes that differ; returns true when applied. Pair with
+ * the backend `resize` (viewport + render targets) via `resizeGpuBackend` in
+ * play.ts. Headless-safe, never throws.
+ */
+export function setGpuCanvasSize(canvas: unknown, width: number, height: number): boolean {
+  try {
+    if (typeof canvas !== 'object' || canvas === null) return false;
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return false;
+    const c = canvas as CanvasLike;
+    if (typeof c.width !== 'number' || typeof c.height !== 'number') return false;
+    if (c.width === width && c.height === height) return true;
+    c.width = width;
+    c.height = height;
+    return true;
+  } catch {
+    return false;
+  }
+}
