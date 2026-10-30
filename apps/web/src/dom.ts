@@ -1788,6 +1788,17 @@ export function startPlayLoop(
 
   const tick = (nowMs: number): void => {
     if (stopped) return;
+    if (boot.gpu) {
+      // GPU-PROOF-5 live-loop routing fix: an attached GPU backend owns the
+      // frame (sim + submit via frameGpuPlay, no CPU world raster). The
+      // pooled CPU path (frameAsync) must NEVER run in parallel — pooling
+      // wins by default whenever workers exist, so an explicit GPU-first
+      // branch is required, not a useAsync check. Hot-swap-safe: leaving
+      // webgl2 disposes boot.gpu and the loop falls back below unchanged.
+      tickSync(nowMs);
+      raf = requestAnimationFrame(tick);
+      return;
+    }
     if (useAsync) {
       // Pooled async render (frameAsync owns pumps + sim + async kick +
       // resolve — do NOT pre-pump here: a second drain would clear the

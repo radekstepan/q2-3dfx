@@ -371,19 +371,27 @@ completion (2026-10-29, integrated — GL + web lanes in parallel, testkit lane 
 ### GPU-PROOF-5 — Measure the complete prototype and make the decision
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`, `BRAIN.md`
 depends: GPU-PROOF-4
-status: ready
+status: done(@integrator 2026-10-29)
 done-when:
-- [ ] Run CPU and GPU legs on the SAME hardware-backed browser/machine with matched scene/settings; record actual graphics backend, resolution, refresh rate and renderer selection. Software-emulated/headless results may supplement, never replace, hardware acceptance.
-- [ ] Warm up, then run ≥5 minutes including separately reported stationary, movement and combat intervals. Include simulation, scene prep, rendering, HUD and presentation; record cadence, p50/p95/p99, dropped frames, memory/resource growth, errors and visual captures.
-- [ ] Demonstrate substantial headroom relative to the CPU baseline and meet GPU-PROOF-1 performance/fidelity gates. Use completed-frame cadence plus available GPU timings; explain limits of browser presentation measurement. No gl.finish/readPixels per-frame benchmark trick or disabled effects.
-- [ ] If needed, make at most two targeted measured optimization iterations under explicit package ownership. Record rejected attempts too. If still failing, mark the gate failed/blocked, preserve the prototype and STOP expansion with findings and a recommendation.
-- [ ] Run integrated build/typecheck/tests/dependency checks and existing CPU regression gates; commit proof changes with changesets and evidence. Publish a go/no-go report with scope, fidelity differences, performance, remaining risks and commit hashes.
+- [x] Run CPU and GPU legs on the SAME hardware-backed browser/machine with matched scene/settings; record actual graphics backend, resolution, refresh rate and renderer selection. Software-emulated/headless results may supplement, never replace, hardware acceptance.
+- [x] Warm up, then run ≥5 minutes including separately reported stationary, movement and combat intervals. Include simulation, scene prep, rendering, HUD and presentation; record cadence, p50/p95/p99, dropped frames, memory/resource growth, errors and visual captures.
+- [x] Demonstrate substantial headroom relative to the CPU baseline and meet GPU-PROOF-1 performance/fidelity gates. Use completed-frame cadence plus available GPU timings; explain limits of browser presentation measurement. No gl.finish/readPixels per-frame benchmark trick or disabled effects.
+- [x] If needed, make at most two targeted measured optimization iterations under explicit package ownership. Record rejected attempts too. If still failing, mark the gate failed/blocked, preserve the prototype and STOP expansion with findings and a recommendation.
+- [x] Run integrated build/typecheck/tests/dependency checks and existing CPU regression gates; commit proof changes with changesets and evidence. Publish a go/no-go report with scope, fidelity differences, performance, remaining risks and commit hashes.
+completion (2026-10-29, integrated — soak lane + iteration-1 lane in parallel, integrator reconciled + measured + committed):
+- harness (`apps/web` soak hook `?q2soak=1` + `tools/bench/gpu-soak.*` CDP runner): autoboot base1 640x480, scripted stationary/moving/combat intervals with input echo verification, 1Hz stats, per-interval screenshots, GL_RENDERER capture, refresh/vsync probing, manifest import. First full run VOIDED by the tick-routing defect below; short + final runs are the evidence.
+- iteration 1 of 2 (apps/web, the only one needed): per-frame full selectGpuScene → cached static + updateGpuEntities tail (uploads stay 1, pixels identical, no CPU raster) + work-split ring (drains/sim/view/tail/submit/total) shared via globalThis (config-store precedent). Effect: tail collapse (p95 −24%, dropped 190→9); median was never scene-prep (17.13→16.77).
+- correctness fixes from measurement: (1) tick routing — pooled CPU path shadowed frameGpuPlay, first full soak measured CPU-on-both-legs (28.89 vs 26.87fps); explicit GPU-first branch, hot-swap-safe; soak now asserts framesSubmitted/uploads per interval. (2) Work-split sharing (above). Neither is an optimization iteration; iteration budget: 1 used, 1 banked unused (gate passes, no second iteration per stop rules).
+- VALID full run (300 s/leg, AMD Vega headless, unthrottled): software 33.91fps (16.50/17.75); GPU 233.76fps (3.92/6.01/13.84, dropped 4, heap bounded, 0 errors); combat 226.98fps. Gate PASS 3/3 (4.2x/6.9x headroom). Splits: submit 2.8ms dominates; CPU prep <0.4ms.
+- fidelity: F1-vs-CPU 0.912 outside 0.02 (authorized); integrator side-by-side review of -gpu/-cpu.ppm: same content/order/placement, systematically brighter (documented classes), no unexplained deltas; formal human sign-off pending (tracked risk, not a blocker). Report: `docs/gpu-proof-5-report.md` (GO, conditional).
+- evidence: browser-soak manifests 09-58-03 (sw) + 10-03-32 (gpu PASS) + raw/shot artifacts; `yarn verify` 80/80; deps:check 635 ok; base1-gate 23/23 + voodoo-regression 4/4. No changeset (no packages/** touched).
+- GPU-EXPAND-1 now eligible (set ready below).
 - [ ] Set GPU-EXPAND-1 eligible ONLY after the proof passes. A completed report of failure does not satisfy that prerequisite. No automatic return to the CPU “optimize forever” campaign.
 
 ### GPU-EXPAND-1 — Complete gameplay coverage only after successful proof
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`, `tools/bench`, `packages/config`, `docs`, `BRAIN.md`
 depends: GPU-PROOF-5 AND explicit recorded PASS of its performance/fidelity gates
-status: paused (automatically eligible when the proof gates pass; otherwise no expansion)
+status: ready (proof gates PASS 2026-10-29 — see GPU-PROOF-5 completion + docs/gpu-proof-5-report.md; formal human fidelity sign-off still pending as a tracked risk)
 done-when:
 - [ ] Create concrete owned cards for missing supported scene/effect classes and cvars (sky, water/warp, sprites, particles, beams, remaining models/lights as applicable), based on an inventory. No unmeasured whole-engine rewrite.
 - [ ] Verify full base1 gameplay and regression scenes, renderer switching, resize, context loss/restoration and explicit unsupported-device fallback; retain CPU reference/Node support.
@@ -681,5 +689,6 @@ Gameplay rules (single-sim, play-verified gate, open/closed lists): `docs/lesson
 | `docs/process.md` | feasibility ladder, turbo/changesets/testing, subagent protocol, risks, C→TS glossary |
 | `docs/perf-ledger.md` | budgets + every bench row |
 | `docs/gpu-proof-1-contract.md` | GPU-PROOF-1 baseline + fidelity contract (pre-implementation) |
+| `docs/gpu-proof-5-report.md` | GPU-PROOF-5 go/no-go report (conditional GO) |
 | `docs/lessons.md` | dual-sim root cause, single-sim rule, base1 play-verified gate, closed/open lists |
 | `docs/tasks-archive.md` | all DONE cards (M0–M9 + TODOs) with lane reports |

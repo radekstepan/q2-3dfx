@@ -119,7 +119,20 @@ import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } f
 import type { BrowserForegroundDetail, DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
 import { detectGpuCapability, getGpuStatus, resolveBootRenderer } from './gpu-select.js';
 import { acquireGpuCanvas } from './gpu-canvas.js';
-import { WebGLRenderer, selectGpuScene } from '@q2/webgl-renderer';
+import { WebGLRenderer, selectGpuScene, updateGpuEntities } from '@q2/webgl-renderer';
+
+/**
+ * PROOF-5 iteration-1 contract pin: the per-frame entity-tail path below
+ * consumes the committed `updateGpuEntities` (world refs reused by
+ * reference). A static import of a missing export already fails the bundle
+ * load; this runtime pin fails loudly with the reason instead of silently
+ * falling back to a local reimplementation (forbidden by the card).
+ */
+if (typeof updateGpuEntities !== 'function') {
+  throw new Error(
+    'play(frameGpuPlay): updateGpuEntities missing from @q2/webgl-renderer — refusing to reimplement (GPU-PROOF-5 iteration 1)',
+  );
+}
 
 /**
  * Which resolve path the last `resolveDisplay` took (observability for
@@ -2999,6 +3012,16 @@ export interface GpuBootState {
   gpu: WebGLRenderer;
   /** Last submitted scene (static world once + per-frame entity tail). */
   scene: GpuSceneInput;
+  /**
+   * Pristine boot-time STATIC world scene (GPU-PROOF-5 iteration 1): the
+   * `selectGpuScene` result from `attachGpuBackend` (empty entities, spawn
+   * view). `frameGpuPlay` derives every frame's submitted scene from THIS via
+   * the committed `updateGpuEntities` (world refs reused by reference, so
+   * `staticGeneration` never changes and uploads stay 1); `scene` above
+   * remains the last submitted scene (tail-updated). Never mutated after
+   * attach — the tail builder only reads its world refs.
+   */
+  staticScene: GpuSceneInput;
   /** Sim clock for GPU frames (mirrors Host privates, like frameAsync). */
   loop: AsyncLoopState;
   /**
@@ -3371,7 +3394,8 @@ function attachGpuBackend(driver: LocalDriver, width: number, height: number): G
     gpu.init(acquired.gl as unknown as WebGL2RenderingContext, width, height);
     const scene = selectGpuScene(driver.mini, [], spawnViewFor(driver), width, height);
     gpu.setScene(scene);
-    return { canvas: acquired.canvas, gl: acquired.gl, gpu, scene, loop: createAsyncLoopState(), appearance: null };
+    installGpuWorkConveyor();
+    return { canvas: acquired.canvas, gl: acquired.gl, gpu, scene, staticScene: scene, loop: createAsyncLoopState(), appearance: null };
   } catch {
     return null;
   }
@@ -4697,6 +4721,138 @@ export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: numb
   return resolveDisplayAsync(boot, hud, frameState);
 }
 
+/* --- GPU-PROOF-5 iteration-1 work-split instrumentation -------------------
+ *
+ * `frameGpuPlay` timestamps 6 sections per frame with `performance.now()` and
+ * records them into the preallocated module-scope ring below. Cost per frame
+ * is 7 clock reads + 6 float stores (sub-microsecond against ~17ms frames);
+ * the ring is a fixed-size `Float64Array` (pinned capacity, circular index —
+ * ZERO allocation per frame, typed arrays only per the hot-path rules). No
+ * behavior change: recording never touches sim/render state.
+ *
+ * Readers (sampled 1Hz by the soak runner / tests, never the frame loop):
+ * - `readGpuWorkSplits()` returns medians over the filled ring rows.
+ * - `globalThis.__q2soakWork` (installed by `installGpuWorkConveyor`) is the
+ *   same reader behind a CDP-evaluable conveyor: the unmodified soak runner
+ *   samples it 1Hz without disturbing the loop.
+ */
+
+/** Work-split section names, in ring column order. */
+export const GPU_WORK_SPLIT_NAMES = ['drains', 'sim', 'view', 'tail', 'submit', 'total'] as const;
+
+/** Ring column count (matches `GPU_WORK_SPLIT_NAMES.length`; pinned). */
+export const GPU_WORK_COLS = 6;
+
+/** Ring row capacity (frames retained; oldest evicted past it). */
+export const GPU_WORK_RING_CAPACITY = 4096;
+
+/**
+ * Work-split ring state. Kept on `globalThis` (like the `@q2/config` store)
+ * so the instrumentation survives duplicated module evaluation (vite dev can
+ * evaluate the loop entry and the soak entry as separate instances —
+ * module-scope state would then silently stay zero for the reader). The
+ * ring is allocated once, lazily, and never grows.
+ */
+interface GpuWorkRingState {
+  ring: Float64Array;
+  head: number;
+  samples: number;
+}
+declare global {
+  var __q2gpuWorkRing__: GpuWorkRingState | undefined;
+}
+function gpuWorkState(): GpuWorkRingState {
+  let s = globalThis.__q2gpuWorkRing__;
+  if (s === undefined) {
+    s = { ring: new Float64Array(GPU_WORK_RING_CAPACITY * GPU_WORK_COLS), head: 0, samples: 0 };
+    globalThis.__q2gpuWorkRing__ = s;
+  }
+  return s;
+}
+
+/** Record one frame's 6 section times (ms). Zero-alloc: 6 stores + index. */
+function recordGpuWork(drainsMs: number, simMs: number, viewMs: number, tailMs: number, submitMs: number, totalMs: number): void {
+  const st = gpuWorkState();
+  const o = st.head * GPU_WORK_COLS;
+  st.ring[o] = drainsMs;
+  st.ring[o + 1] = simMs;
+  st.ring[o + 2] = viewMs;
+  st.ring[o + 3] = tailMs;
+  st.ring[o + 4] = submitMs;
+  st.ring[o + 5] = totalMs;
+  st.head = (st.head + 1) % GPU_WORK_RING_CAPACITY;
+  if (st.samples < GPU_WORK_RING_CAPACITY) st.samples++;
+}
+
+/** Medians over the filled ring rows (ms per section + fill state). */
+export interface GpuWorkSplits {
+  /** Filled rows (saturates at `capacity` once the ring wraps). */
+  samples: number;
+  /** Ring capacity (pinned; the backing store never grows). */
+  capacity: number;
+  drainsMs: number;
+  simMs: number;
+  viewMs: number;
+  tailMs: number;
+  submitMs: number;
+  totalMs: number;
+}
+
+/** Median of a column over the filled rows (scratch alloc: reader path only). */
+function gpuWorkMedian(state: GpuWorkRingState, col: number, n: number): number {
+  const scratch = new Float32Array(n);
+  for (let r = 0; r < n; r++) scratch[r] = state.ring[r * GPU_WORK_COLS + col]!;
+  scratch.sort();
+  const mid = n >> 1;
+  return n % 2 === 1 ? scratch[mid]! : (scratch[mid - 1]! + scratch[mid]!) / 2;
+}
+
+/**
+ * Medians over the filled work-split ring rows (empty ring → all zeros).
+ * Allocates scratch for the medians: call 1Hz from harnesses/CDP or from
+ * tests — never from the frame loop.
+ */
+export function readGpuWorkSplits(): GpuWorkSplits {
+  const st = gpuWorkState();
+  const n = st.samples;
+  if (n <= 0) {
+    return { samples: 0, capacity: GPU_WORK_RING_CAPACITY, drainsMs: 0, simMs: 0, viewMs: 0, tailMs: 0, submitMs: 0, totalMs: 0 };
+  }
+  return {
+    samples: n,
+    capacity: GPU_WORK_RING_CAPACITY,
+    drainsMs: gpuWorkMedian(st, 0, n),
+    simMs: gpuWorkMedian(st, 1, n),
+    viewMs: gpuWorkMedian(st, 2, n),
+    tailMs: gpuWorkMedian(st, 3, n),
+    submitMs: gpuWorkMedian(st, 4, n),
+    totalMs: gpuWorkMedian(st, 5, n),
+  };
+}
+
+/**
+ * Test/harness-only: clear the work-split ring (never the frame loop).
+ * Lets determinism/wrap tests isolate their frames from earlier suites in
+ * the same worker (the ring is shared by design — see above).
+ */
+export function testResetGpuWorkSplits(): void {
+  const st = gpuWorkState();
+  st.ring.fill(0);
+  st.head = 0;
+  st.samples = 0;
+}
+
+/**
+ * Install the `globalThis.__q2soakWork` conveyor (idempotent): the soak
+ * runner evaluates `window.__q2soakWork()` at 1Hz to sample section medians
+ * without disturbing the loop. Headless-safe (`globalThis`, never `window`).
+ */
+export function installGpuWorkConveyor(): () => GpuWorkSplits {
+  const g = globalThis as unknown as { __q2soakWork?: () => GpuWorkSplits };
+  g.__q2soakWork ??= readGpuWorkSplits;
+  return g.__q2soakWork;
+}
+
 /**
  * One GPU gameplay frame (GPU-PROOF-3): simulation + GPU submission WITHOUT
  * the CPU world span rasterizer.
@@ -4708,15 +4864,29 @@ export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: numb
  * - CRITICAL: `refresh.renderView` is NEVER called here — no CPU world span
  *   rasterization runs in parallel with the GPU submit. HUD painting continues
  *   on the 2D overlay canvas (see `paintHudOverlay`, called by the rAF tick).
- * - Entity tail: `selectGpuScene` per frame (conservative fallback; uploads
- *   stay 1 via `staticGeneration`, so the per-frame `setScene` is a no-op
- *   upload — the `updateGpuEntities` incremental switch is a PROOF-5
- *   optimization candidate, not needed for correctness).
+ * - Entity tail (GPU-PROOF-5 iteration 1): the static world scene is cached
+ *   at boot (`GpuBootState.staticScene`, built once in `attachGpuBackend`)
+ *   and each frame builds ONLY the entity tail via the committed
+ *   `updateGpuEntities(staticScene, entities, view)` — no per-frame PVS
+ *   union over the world surfaces, no frustum cull, no blend re-sort of the
+ *   world, no fresh transform array. World refs are reused BY REFERENCE, so
+ *   `staticGeneration` never changes and uploads stay 1 across N frames.
+ *   `transforms` stays the boot `[identity]` slot BY DESIGN (not a gap): the
+ *   committed `WebGLRenderer` derives full-basis entity model matrices per
+ *   frame from `setEntities` (pitch/yaw/roll basis + frame/backlerp
+ *   interpolation in `drawAlias`) and never consumes per-entity transform
+ *   slots — they are yaw-only legacy reservations from the PROOF-2
+ *   selector. Reusing the static array by reference keeps per-frame scene
+ *   assembly to the tail surfaces array + one ref per entity.
  * - Dynamic lights/beams: the one-shot driver queues are drained HERE into
  *   GPU inputs (`lights` + synthesized beam entities) instead of the CPU
  *   pumps — the CPU pools would be purposeless since CPU renderView never
  *   runs. Mappings mirror the CPU pumps exactly (muzzle [1,1,0], explosion
  *   [1,.5,.5]/350, blaster [1,1,0]/150, bolt 200).
+ * - Work-split instrumentation (GPU-PROOF-5 iteration 1, always on):
+ *   `performance.now()` section timings accumulate into the module-scope
+ *   ring (see above); sample via `readGpuWorkSplits()` /
+ *   `window.__q2soakWork()`. No behavior change.
  *
  * Returns the live backend status (`framesSubmitted` counts real on-canvas
  * submissions), or null when no GPU backend is attached (caller gates on
@@ -4725,6 +4895,7 @@ export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: numb
 export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus | null {
   const g = boot.gpu;
   if (!g) return null;
+  const tDrain0 = performance.now();
   // GPU-side dynamic drains (mirror pumpMuzzleLight/pumpExplosionLights/
   // pumpBoltLights/pumpTracers mappings; one-shot queues, so the CPU pumps
   // are skipped — CPU renderView never runs in this path).
@@ -4759,8 +4930,6 @@ export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus |
       intensity: 200,
     });
   }
-  stepAsyncSim(boot.host, g.loop, nowMs);
-  const { view, renderables } = buildAsyncView(boot.host, g.loop.serverAcc);
   // Live beams: the driver tracer queue drains here into synthesized beam
   // entities (origin=start, angles=dir, frame=length, skin=color — the
   // contract-free beam convention `resolveBeam` reads). Negative model
@@ -4778,6 +4947,10 @@ export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus |
       skin: t.color,
     } as Entity;
   });
+  const tSim0 = performance.now();
+  stepAsyncSim(boot.host, g.loop, nowMs);
+  const tView0 = performance.now();
+  const { view, renderables } = buildAsyncView(boot.host, g.loop.serverAcc);
   const entities = beams.length > 0 ? [...renderables, ...beams] : renderables;
   // PROOF-4 appearance wiring (no shader work): re-read the pinned vd_*
   // cvars EVERY frame (no stale profile) and make them effective WITHOUT new
@@ -4789,17 +4962,36 @@ export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus |
   const appearance = readGpuAppearanceSnapshot();
   g.appearance = appearance;
   pushGpuAppearance(g.gpu, appearance);
-  const scene = selectGpuScene(
-    boot.driver.mini,
+  const tTail0 = performance.now();
+  // PROOF-5 iteration 1: entity tail ONLY from the cached static scene (no
+  // per-frame `selectGpuScene`; world refs reused by reference).
+  const tail = updateGpuEntities(
+    g.staticScene,
     entities,
     view,
-    boot.host.fb.width,
-    boot.host.fb.height,
+    beamKinds.size > 0 ? beamKinds : undefined,
   );
+  const scene: GpuSceneInput = {
+    surfaces: tail,
+    // Boot `[identity]` slot reused by reference: the committed renderer
+    // derives full-basis entity matrices from `setEntities` (see above).
+    transforms: g.staticScene.transforms,
+    staticGeneration: g.staticScene.staticGeneration,
+  };
+  const tSubmit0 = performance.now();
   g.gpu.setScene(scene);
   g.gpu.setEntities(entities, beamKinds.size > 0 ? beamKinds : undefined);
   g.scene = scene;
   g.gpu.renderFrame({ view, scene, time: view.time, lights });
+  const tEnd = performance.now();
+  recordGpuWork(
+    tSim0 - tDrain0,
+    tView0 - tSim0,
+    tTail0 - tView0,
+    tSubmit0 - tTail0,
+    tEnd - tSubmit0,
+    tEnd - tDrain0,
+  );
   return g.gpu.getStatus();
 }
 

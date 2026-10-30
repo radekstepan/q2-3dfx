@@ -1,0 +1,101 @@
+{
+  "manifestVersion": 1,
+  "kind": "browser-soak",
+  "date": "2026-10-29T10:03:32.870Z",
+  "command": {
+    "argv": [
+      "/home/radek/.nvm/versions/node/v22.23.4/bin/node",
+      "/home/radek/dev/q2-3dfx/q2ts/tools/bench/gpu-soak.mjs"
+    ],
+    "env": {
+      "Q2_PAK": "/home/radek/dev/q2-3dfx/external/q2/baseq2/pak0.pak"
+    },
+    "cwd": "/home/radek/dev/q2-3dfx/q2ts"
+  },
+  "commitShort": "8544883",
+  "commitFull": "8544883da76b81a52a64130b6cf789e58ccc5370",
+  "treeDirty": true,
+  "distFresh": {
+    "fresh": true,
+    "distMtimeMs": 1793263106187.404,
+    "newestSrcMtimeMs": 1793262704770.4707,
+    "newestSrcFile": "/home/radek/dev/q2-3dfx/q2ts/tools/bench/src/index.ts"
+  },
+  "pak": {
+    "path": "(browser-imported)",
+    "bytes": null,
+    "mtimeMs": null,
+    "mtimeIso": null,
+    "missing": true
+  },
+  "machine": {},
+  "node": "v22.23.4",
+  "browser": {
+    "name": "chromium",
+    "version": "Chromium 156.0.8078.47 for Linux Mint",
+    "headless": true
+  },
+  "compositor": "hardware",
+  "loadavg": [
+    3.82,
+    3.79,
+    3.53
+  ],
+  "cpus": 8,
+  "quietOk": true,
+  "fidelity": null,
+  "warmup": null,
+  "reps": 299,
+  "workers": [
+    7
+  ],
+  "resultFile": "/home/radek/dev/q2-3dfx/q2ts/tools/bench/evidence/raw/browser-soak-8544883-2026-10-29T10-03-32.json",
+  "summary": {
+    "resolution": "640x480",
+    "renderer": "webgl2-experimental",
+    "durationS": 300.07,
+    "samples": 299,
+    "presentedFpsMedian": 233.75545706001932,
+    "frameP50Ms": 3.915000021457672,
+    "frameP95Ms": 6.014999985694885,
+    "frameMaxMs": 184.8100000023842,
+    "hardwareBacked": true,
+    "compositor": "hardware"
+  },
+  "soak": {
+    "schemaVersion": 1,
+    "commitShort": "8544883",
+    "commitFull": "8544883da76b81a52a64130b6cf789e58ccc5370",
+    "date": "2026-10-29T10:03:32.865Z",
+    "browser": {
+      "name": "chromium",
+      "version": "Chromium 156.0.8078.47 for Linux Mint",
+      "headless": true
+    },
+    "compositor": "hardware",
+    "compositorDetail": "ANGLE (AMD, AMD Radeon Vega 11 Graphics (radeonsi raven ACO), OpenGL ES 3.2)",
+    "hardwareBacked": true,
+    "page": "vite-dev ?q2soak=1 renderer=webgl2-experimental (see raw)",
+    "resolution": "640x480",
+    "width": 640,
+    "height": 480,
+    "renderer": "webgl2-experimental",
+    "workers": [
+      7
+    ],
+    "durationS": 300.07,
+    "samples": 299,
+    "presentedFpsMedian": 233.75545706001932,
+    "frameP50Ms": 3.915000021457672,
+    "frameP95Ms": 6.014999985694885,
+    "frameMaxMs": 184.8100000023842,
+    "workloads": [
+      "stationary",
+      "moving",
+      "combat"
+    ],
+    "notes": "gpu-soak 2026-10-29T09-52-27 webgl2-experimental: gl=ANGLE (AMD, AMD Radeon Vega 11 Graphics (radeonsi raven ACO), OpenGL ES 3.2) actual=webgl2-experimental warn=null attack=locked-mouse moveEcho=true refresh~227.8Hz(vsync unverified headless; dropped=gaps>=34ms) memΔ=-39.2MB errors=0 unthrottled=yes (rAF uncapped: intervals measure frame work, not the 60Hz cap) . Raw+shots: /home/radek/dev/q2-3dfx/q2ts/tools/bench/evidence/raw/gpu-soak-2026-10-29T09-52-27-webgl2-experimental.json. No display vsync.",
+    "rawFile": null
+  },
+  "ledgerHint": "| 2026-10-29 | 8544883 | browser-soak (hardware,hw) | 640x480 webgl2-experimental presented 233.75545706001932fps p95 6.014999985694885ms | evidence: browser-soak-8544883-2026-10-29T10-03-32.manifest.json |"
+}

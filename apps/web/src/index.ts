@@ -17,6 +17,7 @@ import { blitToCanvas } from './dom.js';
 import { pakHasMaps } from './pak.js';
 import type { WebPak } from './pak.js';
 import { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
+import { parseSoakParams, runSoakBoot } from './soak.js';
 
 export { bootToFirstFrame };
 export type { RendererKind };
@@ -277,6 +278,18 @@ export function installBenchHook(
 // builds working and Node imports side-effect free.
 if (typeof document !== 'undefined') {
   void import('./dom.js').then((dom) => {
+    // GPU-PROOF-5 soak mode (measurement only): `?q2soak=1&q2pak=<url>&q2renderer=<id>`
+    // boots base1 at 640x480 through the production loop for headless CDP
+    // measurement. The normal interactive boot below is untouched.
+    try {
+      const soakParams = parseSoakParams(typeof location !== 'undefined' ? location.search : '');
+      if (soakParams) {
+        void runSoakBoot(soakParams);
+        return;
+      }
+    } catch {
+      /* malformed soak query: fall through to the normal boot */
+    }
     // Restore the menu cvars (renderer/skill/resolution/map/brightness)
     // before the first boot so a reload keeps the previous session's menu.
     dom.restorePersistedCVars();

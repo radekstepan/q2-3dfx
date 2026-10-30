@@ -58,6 +58,12 @@ export {
   type EvidenceCore, type EvidenceManifest, type BrowserSoakRecord,
   type SoakImportResult, type SoakImportOpts, type ProvenanceOpts,
 } from './evidence.js';
+export {
+  percentile, frameIntervals, summarizeFrameTimes, cadenceFps, countDroppedBeats,
+  classifyCompositor, buildSoakRecord, buildGpuProofRecord, renderLegNumbersTable,
+  type FrameIntervalSummary, type GpuSoakLegInput, type GpuSoakGateInput,
+  type GpuSoakLegNumbers,
+} from './gpu-soak.js';
 
 export async function runBenchTool(opts: BenchOptions = {}): Promise<string> {
   const width = opts.width ?? 640;

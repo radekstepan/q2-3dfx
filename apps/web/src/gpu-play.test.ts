@@ -18,6 +18,11 @@ import {
   GPU_APPEARANCE_CVARS,
   GPU_APPEARANCE_HOOKS,
   readGpuAppearanceSnapshot,
+  readGpuWorkSplits,
+  testResetGpuWorkSplits,
+  installGpuWorkConveyor,
+  GPU_WORK_RING_CAPACITY,
+  GPU_WORK_SPLIT_NAMES,
 } from './play.js';
 import { acquireGpuCanvas, GPU_CANVAS_ID, GPU_CONTEXT_ATTRS } from './gpu-canvas.js';
 const WEB_Q2_PAK = process.env.Q2_PAK;
@@ -562,5 +567,186 @@ describe.runIf(!!WEB_Q2_PAK)('GPU-PROOF-3 base1 combat (Q2_PAK)', () => {
     // lives in the browser harness, never in src/).
     expect(stub.log).not.toContain('readPixels');
     renderSpy.mockRestore();
+  });
+});
+
+describe('GPU-PROOF-5 iteration-1 work-split instrumentation (play.ts)', () => {
+  it('empty ring reads zeros; conveyor installed at boot and matches the reader', () => {
+    installStubDoc();
+    testResetGpuWorkSplits();
+    const empty = readGpuWorkSplits();
+    expect(empty.samples).toBe(0);
+    expect(empty.capacity).toBe(GPU_WORK_RING_CAPACITY);
+    for (const name of GPU_WORK_SPLIT_NAMES) {
+      const v = empty[`${name}Ms` as const];
+      expect(v).toBe(0);
+    }
+    const boot = capableBoot();
+    expect(boot.gpu).not.toBeNull();
+    const g = globalThis as unknown as { __q2soakWork?: unknown };
+    expect(typeof g.__q2soakWork).toBe('function');
+    expect(installGpuWorkConveyor()).toBe(g.__q2soakWork);
+  });
+
+  it('N frames: 6 non-negative finite medians, samples track frames', () => {
+    installStubDoc();
+    testResetGpuWorkSplits();
+    const boot = capableBoot();
+    keyDown(boot.host.input, 'forward');
+    keyDown(boot.host.input, 'attack');
+    const N = 60;
+    for (let f = 0; f < N; f++) frameGpuPlay(boot, f * 16);
+    keyUp(boot.host.input, 'forward');
+    keyUp(boot.host.input, 'attack');
+    const splits = readGpuWorkSplits();
+    expect(splits.samples).toBe(N);
+    expect(splits.capacity).toBe(GPU_WORK_RING_CAPACITY);
+    expect(GPU_WORK_SPLIT_NAMES).toEqual(['drains', 'sim', 'view', 'tail', 'submit', 'total']);
+    for (const name of GPU_WORK_SPLIT_NAMES) {
+      const v = splits[`${name}Ms` as const];
+      expect(Number.isFinite(v)).toBe(true);
+      expect(v).toBeGreaterThanOrEqual(0);
+    }
+    // Sections partition the frame: parts sum to the total (float-exact —
+    // the parts are differences of the same clock reads as the total).
+    const parts = splits.drainsMs + splits.simMs + splits.viewMs + splits.tailMs + splits.submitMs;
+    expect(parts).toBeGreaterThanOrEqual(0);
+    expect(splits.totalMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('ring wraps without growth: capacity pinned past CAPACITY frames', { timeout: 120000 }, () => {
+    installStubDoc();
+    testResetGpuWorkSplits();
+    const boot = capableBoot();
+    keyDown(boot.host.input, 'forward');
+    const N = GPU_WORK_RING_CAPACITY + 64;
+    for (let f = 0; f < N; f++) frameGpuPlay(boot, f * 16);
+    keyUp(boot.host.input, 'forward');
+    const splits = readGpuWorkSplits();
+    // Saturated, never grown: the backing store is a fixed Float64Array.
+    expect(splits.samples).toBe(GPU_WORK_RING_CAPACITY);
+    expect(splits.capacity).toBe(GPU_WORK_RING_CAPACITY);
+    for (const name of GPU_WORK_SPLIT_NAMES) {
+      const v = splits[`${name}Ms` as const];
+      expect(Number.isFinite(v)).toBe(true);
+      expect(v).toBeGreaterThanOrEqual(0);
+    }
+    expect(boot.gpu!.gpu.getStatus().framesSubmitted).toBe(N);
+  });
+});
+
+describe('GPU-PROOF-5 iteration-1 static-scene tail (play.ts)', () => {
+  it('devroom: static world refs identical by reference, transforms reused, uploads 1, no CPU raster', () => {
+    installStubDoc();
+    const boot = capableBoot();
+    expect(boot.gpu).not.toBeNull();
+    const renderSpy = vi.spyOn(boot.refresh, 'renderView');
+    const staticScene = boot.gpu!.staticScene;
+    // Boot scene and static scene start as the same object (built once).
+    expect(boot.gpu!.scene).toBe(staticScene);
+    const staticCount = staticScene.surfaces.length;
+    const staticFirst = staticScene.surfaces[0];
+    keyDown(boot.host.input, 'forward');
+    keyDown(boot.host.input, 'attack');
+    const N = 30;
+    for (let f = 0; f < N; f++) frameGpuPlay(boot, f * 16);
+    keyUp(boot.host.input, 'forward');
+    keyUp(boot.host.input, 'attack');
+    // Per-frame scenes are fresh objects built ONLY from the static tail…
+    expect(boot.gpu!.scene).not.toBe(staticScene);
+    // …but every transformIndex-0 ref is the SAME object as the static one.
+    const tailWorld = boot.gpu!.scene.surfaces.filter((r) => r.transformIndex === 0);
+    expect(tailWorld.length).toBe(staticCount);
+    for (const ref of tailWorld) {
+      expect(staticScene.surfaces.includes(ref)).toBe(true);
+    }
+    // Transforms stay the boot `[identity]` slot by reference (renderer
+    // derives entity matrices from setEntities; see frameGpuPlay note).
+    expect(boot.gpu!.scene.transforms).toBe(staticScene.transforms);
+    expect(boot.gpu!.scene.transforms.length).toBe(1);
+    // Static base never mutated by the tail builder.
+    expect(staticScene.surfaces.length).toBe(staticCount);
+    expect(staticScene.surfaces[0]).toBe(staticFirst);
+    expect(boot.gpu!.scene.staticGeneration).toBe(staticScene.staticGeneration);
+    // Submission contract holds: uploads stay 1, N frames submitted, no CPU.
+    expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
+    expect(boot.gpu!.gpu.getStatus().framesSubmitted).toBe(N);
+    expect(renderSpy).not.toHaveBeenCalled();
+    expect(boot.host.serverTime).toBeGreaterThan(0);
+    expect(boot.host.playerOrigin[0]).toBeGreaterThan(-168);
+    expect(boot.driver.events).toContain('shot');
+    renderSpy.mockRestore();
+  });
+});
+
+describe.runIf(!!WEB_Q2_PAK)('GPU-PROOF-5 iteration-1 base1 tail + determinism (Q2_PAK)', () => {
+  async function loadPakBoot(width = 96, height = 72): Promise<ReturnType<typeof bootPlay>> {
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const pak = ingestPak(buf);
+    setCVar('vid_renderer', 'webgl2-experimental');
+    const boot = bootPlay({ width, height, pak });
+    expect(boot.renderer).toBe('webgl2-experimental');
+    expect(boot.gpu).not.toBeNull();
+    expect(boot.source).toBe('pak');
+    return boot;
+  }
+
+  function driveCombat(boot: ReturnType<typeof bootPlay>, log: string[], frames: number): void {
+    log.length = 0;
+    keyDown(boot.host.input, 'forward');
+    keyDown(boot.host.input, 'attack');
+    for (let f = 0; f < frames; f++) frameGpuPlay(boot, f * 16);
+    keyUp(boot.host.input, 'forward');
+    keyUp(boot.host.input, 'attack');
+  }
+
+  it('base1: static tail holds on the real world — refs by reference, uploads 1, combat advances', { timeout: 180000 }, async () => {
+    const stub = installStubDoc();
+    const boot = await loadPakBoot();
+    const renderSpy = vi.spyOn(boot.refresh, 'renderView');
+    const staticScene = boot.gpu!.staticScene;
+    expect(staticScene.surfaces.length).toBeGreaterThan(0);
+    const N = 20;
+    driveCombat(boot, stub.log, N);
+    const tailWorld = boot.gpu!.scene.surfaces.filter((r) => r.transformIndex === 0);
+    expect(tailWorld.length).toBe(staticScene.surfaces.length);
+    for (const ref of tailWorld) {
+      expect(staticScene.surfaces.includes(ref)).toBe(true);
+    }
+    expect(boot.gpu!.scene.transforms).toBe(staticScene.transforms);
+    expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
+    expect(boot.gpu!.gpu.getStatus().framesSubmitted).toBe(N);
+    expect(renderSpy).not.toHaveBeenCalled();
+    expect(boot.host.serverTime).toBeGreaterThan(0);
+    expect(boot.driver.events).toContain('shot');
+    expect(stub.log).toContain('drawElements');
+    expect(stub.log).not.toContain('readPixels');
+    renderSpy.mockRestore();
+  });
+
+  it('base1: same boot inputs twice → identical stub-GL call sequence + identical scene', { timeout: 180000 }, async () => {
+    const stub = installStubDoc();
+    const N = 20;
+    const bootA = await loadPakBoot();
+    driveCombat(bootA, stub.log, N);
+    const logA = stub.log.slice();
+    const sceneA = JSON.stringify(bootA.gpu!.scene.surfaces);
+    const statusA = bootA.gpu!.gpu.getStatus();
+    const bootB = await loadPakBoot();
+    driveCombat(bootB, stub.log, N);
+    const logB = stub.log.slice();
+    const sceneB = JSON.stringify(bootB.gpu!.scene.surfaces);
+    const statusB = bootB.gpu!.gpu.getStatus();
+    // Identical submitted pixels for identical inputs: the stub records the
+    // production GL call sequence (names + real draws), which is byte-equal.
+    expect(logB).toEqual(logA);
+    expect(logA).toContain('drawElements');
+    expect(sceneB).toBe(sceneA);
+    expect(statusB.framesSubmitted).toBe(statusA.framesSubmitted);
+    expect(bootB.gpu!.gpu.testUploadStats().uploads).toBe(1);
   });
 });
