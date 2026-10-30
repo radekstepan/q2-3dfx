@@ -8,7 +8,8 @@
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
 > **Current direction (reviewed 2026-10-29 at 3269c30): the WebGL2 prototype exists.
-> Execute GPU-FOLLOW-0 FIRST (user sees a black screen), then GPU-FOLLOW-1–7 to repair scene coverage, finish integration and
+> GPU-FOLLOW-0 fixed the black overlay. Execute GPU-FOLLOW-2, GPU-FOLLOW-2A/2B
+> first for missing world/textures/enemies; GPU-FOLLOW-1 reporting can run independently. Finish remaining cards to establish
 > establish acceptance. Keep it experimental; CPU optimization remains paused.**
 
 ---
@@ -296,11 +297,59 @@ Execution policy for follow-up:
 - Follow §7 disjoint package ownership, interface-first changes, integrator-only
   docs/changesets/commits; run expensive benchmarks sequentially. Recheck current
   code before implementing; do not redo fixes that landed after this review.
-- `ready` cards with unsatisfied dependencies wait. GPU-FOLLOW-2/3/4 share owners
+- `ready` cards with unsatisfied dependencies wait. GPU-FOLLOW-2/2A/2B/3/4 share owners
   and must be serialized or explicitly handed off. Commit validated increments
   autonomously, no push; preserve unrelated changes. No hardware or user visual
   approval may be fabricated. If unavailable, finish independent work and record
   the exact blocked acceptance step.
+
+### Latest user-visible review — `4dd7fc0` (2026-10-29)
+
+User can now see the GPU scene, but reports missing textures/elements, black spots,
+see-through “dollhouse” geometry and no enemies. FOLLOW-0 fixed presentation ONLY;
+its nonblack/gun-region pixel-count tests do not prove scene content. Do not reopen
+the CSS fix unless regression evidence warrants it; do not call these symptoms
+permitted Voodoo-style differences or spend the remaining performance iteration on them.
+
+Confirmed source defects still present:
+1. `play.ts: attachGpuBackend` uploads `selectGpuScene(...spawnView...)`;
+   `frameGpuPlay` updates only the entity tail. `scene.ts` filters by spawn PVS,
+   frustum and backface. `renderer.ts` caches batches from that subset. Missing
+   previously invisible walls are a direct candidate for the dollhouse symptom.
+2. `play.ts: applyRendererCvar` deliberately attaches world/palette WITHOUT models
+   and skins on CPU→GPU switching; its comment says entities remain mesh-less until
+   reboot. `renderer.ts: drawAlias` warns and returns when no mesh exists. This is
+   a concrete missing-enemy path; also test GPU cold boot separately before claiming
+   every enemy disappearance has the same cause.
+3. `renderer.ts: uploadTextureLevels` applies CLAMP_TO_EDGE to every texture,
+   including world WAL textures; `worldMesh.ts` supplies unrestricted normalized
+   BSP UVs and the shader samples them directly. Repeating walls therefore clamp
+   to border texels. World repeat and model/sprite/atlas clamp are distinct policies.
+4. `worldMesh.ts: packLightAtlas` substitutes just three bytes for a short lightmap
+   but still loops over its full luxW×luxH. Reads after the first pixel become
+   undefined/NaN and store as zero: black fallback lightmap texels. Atlas UVs also
+   omit the half-luxel centre and packed tiles have no filter gutters; test edge
+   bleeding before deciding its contribution to the reported black areas.
+5. RGB upload builds tightly packed mip arrays but contains no UNPACK_ALIGNMENT
+   setting. Test non-four-byte row strides (including tiny mip levels) on real GL
+   for upload errors/corruption; stub texImage2D call logs cannot validate this.
+
+Immediate execution prompt for the implementing LLM:
+- Fix scene completeness before fidelity tuning or speed. Reproduce both routes:
+  cold GPU boot and software/voodoo→GPU selection in the real production page.
+- Implement FOLLOW-2, 2A and 2B under explicit non-overlapping package ownership;
+  serialize shared renderer ownership or transfer it. FOLLOW-1 is reporting work
+  and may run independently, not block visible correctness fixes.
+- For each symptom establish failing evidence, fix the actual producer/registry/
+  selection/upload/draw path, then prove the particular wall/material/enemy is
+  rendered. Do not hide missing assets with silent skips, white/black substitutions,
+  disabled culling, empty scenes or a lower screenshot threshold.
+- Keep deterministic diagnostic modes (surface IDs, unlit diffuse, lightmap-only,
+  depth/coverage, entity IDs) test-only or explicitly debug-gated. They isolate holes
+  from black shading; normal gameplay retains the intended fidelity.
+- Run fresh composed-page captures and per-object assertions after fixes. Preserve
+  reference output/old evidence; commit validated changes with changesets without
+  pushing. Continue the finite correctness queue; default promotion remains blocked.
 
 ### GPU-FOLLOW-0 — Fix the actual black browser presentation FIRST
 owns: `apps/web`, `packages/testkit`
@@ -333,7 +382,7 @@ done-when:
 
 ### GPU-FOLLOW-2 — Correct moving-camera world visibility and draw order
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
-depends: GPU-FOLLOW-1
+depends: GPU-FOLLOW-0
 status: ready
 starting-points: `play.ts: attachGpuBackend/frameGpuPlay`; `scene.ts: selectGpuScene`; `entities.ts: updateGpuEntities`; `renderer.ts: setScene/uploadStatic/drawScene`
 done-when:
@@ -341,11 +390,37 @@ done-when:
 - [ ] Recompute transparent WORLD distance/order for the current view and combine with entity ordering where required; ensure actual draw calls follow the updated selection/order without rebuilding the whole mesh per frame.
 - [ ] Add fail-before tests for a 180-degree turn, camera translation across PVS clusters and changing transparent overlap. Include pixel/capture checks from the real browser path, not only updated surface lists or an uploads==1 assertion.
 - [ ] Traverse multiple rooms including doors/lifts; audit brush/submodel transforms and newly revealed geometry. Document missing dynamic-world support explicitly and implement the base1-required cases before claiming full-map coverage.
+- [ ] Add semantic hole/occlusion checks: previously hidden wall/floor/ceiling surface IDs become drawable after a turn, no exterior background shows through a known opaque wall, and doors/lifts occlude/move correctly. Audit winding/normal signs, polygon triangulation and near clipping if holes remain; do not globally disable culling to mask errors.
 - [ ] Remeasure the same route after correctness repair. No performance win may rely on rendering only the spawn subset.
+
+### GPU-FOLLOW-2A — Restore enemies, gun and assets on every entry path
+owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
+depends: GPU-FOLLOW-2
+status: ready
+starting-points: `play.ts: registerPakModels/applyRendererCvar`; `renderer.ts: registerModelData/registerSkinPixels/drawAlias`
+done-when:
+- [ ] Reproduce missing enemies on CPU→GPU hot-swap and cold GPU boot separately. Trace a known alive enemy through game state, renderables, handle registry, GPU mesh/skin, draw call and visible pixels. Distinguish missing assets from absent game entities or occlusion.
+- [ ] Retain/replay parsed asset data under the existing handles when attaching/restoring a GPU backend; all registered models, skins and kinds reach it without reboot or duplicate CPU registrations/handle drift. Do not solve switching by restarting/resetting the player's game.
+- [ ] GPU asset registration exceptions are surfaced with asset/handle context, not swallowed behind successful CPU registration. Required assets fail tests loudly; any intentional fallback is explicit and visible.
+- [ ] Test software→GPU, voodoo→GPU, GPU cold boot and repeated switches with the real soldier plus viewmodel and a second model/skin. Assert registry completeness, real draw execution, animation and visible per-entity differences; nonblack pixels or the gun alone are insufficient.
+- [ ] Verify enemies remain present while moving between rooms and after a supported context restore; preserve gameplay state, enemies' positions and weapon state across switches.
+
+### GPU-FOLLOW-2B — Repair diffuse texture and lightmap correctness
+owns: `packages/webgl-renderer`, `packages/testkit`
+depends: GPU-FOLLOW-2A
+status: ready
+starting-points: `renderer.ts: uploadTextureLevels/diffuseFor/skinFor`; `worldMesh.ts: pushSurfaceTris/packLightAtlas`; `appearance.ts: voodooSampleMipped`
+done-when:
+- [ ] Reproduce a failing world-repeat fixture with UVs outside [0,1], including negative UVs and bilinear seams. Give WAL/world materials repeat addressing and skins/sprites/lightmap atlases their intended clamp policy through texture creation and sampling. Preserve correct mip derivatives and resampling UV scale.
+- [ ] Set/restore appropriate pixel-unpack state for tightly packed RGB data; exercise 1/2/3-wide, odd-width/NPOT and real skin mip chains in a real WebGL context. Assert no upload GL errors, valid expected mip texels and sampled colors (not only texImage2D arguments).
+- [ ] Expand missing/short lightmap fallback to every luxel or represent a deliberate uniform unlit material. Never index beyond a three-byte fallback; test no-light surfaces and atlas overflow. Audit surface lightId mapping and light-style handling against the CPU reference.
+- [ ] Fix/test luxel centre placement and bilinear isolation between adjacent atlas tiles (gutters/edge duplication or equivalent). Use contrasting tiles, last-row/column samples and actual map edges to detect dark bleeding.
+- [ ] Capture diffuse-only, lightmap-only and final output at the same camera for reported black regions; identify each region's cause. Test actual textured walls/floors and enemy/gun skins in the composed page. No global brightness boost, disabling lighting or changed goldens to hide black spots.
+- [ ] Retain intended genuinely dark texels and documented appearance policy. Report asset warnings and material/texture counts; no silently missing required textures or GL upload errors on the supported route.
 
 ### GPU-FOLLOW-3 — Complete live effects and required world appearance
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
-depends: GPU-FOLLOW-2
+depends: GPU-FOLLOW-2B
 status: ready
 done-when:
 - [ ] Inventory actual live producers/consumers for sprites, particles, beams, explosions, lights and model/skin kinds. Connect game events and lifetimes to GPU drawing; rendering synthetic fixtures alone is insufficient. Verify event drains occur in the intended tick order without dropping or double-consuming effects.
@@ -386,7 +461,7 @@ done-when:
 
 ### GPU-FOLLOW-7 — Final acceptance and deliberate rollout
 owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config` (integrator)
-depends: GPU-FOLLOW-1, GPU-FOLLOW-2, GPU-FOLLOW-3, GPU-FOLLOW-4, GPU-FOLLOW-5, GPU-FOLLOW-6
+depends: GPU-FOLLOW-1, GPU-FOLLOW-2, GPU-FOLLOW-2A, GPU-FOLLOW-2B, GPU-FOLLOW-3, GPU-FOLLOW-4, GPU-FOLLOW-5, GPU-FOLLOW-6
 status: ready
 done-when:
 - [ ] Review integrated changes; run yarn verify, yarn deps:check, real-asset base1/voodoo gates and GPU lifecycle/image/gameplay suites. Record skips as missing coverage; retain CPU goldens and Node support.
