@@ -481,14 +481,15 @@ fixtures for infantry or barrels. Source is still f05e0ba; fixes are not yet lan
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
 depends: GPU-FOLLOW-0
 prerequisite-evidence: FOLLOW-2 implementation landed in f05e0ba; its remaining validation must not block this repair
-status: ready
+status: done(@integrator 2026-10-29)
 starting-points: `play.ts: registerPakModels/applyRendererCvar`; `renderer.ts: registerModelData/registerSkinPixels/drawAlias`
 done-when:
-- [ ] Reproduce missing enemies on CPU→GPU hot-swap and cold GPU boot separately. Trace a known alive enemy through game state, renderables, handle registry, GPU mesh/skin, draw call and visible pixels. Distinguish missing assets from absent game entities or occlusion.
-- [ ] Retain/replay parsed asset data under the existing handles when attaching/restoring a GPU backend; all registered models, skins and kinds reach it without reboot or duplicate CPU registrations/handle drift. Do not solve switching by restarting/resetting the player's game.
-- [ ] GPU asset registration exceptions are surfaced with asset/handle context, not swallowed behind successful CPU registration. Required assets fail tests loudly; any intentional fallback is explicit and visible.
-- [ ] Test software→GPU, voodoo→GPU, GPU cold boot and repeated switches with the real soldier plus viewmodel and a second model/skin. Assert registry completeness, real draw execution, animation and visible per-entity differences; nonblack pixels or the gun alone are insufficient.
-- [ ] Verify enemies remain present while moving between rooms and after a supported context restore; preserve gameplay state, enemies' positions and weapon state across switches.
+- [x] Reproduce missing enemies on CPU→GPU hot-swap and cold GPU boot separately. Trace a known alive enemy through game state, renderables, handle registry, GPU mesh/skin, draw call and visible pixels. Distinguish missing assets from absent game entities or occlusion.
+- [x] Retain/replay parsed asset data under the existing handles when attaching/restoring a GPU backend; all registered models, skins and kinds reach it without reboot or duplicate CPU registrations/handle drift. Do not solve switching by restarting/resetting the player's game.
+- [x] GPU asset registration exceptions are surfaced with asset/handle context, not swallowed behind successful CPU registration. Required assets fail tests loudly; any intentional fallback is explicit and visible.
+- [x] Test software→GPU, voodoo→GPU, GPU cold boot and repeated switches with the real soldier plus viewmodel and a second model/skin. Assert registry completeness, real draw execution, animation and visible per-entity differences; nonblack pixels or the gun alone are insufficient.
+- [x] Verify enemies remain present while moving between rooms and after a supported context restore; preserve gameplay state, enemies' positions and weapon state across switches.
+completion (2026-10-29, integrated — three disjoint lanes, integrator reconciled + committed): webgl-renderer idempotent replay + handle/kind warnings + registry hooks; apps/web RetainedPakAssets + replayPakAssetsToGpu on cold boot + hot-swap (no reboot, no handle drift, gameplay preserved); testkit cold/hot-swap registry/draw/gameplay pins + real soldier/infantry/barrel/gun unlit-vs-shade triage + matched composed crops. Evidence: webgl-renderer 13/13 follow2a (106/3 Q2_PAK full pkg), web gpu-hotswap 5/5 + neighbors 84/84, testkit gpu-follow-2a 9/9 (205/10 full pkg Q2_PAK). Changesets: webgl-renderer-gpu-follow-2a + testkit-gpu-follow-2a (web ignored). Ledger: GPU-FOLLOW-2A row appended. GPU-FOLLOW-2B now eligible.
 
 ### GPU-FOLLOW-2B — Repair diffuse texture and lightmap correctness
 owns: `packages/webgl-renderer`, `packages/testkit`

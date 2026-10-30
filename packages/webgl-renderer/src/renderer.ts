@@ -342,9 +342,42 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.staticDirty = true;
   }
 
-  /** Register model data for an entity model handle (kind + parsed MD2). */
+  /**
+   * Register model data for an entity model handle (kind + parsed MD2).
+   *
+   * Idempotent replay (FOLLOW-2A hot-swap/cold-boot mirror): re-registering
+   * the same handle overwrites the stored kind/mesh and drops the GL cache
+   * entry so the next draw rebuilds exactly one entry — never a duplicate.
+   * Missing/invalid md2 data records an explicit handle/kind-context warning
+   * (draws skip that entity, never crash, never silent). sp2/tracer handles
+   * carry no mesh by design, so null data for those kinds is expected and
+   * stays warning-free.
+   */
   registerModelData(handle: number, kind: GpuEntityModelKind, data: unknown): void {
-    this.models.set(handle, { kind, mesh: kind === 'md2' ? gpuMeshFromMd2(data) : null });
+    if (!Number.isInteger(handle) || handle < 0) {
+      this.warn(`registerModelData: invalid handle ${String(handle)} kind ${String(kind)} (ignored)`);
+      return;
+    }
+    if (kind !== 'md2' && kind !== 'sp2' && kind !== 'tracer') {
+      this.warn(`registerModelData: unknown kind ${String(kind)} for handle ${handle} (ignored)`);
+      return;
+    }
+    let mesh: AliasMesh | null = null;
+    if (kind === 'md2') {
+      try {
+        mesh = gpuMeshFromMd2(data);
+      } catch (err) {
+        mesh = null;
+        this.warn(`registerModelData: md2 convert threw for handle ${handle} (${err instanceof Error ? err.message : String(err)})`);
+      }
+      if (!mesh) {
+        const detail = data === null || data === undefined
+          ? 'null/undefined data'
+          : `typeof ${typeof data}`;
+        this.warn(`registerModelData: model ${handle} kind md2 has no mesh (${detail}, entity draws skip)`);
+      }
+    }
+    this.models.set(handle, { kind, mesh });
     this.modelGL.delete(handle);
   }
 
@@ -446,6 +479,34 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   /** Recorded non-fatal warnings (test hook): oversize, caps, fallbacks. */
   testWarnings(): string[] {
     return [...this.warnings];
+  }
+
+  /**
+   * Registered model handles, sorted (FOLLOW-2A test hook): hot-swap replay
+   * observability for the web/testkit lanes — proves every mirrored model
+   * reached the backend under its existing handle without reboot.
+   */
+  testRegisteredModels(): number[] {
+    return [...this.models.keys()].sort((a, b) => a - b);
+  }
+
+  /** Registered skin handles, sorted (FOLLOW-2A test hook, same contract). */
+  testRegisteredSkins(): number[] {
+    return [...this.skins.keys()].sort((a, b) => a - b);
+  }
+
+  /** Stored kind for one model handle (FOLLOW-2A test hook; null = unknown). */
+  testModelKind(handle: number): GpuEntityModelKind | null {
+    return this.models.get(handle)?.kind ?? null;
+  }
+
+  /**
+   * Live per-model GL cache entries (FOLLOW-2A test hook): replay must not
+   * accumulate duplicates — after any number of re-registrations + draws this
+   * holds at most one entry per drawn md2 handle.
+   */
+  testModelCacheSize(): number {
+    return this.modelGL.size;
   }
 
   /**
@@ -1109,7 +1170,10 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const reg = this.models.get(e.model);
     const mesh = reg?.mesh ?? null;
     if (!mesh) {
-      this.warn(`alias entity model ${e.model} has no mesh (skipped)`);
+      // Missing-asset skip (FOLLOW-2A observability): the handle/kind context
+      // distinguishes this from an absent entity or frustum/PVS occlusion
+      // (those never reach drawAlias at all). Recorded, never a crash.
+      this.warn(`drawAlias: model ${e.model} kind ${reg?.kind ?? 'unregistered'} has no mesh (skipped)`);
       return;
     }
     const { frameA, frameB, lerp } = resolveAliasLerp(e.frame, e.oldframe, e.backlerp, mesh.numFrames);

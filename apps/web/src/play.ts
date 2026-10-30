@@ -3167,8 +3167,9 @@ export function pushGpuAppearance(gpu: object, snapshot: GpuAppearanceSnapshot):
  * - Context-loss re-upload: loss records + skips per contract, but the live
  *   loop never re-attaches world/palette/models after restore (owner: EXPAND).
  * - Hot-swap asset migration: entering webgl2 mid-session attaches world +
- *   palette only; entities stay mesh-less until a reboot (recorded backend
- *   warnings; owner: EXPAND).
+ *   palette AND replays the retained MD2/PCX cache under existing handles
+ *   (`replayPakAssetsToGpu`, GPU-FOLLOW-2A) — entities no longer stay
+ *   mesh-less after a CPU→GPU switch.
  * - GPU-resident HUD: the overlay stays a CPU `paintHudOverlay` blit above
  *   the GL canvas by design here (owner: EXPAND).
  */
@@ -3256,6 +3257,51 @@ export interface PakModelHandles {
   banner: number;
   bannerSkin: number;
   skins: number[];
+  /**
+   * Retained parsed asset data (GPU-FOLLOW-2A): every successfully parsed
+   * MD2/PCX is cached under its existing CPU handle, plus an explicit
+   * fallback marker when a lump is missing/unparseable. `bootPlay` and
+   * `applyRendererCvar` replay this cache into a (re)attached GPU backend
+   * under the SAME handles — no CPU re-registration, no handle drift.
+   */
+  assets: RetainedPakAssets;
+}
+
+/**
+ * One retained model asset: parsed data cached under its CPU handle.
+ * `fallback` marks the box-critter substitution (explicit `console.warn`
+ * at registration); the stored `data` (real MD2 or devmesh) is what the
+ * GPU replay uploads, so fallbacks never surface as mesh-less either.
+ */
+export interface RetainedModelAsset {
+  handle: number;
+  kind: 'md2' | 'sp2' | 'tracer';
+  data: unknown;
+  /** Pak lump path (asset/handle context for warnings). */
+  path: string;
+  fallback: boolean;
+}
+
+/**
+ * One retained skin asset: parsed texels cached under its CPU handle.
+ * `pixels` is null for the CPU checker fallback (no texels to mirror —
+ * the GPU backend keeps its white fallback); the registration-time warning
+ * keeps that explicit.
+ */
+export interface RetainedSkinAsset {
+  handle: number;
+  pixels: Uint8Array | null;
+  width: number;
+  height: number;
+  /** Pak lump path (asset/handle context for warnings). */
+  path: string;
+  fallback: boolean;
+}
+
+/** Retained parsed asset data returned alongside `PakModelHandles`. */
+export interface RetainedPakAssets {
+  models: RetainedModelAsset[];
+  skins: RetainedSkinAsset[];
 }
 
 /**
@@ -3274,43 +3320,79 @@ export interface GpuAssetSink {
 export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak, gpuSink?: GpuAssetSink | null): PakModelHandles {
   createDevroom(); // guarantees getDevMesh(0) exists for per-file fallbacks
   const skins: number[] = [];
+  const retainedModels: RetainedModelAsset[] = [];
+  const retainedSkins: RetainedSkinAsset[] = [];
   const ext = refresh as unknown as {
     registerSkinData?: (name: string, texels: Uint8Array, width: number, height: number) => number;
   };
+  const describeFailure = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+  const mirrorSkin = (h: number, path: string, pixels: Uint8Array, width: number, height: number): void => {
+    if (!gpuSink) return;
+    try {
+      gpuSink.registerSkinPixels(h, pixels, width, height);
+    } catch (err) {
+      console.warn(`[q2ts-web] registerPakModels: GPU skin mirror failed for ${path} (skin ${h}): ${describeFailure(err)}`);
+    }
+  };
+  const mirrorModel = (h: number, path: string, data: unknown): void => {
+    if (!gpuSink) return;
+    try {
+      gpuSink.registerModelData(h, 'md2', data);
+    } catch (err) {
+      console.warn(`[q2ts-web] registerPakModels: GPU model mirror failed for ${path} (model ${h}): ${describeFailure(err)}`);
+    }
+  };
   const loadSkin = (path: string): number => {
+    let failure: string | null = null;
+    let parsed: Pcx | null = null;
     try {
       const bytes = tryPakEntry(pak, path);
-      if (bytes && typeof ext.registerSkinData === 'function') {
-        const pcx = parsePCX(bytes);
-        const h = ext.registerSkinData(path, pcx.pixels, pcx.width, pcx.height);
-        skins.push(h);
-        // GPU-PROOF-3 live-loop hookup: mirror parsed texels under the same handle.
-        try { gpuSink?.registerSkinPixels(h, pcx.pixels, pcx.width, pcx.height); } catch { /* CPU registration stands */ }
-        return h;
+      if (!bytes) {
+        failure = 'missing in pak';
+      } else if (typeof ext.registerSkinData !== 'function') {
+        failure = 'no registerSkinData hook';
+      } else {
+        parsed = parsePCX(bytes);
       }
-    } catch {
-      /* fall through to the checker fallback */
+    } catch (err) {
+      failure = `unparseable (${describeFailure(err)})`;
+      parsed = null;
+    }
+    if (parsed && typeof ext.registerSkinData === 'function') {
+      const h = ext.registerSkinData(path, parsed.pixels, parsed.width, parsed.height);
+      skins.push(h);
+      retainedSkins.push({ handle: h, pixels: parsed.pixels.slice(), width: parsed.width, height: parsed.height, path, fallback: false });
+      // GPU-PROOF-3 live-loop hookup: mirror parsed texels under the same handle.
+      mirrorSkin(h, path, parsed.pixels, parsed.width, parsed.height);
+      return h;
     }
     const h = refresh.registerSkin(path);
     skins.push(h);
+    retainedSkins.push({ handle: h, pixels: null, width: 0, height: 0, path, fallback: true });
+    console.warn(`[q2ts-web] registerPakModels: skin ${path} ${failure ?? 'unavailable'} → checker fallback (skin ${h})`);
     return h;
   };
   const loadModel = (path: string): number => {
+    let failure: string | null = null;
     try {
       const bytes = tryPakEntry(pak, path);
       if (bytes) {
         const md2 = parseMD2(bytes);
         const h = refresh.registerModel({ name: path, kind: 'md2', data: md2 });
+        retainedModels.push({ handle: h, kind: 'md2', data: md2, path, fallback: false });
         // GPU-PROOF-3 live-loop hookup: mirror parsed MD2 under the same handle.
-        try { gpuSink?.registerModelData(h, 'md2', md2); } catch { /* CPU registration stands */ }
+        mirrorModel(h, path, md2);
         return h;
       }
-    } catch {
-      /* fall through to the box-critter fallback */
+      failure = 'missing in pak';
+    } catch (err) {
+      failure = `unparseable (${describeFailure(err)})`;
     }
     const devmesh = getDevMesh(0);
     const h = refresh.registerModel({ name: path, kind: 'md2', data: devmesh });
-    try { gpuSink?.registerModelData(h, 'md2', devmesh); } catch { /* CPU registration stands */ }
+    retainedModels.push({ handle: h, kind: 'md2', data: devmesh, path, fallback: true });
+    console.warn(`[q2ts-web] registerPakModels: model ${path} ${failure ?? 'unavailable'} → box-critter fallback (model ${h})`);
+    mirrorModel(h, path, devmesh);
     return h;
   };
   // Soldier first: skin handle 0 + model handle 0 (see contract above).
@@ -3399,7 +3481,46 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak, gpuSin
     gibMeat, gibMeatSkin, gibChest, gibChestSkin, gibBone, gibBoneSkin, gibHead, gibHeadSkin,
     items, ship, shipSkin, banner, bannerSkin, corpse, corpseSkin,
     skins,
+    assets: { models: retainedModels, skins: retainedSkins },
   };
+}
+
+/**
+ * Replay retained parsed asset data into a (re)attached GPU backend under
+ * the SAME handles (GPU-FOLLOW-2A): cold boot and CPU→GPU hot-swap share
+ * this path, so entities never stay mesh-less and CPU handles never drift
+ * (no `registerPakModels` re-run here). Checker-fallback skins carry no
+ * texels and stay CPU-only (explicit at registration); every other entry
+ * replays via `GpuAssetSink`. Backend exceptions surface with asset/handle
+ * context via `console.warn` (never swallowed); a throwing entry is skipped
+ * so one bad lump cannot block the rest, and the missing backend handle
+ * fails completeness tests loudly.
+ */
+export function replayPakAssetsToGpu(
+  handles: PakModelHandles | null,
+  sink: GpuAssetSink | null | undefined,
+): { models: number; skins: number } {
+  if (!handles || !sink) return { models: 0, skins: 0 };
+  let models = 0;
+  let skins = 0;
+  for (const m of handles.assets.models) {
+    try {
+      sink.registerModelData(m.handle, m.kind, m.data);
+      models++;
+    } catch (err) {
+      console.warn(`[q2ts-web] replayPakAssetsToGpu: model ${m.path} (model ${m.handle}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  for (const s of handles.assets.skins) {
+    if (s.pixels === null) continue; // checker fallback is CPU-only by design
+    try {
+      sink.registerSkinPixels(s.handle, s.pixels, s.width, s.height);
+      skins++;
+    } catch (err) {
+      console.warn(`[q2ts-web] replayPakAssetsToGpu: skin ${s.path} (skin ${s.handle}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return { models, skins };
 }
 
 /**
@@ -3422,15 +3543,24 @@ function spawnViewFor(driver: LocalDriver): RefDef {
  * Attach the GPU backend for a `webgl2-experimental` boot/hot-swap: acquire
  * the GL canvas (stacked under the 2D/HUD canvas), init the committed
  * `WebGLRenderer`, and upload the STATIC world scene ONCE (empty entities at
- * boot). Returns null when no GL canvas/context is available — the caller
- * falls back to the CPU path WITH a warning, never silently. Never throws.
+ * boot). When retained pak assets are provided (GPU-FOLLOW-2A cold boot via
+ * `bootPlay`, hot-swap via `applyRendererCvar`), they are replayed into the
+ * backend under their SAME existing handles — entities never stay mesh-less.
+ * Returns null when no GL canvas/context is available — the caller falls
+ * back to the CPU path WITH a warning, never silently. Never throws.
  */
-function attachGpuBackend(driver: LocalDriver, width: number, height: number): GpuBootState | null {
+function attachGpuBackend(
+  driver: LocalDriver,
+  width: number,
+  height: number,
+  assets: PakModelHandles | null = null,
+): GpuBootState | null {
   const acquired = acquireGpuCanvas(undefined, width, height);
   if (!acquired) return null;
   try {
     const gpu = new WebGLRenderer();
     gpu.init(acquired.gl as unknown as WebGL2RenderingContext, width, height);
+    if (assets) replayPakAssetsToGpu(assets, gpu);
     const scene = selectGpuScene(driver.mini, [], spawnViewFor(driver), width, height);
     gpu.setScene(scene);
     // Persistent inventory snapshot (observability only): the full upload
@@ -3560,10 +3690,12 @@ export function bootPlay(opts: {
   // without one, keep the procedural box-critter exactly as before.
   let models: PakModelHandles | null = null;
   if (opts.pak) {
-    // GPU-PROOF-3: mirror parsed MD2/PCX into the GPU backend under the same
-    // handles when it is attached (boot-time webgl2 selection). The sink is
-    // guarded per call — CPU registration never depends on the mirror.
-    models = registerPakModels(refresh, opts.pak, gpu?.gpu ?? null);
+    // GPU-FOLLOW-2A: CPU registration always runs first and populates the
+    // retained asset cache (handle stability: soldier skin 0 + model 0
+    // first, no numeric shifts). The GPU backend is fed by the explicit
+    // replay below — the same `replayPakAssetsToGpu` path the CPU→GPU
+    // hot-swap uses — never by a divergent mirror.
+    models = registerPakModels(refresh, opts.pak, null);
     driver.models = models;
   } else if (driver.monsters.length > 0) {
     createDevroom();
@@ -3583,11 +3715,13 @@ export function bootPlay(opts: {
   // software) so a voodoo boot never starts on the wrong backend.
   armRasterPolicy(boot);
   // GPU-PROOF-3 live-loop hookup: the backend needs the world + palette for
-  // static uploads (models/skins mirrored during registerPakModels above).
+  // static uploads. GPU-FOLLOW-2A: the retained MD2/PCX cache replays under
+  // the SAME handles right after (cold boot shares the hot-swap path).
   // Without a pak there is nothing to attach (devroom stays CPU/clear-only).
   if (boot.gpu && mainPalette) {
     boot.gpu.gpu.attachWorld(driver.mini);
     boot.gpu.gpu.setPalette(mainPalette);
+    replayPakAssetsToGpu(models, boot.gpu.gpu);
   }
   return boot;
 }
@@ -3649,16 +3783,19 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
   // backend (same path as boot); leaving it disposes the backend. Attach
   // failure degrades to software WITH a warning, never silently.
   if (kind === 'webgl2-experimental' && !boot.gpu) {
-    const attached = attachGpuBackend(boot.driver, boot.host.fb.width, boot.host.fb.height);
+    const attached = attachGpuBackend(boot.driver, boot.host.fb.width, boot.host.fb.height, boot.models);
     if (attached) {
       boot.gpu = attached;
-      // World + palette for the static upload (models/skins were registered
-      // at boot without a GPU sink on this path, so entities stay mesh-less
-      // until a reboot — recorded backend warnings, never a crash; full
-      // hot-swap asset migration is EXPAND scope).
+      // World + palette for the static upload, then the retained MD2/PCX
+      // cache replays under the SAME handles (GPU-FOLLOW-2A): no CPU
+      // re-registration (no handle drift), no reboot, no reset of the
+      // player's game. Devroom boots carry no retained assets (models null)
+      // and stay clear-only.
       attached.gpu.attachWorld(boot.driver.mini);
       const pal = gpuPaletteFor(boot);
       if (pal) attached.gpu.setPalette(pal);
+      // (Retained models/skins already replayed inside attachGpuBackend
+      // under the same handles — see above.)
       try {
         syncGpuCanvasToHud(undefined);
         setHudTransparent(undefined, true);
