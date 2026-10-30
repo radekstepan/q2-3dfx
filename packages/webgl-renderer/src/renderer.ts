@@ -194,6 +194,8 @@ interface ProgLocs {
   uFogAmount: WebGLUniformLocation | null;
   uFogColor: WebGLUniformLocation | null;
   uFogTable: WebGLUniformLocation | null;
+  // FOLLOW-2B test-only diagnostic view (debug-gated; production stays 0).
+  uDebugMode: WebGLUniformLocation | null;
 }
 
 /** Appearance-pass program locations (fullscreen resolve to the canvas). */
@@ -252,6 +254,15 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private fogLUT: Float32Array | null = null;
   /** Forced-fog test hook (production: null => scene contribution 0, base1 rule). */
   private fogOverride: { amount: number; color: [number, number, number] } | null = null;
+  /**
+   * FOLLOW-2B test-only diagnostic view (debug-gated, never set in
+   * production): 0 = final (shipped), 1 = unlit diffuse/skin, 2 = lightmap
+   * (world) / shade base (alias). Uploaded per draw by drawWorldRange /
+   * drawAlias / setVoodooPolicy; the shaders early-out before lighting/fog.
+   */
+  private debugView: 0 | 1 | 2 = 0;
+  /** Atlas accounting for the current generation (FOLLOW-2B report hook). */
+  private atlasStats: { width: number; height: number; rects: number; skipped: number; shortFallback: number } | null = null;
   /** Uploaded chain depth per texture (for the uMaxLevel LOD clamp). */
   private texLevels = new Map<WebGLTexture, number>();
   private staticDirty = true;
@@ -532,6 +543,40 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     return { float: this.target.float, w: this.target.w, h: this.target.h };
   }
 
+  /**
+   * FOLLOW-2B test-only diagnostic view (debug-gated): 0 = final (shipped
+   * default), 1 = unlit diffuse (world) / unlit skin (alias), 2 = lightmap
+   * block (world) / shade base (alias). Production never calls this; the
+   * triage captures (diffuse-only / lightmap-only / final at the same
+   * camera) run through it explicitly.
+   */
+  setDebugView(mode: 0 | 1 | 2): void {
+    this.debugView = mode;
+  }
+
+  /**
+   * Atlas accounting for the current static generation (FOLLOW-2B report
+   * hook): atlas dims, packed rect count, overflow-skipped count and
+   * short-fallback count. Null before the first static upload.
+   */
+  testAtlasStats(): { width: number; height: number; rects: number; skipped: number; shortFallback: number } | null {
+    return this.atlasStats ? { ...this.atlasStats } : null;
+  }
+
+  /**
+   * Material/texture counts for the current generation (FOLLOW-2B report
+   * hook): live diffuse textures (world WAL uploads), skin textures, atlas
+   * presence and recorded warnings. Null entries are skipped handles, never
+   * silent origin reads.
+   */
+  testMaterialStats(): { diffuseTextures: number; skinTextures: number; atlas: boolean; warnings: number } {
+    let diffuse = 0;
+    for (const t of this.diffuseTex.values()) if (t) diffuse++;
+    let skins = 0;
+    for (const t of this.skinTex.values()) if (t) skins++;
+    return { diffuseTextures: diffuse, skinTextures: skins, atlas: this.atlasTex !== null, warnings: this.warnings.length };
+  }
+
   private warn(msg: string): void {
     if (!this.warnings.includes(msg)) this.warnings.push(msg);
   }
@@ -611,6 +656,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
         uFogAmount: L('uFogAmount'),
         uFogColor: L('uFogColor'),
         uFogTable: L('uFogTable'),
+        uDebugMode: L('uDebugMode'),
       };
     };
     try {
@@ -662,8 +708,15 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       if (world.surfaces[i] && world.surfaces[i]!.n >= 3) allIds.push(i);
     }
     const sig = styleSignature(input.view.lightStyles);
-    const { atlas, skipped } = packLightAtlas(world, allIds, input.view.lightStyles);
-    for (const id of skipped) this.warn(`lightmap atlas overflow: surface ${id} unlit (atlas origin)`);
+    const { atlas, skipped, shortFallback } = packLightAtlas(world, allIds, input.view.lightStyles);
+    for (const id of skipped) this.warn(`lightmap atlas overflow: surface ${id} unlit (uniform unlit tile)`);
+    this.atlasStats = {
+      width: atlas.width,
+      height: atlas.height,
+      rects: atlas.rectOf.size,
+      skipped: skipped.length,
+      shortFallback: shortFallback.length,
+    };
     this.atlas = atlas;
     this.styleSig = sig;
     const store = buildFullWorldStore(world, atlas);
@@ -714,12 +767,84 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     return buf;
   }
 
+  /**
+   * Upload one RGB level with explicit tightly-packed pixel state
+   * (FOLLOW-2B): UNPACK_ALIGNMENT 1 + UNPACK_ROW_LENGTH 0 for the upload,
+   * restored afterwards; a guarded getError warn makes real-GL upload
+   * failures loud instead of silent. Stubs without pixelStorei/getError
+   * (typeof-guarded) keep working with default unpack state.
+   */
+  private uploadPixels(
+    gl: WebGL2RenderingContext,
+    level: number,
+    w: number,
+    h: number,
+    data: Uint8Array,
+  ): void {
+    const hasStore = typeof (gl as unknown as { pixelStorei?: unknown }).pixelStorei === 'function';
+    let prevAlign: number | null = null;
+    let prevRowLen: number | null = null;
+    if (hasStore) {
+      try {
+        const cur = gl.getParameter(gl.UNPACK_ALIGNMENT) as number;
+        if (typeof cur === 'number') prevAlign = cur;
+      } catch {
+        prevAlign = null;
+      }
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      const rowLenEnum = (gl as unknown as { UNPACK_ROW_LENGTH?: number }).UNPACK_ROW_LENGTH;
+      if (typeof rowLenEnum === 'number') {
+        try {
+          const curRow = gl.getParameter(rowLenEnum) as number;
+          if (typeof curRow === 'number') prevRowLen = curRow;
+        } catch {
+          prevRowLen = null;
+        }
+        gl.pixelStorei(rowLenEnum, 0);
+      }
+    }
+    try {
+      gl.texImage2D(gl.TEXTURE_2D, level, gl.RGB, w, h, 0, gl.RGB, gl.UNSIGNED_BYTE, data);
+    } finally {
+      if (hasStore) {
+        try {
+          gl.pixelStorei(gl.UNPACK_ALIGNMENT, prevAlign ?? 4);
+          const rowLenEnum = (gl as unknown as { UNPACK_ROW_LENGTH?: number }).UNPACK_ROW_LENGTH;
+          if (typeof rowLenEnum === 'number' && prevRowLen !== null) {
+            gl.pixelStorei(rowLenEnum, prevRowLen);
+          }
+        } catch {
+          /* restore is best-effort on exotic handles */
+        }
+      }
+    }
+    if (typeof (gl as unknown as { getError?: unknown }).getError === 'function') {
+      try {
+        const err = gl.getError();
+        if (err !== gl.NO_ERROR) {
+          this.warn(`texture upload ${w}x${h} level ${level} GL error ${err} (texels may be corrupt)`);
+        }
+      } catch {
+        /* error polling is best-effort */
+      }
+    }
+  }
+
+  /**
+   * Upload a texture with per-kind wrap addressing (FOLLOW-2B): world WAL
+   * diffuse uses REPEAT (BSP UVs are unrestricted texel coords, routinely
+   * negative/multi-tile); skins, sprites, the lightmap atlas and the white
+   * texel use CLAMP_TO_EDGE. Uploads pin the active unit to TEXTURE0 so a
+   * lazy first-use upload can never clobber the unit-1 lightmap binding
+   * (sampler-unit isolation); every world draw re-binds both units anyway.
+   */
   private uploadTextureLevels(
     gl: WebGL2RenderingContext,
     rgb: Uint8Array,
     w: number,
     h: number,
     mips: boolean,
+    wrap: 'repeat' | 'clamp',
   ): WebGLTexture {
     const tex = gl.createTexture();
     if (!tex) this.fail('WebGLRenderer.uploadStatic: createTexture returned null');
@@ -727,11 +852,14 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const linear = ap ? ap.bilinear : true;
     const min = linear ? gl.LINEAR : gl.NEAREST;
     const mag = linear ? gl.LINEAR : gl.NEAREST;
+    // Pin side effects to unit 0 (see above); draw paths re-bind unit 1.
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, min);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, mag);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const wrapMode = wrap === 'repeat' ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrapMode);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrapMode);
     if (mips) {
       // CPU-built mip chain (Voodoo box-filter rule, clamp addressing):
       // level 0 is the capped base, each step halves to 1x1. MIN stays
@@ -740,19 +868,25 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       const chain = buildMipChainRGB(rgb, w, h);
       for (let lvl = 0; lvl < chain.length; lvl++) {
         const m = chain[lvl]!;
-        gl.texImage2D(gl.TEXTURE_2D, lvl, gl.RGB, m.w, m.h, 0, gl.RGB, gl.UNSIGNED_BYTE, m.data);
+        this.uploadPixels(gl, lvl, m.w, m.h, m.data);
       }
       this.texLevels.set(tex, chain.length - 1);
     } else {
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, w, h, 0, gl.RGB, gl.UNSIGNED_BYTE, rgb);
+      this.uploadPixels(gl, 0, w, h, rgb);
       this.texLevels.set(tex, 0);
     }
     return tex;
   }
 
   /** Backwards-compatible single-level upload (lightmap atlas, white texel). */
-  private uploadTexture(gl: WebGL2RenderingContext, rgb: Uint8Array, w: number, h: number): WebGLTexture {
-    return this.uploadTextureLevels(gl, rgb, w, h, false);
+  private uploadTexture(
+    gl: WebGL2RenderingContext,
+    rgb: Uint8Array,
+    w: number,
+    h: number,
+    wrap: 'repeat' | 'clamp' = 'clamp',
+  ): WebGLTexture {
+    return this.uploadTextureLevels(gl, rgb, w, h, false, wrap);
   }
 
   /** Per-draw sampler mode (vd_bilinear is live: no re-upload, just params). */
@@ -784,7 +918,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
           if (capped.capped) {
             this.warn(`diffuse texture ${texId} oversized ${tex.width}x${tex.height} (resampled to ${capped.w}x${capped.h})`);
           }
-          out = this.uploadTextureLevels(gl, capped.data, capped.w, capped.h, true);
+          out = this.uploadTextureLevels(gl, capped.data, capped.w, capped.h, true, 'repeat');
         }
       }
     }
@@ -808,7 +942,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
         if (capped.capped) {
           this.warn(`skin ${handle} oversized ${skin.width}x${skin.height} (resampled to ${capped.w}x${capped.h})`);
         }
-        out = { tex: this.uploadTextureLevels(gl, capped.data, capped.w, capped.h, true), w: skin.width, h: skin.height };
+        out = { tex: this.uploadTextureLevels(gl, capped.data, capped.w, capped.h, true, 'clamp'), w: skin.width, h: skin.height };
       } else {
         this.warn(`skin ${handle} texel mismatch (white fallback)`);
       }
@@ -849,13 +983,21 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     for (let i = 0; i < world.surfaces.length; i++) {
       if (world.surfaces[i] && world.surfaces[i]!.n >= 3) worldIds.push(i);
     }
-    const { atlas, skipped } = packLightAtlas(world, worldIds, lightStyles);
+    const { atlas, skipped, shortFallback } = packLightAtlas(world, worldIds, lightStyles);
     // Same surface set => same rects (pack order is deterministic); only
     // texels change, so lightUV attributes stay valid.
-    for (const id of skipped) this.warn(`lightmap atlas overflow: surface ${id} unlit (atlas origin)`);
+    for (const id of skipped) this.warn(`lightmap atlas overflow: surface ${id} unlit (uniform unlit tile)`);
+    this.atlasStats = {
+      width: atlas.width,
+      height: atlas.height,
+      rects: atlas.rectOf.size,
+      skipped: skipped.length,
+      shortFallback: shortFallback.length,
+    };
     if (this.atlasTex && atlas.width === this.atlas.width && atlas.height === this.atlas.height) {
+      gl.activeTexture(gl.TEXTURE1);
       gl.bindTexture(gl.TEXTURE_2D, this.atlasTex);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, atlas.width, atlas.height, 0, gl.RGB, gl.UNSIGNED_BYTE, atlas.pixels);
+      this.uploadPixels(gl, 0, atlas.width, atlas.height, atlas.pixels);
       this.atlas.pixels = atlas.pixels;
     } else {
       this.atlasTex = this.uploadTexture(gl, atlas.pixels, atlas.width, atlas.height);
@@ -1142,6 +1284,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private setVoodooPolicy(gl: WebGL2RenderingContext, p: ProgLocs): void {
     const ap = this.apFrame;
     const lut = this.fogLUT;
+    if (p.uDebugMode) gl.uniform1i(p.uDebugMode, this.debugView);
     if (!ap || !lut) return;
     if (p.uLodBias) gl.uniform1f(p.uLodBias, ap.lodBias);
     if (p.uMipDither) gl.uniform1i(p.uMipDither, ap.mipDither ? 1 : 0);
@@ -1201,6 +1344,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const MVP = multiplyMat4(P, MV);
     const alias = progs.alias;
     gl.useProgram(alias.prog);
+    if (alias.uDebugMode) gl.uniform1i(alias.uDebugMode, this.debugView);
     this.setMVP(gl, alias, MVP, gun ? GUN_DEPTH_SCALE : 1);
     if (alias.uDepthBias) gl.uniform1f(alias.uDepthBias, gun ? GUN_DEPTH_BIAS : 0);
     this.setLights(gl, alias, lights);
@@ -1314,9 +1458,12 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   /**
    * Draw one uploaded world surface range (selection-driven). Missing ranges
    * (degenerate/sky ids, unknown surfaces) are skipped — never crash.
-   * Re-binds the lit program every draw: blend-pass draws interleave world
-   * ranges with alias/sprite/beam draws that switch programs (per-program
-   * uniforms persist, so no uniform re-upload is needed).
+   * Re-binds the lit program every draw + BOTH sampler units (unit 0 diffuse,
+   * unit 1 lightmap): blend-pass draws interleave world ranges with
+   * alias/sprite/beam draws that switch programs, and a lazy first-use
+   * diffuse upload pins TEXTURE0 — per-draw re-bind keeps unit 1 intact.
+   * Uploads uDebugMode per draw so triage captures (0/1/2) take effect
+   * without a pass restart.
    */
   private drawWorldRange(
     gl: WebGL2RenderingContext,
@@ -1328,8 +1475,10 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     if (!this.worldPosBuf || !this.worldUVBuf || !this.worldLUVBuf ||
       !this.worldAlphaBuf || !this.worldIdxBuf) return;
     gl.useProgram(p.prog);
+    if (p.uDebugMode) gl.uniform1i(p.uDebugMode, this.debugView);
     const tex = this.diffuseFor(gl, range.texId) ?? this.whiteFor(gl);
     this.bindDiffuse(gl, p, tex);
+    this.bindLightmap(gl, p);
     this.bindAttrib(gl, 0, this.worldPosBuf, 3);
     this.bindAttrib(gl, 1, this.worldUVBuf, 2);
     this.bindAttrib(gl, 2, this.worldLUVBuf, 2);

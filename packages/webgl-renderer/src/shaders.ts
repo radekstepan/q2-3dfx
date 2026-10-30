@@ -56,12 +56,24 @@ uniform sampler2D uLightmap;
 uniform vec4 uLightPos[8];
 uniform vec3 uLightColor[8];
 uniform int uNumLights;
+uniform int uDebugMode;
 out vec4 oColor;
 ${GLSL_MIP_POLICY}
 ${GLSL_FOG_OVERBRIGHT}
 void main() {
   vec3 texel = voodooSampleMipped(uDiffuse, vUV);
+  // FOLLOW-2B test-only diagnostic views (debug-gated, production stays 0):
+  // 1 = unlit diffuse (repeat/wrap + upload triage), 2 = lightmap block only
+  // (atlas placement/bleed triage). Final (0) is the shipped path.
+  if (uDebugMode == 1) {
+    oColor = vec4(texel, vAlpha);
+    return;
+  }
   vec3 lm = texture(uLightmap, vLightUV).rgb;
+  if (uDebugMode == 2) {
+    oColor = vec4(lm, vAlpha);
+    return;
+  }
   vec3 dyn = vec3(0.0);
   for (int i = 0; i < 8; i++) {
     if (i >= uNumLights) break;
@@ -117,11 +129,23 @@ uniform vec4 uLightPos[8];
 uniform vec3 uLightColor[8];
 uniform int uNumLights;
 uniform float uAlpha;
+uniform int uDebugMode;
 out vec4 oColor;
 ${GLSL_MIP_POLICY}
 ${GLSL_FOG_OVERBRIGHT}
 void main() {
   vec3 texel = voodooSampleMipped(uDiffuse, vUV);
+  // FOLLOW-2B test-only diagnostic views (debug-gated, production stays 0):
+  // 1 = unlit skin (upload/UV/palette triage), 2 = shade base only
+  // (normal/shading triage). Final (0) is the shipped path.
+  if (uDebugMode == 1) {
+    oColor = vec4(texel, vAlpha * uAlpha);
+    return;
+  }
+  if (uDebugMode == 2) {
+    oColor = vec4(vec3(vShade), vAlpha * uAlpha);
+    return;
+  }
   vec3 dyn = vec3(0.0);
   for (int i = 0; i < 8; i++) {
     if (i >= uNumLights) break;

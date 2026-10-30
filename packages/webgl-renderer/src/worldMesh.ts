@@ -11,7 +11,10 @@
 //
 // Lightmap atlas: one RGB UNSIGNED_BYTE atlas per static generation packing
 // every referenced surface lightmap block (shelf pack, width 1024, height
-// grows; >2048 records a warning and skips the overflow, never crashes).
+// grows; >2048 records a warning and skips the overflow into a deliberate
+// uniform unlit tile, never a crash and never a silent atlas-origin read).
+// Tiles carry 1-texel edge-duplicated gutters and lightUVs address luxel
+// centres (CPU bilinear-centre rule); short/unlit blocks expand per-luxel.
 // Style scaling (combineStyleScales, the CPU rule: sum of lightStyles over
 // the surface's 4 style slots, 255 = unused) is BAKED into the atlas texels
 // using the frame's lightStyles; when the style signature changes the atlas
@@ -60,8 +63,18 @@ export interface LightAtlas {
   width: number;
   height: number;
   pixels: Uint8Array;
+  /** surface id -> CONTENT rect (gutter-excluded origin, luxel dims). */
   rectOf: Map<number, { x: number; y: number; w: number; h: number }>;
+  /**
+   * Centre of the reserved uniform unlit tile (neutral mid-gray, no style
+   * scaling — a deliberate uniform material, never atlas origin). Surfaces
+   * with no lightmap and overflow-skipped surfaces sample here.
+   */
+  unlitUV: [number, number];
 }
+
+/** Neutral unlit luxel value (matches the bspWorld unlit sentinel). */
+export const UNLIT_LUXEL = 128;
 
 /** Max atlas dimension before overflow skips (recorded, never crash). */
 export const ATLAS_MAX_DIM = 2048;
@@ -85,6 +98,7 @@ function pushSurfaceTris(
   s: MiniSurf,
   alpha: number,
   rect: AtlasRect | null,
+  unlitUV: readonly [number, number],
   atlasW: number,
   atlasH: number,
   texW: number,
@@ -95,9 +109,14 @@ function pushSurfaceTris(
     b.positions.push(s.verts[i * 3]!, s.verts[i * 3 + 1]!, s.verts[i * 3 + 2]!);
     b.uvs.push(s.uvs[i * 2]! / texW, s.uvs[i * 2 + 1]! / texH);
     if (rect) {
-      b.lightUVs.push((rect.x + s.lux[i * 2]!) / atlasW, (rect.y + s.lux[i * 2 + 1]!) / atlasH);
+      // Luxel-centre placement (matches the CPU sampleLightBlock rule where
+      // integer luxel coords address luxel CENTRES): the GPU LINEAR tap at
+      // (rect + lux + 0.5) lands on the luxel centre instead of straddling
+      // the texel edge into the neighbour tile.
+      b.lightUVs.push((rect.x + 0.5 + s.lux[i * 2]!) / atlasW, (rect.y + 0.5 + s.lux[i * 2 + 1]!) / atlasH);
     } else {
-      b.lightUVs.push(0, 0);
+      // Deliberate uniform unlit material (never atlas origin).
+      b.lightUVs.push(unlitUV[0], unlitUV[1]);
     }
     b.alphas.push(alpha);
   }
@@ -159,7 +178,8 @@ function classifyForStore(s: MiniSurf): { material: GpuSurfaceKind; transparent:
  * (n >= 3) is packed exactly once in surface-id order — no camera culling —
  * so per-frame draw selection is just a choice of ranges (no rebuild).
  * Per-vertex alpha bakes the SURF_TRANS33/66 rule; lightUVs come from the
- * handed atlas (missing rects read (0,0), the atlas-origin fallback).
+ * handed atlas (luxel centres with gutter isolation; missing rects sample
+ * the atlas unlit tile, the deliberate uniform fallback).
  */
 export function buildFullWorldStore(
   world: MiniWorld,
@@ -197,9 +217,12 @@ export function buildFullWorldStore(
       pos.push(s.verts[i * 3]!, s.verts[i * 3 + 1]!, s.verts[i * 3 + 2]!);
       uv.push(s.uvs[i * 2]! / texW, s.uvs[i * 2 + 1]! / texH);
       if (rect) {
-        luv.push((rect.x + s.lux[i * 2]!) / atlas.width, (rect.y + s.lux[i * 2 + 1]!) / atlas.height);
+        // Luxel-centre placement (see pushSurfaceTris): integer luxel
+        // coords address luxel centres, matching the CPU bilinear rule.
+        luv.push((rect.x + 0.5 + s.lux[i * 2]!) / atlas.width, (rect.y + 0.5 + s.lux[i * 2 + 1]!) / atlas.height);
       } else {
-        luv.push(0, 0);
+        // Deliberate uniform unlit material (never atlas origin).
+        luv.push(atlas.unlitUV[0], atlas.unlitUV[1]);
       }
       alpha.push(a);
     }
@@ -281,7 +304,7 @@ export function buildTexturedWorldBatches(
     const texH = tex?.height ?? 1;
     const alpha = ref.transparent ? (s.translucent === 2 ? TRANS66_ALPHA : TRANS33_ALPHA) : 1;
     const bucket = getBucket(ref.transparent ? 'transparent' : 'opaque', s.texId);
-    pushSurfaceTris(bucket, s, alpha, atlas.rectOf.get(s.id) ?? null, atlas.width, atlas.height, texW, texH);
+    pushSurfaceTris(bucket, s, alpha, atlas.rectOf.get(s.id) ?? null, atlas.unlitUV, atlas.width, atlas.height, texW, texH);
   }
 
   const opaque: WorldBatch[] = [];
@@ -309,63 +332,169 @@ export function buildTexturedWorldBatches(
  * Pack every referenced surface lightmap block into one RGB atlas, baking
  * the CPU style scale (combineStyleScales over the frame's lightStyles).
  * Returns the atlas plus the list of surface ids that did not fit (empty in
- * practice; skipped with a recorded warning, never a crash).
+ * practice on base1; skipped with a recorded warning, never a crash) and
+ * the list of ids whose samples were short (filled per-luxel, see below).
+ *
+ * Tile isolation (FOLLOW-2B): each tile is placed with a 1-texel gutter
+ * duplicating its edge texels, and lightUVs address luxel CENTRES
+ * (+0.5, matching the CPU sampleLightBlock rule where integer luxel coords
+ * hit luxel centres). A bilinear tap at a tile edge therefore blends with
+ * the tile's own duplicated edge instead of the neighbour tile. `rectOf`
+ * stores the CONTENT origin (gutter-excluded) plus luxel dims.
+ *
+ * Short samples (FOLLOW-2B): a block shorter than luxW*luxH*3 (the unlit
+ * sentinel path) is expanded to EVERY luxel with the neutral mid-gray fill
+ * instead of indexing past a 3-byte fallback (which read undefined/NaN and
+ * stored black). Recorded in `shortFallback`, never silent.
+ *
+ * No-light + overflow surfaces (FOLLOW-2B): ids without a rect (missing
+ * lightmap, or packed past ATLAS_MAX_DIM) sample the reserved uniform
+ * unlit tile (`atlas.unlitUV`) — a deliberate uniform material, never a
+ * silent read of whatever tile sits at the atlas origin.
  */
 export function packLightAtlas(
   world: MiniWorld,
   surfaceIds: number[],
   lightStyles: Float32Array,
-): { atlas: LightAtlas; skipped: number[] } {
+): { atlas: LightAtlas; skipped: number[]; shortFallback: number[] } {
   type Item = { id: number; w: number; h: number; src: Uint8Array; scale: number };
   const items: Item[] = [];
+  const shortFallback: number[] = [];
   for (const id of surfaceIds) {
-    const lm = world.lightmaps[id];
+    const surf = world.surfaces[id];
+    if (!surf) continue;
+    // CPU parity (frame.ts / light.ts): the lightmap block is keyed by
+    // surf.lightId % lightmaps.length, NOT by surface id. Procedural tests
+    // set lightId == id, hiding divergence; resolve here so a remapped
+    // lightId (or % wrap) samples the same block as the CPU reference.
+    const lmCount = world.lightmaps.length;
+    if (lmCount === 0) continue;
+    const lmIdx = ((surf.lightId % lmCount) + lmCount) % lmCount;
+    const lm = world.lightmaps[lmIdx];
     if (!lm || lm.luxW < 1 || lm.luxH < 1) continue;
     const need = lm.luxW * lm.luxH * 3;
-    const src = lm.samples.length >= need ? lm.samples.subarray(0, need) : new Uint8Array([128, 128, 128]);
+    let src: Uint8Array;
+    if (lm.samples.length >= need) {
+      src = lm.samples.subarray(0, need);
+    } else {
+      // Unlit/short block: neutral fill for EVERY luxel (the bspWorld
+      // [128,128,128] sentinel value, replicated — never an OOB read).
+      src = new Uint8Array(need).fill(UNLIT_LUXEL);
+      shortFallback.push(id);
+    }
     items.push({ id, w: lm.luxW, h: lm.luxH, src, scale: combineStyleScales(lm.styles, lightStyles) });
   }
   items.sort((a, b) => b.h - a.h || b.w - a.w);
   const rectOf = new Map<number, { x: number; y: number; w: number; h: number }>();
   const skipped: number[] = [];
-  // Shelf pack: rows of ATLAS_WIDTH; height grows on demand.
-  let shelfY = 0;
-  let shelfH = 0;
-  let shelfX = 0;
+  // Shelf pack with 1-texel gutters: padded footprint (w+2, h+2), content
+  // origin stored in rectOf. The reserved unlit tile occupies padded (0,0)
+  // (content (1,1)); the first shelf row starts at x=3.
   const placed: Array<Item & { x: number; y: number }> = [];
+  let shelfY = 0;
+  let shelfH = 3;
+  let shelfX = 3;
   for (const it of items) {
-    if (it.w > ATLAS_WIDTH || shelfY + Math.max(shelfH, it.h) > ATLAS_MAX_DIM) {
+    const pw = it.w + 2;
+    const ph = it.h + 2;
+    if (pw > ATLAS_WIDTH || shelfY + Math.max(shelfH, ph) > ATLAS_MAX_DIM) {
       skipped.push(it.id);
       continue;
     }
-    if (shelfX + it.w > ATLAS_WIDTH) {
+    if (shelfX + pw > ATLAS_WIDTH) {
       shelfY += shelfH;
       shelfX = 0;
       shelfH = 0;
     }
-    if (shelfY + it.h > ATLAS_MAX_DIM) {
+    if (shelfY + ph > ATLAS_MAX_DIM) {
       skipped.push(it.id);
       continue;
     }
-    placed.push({ ...it, x: shelfX, y: shelfY });
-    rectOf.set(it.id, { x: shelfX, y: shelfY, w: it.w, h: it.h });
-    shelfX += it.w;
-    if (it.h > shelfH) shelfH = it.h;
+    // Content origin (gutter-excluded).
+    placed.push({ ...it, x: shelfX + 1, y: shelfY + 1 });
+    rectOf.set(it.id, { x: shelfX + 1, y: shelfY + 1, w: it.w, h: it.h });
+    shelfX += pw;
+    if (ph > shelfH) shelfH = ph;
   }
-  const height = Math.max(1, shelfY + shelfH);
+  const height = Math.max(3, shelfY + shelfH);
   const pixels = new Uint8Array(ATLAS_WIDTH * height * 3);
+  const blit = (dx: number, dy: number, r: number, g: number, b: number): void => {
+    const o = (dy * ATLAS_WIDTH + dx) * 3;
+    pixels[o] = r;
+    pixels[o + 1] = g;
+    pixels[o + 2] = b;
+  };
+  // Reserved uniform unlit tile: content (1,1), gutters duplicated.
+  blit(1, 1, UNLIT_LUXEL, UNLIT_LUXEL, UNLIT_LUXEL);
+  blit(0, 1, UNLIT_LUXEL, UNLIT_LUXEL, UNLIT_LUXEL);
+  blit(2, 1, UNLIT_LUXEL, UNLIT_LUXEL, UNLIT_LUXEL);
+  blit(1, 0, UNLIT_LUXEL, UNLIT_LUXEL, UNLIT_LUXEL);
+  blit(1, 2, UNLIT_LUXEL, UNLIT_LUXEL, UNLIT_LUXEL);
+  blit(0, 0, UNLIT_LUXEL, UNLIT_LUXEL, UNLIT_LUXEL);
+  blit(2, 0, UNLIT_LUXEL, UNLIT_LUXEL, UNLIT_LUXEL);
+  blit(0, 2, UNLIT_LUXEL, UNLIT_LUXEL, UNLIT_LUXEL);
+  blit(2, 2, UNLIT_LUXEL, UNLIT_LUXEL, UNLIT_LUXEL);
+  const unlitUV: [number, number] = [1.5 / ATLAS_WIDTH, 1.5 / height];
   for (const p of placed) {
     for (let y = 0; y < p.h; y++) {
       for (let x = 0; x < p.w; x++) {
         const si = (y * p.w + x) * 3;
-        const di = ((p.y + y) * ATLAS_WIDTH + (p.x + x)) * 3;
-        pixels[di] = clamp255(Math.round(p.src[si]! * p.scale));
-        pixels[di + 1] = clamp255(Math.round(p.src[si + 1]! * p.scale));
-        pixels[di + 2] = clamp255(Math.round(p.src[si + 2]! * p.scale));
+        blit(
+          p.x + x, p.y + y,
+          clamp255(Math.round(p.src[si]! * p.scale)),
+          clamp255(Math.round(p.src[si + 1]! * p.scale)),
+          clamp255(Math.round(p.src[si + 2]! * p.scale)),
+        );
       }
     }
+    // Gutters duplicate the tile edges (bilinear isolation): top/bottom
+    // rows, left/right columns, then the four corners.
+    const row = (sy: number, dy: number): void => {
+      for (let x = 0; x < p.w; x++) {
+        const si = (sy * p.w + x) * 3;
+        blit(
+          p.x + x, dy,
+          clamp255(Math.round(p.src[si]! * p.scale)),
+          clamp255(Math.round(p.src[si + 1]! * p.scale)),
+          clamp255(Math.round(p.src[si + 2]! * p.scale)),
+        );
+      }
+    };
+    row(0, p.y - 1);
+    row(p.h - 1, p.y + p.h);
+    for (let y = 0; y < p.h; y++) {
+      const sl = (y * p.w) * 3;
+      const sr = (y * p.w + (p.w - 1)) * 3;
+      blit(
+        p.x - 1, p.y + y,
+        clamp255(Math.round(p.src[sl]! * p.scale)),
+        clamp255(Math.round(p.src[sl + 1]! * p.scale)),
+        clamp255(Math.round(p.src[sl + 2]! * p.scale)),
+      );
+      blit(
+        p.x + p.w, p.y + y,
+        clamp255(Math.round(p.src[sr]! * p.scale)),
+        clamp255(Math.round(p.src[sr + 1]! * p.scale)),
+        clamp255(Math.round(p.src[sr + 2]! * p.scale)),
+      );
+    }
+    const corners: Array<[number, number, number]> = [
+      [0, p.x - 1, p.y - 1],
+      [p.w - 1, p.x + p.w, p.y - 1],
+      [(p.h - 1) * p.w, p.x - 1, p.y + p.h],
+      [(p.h - 1) * p.w + (p.w - 1), p.x + p.w, p.y + p.h],
+    ];
+    for (const [si0, dx, dy] of corners) {
+      const si = si0 * 3;
+      blit(
+        dx, dy,
+        clamp255(Math.round(p.src[si]! * p.scale)),
+        clamp255(Math.round(p.src[si + 1]! * p.scale)),
+        clamp255(Math.round(p.src[si + 2]! * p.scale)),
+      );
+    }
   }
-  return { atlas: { width: ATLAS_WIDTH, height, pixels, rectOf }, skipped };
+  return { atlas: { width: ATLAS_WIDTH, height, pixels, rectOf, unlitUV }, skipped, shortFallback };
 }
 
 function clamp255(v: number): number {
