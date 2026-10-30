@@ -948,6 +948,7 @@ import {
   resolveDisplay,
 } from './play.js';
 import type { AsyncLoopState } from './play.js';
+import { syncGpuCanvasToHud } from './gpu-canvas.js';
 import { browserPoolAvailable, defaultBrowserWorkers } from './render-workers.js';
 import type { BrowserBandPool, BrowserForegroundDetail } from './render-workers.js';
 import { attachToCanvas } from '@q2/input/dom';
@@ -1630,6 +1631,16 @@ export function startPlayLoop(
   el.style.imageRendering = 'pixelated';
   el.style.width = `${host.fb.width * 2}px`;
   el.style.height = `${host.fb.height * 2}px`;
+  // GPU presentation (GPU-FOLLOW-0): the GL canvas mirrors the HUD CSS size
+  // (fb*2 above). Sync on loop start so boot/hot-swap/reboot alignment holds
+  // even when the HUD size was set before the GL canvas existed.
+  if (boot.gpu) {
+    try {
+      syncGpuCanvasToHud(undefined, el);
+    } catch {
+      /* GL overlay stays at its acquired size; HUD still presents */
+    }
+  }
 
   let sound: BrowserSound | null = null;
   let shotLoading = false;
@@ -1770,6 +1781,13 @@ export function startPlayLoop(
       // GPU-PROOF-3 live lane: sim + GPU submit with NO CPU world span
       // rasterization (frameGpuPlay never calls refresh.renderView); HUD is
       // painted transparently on the 2D overlay above the GL canvas.
+      // Re-sync the GL CSS size every GPU frame: resize/reboot changes the
+      // HUD displayed size, and the GL canvas must track it.
+      try {
+        syncGpuCanvasToHud(undefined, el);
+      } catch {
+        /* GL overlay stays at its last size; HUD still presents */
+      }
       frameGpuPlay(boot, nowMs);
       const overlay = paintHudOverlay(boot, hud);
       finishFrame(overlay, hud, true);

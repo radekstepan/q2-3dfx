@@ -16,6 +16,11 @@ declare module 'fs' {
 }
 declare module 'zlib' {
   export function inflateSync(data: Uint8Array): Uint8Array;
+  export function deflateSync(data: Uint8Array): Uint8Array;
+}
+declare module 'node:zlib' {
+  export function inflateSync(data: Uint8Array): Uint8Array;
+  export function deflateSync(data: Uint8Array): Uint8Array;
 }
 declare module 'path' {
   export function join(...parts: string[]): string;
@@ -53,6 +58,16 @@ declare module 'node:fs' {
   export function existsSync(path: string): boolean;
   export function accessSync(path: string, mode?: number): void;
   export function readdirSync(path: string): string[];
+  export interface FsStat {
+    size: number;
+    mtimeMs: number;
+    isDirectory(): boolean;
+  }
+  export function statSync(path: string): FsStat;
+  export interface ReadStream {
+    pipe(dest: unknown): void;
+  }
+  export function createReadStream(path: string): ReadStream;
   export const constants: { X_OK: number };
 }
 declare module 'node:http' {
@@ -77,10 +92,13 @@ declare module 'child_process' {
   export function execSync(cmd: string, opts?: { encoding?: string }): string;
 }
 declare module 'node:child_process' {
+  export interface ChildProcessPipe {
+    on(event: 'data', listener: (chunk: Uint8Array) => void): void;
+  }
   export interface ChildProcess {
     pid?: number;
-    stdout: null;
-    stderr: { on(event: 'data', listener: (chunk: Uint8Array) => void): void } | null;
+    stdout: ChildProcessPipe | null;
+    stderr: ChildProcessPipe | null;
     on(event: 'error', listener: (err: Error) => void): void;
     on(event: 'exit', listener: (code: number | null) => void): void;
     kill(signal?: string): boolean;
@@ -88,7 +106,7 @@ declare module 'node:child_process' {
   export function spawn(
     command: string,
     args: string[],
-    opts?: { stdio?: Array<string | null> },
+    opts?: { stdio?: Array<string | null>; cwd?: string },
   ): ChildProcess;
 }
 declare module 'node:module' {

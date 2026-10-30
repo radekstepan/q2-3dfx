@@ -305,15 +305,21 @@ Execution policy for follow-up:
 ### GPU-FOLLOW-0 — Fix the actual black browser presentation FIRST
 owns: `apps/web`, `packages/testkit`
 depends: none
-status: ready
+status: done(@integrator 2026-10-29)
 priority: blocking — user reports the entire game is black (2026-10-29)
 source-evidence: `apps/web/index.html` gives `#q2` a black CSS background; `gpu-canvas.ts` puts this HUD canvas at z-index 1 ABOVE `#q2-gl` at 0 without clearing its CSS background. Transparent HUD ImageData does not remove that CSS background. `dom.ts` doubles the HUD canvas CSS size, while GPU canvas sizing is not synchronized.
 done-when:
-- [ ] Reproduce in the real application DOM/CSS and capture the composed visible page. Inspect computed styles, bounding rectangles, canvas/context state and rendering errors. The black CSS overlay is a concrete source-level defect; verify whether additional failures remain after fixing it.
-- [ ] In GPU mode make the HUD canvas background transparent, with correctly aligned GPU/HUD drawing surfaces and matching displayed size/aspect. Restore appropriate CPU presentation on GPU→CPU switching/fallback. Preserve HUD visibility, pointer input, bezel layout and resize behavior.
-- [ ] Add a real-browser regression using the production HTML/CSS: assert visible scene pixels in a page screenshot (not only readPixels from the underlying GPU canvas), HUD overlay and canvas alignment. Cover boot and CPU→GPU→CPU switching at supported resolutions.
-- [ ] Verify real base1 room AND textured gun are visible on the user's normal page. Treat previously black screenshots as a failed presentation gate, not a headless artifact excused by successful GPU readback. No further performance or default-promotion claims until the composed page works.
-- [ ] Record the fix/evidence and commit with appropriate validation. Resume the remaining queue only after presentation is demonstrated; do not rewrite shaders to compensate for a CSS overlay.
+- [x] Reproduce in the real application DOM/CSS and capture the composed visible page. Inspect computed styles, bounding rectangles, canvas/context state and rendering errors. The black CSS overlay is a concrete source-level defect; verify whether additional failures remain after fixing it.
+- [x] In GPU mode make the HUD canvas background transparent, with correctly aligned GPU/HUD drawing surfaces and matching displayed size/aspect. Restore appropriate CPU presentation on GPU→CPU switching/fallback. Preserve HUD visibility, pointer input, bezel layout and resize behavior.
+- [x] Add a real-browser regression using the production HTML/CSS: assert visible scene pixels in a page screenshot (not only readPixels from the underlying GPU canvas), HUD overlay and canvas alignment. Cover boot and CPU→GPU→CPU switching at supported resolutions.
+- [x] Verify real base1 room AND textured gun are visible on the user's normal page. Treat previously black screenshots as a failed presentation gate, not a headless artifact excused by successful GPU readback. No further performance or default-promotion claims until the composed page works.
+- [x] Record the fix/evidence and commit with appropriate validation. Resume the remaining queue only after presentation is demonstrated; do not rewrite shaders to compensate for a CSS overlay.
+completion (2026-10-29, integrated — two disjoint lanes, integrator reconciled + committed):
+- apps/web: `syncGpuCanvasToHud`/`setHudTransparent`/`removeGpuCanvas` in `gpu-canvas.ts`; attach/boot/hot-swap wiring in `play.ts`; loop-start + per-frame sync in `dom.ts`; `#q2-gl` CSS in `index.html`; stub-DOM `gpu-presentation.test.ts` 9/9.
+- testkit: `gpu-presentation.ts` harness + `gpu-presentation.test.ts` (pure helpers headless + Q2_PAK/chromium/vite-gated production page suite: boot-cpu / cpu-to-gpu / gpu-to-cpu / gpu-small-viewport, screenshot floors + rect equality + context health).
+- evidence: production page GPU leg transparent bg, rects equal (746x960 default, 466x960 small), nonBlack 0.867 gunRegion 0.996 triples 4471; CPU legs opaque bg, no GL canvas, nonBlack 0.66; 0 page exceptions; web 278 green; testkit browser suite green; fg-recovery parallel flakes green sequential (known pattern).
+- ledger: GPU-FOLLOW-0 row appended. Changesets: web-gpu-presentation-overlay + testkit-gpu-presentation.
+- GPU-FOLLOW-1 now eligible (depends FOLLOW-0 done).
 
 ### GPU-FOLLOW-1 — Repair acceptance reporting and preserve reproducible evidence
 owns: `docs`, `BRAIN.md`, `tools/bench`, `packages/testkit`

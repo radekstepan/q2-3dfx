@@ -3,6 +3,7 @@
 declare const process: {
   argv: string[];
   version: string;
+  execPath: string;
   env: Record<string, string | undefined>;
   hrtime: {
     (time?: [number, number]): [number, number];

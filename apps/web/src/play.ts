@@ -118,7 +118,7 @@ import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
 import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } from './render-workers.js';
 import type { BrowserForegroundDetail, DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
 import { detectGpuCapability, getGpuStatus, resolveBootRenderer } from './gpu-select.js';
-import { acquireGpuCanvas } from './gpu-canvas.js';
+import { acquireGpuCanvas, removeGpuCanvas, setHudTransparent, syncGpuCanvasToHud } from './gpu-canvas.js';
 import { WebGLRenderer, selectGpuScene, updateGpuEntities } from '@q2/webgl-renderer';
 
 /**
@@ -3395,6 +3395,12 @@ function attachGpuBackend(driver: LocalDriver, width: number, height: number): G
     const scene = selectGpuScene(driver.mini, [], spawnViewFor(driver), width, height);
     gpu.setScene(scene);
     installGpuWorkConveyor();
+    try {
+      syncGpuCanvasToHud(undefined);
+      setHudTransparent(undefined, true);
+    } catch {
+      /* presentation best-effort: GL scene still submits */
+    }
     return { canvas: acquired.canvas, gl: acquired.gl, gpu, scene, staticScene: scene, loop: createAsyncLoopState(), appearance: null };
   } catch {
     return null;
@@ -3432,6 +3438,12 @@ export function bootPlay(opts: {
       renderer = 'software';
       rendererWarning = `webgl2-experimental requested but unavailable (no WebGL2 context); staying on software`;
       console.warn(`[q2ts-web] bootPlay: ${rendererWarning}`);
+      try {
+        setHudTransparent(undefined, false);
+        removeGpuCanvas(undefined);
+      } catch {
+        /* CPU presentation already correct; best-effort cleanup only */
+      }
     }
   }
   // GPU-PROOF-3 gameplay integration (see above): when
@@ -3599,9 +3611,21 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
       attached.gpu.attachWorld(boot.driver.mini);
       const pal = gpuPaletteFor(boot);
       if (pal) attached.gpu.setPalette(pal);
+      try {
+        syncGpuCanvasToHud(undefined);
+        setHudTransparent(undefined, true);
+      } catch {
+        /* presentation best-effort: backend still attached */
+      }
     } else {
       kind = 'software';
       warning = `webgl2-experimental requested but unavailable (no WebGL2 context); staying on software`;
+      try {
+        setHudTransparent(undefined, false);
+        removeGpuCanvas(undefined);
+      } catch {
+        /* CPU presentation already correct; best-effort cleanup only */
+      }
     }
   } else if (kind !== 'webgl2-experimental' && boot.gpu) {
     try {
@@ -3610,6 +3634,12 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
       /* dispose is idempotent by contract; belt-and-braces for hot-swap */
     }
     boot.gpu = null;
+    try {
+      setHudTransparent(undefined, false);
+      removeGpuCanvas(undefined);
+    } catch {
+      /* CPU presentation already correct; best-effort cleanup only */
+    }
   }
   boot.renderer = kind;
   boot.lastRendererWarning = warning;
