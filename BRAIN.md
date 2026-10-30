@@ -334,7 +334,7 @@ historical, not instructions to reimplement completed/current repairs.
 owns: `packages/webgl-renderer`, `packages/testkit`
 depends: GPU-FOLLOW-2A
 status: in-progress (existing implementing LLM; preserve current renderer ownership)
-progress-at-review: dirty working tree already adds world REPEAT vs skin CLAMP, explicit RGB unpack state, sampler-unit rebinding, expanded lightmap fallback, half-luxel centres/gutters and diagnostic hooks. These changes match the user's improved visuals but are not yet a committed/validated completion. Inspect the latest diff; finish and test, do not rewrite them.
+progress-at-review: committed 3467ddd on top of the dirty tree (REPEAT vs CLAMP, unpack state, sampler re-bind, uDebugMode upload, atlasStats/material hooks, lightId-parity fix, stub regression in follow2b.test.ts + worldMesh.test.ts). Typecheck/test/build green for @q2/webgl-renderer (104 passed). Remaining to close: real-GL upload sampling (1/2/3-wide, odd/NPOT, skin chains), same-camera 0/1/2 captures of real walls/skins in the composed page, real-GL sampler/atlas-capacity image regression, and full-map overflow measurement. Do not relitigate the landed wiring; finish with browser evidence.
 starting-points: `renderer.ts: uploadTextureLevels/diffuseFor/skinFor`; `worldMesh.ts: pushSurfaceTris/packLightAtlas`; `appearance.ts: voodooSampleMipped`
 done-when:
 - [ ] Reproduce a failing world-repeat fixture with UVs outside [0,1], including negative UVs and bilinear seams. Give WAL/world materials repeat addressing and skins/sprites/lightmap atlases their intended clamp policy through texture creation and sampling. Preserve correct mip derivatives and resampling UV scale.
