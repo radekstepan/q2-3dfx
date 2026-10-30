@@ -8,8 +8,8 @@
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
 > **Current direction (2026-10-29): preserve the near-60-FPS gains. Finish review
-> of the uncommitted lifecycle bundle, fix missing sky and water seams, then collect
-> final fidelity/display evidence. Active order: FOLLOW-4 → 3A → 3B → 5/6 → 7.
+> of final visual evidence. Lifecycle landed in `dfc58d9`; the solid blue sky is
+> still the untextured fallback. Fix sky and water next: 3A → 3B → 5/6 → 7.
 > CPU optimization stays paused. Only §8 contains the active task queue.**
 
 ---
@@ -260,34 +260,25 @@ inventory, test results and diagnoses. Completed cards/evidence live in
 `docs/tasks-archive.md` and `docs/performance-gpu-history-2026-10-29.md`.
 This queue supersedes old task lists and the archived snapshot.
 
-Execution: finish 4 → 3A → 3B → 5/6 → 7. Treat `review` as resumable work;
-claim ownership before editing. One writer per package. Preserve the existing
-uncommitted FOLLOW-4 implementation; review and complete it instead of rebuilding
-it. Commit validated increments with changesets, no push. Archive completed cards
+Execution: 3A → 3B → 5/6 → 7. FOLLOW-4 landed in `dfc58d9` and satisfies
+dependencies; working tree was clean at this review. Treat `review` as resumable
+work; claim ownership before editing. One writer per package. Preserve the landed
+lifecycle machinery. Commit validated increments with changesets, no push. Archive completed cards
 with evidence rather than growing this queue with implementation narratives.
 Keep GPU experimental and CPU reference/goldens intact. Stop speculative
 optimization; only a measured final gate miss permits the one remaining measured
 optimization iteration. Unit/mirror tests and draw counts do not prove visible
 correctness. Expensive validation runs sequentially.
 
-### GPU-FOLLOW-4 — Finish and validate the uncommitted lifecycle bundle
-owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`, `packages/config`, `.changeset`
-depends: none (FOLLOW-3 implementation landed in `8fde77f`; appearance defects below)
-status: done (validated 2026-10-30: hermetic 6+16+8+5 green, real-browser 2-cycle loss/restore green with Q2_PAK, typecheck/lint/build + deps:check green)
-done-when:
-- [x] Review the existing diff/tests/changesets listed in the review document. Verify same-context resource deletion, invalid-handle handling after loss, retained replay, listener cleanup, resize/aspect/HUD alignment and explicit fallback. Correct any actual defects; do not recreate landed machinery.
-- [x] Strengthen the real-browser test on the production game canvas: assert GPU identity before/after, submissions frozen after the loss event and advancing after restoration, lifecycle counts, and correct restored world/model/skin pixels. Throwaway probe or unchanged renderer label is insufficient. Check repeated resize/switch/map/loss cycles for bounded resources and duplicate canvases/listeners.
-- [x] Run asset-backed and actual-browser lifecycle gates with Q2_PAK; record browser/device and skips honestly. Isolate the historical first-submit GL 1282 at its originating operation; fix application errors or provide a minimal independently supported driver explanation. Do not hide errors by clearing the queue.
-- [x] Run `yarn verify` and `yarn deps:check`; reconcile package changesets and commit only the validated lifecycle bundle. Record known sky/water defects separately; this commit is not final renderer acceptance.
-
-### GPU-FOLLOW-3A — Wire the production sky asset into the GPU renderer
+### GPU-FOLLOW-3A — Replace the solid-blue fallback with the map sky
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
 depends: GPU-FOLLOW-4
 status: ready
-starting-points: `play.ts: loadSkyStrip/skyNameForMap/setSkyTexture`, `renderer.ts: registerSkyStrip`
+starting-points: `play.ts: loadSkyStrip/skyNameForMap/setSkyTexture`, `renderer.ts: registerSkyStrip/drawSkyRange`
+known-cause: no production `registerSkyStrip` call; `dfc58d9` fixed fallback drawing, not sky texture wiring. Do not revert the valid sampler binding fix.
 done-when:
 - [ ] Retain the loaded map sky and register it with the GPU on cold boot, CPU→GPU selection and context restore. Replace/clear it on map change; avoid rereading or uploading each frame. Pass per-face height, not the six-face strip's total height. Make missing/invalid sky assets diagnosable.
-- [ ] Add production integration coverage that fails when sky replay is omitted. Capture a real sky-facing map view before/after switching and restoration; prove textured sky pixels, correct face orientation/seams and opaque world occlusion. Do not accept flat fallback, merely nonblack frames, or a direct renderer fixture as completion.
+- [ ] Add a negative control that deliberately omits sky registration and fails the sky-image check even though the page stays nonblack and colorful. Use a known textured region of the actual map sky (not an arbitrary patch that may naturally be uniform), with expected asset features/pixels. Add production integration coverage that fails when sky replay is omitted. Capture a real sky-facing map view before/after switching and restoration; prove textured sky pixels, correct face orientation/seams and opaque world occlusion. Do not accept flat fallback, merely nonblack frames, or a direct renderer fixture as completion.
 - [ ] Run relevant gates plus `yarn verify`; add changesets and commit the isolated repair with evidence.
 
 ### GPU-FOLLOW-3B — Remove visible water tile boundaries
@@ -307,6 +298,7 @@ depends: GPU-FOLLOW-3B
 status: ready
 done-when:
 - [ ] Capture matched F0/F1/F2 CPU/GPU scene/time/cvars on the repaired renderer; report new full-frame and region/material metrics. Repair the degenerate PROOF-4 far/mip fixture so it actually exercises its intended content. Keep historical pre-repair failures labelled historical.
+- [ ] Strengthen lifecycle image evidence with matched deterministic before/after scene crops or independent world/model/skin expectations and negative controls removing a required asset. Existing nonblack, gun-region brightness and distinct-color counts can pass with missing textures; do not label them semantic proof.
 - [ ] Investigate remaining unexplained UV/lighting/depth/transparency differences and add meaningful regression fixtures. Include repaired sky/water. Do not loosen assertions or replace goldens to conceal defects.
 - [ ] Meet the existing fidelity contract, or present concrete side-by-sides and a precise proposed contract for user approval. Record automated and user verdicts separately; no implicit approval of threshold changes.
 

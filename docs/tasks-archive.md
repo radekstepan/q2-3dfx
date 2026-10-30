@@ -425,3 +425,22 @@ lane A (`packages/webgl-renderer`): TRANS-first classification (turbulent+transl
 lane B (`apps/web`): `gpu-effects.ts` (producer→consumer inventory, full retained-asset modelKindsForFrame + beam synthesis, light consts, material censuses, readLiveEffects) + `play.ts` frameGpuPlay submits full kinds to selection+draw + soak `effects` (additive optional); `gpu-follow3.test.ts` 17/17 (unit policy + live blaster→explosion→geometry→submissions + monster return-fire beams + full registration sweep + live walk sky/glass/water + headless-browser combat pixels: bolts=2 expl=1 particles=80 nonblack 0.919); neighbors soak+gpu-play+play+combat 86/86, live-route/browser/switch suites 57/57 green. STOP-and-report items 1/2/4 resolved by lane A in-card; item 3 (no live sprite producer — 8 sp2 in pak, no server queue) filed as game/server follow-up.
 lane C (`packages/testkit`): `gpu-effects-semantics.ts` (weapon/enemy/pickup catalogs by value, `Follow3LiveCapture` shape by name, event-drain gate, CPU oracle: SoftwareRenderer pixel floors + selector submission floors, `validateFollow3Coverage`, HUD report-only) + 18/18 tests (healthy-pass + one tamper leg per failure mode at healthy counts). typecheck/build clean.
 integrator merge fixes (no loosening): (1) lane B pre-fix turbulent pin (`transparent===false`) → post-fix (`===true`) now that lane A landed TRANS-first; header updated. (2) `gpu-boundary` entity-kind pins → index-stable surfaceId-slot matching (blend sorting breaks positional correspondence; slot is identity, order is draw sequence). Full merged record: web 384 passed/3 pre-existing clean-tree fails (browser-lane + 2 pool-diag), webgl-renderer 142/5skipped, testkit 234 passed/1 pre-existing PROOF-4 suite fail (FOLLOW-5 territory), bench untouched; deps:check 632 edges ok; typecheck+lint+build 24/24. Changesets: webgl-renderer-gpu-follow-3 (minor) + web-gpu-follow-3 + testkit-gpu-follow-3.
+
+
+## FOLLOW-4 integration archive — reviewed at dfc58d9
+
+### GPU-FOLLOW-4 — Finish and validate the uncommitted lifecycle bundle
+owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`, `packages/config`, `.changeset`
+depends: none (FOLLOW-3 implementation landed in `8fde77f`; appearance defects below)
+status: done (validated 2026-10-30: hermetic 6+16+8+5 green, real-browser 2-cycle loss/restore green with Q2_PAK, typecheck/lint/build + deps:check green)
+done-when:
+- [x] Review the existing diff/tests/changesets listed in the review document. Verify same-context resource deletion, invalid-handle handling after loss, retained replay, listener cleanup, resize/aspect/HUD alignment and explicit fallback. Correct any actual defects; do not recreate landed machinery.
+- [x] Strengthen the real-browser test on the production game canvas: assert GPU identity before/after, submissions frozen after the loss event and advancing after restoration, lifecycle counts, and correct restored world/model/skin pixels. Throwaway probe or unchanged renderer label is insufficient. Check repeated resize/switch/map/loss cycles for bounded resources and duplicate canvases/listeners.
+- [x] Run asset-backed and actual-browser lifecycle gates with Q2_PAK; record browser/device and skips honestly. Isolate the historical first-submit GL 1282 at its originating operation; fix application errors or provide a minimal independently supported driver explanation. Do not hide errors by clearing the queue.
+- [x] Run `yarn verify` and `yarn deps:check`; reconcile package changesets and commit only the validated lifecycle bundle. Record known sky/water defects separately; this commit is not final renderer acceptance.
+
+Review qualification: implementation and strengthened freeze/resume browser assertions landed.
+The commit reports targeted tests plus typecheck/lint/build/deps checks; this review
+did not independently reproduce a full `yarn verify`. Generic nonblack/color-count
+capture checks do not establish restored world/model/skin identity; remaining
+semantic image evidence belongs to FOLLOW-5, integrated verification to FOLLOW-7.

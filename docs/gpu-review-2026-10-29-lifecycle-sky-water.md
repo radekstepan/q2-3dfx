@@ -5,7 +5,30 @@ Review baseline: HEAD `8fde77f`. User reports application builds/runs, mostly
 Current defects: sky absent; water has visible moving tiles/hard boundaries.
 This is evidence and history, not an execution queue. See BRAIN.md for tasks.
 
-## Uncommitted work and readiness
+## Follow-up review at `dfc58d9` — solid blue sky
+
+This follow-up supersedes the dirty-tree/readiness snapshot below. Working tree
+was clean before this documentation update. FOLLOW-4 is now committed. Renderer
+`follow4.test.ts` was rerun: 6/6 passed. No full verification or live browser run
+was repeated in this review.
+
+The commit binds a complete white sampler texture in `drawSkyRange`, fixing the
+previous invalid draw (GL 1282). Sky vertices still have a single palette-derived
+color. `drawScene` selects this flat branch when no sky strip is registered, and
+`apps/web` still contains no `registerSkyStrip` call. Thus the user's all-blue
+sky is consistent with the fallback now rendering, not a completed textured-sky
+repair. Keep the sampler fix; implement FOLLOW-3A's production asset replay.
+
+The browser test now asserts frozen/resumed submissions and lifecycle counts over
+two cycles. Its screenshot checks still measure only nonblack fraction, gun-region
+nonblack fraction, near-white fraction and distinct colors. They do not prove
+specific restored world/model/skin content, nor reject a flat sky on an otherwise
+colorful page. FOLLOW-5 retains semantic recovery evidence; FOLLOW-3A requires a
+sky-specific negative control. Commit evidence reports focused tests and
+ typecheck/lint/build/dependency checks; retain the final full verify gate rather
+than treating the old checked box as independently verified here.
+
+## Historical uncommitted work and readiness
 
 The existing dirty files form GPU-FOLLOW-4, not unexplained rendering experiments:
 
