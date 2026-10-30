@@ -384,6 +384,21 @@ describe('FOLLOW-4 renderer lifecycle (stub GL)', () => {
     expect(r.testModelCacheSize()).toBe(1);
   });
 
+  it('sky clear drops the strip (map change) without warnings; re-register restores it', () => {
+    const s = stubGL4();
+    const r = new WebGLRenderer();
+    r.init(s.gl, 64, 48);
+    expect(r.registerSkyStrip(new Uint8Array(8 * 48).fill(7), 8, 8)).toBe(true);
+    expect(r.testSkyStrip()).toEqual({ tileW: 8, tileH: 8 });
+    const warnsBefore = r.testWarnings().length;
+    r.clearSkyStrip();
+    expect(r.testSkyStrip()).toBeNull();
+    // Explicit map-change clears are silent (diagnostics belong to play.ts).
+    expect(r.testWarnings().length).toBe(warnsBefore);
+    expect(r.registerSkyStrip(new Uint8Array(8 * 48).fill(9), 8, 8)).toBe(true);
+    expect(r.testSkyStrip()).toEqual({ tileW: 8, tileH: 8 });
+  });
+
   it('loss stops submission with no deletes; restore replays retained assets and recreates state', () => {
     const s = stubGL4();
     const r = new WebGLRenderer();

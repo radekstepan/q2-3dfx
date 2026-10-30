@@ -2958,6 +2958,94 @@ export function loadSkyStrip(
   return { texels: strip, width: w, height: h * 6 };
 }
 
+/**
+ * Derive the retained GPU sky from the pak + map (GPU-FOLLOW-3A): single
+ * read of the six `env/<sky>{rt,bk,lf,ft,up,dn}.pcx` faces via `loadSkyStrip`,
+ * converted to PER-FACE tile dims for `registerSkyStrip` (which takes the
+ * single-face height, not the strip's total height). Returns `{ sky, warning
+ * }`: `sky` null = flat-fill fallback with a diagnosable `warning` naming
+ * the sky key or the missing/invalid art (devroom/no-pak is also a warning).
+ * Never throws; never re-reads per frame (call once per boot/map).
+ */
+export function retainedSkyFromPak(
+  pak: WebPak | null,
+  map: BspMap | null,
+  mainPalette: Uint8Array | null,
+): { sky: RetainedSky | null; warning: string | null } {
+  try {
+    if (!pak || !map || !mainPalette) {
+      return { sky: null, warning: 'no map sky (devroom or missing palette/pak: flat sky fallback)' };
+    }
+    const name = skyNameForMap(map);
+    if (!name) {
+      return { sky: null, warning: 'no worldspawn sky key (flat sky fallback)' };
+    }
+    const strip = loadSkyStrip(pak, name, mainPalette);
+    if (!strip) {
+      return { sky: null, warning: `sky ${name} missing/invalid env faces (flat sky fallback)` };
+    }
+    if (!Number.isInteger(strip.height / 6) || strip.width <= 0 || strip.height <= 0) {
+      return { sky: null, warning: `sky ${name} has non-divisible strip height ${strip.height} (flat sky fallback)` };
+    }
+    const tileH = strip.height / 6;
+    return {
+      sky: { name, texels: strip.texels.slice(), tileW: strip.width, tileH },
+      warning: null,
+    };
+  } catch (err) {
+    return { sky: null, warning: `sky load failed (${err instanceof Error ? err.message : String(err)}: flat sky fallback)` };
+  }
+}
+
+/**
+ * Register the boot's retained sky with the live GPU backend (GPU-FOLLOW-3A):
+ * textured path calls `registerSkyStrip` with PER-FACE dims; fallback path
+ * calls `clearSkyStrip` so a previous map's strip never lingers. Idempotent —
+ * re-registering drops the obsolete same-context GL texture once via the
+ * backend (lazy re-upload on the next sky draw, never per-frame re-reads).
+ * Returns true when a textured sky is active, false on the flat fallback.
+ * Never throws (structural probe + try/catch: a backend without the entry
+ * points keeps the flat fill).
+ */
+export function syncGpuSky(boot: PlayBoot): boolean {
+  const gpu = boot.gpu?.gpu as unknown as {
+    registerSkyStrip?: (texels: Uint8Array, tileW: number, tileH: number) => boolean;
+    clearSkyStrip?: () => void;
+  } | undefined;
+  if (!boot.gpu || !gpu) return false;
+  try {
+    if (boot.sky) {
+      if (typeof gpu.registerSkyStrip === 'function') {
+        return gpu.registerSkyStrip(boot.sky.texels, boot.sky.tileW, boot.sky.tileH);
+      }
+      return false;
+    }
+    if (typeof gpu.clearSkyStrip === 'function') {
+      gpu.clearSkyStrip();
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Retained map sky for the GPU backend (GPU-FOLLOW-3A): the `loadSkyStrip`
+ * palette-index strip with PER-FACE tile dims (`registerSkyStrip` takes the
+ * single-face height, not the six-face strip's total height). Sliced once at
+ * boot from the pak; replayed without re-reading on selection/restore.
+ */
+export interface RetainedSky {
+  /** Map `worldspawn` sky key (base1: `unit1_`). */
+  name: string;
+  /** Palette-index texels: six vertically stacked tiles (rt/bk/lf/ft/up/dn). */
+  texels: Uint8Array;
+  /** Single-face tile width (strip width). */
+  tileW: number;
+  /** Single-face tile height (strip height / 6). */
+  tileH: number;
+}
+
 export interface PlayBoot {
   host: Host;
   driver: LocalDriver;
@@ -3025,6 +3113,20 @@ export interface PlayBoot {
   models: PakModelHandles | null;
   /** The pak this boot was built from (null = devroom): reboot reuses it. */
   pak: WebPak | null;
+  /**
+   * Retained map sky for the GPU backend (GPU-FOLLOW-3A): per-face tile dims
+   * derived once from `loadSkyStrip` (strip height / 6), never re-read per
+   * frame. Null = flat-fill fallback (missing/invalid art or devroom; see
+   * `skyWarning`). Re-registered on cold boot, CPU→GPU selection and context
+   * restore; replaced/cleared on map change (reboot builds a fresh boot).
+   */
+  sky: RetainedSky | null;
+  /**
+   * Diagnosable sky fallback reason (null when a textured sky is retained):
+   * names the map sky key or the missing/invalid faces. Also `console.warn`d
+   * at boot — never silent.
+   */
+  skyWarning: string | null;
   /**
    * Live GPU backend (GPU-PROOF-3): non-null exactly when `renderer` is
    * `webgl2-experimental` AND a GL canvas/context was acquired at boot (or
@@ -3712,7 +3814,10 @@ export function notifyGpuContextRestored(boot: PlayBoot): boolean {
   }
   // FOLLOW-2A replay reuse: SAME handles, explicit path/handle warnings on
   // failure (never silent), skipped entries keep their backend warning.
+  // GPU-FOLLOW-3A: replay the retained map sky (per-face dims) — restoration
+  // without it would silently revert to the flat fallback.
   if (boot.models) replayPakAssetsToGpu(boot.models, g.gpu);
+  syncGpuSky(boot);
   try {
     syncGpuCanvasToHud(undefined);
     setHudTransparent(undefined, true);
@@ -3827,6 +3932,11 @@ export function bootPlay(opts: {
   // live rAF loop submits through `frameGpuPlay` (no CPU world raster).
   const refresh = new SoftwareRenderer();
   let mainPalette: Uint8Array | null = null;
+  // GPU-FOLLOW-3A: retain the map sky once (single pak read, never per-frame).
+  // The CPU path keeps its strip contract; the GPU path replays the retained
+  // per-face dims via `syncGpuSky` (cold boot, hot-swap, restore).
+  let retainedSky: RetainedSky | null = null;
+  let skyWarning: string | null = null;
   if (opts.pak) {
     const pcxBytes = tryPakEntry(opts.pak, 'pics/colormap.pcx');
     if (pcxBytes) {
@@ -3838,20 +3948,26 @@ export function bootPlay(opts: {
       }
     }
     // Original Quake II sky: six env/ faces packed as one strip (id mapping).
-    // Missing/unparseable art → renderer keeps its flat-fill fallback.
-    if (driver.map && mainPalette) {
-      const sky = skyNameForMap(driver.map);
-      if (sky) {
-        const strip = loadSkyStrip(opts.pak, sky, mainPalette);
-        if (strip) {
-          try {
-            refresh.setSkyTexture(strip);
-          } catch {
-            /* flat-fill fallback stays active */
-          }
-        }
+    // Missing/unparseable art → flat-fill fallback with a diagnosable warning.
+    const derived = retainedSkyFromPak(opts.pak, driver.map, mainPalette);
+    retainedSky = derived.sky;
+    skyWarning = derived.warning;
+    if (skyWarning !== null) {
+      console.warn(`[q2ts-web] bootPlay: ${skyWarning}`);
+    }
+    if (retainedSky) {
+      try {
+        refresh.setSkyTexture({
+          texels: retainedSky.texels,
+          width: retainedSky.tileW,
+          height: retainedSky.tileH * 6,
+        });
+      } catch {
+        /* flat-fill fallback stays active */
       }
     }
+  } else {
+    skyWarning = 'no map sky (devroom or missing palette/pak: flat sky fallback)';
   }
   // HUD font: real `pics/conchars.pcx` when the pak ships it, procedural
   // xorshift fallback otherwise (deterministic per boot so tests are
@@ -3902,7 +4018,7 @@ export function bootPlay(opts: {
     lastRasterPolicy: { mode: renderer, rgbEnabled: false, hooked: false },
     browserPool: null,
     statScanoutKicks: 0, statScanoutFallbacks: 0, statAsyncFallbacks: 0,
-    models, pak: opts.pak ?? null, gpu,
+    models, pak: opts.pak ?? null, sky: retainedSky, skyWarning, gpu,
   };
   // Arm the raster policy the cvar selects (RGB path on for voodoo, off for
   // software) so a voodoo boot never starts on the wrong backend.
@@ -3914,10 +4030,13 @@ export function bootPlay(opts: {
   // static uploads. GPU-FOLLOW-2A: the retained MD2/PCX cache replays under
   // the SAME handles right after (cold boot shares the hot-swap path).
   // Without a pak there is nothing to attach (devroom stays CPU/clear-only).
+  // GPU-FOLLOW-3A: the retained map sky registers here (per-face dims, never
+  // the strip's total height); missing art clears to the flat fallback.
   if (boot.gpu && mainPalette) {
     boot.gpu.gpu.attachWorld(driver.mini);
     boot.gpu.gpu.setPalette(mainPalette);
     replayPakAssetsToGpu(models, boot.gpu.gpu);
+    syncGpuSky(boot);
   }
   return boot;
 }
@@ -3995,6 +4114,10 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
       if (pal) attached.gpu.setPalette(pal);
       // (Retained models/skins already replayed inside attachGpuBackend
       // under the same handles — see above.)
+      // GPU-FOLLOW-3A: replay the retained map sky (per-face dims) so a
+      // CPU→GPU switch shows the textured sky without re-reading the pak.
+      // Missing art clears to the flat fallback (never a stale strip).
+      syncGpuSky(boot);
       try {
         syncGpuCanvasToHud(undefined);
         setHudTransparent(undefined, true);

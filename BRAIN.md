@@ -273,13 +273,23 @@ correctness. Expensive validation runs sequentially.
 ### GPU-FOLLOW-3A — Replace the solid-blue fallback with the map sky
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
 depends: GPU-FOLLOW-4
-status: ready
+status: in-progress(@opencode)
 starting-points: `play.ts: loadSkyStrip/skyNameForMap/setSkyTexture`, `renderer.ts: registerSkyStrip/drawSkyRange`
 known-cause: no production `registerSkyStrip` call; `dfc58d9` fixed fallback drawing, not sky texture wiring. Do not revert the valid sampler binding fix.
 done-when:
 - [ ] Retain the loaded map sky and register it with the GPU on cold boot, CPU→GPU selection and context restore. Replace/clear it on map change; avoid rereading or uploading each frame. Pass per-face height, not the six-face strip's total height. Make missing/invalid sky assets diagnosable.
 - [ ] Add a negative control that deliberately omits sky registration and fails the sky-image check even though the page stays nonblack and colorful. Use a known textured region of the actual map sky (not an arbitrary patch that may naturally be uniform), with expected asset features/pixels. Add production integration coverage that fails when sky replay is omitted. Capture a real sky-facing map view before/after switching and restoration; prove textured sky pixels, correct face orientation/seams and opaque world occlusion. Do not accept flat fallback, merely nonblack frames, or a direct renderer fixture as completion.
 - [ ] Run relevant gates plus `yarn verify`; add changesets and commit the isolated repair with evidence.
+- TODO(GPU-FOLLOW-3A) 2026-10-30: repair implemented, relevant gates green
+  (testkit `gpu-sky` 4/4; web `gpu-sky` 4/4 incl. Q2_PAK cold-boot/switch/restore,
+  negative control, devroom clear; webgl `follow4` 7/7; web `play`+`gpu-hotswap`
+  44/44; web `gpu-lifecycle` 16/16; typecheck/lint green; `deps:check` ok).
+  Full `yarn verify` NOT green: 2 failures in `packages/testkit/src/gpu-browser.test.ts`
+  proven pre-existing/environmental — (1) PROOF-4 appearance far/mip reads 0/0,
+  reproduced on the clean stash (owns: FOLLOW-5); (2) PROOF-3 CDP
+  `Runtime.evaluate after 30000ms` under full-suite load, passes in isolation
+  both with and without this change (30s each). Boxes 1–2 evidenced; box 3
+  pending a green full verify.
 
 ### GPU-FOLLOW-3B — Remove visible water tile boundaries
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`

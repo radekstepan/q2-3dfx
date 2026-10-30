@@ -489,6 +489,20 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     return this.skyStrip ? { tileW: this.skyStrip.tileW, tileH: this.skyStrip.tileH } : null;
   }
 
+  /**
+   * Drop the registered sky strip (GPU-FOLLOW-3A map-change path): the next
+   * sky draw falls back to the flat fill. Deletes the obsolete same-context
+   * strip texture before dropping it (never rely on GC); after loss the
+   * handle is invalid so it is just dropped. Explicit clears are silent —
+   * missing/invalid art diagnostics belong to the play layer, not to this
+   * intentional fallback.
+   */
+  clearSkyStrip(): void {
+    this.freeTexture(this.skyStripTex);
+    this.skyStripTex = null;
+    this.skyStrip = null;
+  }
+
   /** Register skin texels (palette indices) for an entity skin handle. */
   registerSkinPixels(handle: number, pixels: Uint8Array, width: number, height: number): number {    if (!Number.isInteger(width) || !Number.isInteger(height) ||
       width < 1 || height < 1 || width > 1024 || height > 1024 ||
