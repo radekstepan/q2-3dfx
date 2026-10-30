@@ -77,7 +77,7 @@ export function buildProofPageHtml(libMap: GpuBrowserLibMap): string {
  */
 const PROOF_PAGE_JS = `
 'use strict';
-import { WebGLRenderer, selectGpuScene, compileProgram } from '@q2/webgl-renderer';
+import { WebGLRenderer, selectGpuScene, compileProgram, resolveAppearanceFrame } from '@q2/webgl-renderer';
 import { VS_LIT, FS_LIT, VS_ALIAS, FS_ALIAS, VS_FLAT, FS_FLAT } from '@q2/webgl-renderer';
 import { VS_POST, FS_APPEARANCE, buildMipChainRGB } from '@q2/webgl-renderer';
 import { setCVar, setCVarFromString, resetCVars } from '@q2/config';
@@ -224,15 +224,40 @@ function renderCapture(rawGL, rr, draws, entities, lights, view) {
   var v = view || VIEW;
   var beforeE = draws.elements, beforeA = draws.arrays;
   rr.renderer.setEntities(entities, KINDS);
+  // FOLLOW-2B GL-error phase attribution (test-only drains; production never
+  // polls): snapshot sticky flags before the render, after the render
+  // (draw-side) and after readPixels (harness-side). Records only the FIRST
+  // non-empty occurrence so the proof stays small; the renderer upload polls
+  // already attribute texImage2D failures inline.
+  var capPre = drainGLErrors(rawGL);
   rr.renderer.renderFrame({ view: v, scene: rr.scene, time: 1.5, lights: lights });
+  var capPostDraw = drainGLErrors(rawGL);
   var px = new Uint8Array(N * 4);
   rawGL.readPixels(0, 0, W, H, rawGL.RGBA, rawGL.UNSIGNED_BYTE, px);
+  var capPostRead = drainGLErrors(rawGL);
+  if (!window.__q2glFirst && (capPre.length + capPostDraw.length + capPostRead.length) > 0) {
+    window.__q2glFirst = { pre: capPre, postDraw: capPostDraw, postRead: capPostRead };
+  }
+  window.__q2capN = (window.__q2capN || 0) + 1;
   return { px: px, draws: (draws.elements - beforeE) + (draws.arrays - beforeA) };
 }
 
 function summarize(diff) {
   if (!diff.bbox) return { count: diff.count, frac: diff.frac, bbox: null, bboxFrac: 0 };
   return { count: diff.count, frac: diff.frac, bbox: diff.bbox, bboxArea: diff.bboxArea, bboxFrac: diff.bboxFrac };
+}
+
+// FOLLOW-2B error localization: drain all pending GL error flags into an
+// array (getError clears one flag per call; un-drained flags are sticky, so
+// a single late read cannot attribute the source).
+function drainGLErrors(rawGL) {
+  var errs = [];
+  for (var i = 0; i < 8; i++) {
+    var e = rawGL.getError();
+    if (e === 0) break;
+    errs.push(e);
+  }
+  return errs;
 }
 
 // Centroid of pixels differing by more than tol in any channel (GL coords:
@@ -689,9 +714,24 @@ async function main() {
     lightStyles: VIEW.lightStyles,
   };
   var rrFar = makeRenderer(counted.gl, worldF1, palette, soldierMd2, gunMd2, soldierSkin, gunSkin, ENT_F1, FAR_VIEW);
+  // FOLLOW-2B checkpoint: drain before far/mip captures to see whether any
+  // GL flag predates them (sticky flags otherwise misattribute).
+  var glErrorsPreFar = drainGLErrors(rawGL);
   var capFarOn = renderCapture(rawGL, rrFar, counted.draws, ENT_F1, LIGHTS_F1);
   setCVar('vd_mipdither', 0);
   var capFarOff = renderCapture(rawGL, rrFar, counted.draws, ENT_F1, LIGHTS_F1);
+  setCVar('vd_mipdither', 1);
+  // FOLLOW-2B hypothesis check (the far fixture above renders the
+  // far-selected scene from the NEAR camera by default): render the same
+  // scene from its own FAR camera, where minification is real. If the
+  // atlas-isolation fix is sound, the far camera shows proper minified
+  // content and the dither toggle bites there — while the near-camera far
+  // captures legitimately depth-resolve to F1.
+  var capFarViewOn = renderCapture(rawGL, rrFar, counted.draws, ENT_F1, LIGHTS_F1, FAR_VIEW);
+  var mipFlagOn = resolveAppearanceFrame().mipDither;
+  setCVar('vd_mipdither', 0);
+  var capFarViewOff = renderCapture(rawGL, rrFar, counted.draws, ENT_F1, LIGHTS_F1, FAR_VIEW);
+  var mipFlagOff = resolveAppearanceFrame().mipDither;
   setCVar('vd_mipdither', 1);
 
   // (d) pinned F1 fixed-scene capture (the CPU-vs-GPU comparison input) +
@@ -701,6 +741,75 @@ async function main() {
   var capF1P = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
   window.__q2capF1 = capF1P.px;
   window.__q2capSlice = function (a, b) { return Array.prototype.slice.call(window.__q2capF1.subarray(a, b)); };
+  // FOLLOW-2B dither-liveness probe (near camera, F1 scene): the dither
+  // toggle must perturb mid-distance textured content if the uMipDither
+  // path is alive. A zero here means globally dead dither (regression);
+  // nonzero with zero far response means minified taps have converged to
+  // per-tile averages (bleed removal working, fixture testing the wrong
+  // regime).
+  setCVar('vd_mipdither', 0);
+  var capF1DitherOff = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
+  var mipFlagF1Off = resolveAppearanceFrame().mipDither;
+  setCVar('vd_mipdither', 1);
+  // FOLLOW-2B same-camera triage (test-only diagnostic views, production
+  // stays 0): diffuse-only, lightmap-only, then final at the SAME camera.
+  // Identifies which stage owns any black region (wrap/upload vs atlas).
+  // Drain pre-existing flags first so post-triage errors attribute cleanly.
+  var glErrorsPreTriage = drainGLErrors(rawGL);
+  rrF1.renderer.setDebugView(1);
+  var capDiffuse = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
+  rrF1.renderer.setDebugView(2);
+  var capLight = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
+  rrF1.renderer.setDebugView(0);
+  window.__q2capDiffuse = capDiffuse.px;
+  window.__q2capLight = capLight.px;
+  function brightStats(px) {
+    var sum = 0, nonblack = 0;
+    for (var bi = 0; bi < N; bi++) {
+      var bo = bi * 4;
+      var lum = (px[bo] + px[bo + 1] + px[bo + 2]) / 3;
+      sum += lum;
+      if (px[bo] > 4 || px[bo + 1] > 4 || px[bo + 2] > 4) nonblack++;
+    }
+    return { mean: sum / N, nonblackFrac: nonblack / N };
+  }
+  var atlasStats = rrF1.renderer.testAtlasStats();
+  var matStats = rrF1.renderer.testMaterialStats();
+  var policyUp = rrF1.renderer.testPolicyUploads();
+  var glFirst = window.__q2glFirst || null;
+  var warnList = rrF1.renderer.testWarnings();
+  var uploadErrs = [];
+  var preExistingErrs = [];
+  for (var wi = 0; wi < warnList.length; wi++) {
+    if (warnList[wi].indexOf('texture upload') === 0) uploadErrs.push(warnList[wi]);
+    else if (warnList[wi].indexOf('pre-existing GL error') === 0) preExistingErrs.push(warnList[wi]);
+  }
+  proof.follow2b = {
+    diffuse: brightStats(capDiffuse.px),
+    light: brightStats(capLight.px),
+    final: brightStats(capF1P.px),
+    diffuseVsFinal: summarize(diffStats(capDiffuse.px, capF1P.px)),
+    lightVsFinal: summarize(diffStats(capLight.px, capF1P.px)),
+    farView: brightStats(capFarViewOn.px),
+    farViewVsNear: summarize(diffStats(capFarViewOn.px, capF1P.px)),
+    farViewMipOnOff: summarize(diffStats(capFarViewOn.px, capFarViewOff.px)),
+    f1MipOnOff: summarize(diffStats(capF1P.px, capF1DitherOff.px)),
+    mipFlags: [mipFlagOn, mipFlagOff],
+    mipFlagF1Off: mipFlagF1Off,
+    atlas: atlasStats,
+    materials: matStats,
+    policyUploads: policyUp,
+    glFirstErrors: glFirst,
+    warnings: warnList.slice(0, 20),
+    warningCount: warnList.length,
+    uploadErrors: uploadErrs,
+    preExistingGLErrors: preExistingErrs,
+    glErrorsPreFar: typeof glErrorsPreFar !== 'undefined' ? glErrorsPreFar : null,
+    glErrorsPreTriage: glErrorsPreTriage,
+    glErrorsPostTriage: drainGLErrors(rawGL),
+    glErrorAfterCaptures: rawGL.getError(),
+  };
+  log('follow2b: ' + JSON.stringify(proof.follow2b));
   rrF1.renderer.setFogOverride(1, [0.4, 0.5, 0.6]);
   var capFog = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
   rrF1.renderer.setFogOverride(null);

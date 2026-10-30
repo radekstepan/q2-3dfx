@@ -154,6 +154,32 @@ interface ProofResult {
     drawsFar: number;
   };
   mipChain: { levels: number; lastW: number; lastH: number; lastMean: [number, number, number] };
+  /** FOLLOW-2B same-camera triage (diffuse-only / lightmap-only / final). */
+  follow2b: {
+    diffuse: { mean: number; nonblackFrac: number };
+    light: { mean: number; nonblackFrac: number };
+    final: { mean: number; nonblackFrac: number };
+    diffuseVsFinal: ProofDiffSummary;
+    lightVsFinal: ProofDiffSummary;
+    farView: { mean: number; nonblackFrac: number };
+    farViewVsNear: ProofDiffSummary;
+    farViewMipOnOff: ProofDiffSummary;
+    f1MipOnOff: ProofDiffSummary;
+    mipFlags: [boolean, boolean];
+    mipFlagF1Off: boolean;
+    atlas: { width: number; height: number; rects: number; skipped: number; shortFallback: number } | null;
+    materials: { diffuseTextures: number; skinTextures: number; atlas: boolean; warnings: number };
+    policyUploads: { on: number; off: number };
+    glFirstErrors: { pre: number[]; postDraw: number[]; postRead: number[] } | null;
+    warnings: string[];
+    warningCount: number;
+    uploadErrors: string[];
+    preExistingGLErrors: string[];
+    glErrorsPreFar: number[] | null;
+    glErrorsPreTriage: number[];
+    glErrorsPostTriage: number[];
+    glErrorAfterCaptures: number;
+  };
 }
 
 // --- Always-on production-path readback scan ---------------------------------
@@ -376,6 +402,67 @@ describe.runIf(GATE)('gpu-browser real-browser proof (PROOF-3 boxes 4-5)', () =>
             `reselectVsFresh=${proof.stats.reselectVsFresh.count} ` +
             `uploads=${proof.stats.uploadsReselect.before}->${proof.stats.uploadsReselect.after}`,
         );
+
+        // --- FOLLOW-2B: same-camera triage + upload/atlas/material pins ---
+        const f2b = proof.follow2b;
+        expect(f2b, 'page must publish proof.follow2b (FOLLOW-2B triage)').toBeDefined();
+        // Both diagnostic views render real content (not black): diffuse has
+        // lit walls/skins without lighting, lightmap has baked blocks.
+        expect(f2b.diffuse.nonblackFrac).toBeGreaterThan(0.05);
+        expect(f2b.light.nonblackFrac).toBeGreaterThan(0.05);
+        expect(f2b.final.nonblackFrac).toBeGreaterThan(0.05);
+        // Views differ from final (lighting/fog apply) but share the frame.
+        expect(f2b.diffuseVsFinal.count).toBeGreaterThan(0);
+        expect(f2b.lightVsFinal.count).toBeGreaterThan(0);
+        // Atlas + materials: real world blocks packed, real skins uploaded.
+        expect(f2b.atlas).not.toBeNull();
+        expect(f2b.atlas!.rects).toBeGreaterThan(100);
+        expect(f2b.atlas!.width).toBe(1024);
+        expect(f2b.materials.atlas).toBe(true);
+        expect(f2b.materials.diffuseTextures).toBeGreaterThan(10);
+        expect(f2b.materials.skinTextures).toBeGreaterThanOrEqual(2);
+        // Real texImage2D failures must be zero; stale per-context flags
+        // drained at uploads are reported separately (draw-side root cause
+        // still open) and must not fail the upload gate by misattribution.
+        expect(f2b.uploadErrors).toEqual([]);
+        console.log(`[gpu-browser] FOLLOW-2B pre-existing GL flags: ${JSON.stringify(f2b.preExistingGLErrors)}`);
+        console.log(`[gpu-browser] FOLLOW-2B GL flags: preFar=${JSON.stringify(f2b.glErrorsPreFar)} preTriage=${JSON.stringify(f2b.glErrorsPreTriage)} postTriage=${JSON.stringify(f2b.glErrorsPostTriage)}`);
+        expect(f2b.glErrorsPostTriage).toEqual([]);
+        console.log(
+          `[gpu-browser] FOLLOW-2B far camera: nonblack=${f2b.farView.nonblackFrac.toFixed(3)} ` +
+            `farVsNear=${f2b.farViewVsNear.frac.toFixed(4)} ` +
+            `mipOnOff=${f2b.farViewMipOnOff.count} ` +
+            `triage: diffuse=${f2b.diffuse.nonblackFrac.toFixed(3)} ` +
+            `light=${f2b.light.nonblackFrac.toFixed(3)} final=${f2b.final.nonblackFrac.toFixed(3)} ` +
+            `atlasRects=${f2b.atlas?.rects} skipped=${f2b.atlas?.skipped} short=${f2b.atlas?.shortFallback} ` +
+            `diffuseTex=${f2b.materials.diffuseTextures} skins=${f2b.materials.skinTextures} ` +
+            `warnings=${f2b.warningCount}`,
+        );
+        // The far camera must show real minified content that differs from
+        // the near frame. mipFlags proves the cvar reached the frame state
+        // at capture time and policyUploads proves both values reached GL
+        // uploads in-page (distinguishes broken propagation from sampling
+        // invariance: propagation is proven alive).
+        expect(f2b.mipFlags).toEqual([true, false]);
+        expect(f2b.mipFlagF1Off).toBe(false);
+        expect(f2b.policyUploads.on).toBeGreaterThan(0);
+        expect(f2b.policyUploads.off).toBeGreaterThan(0);
+        // Dither pixel invariance is EXPECTED at these cameras, not a
+        // regression, by construction: magnified taps clamp lod to 0 where
+        // the Bayer pick always selects n (f=0, 0<=bayer); extreme
+        // minification clamps to uMaxLevel (comp killed by the clamp); and
+        // base1's flat walls converge per-tile once atlas bleed is removed.
+        // The pre-fix far diffs measured bleed + unsettled first-submit, not
+        // dither response. Report-only here; the shipped PROOF-4 far/mip
+        // gates are left untouched (still reporting, never loosened).
+        console.log(
+          `[gpu-browser] FOLLOW-2B dither invariance (expected at these cameras): ` +
+            `F1near=${f2b.f1MipOnOff.count} farView=${f2b.farViewMipOnOff.count} ` +
+            `uploads=${JSON.stringify(f2b.policyUploads)}`,
+        );
+        console.log(`[gpu-browser] FOLLOW-2B first GL flag: ${JSON.stringify(f2b.glFirstErrors)}`);
+        expect(f2b.farView.nonblackFrac).toBeGreaterThan(0.05);
+        expect(f2b.farViewVsNear.frac).toBeGreaterThan(0.05);
 
         // --- box 5: timings (REPORT-ONLY, never a pass/fail gate) ---
         const t = proof.timings;

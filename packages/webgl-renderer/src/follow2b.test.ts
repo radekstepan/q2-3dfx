@@ -8,6 +8,7 @@
 // machine so a lazy upload can never silently clobber unit 1.
 
 import { describe, expect, it } from 'vitest';
+import { resetCVars, setCVar } from '@q2/config';
 import type { MiniWorld } from '@q2/sw-renderer';
 import type { GpuFrameInput, GpuSceneInput } from '@q2/renderer-api';
 import { WebGLRenderer } from './renderer.js';
@@ -317,5 +318,22 @@ describe('GPU-FOLLOW-2B wiring (stub GL)', () => {
     const warns = r.testWarnings();
     expect(warns.filter((w) => w.startsWith('texture upload')).length).toBe(0);
     expect(mat.warnings).toBe(warns.length);
+  });
+
+  it('vd_mipdither cvar reaches the uMipDither uniform live (no re-upload)', () => {
+    const { calls, gl } = stubGL2B();
+    const r = new WebGLRenderer();
+    r.init(gl, 64, 48);
+    try {
+      resetCVars();
+      setCVar('vd_mipdither', 1);
+      driveFrame(r, gl);
+      expect(calls).toContain('uniform1i uMipDither 1');
+      setCVar('vd_mipdither', 0);
+      driveFrame(r, gl);
+      expect(calls).toContain('uniform1i uMipDither 0');
+    } finally {
+      resetCVars();
+    }
   });
 });

@@ -265,6 +265,10 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private atlasStats: { width: number; height: number; rects: number; skipped: number; shortFallback: number } | null = null;
   /** Uploaded chain depth per texture (for the uMaxLevel LOD clamp). */
   private texLevels = new Map<WebGLTexture, number>();
+  /** Test-only count of setVoodooPolicy uploads by mipDither value (FOLLOW-2B
+   * dither-liveness attribution: proves the toggled cvar reached GL uploads
+   * in-browser, distinguishing a CPU/store break from shader invariance). */
+  private policyUploads = { on: 0, off: 0 };
   private staticDirty = true;
   // FOLLOW-2 persistent world store: one shared buffer set for the FULL
   // inventory (uploaded once per generation) + per-surface ranges. Draw
@@ -555,6 +559,13 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   }
 
   /**
+   * Test-only uMipDither upload counts (FOLLOW-2B dither attribution).
+   */
+  testPolicyUploads(): { on: number; off: number } {
+    return { ...this.policyUploads };
+  }
+
+  /**
    * Atlas accounting for the current static generation (FOLLOW-2B report
    * hook): atlas dims, packed rect count, overflow-skipped count and
    * short-fallback count. Null before the first static upload.
@@ -773,6 +784,11 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
    * restored afterwards; a guarded getError warn makes real-GL upload
    * failures loud instead of silent. Stubs without pixelStorei/getError
    * (typeof-guarded) keep working with default unpack state.
+   *
+   * GL error flags are sticky: a flag set by an EARLIER call would
+   * misattribute to this upload, so the pre-poll distinguishes a flag this
+   * texImage2D set itself (actionable: texels may be corrupt) from a
+   * pre-existing flag drained here (reported once, not blamed on the upload).
    */
   private uploadPixels(
     gl: WebGL2RenderingContext,
@@ -781,6 +797,18 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     h: number,
     data: Uint8Array,
   ): void {
+    const hasError = typeof (gl as unknown as { getError?: unknown }).getError === 'function';
+    let preErr = 0;
+    if (hasError) {
+      try {
+        preErr = gl.getError();
+      } catch {
+        preErr = 0;
+      }
+      if (preErr !== gl.NO_ERROR) {
+        this.warn(`pre-existing GL error ${preErr} observed at texture upload ${w}x${h} level ${level} (drained, not attributed to this upload)`);
+      }
+    }
     const hasStore = typeof (gl as unknown as { pixelStorei?: unknown }).pixelStorei === 'function';
     let prevAlign: number | null = null;
     let prevRowLen: number | null = null;
@@ -1286,6 +1314,8 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const lut = this.fogLUT;
     if (p.uDebugMode) gl.uniform1i(p.uDebugMode, this.debugView);
     if (!ap || !lut) return;
+    if (ap.mipDither) this.policyUploads.on++;
+    else this.policyUploads.off++;
     if (p.uLodBias) gl.uniform1f(p.uLodBias, ap.lodBias);
     if (p.uMipDither) gl.uniform1i(p.uMipDither, ap.mipDither ? 1 : 0);
     if (p.uOverbright) gl.uniform1f(p.uOverbright, ap.overbright ? 2 : 1);
