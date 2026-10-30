@@ -8,12 +8,16 @@
 // buffers (alias interpolation, billboards, particles).
 //
 // Passes per frame (transparent ordering from the submitted selection, far->near):
-//   scene target: sky (flat, no depth write) -> opaque world (lit) ->
-//   opaque alias + opaque sprites (entity order) -> gun pass (depth-hack
-//   MVP) -> POINTS particles (depth write) -> blend (SRC_ALPHA /
-//   ONE_MINUS, depth test on, depth write OFF): transparent world +
-//   transparent alias + transparent sprites + beams interleaved far->near in
-//   ONE scene-order pass (the selection carries the combined world/entity order);
+//   scene target: sky (textured view-centered box when a strip is
+//   registered, else the flat fill; no depth write in either case) ->
+//   opaque world (lit, warped when turbulent) -> opaque alias + opaque
+//   sprites (entity order) -> gun pass (depth-hack MVP) -> POINTS particles
+//   (depth write) -> blend (SRC_ALPHA / ONE_MINUS, depth test on, depth
+//   write OFF): transparent world (glass + turbulent+translucent water,
+//   warped) + translucent alias + transparent sprites + beams interleaved
+//   far->near in ONE scene-order pass (the selection carries the combined
+//   world/entity order; beams ALWAYS ride the blend pass, even at default
+//   alpha 1 — the blend with alpha 1 is color-preserving);
 //   appearance: ONE fullscreen pass to the canvas (VS_POST/FS_APPEARANCE):
 //   dither -> RGB565 quantize -> reconstruction taps -> display gamma.
 //   Output stays resident on GPU through presentation; the normal path
@@ -46,9 +50,14 @@
 //   per-luxel; tolerances cover the difference);
 //   - gun depth: NDC z remap (scale 0.02, bias -0.9), the GPU interpretation
 //   of RF_DEPTHHACK 1/z x3 (wins except nose-to-wall);
-//   - beams are ~1.5px camera-facing quads (CPU: 1px DDA core+glow);
-//   - no GL face culling (visibility = selectGpuScene's CPU backface rule);
-//   - turbulent water draws unwarped (warp deferred to EXPAND);
+//   - beams are ~1.5px camera-facing quads (CPU: 1px DDA core+glow), always
+//     in the blend pass with distance order (even at default alpha);
+//   - no GL face culling (visibility = selectGpuScene's CPU backface rule:
+//     single-sided for opaque + glass, double-sided for sky + turbulent);
+//   - turbulent water warps per pixel (closed-form CPU-turbTable mirror,
+//     phase from the frame time; opaque + translucent water warp identically);
+//   - sky is a textured view-centered box (single-face quads, own tiles,
+//     fullbright mip-0) when a strip is registered, else the flat fill;
 //   - translucency is true blending (documented screen-door deviation);
 //   - HUD is composited above by the apps/web overlay (already above GL);
 //   - vd_palettetex: always expanded-RGB uploads (no paletted textures in
@@ -79,6 +88,8 @@ import type {
 import { MAX_GPU_LIGHTS } from '@q2/renderer-api';
 import {
   setupCamera,
+  SKY_BOX_HALF,
+  isValidSkySize,
   type Camera,
   type MiniWorld,
 } from '@q2/sw-renderer';
@@ -129,6 +140,7 @@ import {
 import {
   collectParticlePoints,
   emitBeamQuad,
+  emitSkyBoxFaces,
   emitSpriteQuad,
   emptyFlatBatch,
   resolveBeam,
@@ -196,6 +208,9 @@ interface ProgLocs {
   uFogTable: WebGLUniformLocation | null;
   // FOLLOW-2B test-only diagnostic view (debug-gated; production stays 0).
   uDebugMode: WebGLUniformLocation | null;
+  // FOLLOW-3 turbulent warp (FS_LIT only; null on other programs, guarded).
+  uWarpOn: WebGLUniformLocation | null;
+  uTime: WebGLUniformLocation | null;
 }
 
 /** Appearance-pass program locations (fullscreen resolve to the canvas). */
@@ -278,7 +293,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private worldLUVBuf: WebGLBuffer | null = null;
   private worldAlphaBuf: WebGLBuffer | null = null;
   private worldIdxBuf: WebGLBuffer | null = null;
-  private worldRanges = new Map<number, { start: number; count: number; texId: number; transparent: boolean }>();
+  private worldRanges = new Map<number, { start: number; count: number; texId: number; transparent: boolean; warped: boolean }>();
   private vertBase = new Map<number, { vStart: number; vCount: number }>();
   /** CPU shadow of the uploaded positions (mover re-sync compare). */
   private worldPositions: Float32Array | null = null;
@@ -286,6 +301,15 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private skyColBuf: WebGLBuffer | null = null;
   private skyIdxBuf: WebGLBuffer | null = null;
   private skyRanges = new Map<number, { start: number; count: number }>();
+  /**
+   * Packed sky strip (GPU-FOLLOW-3): vertical 6-tile strip in
+   * SKY_TILE_SUFFIXES order (rt/bk/lf/ft/up/dn), registered by the play
+   * layer from env/<skyname>*.pcx (base1: env/unit1_*.pcx). Null = flat
+   * fallback fill (the CPU no-skyTex path). The strip upload is lazy
+   * (first sky draw) and single-level (CPU mip-0 rule for skybox faces).
+   */
+  private skyStrip: { pixels: Uint8Array; tileW: number; tileH: number } | null = null;
+  private skyStripTex: WebGLTexture | null = null;
   private atlasTex: WebGLTexture | null = null;
   private atlas: LightAtlas | null = null;
   private styleSig = 0;
@@ -396,9 +420,36 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.modelGL.delete(handle);
   }
 
+  /**
+   * Register the packed sky strip sampled by SURF_SKY surfaces (GPU-FOLLOW-3,
+   * CPU setSkyTexture parity): ONE vertical strip of 6 tiles in filename
+   * suffix order [rt, bk, lf, ft, up, dn] (SKY_TILE_SUFFIXES), tileW = strip
+   * width (must be a power of two: the affine CPU sampler indexes with
+   * u & (tileW-1)), strip height = 6 * tileH. Texels are PALETTE INDICES
+   * (like setSkyTexture); expansion uses the current palette at upload.
+   * Returns true on success; invalid sizes warn + keep the previous strip
+   * (flat fill when none). Idempotent replay: re-registering drops the
+   * uploaded GL copy so the next sky draw re-uploads exactly once.
+   */
+  registerSkyStrip(texels: Uint8Array, tileW: number, tileH: number): boolean {
+    if (!Number.isInteger(tileW) || !Number.isInteger(tileH) ||
+      !isValidSkySize(tileW, tileH * 6) ||
+      texels.length !== tileW * tileH * 6) {
+      this.warn(`registerSkyStrip: invalid ${tileW}x${tileH} strip (flat sky fallback)`);
+      return false;
+    }
+    this.skyStrip = { pixels: texels.slice(), tileW, tileH };
+    this.skyStripTex = null;
+    return true;
+  }
+
+  /** Registered sky strip dims (test hook; null when no strip registered). */
+  testSkyStrip(): { tileW: number; tileH: number } | null {
+    return this.skyStrip ? { tileW: this.skyStrip.tileW, tileH: this.skyStrip.tileH } : null;
+  }
+
   /** Register skin texels (palette indices) for an entity skin handle. */
-  registerSkinPixels(handle: number, pixels: Uint8Array, width: number, height: number): number {
-    if (!Number.isInteger(width) || !Number.isInteger(height) ||
+  registerSkinPixels(handle: number, pixels: Uint8Array, width: number, height: number): number {    if (!Number.isInteger(width) || !Number.isInteger(height) ||
       width < 1 || height < 1 || width > 1024 || height > 1024 ||
       pixels.length !== width * height) {
       this.warn(`registerSkinPixels: invalid ${width}x${height} for handle ${handle} (white fallback)`);
@@ -618,6 +669,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.skyColBuf = null;
     this.skyIdxBuf = null;
     this.skyRanges = new Map();
+    this.skyStripTex = null;
     this.atlasTex = null;
     this.atlas = null;
     this.diffuseTex = new Map();
@@ -668,6 +720,8 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
         uFogColor: L('uFogColor'),
         uFogTable: L('uFogTable'),
         uDebugMode: L('uDebugMode'),
+        uWarpOn: L('uWarpOn'),
+        uTime: L('uTime'),
       };
     };
     try {
@@ -735,7 +789,13 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.worldRanges = new Map();
     this.vertBase = new Map();
     for (const [id, r] of store.world.surfaces) {
-      this.worldRanges.set(id, { start: r.indexStart, count: r.indexCount, texId: r.texId, transparent: r.transparent });
+      this.worldRanges.set(id, {
+        start: r.indexStart,
+        count: r.indexCount,
+        texId: r.texId,
+        transparent: r.transparent,
+        warped: r.material === 'turbulent',
+      });
       this.vertBase.set(id, { vStart: r.vertStart, vCount: r.vertCount });
     }
     this.worldPositions = store.world.positions.slice();
@@ -986,6 +1046,29 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     return this.whiteTex;
   }
 
+  /**
+   * Sky strip texture (lazy, single-level, palette-expanded at upload like
+   * skinFor). One mip level only: the CPU skybox path samples mip 0 with no
+   * lightmap, so uMaxLevel clamps to 0 and the mip-dither pick can never
+   * leave level 0. CLAMP addressing: the per-face UVs are clamped in-tile
+   * by skyUvOnFace, so no tile bleeds. Null without a strip or palette
+   * (caller falls back to the flat fill).
+   */
+  private skyStripFor(gl: WebGL2RenderingContext): WebGLTexture | null {
+    if (this.skyStripTex) return this.skyStripTex;
+    const strip = this.skyStrip;
+    const palette = this.palette;
+    if (!strip || !palette) return null;
+    const rgb = expandPaletteTexture(strip.pixels, strip.tileW, strip.tileH * 6, palette);
+    if (!rgb) {
+      this.warn('sky strip texel mismatch (flat sky fallback)');
+      return null;
+    }
+    const tex = this.uploadTextureLevels(gl, rgb, strip.tileW, strip.tileH * 6, false, 'clamp');
+    this.skyStripTex = tex;
+    return tex;
+  }
+
   /** 1.0-filled buffer (alias alpha attribute filler). */
   private onesFor(gl: WebGL2RenderingContext): WebGLBuffer | null {
     if (!this.onesBuf) {
@@ -1087,9 +1170,21 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       if (flat.uPointSize) gl.uniform1f(flat.uPointSize, 1);
       if (flat.uTextured) gl.uniform1i(flat.uTextured, 0);
       gl.depthMask(false);
-      for (const ref of scene.surfaces) {
-        if (ref.material !== 'sky' || ref.transformIndex !== 0) continue;
-        this.drawSkyRange(gl, ref.surfaceId);
+      const hasSky = scene.surfaces.some((r) => r.material === 'sky' && r.transformIndex === 0);
+      const strip = hasSky ? this.skyStripFor(gl) : null;
+      if (strip && this.skyStrip) {
+        // Textured skybox (GPU-FOLLOW-3, CPU emitSkyBox parity): one
+        // view-centered box (single-face quads, own tiles, fullbright) no
+        // matter how many sky surfaces are visible — the hull ranges are
+        // skipped, exactly like the CPU discarding SURF_SKY polys.
+        const box = emptyFlatBatch();
+        emitSkyBoxFaces(box, cam.origin, SKY_BOX_HALF, this.skyStrip.tileW, this.skyStrip.tileH);
+        this.drawFlatBatch(gl, VP, box, strip);
+      } else {
+        for (const ref of scene.surfaces) {
+          if (ref.material !== 'sky' || ref.transformIndex !== 0) continue;
+          this.drawSkyRange(gl, ref.surfaceId);
+        }
       }
       gl.depthMask(true);
     }
@@ -1109,7 +1204,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
         if (ref.transparent || ref.material === 'sky') continue;
         if (ref.transformIndex === 0) {
           if (ref.material !== 'opaque' && ref.material !== 'turbulent') continue;
-          this.drawWorldRange(gl, lit, ref.surfaceId);
+          this.drawWorldRange(gl, lit, ref.surfaceId, input.time);
           continue;
         }
         const e = this.entities[-1 - ref.surfaceId];
@@ -1159,8 +1254,13 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       this.bindLightmap(gl, lit);
       for (const ref of scene.surfaces) {
         if (ref.transformIndex === 0) {
-          if (!ref.transparent || ref.material !== 'transparent') continue;
-          this.drawWorldRange(gl, lit, ref.surfaceId);
+          // Blend-pass world: every transparent non-sky ref in scene order
+          // (far->near) — glass ('transparent') AND turbulent+translucent
+          // water ('turbulent', warped per draw). Sky can never be
+          // transparent here (sky+translucent classifies as glass and has no
+          // world range), but the guard documents the invariant.
+          if (!ref.transparent || ref.material === 'sky') continue;
+          this.drawWorldRange(gl, lit, ref.surfaceId, input.time);
           continue;
         }
         const e = this.entities[-1 - ref.surfaceId];
@@ -1493,12 +1593,16 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
    * alias/sprite/beam draws that switch programs, and a lazy first-use
    * diffuse upload pins TEXTURE0 — per-draw re-bind keeps unit 1 intact.
    * Uploads uDebugMode per draw so triage captures (0/1/2) take effect
-   * without a pass restart.
+   * without a pass restart. Turbulent ranges warp (uWarpOn from the uploaded
+   * range flag + uTime from the frame time, the CPU turbPhase rule) in BOTH
+   * passes — opaque water and translucent water warp identically
+   * (GPU-FOLLOW-3).
    */
   private drawWorldRange(
     gl: WebGL2RenderingContext,
     p: ProgLocs,
     surfaceId: number,
+    time: number,
   ): void {
     const range = this.worldRanges.get(surfaceId);
     if (!range) return;
@@ -1506,6 +1610,8 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       !this.worldAlphaBuf || !this.worldIdxBuf) return;
     gl.useProgram(p.prog);
     if (p.uDebugMode) gl.uniform1i(p.uDebugMode, this.debugView);
+    if (p.uWarpOn) gl.uniform1i(p.uWarpOn, range.warped ? 1 : 0);
+    if (p.uTime) gl.uniform1f(p.uTime, time);
     const tex = this.diffuseFor(gl, range.texId) ?? this.whiteFor(gl);
     this.bindDiffuse(gl, p, tex);
     this.bindLightmap(gl, p);

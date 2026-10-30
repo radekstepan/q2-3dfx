@@ -57,11 +57,29 @@ uniform vec4 uLightPos[8];
 uniform vec3 uLightColor[8];
 uniform int uNumLights;
 uniform int uDebugMode;
+uniform int uWarpOn;
+uniform float uTime;
 out vec4 oColor;
 ${GLSL_MIP_POLICY}
 ${GLSL_FOG_OVERBRIGHT}
+// Turbulent water warp (GPU-FOLLOW-3, CPU runSubdivTurbulent parity):
+// wu = u + T[(v+phase) & 1023], wv = v + T[(u+phase) & 1023], T closed-form
+// 16 + 15*sin(2*pi*idx/1024) (the CPU table, unrounded), phase from uTime.
+// UVs are texel units here (the uploaded world UVs are normalized 0..1, so
+// the caller scales by texture size first). uWarpOn 0 = verbatim passthrough.
+vec2 voodooWarp(vec2 uv) {
+  if (uWarpOn == 0) return uv;
+  float ph = floor(uTime * 64.0);
+  float iu = floor(uv.x);
+  float iv = floor(uv.y);
+  float tu = 16.0 + 15.0 * sin(6.283185307179586 * mod(iv + ph, 1024.0) / 1024.0);
+  float tv = 16.0 + 15.0 * sin(6.283185307179586 * mod(iu + ph, 1024.0) / 1024.0);
+  return vec2(uv.x + tu, uv.y + tv);
+}
 void main() {
-  vec3 texel = voodooSampleMipped(uDiffuse, vUV);
+  // vUV is normalized 0..1 (world batches); warp runs in texel units.
+  vec2 wuv = voodooWarp(vUV * vec2(textureSize(uDiffuse, 0)));
+  vec3 texel = voodooSampleMipped(uDiffuse, wuv / vec2(textureSize(uDiffuse, 0)));
   // FOLLOW-2B test-only diagnostic views (debug-gated, production stays 0):
   // 1 = unlit diffuse (repeat/wrap + upload triage), 2 = lightmap block only
   // (atlas placement/bleed triage). Final (0) is the shipped path.

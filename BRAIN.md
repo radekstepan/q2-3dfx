@@ -9,9 +9,9 @@
 > This file states the rules and the *active* work. Everything else is a pointer.
 > **Current direction (2026-10-29): user reports mostly 60 FPS at 640×480 and
 > no visible broken textures/black spots. GPU-FOLLOW-2B is DONE (committed +
-> real-browser evidence); GPU-FOLLOW-2C is DONE (3-lane integration below);
-> work the short remaining §8 queue next (3 → 4 → 5/6 → 7). Preserve gains;
-> CPU optimization stays paused.**
+> real-browser evidence); GPU-FOLLOW-2C is DONE (3-lane integration);
+> GPU-FOLLOW-3 is DONE (3-lane integration below); work the short remaining
+> §8 queue next (4 → 5/6 → 7). Preserve gains; CPU optimization stays paused.**
 
 ---
 
@@ -286,7 +286,7 @@ historical, not instructions to reimplement completed/current repairs.
 
 ### Execution rules for the remaining queue
 
-- Continue 3 → 4 → 5/6 → 7 (2B/2C done and integrated). FOLLOW-5 and 6
+- Continue 4 → 5/6 → 7 (2B/2C/3 done and integrated). FOLLOW-5 and 6
   may run independently after 4 when package ownership permits. Exactly one writer
   per package; delegate independent lanes under §7; integrator owns shared docs,
   changesets and commits. Keep card IDs stable for the LLM already working.
@@ -361,13 +361,14 @@ done-when:
 ### GPU-FOLLOW-3 — Complete live effects and required world appearance
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
 depends: GPU-FOLLOW-2C
-status: ready
+status: done (3-lane integration below; lane report in `docs/tasks-archive.md`)
 done-when:
-- [ ] Inventory actual live producers/consumers for sprites, particles, beams, explosions, lights and model/skin kinds. Connect game events and lifetimes to GPU drawing; rendering synthetic fixtures alone is insufficient. Verify event drains occur in the intended tick order without dropping or double-consuming effects.
-- [ ] Classify/order default-alpha beams for their actual blended draw pass; test beam/glass/translucent-alias overlap at changing camera positions.
-- [ ] Preserve model-kind metadata (not just the temporary tracer map), sprite animation/size, particle counts/lifetimes and weapon/light timing. Prove real combat event → submitted geometry → visible pixels with tests.
-- [ ] Implement base1-required sky and water/warp/transparent behavior; current sky is flat and turbulence unwarped. Test combined turbulent/translucent flags and draw/depth order. Audit remaining cvar behavior and label unsupported choices explicitly.
-- [ ] Exercise all supported weapons, enemies, pickups and relevant effects on the live path; no missing-mesh/skin warnings in supported scenes. Keep GPU-resident HUD optional unless measured CPU-overlay cost or correctness requires it.
+- [x] Inventory actual live producers/consumers for sprites, particles, beams, explosions, lights and model/skin kinds. Connect game events and lifetimes to GPU drawing; rendering synthetic fixtures alone is insufficient. Verify event drains occur in the intended tick order without dropping or double-consuming effects. (Lane B `gpu-effects.ts` inventory + drain-order tests; blaster→bolt→muzzle→impact→explosion→particles proven live)
+- [x] Classify/order default-alpha beams for their actual blended draw pass; test beam/glass/translucent-alias overlap at changing camera positions. (Lane A `entityBlend`: tracers always blend with distance keys; overlap tested at spawn/translated/180°-turn cameras; combined far→near world+entity order, CPU difference documented in PROOF-4.md §6)
+- [x] Preserve model-kind metadata (not just the temporary tracer map), sprite animation/size, particle counts/lifetimes and weapon/light timing. Prove real combat event → submitted geometry → visible pixels with tests. (Lane B full `modelKindsForFrame` to selection+draw; browser combat leg: bolts=2 expl=1 particles=80 muzzle=true nonblack 0.919)
+- [x] Implement base1-required sky and water/warp/transparent behavior; current sky is flat and turbulence unwarped. Test combined turbulent/translucent flags and draw/depth order. Audit remaining cvar behavior and label unsupported choices explicitly. (Lane A: TRANS-first, single-sided glass, per-pixel warp, textured skybox via registerSkyStrip with flat fallback, `GPU_CVAR_GAPS`; real inventory 128 sky / 102 turbulent+translucent / 17 glass)
+- [x] Exercise all supported weapons, enemies, pickups and relevant effects on the live path; no missing-mesh/skin warnings in supported scenes. Keep GPU-resident HUD optional unless measured CPU-overlay cost or correctness requires it. (Lane C catalogs + `validateFollow3Coverage` 18/18; HUD stays report-only. Follow-up, not a blocker: no live sprite producer — 8 sp2 ship in pak0, server queue absent, sprite path covered by fixture + billboard contract; needs a server/game producer decision)
+- Integrator merge fixes (no loosening): lane B's pre-fix turbulent pin → post-fix blend expectation; `gpu-boundary` entity-kind pins → index-stable `surfaceId`-slot matching (transparent refs sort far→near; identity is the slot, order the draw sequence).
 
 ### GPU-FOLLOW-4 — Make resource lifecycle, switching and resize reliable
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`, `packages/config`

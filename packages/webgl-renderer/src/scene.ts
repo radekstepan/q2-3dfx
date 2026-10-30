@@ -20,11 +20,13 @@
 //      node-owned face is referenced by the mark surfaces of the leafs
 //      below it, so leaf faceLists subsume node firstSurf/numSurfs ranges.
 //   4. Frustum-cull survivors by bbox (culledByFrustum, same helper).
-//   5. Backface-cull OPAQUE non-sky world surfaces via fn·(center-origin):
+//   5. Backface-cull single-sided world surfaces via fn·(center-origin):
 //      the front side faces the camera iff dot(fn, origin-center) > 0, so
-//      dot(fn, center-origin) >= 0 (edge-on included) is culled. Sky,
-//      turbulent and translucent surfaces are exempt (sky hulls face
-//      outward; water/glass read from both sides).
+//      dot(fn, center-origin) >= 0 (edge-on included) is culled. Only
+//      turbulent and sky surfaces are exempt (sky hulls face outward;
+//      water/glass reads from both sides in the CPU too: frame.ts culls
+//      iff !turbulent && !sky, so translucent glass IS culled from behind).
+//      Turbulent+translucent water stays double-sided in the blend pass.
 //   6. Classify: sky -> sky, turbulent -> turbulent, translucent 1/2 ->
 //      transparent, else opaque. Degenerate placeholder faces (n < 3, the
 //      SURF_NODRAW empties bspToMiniWorld keeps index-stable) are skipped:
@@ -96,11 +98,22 @@ export function orderDistance(
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+/**
+ * CPU parity (frame.ts R_RenderFace, GPU-FOLLOW-3): translucency is checked
+ * FIRST, before sky/warp. A turbulent+translucent surface (base1 has 102:
+ * translucent water) defers to the alpha blend pass AND keeps its warp
+ * identity (material 'turbulent', transparent true — the blend pass warps
+ * turbulent refs). A sky+translucent surface (never in base1) follows the
+ * same TRANS-first rule into the blend pass as textured glass. Sky and
+ * warp-only surfaces stay opaque; sky keeps the flat/box background path.
+ */
 function classifyWorldSurface(s: MiniSurf): { material: GpuMaterialKind; transparent: boolean } {
+  const t = s.translucent ?? 0;
+  if (t === 1 || t === 2) {
+    return { material: s.turbulent ? 'turbulent' : 'transparent', transparent: true };
+  }
   if (s.sky) return { material: 'sky', transparent: false };
   if (s.turbulent) return { material: 'turbulent', transparent: false };
-  const t = s.translucent ?? 0;
-  if (t === 1 || t === 2) return { material: 'transparent', transparent: true };
   return { material: 'opaque', transparent: false };
 }
 
@@ -110,6 +123,22 @@ function entityMaterial(
   if (kind === 'sp2') return 'sprite';
   if (kind === 'tracer') return 'beam';
   return 'alias';
+}
+
+/**
+ * Entity blend membership (GPU-FOLLOW-3): tracer beams ALWAYS ride the
+ * blended draw pass, even at default alpha 1. The CPU draws entity tracers
+ * unconditionally in the foreground (frame.ts drawForegroundEntityPass has
+ * no alpha gate for kind 'tracer': full-bright additive spans, depth-tested).
+ * The GPU blend pass with alpha 1 is color-preserving (SRC_ALPHA/ONE_MINUS
+ * with src alpha 1) and depth-tested without depth writes — the documented
+ * approximation. Crucially this gives every beam a real distance order key
+ * so beam/glass/translucent-alias overlap sorts far->near instead of leaving
+ * default-alpha beams at order 0 in the opaque tail.
+ */
+export function entityBlend(e: Entity, kind: GpuEntityModelKind | undefined): boolean {
+  if (kind === 'tracer') return true;
+  return (e.alpha ?? 1) < 1;
 }
 
 /**
@@ -207,7 +236,12 @@ export function selectWorldRefs(
     if (!s || s.n < 3) continue; // degenerate/NODRAW placeholder: no triangles
     if (culledByFrustum(cam, s.mins, s.maxs)) continue;
     const cls = classifyWorldSurface(s);
-    if (cls.material === 'opaque') {
+    // CPU parity (frame.ts: `if (!surf.turbulent && !surf.sky)`): glass
+    // (translucent, non-turbulent, non-sky) is single-sided and culled from
+    // behind exactly like opaque. Sky hulls face outward and turbulent water
+    // reads from both sides, so both stay double-sided in every pass
+    // (including the blend pass for turbulent+translucent water).
+    if (!s.turbulent && !s.sky) {
       // Backface: front faces the camera iff dot(fn, origin-center) > 0.
       const dx = s.center[0]! - ox;
       const dy = s.center[1]! - oy;
@@ -264,7 +298,7 @@ export function refreshGpuScene(
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i]!;
     const material = entityMaterial(modelKinds?.get(e.model));
-    const isTransparent = (e.alpha ?? 1) < 1;
+    const isTransparent = entityBlend(e, modelKinds?.get(e.model));
     transforms.push(entityTransform(e.origin, e.angles[1]!));
     const ref: GpuSurfaceRef = {
       surfaceId: -1 - i, // entity refs carry no CPU surface id; index-stable slot

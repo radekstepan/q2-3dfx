@@ -393,6 +393,49 @@ export function downsampleToCap(
   return { data: resampleRGBBox(rgb, w, h, cap.w, cap.h), w: cap.w, h: cap.h, capped: true };
 }
 
+// --- Turbulent water warp (GPU-FOLLOW-3 CPU mirror) --------------------------
+//
+// The CPU warps turbulent UVs per pixel (spans.ts runSubdivTurbulent, the
+// ref_soft water rule): in 16.16 texel units,
+//   wu = u + turbTable[(v_int + phase) & 1023]
+//   wv = v + turbTable[(u_int + phase) & 1023]
+// with turbTable[i] = round(16 + 15*sin(2*pi*i/1024)) (buildTurbTable,
+// r_scan.c sintable equivalent, values 1..31) and
+// phase = ((time*64)|0) & 1023 (frame.ts turbPhase, level-time seconds).
+//
+// The GPU evaluates the same rule in FS_LIT in closed form
+// (16 + 15*sin(2*pi*idx/1024), no 1024-entry table upload); warpUv is the
+// CPU-side pure mirror of that closed form, used by tests to pin the
+// approximation against the real table. Agreement is within half a texel
+// (table rounding) plus float-sin precision — an approximation, stated here,
+// not bit-exact emulation. Indices use the integer texel part (floor for
+// negative repeat UVs, matching (tv>>16) arithmetic shift + & 1023 mask via
+// a positive modulo).
+
+/** Warp phase for a level-time in seconds (frame.ts turbPhase rule: ((time*64)|0) & 1023). */
+export function warpPhaseFor(timeSec: number): number {
+  return ((timeSec * 64) | 0) & 1023;
+}
+
+/** Closed-form warp-table value at index 0..1023 (unrounded). */
+export function warpTableValue(idx: number): number {
+  return 16 + 15 * Math.sin((2 * Math.PI * idx) / 1024);
+}
+
+/**
+ * Warped UVs in texel units for a turbulent surface at level-time timeSec.
+ * Pure mirror of the FS_LIT voodooWarp chunk (same formula, same phase).
+ */
+export function warpUv(u: number, v: number, timeSec: number): [number, number] {
+  const phase = warpPhaseFor(timeSec);
+  const iu = Math.floor(u);
+  const iv = Math.floor(v);
+  const pos = (x: number): number => ((x % 1024) + 1024) % 1024;
+  const tu = warpTableValue(pos(iv + phase));
+  const tv = warpTableValue(pos(iu + phase));
+  return [u + tu, v + tv];
+}
+
 // --- Lightmap overbright (duplicate of voodoo modulateLightmap, CPU form) ---
 
 /**
@@ -746,4 +789,18 @@ export const APPEARANCE_CVAR_DOC: ReadonlyArray<CvarInterpretation> = Object.fre
   { cvar: 'vd_maxtexsize', kind: 'upload-time', note: 'Cap enforced at upload: aspect-preserving box resample + recorded warning (closes the CPU dims-only gap on the GPU path).' },
   { cvar: 'vd_zbits', kind: 'target-creation', note: '<=16 requests DEPTH_COMPONENT16, >=24 requests DEPTH_COMPONENT24. GL depth tests BEFORE write (true pre-test policy), unlike the CPU post-hoc banding helper.' },
   { cvar: 'vd_palettetex', kind: 'policy-note', note: 'No paletted textures in WebGL: always uploads expanded RGB; filtering is identical either way (never gates filtering, per the CPU rule).' },
+]);
+
+// --- Non-vd_ cvar audit (GPU-FOLLOW-3: remaining behavior, unsupported labelled)
+//
+// Appearance-affecting cvars the CPU world path reads that the GPU backend
+// does NOT honor. Listed explicitly so no silent divergence: each entry is
+// a deliberate unsupported choice (out of scope for this card) or a pending
+// audit. Changing any entry to honored behavior is a follow-up card, not a
+// silent fix.
+export const GPU_CVAR_GAPS: ReadonlyArray<CvarInterpretation> = Object.freeze([
+  { cvar: 'r_translucency', kind: 'policy-note', note: 'UNSUPPORTED (=0 opaque fallback ignored): the GPU always blends translucent world surfaces (TRANS33/66 alpha) in the far->near blend pass. Set on the CPU by translucencyModeFromCvars; no GPU read.' },
+  { cvar: 'sw_stipplealpha', kind: 'policy-note', note: 'UNSUPPORTED (screen-door stipple ignored): the GPU always true-blends; the CPU stipple path (mode 2) has no GPU equivalent. Documented deviation (true blending vs Voodoo screen-door).' },
+  { cvar: 'r_drawworld', kind: 'policy-note', note: 'UNSUPPORTED (=0 world-hide ignored): the GPU always draws the submitted world selection. The play layer never sets it on the GPU path; hiding the world requires not submitting it.' },
+  { cvar: 'sw_gamma', kind: 'policy-note', note: 'NOT READ (by design): the software 8-bit gamma path does not apply here; the GPU uses vd_gamma (display-stage RAMDAC placement) for the same role.' },
 ]);

@@ -655,9 +655,15 @@ function assertSelectionInvariants(
   }
 
   // Combat entity refs exist with transformIndex >= 1, kinds preserved.
+  // Entity refs ride the blend pass far->near when transparent (tracers
+  // always blend), so match by the index-stable surfaceId slot (-1-i),
+  // not by position: order is a draw sequence, identity is the slot.
   expect(entityRefs).toHaveLength(entities.length);
   const kinds = entityKindsForFixture(entities.length);
-  entityRefs.forEach((ref, i) => {
+  const bySlot = new Map(entityRefs.map((r) => [r.surfaceId, r]));
+  entities.forEach((e, i) => {
+    const ref = bySlot.get(-1 - i)!;
+    expect(ref).toBeDefined();
     expect(ref.transformIndex).toBeGreaterThanOrEqual(1);
     expect(ref.transformIndex).toBeLessThan(scene.transforms.length);
     expect(ref.material === 'alias' || ref.material === 'sprite' || ref.material === 'beam').toBe(true);

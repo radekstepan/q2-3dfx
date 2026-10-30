@@ -13,6 +13,8 @@
 import { getCVarString, setCVarFromString } from '@q2/config';
 import { v3 } from '@q2/math';
 import { cameraCluster } from '@q2/webgl-renderer';
+import { readLiveEffects } from './gpu-effects.js';
+import type { LiveEffects } from './gpu-effects.js';
 import { startPlayLoop } from './dom.js';
 import type { PlayBoot } from './play.js';
 import { bootPlay, buildAsyncView, getGpuStatus, playerPosText } from './play.js';
@@ -313,6 +315,13 @@ export interface SoakRouteSnapshot {
   materials: { diffuse: number; skins: number; atlas: boolean; warnings: number } | null;
   /** Submitted-scene census (world opaque/transparent + entity refs). */
   scene: { worldOpaque: number; worldTransparent: number; entityRefs: number; staticTotal: number } | null;
+  /**
+   * Live combat/effects state (GPU-FOLLOW-3 additive extension: OPTIONAL so
+   * the FOLLOW-2C `__q2soakRoute` shape stays intact — old readers ignore it).
+   * Null before the soak boot lands; otherwise bolts/explosions/particles,
+   * muzzle state, monster kinds, pickups and world/scene material censuses.
+   */
+  effects?: LiveEffects | null;
 }
 
 /** Cap for the mover list in a route snapshot (bounded, never truncated silently in tests). */
@@ -498,10 +507,17 @@ export function readSoakRoute(): SoakRouteSnapshot | null {
   } catch {
     scene = null;
   }
+  // FOLLOW-3 additive effects (optional field above): best-effort, never throws.
+  let effects: LiveEffects | null = null;
+  try {
+    effects = readLiveEffects(boot);
+  } catch {
+    effects = null;
+  }
   return {
     frame, camera, cluster, movers, trains, aliveMonsters, monsterKinds,
     viewmodel, handles, registeredModels, registeredSkins, uploads, framesSubmitted,
-    warnings, materials, scene,
+    warnings, materials, scene, effects,
   };
 }
 

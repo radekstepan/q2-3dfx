@@ -160,11 +160,13 @@ describe('selectGpuScene pure units (always run)', () => {
     const { entities, kinds } = fixtureEntities();
     const out = selectGpuScene(fixtureWorld(), entities, refDef([0, 0, 0], 90), W, H, kinds);
     const transparent = out.surfaces.filter((r) => r.transparent);
-    expect(transparent.length).toBe(3); // world 200/150 + transparent sprite at 50
+    // World 200/150 + default-alpha beam at ~60.4 (FOLLOW-3: tracers always
+    // blend with a real distance key) + transparent sprite at 50.
+    expect(transparent.length).toBe(4);
     for (let i = 1; i < transparent.length; i++) {
       expect(transparent[i - 1]!.order).toBeGreaterThanOrEqual(transparent[i]!.order);
     }
-    expect(transparent.map((r) => r.order)).toEqual([200, 150, 50]);
+    expect(transparent.map((r) => r.order)).toEqual([200, 150, Math.sqrt(3650), 50]);
     expect(out.transforms.length).toBe(1 + entities.length);
     expect([...out.transforms[0]!]).toEqual([...identityTransform()]);
     const bySlot = (slot: number) => out.surfaces.find((r) => r.transformIndex === slot)!;
@@ -173,6 +175,7 @@ describe('selectGpuScene pure units (always run)', () => {
     expect(bySlot(2).material).toBe('sprite'); // sp2 -> sprite
     expect(bySlot(2).transparent).toBe(true); // alpha 0.5
     expect(bySlot(3).material).toBe('beam'); // tracer -> beam
+    expect(bySlot(3).transparent).toBe(true); // FOLLOW-3: default-alpha beams blend
     for (const r of out.surfaces) {
       if (r.transformIndex > 0) expect(r.transformIndex).toBeLessThan(out.transforms.length);
     }

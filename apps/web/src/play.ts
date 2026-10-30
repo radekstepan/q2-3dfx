@@ -119,6 +119,7 @@ import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } f
 import type { BrowserForegroundDetail, DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
 import { detectGpuCapability, getGpuStatus, resolveBootRenderer } from './gpu-select.js';
 import { acquireGpuCanvas, removeGpuCanvas, setHudTransparent, syncGpuCanvasToHud } from './gpu-canvas.js';
+import { modelKindsForFrame, synthesizeBeamEntities } from './gpu-effects.js';
 import { WebGLRenderer, fullWorldRefs, refreshGpuScene, selectGpuScene } from '@q2/webgl-renderer';
 
 /**
@@ -5142,22 +5143,16 @@ export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus |
     });
   }
   // Live beams: the driver tracer queue drains here into synthesized beam
-  // entities (origin=start, angles=dir, frame=length, skin=color — the
-  // contract-free beam convention `resolveBeam` reads). Negative model
-  // handles never collide with registry handles (>= 0); modelKinds marks
-  // them 'tracer' explicitly.
-  const beamKinds = new Map<number, 'md2' | 'sp2' | 'tracer'>();
-  const beams: Entity[] = boot.driver.drainTracers().map((t, i) => {
-    const model = -1000 - i;
-    beamKinds.set(model, 'tracer');
-    return {
-      model,
-      origin: new Float32Array([t.origin[0]!, t.origin[1]!, t.origin[2]!]),
-      angles: new Float32Array([t.dir[0]!, t.dir[1]!, t.dir[2]!]),
-      frame: t.length,
-      skin: t.color,
-    } as Entity;
-  });
+  // entities (FOLLOW-3 `synthesizeBeamEntities`: origin=start, angles=dir,
+  // frame=length, skin=color — the contract-free beam convention
+  // `resolveBeam` reads). Negative model handles never collide with registry
+  // handles (>= 0). The kind map carries the FULL retained-asset metadata
+  // (every registered md2/sp2 handle keeps its kind, not just the tracer
+  // entries), so selection and draw dispatch agree without depending on
+  // registry fallthrough.
+  const beamSyn = synthesizeBeamEntities(boot.driver.drainTracers());
+  const beams: Entity[] = beamSyn.entities;
+  const modelKinds = modelKindsForFrame(boot.models, beamSyn.kinds.keys());
   const tSim0 = performance.now();
   stepAsyncSim(boot.host, g.loop, nowMs);
   const tView0 = performance.now();
@@ -5183,12 +5178,12 @@ export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus |
     view,
     boot.host.fb.width,
     boot.host.fb.height,
-    beamKinds.size > 0 ? beamKinds : undefined,
+    modelKinds.size > 0 ? modelKinds : undefined,
     g.staticScene.staticGeneration,
   );
   const tSubmit0 = performance.now();
   g.gpu.setScene(scene);
-  g.gpu.setEntities(entities, beamKinds.size > 0 ? beamKinds : undefined);
+  g.gpu.setEntities(entities, modelKinds.size > 0 ? modelKinds : undefined);
   g.scene = scene;
   g.gpu.renderFrame({ view, scene, time: view.time, lights });
   const tEnd = performance.now();

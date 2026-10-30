@@ -165,10 +165,16 @@ export interface FullSkyStore {
 }
 
 function classifyForStore(s: MiniSurf): { material: GpuSurfaceKind; transparent: boolean } {
+  // TRANS-first, matching scene.ts classifyWorldSurface (GPU-FOLLOW-3 CPU
+  // parity: frame.ts defers translucent surfaces to the alpha pass before
+  // the sky check). Turbulent+translucent keeps the warp identity in the
+  // blend pass; sky+translucent (never in base1) becomes textured glass.
+  const t = s.translucent ?? 0;
+  if (t === 1 || t === 2) {
+    return { material: s.turbulent ? 'turbulent' : 'transparent', transparent: true };
+  }
   if (s.sky) return { material: 'sky', transparent: false };
   if (s.turbulent) return { material: 'turbulent', transparent: false };
-  const t = s.translucent ?? 0;
-  if (t === 1 || t === 2) return { material: 'transparent', transparent: true };
   return { material: 'opaque', transparent: false };
 }
 
@@ -258,9 +264,10 @@ export function buildFullWorldStore(
  * Build ordered world batches from (world, refs, atlas): opaque merged per
  * texId (order-free), then transparent in scene order with consecutive
  * same-texId runs merged (draw order preserved). Sky surfaces are collected
- * separately (flat fill, no texture). Turbulent surfaces ride the opaque
- * buckets with identical state — the water warp is deferred (PROOF-4/EXPAND
- * inventory), documented here, not silently dropped.
+ * separately (flat fill, no texture). Turbulent refs keep the warp identity
+ * in both buckets (opaque water warps in place; turbulent+translucent water
+ * warps in the blend pass with its TRANS33/66 alpha); the renderer applies
+ * the warp per draw from the material (GPU-FOLLOW-3).
  */
 export function buildTexturedWorldBatches(
   world: MiniWorld,

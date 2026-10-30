@@ -133,15 +133,18 @@ function clusterWorld(): MiniWorld {
   return w;
 }
 
-/** Two overlapping transparent surfaces on the +Y axis for order-flip checks. */
+/** Two overlapping translucent-water surfaces on the +Y axis for order-flip checks. */
 function glassWorld(): MiniWorld {
   const w = emptyWorld();
   w.leafs = [{ cluster: 0, firstSurf: 0, numSurfs: 0, faceList: [0, 1] }];
   w.pvs = [new Uint8Array([1])];
   w.clusterCount = 1;
   w.surfaces = [
-    wallSurf(0, [0, 60, 0], [0, -1, 0], { translucent: 1 }),
-    wallSurf(1, [0, 140, 0], [0, -1, 0], { translucent: 2 }),
+    // Turbulent + translucent (base1 water rule, GPU-FOLLOW-3): double-sided
+    // like the CPU (`!turbulent && !sky` culls), so both walls stay visible
+    // from either side and the blend order genuinely flips with the camera.
+    wallSurf(0, [0, 60, 0], [0, -1, 0], { translucent: 1, turbulent: true }),
+    wallSurf(1, [0, 140, 0], [0, -1, 0], { translucent: 2, turbulent: true }),
   ];
   w.textures = [{ texels: new Uint8Array(64).fill(3), width: 8, height: 8 }];
   return w;
@@ -411,15 +414,19 @@ describe.runIf(!!process.env.Q2_PAK)('FOLLOW-2 real base1 visibility (Q2_PAK)', 
     for (const id of [...spawnIds, ...turnedIds]) expect(fullIds.has(id)).toBe(true);
 
     // Occlusion semantic: every selected world surface re-passes an
-    // independent frustum check, and every opaque one faces the camera
-    // (front side visible). Sky/turbulent/translucent are exempt by rule.
+    // independent frustum check, and every single-sided one faces the camera
+    // (front side visible). Sky hulls and turbulent water are double-sided
+    // (CPU frame.ts: cull iff !turbulent && !sky); translucent glass IS
+    // culled from behind like opaque.
     for (const [view, sel] of [[spawnView, spawn], [turnView, turned]] as const) {
       const cam = setupCamera(view.origin, view.angles, view.fovX, W, H);
       for (const ref of sel.surfaces) {
         if (ref.transformIndex !== 0) continue;
         const s = world.surfaces[ref.surfaceId]!;
         expect(culledByFrustum(cam, s.mins, s.maxs), `surface ${ref.surfaceId} frustum`).toBe(false);
-        if (ref.material === 'opaque') {
+        // Single-sided (opaque + translucent glass) faces the camera;
+        // sky + turbulent water are double-sided and exempt.
+        if (ref.material === 'opaque' || ref.material === 'transparent') {
           const dx = view.origin[0]! - s.center[0]!;
           const dy = view.origin[1]! - s.center[1]!;
           const dz = view.origin[2]! - s.center[2]!;

@@ -46,8 +46,13 @@ import {
 } from '@q2/sw-renderer';
 import {
   orderDistance,
+  entityBlend,
   type GpuEntityModelKind,
 } from './scene.js';
+import {
+  SKY_BOX_CORNERS,
+  skyUvOnFace,
+} from '@q2/sw-renderer';
 
 /** World-space sprite size (matches the CPU SpriteDef 48x48). */
 export const GPU_SPRITE_SIZE = 48;
@@ -55,11 +60,55 @@ export const GPU_SPRITE_SIZE = 48;
 export const GPU_BEAM_WIDTH_PX = 1.5;
 
 /**
+ * Emit the view-centered skybox (GPU-FOLLOW-3, CPU emitSkyBox parity):
+ * 6 single-face quads around the view origin, one tile per box face, so
+ * span interpolation can never sweep UVs across tile boundaries (the
+ * black-lava streak the CPU avoids the same way). Each face samples its own
+ * strip tile (skyUvOnFace, the per-face form of the CPU box_vecs mapping);
+ * unlit fullbright white vertex colors (the bound strip texture carries the
+ * color); depth-tested as background (drawn first, no depth write — the
+ * caller owns depth state, like emitSpriteQuad/emitBeamQuad).
+ *
+ * Pure + view-locked: corners are origin + corner*half, directions are the
+ * corner offsets, so translating the origin translates the box with zero
+ * parallax (the CPU R_EmitSkyBox rule). UVs are NORMALIZED strip coords
+ * (u/tileW, v/stripH) to match the world-batch UV convention.
+ */
+export function emitSkyBoxFaces(
+  b: FlatBatch,
+  origin: Float32Array,
+  half: number,
+  tileW: number,
+  tileH: number,
+): void {
+  const ox = origin[0]!;
+  const oy = origin[1]!;
+  const oz = origin[2]!;
+  const stripH = tileH * 6;
+  const tmp = { u: 0, v: 0 };
+  for (let face = 0; face < 6; face++) {
+    const corners = SKY_BOX_CORNERS[face]!;
+    const base = b.pos.length / 3;
+    for (let c = 0; c < 4; c++) {
+      const dx = corners[c * 3]! * half;
+      const dy = corners[c * 3 + 1]! * half;
+      const dz = corners[c * 3 + 2]! * half;
+      skyUvOnFace(dx, dy, dz, face, tileW, tileH, tmp);
+      b.pos.push(ox + dx, oy + dy, oz + dz);
+      b.col.push(1, 1, 1, 1);
+      b.uv.push(tmp.u / tileW, tmp.v / stripH);
+    }
+    b.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  }
+}
+
+/**
  * Refresh the entity-ref tail of a scene. World refs (transformIndex 0)
  * are reused by reference; entity refs are rebuilt from (entities, view)
  * with the same classification the selector uses (kind from modelKinds,
- * transparent bit from alpha, order = camera distance, blend tail sorted
- * far->near). Returns the full surfaces array.
+ * blend membership from entityBlend — tracers always blend — order =
+ * camera distance, blend tail sorted far->near). Returns the full surfaces
+ * array.
  */
 export function updateGpuEntities(
   scene: GpuSceneInput,
@@ -82,7 +131,10 @@ export function updateGpuEntities(
     const e = entities[i]!;
     const k = modelKinds?.get(e.model);
     const material: GpuMaterialKind = k === 'sp2' ? 'sprite' : k === 'tracer' ? 'beam' : 'alias';
-    const isTransparent = (e.alpha ?? 1) < 1;
+    // Tracer beams always blend (entityBlend: the CPU draws entity tracers
+    // unconditionally in the foreground, so default-alpha beams need a real
+    // distance order key in the combined far->near sort, not order 0).
+    const isTransparent = entityBlend(e, k);
     // transformIndex 1+i matches the selector layout (identity + yaw-only
     // entity slots); the GPU renderer derives full-basis model matrices
     // from the entities instead of consuming these.

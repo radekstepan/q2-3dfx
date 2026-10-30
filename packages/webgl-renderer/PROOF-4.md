@@ -106,7 +106,13 @@ above GL); no HUD code runs here (ordering preserved, nothing to implement).
    deviation, preserved from PROOF-3).
 3. Fog: capability-gated table fog, scene contribution 0 in base1 (no haze);
    proven inert by default + proven live by the FORCED-fog fixture.
-4. Turbulence: water draws unwarped (warp deferred to EXPAND).
+4. ~~Turbulence: water draws unwarped (warp deferred to EXPAND).~~
+   DONE (GPU-FOLLOW-3): turbulent water warps per pixel in FS_LIT
+   (`uWarpOn` + `uTime`), closed-form mirror of the CPU turbTable rule
+   (wu = u + T[(v+phase)&1023], T = 16+15·sin, phase = ((time·64)|0)&1023
+   from the frame time). Opaque water and translucent water warp
+   identically; agreement with the real table is within half a texel
+   (table rounding + float precision — stated approximation).
 5. Skins cap: GPU resamples oversized skins (box) where the CPU helper is
    still dims-only — GPU closes the gap, CPU helper pending.
 6. Depth: GL pre-test depth (true policy); the CPU post-hoc banding helper
@@ -117,3 +123,34 @@ above GL); no HUD code runs here (ordering preserved, nothing to implement).
    (F1/F2 pin scenes: tracer over world + sprite + particle cloud + gun).
 8. No claim of hardware-accurate Voodoo3 emulation without a Voodoo3 capture
    oracle (contract §4).
+
+## 6. GPU-FOLLOW-3 material/behavior repairs (this card)
+
+1. TRANS-first classification (CPU frame.ts parity): translucency is checked
+   before sky/warp. Turbulent+translucent water (102 faces in base1) rides
+   the blend pass with TRANS33/66 alpha AND keeps the warp identity; plain
+   glass stays single-sided (culled from behind like the CPU:
+   `!turbulent && !sky`); sky hulls and water stay double-sided.
+   Sky+translucent (absent from base1) follows TRANS-first into the blend
+   pass as textured glass.
+2. Beams always blend: tracer entities ride the blended draw pass even at
+   default alpha 1, with a real camera-distance order key (the CPU draws
+   entity tracers unconditionally in the foreground; the blend with alpha 1
+   is color-preserving). Belt-and-braces fallback for unselected tracers is
+   retained and normally empty. The combined world+entity blend pass sorts
+   far->near per view: this DIFFERS from the CPU order (CPU draws deferred
+   world alpha first, then entities in entity order) — a stated
+   approximation; overlap is distance-correct instead of class-ordered.
+3. Textured sky: `registerSkyStrip` (CPU setSkyTexture parity — vertical
+   6-tile strip in suffix order, palette-indexed texels) feeds a
+   view-centered skybox (6 single-face quads around the camera origin,
+   per-face tiles via the CPU box_vecs mapping, fullbright mip-0,
+   depth-tested as background, no depth write). Without a strip the flat
+   fill remains (the CPU no-skyTex path). base1 needs `env/unit1_*.pcx`;
+   the play layer (not this package) resolves the worldspawn sky name and
+   packs the strip — lane B/C owns that wiring.
+4. Cvar gaps (explicit, in `appearance.ts GPU_CVAR_GAPS`): `r_translucency`
+   (=0 opaque fallback ignored — always blends), `sw_stipplealpha`
+   (screen-door ignored — always true-blends), `r_drawworld` (=0 hide
+   ignored), `sw_gamma` (not read — `vd_gamma` covers the role). Changing
+   any of these to honored behavior is a follow-up card, not a silent fix.

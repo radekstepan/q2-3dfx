@@ -23,6 +23,7 @@ export * from './gpu-proof.js';
 export * from './gpu-acceptance.js';
 export * from './gpu-follow-2a.js';
 export * from './gpu-scene-semantics.js';
+export * from './gpu-effects-semantics.js';
 
 export const GOLDEN_TOLERANCE_SOFTWARE = 0;
 export const GOLDEN_TOLERANCE_VOODOO_LSB = 1;
