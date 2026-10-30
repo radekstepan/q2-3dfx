@@ -97,6 +97,7 @@ import { MAX_GPU_LIGHTS } from '@q2/renderer-api';
 import {
   setupCamera,
   SKY_BOX_HALF,
+  SKY_SIDE_IMAGE,
   isValidSkySize,
   type Camera,
   type MiniWorld,
@@ -148,7 +149,7 @@ import {
 import {
   collectParticlePoints,
   emitBeamQuad,
-  emitSkyBoxFaces,
+  emitSkyBoxFace,
   emitSpriteQuad,
   emptyFlatBatch,
   resolveBeam,
@@ -313,11 +314,20 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
    * Packed sky strip (GPU-FOLLOW-3): vertical 6-tile strip in
    * SKY_TILE_SUFFIXES order (rt/bk/lf/ft/up/dn), registered by the play
    * layer from env/<skyname>*.pcx (base1: env/unit1_*.pcx). Null = flat
-   * fallback fill (the CPU no-skyTex path). The strip upload is lazy
-   * (first sky draw) and single-level (CPU mip-0 rule for skybox faces).
+   * fallback fill (the CPU no-skyTex path). Upload is lazy (first sky
+   * draw) and per-face single-level (CPU mip-0 rule for skybox faces):
+   * each of the 6 tiles uploads to its OWN face texture with CLAMP, so
+   * bilinear taps at face borders can never blend a neighbour face (the
+   * old single-strip texture with whole-strip CLAMP bled across internal
+   * tile borders). UVs are face-local (see entities.emitSkyBoxFace).
    */
   private skyStrip: { pixels: Uint8Array; tileW: number; tileH: number } | null = null;
-  private skyStripTex: WebGLTexture | null = null;
+  /** Per-face sky textures, indexed by TILE 0..5 in SKY_TILE_SUFFIXES
+   * (strip) order (lazy; null = not yet uploaded). Box face f binds tile
+   * SKY_SIDE_IMAGE[f] (id r_skysideimage), never tile f. */
+  private skyFaceTex: Array<WebGLTexture | null> = [null, null, null, null, null, null];
+  /** Last sky-pass mode (test hook: proves the window-background repair). */
+  private lastSky: { mode: 'textured-box' | 'flat-hull' | 'none'; refs: number } | null = null;
   private atlasTex: WebGLTexture | null = null;
   private atlas: LightAtlas | null = null;
   private styleSig = 0;
@@ -477,16 +487,28 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       return false;
     }
     this.skyStrip = { pixels: texels.slice(), tileW, tileH };
-    // FOLLOW-4: delete the obsolete same-context strip texture before
-    // dropping it; the next sky draw re-uploads exactly once.
-    this.freeTexture(this.skyStripTex);
-    this.skyStripTex = null;
+    // FOLLOW-4: delete obsolete same-context face textures before dropping
+    // them; the next sky draw re-uploads each face exactly once.
+    for (let f = 0; f < 6; f++) {
+      this.freeTexture(this.skyFaceTex[f]);
+      this.skyFaceTex[f] = null;
+    }
     return true;
   }
 
   /** Registered sky strip dims (test hook; null when no strip registered). */
   testSkyStrip(): { tileW: number; tileH: number } | null {
     return this.skyStrip ? { tileW: this.skyStrip.tileW, tileH: this.skyStrip.tileH } : null;
+  }
+
+  /** Per-face upload state (test hook: 6 entries, true = GL texture live). */
+  testSkyFaces(): boolean[] {
+    return this.skyFaceTex.map((t) => t !== null);
+  }
+
+  /** Last sky-pass mode (test hook; null before the first scene draw). */
+  testLastSky(): { mode: 'textured-box' | 'flat-hull' | 'none'; refs: number } | null {
+    return this.lastSky ? { ...this.lastSky } : null;
   }
 
   /**
@@ -498,9 +520,12 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
    * intentional fallback.
    */
   clearSkyStrip(): void {
-    this.freeTexture(this.skyStripTex);
-    this.skyStripTex = null;
+    for (let f = 0; f < 6; f++) {
+      this.freeTexture(this.skyFaceTex[f]);
+      this.skyFaceTex[f] = null;
+    }
     this.skyStrip = null;
+    this.lastSky = null;
   }
 
   /** Register skin texels (palette indices) for an entity skin handle. */
@@ -912,7 +937,8 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.skyColBuf = null;
     this.skyIdxBuf = null;
     this.skyRanges = new Map();
-    this.skyStripTex = null;
+    this.skyFaceTex = [null, null, null, null, null, null];
+    this.lastSky = null;
     this.atlasTex = null;
     this.atlas = null;
     this.diffuseTex = new Map();
@@ -949,7 +975,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     for (const handle of [...this.modelGL.keys()]) this.freeModelGL(handle);
     this.freeTexture(this.whiteTex);
     this.freeTexture(this.atlasTex);
-    this.freeTexture(this.skyStripTex);
+    for (let f = 0; f < 6; f++) this.freeTexture(this.skyFaceTex[f]);
     this.freeBuffer(this.worldPosBuf);
     this.freeBuffer(this.worldUVBuf);
     this.freeBuffer(this.worldLUVBuf);
@@ -1395,25 +1421,29 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   }
 
   /**
-   * Sky strip texture (lazy, single-level, palette-expanded at upload like
-   * skinFor). One mip level only: the CPU skybox path samples mip 0 with no
-   * lightmap, so uMaxLevel clamps to 0 and the mip-dither pick can never
-   * leave level 0. CLAMP addressing: the per-face UVs are clamped in-tile
-   * by skyUvOnFace, so no tile bleeds. Null without a strip or palette
-   * (caller falls back to the flat fill).
+   * One sky face texture (lazy, single-level, palette-expanded at upload
+   * like skinFor). One mip level only: the CPU skybox path samples mip 0
+   * with no lightmap, so uMaxLevel clamps to 0 and the mip-dither pick can
+   * never leave level 0. Per-face CLAMP addressing: combined with
+   * face-local half-texel-inset UVs (entities.emitSkyBoxFace), the bilinear
+   * footprint stays inside this face — neighbour tiles are separate GL
+   * textures and unreachable. Null without a strip or palette (caller
+   * falls back to the flat fill).
    */
-  private skyStripFor(gl: WebGL2RenderingContext): WebGLTexture | null {
-    if (this.skyStripTex) return this.skyStripTex;
+  private skyFaceFor(gl: WebGL2RenderingContext, tile: number): WebGLTexture | null {
+    if (this.skyFaceTex[tile]) return this.skyFaceTex[tile];
     const strip = this.skyStrip;
     const palette = this.palette;
     if (!strip || !palette) return null;
-    const rgb = expandPaletteTexture(strip.pixels, strip.tileW, strip.tileH * 6, palette);
+    const { tileW, tileH } = strip;
+    const slice = strip.pixels.subarray(tile * tileW * tileH, (tile + 1) * tileW * tileH);
+    const rgb = expandPaletteTexture(slice, tileW, tileH, palette);
     if (!rgb) {
-      this.warn('sky strip texel mismatch (flat sky fallback)');
+      this.warn(`sky face ${tile} texel mismatch (flat sky fallback)`);
       return null;
     }
-    const tex = this.uploadTextureLevels(gl, rgb, strip.tileW, strip.tileH * 6, false, 'clamp');
-    this.skyStripTex = tex;
+    const tex = this.uploadTextureLevels(gl, rgb, tileW, tileH, false, 'clamp');
+    this.skyFaceTex[tile] = tex;
     return tex;
   }
 
@@ -1525,21 +1555,42 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       if (flat.uTextured) gl.uniform1i(flat.uTextured, 0);
       gl.depthMask(false);
       this.noteGlErrorAt(gl, 'drawScene-sky-setup');
-      const hasSky = scene.surfaces.some((r) => r.material === 'sky' && r.transformIndex === 0);
-      const strip = hasSky ? this.skyStripFor(gl) : null;
-      if (strip && this.skyStrip) {
-        // Textured skybox (GPU-FOLLOW-3, CPU emitSkyBox parity): one
-        // view-centered box (single-face quads, own tiles, fullbright) no
-        // matter how many sky surfaces are visible — the hull ranges are
-        // skipped, exactly like the CPU discarding SURF_SKY polys.
-        const box = emptyFlatBatch();
-        emitSkyBoxFaces(box, cam.origin, SKY_BOX_HALF, this.skyStrip.tileW, this.skyStrip.tileH);
-        this.drawFlatBatch(gl, VP, box, strip);
+      const skyRefs = scene.surfaces.filter((r) => r.material === 'sky' && r.transformIndex === 0).length;
+      // FOLLOW-3A window repair: the textured background box draws whenever
+      // a strip is retained — NOT gated on selected sky refs. The old
+      // hasSky gate left windows black when PVS/frustum selection carried
+      // zero sky refs even though exterior sky was visible through glass;
+      // the box is depth-tested background (far plane, no depth write), so
+      // opaque walls still occlude it and glass still blends over it.
+      if (this.skyStrip) {
+        const faces: Array<WebGLTexture | null> = [];
+        for (let f = 0; f < 6; f++) faces.push(this.skyFaceFor(gl, f));
+        if (faces.every((t) => t !== null)) {
+          // Textured skybox (CPU emitSkyBox parity): six view-centered
+          // single-face quads, each with its own face texture (fullbright);
+          // the hull ranges are skipped, like the CPU discarding SURF_SKY.
+          // Box face f samples tile SKY_SIDE_IMAGE[f] (id r_skysideimage:
+          // face->suffix table), NOT tile f — the strip is packed in
+          // filename suffix order [rt,bk,lf,ft,up,dn].
+          for (let f = 0; f < 6; f++) {
+            const box = emptyFlatBatch();
+            emitSkyBoxFace(box, cam.origin, SKY_BOX_HALF, f, this.skyStrip.tileW, this.skyStrip.tileH);
+            this.drawFlatBatch(gl, VP, box, faces[SKY_SIDE_IMAGE[f]!]!);
+          }
+          this.lastSky = { mode: 'textured-box', refs: skyRefs };
+        } else {
+          for (const ref of scene.surfaces) {
+            if (ref.material !== 'sky' || ref.transformIndex !== 0) continue;
+            this.drawSkyRange(gl, ref.surfaceId);
+          }
+          this.lastSky = { mode: 'flat-hull', refs: skyRefs };
+        }
       } else {
         for (const ref of scene.surfaces) {
           if (ref.material !== 'sky' || ref.transformIndex !== 0) continue;
           this.drawSkyRange(gl, ref.surfaceId);
         }
+        this.lastSky = { mode: scene.surfaces.some((r) => r.material === 'sky' && r.transformIndex === 0) ? 'flat-hull' : 'none', refs: skyRefs };
       }
       gl.depthMask(true);
     }

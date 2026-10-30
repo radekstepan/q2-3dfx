@@ -111,23 +111,35 @@ export function skyBackendViolations(backend: SkyBackendView, expected: SkyStrip
 }
 
 /**
- * Validate stub-GL draw evidence for a sky-facing view: the textured path
- * must draw the single view-centered 36-index box with `uTextured 1`; the
- * flat fallback (no strip) must NOT draw that box. `calls` is the stub-GL
- * call log (e.g. `drawElements TRIANGLES 36 @0`, `uniform1i uTextured 1`).
+ * Validate stub-GL draw evidence for a sky-facing view (FOLLOW-3A repair):
+ * the textured path draws SIX per-face 6-index boxes (one draw per face,
+ * each with its own face texture) with `uTextured 1`; the flat fallback
+ * (no strip) must NOT draw textured boxes. `calls` is the stub-GL call log
+ * (e.g. `drawElements TRIANGLES 6 @0`, `uniform1i uTextured 1`).
+ *
+ * History: the old single-strip path drew one 36-index box; per-face
+ * isolation (the border repair) draws six 6-index faces instead. A lone
+ * 36-index draw is now a violation on the textured leg (stale path).
  */
 export function skyDrawViolations(calls: string[], expectTextured: boolean): string[] {
   const out: string[] = [];
-  const hasBox = calls.includes('drawElements TRIANGLES 36 @0');
+  const faceDraws = calls.filter((c) => c === 'drawElements TRIANGLES 6 @0').length;
+  const boxDraws = calls.filter((c) => c === 'drawElements TRIANGLES 36 @0').length;
   const hasTextured = calls.includes('uniform1i uTextured 1');
   if (expectTextured) {
-    if (!hasBox) out.push('missing textured skybox draw (drawElements TRIANGLES 36 @0)');
+    if (boxDraws > 0) out.push('stale single-strip skybox draw (drawElements TRIANGLES 36 @0; want six per-face 6-index draws)');
+    if (faceDraws < 6) out.push(`missing per-face textured skybox draws (want 6x drawElements TRIANGLES 6 @0, got ${faceDraws})`);
     if (!hasTextured) out.push('missing textured skybox sampler (uniform1i uTextured 1)');
     if (calls.filter((c) => c.startsWith('drawElements')).length === 0) {
       out.push('no draws at all (page would be black/clear-only)');
     }
-  } else {
-    if (hasBox) out.push('unexpected textured skybox draw on the flat-fallback leg');
+  } else if (faceDraws > 0 && hasTextured) {
+    // A flat hull range can coincidentally be 6 indices at offset 0, so a
+    // bare 6-index draw is not proof of texturing — only a 6-index draw
+    // with the textured sampler set is.
+    out.push('unexpected textured skybox draw on the flat-fallback leg');
+  } else if (boxDraws > 0) {
+    out.push('unexpected stale strip skybox draw on the flat-fallback leg');
   }
   return out;
 }

@@ -19,7 +19,6 @@ import { parsePCX, parseWAL } from '@q2/formats';
 import {
   bspToMiniWorld,
   buildTurbTable,
-  SKY_SIDE_IMAGE,
   SKY_TILE_SUFFIXES,
   translucencyModeFromCvars,
   type BspTexelSource,
@@ -48,7 +47,7 @@ import {
   warpUv,
 } from './appearance.js';
 import { FS_LIT } from './shaders.js';
-import { emitSkyBoxFaces, emptyFlatBatch, updateGpuEntities } from './entities.js';
+import { emitSkyBoxFace, emitSkyBoxFaces, emptyFlatBatch, updateGpuEntities } from './entities.js';
 import { WebGLRenderer } from './renderer.js';
 import { stubGLFull } from './proof3.test.js';
 
@@ -299,24 +298,25 @@ describe('FOLLOW-3 warp mirror (pure)', () => {
 });
 
 describe('FOLLOW-3 skybox emitter (pure)', () => {
-  it('emits 6 single-face quads with per-face tiles and normalized UVs', () => {
+  it('emits 6 single-face quads with face-local half-texel UVs', () => {
     const b = emptyFlatBatch();
     emitSkyBoxFaces(b, new Float32Array([100, 200, 300]), 16384, 256, 256);
     expect(b.pos.length).toBe(24 * 3);
     expect(b.col.length).toBe(24 * 4);
     expect(b.uv.length).toBe(24 * 2);
     expect(b.idx.length).toBe(36);
-    // Every face samples its own strip tile (SKY_SIDE_IMAGE), in-tile.
+    // FOLLOW-3A repair: every face samples its OWN face texture with
+    // face-local UVs (0..1, half-texel inset) — never packed-strip coords.
+    // Neighbor tiles are separate GL textures and unreachable.
     for (let face = 0; face < 6; face++) {
       for (let c = 0; c < 4; c++) {
         const v = face * 4 + c;
         const u = b.uv[v * 2]!;
         const vv = b.uv[v * 2 + 1]!;
-        expect(u).toBeGreaterThanOrEqual(0);
-        expect(u).toBeLessThan(1);
-        const tile = vv * 6;
-        expect(tile).toBeGreaterThanOrEqual(SKY_SIDE_IMAGE[face]!);
-        expect(tile).toBeLessThan(SKY_SIDE_IMAGE[face]! + 1);
+        expect(u).toBeGreaterThanOrEqual(0.5 / 256);
+        expect(u).toBeLessThanOrEqual(1 - 0.5 / 256);
+        expect(vv).toBeGreaterThanOrEqual(0.5 / 256);
+        expect(vv).toBeLessThanOrEqual(1 - 0.5 / 256);
       }
       // Fullbright white, opaque.
       for (let c = 0; c < 4; c++) {
@@ -438,7 +438,7 @@ describe('FOLLOW-3 draw paths (stub GL)', () => {
     expect(blendDraws.length).toBe(1); // exactly the beam quad (2 tris)
   });
 
-  it('textured skybox draws one 36-index box with a strip; fallback draws hulls', () => {
+  it('textured skybox draws six per-face 6-index boxes with face-local isolation; fallback draws hulls', () => {
     const mkWorld = (): MiniWorld => {
       const w = emptyWorld();
       w.leafs = [{ cluster: 0, firstSurf: 0, numSurfs: 0, faceList: [0] }];
@@ -477,11 +477,73 @@ describe('FOLLOW-3 draw paths (stub GL)', () => {
       expect(r.testWarnings().some((w) => w.includes('registerSkyStrip'))).toBe(true);
     }
     const boxed = wire(true);
-    expect(boxed).toContain('drawElements TRIANGLES 36 @0'); // 6 faces x 2 tris
+    // FOLLOW-3A repair: six per-face 6-index draws (isolated face textures),
+    // never the old single 36-index strip box.
+    expect(boxed.filter((c) => c === 'drawElements TRIANGLES 6 @0').length).toBeGreaterThanOrEqual(6);
+    expect(boxed).not.toContain('drawElements TRIANGLES 36 @0');
     expect(boxed).toContain('uniform1i uTextured 1');
     const flat = wire(false);
+    expect(flat.filter((c) => c === 'drawElements TRIANGLES 6 @0').length).toBeLessThan(6);
     expect(flat).not.toContain('drawElements TRIANGLES 36 @0');
     expect(flat.filter((c) => c.startsWith('drawElements')).length).toBeGreaterThan(0);
+  });
+
+  it('textured background box draws with zero selected sky refs (window repair)', () => {
+    const state = stubGLFull();
+    const r = new WebGLRenderer();
+    r.init(state.gl, 64, 48);
+    const w = emptyWorld();
+    w.leafs = [{ cluster: 0, firstSurf: 0, numSurfs: 0, faceList: [0] }];
+    w.pvs = [new Uint8Array([1])];
+    w.clusterCount = 1;
+    // Opaque wall only: no sky in the selection (the old hasSky gate drew
+    // nothing here, leaving windows black).
+    w.surfaces = [quadSurf(0, [0, 100, 60], [0, -1, 0], {})];
+    w.textures = [{ texels: new Uint8Array(64).fill(3), width: 8, height: 8 }];
+    w.lightmaps = [];
+    r.attachWorld(w);
+    r.setPalette(rampPalette());
+    expect(r.registerSkyStrip(new Uint8Array(8 * 48).fill(7), 8, 8)).toBe(true);
+    const scene = selectGpuScene(w, [], refDef([0, 0, 0], 90), 64, 48);
+    expect(scene.surfaces.some((s) => s.material === 'sky')).toBe(false);
+    r.setScene(scene);
+    r.setEntities([], undefined);
+    r.renderFrame({ view: refDef([0, 0, 0], 90), scene, time: 0 });
+    // Background box still draws (depth-tested background; the opaque wall
+    // overwrites it where it covers).
+    expect(state.calls.filter((c) => c === 'drawElements TRIANGLES 6 @0').length).toBeGreaterThanOrEqual(6);
+    expect(state.calls).toContain('uniform1i uTextured 1');
+    expect(r.testLastSky()).toEqual({ mode: 'textured-box', refs: 0 });
+    // And the opaque wall still draws on top (occlusion preserved).
+    expect(state.calls.filter((c) => c.startsWith('drawElements')).length).toBeGreaterThan(6);
+  });
+
+  it('sky face UVs stay half-texel inside their own face (no neighbour bleed)', () => {
+    const origin = new Float32Array([0, 0, 0]);
+    for (let face = 0; face < 6; face++) {
+      const b = emptyFlatBatch();
+      emitSkyBoxFace(b, origin, 16384, face, 8, 8);
+      expect(b.uv.length).toBe(8); // 4 verts x 2
+      expect(b.idx).toEqual([0, 1, 2, 0, 2, 3]);
+      for (let i = 0; i < 4; i++) {
+        const u = b.uv[i * 2]!;
+        const v = b.uv[i * 2 + 1]!;
+        // Face-local 0..1, half-texel inset for 8px tiles.
+        expect(u).toBeGreaterThanOrEqual(0.5 / 8);
+        expect(u).toBeLessThanOrEqual(1 - 0.5 / 8);
+        expect(v).toBeGreaterThanOrEqual(0.5 / 8);
+        expect(v).toBeLessThanOrEqual(1 - 0.5 / 8);
+      }
+    }
+    // Full box = 6 isolated faces (36 indices, 48 UVs, all in 0..1).
+    const all = emptyFlatBatch();
+    emitSkyBoxFaces(all, origin, 16384, 8, 8);
+    expect(all.idx.length).toBe(36);
+    expect(all.uv.length).toBe(48);
+    for (const uv of all.uv) {
+      expect(uv).toBeGreaterThanOrEqual(0.5 / 8);
+      expect(uv).toBeLessThanOrEqual(1 - 0.5 / 8);
+    }
   });
 });
 
@@ -660,8 +722,9 @@ describe.runIf(!!process.env.Q2_PAK)('FOLLOW-3 on real base1 (Q2_PAK)', () => {
     r.setScene(scene);
     r.setEntities(entities, kinds);
     r.renderFrame({ view, scene, time: 1.5 });
-    // The view-centered box (6 faces x 2 tris) draws textured in the sky pass.
-    expect(state.calls).toContain('drawElements TRIANGLES 36 @0');
+    // The view-centered box (6 isolated per-face draws x 2 tris) is textured.
+    expect(state.calls.filter((c) => c === 'drawElements TRIANGLES 6 @0').length).toBeGreaterThanOrEqual(6);
+    expect(state.calls).not.toContain('drawElements TRIANGLES 36 @0');
     expect(state.calls).toContain('uniform1i uTextured 1');
     // No upload GL errors on the supported route (real WALs + real skins absent
     // here ride white-fallback warnings, never silent origin reads).

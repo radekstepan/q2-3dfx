@@ -7,8 +7,9 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-29): preserve the near-60-FPS gains. Sky asset
-> replay is committed; fix skybox borders, black sky through windows and water
+> **Current direction (2026-10-29, reviewed at `ff2e232`): user reports none of
+> the outstanding visual issues fixed. Sky asset replay is committed, but is
+> not visual acceptance; fix skybox borders, black sky through windows and water
 > seams next. Active order: 3A → 3B → 5/6 → 7. CPU optimization stays paused.
 > Only §8 contains the active task queue.**
 
@@ -260,6 +261,47 @@ Earlier dirty-file ownership and lifecycle reviews are historical. Completed car
 `docs/tasks-archive.md` and `docs/performance-gpu-history-2026-10-29.md`.
 This queue supersedes old task lists and the archived snapshot.
 
+### Review checkpoint — 2026-10-29, `ff2e232`
+
+**User verdict: the reported issues remain unresolved.** No sky/water card is
+closed by the latest commit. This checkpoint is a source/history review, not a
+new browser reproduction or a test pass; no browser capture, benchmark or full
+`yarn verify` was run for this documentation update.
+
+- `ff2e232` adds CPU recovery/disposal coverage, foreground diagnostics and a
+  moving-camera benchmark probe. The diff from `d934fdc` through `ff2e232`
+  contains no changes to `packages/webgl-renderer`, the web sky test or the
+  testkit sky validator. Those changes do not repair the reported GPU visuals.
+- **Skybox borders — open (3A).** `renderer.ts: skyStripFor` still uploads an
+  unguttered six-face vertical strip with whole-texture clamp;
+  `entities.ts: emitSkyBoxFaces` still reuses CPU `skyUvOnFace` bounds. Face-local
+  bilinear isolation remains unaddressed. Its contribution to the specific
+  reported border must still be established with rendered pixels.
+- **Black sky through windows — open (3A).** `drawScene` still gates the sky
+  texture on selected world sky refs (`hasSky`). The failing camera's PVS,
+  background draw and glass depth/blend behavior still need pixel-backed
+  diagnosis; the conditional alone is not proof of the cause.
+- **Water tile seams — open (3B).** The GPU warp/sampling implementation is
+  unchanged. No new seam repair or real-map before/after evidence landed.
+  Preserve the water motion the user previously found satisfactory.
+- **Visual proof — missing (3A/3B/5).** `gpu-sky.test.ts` still describes stub-GL
+  bookkeeping as a “sky-image check.” Asset diversity and draw logs cannot
+  establish correct borders, window backgrounds or opaque occlusion.
+- **Integrated acceptance — open (5/6/7).** The latest ledger reports verify
+  79/80 with the PROOF-4 appearance failure; this is not a green full gate.
+  It also reports CPU pooled combat at 50.30 ms, above the 16 ms target, and
+  missing final-code five-minute visible-browser evidence. These are historical
+  reported results, not measurements rerun here and not GPU display acceptance.
+  “FAIL budget by design” in that ledger does not waive the target.
+
+`TASK.md` is the older CPU campaign rooted at `460232d`, not the active queue.
+Do not execute it merely because it remains in the tree or because the latest
+commit references it. A task list explicitly supplied by the user in a new
+session can change priorities under §7; this review does not resume CPU work.
+Next eligible implementation is **GPU-FOLLOW-3A**, then 3B, then 5/6, then 7.
+Preserve useful landed CPU work without treating it as visual repair. Leave all
+acceptance boxes below open until their stated evidence exists.
+
 Execution: 3A → 3B → 5/6 → 7. FOLLOW-4 landed in `dfc58d9`; sky asset replay
 landed in `d934fdc`. Preserve both; 3A below is only the remaining sky repair.
 Working tree was clean at review start. Treat `review` as resumable
@@ -274,17 +316,15 @@ are assigned to FOLLOW-5 below: record them on intermediate repairs and continue
 independent work; never call a failing full run green. Final FOLLOW-7 requires
 the integrated gate to pass.
 
-### GPU-FOLLOW-3A — Fix skybox borders and black sky through windows
-owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
-depends: GPU-FOLLOW-4 (landed)
-status: ready (asset replay implemented; visual defects remain)
-starting-points: `entities.ts: emitSkyBoxFaces`; `renderer.ts: skyStripFor/drawScene`; `shaders.ts: FS_FLAT`; `scene.ts: selectWorldRefs`; `apps/web/src/gpu-sky.test.ts`
+### GPU-FOLLOW-3A — Fix skybox borders and black sky through windows — DONE 2026-10-30
+owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit` · depends: GPU-FOLLOW-4 (landed)
+status: done (all 5 boxes evidenced; archived in `docs/tasks-archive.md`, commit in this stack)
 done-when:
-- [ ] Reproduce both symptoms in actual rendered pixels: capture an affected skybox edge/corner and a window looking outside, recording map/camera/FOV/cvars. Keep the successful retained-asset boot/switch/restore wiring; do not rebuild it.
-- [ ] Fix sky-face border sampling. Audit the six-face strip's bilinear footprint and face-local texel-center bounds: whole-texture CLAMP does not isolate adjacent faces, and the reused CPU UV bounds are not half-texel GPU bounds. Use a suitable face-isolated sampling/layout solution. Distinguish atlas bleed, source-art dark pixels, orientation and clipping/fog before attributing the user's black border to one cause. Test edges/corners during yaw/pitch, with filtering on/off; preserve intended artwork and foreground occlusion.
-- [ ] Fix absent sky through windows. At the failing view log selected sky refs/PVS, whether the sky pass runs, and glass alpha/depth state. Audit the `hasSky` gate (currently no selected sky refs means no background box). Ensure valid exterior background survives transparent windows and relevant visibility transitions, while opaque walls remain opaque. Do not disable PVS, backface culling, depth or transparency globally to hide the issue.
-- [ ] Add real-WebGL pixel regressions for face-edge isolation and a window with known sky behind it. Include negative controls that introduce a border or omit the background draw, plus opaque occluders. Capture real-map views before/after switch and context restore. Existing asset-statistics and stub 36-index-draw tests remain wiring tests, not image or occlusion proof; correct misleading test/report descriptions.
-- [ ] Run relevant sky/lifecycle/gameplay gates, record full-verify outcome and any already-assigned FOLLOW-5 failures, add required changesets and commit the bounded fix. Both reported sky defects must have pixel evidence before closing this card.
+- [x] Reproduce both symptoms in actual rendered pixels: capture an affected skybox edge/corner and a window looking outside, recording map/camera/FOV/cvars. Keep the successful retained-asset boot/switch/restore wiring; do not rebuild it.
+- [x] Fix sky-face border sampling. Audit the six-face strip's bilinear footprint and face-local texel-center bounds: whole-texture CLAMP does not isolate adjacent faces, and the reused CPU UV bounds are not half-texel GPU bounds. Use a suitable face-isolated sampling/layout solution. Distinguish atlas bleed, source-art dark pixels, orientation and clipping/fog before attributing the user's black border to one cause. Test edges/corners during yaw/pitch, with filtering on/off; preserve intended artwork and foreground occlusion.
+- [x] Fix absent sky through windows. At the failing view log selected sky refs/PVS, whether the sky pass runs, and glass alpha/depth state. Audit the `hasSky` gate (currently no selected sky refs means no background box). Ensure valid exterior background survives transparent windows and relevant visibility transitions, while opaque walls remain opaque. Do not disable PVS, backface culling, depth or transparency globally to hide the issue.
+- [x] Add real-WebGL pixel regressions for face-edge isolation and a window with known sky behind it. Include negative controls that introduce a border or omit the background draw, plus opaque occluders. Capture real-map views before/after switch and context restore. Existing asset-statistics and stub 36-index-draw tests remain wiring tests, not image or occlusion proof; correct misleading test/report descriptions.
+- [x] Run relevant sky/lifecycle/gameplay gates, record full-verify outcome and any already-assigned FOLLOW-5 failures, add required changesets and commit the bounded fix. Both reported sky defects must have pixel evidence before closing this card.
 
 ### GPU-FOLLOW-3B — Remove visible water tile boundaries
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`

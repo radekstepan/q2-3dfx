@@ -51,6 +51,7 @@ import {
 } from './scene.js';
 import {
   SKY_BOX_CORNERS,
+  SKY_SIDE_IMAGE,
   skyUvOnFace,
 } from '@q2/sw-renderer';
 
@@ -60,19 +61,22 @@ export const GPU_SPRITE_SIZE = 48;
 export const GPU_BEAM_WIDTH_PX = 1.5;
 
 /**
- * Emit the view-centered skybox (GPU-FOLLOW-3, CPU emitSkyBox parity):
+ * Emit the view-centered skybox (GPU-FOLLOW-3A repair, CPU emitSkyBox parity):
  * 6 single-face quads around the view origin, one tile per box face, so
  * span interpolation can never sweep UVs across tile boundaries (the
  * black-lava streak the CPU avoids the same way). Each face samples its own
- * strip tile (skyUvOnFace, the per-face form of the CPU box_vecs mapping);
- * unlit fullbright white vertex colors (the bound strip texture carries the
+ * uploaded face texture with FACE-LOCAL normalized UVs (0..1 over that
+ * face's tile, half-texel inset to texel centers) — never the packed-strip
+ * coordinates. The old strip layout (six tiles stacked vertically with
+ * whole-texture CLAMP) let bilinear taps at internal tile borders blend the
+ * neighbour face; per-face textures with CLAMP isolate every edge.
+ * Unlit fullbright white vertex colors (the bound face texture carries the
  * color); depth-tested as background (drawn first, no depth write — the
  * caller owns depth state, like emitSpriteQuad/emitBeamQuad).
  *
  * Pure + view-locked: corners are origin + corner*half, directions are the
  * corner offsets, so translating the origin translates the box with zero
- * parallax (the CPU R_EmitSkyBox rule). UVs are NORMALIZED strip coords
- * (u/tileW, v/stripH) to match the world-batch UV convention.
+ * parallax (the CPU R_EmitSkyBox rule).
  */
 export function emitSkyBoxFaces(
   b: FlatBatch,
@@ -81,25 +85,62 @@ export function emitSkyBoxFaces(
   tileW: number,
   tileH: number,
 ): void {
+  for (let face = 0; face < 6; face++) {
+    emitSkyBoxFace(b, origin, half, face, tileW, tileH);
+  }
+}
+
+/**
+ * Emit ONE skybox face with face-local UVs (GPU-FOLLOW-3A border repair).
+ * UVs are normalized over the single face tile (0..1) clamped to texel
+ * centers ([0.5/tile, 1-0.5/tile]): with per-face CLAMP textures the
+ * bilinear footprint can never reach a neighbour face. The projection is
+ * still the per-face form of the CPU box_vecs mapping (skyUvOnFace), only
+ * re-expressed in face-local space.
+ */
+export function emitSkyBoxFace(
+  b: FlatBatch,
+  origin: Float32Array,
+  half: number,
+  face: number,
+  tileW: number,
+  tileH: number,
+): void {
   const ox = origin[0]!;
   const oy = origin[1]!;
   const oz = origin[2]!;
-  const stripH = tileH * 6;
+  const tileOff = SKY_SIDE_IMAGE[face]! * tileH;
   const tmp = { u: 0, v: 0 };
-  for (let face = 0; face < 6; face++) {
-    const corners = SKY_BOX_CORNERS[face]!;
-    const base = b.pos.length / 3;
-    for (let c = 0; c < 4; c++) {
-      const dx = corners[c * 3]! * half;
-      const dy = corners[c * 3 + 1]! * half;
-      const dz = corners[c * 3 + 2]! * half;
-      skyUvOnFace(dx, dy, dz, face, tileW, tileH, tmp);
-      b.pos.push(ox + dx, oy + dy, oz + dz);
-      b.col.push(1, 1, 1, 1);
-      b.uv.push(tmp.u / tileW, tmp.v / stripH);
-    }
-    b.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+  const corners = SKY_BOX_CORNERS[face]!;
+  const base = b.pos.length / 3;
+  const invW = 1 / tileW;
+  const invH = 1 / tileH;
+  const loU = 0.5 * invW;
+  const hiU = 1 - 0.5 * invW;
+  const loV = 0.5 * invH;
+  const hiV = 1 - 0.5 * invH;
+  for (let c = 0; c < 4; c++) {
+    const dx = corners[c * 3]! * half;
+    const dy = corners[c * 3 + 1]! * half;
+    const dz = corners[c * 3 + 2]! * half;
+    skyUvOnFace(dx, dy, dz, face, tileW, tileH, tmp);
+    // Strip -> tile-local texel, then clamp to texel centers so the
+    // bilinear footprint stays inside this face (half-texel GPU rule;
+    // the CPU affine sampler masks instead and is untouched).
+    let tu = tmp.u;
+    let tv = tmp.v - tileOff;
+    if (!(tu >= 0.5)) tu = 0.5;
+    else if (!(tu <= tileW - 0.5)) tu = tileW - 0.5;
+    if (!(tv >= 0.5)) tv = 0.5;
+    else if (!(tv <= tileH - 0.5)) tv = tileH - 0.5;
+    b.pos.push(ox + dx, oy + dy, oz + dz);
+    b.col.push(1, 1, 1, 1);
+    b.uv.push(
+      Math.min(Math.max((tu * invW), loU), hiU),
+      Math.min(Math.max((tv * invH), loV), hiV),
+    );
   }
+  b.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
 }
 
 /**

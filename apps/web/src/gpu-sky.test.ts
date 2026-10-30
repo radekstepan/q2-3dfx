@@ -3,8 +3,14 @@
 // Proves the map sky leaves the pak and reaches the GPU on cold boot,
 // CPU→GPU selection and context restore — with per-face dims (never the
 // strip total) — and that a deliberately omitted registration fails the
-// sky-image check even though the page stays nonblack/colorful. Headless:
+// sky WIRING check even though the page stays nonblack/colorful. Headless:
 // stub DOM/GL (recording); real-pak legs are Q2_PAK-gated.
+//
+// NOTE (FOLLOW-3A repair): these are wiring/bookkeeping checks (asset
+// diversity, backend dims, sky refs, stub draw logs), NOT rendered-pixel
+// image proof. Border isolation and window backgrounds are proven by
+// real-WebGL pixel regressions (webgl-renderer FOLLOW-3A legs + the
+// browser pixel capture below), not by these draw counts.
 import { describe, expect, it, afterEach, vi } from 'vitest';
 import { resetCVars, setCVar } from '@q2/config';
 import { selectGpuScene } from '@q2/webgl-renderer';
@@ -329,7 +335,7 @@ describe.runIf(!!WEB_Q2_PAK)('GPU-FOLLOW-3A production sky replay (Q2_PAK)', () 
     // Deliberately omit the replay: clear the strip (the flat fallback).
     boot.gpu!.gpu.clearSkyStrip();
     expect(boot.gpu!.gpu.testSkyStrip()).toBeNull();
-    // The sky-image check now fails — even though the page still draws
+    // The sky wiring check now fails — even though the page still draws
     // (nonblack: hull sky + opaque world draws remain).
     expect(skyBackendViolations(boot.gpu!.gpu, boot.sky!).length).toBeGreaterThan(0);
     renderSkyView(boot, doc.drawLog);

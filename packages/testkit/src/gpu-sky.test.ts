@@ -30,9 +30,18 @@ describe('gpu-sky validators', () => {
     expect(skyBackendViolations(backend, expected).join('\n')).toMatch(/total-height/);
   });
 
-  it('textured draws require the 36-index box; fallback legs must not draw it', () => {
-    expect(skyDrawViolations(['drawElements TRIANGLES 36 @0', 'uniform1i uTextured 1'], true)).toEqual([]);
+  it('textured draws require six per-face 6-index boxes; fallback legs must not draw them', () => {
+    const textured = [
+      ...Array(6).fill('drawElements TRIANGLES 6 @0'),
+      'uniform1i uTextured 1',
+    ];
+    expect(skyDrawViolations(textured, true)).toEqual([]);
+    expect(skyDrawViolations(['drawElements TRIANGLES 36 @0', 'uniform1i uTextured 1'], true).length).toBeGreaterThan(0);
     expect(skyDrawViolations(['drawElements TRIANGLES 10 @0'], true).length).toBeGreaterThan(0);
+    // A bare 6-index draw without the textured sampler is a hull
+    // coincidence, not a textured box — no violation on the fallback leg.
+    expect(skyDrawViolations(['drawElements TRIANGLES 6 @0'], false)).toEqual([]);
+    expect(skyDrawViolations([...Array(6).fill('drawElements TRIANGLES 6 @0'), 'uniform1i uTextured 1'], false).length).toBeGreaterThan(0);
     expect(skyDrawViolations(['drawElements TRIANGLES 36 @0'], false).length).toBeGreaterThan(0);
     expect(skyDrawViolations(['drawElements TRIANGLES 10 @0'], false)).toEqual([]);
   });
