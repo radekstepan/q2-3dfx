@@ -7,10 +7,10 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-29): preserve the near-60-FPS gains. Finish review
-> of final visual evidence. Lifecycle landed in `dfc58d9`; the solid blue sky is
-> still the untextured fallback. Fix sky and water next: 3A → 3B → 5/6 → 7.
-> CPU optimization stays paused. Only §8 contains the active task queue.**
+> **Current direction (2026-10-29): preserve the near-60-FPS gains. Sky asset
+> replay is committed; fix skybox borders, black sky through windows and water
+> seams next. Active order: 3A → 3B → 5/6 → 7. CPU optimization stays paused.
+> Only §8 contains the active task queue.**
 
 ---
 
@@ -255,41 +255,36 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ## 8. Actionable queue
 
-Read `docs/gpu-review-2026-10-29-lifecycle-sky-water.md` for the reviewed dirty-file
-inventory, test results and diagnoses. Completed cards/evidence live in
+Read `docs/gpu-review-d934fdc-sky-water.md` for current findings and test limits.
+Earlier dirty-file ownership and lifecycle reviews are historical. Completed cards/evidence live in
 `docs/tasks-archive.md` and `docs/performance-gpu-history-2026-10-29.md`.
 This queue supersedes old task lists and the archived snapshot.
 
-Execution: 3A → 3B → 5/6 → 7. FOLLOW-4 landed in `dfc58d9` and satisfies
-dependencies; working tree was clean at this review. Treat `review` as resumable
+Execution: 3A → 3B → 5/6 → 7. FOLLOW-4 landed in `dfc58d9`; sky asset replay
+landed in `d934fdc`. Preserve both; 3A below is only the remaining sky repair.
+Working tree was clean at review start. Treat `review` as resumable
 work; claim ownership before editing. One writer per package. Preserve the landed
 lifecycle machinery. Commit validated increments with changesets, no push. Archive completed cards
 with evidence rather than growing this queue with implementation narratives.
 Keep GPU experimental and CPU reference/goldens intact. Stop speculative
 optimization; only a measured final gate miss permits the one remaining measured
 optimization iteration. Unit/mirror tests and draw counts do not prove visible
-correctness. Expensive validation runs sequentially.
+correctness. Expensive validation runs sequentially. Known full-suite failures
+are assigned to FOLLOW-5 below: record them on intermediate repairs and continue
+independent work; never call a failing full run green. Final FOLLOW-7 requires
+the integrated gate to pass.
 
-### GPU-FOLLOW-3A — Replace the solid-blue fallback with the map sky
+### GPU-FOLLOW-3A — Fix skybox borders and black sky through windows
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
-depends: GPU-FOLLOW-4
-status: in-progress(@opencode)
-starting-points: `play.ts: loadSkyStrip/skyNameForMap/setSkyTexture`, `renderer.ts: registerSkyStrip/drawSkyRange`
-known-cause: no production `registerSkyStrip` call; `dfc58d9` fixed fallback drawing, not sky texture wiring. Do not revert the valid sampler binding fix.
+depends: GPU-FOLLOW-4 (landed)
+status: ready (asset replay implemented; visual defects remain)
+starting-points: `entities.ts: emitSkyBoxFaces`; `renderer.ts: skyStripFor/drawScene`; `shaders.ts: FS_FLAT`; `scene.ts: selectWorldRefs`; `apps/web/src/gpu-sky.test.ts`
 done-when:
-- [ ] Retain the loaded map sky and register it with the GPU on cold boot, CPU→GPU selection and context restore. Replace/clear it on map change; avoid rereading or uploading each frame. Pass per-face height, not the six-face strip's total height. Make missing/invalid sky assets diagnosable.
-- [ ] Add a negative control that deliberately omits sky registration and fails the sky-image check even though the page stays nonblack and colorful. Use a known textured region of the actual map sky (not an arbitrary patch that may naturally be uniform), with expected asset features/pixels. Add production integration coverage that fails when sky replay is omitted. Capture a real sky-facing map view before/after switching and restoration; prove textured sky pixels, correct face orientation/seams and opaque world occlusion. Do not accept flat fallback, merely nonblack frames, or a direct renderer fixture as completion.
-- [ ] Run relevant gates plus `yarn verify`; add changesets and commit the isolated repair with evidence.
-- TODO(GPU-FOLLOW-3A) 2026-10-30: repair implemented, relevant gates green
-  (testkit `gpu-sky` 4/4; web `gpu-sky` 4/4 incl. Q2_PAK cold-boot/switch/restore,
-  negative control, devroom clear; webgl `follow4` 7/7; web `play`+`gpu-hotswap`
-  44/44; web `gpu-lifecycle` 16/16; typecheck/lint green; `deps:check` ok).
-  Full `yarn verify` NOT green: 2 failures in `packages/testkit/src/gpu-browser.test.ts`
-  proven pre-existing/environmental — (1) PROOF-4 appearance far/mip reads 0/0,
-  reproduced on the clean stash (owns: FOLLOW-5); (2) PROOF-3 CDP
-  `Runtime.evaluate after 30000ms` under full-suite load, passes in isolation
-  both with and without this change (30s each). Boxes 1–2 evidenced; box 3
-  pending a green full verify.
+- [ ] Reproduce both symptoms in actual rendered pixels: capture an affected skybox edge/corner and a window looking outside, recording map/camera/FOV/cvars. Keep the successful retained-asset boot/switch/restore wiring; do not rebuild it.
+- [ ] Fix sky-face border sampling. Audit the six-face strip's bilinear footprint and face-local texel-center bounds: whole-texture CLAMP does not isolate adjacent faces, and the reused CPU UV bounds are not half-texel GPU bounds. Use a suitable face-isolated sampling/layout solution. Distinguish atlas bleed, source-art dark pixels, orientation and clipping/fog before attributing the user's black border to one cause. Test edges/corners during yaw/pitch, with filtering on/off; preserve intended artwork and foreground occlusion.
+- [ ] Fix absent sky through windows. At the failing view log selected sky refs/PVS, whether the sky pass runs, and glass alpha/depth state. Audit the `hasSky` gate (currently no selected sky refs means no background box). Ensure valid exterior background survives transparent windows and relevant visibility transitions, while opaque walls remain opaque. Do not disable PVS, backface culling, depth or transparency globally to hide the issue.
+- [ ] Add real-WebGL pixel regressions for face-edge isolation and a window with known sky behind it. Include negative controls that introduce a border or omit the background draw, plus opaque occluders. Capture real-map views before/after switch and context restore. Existing asset-statistics and stub 36-index-draw tests remain wiring tests, not image or occlusion proof; correct misleading test/report descriptions.
+- [ ] Run relevant sky/lifecycle/gameplay gates, record full-verify outcome and any already-assigned FOLLOW-5 failures, add required changesets and commit the bounded fix. Both reported sky defects must have pixel evidence before closing this card.
 
 ### GPU-FOLLOW-3B — Remove visible water tile boundaries
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
@@ -297,16 +292,17 @@ depends: GPU-FOLLOW-3A
 status: ready
 starting-points: `shaders.ts: FS_LIT/voodooWarp`, world UVs, diffuse mip generation/sampling
 done-when:
-- [ ] Reproduce hard lines in real water; record map, camera, material, time and crops. Distinguish texture-repeat boundaries from BSP-face/lightmap seams and warp/LOD/precision effects using fixed-time, fixed-LOD and diffuse/unlit diagnostics. Compare adjacent faces at the same world position and the CPU/reference appearance. Record the demonstrated cause before changing the algorithm.
+- [ ] Preserve the now-satisfactory water motion. Reproduce the remaining visible tile seams in real water; record map, camera, material, time and crops. Distinguish texture-repeat boundaries from BSP-face/lightmap seams and warp/LOD/precision effects using fixed-time, fixed-LOD and diffuse/unlit diagnostics. Compare adjacent faces at the same world position and the CPU/reference appearance. Record the demonstrated cause before changing the algorithm.
 - [ ] Fix that cause while retaining animated turbulence, intended texture scale, repeat behavior and transparent/depth ordering. Check original versus resized texture dimensions and derivatives if implicated. Do not mask seams by disabling warp, lighting or mipmapping, or globally blurring water.
 - [ ] Add a regression that fails for the observed defect: actual sampled pixels across repeat/face boundaries at multiple times, plus real-page stationary/moving water captures. Include combined turbulent/translucent material coverage. Formula-string/mirror checks alone are insufficient.
-- [ ] Run relevant gates plus `yarn verify`; add changesets and commit separately. Confirm sky and prior wall/enemy/barrel repairs remain intact.
+- [ ] Run relevant gates and record `yarn verify` outcome (known suite failures belong to FOLLOW-5); add changesets and commit separately. Confirm sky and prior wall/enemy/barrel repairs remain intact.
 
 ### GPU-FOLLOW-5 — Refresh final fidelity evidence
 owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`
 depends: GPU-FOLLOW-3B
 status: ready
 done-when:
+- [ ] Resolve the reported full-suite PROOF-3 CDP 30-second timeout under load: reproduce and isolate resource/process contention, run expensive browser tests with controlled concurrency, and retain bounded useful timeouts. Do not skip the gate or merely inflate timeouts without evidence.
 - [ ] Capture matched F0/F1/F2 CPU/GPU scene/time/cvars on the repaired renderer; report new full-frame and region/material metrics. Repair the degenerate PROOF-4 far/mip fixture so it actually exercises its intended content. Keep historical pre-repair failures labelled historical.
 - [ ] Strengthen lifecycle image evidence with matched deterministic before/after scene crops or independent world/model/skin expectations and negative controls removing a required asset. Existing nonblack, gun-region brightness and distinct-color counts can pass with missing textures; do not label them semantic proof.
 - [ ] Investigate remaining unexplained UV/lighting/depth/transparency differences and add meaningful regression fixtures. Include repaired sky/water. Do not loosen assertions or replace goldens to conceal defects.
@@ -348,5 +344,6 @@ done-when:
 | `docs/performance-gpu-history-2026-10-29.md` | Archived reviews/cards/evidence, including unresolved deferred work; not an active queue |
 | `docs/gpu-follow-1-reconciliation.md` | Corrected interpretation of prototype evidence |
 | `docs/lessons.md` | dual-sim root cause, single-sim rule, base1 play-verified gate, closed/open lists |
+| `docs/gpu-review-d934fdc-sky-water.md` | Current sky/water findings, evidence limits and prior card snapshot |
 | `docs/gpu-review-2026-10-29-lifecycle-sky-water.md` | Dirty-file ownership, review evidence, diagnoses and superseded queue |
 | `docs/tasks-archive.md` | all DONE cards (M0–M9 + TODOs) with lane reports |
