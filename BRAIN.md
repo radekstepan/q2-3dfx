@@ -7,8 +7,9 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-28): execute GPU-PROOF-1–5 in §8. The CPU
-> optimization campaign is paused. Prove a small WebGL2 renderer before expanding it.**
+> **Current direction (reviewed 2026-10-29 at 3269c30): the WebGL2 prototype exists.
+> Execute GPU-FOLLOW-0 FIRST (user sees a black screen), then GPU-FOLLOW-1–7 to repair scene coverage, finish integration and
+> establish acceptance. Keep it experimental; CPU optimization remains paused.**
 
 ---
 
@@ -253,7 +254,141 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ## 8. Active tasks (everything else is DONE — see `docs/tasks-archive.md`)
 
-### Current direction — bounded WebGL2 proof, then conditional expansion
+### Current progress and remaining queue — review of `3269c30` (2026-10-29)
+
+Prototype implementation landed in `324105c`, `8063252`, `d582fb3`, `57e185e`,
+`8544883`, `3269c30`: GPU scene/backend boundary, world/model drawing, appearance
+passes, live-loop routing, GPU submission counters and a browser soak harness.
+Do not rebuild those components or restart CPU tuning.
+
+Acceptance correction (this review overrides older PASS/GO claims below and in
+`docs/gpu-proof-5-report.md` until GPU-FOLLOW-1 reconciles them):
+- The recorded AMD Vega hardware-backed HEADLESS run is promising: 300 s,
+  unthrottled cadence 233.76/s, interval p50 3.92 ms / p95 6.01 ms. It is not
+  proof of visible-display 60 FPS, completed GPU work, or full-map correctness.
+  Main-thread submit time is not GPU execution time. The CPU leg used different
+  compositing conditions; do not promote the 6.9x ratio to a matched GPU speedup.
+- The fixed-frame fidelity metric is 0.912 versus a 0.02 limit: it FAILED.
+  Documented approximation categories and an agent's visual review are not a
+  passed numeric gate or user approval. Human Voodoo-hardware-oracle review is
+  distinct from accepting this project's GPU appearance; no oracle is needed to
+  identify missing geometry or repair a failed existing reference comparison.
+- Source review found frozen spawn visibility: `play.ts: attachGpuBackend` calls
+  `selectGpuScene` with the spawn view; `frameGpuPlay` only calls `updateGpuEntities`
+  on that cached subset. `renderer.ts: uploadStatic` builds buffers from those refs.
+  Turning/moving cannot recover omitted world faces; transparent world order is
+  also retained from the old view. Persistent geometry is good; frozen visibility
+  is not. Previous “moving” throughput must be rechecked after repairing coverage.
+- Integration gaps remain: live particles/sprites, hot-swap model/skin migration,
+  browser context lifecycle and resize, flat sky/unwarped water. Source also drops
+  old resource references during `uploadStatic`, and resize drops the target,
+  without deleting those resources first. Bounded memory is not established by a
+  single-scene heap trend; GPU allocation lifetimes need tests.
+
+Execution policy for follow-up:
+- This is a finite correctness/integration queue, not a renewed performance
+  campaign. Fix the listed issues and measure the complete result; at most the
+  ONE remaining proof optimization iteration may be used if performance misses.
+  Then report the blocker/evidence, do not silently extend the budget.
+- GPU-FOLLOW-1–6 may repair and validate the existing experimental prototype
+  without declaring GPU-EXPAND-1 accepted. No default promotion or unrelated
+  feature expansion until GPU-FOLLOW-7 passes. CPU backend/goldens stay intact.
+- Follow §7 disjoint package ownership, interface-first changes, integrator-only
+  docs/changesets/commits; run expensive benchmarks sequentially. Recheck current
+  code before implementing; do not redo fixes that landed after this review.
+- `ready` cards with unsatisfied dependencies wait. GPU-FOLLOW-2/3/4 share owners
+  and must be serialized or explicitly handed off. Commit validated increments
+  autonomously, no push; preserve unrelated changes. No hardware or user visual
+  approval may be fabricated. If unavailable, finish independent work and record
+  the exact blocked acceptance step.
+
+### GPU-FOLLOW-0 — Fix the actual black browser presentation FIRST
+owns: `apps/web`, `packages/testkit`
+depends: none
+status: ready
+priority: blocking — user reports the entire game is black (2026-10-29)
+source-evidence: `apps/web/index.html` gives `#q2` a black CSS background; `gpu-canvas.ts` puts this HUD canvas at z-index 1 ABOVE `#q2-gl` at 0 without clearing its CSS background. Transparent HUD ImageData does not remove that CSS background. `dom.ts` doubles the HUD canvas CSS size, while GPU canvas sizing is not synchronized.
+done-when:
+- [ ] Reproduce in the real application DOM/CSS and capture the composed visible page. Inspect computed styles, bounding rectangles, canvas/context state and rendering errors. The black CSS overlay is a concrete source-level defect; verify whether additional failures remain after fixing it.
+- [ ] In GPU mode make the HUD canvas background transparent, with correctly aligned GPU/HUD drawing surfaces and matching displayed size/aspect. Restore appropriate CPU presentation on GPU→CPU switching/fallback. Preserve HUD visibility, pointer input, bezel layout and resize behavior.
+- [ ] Add a real-browser regression using the production HTML/CSS: assert visible scene pixels in a page screenshot (not only readPixels from the underlying GPU canvas), HUD overlay and canvas alignment. Cover boot and CPU→GPU→CPU switching at supported resolutions.
+- [ ] Verify real base1 room AND textured gun are visible on the user's normal page. Treat previously black screenshots as a failed presentation gate, not a headless artifact excused by successful GPU readback. No further performance or default-promotion claims until the composed page works.
+- [ ] Record the fix/evidence and commit with appropriate validation. Resume the remaining queue only after presentation is demonstrated; do not rewrite shaders to compensate for a CSS overlay.
+
+### GPU-FOLLOW-1 — Repair acceptance reporting and preserve reproducible evidence
+owns: `docs`, `BRAIN.md`, `tools/bench`, `packages/testkit`
+depends: GPU-FOLLOW-0
+status: ready
+done-when:
+- [ ] Reconcile PROOF-4/5 report, ledger and acceptance predicates: implementation exists, headless throughput promising, fidelity FAILED, visible-display acceptance pending. Retain historical raw results; annotate superseded verdicts rather than deleting inconvenient evidence.
+- [ ] Separate rAF/submission cadence, CPU frame work, asynchronous GPU duration (when supported) and displayed-frame evidence. Do not label submit time GPU work or infer display refresh from unthrottled BeginFrames.
+- [ ] Repair manifests: capture actual asset identity, fidelity cvars, warmup, machine/graphics backend, source/build identity and dirty diff provenance. Existing 10-03-32 manifest has fidelity/warmup null, machine {}, asset marked missing and a dirty 8544883 tree. Preserve the measured artifacts with their limitations.
+- [ ] Add acceptance tests that reject failed fidelity, incomplete scene coverage and headless-only displayed-FPS claims. Keep tolerances fixed; no reclassification of a failed number as PASS.
+
+### GPU-FOLLOW-2 — Correct moving-camera world visibility and draw order
+owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
+depends: GPU-FOLLOW-1
+status: ready
+starting-points: `play.ts: attachGpuBackend/frameGpuPlay`; `scene.ts: selectGpuScene`; `entities.ts: updateGpuEntities`; `renderer.ts: setScene/uploadStatic/drawScene`
+done-when:
+- [ ] Separate persistent full-map geometry/material storage from current-camera draw selection. Update PVS/frustum/backface selection when relevant camera state changes; upload static data once or lazily with explicit residency, never omit surfaces permanently because they were invisible at spawn.
+- [ ] Recompute transparent WORLD distance/order for the current view and combine with entity ordering where required; ensure actual draw calls follow the updated selection/order without rebuilding the whole mesh per frame.
+- [ ] Add fail-before tests for a 180-degree turn, camera translation across PVS clusters and changing transparent overlap. Include pixel/capture checks from the real browser path, not only updated surface lists or an uploads==1 assertion.
+- [ ] Traverse multiple rooms including doors/lifts; audit brush/submodel transforms and newly revealed geometry. Document missing dynamic-world support explicitly and implement the base1-required cases before claiming full-map coverage.
+- [ ] Remeasure the same route after correctness repair. No performance win may rely on rendering only the spawn subset.
+
+### GPU-FOLLOW-3 — Complete live effects and required world appearance
+owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
+depends: GPU-FOLLOW-2
+status: ready
+done-when:
+- [ ] Inventory actual live producers/consumers for sprites, particles, beams, explosions, lights and model/skin kinds. Connect game events and lifetimes to GPU drawing; rendering synthetic fixtures alone is insufficient. Verify event drains occur in the intended tick order without dropping or double-consuming effects.
+- [ ] Preserve model-kind metadata (not just the temporary tracer map), sprite animation/size, particle counts/lifetimes and weapon/light timing. Prove real combat event → submitted geometry → visible pixels with tests.
+- [ ] Implement base1-required sky and water/warp/transparent behavior; current sky is flat and turbulence unwarped. Test combined turbulent/translucent flags and draw/depth order. Audit remaining cvar behavior and label unsupported choices explicitly.
+- [ ] Exercise all supported weapons, enemies, pickups and relevant effects on the live path; no missing-mesh/skin warnings in supported scenes. Keep GPU-resident HUD optional unless measured CPU-overlay cost or correctness requires it.
+
+### GPU-FOLLOW-4 — Make resource lifecycle, switching and resize reliable
+owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`, `packages/config`
+depends: GPU-FOLLOW-3
+status: ready
+starting-points: `renderer.ts: uploadStatic/resize/dispose`; `gpu-canvas.ts`; `play.ts` GPU attach and renderer switching
+done-when:
+- [ ] Delete obsolete same-context buffers/textures/programs/FBOs/renderbuffers before replacing their ownership; do not drop maps/targets and rely on GC. Distinguish invalid handles after context loss from live resources during ordinary resize/map replacement.
+- [ ] Wire actual canvas contextlost/contextrestored events, prevent default loss handling where restoration is supported, stop submission safely and recreate programs/world/model/skin/appearance state after restoration. Test using a real browser context-loss mechanism.
+- [ ] Restore all registered model/skin assets on CPU→GPU hot-swap without reboot, and keep GPU→CPU→GPU, unsupported-device fallback and user-visible warnings correct. Never silently count fallback as GPU execution.
+- [ ] Resize synchronizes drawing buffer, render targets, viewport, camera aspect and HUD overlay. Repeated resize/switch/map/loss cycles have stable resource counts, no duplicate canvases/listeners and correct rendered output.
+
+### GPU-FOLLOW-5 — Resolve fidelity failure with scoped visual evidence
+owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`
+depends: GPU-FOLLOW-4
+status: ready
+done-when:
+- [ ] Reproduce F0/F1/F2 CPU/GPU captures with identical scene/time/cvars after coverage fixes. Preserve the 0.912-vs-0.02 failure as baseline; investigate lighting/gamma/color-space, UV/skin sampling, depth, silhouettes and transparency rather than attributing the entire image to permitted approximations.
+- [ ] Fix unintended differences and add local regression fixtures. Measure region/class-specific differences for intended approximations; retain full-frame metrics. No threshold loosening or golden replacement to hide unexplained changes.
+- [ ] Meet the existing fidelity contract OR prepare concrete side-by-side artifacts and a precise proposed visual contract for USER approval. Agent approval, documented approximation categories and missing historical Voodoo captures do not authorize accepting a new tolerance.
+- [ ] Record automated fidelity and any required user visual approval separately. Independent lifecycle/measurement work may continue while approval is pending; final acceptance/default promotion may not.
+
+### GPU-FOLLOW-6 — Verify the complete live renderer on a visible display
+owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
+depends: GPU-FOLLOW-4
+status: ready
+done-when:
+- [ ] Run a hardware-backed visible-browser 640×480 soak ≥5 minutes with stationary, multi-room movement/PVS changes and combat, all required effects and real viewmodel. Capture actual camera positions, visited regions, geometry/effect execution and nonblack visible captures, not just echoed inputs.
+- [ ] Use matched CPU/GPU browser/compositor settings for comparisons or label unmatched numbers non-comparative. Record refresh/vsync, p50/p95/p99, dropped frames and explicitly described completed/display cadence evidence. Do not claim scanout presentation from framesSubmitted alone.
+- [ ] Check original work/cadence gates (≤16 ms median frame work, ≥59 FPS on nominal 60 Hz, p95 interval ≤20 ms) separately, with bounded CPU/GPU resources and no silent fallback. Avoid per-frame blocking readbacks/finish; asynchronous GPU timing is supplementary.
+- [ ] Record the immutable final build, raw samples and captures. If display access is unavailable, leave this card blocked with exact environment requirements. If performance fails, use at most the remaining one measured optimization iteration then report; do not resume CPU tuning.
+
+### GPU-FOLLOW-7 — Final acceptance and deliberate rollout
+owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config` (integrator)
+depends: GPU-FOLLOW-1, GPU-FOLLOW-2, GPU-FOLLOW-3, GPU-FOLLOW-4, GPU-FOLLOW-5, GPU-FOLLOW-6
+status: ready
+done-when:
+- [ ] Review integrated changes; run yarn verify, yarn deps:check, real-asset base1/voodoo gates and GPU lifecycle/image/gameplay suites. Record skips as missing coverage; retain CPU goldens and Node support.
+- [ ] Publish separate implementation, correctness, fidelity and displayed-performance verdicts with evidence/commits. Resolve contradictory PASS/GO statements in reports/ledger/BRAIN; no unsupported final acceptance.
+- [ ] Only with all required gates passed, close GPU-EXPAND-1 and decide/promote the GPU selection/default with accurate labels and explicit fallback. Otherwise keep experimental and list remaining blockers; no automatic promotion from headless throughput.
+- [ ] Add publishable-package changesets and validated commits without pushing. Archive completed proof/follow-up cards only after evidence is linked and unresolved items remain visible.
+
+### Original proof plan — historical implementation and evidence
 
 User decision (2026-10-28): prioritize a fast playable game with the Voodoo look.
 Stop the open-ended CPU optimization campaign. Preserve completed engine work and
@@ -264,7 +399,7 @@ The last documented controlled CPU comparison was 51.32 → 47.22 ms for Node co
 that result is useful but does not establish browser performance or a viable 16 ms path.
 
 Execution rules:
-- Implement GPU-PROOF-1–5, in order, autonomously with validated changesets/commits;
+- For current work execute GPU-FOLLOW-1–7 above; retain the proof plan as history. Use validated changesets/commits;
   no push. Use subagents only for disjoint package ownership under §7. The integrator
   owns BRAIN/docs/changesets and commits. Keep expensive measurements sequential.
 - First reconcile active agent ownership and preserve any in-flight/uncommitted CPU
@@ -353,12 +488,12 @@ completion (2026-10-29, integrated — GL + wiring lanes in parallel, browser la
 ### GPU-PROOF-4 — Implement and validate the Voodoo appearance
 owns: `packages/webgl-renderer`, `packages/voodoo`, `apps/web`, `packages/testkit`
 depends: GPU-PROOF-3
-status: done(@integrator 2026-10-29)
+status: review (implementation landed; acceptance reopened by 2026-10-29 source/evidence review)
 done-when:
 - [x] Implement the GPU appearance contract from GPU-PROOF-1: required sampling/mip policy, fog, RGB565 quantization, ordered dither, reconstruction and gamma, with correct HUD ordering. Use render targets/shader passes; keep output resident on GPU through presentation.
 - [x] Reuse or extract pure shared policy/constants only where useful; do not rewrite the CPU reference or couple it to WebGL. Explain any GPU-specific interpretation of existing cvars.
-- [x] Unit-test deterministic math/policy and run real-GPU fixtures for ramps/dither phase, fog, mip transitions, transparent overlap and depth. Compare fixed real-scene captures using the predeclared tolerances.
-- [x] Review captures side by side for textured gun, geometry, transparency, dark areas and minification. Report all approximation differences explicitly; if human sign-off is needed, leave that acceptance pending rather than inventing approval.
+- [ ] Unit-test deterministic math/policy and run real-GPU fixtures for ramps/dither phase, fog, mip transitions, transparent overlap and depth. Compare fixed real-scene captures using the predeclared tolerances.
+- [ ] Review captures side by side for textured gun, geometry, transparency, dark areas and minification. Report all approximation differences explicitly; if human sign-off is needed, leave that acceptance pending rather than inventing approval.
 completion (2026-10-29, integrated — GL + web lanes in parallel, testkit lane after, integrator reconciled + committed):
 - appearance core (`packages/webgl-renderer`: `appearance.ts` + `PROOF-4.md` cvar table; `packages/voodoo` untouched — values duplicated-by-value with source citations, no new dep edge): linear scene target (RGBA16F w/ float ext, RGBA8 fallback + warning), one fullscreen pass (absolute-phase Bayer → 565 quantize → matched `2x2sub+2x2box` w/ edge rejection → gamma 1.3, HUD stays composited above), CPU box-filter mip chains + dithered n/n+1 pick + `vd_lodbias`, 64-entry table fog (zero in base1, forced fixture proves the path), gun NDC remap, per-pixel dlights. Backend reads `vd_*` per frame itself (no stale profile); `setFogOverride`/`testTargetInfo` are test hooks only.
 - live loop (`apps/web`): per-frame `vd_*` snapshot recorded on the boot (observable record), HUD-overlay independence pinned (equality across appearance inputs), z-order/DOM-order pins, Q2_PAK appearance smoke (20 combat frames, draws logged, no readback). Zero behavior change for CPU paths.
@@ -371,14 +506,14 @@ completion (2026-10-29, integrated — GL + web lanes in parallel, testkit lane 
 ### GPU-PROOF-5 — Measure the complete prototype and make the decision
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`, `BRAIN.md`
 depends: GPU-PROOF-4
-status: done(@integrator 2026-10-29)
+status: review (implementation landed; acceptance reopened by 2026-10-29 source/evidence review)
 done-when:
-- [x] Run CPU and GPU legs on the SAME hardware-backed browser/machine with matched scene/settings; record actual graphics backend, resolution, refresh rate and renderer selection. Software-emulated/headless results may supplement, never replace, hardware acceptance.
+- [ ] Run CPU and GPU legs on the SAME hardware-backed browser/machine with matched scene/settings; record actual graphics backend, resolution, refresh rate and renderer selection. Software-emulated/headless results may supplement, never replace, hardware acceptance.
 - [x] Warm up, then run ≥5 minutes including separately reported stationary, movement and combat intervals. Include simulation, scene prep, rendering, HUD and presentation; record cadence, p50/p95/p99, dropped frames, memory/resource growth, errors and visual captures.
-- [x] Demonstrate substantial headroom relative to the CPU baseline and meet GPU-PROOF-1 performance/fidelity gates. Use completed-frame cadence plus available GPU timings; explain limits of browser presentation measurement. No gl.finish/readPixels per-frame benchmark trick or disabled effects.
+- [ ] Demonstrate substantial headroom relative to the CPU baseline and meet GPU-PROOF-1 performance/fidelity gates. Use completed-frame cadence plus available GPU timings; explain limits of browser presentation measurement. No gl.finish/readPixels per-frame benchmark trick or disabled effects.
 - [x] If needed, make at most two targeted measured optimization iterations under explicit package ownership. Record rejected attempts too. If still failing, mark the gate failed/blocked, preserve the prototype and STOP expansion with findings and a recommendation.
 - [x] Run integrated build/typecheck/tests/dependency checks and existing CPU regression gates; commit proof changes with changesets and evidence. Publish a go/no-go report with scope, fidelity differences, performance, remaining risks and commit hashes.
-completion (2026-10-29, integrated — soak lane + iteration-1 lane in parallel, integrator reconciled + measured + committed):
+historical completion claim (superseded by GPU-FOLLOW review above; 2026-10-29, integrated — soak lane + iteration-1 lane in parallel, integrator reconciled + measured + committed):
 - harness (`apps/web` soak hook `?q2soak=1` + `tools/bench/gpu-soak.*` CDP runner): autoboot base1 640x480, scripted stationary/moving/combat intervals with input echo verification, 1Hz stats, per-interval screenshots, GL_RENDERER capture, refresh/vsync probing, manifest import. First full run VOIDED by the tick-routing defect below; short + final runs are the evidence.
 - iteration 1 of 2 (apps/web, the only one needed): per-frame full selectGpuScene → cached static + updateGpuEntities tail (uploads stay 1, pixels identical, no CPU raster) + work-split ring (drains/sim/view/tail/submit/total) shared via globalThis (config-store precedent). Effect: tail collapse (p95 −24%, dropped 190→9); median was never scene-prep (17.13→16.77).
 - correctness fixes from measurement: (1) tick routing — pooled CPU path shadowed frameGpuPlay, first full soak measured CPU-on-both-legs (28.89 vs 26.87fps); explicit GPU-first branch, hot-swap-safe; soak now asserts framesSubmitted/uploads per interval. (2) Work-split sharing (above). Neither is an optimization iteration; iteration budget: 1 used, 1 banked unused (gate passes, no second iteration per stop rules).
@@ -390,8 +525,8 @@ completion (2026-10-29, integrated — soak lane + iteration-1 lane in parallel,
 
 ### GPU-EXPAND-1 — Complete gameplay coverage only after successful proof
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`, `tools/bench`, `packages/config`, `docs`, `BRAIN.md`
-depends: GPU-PROOF-5 AND explicit recorded PASS of its performance/fidelity gates
-status: ready (proof gates PASS 2026-10-29 — see GPU-PROOF-5 completion + docs/gpu-proof-5-report.md; formal human fidelity sign-off still pending as a tracked risk)
+depends: GPU-FOLLOW-7 AND explicit recorded PASS of fidelity/displayed-performance gates
+status: paused (promotion gate unmet; use GPU-FOLLOW-1–7 for finite prototype remediation)
 done-when:
 - [ ] Create concrete owned cards for missing supported scene/effect classes and cvars (sky, water/warp, sprites, particles, beams, remaining models/lights as applicable), based on an inventory. No unmeasured whole-engine rewrite.
 - [ ] Verify full base1 gameplay and regression scenes, renderer switching, resize, context loss/restoration and explicit unsupported-device fallback; retain CPU reference/Node support.
@@ -675,7 +810,7 @@ Budgets: software ≤16 ms/frame @640×480, voodoo ≤16 ms/frame @640×480, sta
 cached-pak to first frame. Full history: `docs/perf-ledger.md`.
 Gameplay rules (single-sim, play-verified gate, open/closed lists): `docs/lessons.md`.
 
-> Historical TASK.md remediation report at 4631ca2 (not current sign-off): claimed items 1–4 complete; focused correctness suites passed (`yarn verify` 76/76, pooled≡serial full-RGBA, recovery alpha-once, next-frame); performance measured (Node pooled-7 rgb combat 48.84ms, serial 122ms, sw 20.3ms @640×480; budgets NOT met); target acceptance OPEN (5-min 640×480 browser soak on final code + 60fps/16ms). Review found live-writer recovery gaps, per-kick browser checkpoint allocations, absent production worker timings and incorrect browser worker/main attribution; PERF-NEXT-1–8 above govern completion. See `docs/perf-ledger.md` 2026-10-28 TASK row and changesets `sw-renderer-fg-recovery-tris`, `testkit-fg-recovery-harness`.
+> Historical TASK.md remediation report at 4631ca2 (not current sign-off): claimed items 1–4 complete; focused correctness suites passed (`yarn verify` 76/76, pooled≡serial full-RGBA, recovery alpha-once, next-frame); performance measured (Node pooled-7 rgb combat 48.84ms, serial 122ms, sw 20.3ms @640×480; budgets NOT met); target acceptance OPEN (5-min 640×480 browser soak on final code + 60fps/16ms). Review found live-writer recovery gaps, per-kick browser checkpoint allocations, absent production worker timings and incorrect browser worker/main attribution; GPU-FOLLOW-1–7 now govern the GPU work; the CPU campaign remains paused. See `docs/perf-ledger.md` 2026-10-28 TASK row and changesets `sw-renderer-fg-recovery-tris`, `testkit-fg-recovery-harness`.
 
 ---
 
