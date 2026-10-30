@@ -8,8 +8,9 @@
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
 > **Current direction (2026-10-29): user reports mostly 60 FPS at 640×480 and
-> no visible broken textures/black spots. Finish the in-progress GPU-FOLLOW-2B,
-> then the short remaining §8 queue. Preserve gains; CPU optimization stays paused.**
+> no visible broken textures/black spots. GPU-FOLLOW-2B is DONE (committed +
+> real-browser evidence); work the short remaining §8 queue next (2C → 3 → 4
+> → 5/6 → 7). Preserve gains; CPU optimization stays paused.**
 
 ---
 
@@ -261,11 +262,11 @@ no failing textures or black spots observed. Treat those earlier reports as
 visually improved, not current known failures. Preserve the gains and regression
 fixtures; do not repeat old investigations without new failing evidence.
 
-**Reviewed baseline:** committed `866a553` plus active, uncommitted FOLLOW-2B work.
-At review, renderer.ts, shaders.ts, worldMesh.ts and worldMesh.test.ts are being
-edited by the implementing LLM. Do not overwrite, revert, duplicate or commit its
-unfinished work from another lane. Re-read git status and this queue before claiming
-ownership; its implementation/evidence may advance after this snapshot.
+**Reviewed baseline:** committed `866a553` plus FOLLOW-2B work now landed as
+`3467ddd` (wiring + stub regression) and `ee180f2` (real-browser triage,
+honest GL attribution, dither-liveness proof). Working tree is clean; the
+former dirty-tree reservation is released. Re-read git status and this queue
+before claiming ownership.
 
 | Work | Current disposition |
 | --- | --- |
@@ -274,7 +275,7 @@ ownership; its implementation/evidence may advance after this snapshot.
 | FOLLOW-1 acceptance/reporting corrections | Done, `f05e0ba` + `a53baf4`; retain rejection gates |
 | FOLLOW-2 full-map storage/current-view selection | Implemented, `f05e0ba`; remaining live route validation is ONLY FOLLOW-2C |
 | FOLLOW-2A model/skin replay and switches | Done, `866a553`; replay retained assets without restarting game |
-| FOLLOW-2B textures/lightmaps | Implementation in progress; user sees no failures now; finish evidence/commit |
+| FOLLOW-2B textures/lightmaps | DONE (`3467ddd` + `ee180f2`); all 7 boxes evidenced (stub + real-GL); 2 follow-ups filed (PROOF-4 far/mip fixture → FOLLOW-5; stale first-submit 1282 → lifecycle note) |
 | Full gameplay coverage, lifecycle and final acceptance | Remaining cards below |
 
 History and full prior evidence: `docs/performance-gpu-history-2026-10-29.md`,
@@ -333,17 +334,17 @@ historical, not instructions to reimplement completed/current repairs.
 ### GPU-FOLLOW-2B — Repair diffuse texture and lightmap correctness
 owns: `packages/webgl-renderer`, `packages/testkit`
 depends: GPU-FOLLOW-2A
-status: in-progress (existing implementing LLM; preserve current renderer ownership)
-progress-at-review: committed 3467ddd on top of the dirty tree (REPEAT vs CLAMP, unpack state, sampler re-bind, uDebugMode upload, atlasStats/material hooks, lightId-parity fix, stub regression in follow2b.test.ts + worldMesh.test.ts). Typecheck/test/build green for @q2/webgl-renderer (104 passed). Remaining to close: real-GL upload sampling (1/2/3-wide, odd/NPOT, skin chains), same-camera 0/1/2 captures of real walls/skins in the composed page, real-GL sampler/atlas-capacity image regression, and full-map overflow measurement. Do not relitigate the landed wiring; finish with browser evidence.
+status: done (landed `3467ddd` + `ee180f2`; lane report in `docs/tasks-archive.md`)
 starting-points: `renderer.ts: uploadTextureLevels/diffuseFor/skinFor`; `worldMesh.ts: pushSurfaceTris/packLightAtlas`; `appearance.ts: voodooSampleMipped`
 done-when:
-- [ ] Reproduce a failing world-repeat fixture with UVs outside [0,1], including negative UVs and bilinear seams. Give WAL/world materials repeat addressing and skins/sprites/lightmap atlases their intended clamp policy through texture creation and sampling. Preserve correct mip derivatives and resampling UV scale.
-- [ ] Set/restore appropriate pixel-unpack state for tightly packed RGB data; exercise 1/2/3-wide, odd-width/NPOT and real skin mip chains in a real WebGL context. Assert no upload GL errors, valid expected mip texels and sampled colors (not only texImage2D arguments).
-- [ ] Expand missing/short lightmap fallback to every luxel or represent a deliberate uniform unlit material. Never index beyond a three-byte fallback; test no-light surfaces and atlas overflow. Audit surface lightId mapping and light-style handling against the CPU reference.
-- [ ] Fix/test luxel centre placement and bilinear isolation between adjacent atlas tiles (gutters/edge duplication or equivalent). Use contrasting tiles, last-row/column samples and actual map edges to detect dark bleeding.
-- [ ] Capture diffuse-only, lightmap-only and final output at the same camera for reported black regions; identify each region's cause. Test actual textured walls/floors and enemy/gun skins in the composed page. No global brightness boost, disabling lighting or changed goldens to hide black spots.
-- [ ] Pin sampler-unit isolation during first-use lazy world/skin uploads and mixed world/alias/sprite draws. Assert unit 0 diffuse and unit 1 lightmap bindings at actual draws with a real-GL image regression; no accidental atlas replacement by uploads. Measure full-map atlas capacity/overflow and implement correct handling rather than sampling unrelated atlas-origin pixels.
-- [ ] Retain intended genuinely dark texels and documented appearance policy. Report asset warnings and material/texture counts; no silently missing required textures or GL upload errors on the supported route.
+- [x] Reproduce a failing world-repeat fixture with UVs outside [0,1], including negative UVs and bilinear seams. Give WAL/world materials repeat addressing and skins/sprites/lightmap atlases their intended clamp policy through texture creation and sampling. Preserve correct mip derivatives and resampling UV scale. (stub REPEAT/CLAMP param pins + negative/multi-tile UV fixture in `follow2b.test.ts`; real-GL: 31 diffuse + atlas healthy, triage nonblack ~0.89)
+- [x] Set/restore appropriate pixel-unpack state for tightly packed RGB data; exercise 1/2/3-wide, odd-width/NPOT and real skin mip chains in a real WebGL context. Assert no upload GL errors, valid expected mip texels and sampled colors (not only texImage2D arguments). (stub ALIGNMENT set/restore in `follow2b.test.ts`; real-GL: `uploadErrors: []` ×4 runs, mipChain 7 levels lastMean [128,128,128], stage diffs 0.71)
+- [x] Expand missing/short lightmap fallback to every luxel or represent a deliberate uniform unlit material. Never index beyond a three-byte fallback; test no-light surfaces and atlas overflow. Audit surface lightId mapping and light-style handling against the CPU reference. (no-light→unlitUV, short-fill+shortFallback, overflow→unlit, lightId%len tests in `worldMesh.test.ts`; real base1: skipped 0, shortFallback 0)
+- [x] Fix/test luxel centre placement and bilinear isolation between adjacent atlas tiles (gutters/edge duplication or equivalent). Use contrasting tiles, last-row/column samples and actual map edges to detect dark bleeding. (centre/gutter-duplication/last-luxel/lightId tests; real far-camera content 0.978 nonblack, no dark bleeding)
+- [x] Capture diffuse-only, lightmap-only and final output at the same camera for reported black regions; identify each region's cause. Test actual textured walls/floors and enemy/gun skins in the composed page. No global brightness boost, disabling lighting or changed goldens to hide black spots. (same-camera 0/1/2 captures + diffs 0.707/0.710 in `proof.follow2b`; production path untouched)
+- [x] Pin sampler-unit isolation during first-use lazy world/skin uploads and mixed world/alias/sprite draws. Assert unit 0 diffuse and unit 1 lightmap bindings at actual draws with a real-GL image regression; no accidental atlas replacement by uploads. Measure full-map atlas capacity/overflow and implement correct handling rather than sampling unrelated atlas-origin pixels. (stub per-draw unit0+unit1 + uDebugMode upload test; real atlas 1024x395, 7663 rects, skipped 0; triage renders clean)
+- [x] Retain intended genuinely dark texels and documented appearance policy. Report asset warnings and material/texture counts; no silently missing required textures or GL upload errors on the supported route. (material counts 31+2+atlas + warnings published; uploadErrors [] on SwiftShader route)
+- Follow-ups (not 2B blockers, remain visible): (1) PROOF-4 near-camera far/mip fixtures read 0/0 post-fix (were 169895 with bleed + unsettled first-submit) — mechanism documented, asserts left untouched (no loosening), repair belongs to FOLLOW-5 post-repair re-baselining. (2) Stale per-context 1282 on first-submit/fixture frames (SwiftShader quirk, zero pixel impact): uploads/draws exonerated (uploadErrors [], postTriage []), precise phase hooks landed (`glFirstErrors`, honest pre-poll); root-cause to lifecycle/driver-quirk note.
 
 ### GPU-FOLLOW-2C — Prove live map completeness and close visibility validation
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`, `tools/bench`

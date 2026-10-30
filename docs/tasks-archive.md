@@ -404,3 +404,10 @@ done-when:
 > (predicted ~1.1-1.2x for real risk). Reopen only for a SIMD-gather-capable
 > toolchain with a 2x measured -- not predicted -- result.
 
+
+### GPU-FOLLOW-2B — Repair diffuse texture and lightmap correctness — DONE 2026-10-29
+owns: `packages/webgl-renderer`, `packages/testkit` · depends: GPU-FOLLOW-2A
+commits: `3467ddd` (wiring + stub regression) + `ee180f2` (real-browser triage + honest GL attribution)
+changesets: webgl-renderer-gpu-follow-2b + testkit-gpu-follow-2b-triage + webgl-renderer-gpu-follow-2b-evidence
+lane report: all 7 done-when boxes evidenced (stub: follow2b 4/4, worldMesh 10/10; real-GL SwiftShader ×4 runs: triage nonblack ~0.89 + stage diffs 0.71, atlas 7663 rects skipped 0, materials 31+2, uploadErrors [], policyUploads on=92/off=8, mipFlags [true,false], far-camera content 0.978/divergence 0.994, suite-1 green). No brightness/lighting/golden changes; production default path untouched (debug views gated, default 0).
+follow-ups left visible (not 2B blockers): (1) PROOF-4 near-camera far/mip fixtures read 0/0 post-fix — mechanism documented (atlas-bleed removal + settled invariance + Bayer/clamp dither math at these cameras; baseline 169895 measured bleed + unsettled first-submit), asserts untouched, repair to FOLLOW-5. (2) Stale per-context 1282 on first-submit/fixture frames — uploads/draws exonerated, zero pixel impact; precise hooks landed; root-cause to lifecycle/driver-quirk note.
