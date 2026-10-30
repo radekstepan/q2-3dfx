@@ -19,7 +19,8 @@
     "bench:compare-diff": "node ./compare-diff.mjs",
     "bench:ab": "node ./ab-run.mjs",
     "bench:browser-soak": "node ./browser-soak.mjs",
-    "bench:gpu-soak": "node ./gpu-soak.mjs"
+    "bench:gpu-soak": "node ./gpu-soak.mjs",
+    "bench:gpu-route": "node ./gpu-route.mjs"
   },
   "dependencies": {
     "@q2/bsp": "workspace:*",

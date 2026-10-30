@@ -1,0 +1,225 @@
+{
+  "manifestVersion": 1,
+  "kind": "browser-soak",
+  "date": "2026-10-30T00:34:00.185Z",
+  "command": {
+    "argv": [
+      "/home/radek/.nvm/versions/node/v22.23.4/bin/node",
+      "/home/radek/dev/q2-3dfx/q2ts/tools/bench/gpu-route.mjs"
+    ],
+    "env": {
+      "Q2_PAK": "/home/radek/dev/q2-3dfx/external/q2/baseq2/pak0.pak",
+      "CHROMIUM_BIN": "/usr/bin/chromium"
+    },
+    "cwd": "/home/radek/dev/q2-3dfx/q2ts/tools/bench"
+  },
+  "commitShort": "4807261",
+  "commitFull": "4807261cd8c64a02d87dc451a45640109e1d8f3b",
+  "treeDirty": true,
+  "distFresh": {
+    "fresh": false,
+    "distMtimeMs": 1793320342768.7646,
+    "newestSrcMtimeMs": 1793320337781.8147,
+    "newestSrcFile": "/home/radek/dev/q2-3dfx/q2ts/packages/testkit/src/gpu-scene-semantics.ts"
+  },
+  "pak": {
+    "path": "/home/radek/dev/q2-3dfx/external/q2/baseq2/pak0.pak",
+    "bytes": 183997730,
+    "mtimeMs": 1546741086000,
+    "mtimeIso": "2019-01-06T02:18:06.000Z",
+    "missing": false
+  },
+  "machine": {
+    "platform": "linux",
+    "arch": "x64",
+    "cpus": "8",
+    "cpuModel": "AMD Ryzen 5 PRO 2400G with Radeon Vega Graphics",
+    "node": "v22.23.4",
+    "date": "2026-10-30T00:34:00.086Z",
+    "memTotalMB": "15417",
+    "memFreeMB": "8448",
+    "load1": "14.89",
+    "load5": "5.78",
+    "load15": "3.27",
+    "quietOk": "false"
+  },
+  "node": "v22.23.4",
+  "browser": {
+    "name": "chromium",
+    "version": "Chromium 156.0.8078.47 for Linux Mint",
+    "headless": true
+  },
+  "compositor": "hardware",
+  "loadavg": [
+    14.89,
+    5.78,
+    3.27
+  ],
+  "cpus": 8,
+  "quietOk": false,
+  "fidelity": {
+    "vd": {
+      "vd_gamma": "1.3",
+      "vd_dither": "1",
+      "vd_16bit": "1",
+      "vd_postfilter": "1",
+      "vd_bilinear": "1",
+      "vd_mipdither": "1",
+      "vd_lodbias": "-0.35",
+      "vd_fog": "1",
+      "vd_overbright": "1",
+      "vd_palettetex": "1",
+      "vd_maxtexsize": "256",
+      "vd_zbits": "16",
+      "vd_dithermode": "4x4",
+      "vd_reconmode": "2x2sub+2x2box",
+      "vd_rgbmaxdelta": "8,8,8"
+    },
+    "sw": {
+      "sw_workers": "7",
+      "sw_accum": "1"
+    }
+  },
+  "warmup": 3,
+  "reps": 15,
+  "workers": [
+    7
+  ],
+  "resultFile": "/home/radek/dev/q2-3dfx/q2ts/tools/bench/evidence/raw/browser-soak-4807261-2026-10-30T00-34-00.json",
+  "summary": {
+    "resolution": "640x480",
+    "renderer": "webgl2-experimental",
+    "durationS": 15.193999999999999,
+    "samples": 15,
+    "presentedFpsMedian": 59.36553902856391,
+    "frameP50Ms": 16.924999999813735,
+    "frameP95Ms": 28.144999999552965,
+    "frameMaxMs": 523.8650000002235,
+    "hardwareBacked": true,
+    "compositor": "hardware",
+    "treeDirtyFiles": 10
+  },
+  "soak": {
+    "schemaVersion": 1,
+    "commitShort": "4807261",
+    "commitFull": "4807261cd8c64a02d87dc451a45640109e1d8f3b",
+    "date": "2026-10-30T00:34:00.179Z",
+    "browser": {
+      "name": "chromium",
+      "version": "Chromium 156.0.8078.47 for Linux Mint",
+      "headless": true
+    },
+    "compositor": "hardware",
+    "compositorDetail": "ANGLE (AMD, AMD Radeon Vega 11 Graphics (radeonsi raven ACO), OpenGL ES 3.2)",
+    "hardwareBacked": true,
+    "page": "vite-dev ?q2soak=1 renderer=webgl2-experimental fixed-route stationary/moving/combat (see raw)",
+    "resolution": "640x480",
+    "width": 640,
+    "height": 480,
+    "renderer": "webgl2-experimental",
+    "workers": [
+      7
+    ],
+    "durationS": 15.193999999999999,
+    "samples": 15,
+    "presentedFpsMedian": 59.36553902856391,
+    "frameP50Ms": 16.924999999813735,
+    "frameP95Ms": 28.144999999552965,
+    "frameMaxMs": 523.8650000002235,
+    "workloads": [
+      "stationary",
+      "moving",
+      "combat"
+    ],
+    "notes": "gpu-route 2026-10-30T00-33-22 webgl2-experimental: gl=ANGLE (AMD, AMD Radeon Vega 11 Graphics (radeonsi raven ACO), OpenGL ES 3.2) actual=webgl2-experimental warn=null attack=locked-mouse moveEcho=true refresh~56.3Hz(BeginFrames rAF rate = submission-cadence work headroom, NOT display refresh; vsync unverified headless; dropped=rAF gaps>=34ms, NOT compositor drops) cells=4 yawSpan=583.5deg submitΔtotal=287+299+280 errors=0 route-timings report-only (NOT an optimization campaign). Raw+shots: /home/radek/dev/q2-3dfx/q2ts/tools/bench/evidence/raw/gpu-route-2026-10-30T00-33-22-webgl2-experimental.json. No display vsync: headless cadence never claims displayed 60 FPS; async GPU duration unknown (no timer query).",
+    "rawFile": null,
+    "fidelity": {
+      "vd": {
+        "vd_gamma": "1.3",
+        "vd_dither": "1",
+        "vd_16bit": "1",
+        "vd_postfilter": "1",
+        "vd_bilinear": "1",
+        "vd_mipdither": "1",
+        "vd_lodbias": "-0.35",
+        "vd_fog": "1",
+        "vd_overbright": "1",
+        "vd_palettetex": "1",
+        "vd_maxtexsize": "256",
+        "vd_zbits": "16",
+        "vd_dithermode": "4x4",
+        "vd_reconmode": "2x2sub+2x2box",
+        "vd_rgbmaxdelta": "8,8,8"
+      },
+      "sw": {
+        "sw_workers": "7",
+        "sw_accum": "1"
+      }
+    },
+    "warmupS": 3,
+    "pak": {
+      "path": "/home/radek/dev/q2-3dfx/external/q2/baseq2/pak0.pak",
+      "bytes": 183997730,
+      "mtimeMs": 1546741086000,
+      "mtimeIso": "2019-01-06T02:18:06.000Z",
+      "missing": false
+    },
+    "machineDetail": {
+      "platform": "linux",
+      "arch": "x64",
+      "cpus": "8",
+      "cpuModel": "AMD Ryzen 5 PRO 2400G with Radeon Vega Graphics",
+      "node": "v22.23.4",
+      "date": "2026-10-30T00:34:00.086Z",
+      "memTotalMB": "15417",
+      "memFreeMB": "8448",
+      "load1": "14.89",
+      "load5": "5.78",
+      "load15": "3.27",
+      "quietOk": "false"
+    },
+    "sourceDirty": true,
+    "sourceDirtyFiles": [
+      "M apps/web/src/soak.ts",
+      "M packages/testkit/src/index.ts",
+      "M tools/bench/package.json",
+      "M tools/bench/src/index.ts",
+      "?? packages/testkit/src/gpu-scene-semantics.test.ts",
+      "?? packages/testkit/src/gpu-scene-semantics.ts",
+      "?? tools/bench/evidence/browser-soak-4807261-2026-10-30T00-31-03.manifest.json",
+      "?? tools/bench/gpu-route.mjs",
+      "?? tools/bench/src/gpu-route.test.ts",
+      "?? tools/bench/src/gpu-route.ts"
+    ],
+    "chromiumFlags": [
+      "--use-angle=gl-egl"
+    ],
+    "cvarSnapshot": {
+      "vid_renderer": "webgl2-experimental",
+      "vid_resolution": "640x480",
+      "sw_workers": "7",
+      "sw_accum": "1",
+      "vd_gamma": "1.3",
+      "vd_dither": "1",
+      "vd_16bit": "1",
+      "vd_postfilter": "1",
+      "vd_bilinear": "1",
+      "vd_mipdither": "1",
+      "vd_lodbias": "-0.35",
+      "vd_fog": "1",
+      "vd_overbright": "1",
+      "vd_palettetex": "1",
+      "vd_maxtexsize": "256",
+      "vd_zbits": "16",
+      "vd_dithermode": "4x4",
+      "vd_reconmode": "2x2sub+2x2box",
+      "vd_rgbmaxdelta": "8,8,8"
+    },
+    "refreshHz": 56.33802816901409,
+    "vsync": false,
+    "droppedFrames": 16,
+    "cpuFallback": false,
+    "limitations": null
+  },
+  "ledgerHint": "| 2026-10-30 | 4807261 | browser-soak (hardware,hw) | 640x480 webgl2-experimental presented 59.36553902856391fps p95 28.144999999552965ms | evidence: browser-soak-4807261-2026-10-30T00-34-00.manifest.json |"
+}

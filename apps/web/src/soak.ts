@@ -11,9 +11,11 @@
 // page only exposes state readers (`__q2soakState`, `__q2soakCvars`) so the
 // runner can verify inputs took effect. No renderer/backend/policy changes.
 import { getCVarString, setCVarFromString } from '@q2/config';
+import { v3 } from '@q2/math';
+import { cameraCluster } from '@q2/webgl-renderer';
 import { startPlayLoop } from './dom.js';
 import type { PlayBoot } from './play.js';
-import { bootPlay, getGpuStatus, playerPosText } from './play.js';
+import { bootPlay, buildAsyncView, getGpuStatus, playerPosText } from './play.js';
 import { ingestPak } from './pak.js';
 
 /** Soak framebuffer geometry (GPU-PROOF-1 gate resolution, both legs). */
@@ -236,7 +238,271 @@ declare global {
     __q2soakFrames?: number[];
     __q2soakState?: () => SoakState;
     __q2soakCvars?: () => Record<string, string>;
+    __q2soakRoute?: () => SoakRouteSnapshot | null;
   }
+}
+
+/**
+ * One brush-mover route sample (GPU-FOLLOW-2C live-route observability).
+ */
+export interface SoakRouteMover {
+  /** Brush model name (`*N`) or null when the edict carries none. */
+  model: string | null;
+  /** Server mover state-machine state (`bottom`, `going_up`, `top`, ...). */
+  state: string;
+  /** Authoritative server origin (world units). */
+  origin: [number, number, number];
+  /** Render-side displacement from the closed pose (null when untracked). */
+  offset: [number, number, number] | null;
+  /** Magnitude of the render offset (null when untracked). */
+  offsetMag: number | null;
+}
+
+/** One brush-train (lift/plug) route sample. */
+export interface SoakRouteTrain {
+  /** Brush model name (`*N`) or null when the edict carries none. */
+  model: string | null;
+  started: boolean;
+  arrived: boolean;
+  origin: [number, number, number];
+}
+
+/**
+ * Live-route snapshot for the FOLLOW-2C coverage leg (additive reader:
+ * `SoakState` is untouched so the bench importer never changes). The CDP
+ * runner polls `window.__q2soakRoute` per leg and records camera, cluster,
+ * mover/train, enemy, viewmodel, material and submission state next to each
+ * composed-page screenshot.
+ */
+export interface SoakRouteSnapshot {
+  frame: number;
+  camera: { origin: [number, number, number]; angles: [number, number, number] } | null;
+  /** PVS cluster at the camera (`cameraCluster`; -1 = outside/no row). */
+  cluster: number | null;
+  movers: SoakRouteMover[];
+  trains: SoakRouteTrain[];
+  aliveMonsters: number;
+  /** Distinct alive monster kinds (`soldier`, `gunner`, `infantry`, ...). */
+  monsterKinds: string[];
+  /** First-person viewmodel (`depthHack` gun) or null when unregistered. */
+  viewmodel: { model: number; skin: number; frame: number } | null;
+  /**
+   * Required pak model/skin handles (null without a pak boot): lets the
+   * runner prove every required mesh/skin resolved to a registered handle.
+   */
+  handles: {
+    monster: number;
+    gunner: number;
+    infantry: number;
+    barrel: number;
+    bolt: number;
+    monsterSkin: number;
+    gunnerSkin: number;
+    infantrySkin: number;
+    barrelSkin: number;
+    boltSkin: number;
+    weapons: number[];
+    weaponSkins: number[];
+  } | null;
+  registeredModels: number[];
+  registeredSkins: number[];
+  uploads: number | null;
+  framesSubmitted: number | null;
+  /** Backend warnings (capped): any entry fails the route's health gate. */
+  warnings: string[];
+  materials: { diffuse: number; skins: number; atlas: boolean; warnings: number } | null;
+  /** Submitted-scene census (world opaque/transparent + entity refs). */
+  scene: { worldOpaque: number; worldTransparent: number; entityRefs: number; staticTotal: number } | null;
+}
+
+/** Cap for the mover list in a route snapshot (bounded, never truncated silently in tests). */
+export const SOAK_ROUTE_MOVER_CAP = 128;
+
+/** Cap for the warnings list in a route snapshot. */
+export const SOAK_ROUTE_WARNING_CAP = 24;
+
+/**
+ * Read the live-route snapshot (FOLLOW-2C leg observability). Null before
+ * the soak boot lands. Never throws: every section degrades to its null
+ * sentinel so a probe fault cannot break the game loop or the runner poll.
+ */
+export function readSoakRoute(): SoakRouteSnapshot | null {
+  const boot = soakBoot;
+  if (!boot) return null;
+  const g = globalThis as unknown as {
+    __q2stats?: { frame?: unknown; fps?: unknown };
+  };
+  const stats = g.__q2stats;
+  const frame = typeof stats?.frame === 'number' ? stats.frame : 0;
+  let camera: SoakRouteSnapshot['camera'] = null;
+  let cluster: number | null = null;
+  try {
+    const acc = boot.gpu ? boot.gpu.loop.serverAcc : 0;
+    const built = buildAsyncView(boot.host, acc);
+    const o = built.view.origin;
+    const a = built.view.angles;
+    camera = {
+      origin: [o[0] as number, o[1] as number, o[2] as number],
+      angles: [a[0] as number, a[1] as number, a[2] as number],
+    };
+    try {
+      cluster = cameraCluster(boot.driver.mini, v3(o[0] as number, o[1] as number, o[2] as number));
+    } catch {
+      cluster = null;
+    }
+  } catch {
+    camera = null;
+    cluster = null;
+  }
+  const movers: SoakRouteMover[] = [];
+  try {
+    for (const m of boot.driver.server.movers.slice(0, SOAK_ROUTE_MOVER_CAP)) {
+      const model = typeof m.ent.model === 'string' ? m.ent.model : null;
+      const e = m.ent.origin;
+      const origin: [number, number, number] = [e[0] as number, e[1] as number, e[2] as number];
+      let offset: [number, number, number] | null = null;
+      let offsetMag: number | null = null;
+      try {
+        if (model !== null) {
+          const off = boot.driver.doorRenderOffset(model);
+          if (off) {
+            offset = [off[0], off[1], off[2]];
+            offsetMag = Math.hypot(off[0], off[1], off[2]);
+          }
+        }
+      } catch {
+        offset = null;
+        offsetMag = null;
+      }
+      movers.push({ model, state: String(m.state), origin, offset, offsetMag });
+    }
+  } catch {
+    /* movers best-effort */
+  }
+  const trains: SoakRouteTrain[] = [];
+  try {
+    for (const tr of boot.driver.server.trains.slice(0, SOAK_ROUTE_MOVER_CAP)) {
+      const model = typeof tr.ent.model === 'string' ? tr.ent.model : null;
+      const e = tr.ent.origin;
+      trains.push({
+        model,
+        started: tr.started === true,
+        arrived: tr.arrived === true,
+        origin: [e[0] as number, e[1] as number, e[2] as number],
+      });
+    }
+  } catch {
+    /* trains best-effort */
+  }
+  let aliveMonsters = -1;
+  let monsterKinds: string[] = [];
+  try {
+    aliveMonsters = boot.driver.aliveMonsters;
+    const kinds = new Set<string>();
+    for (const m of boot.driver.monsters) {
+      if (!m.state.dead) kinds.add(String(m.state.kind));
+    }
+    monsterKinds = [...kinds].sort();
+  } catch {
+    aliveMonsters = -1;
+    monsterKinds = [];
+  }
+  let viewmodel: SoakRouteSnapshot['viewmodel'] = null;
+  try {
+    const vm = boot.driver.viewModel();
+    if (vm) viewmodel = { model: vm.model, skin: vm.skin, frame: vm.frame };
+  } catch {
+    viewmodel = null;
+  }
+  let handles: SoakRouteSnapshot['handles'] = null;
+  try {
+    const models = boot.models;
+    if (models) {
+      handles = {
+        monster: models.monster,
+        gunner: models.gunner,
+        infantry: models.infantry,
+        barrel: models.barrel,
+        bolt: models.bolt,
+        monsterSkin: models.monsterSkin,
+        gunnerSkin: models.gunnerSkin,
+        infantrySkin: models.infantrySkin,
+        barrelSkin: models.barrelSkin,
+        boltSkin: models.boltSkin,
+        weapons: Object.values(models.weapons),
+        weaponSkins: Object.values(models.weaponSkins),
+      };
+    }
+  } catch {
+    handles = null;
+  }
+  let registeredModels: number[] = [];
+  let registeredSkins: number[] = [];
+  let uploads: number | null = null;
+  let framesSubmitted: number | null = null;
+  let warnings: string[] = [];
+  let materials: SoakRouteSnapshot['materials'] = null;
+  try {
+    if (boot.gpu) {
+      try {
+        registeredModels = boot.gpu.gpu.testRegisteredModels();
+      } catch {
+        registeredModels = [];
+      }
+      try {
+        registeredSkins = boot.gpu.gpu.testRegisteredSkins();
+      } catch {
+        registeredSkins = [];
+      }
+      try {
+        uploads = boot.gpu.gpu.testUploadStats().uploads;
+      } catch {
+        uploads = null;
+      }
+      try {
+        framesSubmitted = boot.gpu.gpu.getStatus().framesSubmitted;
+      } catch {
+        framesSubmitted = null;
+      }
+      try {
+        warnings = boot.gpu.gpu.testWarnings().slice(0, SOAK_ROUTE_WARNING_CAP);
+      } catch {
+        warnings = [];
+      }
+      try {
+        const mat = boot.gpu.gpu.testMaterialStats();
+        materials = { diffuse: mat.diffuseTextures, skins: mat.skinTextures, atlas: mat.atlas, warnings: mat.warnings };
+      } catch {
+        materials = null;
+      }
+    }
+  } catch {
+    /* gpu stats best-effort */
+  }
+  let scene: SoakRouteSnapshot['scene'] = null;
+  try {
+    if (boot.gpu) {
+      let worldOpaque = 0;
+      let worldTransparent = 0;
+      let entityRefs = 0;
+      for (const r of boot.gpu.scene.surfaces) {
+        if (r.transformIndex === 0) {
+          if (r.transparent) worldTransparent++;
+          else worldOpaque++;
+        } else {
+          entityRefs++;
+        }
+      }
+      scene = { worldOpaque, worldTransparent, entityRefs, staticTotal: boot.gpu.staticScene.surfaces.length };
+    }
+  } catch {
+    scene = null;
+  }
+  return {
+    frame, camera, cluster, movers, trains, aliveMonsters, monsterKinds,
+    viewmodel, handles, registeredModels, registeredSkins, uploads, framesSubmitted,
+    warnings, materials, scene,
+  };
 }
 
 /** The live boot behind the soak readers (module-scoped, soak-mode only). */
@@ -380,6 +646,7 @@ export async function runSoakBoot(params: SoakParams): Promise<void> {
       if (win) {
         win.__q2soakState = () => readSoakState(status);
         win.__q2soakCvars = () => readSoakCvarSnapshot(SOAK_CVAR_SNAPSHOT_KEYS);
+        win.__q2soakRoute = () => readSoakRoute();
       }
     } catch {
       /* readers best-effort */

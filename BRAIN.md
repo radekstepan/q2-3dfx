@@ -9,8 +9,9 @@
 > This file states the rules and the *active* work. Everything else is a pointer.
 > **Current direction (2026-10-29): user reports mostly 60 FPS at 640×480 and
 > no visible broken textures/black spots. GPU-FOLLOW-2B is DONE (committed +
-> real-browser evidence); work the short remaining §8 queue next (2C → 3 → 4
-> → 5/6 → 7). Preserve gains; CPU optimization stays paused.**
+> real-browser evidence); GPU-FOLLOW-2C is DONE (3-lane integration below);
+> work the short remaining §8 queue next (3 → 4 → 5/6 → 7). Preserve gains;
+> CPU optimization stays paused.**
 
 ---
 
@@ -273,7 +274,7 @@ before claiming ownership.
 | WebGL scene/backend and appearance prototype | Implemented; retain CPU reference/fallback |
 | FOLLOW-0 black CSS overlay/alignment | Done, `4dd7fc0`; page now visibly renders |
 | FOLLOW-1 acceptance/reporting corrections | Done, `f05e0ba` + `a53baf4`; retain rejection gates |
-| FOLLOW-2 full-map storage/current-view selection | Implemented, `f05e0ba`; remaining live route validation is ONLY FOLLOW-2C |
+| FOLLOW-2 full-map storage/current-view selection + FOLLOW-2C live-route validation | DONE (2C integrated below); full-map store + live multi-room/turn/door/lift route with semantic coverage + report-only timings |
 | FOLLOW-2A model/skin replay and switches | Done, `866a553`; replay retained assets without restarting game |
 | FOLLOW-2B textures/lightmaps | DONE (`3467ddd` + `ee180f2`); all 7 boxes evidenced (stub + real-GL); 2 follow-ups filed (PROOF-4 far/mip fixture → FOLLOW-5; stale first-submit 1282 → lifecycle note) |
 | Full gameplay coverage, lifecycle and final acceptance | Remaining cards below |
@@ -285,7 +286,7 @@ historical, not instructions to reimplement completed/current repairs.
 
 ### Execution rules for the remaining queue
 
-- Continue existing FOLLOW-2B ownership, then 2C → 3 → 4 → 5/6 → 7. FOLLOW-5 and 6
+- Continue 3 → 4 → 5/6 → 7 (2B/2C done and integrated). FOLLOW-5 and 6
   may run independently after 4 when package ownership permits. Exactly one writer
   per package; delegate independent lanes under §7; integrator owns shared docs,
   changesets and commits. Keep card IDs stable for the LLM already working.
@@ -349,13 +350,13 @@ done-when:
 ### GPU-FOLLOW-2C — Prove live map completeness and close visibility validation
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`, `tools/bench`
 depends: GPU-FOLLOW-2B
-status: ready
+status: done (3-lane integration below; lane report in `docs/tasks-archive.md`)
 done-when:
-- [ ] Drive the production page through actual multi-room translation/PVS transitions, a 180-degree turn and opening/closing doors plus a lift. Record camera/cluster changes and mover state; selecting two synthetic views is not a live route.
-- [ ] Use independent expectations for named wall/floor/ceiling regions and opaque occlusion (CPU reference or known fixture geometry), plus real composed-page captures. A fresh and reselected GPU renderer agreeing does not prove either one is complete.
-- [ ] Prove specific alive enemies/viewmodel and textured surfaces persist through movement and switches; fail on missing required meshes/skins, upload errors or unexplained holes. Preserve the earlier TURN equality test as a narrower regression.
-- [ ] Feed semantic content/occlusion results into validateSceneCoverage and tests that reject a scene with an intentionally removed wall/enemy even when frames, uploads and screenshot counts look healthy. Keep helper/type ownership explicit across bench/testkit.
-- [ ] Record report-only route timings on the now-complete scene, not a new optimization campaign. Close the remaining FOLLOW-2 validation here only with this evidence (the old card is historical); full final soak remains FOLLOW-6.
+- [x] Drive the production page through actual multi-room translation/PVS transitions, a 180-degree turn and opening/closing doors plus a lift. Record camera/cluster changes and mover state; selecting two synthetic views is not a live route. (Lane A `apps/web/src/gpu-live-route.test.ts`: stub 820 frames/16 clusters/odometer ~855, door *32 open+close peak 35.0, lift *13 ride peak 56.0; real-page CDP legs stationary/translate/turn with cluster 631→1166 + per-leg screenshots + consoleErrors [])
+- [x] Use independent expectations for named wall/floor/ceiling regions and opaque occlusion (CPU reference or known fixture geometry), plus real composed-page captures. A fresh and reselected GPU renderer agreeing does not count as proof on its own. (Lane B CPU-oracle fixture + `deriveSemanticOracle`; live-route capture input shape `LiveRouteSemanticCapture`; real-page leg screenshots)
+- [x] Prove specific alive enemies/viewmodel and textured surfaces persist through movement and switches; fail on missing required meshes/skins, upload errors or unexplained holes. Preserve the earlier TURN equality test as a narrower regression. (Lane A infantry+soldier alive, viewmodel, worldOpaque counts, missing/upload gates stub+browser; TURN equality untouched green)
+- [x] Feed semantic content/occlusion results into validateSceneCoverage and tests that reject a scene with an intentionally removed wall/enemy even when frames, uploads and screenshot counts look healthy. Keep helper/type ownership explicit across bench/testkit. (Lane B `validateSceneCoverageAndContent` successor gate, 12/12: removed wall/floor/ceiling/enemy/viewmodel, occluder leak, missing waypoint, upload errors, stalled submissions; bench keeps its by-value duplicate, no type duplication)
+- [x] Record report-only route timings on the now-complete scene, not a new optimization campaign. Close the remaining FOLLOW-2 validation here only with this evidence (the old card is historical); full final soak remains FOLLOW-6. (Lane C `tools/bench/gpu-route.mjs`: Vega 11 hardware GL, stationary 60.01 / moving 60.07 / combat 58.23 fps, p95 ≤22.85ms, dropped 6, uploads 1, displayed claims VOID; bench changeset-ignored per convention)
 
 ### GPU-FOLLOW-3 — Complete live effects and required world appearance
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`

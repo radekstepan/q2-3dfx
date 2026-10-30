@@ -66,6 +66,15 @@ export {
   type GpuSoakLegNumbers, type GpuWorkSplits,
 } from './gpu-soak.js';
 export {
+  GPU_ROUTE_SEGMENTS, GPU_ROUTE_SCRIPT,
+  parseRoutePos, regionCellKey, distinctRouteRegions, yawSpanDeg,
+  buildRouteSegmentReport, summarizeRoute, describeRouteCadenceEvidence,
+  routeComparabilityNote, buildRouteReport, renderRouteTable,
+  type GpuRouteSegment, type GpuRouteCameraSample, type GpuRouteSegmentInput,
+  type GpuRouteSegmentReport, type GpuRouteSummary, type GpuRouteReportInput,
+  type GpuRouteReport,
+} from './gpu-route.js';
+export {
   GPU_FIDELITY_MAX_FRACTION_DIFF, GPU_FIDELITY_PER_CHANNEL_LSB,
   GPU_FIDELITY_EDGE_EXCLUDE_PX, GPU_FIDELITY_MAX_ABS_DELTA_WARN,
   validateGpuFidelity, validateSceneCoverage, validateDisplayedClaim,
