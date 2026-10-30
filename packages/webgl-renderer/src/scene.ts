@@ -136,15 +136,50 @@ export function cameraCluster(world: MiniWorld, origin: Vec3): number {
 /**
  * Build the persistent GPU scene input for one map + view. Pure:
  * GL-free, DOM-free, no renderer state. Per-scene-build garbage only.
+ *
+ * Storage vs selection (GPU-FOLLOW-2): the renderer uploads the FULL world
+ * inventory ONCE (see fullWorldRefs: every triangulable surface, no camera
+ * culling) and draws the per-frame SELECTION below. Call refreshGpuScene
+ * every frame the camera moves — never reuse a spawn-view subset, or turning
+ * can never recover the surfaces it culled.
  */
-export function selectGpuScene(
+/**
+ * Persistent full-map world inventory (GPU-FOLLOW-2 storage side): every
+ * triangulable surface (n >= 3), classified but NEVER camera-culled (no PVS,
+ * no frustum, no backface) and with order 0 (distances are view-dependent
+ * and recomputed per frame by refreshGpuScene). The renderer uploads this
+ * set once per static generation; per-frame drawing uses the selection.
+ */
+export function fullWorldRefs(world: MiniWorld): GpuSurfaceRef[] {
+  const refs: GpuSurfaceRef[] = [];
+  for (let si = 0; si < world.surfaces.length; si++) {
+    const s = world.surfaces[si];
+    if (!s || s.n < 3) continue; // degenerate/NODRAW placeholder: no triangles
+    const cls = classifyWorldSurface(s);
+    refs.push({
+      surfaceId: si,
+      material: cls.material,
+      materialHandle: cls.material === 'sky' ? -1 : s.texId,
+      transparent: cls.transparent,
+      order: 0,
+      transformIndex: 0,
+    });
+  }
+  return refs;
+}
+
+/**
+ * Current-camera world draw selection (GPU-FOLLOW-2 selection side): the
+ * PVS/frustum/backface-filtered, classified, distance-ordered world refs for
+ * exactly the handed view. Pure; call per frame (or whenever the camera
+ * moves) — the result is a fresh array the renderer draws in order.
+ */
+export function selectWorldRefs(
   world: MiniWorld,
-  entities: Entity[],
   view: RefDef,
   width: number,
   height: number,
-  modelKinds?: ReadonlyMap<number, GpuEntityModelKind>,
-): GpuSceneInput {
+): GpuSurfaceRef[] {
   const origin = view.origin;
   const cam = setupCamera(origin, view.angles, view.fovX, width, height);
   const ox = origin[0]!;
@@ -191,11 +226,41 @@ export function selectGpuScene(
     };
     (cls.transparent ? transparent : opaque).push(ref);
   }
+  // Blend pass sorted far -> near (larger order = farther); opaque stays in
+  // surface-id order (draw order is irrelevant under depth testing).
+  transparent.sort((a, b) => b.order - a.order);
+  return [...opaque, ...transparent];
+}
 
-  // Entity refs: appended unconditionally (PROOF-2 does no entity culling).
+/**
+ * Per-frame scene refresh (GPU-FOLLOW-2): fresh world selection for the
+ * current view (selectWorldRefs) plus the entity-ref tail with the same
+ * classification the selector uses (kind from modelKinds, transparent bit
+ * from alpha, order = camera distance), world + entity blend refs combined
+ * far->near. Returns a full GpuSceneInput (fresh surfaces array + yaw-only
+ * transform slots); the caller passes `generation` through so persistent
+ * uploads stay put across re-selections.
+ */
+export function refreshGpuScene(
+  world: MiniWorld,
+  entities: Entity[],
+  view: RefDef,
+  width: number,
+  height: number,
+  modelKinds?: ReadonlyMap<number, GpuEntityModelKind>,
+  generation: number = GPU_SCENE_GENERATION,
+): GpuSceneInput {
+  const worldRefs = selectWorldRefs(world, view, width, height);
+  const worldOpaque = worldRefs.filter((r) => !r.transparent);
+  const worldTransparent = worldRefs.filter((r) => r.transparent);
+
+  // Entity refs: appended unconditionally (no entity frustum culling).
   const transforms: Float32Array[] = [identityTransform()];
   const entityOpaque: GpuSurfaceRef[] = [];
   const entityTransparent: GpuSurfaceRef[] = [];
+  const ox = view.origin[0]!;
+  const oy = view.origin[1]!;
+  const oz = view.origin[2]!;
   for (let i = 0; i < entities.length; i++) {
     const e = entities[i]!;
     const material = entityMaterial(modelKinds?.get(e.model));
@@ -215,12 +280,39 @@ export function selectGpuScene(
   }
 
   // Opaque batch first (surface-id order, then entity order), transparent
-  // blend pass sorted far -> near (larger order = farther).
-  transparent.push(...entityTransparent);
+  // blend pass sorted far -> near (larger order = farther). World + entity
+  // transparent refs combine into ONE sequence so the draw pass orders them
+  // by distance instead of retaining the old view's blend order.
+  const transparent = [...worldTransparent, ...entityTransparent];
   transparent.sort((a, b) => b.order - a.order);
   return {
-    surfaces: [...opaque, ...entityOpaque, ...transparent],
+    surfaces: [...worldOpaque, ...entityOpaque, ...transparent],
     transforms,
-    staticGeneration: GPU_SCENE_GENERATION,
+    staticGeneration: generation,
   };
+}
+
+/**
+ * Build the persistent GPU scene input for one map + view. Pure:
+ * GL-free, DOM-free, no renderer state. Per-scene-build garbage only.
+ *
+ * Thin wrapper over refreshGpuScene (identical output at the base
+ * generation): prefer refreshGpuScene for per-frame updates — it carries the
+ * generation through so re-selections never re-upload.
+ *
+ * Storage vs selection (GPU-FOLLOW-2): the renderer uploads the FULL world
+ * inventory ONCE (see fullWorldRefs: every triangulable surface, no camera
+ * culling) and draws the per-frame SELECTION below. Call refreshGpuScene
+ * every frame the camera moves — never reuse a spawn-view subset, or turning
+ * can never recover the surfaces it culled.
+ */
+export function selectGpuScene(
+  world: MiniWorld,
+  entities: Entity[],
+  view: RefDef,
+  width: number,
+  height: number,
+  modelKinds?: ReadonlyMap<number, GpuEntityModelKind>,
+): GpuSceneInput {
+  return refreshGpuScene(world, entities, view, width, height, modelKinds, GPU_SCENE_GENERATION);
 }

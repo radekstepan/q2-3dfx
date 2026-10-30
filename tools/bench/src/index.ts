@@ -52,7 +52,7 @@ export {
   evidenceDir, evidenceRawDir, provenanceEnv, pakIdentity, collectFidelityProfile,
   collectMachine, collectNodeProvenance, defaultResultPath, defaultManifestPath,
   buildNodeManifest, writeEvidenceManifest, summarizeAttrRows, summarizeCompare,
-  ledgerHintFor, validateBrowserSoak, importBrowserSoak,
+  ledgerHintFor, validateBrowserSoak, importBrowserSoak, gitDirtyFiles,
   type EvidenceKind, type BrowserCompositor, type PakIdentity, type FidelityProfile,
   type ProvenanceCommand, type BrowserInfo, type AttrLike, type MovingLike,
   type EvidenceCore, type EvidenceManifest, type BrowserSoakRecord,
@@ -61,9 +61,18 @@ export {
 export {
   percentile, frameIntervals, summarizeFrameTimes, cadenceFps, countDroppedBeats,
   classifyCompositor, buildSoakRecord, buildGpuProofRecord, renderLegNumbersTable,
+  describeTimingKinds,
   type FrameIntervalSummary, type GpuSoakLegInput, type GpuSoakGateInput,
-  type GpuSoakLegNumbers,
+  type GpuSoakLegNumbers, type GpuWorkSplits,
 } from './gpu-soak.js';
+export {
+  GPU_FIDELITY_MAX_FRACTION_DIFF, GPU_FIDELITY_PER_CHANNEL_LSB,
+  GPU_FIDELITY_EDGE_EXCLUDE_PX, GPU_FIDELITY_MAX_ABS_DELTA_WARN,
+  validateGpuFidelity, validateSceneCoverage, validateDisplayedClaim,
+  formatGpuAcceptanceReport,
+  type GpuFidelityMeasurement, type GpuCoverageEvidence, type GpuDisplayedClaim,
+  type GpuAcceptanceVerdict, type GpuAcceptanceInput,
+} from './gpu-acceptance.js';
 
 export async function runBenchTool(opts: BenchOptions = {}): Promise<string> {
   const width = opts.width ?? 640;

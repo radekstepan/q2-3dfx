@@ -531,7 +531,16 @@ async function runLeg(ctx, renderer) {
       log(`leg ${renderer}: interval ${name} done frames ${fStart}->${fEnd} over ${durS.toFixed(1)}s samples=${samples.length}`);
     }
     const consoleLines = cdp.consoleLines();
-    return { renderer, isGpu, status, cvarSnap, intervals, consoleLines, legErrors, rafProbe, attackMethod, moveOk };
+    // FOLLOW-1: sample the page work-split conveyor (main-thread caller-clock
+    // medians drains/sim/view/tail/submit/total). submitMs is submission work,
+    // NEVER measured GPU execution; async GPU duration stays unknown here.
+    let workSplits = null;
+    try {
+      workSplits = await cdp.evaluate('window.__q2soakWork ? window.__q2soakWork() : null', 15000);
+    } catch {
+      workSplits = null;
+    }
+    return { renderer, isGpu, status, cvarSnap, intervals, consoleLines, legErrors, rafProbe, attackMethod, moveOk, workSplits };
   } finally {
     try { if (cdp) await cdp.close(); } catch { /* x */ }
     await launched.kill();
@@ -549,7 +558,8 @@ const {
   buildSoakRecord, buildGpuProofRecord, summarizeFrameTimes, frameIntervals,
   cadenceFps, countDroppedBeats, classifyCompositor,
   validateGpuProofBrowserRecord, formatGpuProofGateReport, importBrowserSoak,
-  renderLegNumbersTable,
+  renderLegNumbersTable, describeTimingKinds,
+  collectMachine, pakIdentity, gitDirtyFiles,
 } = lib;
 
 log(`chromium version: ${chromiumVersion()}`);
@@ -606,11 +616,21 @@ for (const renderer of LEGS) {
   const cls = classifyCompositor(leg.status.glRenderer);
   const errCount = leg.legErrors.length + leg.consoleLines.filter((l) => l.startsWith('[exception]')).length;
 
-  // rAF/BeginFrames probe → refreshHz.
+  // rAF/BeginFrames probe → refreshHz (BeginFrames rate = submission-cadence
+  // work headroom, NOT display refresh; headless has no vsync).
   const probeIv = frameIntervals(Array.isArray(leg.rafProbe) ? leg.rafProbe : []);
   const probeSorted = [...probeIv].sort((a, b) => a - b);
   const probeMed = probeSorted.length > 0 ? probeSorted[probeSorted.length >> 1] : null;
   const refreshHz = probeMed && probeMed > 0 ? 1000 / probeMed : null;
+
+  // FOLLOW-1 run-time dirty-tree provenance (captured at RUN time; the
+  // importer-time git status may differ, so the raw carries the run value).
+  let runDirtyFiles = null;
+  try {
+    runDirtyFiles = gitDirtyFiles();
+  } catch {
+    runDirtyFiles = null;
+  }
 
   const perInterval = leg.intervals.map((iv) => {
     const s = summarizeFrameTimes(iv.frameStamps);
@@ -621,11 +641,16 @@ for (const renderer of LEGS) {
   }
 
   // Raw evidence (gitignored raw/ when large).
+  // FOLLOW-1 timing vocabulary: rAF stamps = submission cadence (work
+  // headroom); caller-clock splits = CPU frame work; submitMs is submission
+  // work, NOT GPU execution; async GPU duration is unknown (no timer query);
+  // headless cadence never claims displayed refresh/scanout.
   const rawRecord = {
     kind: 'gpu-soak-leg',
     stamp: STAMP,
     date: new Date().toISOString(),
     commit: git,
+    dirtyFiles: runDirtyFiles,
     browser: { name: 'chromium', version: chromiumVersion(), headless: true },
     chromiumFlags: leg.isGpu ? ['--use-angle=gl-egl'] : ['--disable-gpu', '--enable-unsafe-swiftshader'],
     renderer,
@@ -639,6 +664,8 @@ for (const renderer of LEGS) {
     movementEchoOk: leg.moveOk,
     refreshProbeMedianMs: probeMed,
     refreshHz,
+    timingKinds: 'rAF/submission cadence = unthrottled BeginFrames rate (main-thread work headroom, NOT display refresh); CPU frame work = caller-clock drains/sim/view/tail/submit/total (submitMs is submission work, NOT GPU execution); async GPU duration = unknown (no disjoint-timer query); displayed-frame evidence requires a visible vsync-locked leg',
+    workSplits: leg.workSplits ?? null,
     perInterval,
     summary: { durationS: totalDur, cadenceFps: cadence, ...sumAll, dropped, heapDeltaMB, memSamples: mems.length },
     samples: leg.intervals.map((iv) => ({ name: iv.name, rows: iv.samples })),
@@ -652,9 +679,42 @@ for (const renderer of LEGS) {
   writeFileSync(rawPath, JSON.stringify(rawRecord, null, 1));
   log(`leg ${renderer}: raw ${rawPath} (${allStamps.length} frame stamps, ${(JSON.stringify(rawRecord).length / 1048576).toFixed(1)}MB)`);
 
-  // Committed record via the existing importer.
+  // Committed record via the existing importer (FOLLOW-1 provenance repair).
   const swWorkersRaw = leg.cvarSnap?.sw_workers;
   const swWorkers = Number.isFinite(Number(swWorkersRaw)) ? [Number(swWorkersRaw)] : [0];
+  // Fidelity profile from the page-read cvar snapshot (authoritative vd_*/sw_*).
+  const VD_KEYS = ['vd_gamma', 'vd_dither', 'vd_16bit', 'vd_postfilter', 'vd_bilinear', 'vd_mipdither', 'vd_lodbias', 'vd_fog', 'vd_overbright', 'vd_palettetex', 'vd_maxtexsize', 'vd_zbits', 'vd_dithermode', 'vd_reconmode', 'vd_rgbmaxdelta'];
+  const SW_KEYS = ['sw_workers', 'sw_accum'];
+  let fidelity = null;
+  if (leg.cvarSnap && typeof leg.cvarSnap === 'object') {
+    const vd = {};
+    const sw = {};
+    for (const k of VD_KEYS) if (leg.cvarSnap[k] !== undefined) vd[k] = String(leg.cvarSnap[k]);
+    for (const k of SW_KEYS) if (leg.cvarSnap[k] !== undefined) sw[k] = String(leg.cvarSnap[k]);
+    if (Object.keys(vd).length > 0) fidelity = { vd, sw };
+  }
+  let hostMachine = null;
+  try {
+    hostMachine = await collectMachine();
+  } catch {
+    hostMachine = null;
+  }
+  let pak = null;
+  try {
+    pak = pakIdentity(Q2_PAK);
+  } catch {
+    pak = null;
+  }
+  let dirtyFiles = runDirtyFiles;
+  try {
+    dirtyFiles = gitDirtyFiles() ?? runDirtyFiles;
+  } catch {
+    dirtyFiles = runDirtyFiles;
+  }
+  const cpuFallback = leg.status.warning === null && leg.status.actualRenderer === 'webgl2-experimental' ? false : leg.isGpu ? true : null;
+  const workLine = leg.workSplits && typeof leg.workSplits === 'object'
+    ? `work[submit~${leg.workSplits.submitMs ?? 'n/a'}ms total~${leg.workSplits.totalMs ?? 'n/a'}ms drains~${leg.workSplits.drainsMs ?? 'n/a'} sim~${leg.workSplits.simMs ?? 'n/a'} view~${leg.workSplits.viewMs ?? 'n/a'} tail~${leg.workSplits.tailMs ?? 'n/a'} (caller-clock submission work, NOT GPU execution)]`
+    : 'work[unmeasured: __q2soakWork unavailable]';
   const recordInput = {
     commitShort: git.short, commitFull: git.full,
     browserName: 'chromium', browserVersion: chromiumVersion(), headless: true,
@@ -664,9 +724,21 @@ for (const renderer of LEGS) {
     durationS: totalDur, samples: leg.intervals.reduce((s, iv) => s + iv.samples.length, 0),
     presentedFpsMedian: cadence, frameP50Ms: sumAll.p50Ms, frameP95Ms: sumAll.p95Ms, frameMaxMs: sumAll.maxMs,
     workloads: ['stationary', 'moving', 'combat'],
-    notes: `gpu-soak ${STAMP} ${renderer}: gl=${leg.status.glRenderer} actual=${leg.status.actualRenderer} warn=${leg.status.warning} attack=${leg.attackMethod} moveEcho=${leg.moveOk} refresh~${refreshHz ? refreshHz.toFixed(1) : 'n/a'}Hz(vsync unverified headless; dropped=gaps>=34ms) memΔ=${heapDeltaMB !== null ? heapDeltaMB.toFixed(1) : 'n/a'}MB errors=${errCount} unthrottled=${UNTHROTTLED ? 'yes (rAF uncapped: intervals measure frame work, not the 60Hz cap)' : 'no (60Hz BeginFrames cap applies)'} . Raw+shots: ${rawPath}. No display vsync.`,
+    notes: `gpu-soak ${STAMP} ${renderer}: gl=${leg.status.glRenderer} actual=${leg.status.actualRenderer} warn=${leg.status.warning} attack=${leg.attackMethod} moveEcho=${leg.moveOk} refresh~${refreshHz ? refreshHz.toFixed(1) : 'n/a'}Hz(BeginFrames rAF rate = submission-cadence work headroom, NOT display refresh; vsync unverified headless; dropped=rAF gaps>=34ms, NOT compositor drops) memΔ=${heapDeltaMB !== null ? heapDeltaMB.toFixed(1) : 'n/a'}MB errors=${errCount} unthrottled=${UNTHROTTLED ? 'yes (rAF uncapped: intervals measure frame work, not the 60Hz cap)' : 'no (60Hz BeginFrames cap applies)'} ${workLine}. Raw+shots: ${rawPath}. No display vsync: headless cadence never claims displayed 60 FPS; async GPU duration unknown (no timer query).`,
     workers: swWorkers,
     dateIso: new Date().toISOString(),
+    fidelity,
+    warmupS: WARMUP_S,
+    pak,
+    machineDetail: hostMachine,
+    sourceDirty: git.dirty,
+    sourceDirtyFiles: dirtyFiles,
+    chromiumFlags: leg.isGpu ? ['--use-angle=gl-egl'] : ['--disable-gpu', '--enable-unsafe-swiftshader'],
+    cvarSnapshot: leg.cvarSnap ?? null,
+    refreshHz,
+    vsync: false,
+    droppedFrames: dropped,
+    cpuFallback,
   };
   let manifestPath = '(import skipped)';
   try {

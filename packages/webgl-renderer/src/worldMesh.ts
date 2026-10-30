@@ -26,7 +26,7 @@
 // POT-expanded 288-wide soldier skin — and are uploaded as-is with a
 // warning: the Voodoo 256 cap is appearance policy, enforced in PROOF-4.)
 
-import type { GpuSurfaceRef } from '@q2/renderer-api';
+import type { GpuMaterialKind, GpuSurfaceRef } from '@q2/renderer-api';
 import {
   combineStyleScales,
   type MiniSurf,
@@ -104,6 +104,131 @@ function pushSurfaceTris(
   for (let i = 1; i < s.n - 1; i++) {
     b.indices.push(base, base + i, base + i + 1);
   }
+}
+
+/** One uploaded world surface: index range into the shared big buffers. */
+export interface FullWorldSurface {
+  /** First index in the shared index buffer (in indices, not bytes). */
+  indexStart: number;
+  /** Index count for this surface. */
+  indexCount: number;
+  /** First vertex in the shared attribute buffers. */
+  vertStart: number;
+  /** Vertex count for this surface. */
+  vertCount: number;
+  /** WAL texture id (diffuse lookup at draw time). */
+  texId: number;
+  /** Material class (never 'sky': sky lives in FullSkyStore). */
+  material: Exclude<GpuMaterialKind, 'sky'>;
+  /** True for SURF_TRANS33/66 (blend pass, far->near). */
+  transparent: boolean;
+}
+
+type GpuSurfaceKind = GpuMaterialKind;
+
+/** Persistent full-map world store: one big buffer set, per-surface ranges. */
+export interface FullWorldStore {
+  positions: Float32Array;
+  uvs: Float32Array;
+  lightUVs: Float32Array;
+  alphas: Float32Array;
+  indices: Uint32Array;
+  /** surfaceId -> uploaded range (every triangulable non-sky surface). */
+  surfaces: Map<number, FullWorldSurface>;
+}
+
+/** Persistent sky store: positions + per-surface index ranges (flat fill). */
+export interface FullSkyStore {
+  positions: Float32Array;
+  indices: Uint32Array;
+  /** surfaceId -> index range into the sky buffers. */
+  ranges: Map<number, { start: number; count: number; vertStart: number; vertCount: number }>;
+}
+
+function classifyForStore(s: MiniSurf): { material: GpuSurfaceKind; transparent: boolean } {
+  if (s.sky) return { material: 'sky', transparent: false };
+  if (s.turbulent) return { material: 'turbulent', transparent: false };
+  const t = s.translucent ?? 0;
+  if (t === 1 || t === 2) return { material: 'transparent', transparent: true };
+  return { material: 'opaque', transparent: false };
+}
+
+/**
+ * Pack the FULL world inventory (GPU-FOLLOW-2 storage side) into one shared
+ * buffer set plus per-surface index ranges. Every triangulable surface
+ * (n >= 3) is packed exactly once in surface-id order — no camera culling —
+ * so per-frame draw selection is just a choice of ranges (no rebuild).
+ * Per-vertex alpha bakes the SURF_TRANS33/66 rule; lightUVs come from the
+ * handed atlas (missing rects read (0,0), the atlas-origin fallback).
+ */
+export function buildFullWorldStore(
+  world: MiniWorld,
+  atlas: LightAtlas,
+): { world: FullWorldStore; sky: FullSkyStore } {
+  const pos: number[] = [];
+  const uv: number[] = [];
+  const luv: number[] = [];
+  const alpha: number[] = [];
+  const idx: number[] = [];
+  const surfaces = new Map<number, FullWorldSurface>();
+  const skyPos: number[] = [];
+  const skyIdx: number[] = [];
+  const skyRanges = new Map<number, { start: number; count: number; vertStart: number; vertCount: number }>();
+  for (let si = 0; si < world.surfaces.length; si++) {
+    const s = world.surfaces[si];
+    if (!s || s.n < 3) continue;
+    const cls = classifyForStore(s);
+    if (cls.material === 'sky') {
+      const vertStart = skyPos.length / 3;
+      const start = skyIdx.length;
+      for (let i = 0; i < s.n * 3; i++) skyPos.push(s.verts[i]!);
+      for (let i = 1; i < s.n - 1; i++) skyIdx.push(vertStart + 0, vertStart + i, vertStart + i + 1);
+      skyRanges.set(si, { start, count: skyIdx.length - start, vertStart, vertCount: s.n });
+      continue;
+    }
+    const tex = world.textures[s.texId];
+    const texW = tex?.width ?? 1;
+    const texH = tex?.height ?? 1;
+    const a = cls.transparent ? (s.translucent === 2 ? TRANS66_ALPHA : TRANS33_ALPHA) : 1;
+    const rect = atlas.rectOf.get(s.id) ?? null;
+    const vertStart = pos.length / 3;
+    const start = idx.length;
+    for (let i = 0; i < s.n; i++) {
+      pos.push(s.verts[i * 3]!, s.verts[i * 3 + 1]!, s.verts[i * 3 + 2]!);
+      uv.push(s.uvs[i * 2]! / texW, s.uvs[i * 2 + 1]! / texH);
+      if (rect) {
+        luv.push((rect.x + s.lux[i * 2]!) / atlas.width, (rect.y + s.lux[i * 2 + 1]!) / atlas.height);
+      } else {
+        luv.push(0, 0);
+      }
+      alpha.push(a);
+    }
+    for (let i = 1; i < s.n - 1; i++) idx.push(vertStart + 0, vertStart + i, vertStart + i + 1);
+    surfaces.set(si, {
+      indexStart: start,
+      indexCount: idx.length - start,
+      vertStart,
+      vertCount: s.n,
+      texId: s.texId,
+      material: cls.material,
+      transparent: cls.transparent,
+    });
+  }
+  return {
+    world: {
+      positions: new Float32Array(pos),
+      uvs: new Float32Array(uv),
+      lightUVs: new Float32Array(luv),
+      alphas: new Float32Array(alpha),
+      indices: new Uint32Array(idx),
+      surfaces,
+    },
+    sky: {
+      positions: new Float32Array(skyPos),
+      indices: new Uint32Array(skyIdx),
+      ranges: skyRanges,
+    },
+  };
 }
 
 /**

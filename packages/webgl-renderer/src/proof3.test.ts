@@ -259,8 +259,8 @@ export function stubGLFull(): StubGLState {
     enableVertexAttribArray(loc: number): void {
       calls.push(`enableVertexAttribArray ${loc}`);
     },
-    drawElements(mode: number, count: number): void {
-      calls.push(`drawElements ${modeName(mode)} ${count}`);
+    drawElements(mode: number, count: number, _type?: unknown, offset?: number): void {
+      calls.push(`drawElements ${modeName(mode)} ${count} @${offset ?? 0}`);
     },
     drawArrays(mode: number, _f: number, count: number): void {
       calls.push(`drawArrays ${modeName(mode)} ${count}`);

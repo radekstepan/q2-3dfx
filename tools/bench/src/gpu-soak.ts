@@ -129,14 +129,85 @@ export interface GpuSoakLegInput {
   notes: string;
   workers: number[];
   dateIso: string;
+  /**
+   * FOLLOW-1 provenance (all optional; absent values stay null with an
+   * explicit limitation instead of a fabricated default).
+   */
+  /** Pinned vd_* + sw_* fidelity profile measured under (null = unrecorded). */
+  fidelity?: { vd: Record<string, string>; sw: Record<string, string> } | null;
+  /** Warmup seconds before sampling (null = unrecorded). */
+  warmupS?: number | null;
+  /** Asset identity (null = unrecorded). */
+  pak?: { path: string; bytes: number | null; mtimeMs: number | null; mtimeIso: string | null; missing: boolean } | null;
+  /** Host machine descriptor (null = unrecorded). */
+  machineDetail?: Record<string, string> | null;
+  /** Source tree dirtiness at RUN time (null = unknown). */
+  sourceDirty?: boolean | null;
+  /** `git status --porcelain` lines at RUN time (null = unrecorded). */
+  sourceDirtyFiles?: string[] | null;
+  /** Chromium flags used for the leg. */
+  chromiumFlags?: string[] | null;
+  /** Effective cvar snapshot read back from the page. */
+  cvarSnapshot?: Record<string, string> | null;
+  /** Measured BeginFrames/rAF rate in Hz (null = unmeasured; NOT a display refresh). */
+  refreshHz?: number | null;
+  /** True only when vsync-locked presentation was verified (headless: false). */
+  vsync?: boolean | null;
+  /** Dropped presented frames over the soak (null = uncounted). */
+  droppedFrames?: number | null;
+  /** Any CPU fallback during a GPU leg voids it (null = unverified). */
+  cpuFallback?: boolean | null;
+}
+
+/**
+ * Per-frame CPU work-split medians (ms) from the page's `__q2soakWork`
+ * conveyor (main-thread `performance.now` ring: drains/sim/view/tail/submit
+ * /total). All values are CALLER-CLOCK submission work — `submitMs` is time
+ * spent submitting GL work plus presentation, NEVER measured GPU execution.
+ * Async GPU duration is unavailable in this harness (no disjoint-timer
+ * query); it must be reported as unknown, never inferred from submit time.
+ */
+export interface GpuWorkSplits {
+  drainsMs: number | null;
+  simMs: number | null;
+  viewMs: number | null;
+  tailMs: number | null;
+  submitMs: number | null;
+  totalMs: number | null;
+}
+
+/**
+ * FOLLOW-1 timing vocabulary (load-bearing labels; use verbatim in reports):
+ * - rAF/submission cadence: BeginFrames rate from unthrottled rAF stamps —
+ *   measures main-thread frame WORK headroom, not display refresh.
+ * - CPU frame work: caller-clock splits (drains/sim/view/tail/submit/total).
+ * - async GPU duration: UNKNOWN in this harness (no timer query support).
+ * - displayed-frame evidence: requires a visible (non-headless) vsync-locked
+ *   leg with recorded refresh/vsync/dropped frames — headless cadence alone
+ *   never counts as displayed 60 FPS.
+ */
+export function describeTimingKinds(): string {
+  return [
+    'rAF/submission cadence = unthrottled BeginFrames rate (main-thread work headroom, NOT display refresh)',
+    'CPU frame work = caller-clock splits drains/sim/view/tail/submit/total (submitMs is submission work, NOT GPU execution)',
+    'async GPU duration = unknown in this harness (no disjoint-timer query; never infer from submit time)',
+    'displayed-frame evidence = visible headless=false + vsync=true leg with recorded refresh/dropped frames only',
+  ].join('\n');
 }
 
 /**
  * Assemble the committed BrowserSoakRecord for one leg (CPU legs use this
  * directly via the existing `importBrowserSoak`; the GPU leg extends it).
+ * FOLLOW-1 provenance fields ride along when the runner supplies them;
+ * absent values stay null with explicit limitations (never fabricated).
  */
 export function buildSoakRecord(input: GpuSoakLegInput): BrowserSoakRecord {
   const cls = classifyCompositor(input.glRenderer);
+  const limitations: string[] = [];
+  if (!input.fidelity) limitations.push('fidelity profile unrecorded (vd_* + sw_* cvars unknown)');
+  if (input.warmupS === undefined || input.warmupS === null) limitations.push('warmup unrecorded');
+  if (!input.pak || input.pak.missing) limitations.push('asset identity unrecorded (pak bytes/mtime unknown)');
+  if (!input.machineDetail || Object.keys(input.machineDetail).length === 0) limitations.push('host machine descriptor unrecorded');
   return {
     schemaVersion: 1,
     commitShort: input.commitShort,
@@ -161,6 +232,19 @@ export function buildSoakRecord(input: GpuSoakLegInput): BrowserSoakRecord {
     workloads: [...input.workloads],
     notes: input.notes,
     rawFile: null,
+    fidelity: input.fidelity ?? null,
+    warmupS: input.warmupS ?? null,
+    pak: input.pak ?? null,
+    machineDetail: input.machineDetail ?? null,
+    sourceDirty: input.sourceDirty ?? null,
+    sourceDirtyFiles: input.sourceDirtyFiles ?? null,
+    chromiumFlags: input.chromiumFlags ?? null,
+    cvarSnapshot: input.cvarSnapshot ?? null,
+    refreshHz: input.refreshHz ?? null,
+    vsync: input.vsync ?? null,
+    droppedFrames: input.droppedFrames ?? null,
+    cpuFallback: input.cpuFallback ?? null,
+    limitations: limitations.length > 0 ? limitations : null,
   };
 }
 

@@ -3,16 +3,35 @@
 // Owns: the injected GL context handle, the linear SCENE render target
 // (RGBA16F when EXT_color_buffer_float renders it, else an RGBA8 fallback
 // with a recorded warning — a capability branch, tested both ways via stub),
-// per-generation static uploads (world batches, diffuse/lightmap textures
+// per-generation static uploads (full world inventory, diffuse/lightmap textures
 // with CPU-built mip chains, model index/uv caches) and per-frame dynamic
 // buffers (alias interpolation, billboards, particles).
 //
-// Passes per frame (transparent ordering preserved, far->near):
+// Passes per frame (transparent ordering from the submitted selection, far->near):
 //   scene target: sky (flat, no depth write) -> opaque world (lit) ->
 //   opaque alias + opaque sprites (entity order) -> gun pass (depth-hack
-//   MVP) -> POINTS particles (depth write) -> blend pass (SRC_ALPHA /
-//   ONE_MINUS, depth test on, depth write OFF): transparent world in scene
-//   order, transparent alias, beams;
+//   MVP) -> POINTS particles (depth write) -> blend (SRC_ALPHA /
+//   ONE_MINUS, depth test on, depth write OFF): transparent world +
+//   transparent alias + transparent sprites + beams interleaved far->near in
+//   ONE scene-order pass (the selection carries the combined world/entity order);
+//   appearance: ONE fullscreen pass to the canvas (VS_POST/FS_APPEARANCE):
+//   dither -> RGB565 quantize -> reconstruction taps -> display gamma.
+//   Output stays resident on GPU through presentation; the normal path
+//   never reads back (no readPixels anywhere in src/).
+//
+// Storage vs selection (GPU-FOLLOW-2): the full world inventory (every
+// triangulable surface, no camera culling) uploads ONCE per static
+// generation into one shared buffer set; per-frame drawing walks the
+// submitted GpuSceneInput selection (fresh world PVS/frustum/backface
+// selection + combined transparent order from refreshGpuScene) and draws
+// only its ranges — no mesh rebuild, no re-upload on camera moves. Brush
+// movers (doors/trains/explosives) mutate MiniWorld verts in place via the
+// play-layer DoorSync; the position attribute re-syncs for visibly-changed
+// surfaces only (one whole-buffer bufferData on door-move frames, zero in
+// steady state). Known dynamic-world limits (not silent): lightmaps stay
+// baked in surface space (correct under translation/rotation), but PVS
+// membership is the boot-time graft union (a conservative superset) and
+// blown func_explosive faces drop via the leaf-list strip.
 //   appearance: ONE fullscreen pass to the canvas (VS_POST/FS_APPEARANCE):
 //   dither -> RGB565 quantize -> reconstruction taps -> display gamma.
 //   Output stays resident on GPU through presentation; the normal path
@@ -93,13 +112,12 @@ import {
   multiplyMat4,
 } from './matrices.js';
 import {
-  buildTexturedWorldBatches,
+  buildFullWorldStore,
   expandPaletteTexture,
   packLightAtlas,
   pickSkyPaletteIndex,
   styleSignature,
   type LightAtlas,
-  type WorldBatch,
 } from './worldMesh.js';
 import {
   aliasShadeBase,
@@ -114,7 +132,6 @@ import {
   emitSpriteQuad,
   emptyFlatBatch,
   resolveBeam,
-  updateGpuEntities,
   type FlatBatch,
 } from './entities.js';
 import type { GpuEntityModelKind } from './scene.js';
@@ -143,23 +160,6 @@ interface SkinData {
 interface ModelData {
   kind: GpuEntityModelKind;
   mesh: AliasMesh | null;
-}
-
-interface GLBatch {
-  texId: number;
-  posBuf: WebGLBuffer;
-  uvBuf: WebGLBuffer;
-  luvBuf: WebGLBuffer;
-  alphaBuf: WebGLBuffer;
-  idxBuf: WebGLBuffer;
-  count: number;
-}
-
-interface GLSky {
-  posBuf: WebGLBuffer;
-  colBuf: WebGLBuffer;
-  idxBuf: WebGLBuffer;
-  count: number;
 }
 
 interface ModelGL {
@@ -255,9 +255,22 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   /** Uploaded chain depth per texture (for the uMaxLevel LOD clamp). */
   private texLevels = new Map<WebGLTexture, number>();
   private staticDirty = true;
-  private opaqueBatches: GLBatch[] = [];
-  private transparentBatches: GLBatch[] = [];
-  private skyDraws: GLSky[] = [];
+  // FOLLOW-2 persistent world store: one shared buffer set for the FULL
+  // inventory (uploaded once per generation) + per-surface ranges. Draw
+  // selection walks the submitted scene and draws only its ranges.
+  private worldPosBuf: WebGLBuffer | null = null;
+  private worldUVBuf: WebGLBuffer | null = null;
+  private worldLUVBuf: WebGLBuffer | null = null;
+  private worldAlphaBuf: WebGLBuffer | null = null;
+  private worldIdxBuf: WebGLBuffer | null = null;
+  private worldRanges = new Map<number, { start: number; count: number; texId: number; transparent: boolean }>();
+  private vertBase = new Map<number, { vStart: number; vCount: number }>();
+  /** CPU shadow of the uploaded positions (mover re-sync compare). */
+  private worldPositions: Float32Array | null = null;
+  private skyPosBuf: WebGLBuffer | null = null;
+  private skyColBuf: WebGLBuffer | null = null;
+  private skyIdxBuf: WebGLBuffer | null = null;
+  private skyRanges = new Map<number, { start: number; count: number }>();
   private atlasTex: WebGLTexture | null = null;
   private atlas: LightAtlas | null = null;
   private styleSig = 0;
@@ -307,8 +320,9 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   setScene(scene: GpuSceneInput): void {
     this.scene = scene;
     // Persistent upload: re-upload if and only if the static generation
-    // changed (PROOF-2 bookkeeping; PROOF-3 performs the GL work lazily in
-    // renderFrame once world+palette are attached).
+    // changed. Per-frame camera re-selections keep the generation stable, so
+    // turning/translating never re-uploads — the draw pass follows the new
+    // selection from the already-resident full inventory (FOLLOW-2).
     if (this.uploadedGeneration !== scene.staticGeneration) {
       this.uploadedGeneration = scene.staticGeneration;
       this.uploadCount++;
@@ -475,9 +489,18 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.apFrame = null;
     this.fogLUT = null;
     this.staticDirty = true;
-    this.opaqueBatches = [];
-    this.transparentBatches = [];
-    this.skyDraws = [];
+    this.worldPosBuf = null;
+    this.worldUVBuf = null;
+    this.worldLUVBuf = null;
+    this.worldAlphaBuf = null;
+    this.worldIdxBuf = null;
+    this.worldRanges = new Map();
+    this.vertBase = new Map();
+    this.worldPositions = null;
+    this.skyPosBuf = null;
+    this.skyColBuf = null;
+    this.skyIdxBuf = null;
+    this.skyRanges = new Map();
     this.atlasTex = null;
     this.atlas = null;
     this.diffuseTex = new Map();
@@ -553,62 +576,65 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     }
   }
 
-  /** Upload all static GL state for the current generation (once). */
+  /**
+   * Upload all static GL state for the current generation, ONCE: the FULL
+   * world inventory (every triangulable surface, no camera culling) into one
+   * shared buffer set + per-surface ranges, the full-map light atlas, and
+   * the sky fill. Per-frame camera selections never touch this path (the
+   * generation only bumps on map change / explicit invalidation).
+   */
   private uploadStatic(gl: WebGL2RenderingContext, input: GpuFrameInput): void {
     const world = this.world;
     const palette = this.palette;
-    const scene = this.scene ?? input.scene;
-    if (!world || !palette || !scene) return;
+    if (!world || !palette) return;
     // Fresh GL objects for this generation (same-context re-upload leaks by
     // design — generations change on map switch only).
-    this.opaqueBatches = [];
-    this.transparentBatches = [];
-    this.skyDraws = [];
     this.diffuseTex = new Map();
     this.skinTex = new Map();
     this.modelGL = new Map();
     this.whiteTex = null;
     this.onesBuf = null;
 
-    const refs = updateGpuEntities(scene, [], input.view, undefined);
-    const worldIds = refs.filter((r) => r.transformIndex === 0 && r.material !== 'sky').map((r) => r.surfaceId);
+    // Full inventory: every triangulable surface id (selection-independent).
+    const allIds: number[] = [];
+    for (let i = 0; i < world.surfaces.length; i++) {
+      if (world.surfaces[i] && world.surfaces[i]!.n >= 3) allIds.push(i);
+    }
     const sig = styleSignature(input.view.lightStyles);
-    const { atlas, skipped } = packLightAtlas(world, worldIds, input.view.lightStyles);
+    const { atlas, skipped } = packLightAtlas(world, allIds, input.view.lightStyles);
     for (const id of skipped) this.warn(`lightmap atlas overflow: surface ${id} unlit (atlas origin)`);
     this.atlas = atlas;
     this.styleSig = sig;
-    const { opaque, transparent, sky } = buildTexturedWorldBatches(world, refs, atlas);
+    const store = buildFullWorldStore(world, atlas);
 
-    for (const b of opaque) this.opaqueBatches.push(this.uploadBatch(gl, b));
-    for (const b of transparent) this.transparentBatches.push(this.uploadBatch(gl, b));
+    this.worldRanges = new Map();
+    this.vertBase = new Map();
+    for (const [id, r] of store.world.surfaces) {
+      this.worldRanges.set(id, { start: r.indexStart, count: r.indexCount, texId: r.texId, transparent: r.transparent });
+      this.vertBase.set(id, { vStart: r.vertStart, vCount: r.vertCount });
+    }
+    this.worldPositions = store.world.positions.slice();
+    this.worldPosBuf = this.createStaticBuffer(gl, store.world.positions);
+    this.worldUVBuf = this.createStaticBuffer(gl, store.world.uvs);
+    this.worldLUVBuf = this.createStaticBuffer(gl, store.world.lightUVs);
+    this.worldAlphaBuf = this.createStaticBuffer(gl, store.world.alphas);
+    this.worldIdxBuf = this.createStaticIndexBuffer(gl, store.world.indices);
+
+    this.skyRanges = new Map();
+    for (const [id, r] of store.sky.ranges) this.skyRanges.set(id, { start: r.start, count: r.count });
+    this.skyPosBuf = this.createStaticBuffer(gl, store.sky.positions);
+    const skyCol = new Float32Array(store.sky.positions.length / 3 * 4);
     const skyIdx = pickSkyPaletteIndex(palette);
     const sr = (palette[skyIdx * 3] ?? 0) / 255;
     const sg = (palette[skyIdx * 3 + 1] ?? 0) / 255;
     const sb = (palette[skyIdx * 3 + 2] ?? 0) / 255;
-    for (const s of sky) {
-      const posBuf = this.createStaticBuffer(gl, s.positions);
-      const colArr = new Float32Array((s.positions.length / 3) * 4);
-      for (let i = 0; i < colArr.length; i += 4) {
-        colArr[i] = sr; colArr[i + 1] = sg; colArr[i + 2] = sb; colArr[i + 3] = 1;
-      }
-      const colBuf = this.createStaticBuffer(gl, colArr);
-      const idxBuf = this.createStaticIndexBuffer(gl, s.indices);
-      this.skyDraws.push({ posBuf, colBuf, idxBuf, count: s.indices.length });
+    for (let i = 0; i < skyCol.length; i += 4) {
+      skyCol[i] = sr; skyCol[i + 1] = sg; skyCol[i + 2] = sb; skyCol[i + 3] = 1;
     }
+    this.skyColBuf = this.createStaticBuffer(gl, skyCol);
+    this.skyIdxBuf = this.createStaticIndexBuffer(gl, store.sky.indices);
     this.atlasTex = this.uploadTexture(gl, atlas.pixels, atlas.width, atlas.height);
     this.staticDirty = false;
-  }
-
-  private uploadBatch(gl: WebGL2RenderingContext, b: WorldBatch): GLBatch {
-    return {
-      texId: b.texId,
-      posBuf: this.createStaticBuffer(gl, b.positions),
-      uvBuf: this.createStaticBuffer(gl, b.uvs),
-      luvBuf: this.createStaticBuffer(gl, b.lightUVs),
-      alphaBuf: this.createStaticBuffer(gl, b.alphas),
-      idxBuf: this.createStaticIndexBuffer(gl, b.indices),
-      count: b.indices.length,
-    };
   }
 
   private createStaticBuffer(gl: WebGL2RenderingContext, data: Float32Array): WebGLBuffer {
@@ -755,13 +781,12 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     lightStyles: Float32Array,
     sig: number,
   ): void {
-    const scene = this.scene;
-    if (!scene || !this.atlas) return;
+    if (!this.atlas) return;
+    // Full inventory (same surface set as the upload: pack order is
+    // deterministic, so rects stay valid and lightUV attributes hold).
     const worldIds: number[] = [];
-    for (const r of scene.surfaces) {
-      if (r.transformIndex === 0 && world.surfaces[r.surfaceId] && world.surfaces[r.surfaceId]!.n >= 3) {
-        worldIds.push(r.surfaceId);
-      }
+    for (let i = 0; i < world.surfaces.length; i++) {
+      if (world.surfaces[i] && world.surfaces[i]!.n >= 3) worldIds.push(i);
     }
     const { atlas, skipped } = packLightAtlas(world, worldIds, lightStyles);
     // Same surface set => same rects (pack order is deterministic); only
@@ -814,8 +839,16 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     gl.enable(gl.DEPTH_TEST);
     gl.depthFunc(gl.LESS);
 
+    // FOLLOW-2: draw the SUBMITTED selection (input.scene), not a baked batch
+    // set. The play layer refreshes this every frame the camera moves, so
+    // turning/translating reveals newly visible surfaces with no re-upload.
+    // Brush-mover verts may have shifted since upload: re-sync first.
+    const scene = input.scene ?? this.scene;
+    if (!scene) return;
+    this.syncDynamicVerts(gl, scene);
+
     // Sky first (flat fill, no depth write so nothing z-fights the hull).
-    if (this.skyDraws.length > 0) {
+    {
       const flat = this.progs.flat;
       gl.useProgram(flat.prog);
       this.setMVP(gl, flat, VP, 1);
@@ -823,17 +856,16 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       if (flat.uPointSize) gl.uniform1f(flat.uPointSize, 1);
       if (flat.uTextured) gl.uniform1i(flat.uTextured, 0);
       gl.depthMask(false);
-      for (const s of this.skyDraws) {
-        this.bindAttrib(gl, 0, s.posBuf, 3);
-        this.bindAttrib(gl, 1, s.colBuf, 4);
-        this.bindAttrib(gl, 2, this.onesFor(gl), 2);
-        this.bindIndex(gl, s.idxBuf);
-        gl.drawElements(gl.TRIANGLES, s.count, gl.UNSIGNED_INT, 0);
+      for (const ref of scene.surfaces) {
+        if (ref.material !== 'sky' || ref.transformIndex !== 0) continue;
+        this.drawSkyRange(gl, ref.surfaceId);
       }
       gl.depthMask(true);
     }
 
-    // Opaque world (lit; depth test on, depth write on).
+    // Opaque pass in scene order (world ranges + opaque entities; depth
+    // test on, depth write on). Beams always ride the blend pass below, and
+    // depth-hacked guns have their own pass — both are skipped here.
     {
       const lit = this.progs.lit;
       gl.useProgram(lit.prog);
@@ -842,38 +874,25 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       this.setVoodooPolicy(gl, lit);
       this.bindLightmap(gl, lit);
       gl.depthMask(true);
-      for (const b of this.opaqueBatches) {
-        const tex = this.diffuseFor(gl, b.texId) ?? this.whiteFor(gl);
-        this.bindDiffuse(gl, lit, tex);
-        this.bindWorldBatch(gl, b);
-        gl.drawElements(gl.TRIANGLES, b.count, gl.UNSIGNED_INT, 0);
-      }
-    }
-
-    // Entity resolution for this frame (refs + model matrices).
-
-    // Opaque alias + opaque sprites (entity order preserved).
-    const spriteBatches = new Map<number, FlatBatch>();
-    for (let ei = 0; ei < this.entities.length; ei++) {
-      const e = this.entities[ei]!;
-      const kind = this.entityKind(e.model);
-      const alpha = clamp01(e.alpha ?? 1);
-      if (alpha <= 0) continue;
-      if (kind === 'md2') {
-        if (alpha >= 1 && e.depthHack !== true) this.drawAlias(gl, V, P, e, false, lights);
-      } else if (kind === 'sp2') {
-        if (alpha >= 1) {
-          let b = spriteBatches.get(e.skin);
-          if (!b) {
-            b = emptyFlatBatch();
-            spriteBatches.set(e.skin, b);
-          }
-          this.emitSprite(b, e, cam, alpha);
+      for (const ref of scene.surfaces) {
+        if (ref.transparent || ref.material === 'sky') continue;
+        if (ref.transformIndex === 0) {
+          if (ref.material !== 'opaque' && ref.material !== 'turbulent') continue;
+          this.drawWorldRange(gl, lit, ref.surfaceId);
+          continue;
+        }
+        const e = this.entities[-1 - ref.surfaceId];
+        if (!e) continue;
+        const kind = this.entityKind(e.model);
+        if (kind === 'tracer') continue; // blend pass owns every beam
+        const alpha = clamp01(e.alpha ?? 1);
+        if (alpha <= 0) continue;
+        if (kind === 'md2') {
+          if (alpha >= 1 && e.depthHack !== true) this.drawAlias(gl, V, P, e, false, lights);
+        } else if (kind === 'sp2') {
+          if (alpha >= 1) this.drawSpriteSingle(gl, VP, e, cam, alpha);
         }
       }
-    }
-    for (const [skinHandle, b] of spriteBatches) {
-      if (b.idx.length > 0) this.drawFlatBatch(gl, VP, b, this.skinFor(gl, skinHandle)?.tex ?? null);
     }
 
     // Gun pass (eye-anchored viewmodel, depth-hack MVP).
@@ -892,8 +911,11 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       if (positions.length > 0) this.drawPoints(gl, VP, positions, colors);
     }
 
-    // Blend pass: transparent world (scene order) + transparent alias +
-    // beams, far->near. Depth test on, depth write OFF (CPU deferred alpha).
+    // Blend pass: ONE far->near walk over the submitted selection —
+    // transparent world ranges + translucent alias + transparent sprites +
+    // beams interleaved by the combined order keys refreshGpuScene computed
+    // for THIS view (no frozen spawn-subset order). Depth test on, depth
+    // write OFF (CPU deferred alpha).
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     gl.depthMask(false);
@@ -904,54 +926,35 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       this.setLights(gl, lit, lights);
       this.setVoodooPolicy(gl, lit);
       this.bindLightmap(gl, lit);
-      // Transparent world batches were built in scene order already.
-      for (const b of this.transparentBatches) {
-        const tex = this.diffuseFor(gl, b.texId) ?? this.whiteFor(gl);
-        this.bindDiffuse(gl, lit, tex);
-        this.bindWorldBatch(gl, b);
-        gl.drawElements(gl.TRIANGLES, b.count, gl.UNSIGNED_INT, 0);
-      }
-      // Transparent alias (entity order).
-      for (let ei = 0; ei < this.entities.length; ei++) {
-        const e = this.entities[ei]!;
-        if (this.entityKind(e.model) !== 'md2') continue;
+      for (const ref of scene.surfaces) {
+        if (ref.transformIndex === 0) {
+          if (!ref.transparent || ref.material !== 'transparent') continue;
+          this.drawWorldRange(gl, lit, ref.surfaceId);
+          continue;
+        }
+        const e = this.entities[-1 - ref.surfaceId];
+        if (!e) continue;
+        const kind = this.entityKind(e.model);
+        if (kind === 'tracer') {
+          this.drawBeamSingle(gl, VP, e, cam, palette);
+          continue;
+        }
         const alpha = clamp01(e.alpha ?? 1);
         if (alpha <= 0 || alpha >= 1) continue;
-        this.drawAlias(gl, V, P, e, e.depthHack === true, lights, alpha);
+        if (kind === 'md2') {
+          this.drawAlias(gl, V, P, e, e.depthHack === true, lights, alpha);
+        } else if (kind === 'sp2') {
+          this.drawSpriteSingle(gl, VP, e, cam, alpha);
+        }
       }
-    }
-    // Beams (flat quads, blend-pass state).
-    {
-      const beamBatch = emptyFlatBatch();
+      // Beams whose refs were never selected still draw (the old path drew
+      // every tracer every frame): belt-and-braces for entity lists the
+      // selection did not cover. Normally empty.
       for (let ei = 0; ei < this.entities.length; ei++) {
         const e = this.entities[ei]!;
         if (this.entityKind(e.model) !== 'tracer') continue;
-        const seg = resolveBeam(e);
-        const c = (seg.color & 255) * 3;
-        emitBeamQuad(
-          beamBatch, seg.ax, seg.ay, seg.az, seg.bx, seg.by, seg.bz, cam,
-          (palette[c] ?? 0) / 255, (palette[c + 1] ?? 0) / 255, (palette[c + 2] ?? 0) / 255, 1,
-        );
-      }
-      if (beamBatch.idx.length > 0) this.drawFlatBatch(gl, VP, beamBatch, null);
-    }
-    // Transparent sprites ride the blend pass too (entity order).
-    {
-      const spriteBlend = new Map<number, FlatBatch>();
-      for (let ei = 0; ei < this.entities.length; ei++) {
-        const e = this.entities[ei]!;
-        if (this.entityKind(e.model) !== 'sp2') continue;
-        const alpha = clamp01(e.alpha ?? 1);
-        if (alpha <= 0 || alpha >= 1) continue;
-        let b = spriteBlend.get(e.skin);
-        if (!b) {
-          b = emptyFlatBatch();
-          spriteBlend.set(e.skin, b);
-        }
-        this.emitSprite(b, e, cam, alpha);
-      }
-      for (const [skinHandle, b] of spriteBlend) {
-        if (b.idx.length > 0) this.drawFlatBatch(gl, VP, b, this.skinFor(gl, skinHandle)?.tex ?? null);
+        if (scene.surfaces.some((r) => r.transformIndex !== 0 && r.surfaceId === -1 - ei)) continue;
+        this.drawBeamSingle(gl, VP, e, cam, palette);
       }
     }
     gl.depthMask(true);
@@ -1154,6 +1157,36 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     gl.drawElements(gl.TRIANGLES, mgl.count, gl.UNSIGNED_INT, 0);
   }
 
+  private drawSpriteSingle(
+    gl: WebGL2RenderingContext,
+    VP: Float32Array,
+    e: Entity,
+    cam: Camera,
+    alpha: number,
+  ): void {
+    const b = emptyFlatBatch();
+    this.emitSprite(b, e, cam, alpha);
+    if (b.idx.length === 0) return; // missing skin already warned + skipped
+    this.drawFlatBatch(gl, VP, b, this.skinFor(gl, e.skin)?.tex ?? null);
+  }
+
+  private drawBeamSingle(
+    gl: WebGL2RenderingContext,
+    VP: Float32Array,
+    e: Entity,
+    cam: Camera,
+    palette: Uint8Array,
+  ): void {
+    const b = emptyFlatBatch();
+    const seg = resolveBeam(e);
+    const c = (seg.color & 255) * 3;
+    emitBeamQuad(
+      b, seg.ax, seg.ay, seg.az, seg.bx, seg.by, seg.bz, cam,
+      (palette[c] ?? 0) / 255, (palette[c + 1] ?? 0) / 255, (palette[c + 2] ?? 0) / 255, 1,
+    );
+    if (b.idx.length > 0) this.drawFlatBatch(gl, VP, b, null);
+  }
+
   private emitSprite(batch: FlatBatch, e: Entity, cam: Camera, alpha: number): void {
     const skin = this.skins.get(e.skin);
     if (!skin) {
@@ -1214,12 +1247,81 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buf);
   }
 
-  private bindWorldBatch(gl: WebGL2RenderingContext, b: GLBatch): void {
-    this.bindAttrib(gl, 0, b.posBuf, 3);
-    this.bindAttrib(gl, 1, b.uvBuf, 2);
-    this.bindAttrib(gl, 2, b.luvBuf, 2);
-    this.bindAttrib(gl, 3, b.alphaBuf, 1);
-    this.bindIndex(gl, b.idxBuf);
+  /**
+   * Draw one uploaded world surface range (selection-driven). Missing ranges
+   * (degenerate/sky ids, unknown surfaces) are skipped — never crash.
+   * Re-binds the lit program every draw: blend-pass draws interleave world
+   * ranges with alias/sprite/beam draws that switch programs (per-program
+   * uniforms persist, so no uniform re-upload is needed).
+   */
+  private drawWorldRange(
+    gl: WebGL2RenderingContext,
+    p: ProgLocs,
+    surfaceId: number,
+  ): void {
+    const range = this.worldRanges.get(surfaceId);
+    if (!range) return;
+    if (!this.worldPosBuf || !this.worldUVBuf || !this.worldLUVBuf ||
+      !this.worldAlphaBuf || !this.worldIdxBuf) return;
+    gl.useProgram(p.prog);
+    const tex = this.diffuseFor(gl, range.texId) ?? this.whiteFor(gl);
+    this.bindDiffuse(gl, p, tex);
+    this.bindAttrib(gl, 0, this.worldPosBuf, 3);
+    this.bindAttrib(gl, 1, this.worldUVBuf, 2);
+    this.bindAttrib(gl, 2, this.worldLUVBuf, 2);
+    this.bindAttrib(gl, 3, this.worldAlphaBuf, 1);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.worldIdxBuf);
+    gl.drawElements(gl.TRIANGLES, range.count, gl.UNSIGNED_INT, range.start * 4);
+  }
+
+  /** Draw one uploaded sky surface range (flat fill, no texture). */
+  private drawSkyRange(gl: WebGL2RenderingContext, surfaceId: number): void {
+    const range = this.skyRanges.get(surfaceId);
+    if (!range) return;
+    if (!this.skyPosBuf || !this.skyColBuf || !this.skyIdxBuf) return;
+    this.bindAttrib(gl, 0, this.skyPosBuf, 3);
+    this.bindAttrib(gl, 1, this.skyColBuf, 4);
+    this.bindAttrib(gl, 2, this.onesFor(gl), 2);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.skyIdxBuf);
+    gl.drawElements(gl.TRIANGLES, range.count, gl.UNSIGNED_INT, range.start * 4);
+  }
+
+  /**
+   * Re-sync uploaded world positions for selected surfaces whose baked
+   * verts moved since upload (brush movers: the play-layer DoorSync rewrites
+   * MiniWorld verts/centers/bounds in place). Compares only the current
+   * selection against the CPU shadow; re-uploads the whole position buffer
+   * once when anything changed, never otherwise. UVs/lightUVs/alpha/indices
+   * are topology-fixed and never re-uploaded.
+   */
+  private syncDynamicVerts(gl: WebGL2RenderingContext, scene: GpuSceneInput): void {
+    const world = this.world;
+    if (!world || !this.worldPositions || !this.worldPosBuf) return;
+    let dirty = false;
+    for (const ref of scene.surfaces) {
+      if (ref.transformIndex !== 0) continue;
+      const base = this.vertBase.get(ref.surfaceId);
+      if (!base) continue;
+      const s = world.surfaces[ref.surfaceId];
+      if (!s) continue;
+      const v = s.verts;
+      const off = base.vStart * 3;
+      let changed = false;
+      for (let k = 0; k < v.length; k++) {
+        if (v[k] !== this.worldPositions[off + k]) {
+          changed = true;
+          break;
+        }
+      }
+      if (changed) {
+        this.worldPositions.set(v, off);
+        dirty = true;
+      }
+    }
+    if (dirty) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.worldPosBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, this.worldPositions, gl.DYNAMIC_DRAW);
+    }
   }
 
   private drawFlatBatch(

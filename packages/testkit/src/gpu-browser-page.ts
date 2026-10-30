@@ -218,10 +218,13 @@ function makeRenderer(glImpl, world, palette, soldierMd2, gunMd2, soldierSkin, g
 
 // TEST-ONLY capture: readPixels is forbidden in the production path (pinned
 // by the gpu-readback scan); this harness-generated page may capture.
-function renderCapture(rawGL, rr, draws, entities, lights) {
+// view overrides the render camera (default VIEW): FOLLOW-2 renders the
+// turn selection from the turn view through the same production path.
+function renderCapture(rawGL, rr, draws, entities, lights, view) {
+  var v = view || VIEW;
   var beforeE = draws.elements, beforeA = draws.arrays;
   rr.renderer.setEntities(entities, KINDS);
-  rr.renderer.renderFrame({ view: VIEW, scene: rr.scene, time: 1.5, lights: lights });
+  rr.renderer.renderFrame({ view: v, scene: rr.scene, time: 1.5, lights: lights });
   var px = new Uint8Array(N * 4);
   rawGL.readPixels(0, 0, W, H, rawGL.RGBA, rawGL.UNSIGNED_BYTE, px);
   return { px: px, draws: (draws.elements - beforeE) + (draws.arrays - beforeA) };
@@ -355,6 +358,38 @@ async function main() {
   var capNoSprite = renderCapture(rawGL, rrF1, counted.draws, noSprite, LIGHTS_F1);
   var capNoDepth = renderCapture(rawGL, rrNoDepth, noDepth.draws, ENT_F1, LIGHTS_F1);
 
+  // FOLLOW-2 moving-camera checks (same origin, 180-degree turn): a fresh
+  // renderer over the turn selection, plus a same-renderer re-selection
+  // (fresh turn scene at the boot generation, no re-upload) that must render
+  // byte-identical to the fresh turn renderer. The frozen spawn-subset path
+  // fails this: the re-selected capture then repeats the spawn subset.
+  var TURN_VIEW = {
+    origin: f32([OX, OY, OZ]),
+    angles: f32([0, YAW + 180, 0]),
+    fovX: 90,
+    time: 1.5,
+    lightStyles: VIEW.lightStyles,
+  };
+  var rrTurn = makeRenderer(counted.gl, worldF1, palette, soldierMd2, gunMd2, soldierSkin, gunSkin, ENT_F1, TURN_VIEW);
+  // Same first-submit settle as the F1 warmup above (SwiftShader LSB drift
+  // on the first submit after upload): two throwaway turn renders first.
+  for (var wq2 = 0; wq2 < 2; wq2++) {
+    rrTurn.renderer.setEntities(ENT_F1, KINDS);
+    rrTurn.renderer.renderFrame({ view: TURN_VIEW, scene: rrTurn.scene, time: 1.5, lights: LIGHTS_F1 });
+  }
+  var capTurn = renderCapture(rawGL, rrTurn, counted.draws, ENT_F1, LIGHTS_F1, TURN_VIEW);
+  var savedF1Scene = rrF1.scene;
+  var uploadsBeforeReselect = rrF1.renderer.testUploadStats().uploads;
+  var turnScene = selectGpuScene(worldF1, ENT_F1, TURN_VIEW, W, H, KINDS);
+  rrF1.renderer.setScene(turnScene);
+  rrF1.scene = turnScene;
+  var capReselect = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1, TURN_VIEW);
+  var uploadsAfterReselect = rrF1.renderer.testUploadStats().uploads;
+  // Restore the F1 scene on the combat renderer for the suites below.
+  rrF1.renderer.setScene(savedF1Scene);
+  rrF1.scene = savedF1Scene;
+  var covTurn = coverageOf(capTurn.px);
+
   var covF0 = coverageOf(capF0.px);
   var covF1 = coverageOf(capF1.px);
   proof.stats = {
@@ -369,6 +404,15 @@ async function main() {
     soldier: summarize(diffStats(capF1.px, capNoSoldier.px)),
     sprite: summarize(diffStats(capF1.px, capNoSprite.px)),
     depthOff: summarize(diffStats(capF1.px, capNoDepth.px)),
+    // FOLLOW-2: the turn view covers real geometry (not a void), differs
+    // from the spawn view (the camera actually moved), and the same-renderer
+    // re-selection matches the fresh turn renderer exactly (selection
+    // update without re-upload).
+    coverageTurn: covTurn,
+    drawsTurn: capTurn.draws,
+    turnVsF0: summarize(diffStats(capTurn.px, capF0.px)),
+    reselectVsFresh: summarize(diffStats(capReselect.px, capTurn.px)),
+    uploadsReselect: { before: uploadsBeforeReselect, after: uploadsAfterReselect },
     // >24-centroids (GL coords, y=0 bottom) pin each class on screen.
     centroidGun: centroidOf(capF1.px, capNoGun.px, 24),
     centroidBeam: centroidOf(capF1.px, capNoBeam.px, 24),

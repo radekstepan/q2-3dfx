@@ -112,6 +112,11 @@ interface ProofResult {
     soldier: ProofDiffSummary;
     sprite: ProofDiffSummary;
     depthOff: ProofDiffSummary;
+    coverageTurn: { covered: number; frac: number };
+    drawsTurn: number;
+    turnVsF0: ProofDiffSummary;
+    reselectVsFresh: ProofDiffSummary;
+    uploadsReselect: { before: number; after: number };
     centroidGun: { x: number; y: number; n: number } | null;
     centroidBeam: { x: number; y: number; n: number } | null;
     centroidSoldier: { x: number; y: number; n: number } | null;
@@ -352,6 +357,25 @@ describe.runIf(GATE)('gpu-browser real-browser proof (PROOF-3 boxes 4-5)', () =>
         expect(beam.bboxFrac).toBeGreaterThanOrEqual(BEAM_BBOX_MIN_FRAC);
         expect(beam.count).toBeGreaterThanOrEqual(BEAM_MIN_PX);
         console.log(`[gpu-browser] beam: ${JSON.stringify(beam)}`);
+
+        // --- FOLLOW-2: moving-camera visibility in the real browser ---
+        // The 180-degree turn covers real geometry (not a void) and differs
+        // from the spawn view (the camera actually moved). Re-selecting the
+        // same renderer to the turn scene renders byte-identical to a fresh
+        // turn renderer with no additional upload (the frozen spawn-subset
+        // path fails reselectVsFresh: it repeats the spawn subset).
+        expect(proof.stats.coverageTurn.frac).toBeGreaterThanOrEqual(COVER_MIN);
+        expect(proof.stats.drawsTurn).toBeGreaterThan(0);
+        expect(proof.stats.turnVsF0.frac).toBeGreaterThanOrEqual(F0F1_MIN_FRAC);
+        expect(proof.stats.reselectVsFresh.count).toBe(0);
+        expect(proof.stats.uploadsReselect.after).toBe(proof.stats.uploadsReselect.before);
+        expect(proof.uploadsF1.uploads).toBe(1);
+        console.log(
+          `[gpu-browser] FOLLOW-2 turn: coverage=${proof.stats.coverageTurn.frac.toFixed(4)} ` +
+            `turnVsF0=${proof.stats.turnVsF0.frac.toFixed(4)} ` +
+            `reselectVsFresh=${proof.stats.reselectVsFresh.count} ` +
+            `uploads=${proof.stats.uploadsReselect.before}->${proof.stats.uploadsReselect.after}`,
+        );
 
         // --- box 5: timings (REPORT-ONLY, never a pass/fail gate) ---
         const t = proof.timings;

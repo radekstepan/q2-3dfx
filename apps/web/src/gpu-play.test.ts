@@ -7,6 +7,7 @@
 // Headless-safe: DOM/GL are stubbed exactly like gpu-select.test.ts.
 import { describe, expect, it, afterEach, vi } from 'vitest';
 import { resetCVars, setCVar } from '@q2/config';
+import { v3 } from '@q2/math';
 import { keyDown, keyUp } from '@q2/input';
 import {
   bootPlay,
@@ -635,39 +636,31 @@ describe('GPU-PROOF-5 iteration-1 work-split instrumentation (play.ts)', () => {
   });
 });
 
-describe('GPU-PROOF-5 iteration-1 static-scene tail (play.ts)', () => {
-  it('devroom: static world refs identical by reference, transforms reused, uploads 1, no CPU raster', () => {
+describe('GPU-FOLLOW-2 per-frame world selection (play.ts)', () => {
+  it('devroom: staticScene is the full inventory, frames re-select per view, uploads stay 1', () => {
     installStubDoc();
     const boot = capableBoot();
     expect(boot.gpu).not.toBeNull();
     const renderSpy = vi.spyOn(boot.refresh, 'renderView');
     const staticScene = boot.gpu!.staticScene;
-    // Boot scene and static scene start as the same object (built once).
-    expect(boot.gpu!.scene).toBe(staticScene);
+    // Persistent inventory: every triangulable surface, no camera culling.
+    expect(staticScene.surfaces.length).toBeGreaterThan(0);
+    expect(boot.gpu!.scene).not.toBe(staticScene);
+    // Initial submitted scene is a strict per-view subset of the inventory.
+    const worldOf = (surfaces: { transformIndex: number; surfaceId: number }[]): number[] =>
+      surfaces.filter((r) => r.transformIndex === 0).map((r) => r.surfaceId).sort((a, b) => a - b);
+    const invIds = new Set(worldOf(staticScene.surfaces));
+    expect(worldOf(boot.gpu!.scene.surfaces).every((id) => invIds.has(id))).toBe(true);
     const staticCount = staticScene.surfaces.length;
-    const staticFirst = staticScene.surfaces[0];
     keyDown(boot.host.input, 'forward');
     keyDown(boot.host.input, 'attack');
     const N = 30;
     for (let f = 0; f < N; f++) frameGpuPlay(boot, f * 16);
     keyUp(boot.host.input, 'forward');
     keyUp(boot.host.input, 'attack');
-    // Per-frame scenes are fresh objects built ONLY from the static tail…
-    expect(boot.gpu!.scene).not.toBe(staticScene);
-    // …but every transformIndex-0 ref is the SAME object as the static one.
-    const tailWorld = boot.gpu!.scene.surfaces.filter((r) => r.transformIndex === 0);
-    expect(tailWorld.length).toBe(staticCount);
-    for (const ref of tailWorld) {
-      expect(staticScene.surfaces.includes(ref)).toBe(true);
-    }
-    // Transforms stay the boot `[identity]` slot by reference (renderer
-    // derives entity matrices from setEntities; see frameGpuPlay note).
-    expect(boot.gpu!.scene.transforms).toBe(staticScene.transforms);
-    expect(boot.gpu!.scene.transforms.length).toBe(1);
-    // Static base never mutated by the tail builder.
-    expect(staticScene.surfaces.length).toBe(staticCount);
-    expect(staticScene.surfaces[0]).toBe(staticFirst);
+    // Per-frame scenes are fresh selections, never the cached subset.
     expect(boot.gpu!.scene.staticGeneration).toBe(staticScene.staticGeneration);
+    expect(worldOf(boot.gpu!.scene.surfaces).every((id) => invIds.has(id))).toBe(true);
     // Submission contract holds: uploads stay 1, N frames submitted, no CPU.
     expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
     expect(boot.gpu!.gpu.getStatus().framesSubmitted).toBe(N);
@@ -675,11 +668,36 @@ describe('GPU-PROOF-5 iteration-1 static-scene tail (play.ts)', () => {
     expect(boot.host.serverTime).toBeGreaterThan(0);
     expect(boot.host.playerOrigin[0]).toBeGreaterThan(-168);
     expect(boot.driver.events).toContain('shot');
+    // Static inventory never mutated by the per-frame selection.
+    expect(staticScene.surfaces.length).toBe(staticCount);
     renderSpy.mockRestore();
+  });
+
+  it('devroom: a 180-degree turn re-selects the world (no frozen spawn subset)', () => {
+    installStubDoc();
+    const boot = capableBoot();
+    expect(boot.gpu).not.toBeNull();
+    const worldOf = (surfaces: { transformIndex: number; surfaceId: number }[]): number[] =>
+      surfaces.filter((r) => r.transformIndex === 0).map((r) => r.surfaceId).sort((a, b) => a - b);
+    for (let f = 0; f < 5; f++) frameGpuPlay(boot, f * 16);
+    const facing = worldOf(boot.gpu!.scene.surfaces);
+    expect(facing.length).toBeGreaterThan(0);
+    // Turn 180 degrees in place: the selection must change (fail-before:
+    // the frozen spawn-subset path resubmits the identical set forever).
+    boot.host.input.angles = [0, 180, 0];
+    for (let f = 5; f < 10; f++) frameGpuPlay(boot, f * 16);
+    const turned = worldOf(boot.gpu!.scene.surfaces);
+    expect(turned.length).toBeGreaterThan(0);
+    expect(turned).not.toEqual(facing);
+    // Both views stay inside the persistent inventory; uploads stay 1.
+    const invIds = new Set(worldOf(boot.gpu!.staticScene.surfaces));
+    expect([...facing, ...turned].every((id) => invIds.has(id))).toBe(true);
+    expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
+    expect(boot.gpu!.gpu.getStatus().framesSubmitted).toBe(10);
   });
 });
 
-describe.runIf(!!WEB_Q2_PAK)('GPU-PROOF-5 iteration-1 base1 tail + determinism (Q2_PAK)', () => {
+describe.runIf(!!WEB_Q2_PAK)('GPU-FOLLOW-2 base1 re-selection + determinism (Q2_PAK)', () => {
   async function loadPakBoot(width = 96, height = 72): Promise<ReturnType<typeof bootPlay>> {
     const { readFileSync } = await import('fs');
     const raw = readFileSync(WEB_Q2_PAK as string);
@@ -704,28 +722,78 @@ describe.runIf(!!WEB_Q2_PAK)('GPU-PROOF-5 iteration-1 base1 tail + determinism (
     keyUp(boot.host.input, 'attack');
   }
 
-  it('base1: static tail holds on the real world — refs by reference, uploads 1, combat advances', { timeout: 180000 }, async () => {
+  it('base1: per-frame re-selection follows the camera — turn reveals new surfaces, uploads stay 1', { timeout: 180000 }, async () => {
     const stub = installStubDoc();
     const boot = await loadPakBoot();
     const renderSpy = vi.spyOn(boot.refresh, 'renderView');
+    const worldOf = (surfaces: { transformIndex: number; surfaceId: number }[]): number[] =>
+      surfaces.filter((r) => r.transformIndex === 0).map((r) => r.surfaceId).sort((a, b) => a - b);
     const staticScene = boot.gpu!.staticScene;
-    expect(staticScene.surfaces.length).toBeGreaterThan(0);
+    // Persistent inventory covers the whole map; the submitted scene is a subset.
+    expect(staticScene.surfaces.length).toBeGreaterThan(1000);
+    expect(worldOf(boot.gpu!.scene.surfaces).length).toBeGreaterThan(0);
+    expect(worldOf(boot.gpu!.scene.surfaces).length).toBeLessThan(staticScene.surfaces.length);
     const N = 20;
     driveCombat(boot, stub.log, N);
-    const tailWorld = boot.gpu!.scene.surfaces.filter((r) => r.transformIndex === 0);
-    expect(tailWorld.length).toBe(staticScene.surfaces.length);
-    for (const ref of tailWorld) {
-      expect(staticScene.surfaces.includes(ref)).toBe(true);
-    }
-    expect(boot.gpu!.scene.transforms).toBe(staticScene.transforms);
+    const facing = worldOf(boot.gpu!.scene.surfaces);
+    expect(facing.length).toBeGreaterThan(0);
+    // 180-degree turn in place (same origin, flipped yaw): the selection
+    // must change and reveal surfaces the spawn view culled (fail-before:
+    // the frozen path resubmits the spawn subset and never recovers them).
+    boot.host.input.angles = [0, 270, 0];
+    for (let f = N; f < N + 5; f++) frameGpuPlay(boot, f * 16);
+    const turned = worldOf(boot.gpu!.scene.surfaces);
+    expect(turned.length).toBeGreaterThan(0);
+    expect(turned).not.toEqual(facing);
+    const newlyVisible = turned.filter((id) => !facing.includes(id));
+    expect(newlyVisible.length).toBeGreaterThan(0);
+    // Everything stays inside the persistent inventory; uploads stay 1.
+    const invIds = new Set(worldOf(staticScene.surfaces));
+    expect([...facing, ...turned].every((id) => invIds.has(id))).toBe(true);
     expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
-    expect(boot.gpu!.gpu.getStatus().framesSubmitted).toBe(N);
+    expect(boot.gpu!.gpu.getStatus().framesSubmitted).toBe(N + 5);
     expect(renderSpy).not.toHaveBeenCalled();
     expect(boot.host.serverTime).toBeGreaterThan(0);
     expect(boot.driver.events).toContain('shot');
     expect(stub.log).toContain('drawElements');
     expect(stub.log).not.toContain('readPixels');
     renderSpy.mockRestore();
+  });
+
+  it('base1: brush movers grafted, opening a door displaces verts, GPU keeps submitting without re-upload', { timeout: 180000 }, async () => {
+    const stub = installStubDoc();
+    const boot = await loadPakBoot();
+    const { driver } = boot;
+    // Submodel inventory present: doors/trains/walls grafted into the leaf
+    // lists so the GPU selection can see them (stock traversal cannot).
+    expect(driver.doorSyncCount()).toBeGreaterThan(0);
+    expect(driver.graftedFaceCount()).toBeGreaterThan(0);
+    // Closed pose at spawn: every tracked brush renders at rest.
+    for (const m of driver.server.movers) {
+      expect(driver.doorRenderOffset(m.ent.model!)).toEqual([0, 0, 0]);
+    }
+    // Displace the first door to its open pose, then run frames: the render
+    // side must follow the authoritative origin (syncDoors rewrites the
+    // baked verts), the GPU must keep submitting, and uploads must stay 1
+    // (position re-sync, never a mesh rebuild).
+    const m0 = driver.server.movers[0]!;
+    const travel: [number, number, number] = [
+      m0.pos2[0]! - m0.pos1[0]!,
+      m0.pos2[1]! - m0.pos1[1]!,
+      m0.pos2[2]! - m0.pos1[2]!,
+    ];
+    expect(Math.hypot(travel[0], travel[1], travel[2])).toBeGreaterThan(0);
+    m0.ent.origin = v3(m0.pos2[0], m0.pos2[1], m0.pos2[2]);
+    for (let f = 0; f < 12; f++) frameGpuPlay(boot, f * 16);
+    const offset = driver.doorRenderOffset(m0.ent.model!)!;
+    // Still displaced toward open after a server tick (the tick may start
+    // returning the door at speed*dt, so only the direction is pinned).
+    const dot = offset[0]! * travel[0] + offset[1]! * travel[1] + offset[2]! * travel[2];
+    expect(dot).toBeGreaterThan(0);
+    expect(boot.gpu!.gpu.getStatus().framesSubmitted).toBe(12);
+    expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
+    expect(stub.log).toContain('drawElements');
+    expect(stub.log).not.toContain('readPixels');
   });
 
   it('base1: same boot inputs twice → identical stub-GL call sequence + identical scene', { timeout: 180000 }, async () => {

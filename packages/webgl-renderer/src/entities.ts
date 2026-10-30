@@ -1,10 +1,17 @@
 // @q2/webgl-renderer entities — per-frame entity dynamics (GPU-PROOF-3).
 //
 // Pure, GL-free: updateGpuEntities refreshes ONLY the entity-ref tail of a
-// scene (world refs are reused by reference — static geometry is never
-// rebuilt). Per-frame garbage is small and documented: one surfaces array
-// plus one ref per entity plus the transparent sort (in-place on the fresh
-// array). Static world refs/buffers are untouched per frame.
+// caller-provided world selection (world refs are reused by reference —
+// static geometry is never rebuilt). Per-frame garbage is small and
+// documented: one surfaces array plus one ref per entity plus the transparent
+// sort (in-place on the fresh array). Static world refs/buffers are untouched
+// per frame.
+//
+// NOTE (GPU-FOLLOW-2): the live play path no longer reuses a cached
+// spawn-view world subset — frameGpuPlay calls refreshGpuScene (scene.ts),
+// which re-selects the world for the current camera AND rebuilds the entity
+// tail with the same classification below. updateGpuEntities stays as the
+// tested tail helper (unit contract below), not the per-frame world path.
 //
 // The yaw-only scene transforms are NOT consumed by the GPU renderer: model
 // matrices are derived per frame from the entities (full pitch/yaw/roll

@@ -159,6 +159,38 @@ export interface BrowserSoakRecord {
   notes: string;
   /** Optional path to the raw per-frame sample file (copied to raw/). */
   rawFile: string | null;
+  /**
+   * FOLLOW-1 provenance carriers (all optional for backward compatibility
+   * with pre-FOLLOW-1 soak JSON). When present the importer preserves them
+   * into the manifest instead of recording null/missing; when absent the
+   * manifest records an explicit limitation (never a silent default).
+   */
+  /** Pinned vd_* + sw_* fidelity profile measured under (null = unrecorded). */
+  fidelity?: FidelityProfile | null;
+  /** Warmup seconds before sampling (null = unrecorded). */
+  warmupS?: number | null;
+  /** Asset identity (null = unrecorded; never fabricate a pak). */
+  pak?: PakIdentity | null;
+  /** Host machine descriptor (null = unrecorded). */
+  machineDetail?: Record<string, string> | null;
+  /** Source tree dirtiness at RUN time (null = unknown; import-time git status may differ). */
+  sourceDirty?: boolean | null;
+  /** `git status --porcelain` lines at RUN time (null = unrecorded). */
+  sourceDirtyFiles?: string[] | null;
+  /** Chromium flags used for the leg (GL backend selection is auditable). */
+  chromiumFlags?: string[] | null;
+  /** Effective cvar snapshot read back from the page (null = unrecorded). */
+  cvarSnapshot?: Record<string, string> | null;
+  /** Measured BeginFrames/rAF rate in Hz (null = unmeasured; NOT a display refresh). */
+  refreshHz?: number | null;
+  /** True only when vsync-locked presentation was verified (headless: false). */
+  vsync?: boolean | null;
+  /** Dropped presented frames over the soak (null = uncounted). */
+  droppedFrames?: number | null;
+  /** Any CPU fallback during a GPU leg voids it (null = unverified). */
+  cpuFallback?: boolean | null;
+  /** Explicit limitations of this record (missing provenance, headless, ...). */
+  limitations?: string[] | null;
 }
 
 export interface SoakImportResult {
@@ -179,6 +211,9 @@ export const PROVENANCE_ENV_ALLOWLIST: string[] = [
   'Q2_DETAIL_TIMING',
   'PLAYBENCH_RENDERER', 'PLAYBENCH_W', 'PLAYBENCH_H', 'PLAYBENCH_ITERS',
   'BROWSER_SOAK_IN',
+  'CHROMIUM_BIN',
+  'GPU_SOAK_LEGS', 'GPU_SOAK_WARMUP_S', 'GPU_SOAK_INTERVAL_S', 'GPU_SOAK_OUT',
+  'GPU_SOAK_VITE_PORT', 'GPU_SOAK_LOG', 'GPU_SOAK_UNTHROTTLED',
 ];
 
 const VD_KEYS = [
@@ -456,12 +491,60 @@ export function validateBrowserSoak(v: unknown): { ok: boolean; errors: string[]
     if (n !== null && n !== undefined && (typeof n !== 'number' || !Number.isFinite(n))) errors.push(`${k} must be a number or null`);
   }
   if (!Array.isArray(r['workloads'])) errors.push('workloads must be an array (stationary/moving/combat intervals covered)');
+  for (const k of ['fidelity', 'pak', 'machineDetail', 'cvarSnapshot'] as const) {
+    const v = r[k];
+    if (v !== undefined && v !== null && (typeof v !== 'object' || Array.isArray(v))) {
+      errors.push(`${k} must be an object or null when present (never a fabricated default)`);
+    }
+  }
+  for (const k of ['warmupS', 'refreshHz'] as const) {
+    const v = r[k];
+    if (v !== undefined && v !== null && (typeof v !== 'number' || !Number.isFinite(v) || (v as number) < 0)) {
+      errors.push(`${k} must be a non-negative finite number or null when present`);
+    }
+  }
+  for (const k of ['sourceDirty', 'vsync', 'cpuFallback'] as const) {
+    const v = r[k];
+    if (v !== undefined && v !== null && typeof v !== 'boolean') {
+      errors.push(`${k} must be a boolean or null when present`);
+    }
+  }
+  if (r['droppedFrames'] !== undefined && r['droppedFrames'] !== null) {
+    const d = r['droppedFrames'];
+    if (typeof d !== 'number' || !Number.isInteger(d) || (d as number) < 0) {
+      errors.push('droppedFrames must be a non-negative integer or null when present');
+    }
+  }
+  for (const k of ['sourceDirtyFiles', 'chromiumFlags', 'limitations'] as const) {
+    const v = r[k];
+    if (v !== undefined && v !== null && (!Array.isArray(v) || !(v as unknown[]).every((x) => typeof x === 'string'))) {
+      errors.push(`${k} must be a string array or null when present`);
+    }
+  }
   return { ok: errors.length === 0, errors };
 }
 
 export interface SoakImportOpts {
   outDir?: string;
   manifestPath?: string;
+  /**
+   * FOLLOW-1 provenance overrides (used only when the soak record itself
+   * carries no value): real pak path, fidelity profile, warmup seconds,
+   * host machine descriptor, and run-time dirty-file list.
+   */
+  pakPath?: string;
+  fidelity?: FidelityProfile | null;
+  warmupS?: number | null;
+  machine?: Record<string, string> | null;
+  dirtyFiles?: string[] | null;
+}
+
+/** `git status --porcelain` lines (empty = clean, null = git unavailable). */
+export function gitDirtyFiles(): string[] | null {
+  const out = gitOut('status --porcelain');
+  if (out === null) return null;
+  const lines = out.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+  return lines;
 }
 
 /**
@@ -486,6 +569,31 @@ export function importBrowserSoak(inputPath: string, opts: SoakImportOpts = {}):
   const commitFull = soak.commitFull ?? soak.commitShort;
   const load = loadavg();
   const n = Math.max(1, cpus().length);
+  // FOLLOW-1 provenance repair: prefer record-carried values (written by the
+  // runner at RUN time), then explicit opts, and only then the legacy
+  // missing/empty fallbacks — with the gap recorded in `soak.limitations`
+  // and the manifest summary so old manifests stay readable as limited.
+  const limitations: string[] = [...(soak.limitations ?? [])];
+  const pak: PakIdentity =
+    soak.pak ??
+    (opts.pakPath !== undefined ? pakIdentity(opts.pakPath) : null) ??
+    { path: '(browser-imported)', bytes: null, mtimeMs: null, mtimeIso: null, missing: true };
+  if (pak.missing) limitations.push('asset identity unrecorded: pak bytes/mtime unknown (browser-imported placeholder)');
+  const fidelity: FidelityProfile | null = soak.fidelity ?? opts.fidelity ?? null;
+  if (fidelity === null) limitations.push('fidelity profile unrecorded (vd_* + sw_* cvars unknown)');
+  const warmup: number | null = soak.warmupS ?? opts.warmupS ?? null;
+  if (warmup === null) limitations.push('warmup unrecorded (pre-sampling warmup unknown)');
+  const machine: Record<string, string> = soak.machineDetail ?? opts.machine ?? {};
+  if (Object.keys(machine).length === 0) limitations.push('host machine descriptor unrecorded');
+  const runDirtyFiles: string[] | null = soak.sourceDirtyFiles ?? opts.dirtyFiles ?? null;
+  const treeDirty =
+    soak.sourceDirty ??
+    (runDirtyFiles !== null ? runDirtyFiles.length > 0 : null) ??
+    (gitOut('status --porcelain') ?? '').length > 0;
+  const repairedSoak: BrowserSoakRecord = {
+    ...soak,
+    limitations: limitations.length > 0 ? limitations : (soak.limitations ?? null),
+  };
   const manifest: EvidenceManifest = {
     manifestVersion: EVIDENCE_MANIFEST_VERSION,
     kind: 'browser-soak',
@@ -493,18 +601,18 @@ export function importBrowserSoak(inputPath: string, opts: SoakImportOpts = {}):
     command: { argv: process.argv.slice(0), env: provenanceEnv(), cwd: process.cwd() },
     commitShort: soak.commitShort,
     commitFull,
-    treeDirty: (gitOut('status --porcelain') ?? '').length > 0,
+    treeDirty,
     distFresh: distFreshness(),
-    pak: { path: '(browser-imported)', bytes: null, mtimeMs: null, mtimeIso: null, missing: true },
-    machine: {},
+    pak,
+    machine,
     node: process.version,
     browser: { ...soak.browser },
     compositor: soak.compositor,
     loadavg: [load[0] ?? 0, load[1] ?? 0, load[2] ?? 0],
     cpus: n,
     quietOk: (load[0] ?? 0) <= n,
-    fidelity: null,
-    warmup: null,
+    fidelity,
+    warmup,
     reps: soak.samples,
     workers: [...soak.workers],
     resultFile: resultPath,
@@ -520,13 +628,16 @@ export function importBrowserSoak(inputPath: string, opts: SoakImportOpts = {}):
       hardwareBacked: soak.hardwareBacked,
       compositor: soak.compositor,
     },
-    soak,
+    soak: repairedSoak,
     ledgerHint:
       `| ${new Date().toISOString().slice(0, 10)} | ${soak.commitShort} | browser-soak (${soak.compositor}` +
       `${soak.hardwareBacked ? ',hw' : ',sw'}) | ${soak.resolution} ${soak.renderer} ` +
       `presented ${soak.presentedFpsMedian ?? 'n/a'}fps p95 ${soak.frameP95Ms ?? 'n/a'}ms ` +
       `| evidence: browser-soak-${base}.manifest.json |`,
   };
+  if (runDirtyFiles !== null && runDirtyFiles.length > 0) {
+    manifest.summary['treeDirtyFiles'] = runDirtyFiles.length;
+  }
   const manifestPath = writeEvidenceManifest(manifest, opts.manifestPath);
   return { manifestPath, resultPath, manifest };
 }

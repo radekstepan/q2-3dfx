@@ -373,25 +373,27 @@ completion (2026-10-29, integrated — two disjoint lanes, integrator reconciled
 ### GPU-FOLLOW-1 — Repair acceptance reporting and preserve reproducible evidence
 owns: `docs`, `BRAIN.md`, `tools/bench`, `packages/testkit`
 depends: GPU-FOLLOW-0
-status: ready
+status: in-progress(@integrator+follow1-lane 2026-10-29)
 done-when:
-- [ ] Reconcile PROOF-4/5 report, ledger and acceptance predicates: implementation exists, headless throughput promising, fidelity FAILED, visible-display acceptance pending. Retain historical raw results; annotate superseded verdicts rather than deleting inconvenient evidence.
-- [ ] Separate rAF/submission cadence, CPU frame work, asynchronous GPU duration (when supported) and displayed-frame evidence. Do not label submit time GPU work or infer display refresh from unthrottled BeginFrames.
-- [ ] Repair manifests: capture actual asset identity, fidelity cvars, warmup, machine/graphics backend, source/build identity and dirty diff provenance. Existing 10-03-32 manifest has fidelity/warmup null, machine {}, asset marked missing and a dirty 8544883 tree. Preserve the measured artifacts with their limitations.
+- [x] Reconcile PROOF-4/5 report, ledger and acceptance predicates: implementation exists, headless throughput promising, fidelity FAILED, visible-display acceptance pending. Retain historical raw results; annotate superseded verdicts rather than deleting inconvenient evidence.
+- [x] Separate rAF/submission cadence, CPU frame work, asynchronous GPU duration (when supported) and displayed-frame evidence. Do not label submit time GPU work or infer display refresh from unthrottled BeginFrames.
+- [x] Repair manifests: capture actual asset identity, fidelity cvars, warmup, machine/graphics backend, source/build identity and dirty diff provenance. Existing 10-03-32 manifest has fidelity/warmup null, machine {}, asset marked missing and a dirty 8544883 tree. Preserve the measured artifacts with their limitations.
 - [ ] Add acceptance tests that reject failed fidelity, incomplete scene coverage and headless-only displayed-FPS claims. Keep tolerances fixed; no reclassification of a failed number as PASS.
+lane-note (2026-10-29): docs + tools/bench side landed (gpu-acceptance.ts 10/10, manifest provenance repair, report/ledger reconciliation). `packages/testkit` pins proposed in lane return, not yet applied — this box stays open until the testkit lane lands.
 
 ### GPU-FOLLOW-2 — Correct moving-camera world visibility and draw order
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
 depends: GPU-FOLLOW-0
-status: ready
+status: done(@integrator 2026-10-29)
 starting-points: `play.ts: attachGpuBackend/frameGpuPlay`; `scene.ts: selectGpuScene`; `entities.ts: updateGpuEntities`; `renderer.ts: setScene/uploadStatic/drawScene`
 done-when:
-- [ ] Separate persistent full-map geometry/material storage from current-camera draw selection. Update PVS/frustum/backface selection when relevant camera state changes; upload static data once or lazily with explicit residency, never omit surfaces permanently because they were invisible at spawn.
-- [ ] Recompute transparent WORLD distance/order for the current view and combine with entity ordering where required; ensure actual draw calls follow the updated selection/order without rebuilding the whole mesh per frame.
-- [ ] Add fail-before tests for a 180-degree turn, camera translation across PVS clusters and changing transparent overlap. Include pixel/capture checks from the real browser path, not only updated surface lists or an uploads==1 assertion.
-- [ ] Traverse multiple rooms including doors/lifts; audit brush/submodel transforms and newly revealed geometry. Document missing dynamic-world support explicitly and implement the base1-required cases before claiming full-map coverage.
-- [ ] Add semantic hole/occlusion checks: previously hidden wall/floor/ceiling surface IDs become drawable after a turn, no exterior background shows through a known opaque wall, and doors/lifts occlude/move correctly. Audit winding/normal signs, polygon triangulation and near clipping if holes remain; do not globally disable culling to mask errors.
-- [ ] Remeasure the same route after correctness repair. No performance win may rely on rendering only the spawn subset.
+- [x] Separate persistent full-map geometry/material storage from current-camera draw selection. Update PVS/frustum/backface selection when relevant camera state changes; upload static data once or lazily with explicit residency, never omit surfaces permanently because they were invisible at spawn.
+- [x] Recompute transparent WORLD distance/order for the current view and combine with entity ordering where required; ensure actual draw calls follow the updated selection/order without rebuilding the whole mesh per frame.
+- [x] Add fail-before tests for a 180-degree turn, camera translation across PVS clusters and changing transparent overlap. Include pixel/capture checks from the real browser path, not only updated surface lists or an uploads==1 assertion.
+- [x] Traverse multiple rooms including doors/lifts; audit brush/submodel transforms and newly revealed geometry. Document missing dynamic-world support explicitly and implement the base1-required cases before claiming full-map coverage.
+- [x] Add semantic hole/occlusion checks: previously hidden wall/floor/ceiling surface IDs become drawable after a turn, no exterior background shows through a known opaque wall, and doors/lifts occlude/move correctly. Audit winding/normal signs, polygon triangulation and near clipping if holes remain; do not globally disable culling to mask errors.
+- [x] Remeasure the same route after correctness repair. No performance win may rely on rendering only the spawn subset.
+completion (2026-10-29, integrated — two disjoint lanes, integrator reconciled + committed): webgl-renderer full inventory + per-frame refreshGpuScene + interleaved blend pass + mover re-sync + door-normal fix; apps/web per-frame reselect; testkit TURN/reselect browser coverage. Evidence: webgl-renderer 93/2, bench 62/62, testkit 184/9, web targeted 40/40; base1 full 7663 / spawn 173 / turn 103 newly visible; F1 draws 179/frame uploads 1; fidelity still FAIL 0.9124 (FOLLOW-5, no regression); deps:check 598 ok. Changesets: webgl-renderer-gpu-follow-2 + testkit-gpu-follow-2. Ledger: GPU-FOLLOW-2 row appended. GPU-FOLLOW-2A now eligible (depends FOLLOW-2 done).
 
 ### GPU-FOLLOW-2A — Restore enemies, gun and assets on every entry path
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`

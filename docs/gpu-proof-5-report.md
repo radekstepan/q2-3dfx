@@ -1,10 +1,33 @@
 # GPU-PROOF-5 — go/no-go report (2026-10-29)
 
-> Verdict: **GO (conditional)** — the performance gate PASSES decisively on a
-> hardware-backed browser; fidelity differences are reviewed, classified, and
-> confined to authorized approximations, with formal human sign-off still
-> pending as a tracked risk. GPU-EXPAND-1 is eligible. No further CPU
-> "optimize forever" work is authorized.
+> FOLLOW-1 reconciliation note (2026-10-29, reporting lane — supersedes the
+> verdict below, preserves all measured numbers):
+> implementation EXISTS (prototype renders the base1 scene); headless
+> throughput is PROMISING (233.76/s unthrottled BeginFrames cadence, p50
+> 3.92 ms / p95 6.01 ms on AMD Vega headless — main-thread work headroom,
+> NOT displayed 60 FPS, NOT measured GPU execution); fidelity FAILED
+> (0.912 vs the fixed 0.02 gate — thresholds unchanged, never reclassified
+> as PASS); visible-display acceptance is PENDING (headless + vsync=false
+> cannot claim scanout presentation; no user/hardware-oracle approval
+> fabricated). The historical "GO (conditional)" + "gate PASS 3/3" lines
+> below are retained as the 2026-10-29 record of headroom only — they do not
+> constitute fidelity or displayed-frame acceptance. Manifest limitations:
+> `browser-soak-8544883-2026-10-29T10-03-32` records fidelity null,
+> warmup null, machine {}, pak missing, on a dirty 8544883 tree — preserved
+> with those limits; future soaks carry the repaired provenance (FOLLOW-1
+> bench lane). Timing terms: "refresh ~228 Hz" below is the unthrottled
+> BeginFrames rate, not a display refresh; "submit ~2.8 ms" is caller-clock
+> submission work, not async GPU duration (unknown in this harness).
+> Separated predicates: `tools/bench/src/gpu-acceptance.ts`
+> (`validateGpuFidelity` / `validateSceneCoverage` / `validateDisplayedClaim`
+> / `formatGpuAcceptanceReport`).
+
+> Verdict: **GO (conditional)** — SUPERSEDED by the FOLLOW-1 note above.
+> Retained verbatim as the 2026-10-29 headroom record: the performance
+> headroom claim below PASSES decisively on a hardware-backed headless
+> browser; fidelity differences are documented (0.912 FAILED vs 0.02, never
+> passed) and visible-display acceptance remains pending. GPU-EXPAND-1 is
+> NOT eligible on this report alone.
 
 ## 1. Scope + identity
 
@@ -40,19 +63,28 @@ p95 6.01 ≤ 20 PASS**, refresh ~228 Hz (unthrottled BeginFrames),
 cpuFallback=false, 0 errors, memory bounded (GC settling, no growth).
 
 Headroom vs the CPU baseline: **6.9x cadence, 4.2x median work**.
-Work-split medians (in-frame `performance.now` ring, live GPU leg):
-drains ~0.005 ms, sim ~0.02 ms, view+entities ~0.35 ms, tail ~0.02 ms,
-**submit ~2.8 ms**, total ~3.4 ms. The submit (GPU work + present) dominates;
-CPU-side prep is sub-millisecond. No `gl.finish`/readPixels per-frame tricks,
-no disabled effects; HUD + sim + scene prep + presentation all included.
+Work-split medians (in-frame `performance.now` ring, live GPU leg — caller
+clock, main thread only): drains ~0.005 ms, sim ~0.02 ms, view+entities
+~0.35 ms, tail ~0.02 ms, **submit ~2.8 ms**, total ~3.4 ms. The submit
+(CPU-side submission work + present, NEVER measured GPU execution) dominates;
+CPU-side prep is sub-millisecond. Async GPU duration is UNKNOWN in this
+harness (no disjoint-timer query — never inferred from submit time).
+No `gl.finish`/readPixels per-frame tricks, no disabled effects; HUD + sim
++ scene prep + presentation all included. (FOLLOW-1 2026-10-29: this paragraph
+previously labelled submit as "GPU work + present" — corrected to
+submission work; the numbers are retained.)
 
-Limits, stated plainly: headless has no vsync — the ≥59 fps clause is
+Limits, stated plainly: headless has no vsync — the ≥59 fps clause CANNOT be
 established by work headroom (every frame fits in 4–6 ms ≪ 16.7 ms quantum,
-so a 60 Hz display sustains 60 fps), not by a vsync-locked measurement.
-Software-baseline numbers are SwiftShader-composited supplements, never
-mixed with hardware numbers. Timing run used `GPU_SOAK_UNTHROTTLED=1`;
-capped-headless runs are cap-shaped (p50 pins at 16.6 ms) and cannot resolve
-the median — documented in the manifest notes.
+so a 60 Hz display *could* sustain 60 fps, but no displayed-frame measurement
+exists). (FOLLOW-1 2026-10-29: the original text below claimed the clause
+"is established by work headroom" — that sentence is superseded; headroom
+is promising, display acceptance is pending.) Software-baseline numbers are
+SwiftShader-composited supplements, never mixed with hardware numbers. Timing
+run used `GPU_SOAK_UNTHROTTLED=1`; capped-headless runs are cap-shaped
+(p50 pins at 16.6 ms) and cannot resolve the median — documented in the
+manifest notes. "Refresh ~228 Hz" is the unthrottled BeginFrames/rAF rate
+(submission cadence), not a display refresh rate.
 
 ## 3. Fidelity (contract: exact asset/UV orientation, tolerances 0.02 @ 3 LSB)
 
@@ -117,8 +149,15 @@ the median — documented in the manifest notes.
 
 ## 7. Recommendation
 
-**GO**: promote the GPU backend to experimental-default candidate and open
-GPU-EXPAND-1 (coverage inventory → full-scene parity → explicit fallback
-policy → default promotion). Do NOT resume the CPU optimization campaign.
-Next measurements belong to EXPAND-1 (repeat this soak after coverage
-expansion, same gates, same box).
+**SUPERSEDED by GPU-FOLLOW review (BRAIN.md §8, 2026-10-29) and the FOLLOW-1
+note at the top of this report.** The original line below ("GO: promote the
+GPU backend ... and open GPU-EXPAND-1") is retained as history but no longer
+operative: EXPAND-1 stays paused until FOLLOW-1–7 pass, and no promotion or
+default change happens on headless headroom alone. Do NOT resume the CPU
+optimization campaign either — the finite FOLLOW queue governs next work.
+
+Original (superseded, retained): **GO**: promote the GPU backend to
+experimental-default candidate and open GPU-EXPAND-1 (coverage inventory →
+full-scene parity → explicit fallback policy → default promotion). Do NOT
+resume the CPU optimization campaign. Next measurements belong to EXPAND-1
+(repeat this soak after coverage expansion, same gates, same box).

@@ -51,4 +51,23 @@ describe('rotateDoorVert (func_door_rotating render graft)', () => {
     expect(back[1]!).toBeCloseTo(base[1]!, 9);
     expect(back[2]!).toBeCloseTo(base[2]!, 9);
   });
+
+  it('rotates a face normal as a pure direction about the origin (no translation leak)', () => {
+    // FOLLOW-2 winding audit: syncRotDoor rotates `fn` via
+    // rotateDoorVert(n, origin, delta) == R*n. A nonzero pivot must never
+    // leak translation into the normal — the backface rule depends on it.
+    const zero = v3(0, 0, 0);
+    const n = rotateDoorVert(v3(1, 0, 0), zero, v3(0, 90, 0));
+    expect(n[0]!).toBeCloseTo(0, 9);
+    expect(n[1]!).toBeCloseTo(1, 9);
+    expect(n[2]!).toBeCloseTo(0, 9);
+    // Unit length preserved (rotation, not skew).
+    expect(Math.hypot(n[0]!, n[1]!, n[2]!)).toBeCloseTo(1, 9);
+    // Pitch form: +Z up rotates to +X under +90 pitch (same R as verts —
+    // the existing +X-to--Z vert case pins the convention from the other side).
+    const up = rotateDoorVert(v3(0, 0, 1), zero, v3(90, 0, 0));
+    expect(up[0]!).toBeCloseTo(1, 9);
+    expect(up[1]!).toBeCloseTo(0, 9);
+    expect(up[2]!).toBeCloseTo(0, 9);
+  });
 });

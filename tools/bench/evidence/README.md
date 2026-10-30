@@ -112,9 +112,28 @@ violation):
 | `renderer`, `workers`, `workloads` | voodoo/software, worker sweep, intervals covered |
 | `durationS ≥ 300`, `samples` | soak length (≥5 min) + presented-frame count |
 | `presentedFpsMedian`, `frameP50Ms/P95Ms/MaxMs` | percentiles (numbers or null) |
+| `fidelity`, `warmupS`, `pak`, `machineDetail` (optional) | FOLLOW-1 provenance: pinned vd_* + sw_* profile, warmup seconds, pak identity, host machine — absent stays null with a `limitations` entry, never a fabricated default |
+| `sourceDirty`, `sourceDirtyFiles`, `chromiumFlags`, `cvarSnapshot` (optional) | source/build identity: run-time dirty flag + file list, GL flags, effective page cvars |
+| `refreshHz`, `vsync`, `droppedFrames`, `cpuFallback` (optional) | gate fields: BeginFrames rate (NOT display refresh), vsync verification, presented drops, fallback void |
+| `limitations` (optional) | explicit missing-provenance notes carried into the manifest |
 
 Example: `evidence/browser-soak.example.json` (template — fill in measured
 values, never commit fabricated numbers).
+
+## FOLLOW-1 timing vocabulary + manifest history
+
+- rAF/submission cadence = unthrottled BeginFrames rate (main-thread work
+  headroom, NOT display refresh). CPU frame work = caller-clock
+  drains/sim/view/tail/submit/total (submitMs is submission work, NOT GPU
+  execution). Async GPU duration = unknown (no timer query). Displayed-frame
+  evidence requires a visible (`headless=false`) vsync-locked leg.
+- Pre-FOLLOW-1 GPU manifests (notably
+  `browser-soak-8544883-2026-10-29T10-03-32`) record `fidelity` null,
+  `warmup` null, `machine` {}, pak missing, on a dirty tree with no file
+  list. They are PRESERVED with those limits (see
+  `docs/gpu-follow-1-reconciliation.md`); the importer now records explicit
+  `limitations` instead of silent gaps, and `gpu-soak.mjs` populates the
+  full provenance on new runs.
 
 ## Settings-mismatch policy
 

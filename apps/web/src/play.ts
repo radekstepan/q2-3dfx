@@ -119,18 +119,18 @@ import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } f
 import type { BrowserForegroundDetail, DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
 import { detectGpuCapability, getGpuStatus, resolveBootRenderer } from './gpu-select.js';
 import { acquireGpuCanvas, removeGpuCanvas, setHudTransparent, syncGpuCanvasToHud } from './gpu-canvas.js';
-import { WebGLRenderer, selectGpuScene, updateGpuEntities } from '@q2/webgl-renderer';
+import { WebGLRenderer, fullWorldRefs, refreshGpuScene, selectGpuScene } from '@q2/webgl-renderer';
 
 /**
- * PROOF-5 iteration-1 contract pin: the per-frame entity-tail path below
- * consumes the committed `updateGpuEntities` (world refs reused by
- * reference). A static import of a missing export already fails the bundle
- * load; this runtime pin fails loudly with the reason instead of silently
- * falling back to a local reimplementation (forbidden by the card).
+ * Per-frame GPU scene refresh (GPU-FOLLOW-2): the committed `refreshGpuScene`
+ * (fresh world PVS/frustum/backface selection + combined transparent order).
+ * A static import of a missing export already fails the bundle load; this
+ * runtime pin fails loudly with the reason instead of silently falling back
+ * to a frozen spawn-view subset (forbidden by the card).
  */
-if (typeof updateGpuEntities !== 'function') {
+if (typeof refreshGpuScene !== 'function') {
   throw new Error(
-    'play(frameGpuPlay): updateGpuEntities missing from @q2/webgl-renderer — refusing to reimplement (GPU-PROOF-5 iteration 1)',
+    'play(frameGpuPlay): refreshGpuScene missing from @q2/webgl-renderer — refusing frozen-subset rendering (GPU-FOLLOW-2)',
   );
 }
 
@@ -168,7 +168,18 @@ export interface RasterPolicyStatus {
  * R_AliasSetUpTransform basis the alias backend already uses — an identity
  * delta is the identity, so closed rotators render bit-identical to the
  * baked verts. Pure (no sim state); covered by door-rotation.test.ts.
+ *
+ * Direction-vector form: rotateDoorVert(n, ORIGIN_ZERO, delta) rotates a
+ * normal with no translation (R*n). The rotating-door sync uses this for
+ * face normals so backface culling stays correct mid-swing.
  */
+const ORIGIN_ZERO: Vec3 = (() => {
+  const v = v3();
+  v[0] = 0;
+  v[1] = 0;
+  v[2] = 0;
+  return v;
+})();
 export function rotateDoorVert(base: Vec3, pivot: Vec3, delta: Vec3, out?: Vec3): Vec3 {
   const fwd = v3();
   const right = v3();
@@ -859,6 +870,12 @@ interface DoorSync {
   baseCenter: Float32Array[];
   baseMins: Float32Array[];
   baseMaxs: Float32Array[];
+  /**
+   * Rest face normals (FOLLOW-2 winding audit): rotating doors rotate `fn`
+   * with the verts, so the CPU backface rule and the frustum test stay
+   * correct mid-swing. Translating movers never change normals.
+   */
+  baseFn: Float32Array[];
 }
 
 function tryPakEntry(pak: WebPak, name: string): ArrayBuffer | null {
@@ -2269,7 +2286,11 @@ export class LocalDriver implements HostDriver {
         baseMaxs.push(new Float32Array(s.maxs));
       }
       if (faces.length > 0) {
-        this.doors.push({ ent, rest, restAngles, rotates, model: n, faces, baseVerts, baseCenter, baseMins, baseMaxs });
+        this.doors.push({
+          ent, rest, restAngles, rotates, model: n, faces,
+          baseVerts, baseCenter, baseMins, baseMaxs,
+          baseFn: faces.map((s) => new Float32Array(s.fn)),
+        });
       }
     };
     for (const m of this.server.movers) snap(m.ent, m.pos1, m.ent.angles, false);
@@ -2547,9 +2568,13 @@ export class LocalDriver implements HostDriver {
         s.center.set(d.baseCenter[i]!);
         s.mins.set(d.baseMins[i]!);
         s.maxs.set(d.baseMaxs[i]!);
+        s.fn.set(d.baseFn[i]!);
       }
       return;
     }
+    // Pivot at the door origin: direction vectors rotate about `rest` with
+    // no translation component (the pivot is fixed for pure rotation).
+    const fnTmp = v3();
     const tmp = v3();
     for (let i = 0; i < d.faces.length; i++) {
       const s = d.faces[i]!;
@@ -2585,6 +2610,19 @@ export class LocalDriver implements HostDriver {
       s.maxs[0] = mxx;
       s.maxs[1] = mxy;
       s.maxs[2] = mxz;
+      // Normals rotate with the verts as pure directions (about the origin:
+      // rotateDoorVert(n, 0, delta) == R*n with no translation). Rotating
+      // about the door pivot would leak translation into the normal. Without
+      // this the CPU backface rule culls the wrong side mid-swing and newly
+      // revealed faces stay hidden.
+      const bf = d.baseFn[i]!;
+      fnTmp[0] = bf[0]!;
+      fnTmp[1] = bf[1]!;
+      fnTmp[2] = bf[2]!;
+      rotateDoorVert(fnTmp, ORIGIN_ZERO, delta, fnTmp);
+      s.fn[0] = fnTmp[0]!;
+      s.fn[1] = fnTmp[1]!;
+      s.fn[2] = fnTmp[2]!;
     }
   }
 
@@ -3010,16 +3048,17 @@ export interface GpuBootState {
   gl: unknown;
   /** Committed backend (programs against `GpuRenderer`, never internals). */
   gpu: WebGLRenderer;
-  /** Last submitted scene (static world once + per-frame entity tail). */
+  /** Last submitted scene (fresh world selection + entity tail, per frame). */
   scene: GpuSceneInput;
   /**
-   * Pristine boot-time STATIC world scene (GPU-PROOF-5 iteration 1): the
-   * `selectGpuScene` result from `attachGpuBackend` (empty entities, spawn
-   * view). `frameGpuPlay` derives every frame's submitted scene from THIS via
-   * the committed `updateGpuEntities` (world refs reused by reference, so
-   * `staticGeneration` never changes and uploads stay 1); `scene` above
-   * remains the last submitted scene (tail-updated). Never mutated after
-   * attach — the tail builder only reads its world refs.
+   * Persistent full-map world inventory (GPU-FOLLOW-2 storage side): the
+   * `fullWorldRefs` result from `attachGpuBackend` (every triangulable
+   * surface, no camera culling — the upload set). `frameGpuPlay` NEVER
+   * derives the submitted scene from this; it re-selects per frame via the
+   * committed `refreshGpuScene` (world refs fresh for the current view, so
+   * `staticGeneration` never changes and uploads stay 1 across N frames).
+   * `scene` above remains the last submitted selection. Never mutated after
+   * attach.
    */
   staticScene: GpuSceneInput;
   /** Sim clock for GPU frames (mirrors Host privates, like frameAsync). */
@@ -3394,6 +3433,15 @@ function attachGpuBackend(driver: LocalDriver, width: number, height: number): G
     gpu.init(acquired.gl as unknown as WebGL2RenderingContext, width, height);
     const scene = selectGpuScene(driver.mini, [], spawnViewFor(driver), width, height);
     gpu.setScene(scene);
+    // Persistent inventory snapshot (observability only): the full upload
+    // set the renderer baked from the world (selection-independent). The
+    // per-frame path re-selects from the live world instead of this.
+    const inventory = fullWorldRefs(driver.mini);
+    const staticScene: GpuSceneInput = {
+      surfaces: inventory,
+      transforms: scene.transforms,
+      staticGeneration: scene.staticGeneration,
+    };
     installGpuWorkConveyor();
     try {
       syncGpuCanvasToHud(undefined);
@@ -3401,7 +3449,7 @@ function attachGpuBackend(driver: LocalDriver, width: number, height: number): G
     } catch {
       /* presentation best-effort: GL scene still submits */
     }
-    return { canvas: acquired.canvas, gl: acquired.gl, gpu, scene, staticScene: scene, loop: createAsyncLoopState(), appearance: null };
+    return { canvas: acquired.canvas, gl: acquired.gl, gpu, scene, staticScene, loop: createAsyncLoopState(), appearance: null };
   } catch {
     return null;
   }
@@ -4894,20 +4942,16 @@ export function installGpuWorkConveyor(): () => GpuWorkSplits {
  * - CRITICAL: `refresh.renderView` is NEVER called here — no CPU world span
  *   rasterization runs in parallel with the GPU submit. HUD painting continues
  *   on the 2D overlay canvas (see `paintHudOverlay`, called by the rAF tick).
- * - Entity tail (GPU-PROOF-5 iteration 1): the static world scene is cached
- *   at boot (`GpuBootState.staticScene`, built once in `attachGpuBackend`)
- *   and each frame builds ONLY the entity tail via the committed
- *   `updateGpuEntities(staticScene, entities, view)` — no per-frame PVS
- *   union over the world surfaces, no frustum cull, no blend re-sort of the
- *   world, no fresh transform array. World refs are reused BY REFERENCE, so
- *   `staticGeneration` never changes and uploads stay 1 across N frames.
- *   `transforms` stays the boot `[identity]` slot BY DESIGN (not a gap): the
- *   committed `WebGLRenderer` derives full-basis entity model matrices per
- *   frame from `setEntities` (pitch/yaw/roll basis + frame/backlerp
- *   interpolation in `drawAlias`) and never consumes per-entity transform
- *   slots — they are yaw-only legacy reservations from the PROOF-2
- *   selector. Reusing the static array by reference keeps per-frame scene
- *   assembly to the tail surfaces array + one ref per entity.
+ * - World selection (GPU-FOLLOW-2): every frame re-selects the world for
+ *   the CURRENT view via the committed `refreshGpuScene` (fresh PVS union,
+ *   frustum cull, backface rule, world+entity blend re-sort far->near).
+ *   Nothing is ever reused from a spawn-view subset: turning/translating
+ *   reveals newly visible surfaces immediately. The passed `generation`
+ *   stays the boot one, so persistent uploads stay 1 across N frames, and
+ *   the committed `WebGLRenderer` draws only the submitted ranges (no mesh
+ *   rebuild). `transforms` carries the fresh `[identity]` + yaw-only entity
+ *   slots (the renderer derives full-basis entity matrices per frame from
+ *   `setEntities` and never consumes these slots).
  * - Dynamic lights/beams: the one-shot driver queues are drained HERE into
  *   GPU inputs (`lights` + synthesized beam entities) instead of the CPU
  *   pumps — the CPU pools would be purposeless since CPU renderView never
@@ -4993,21 +5037,18 @@ export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus |
   g.appearance = appearance;
   pushGpuAppearance(g.gpu, appearance);
   const tTail0 = performance.now();
-  // PROOF-5 iteration 1: entity tail ONLY from the cached static scene (no
-  // per-frame `selectGpuScene`; world refs reused by reference).
-  const tail = updateGpuEntities(
-    g.staticScene,
+  // FOLLOW-2: fresh world selection for the CURRENT view every frame (never
+  // a cached spawn-view subset). Generation stays the boot one, so the
+  // renderer keeps its persistent uploads and draws the new ranges.
+  const scene = refreshGpuScene(
+    boot.driver.mini,
     entities,
     view,
+    boot.host.fb.width,
+    boot.host.fb.height,
     beamKinds.size > 0 ? beamKinds : undefined,
+    g.staticScene.staticGeneration,
   );
-  const scene: GpuSceneInput = {
-    surfaces: tail,
-    // Boot `[identity]` slot reused by reference: the committed renderer
-    // derives full-basis entity matrices from `setEntities` (see above).
-    transforms: g.staticScene.transforms,
-    staticGeneration: g.staticScene.staticGeneration,
-  };
   const tSubmit0 = performance.now();
   g.gpu.setScene(scene);
   g.gpu.setEntities(entities, beamKinds.size > 0 ? beamKinds : undefined);
