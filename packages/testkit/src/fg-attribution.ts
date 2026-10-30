@@ -298,6 +298,12 @@ export function readForegroundAttribution(source: object): ForegroundAttribution
  * exactly wherever all three are published; zero completed kicks must not
  * carry worker-completed work (failure/replay is never successful worker
  * execution). Returns mismatch descriptions (empty = reconciles). Pure.
+ *
+ * Per-class completion splits are null BY DESIGN while the producer
+ * publishes none (see readForegroundAttribution) — but a producer that DOES
+ * publish one is held to the same zero-kick rule: a nonzero per-class
+ * worker/main completion on a zero-kick frame is failure staged as
+ * execution, exactly like the kick-level triple.
  */
 export function reconcileForegroundAttribution(a: ForegroundAttribution): string[] {
   const bad: string[] = [];
@@ -319,6 +325,23 @@ export function reconcileForegroundAttribution(a: ForegroundAttribution): string
       ['workerSpans', a.kick.workerSpans],
       ['workerPixels', a.kick.workerPixels],
       ['workerTris', a.kick.workerTris],
+    ] as Array<[string, AttributedCount]>) {
+      if (v !== null && v !== 0) bad.push(`${label}=${v} with kicks=0 (failure staged as execution)`);
+    }
+    // Same rule for published per-class completion splits (unpublished =
+    // null = skipped; a published nonzero on a zero-kick frame is the same
+    // misattribution, flagged with its field name, never laundered).
+    for (const [label, v] of [
+      ['alphaSpansWorkerCompleted', a.alphaSpansWorkerCompleted],
+      ['alphaSpansMainCompleted', a.alphaSpansMainCompleted],
+      ['spriteSpansWorkerCompleted', a.spriteSpansWorkerCompleted],
+      ['spriteSpansMainCompleted', a.spriteSpansMainCompleted],
+      ['aliasTrisWorkerCompleted', a.aliasTrisWorkerCompleted],
+      ['aliasTrisMainCompleted', a.aliasTrisMainCompleted],
+      ['particleSpansWorkerCompleted', a.particleSpansWorkerCompleted],
+      ['particleSpansMainCompleted', a.particleSpansMainCompleted],
+      ['beamSpansWorkerCompleted', a.beamSpansWorkerCompleted],
+      ['beamSpansMainCompleted', a.beamSpansMainCompleted],
     ] as Array<[string, AttributedCount]>) {
       if (v !== null && v !== 0) bad.push(`${label}=${v} with kicks=0 (failure staged as execution)`);
     }

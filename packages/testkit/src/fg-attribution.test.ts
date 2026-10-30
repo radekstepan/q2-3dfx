@@ -592,6 +592,81 @@ describe('foreground attribution reader contract (no renderer)', () => {
     expect(reconcileForegroundAttribution(attr)).toEqual([]);
   });
 
+  it('per-class worker/main splits are null BY DESIGN while the producer publishes none (TASK item 4 gap, tracked)', () => {
+    // WHY null (not zero, not staged-as-worker): one kick drains EVERY RGB
+    // descriptor in order — world batches, deferred-TRANS alpha spans,
+    // sprite/particle/beam spans and alias TRI screen tris ride the same
+    // kick (producer: packages/sw-renderer/src/bands.ts
+    // `processRGBFrameJob` — "every RGB descriptor in order"; browser
+    // mirror: apps/web render-workers.ts `BrowserForegroundDetail`). The
+    // pool reports only the GLOBAL worker/main split, so per-class
+    // completion is unknowable downstream. The optional per-class fields
+    // are accepted if a future producer publishes them; until then they
+    // read null (unknown). This test pins the invariant so the gap is
+    // TRACKED, not silently missing: real-execution legs above (pooled
+    // alpha water, pooled combat) assert the same nulls on live kicks.
+    const a = readForegroundAttribution({ testForegroundStats: (): unknown => validRaw() });
+    expect(a).not.toBeNull();
+    const attr = a as ForegroundAttribution;
+    expect(attr.alphaSpansWorkerCompleted).toBeNull();
+    expect(attr.alphaSpansMainCompleted).toBeNull();
+    expect(attr.spriteSpansWorkerCompleted).toBeNull();
+    expect(attr.spriteSpansMainCompleted).toBeNull();
+    expect(attr.aliasTrisWorkerCompleted).toBeNull();
+    expect(attr.aliasTrisMainCompleted).toBeNull();
+    expect(attr.particleSpansWorkerCompleted).toBeNull();
+    expect(attr.particleSpansMainCompleted).toBeNull();
+    expect(attr.beamSpansWorkerCompleted).toBeNull();
+    expect(attr.beamSpansMainCompleted).toBeNull();
+    // Unknown-by-design reconciles cleanly (nothing published, nothing claimed).
+    expect(reconcileForegroundAttribution(attr)).toEqual([]);
+  });
+
+  it('published per-class splits pass through for a future producer (and still reconcile)', () => {
+    const a = readForegroundAttribution({
+      testForegroundStats: (): unknown => ({
+        ...validRaw(),
+        kicks: 2,
+        alphaSpansWorkerCompleted: 8, alphaSpansMainCompleted: 2,
+        spriteSpansWorkerCompleted: 0, spriteSpansMainCompleted: 0,
+        aliasTrisWorkerCompleted: 6, aliasTrisMainCompleted: 4,
+        particleSpansWorkerCompleted: 0, particleSpansMainCompleted: 0,
+        beamSpansWorkerCompleted: 3, beamSpansMainCompleted: 1,
+      }),
+    });
+    expect(a).not.toBeNull();
+    const attr = a as ForegroundAttribution;
+    expect(attr.alphaSpansWorkerCompleted).toBe(8);
+    expect(attr.alphaSpansMainCompleted).toBe(2);
+    expect(attr.aliasTrisWorkerCompleted).toBe(6);
+    expect(attr.beamSpansMainCompleted).toBe(1);
+    expect(reconcileForegroundAttribution(attr)).toEqual([]);
+  });
+
+  it('reconcile flags per-class completions claimed on a zero-kick frame (misattributed, never laundered)', () => {
+    const mis: ForegroundAttribution = {
+      ...unknownForegroundAttribution(),
+      kicks: 0,
+      alphaSpansWorkerCompleted: 5,
+      beamSpansMainCompleted: 2,
+    };
+    const bad = reconcileForegroundAttribution(mis);
+    expect(bad.length).toBe(2);
+    expect(bad.join('\n')).toMatch(/alphaSpansWorkerCompleted=5 with kicks=0/);
+    expect(bad.join('\n')).toMatch(/beamSpansMainCompleted=2 with kicks=0/);
+    // Genuine serial zeros (hook present, no kick ran, nothing published
+    // non-null) stay clean.
+    expect(reconcileForegroundAttribution({
+      ...unknownForegroundAttribution(),
+      kicks: 0,
+      kick: {
+        spans: 0, pixels: 0, tris: 0,
+        workerSpans: 0, workerPixels: 0, workerTris: 0,
+        mainSpans: 0, mainPixels: 0, mainTris: 0,
+      },
+    })).toEqual([]);
+  });
+
   it('reads newer per-class staged/inline fields when the producer publishes them', () => {
     const a = readForegroundAttribution({
       testForegroundStats: (): unknown => ({

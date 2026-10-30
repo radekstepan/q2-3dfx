@@ -10,10 +10,13 @@
 //    flow through the same consumer vocabulary.
 import { describe, expect, it } from 'vitest';
 import {
+  formatBrowserFgKicks,
   formatKickSizes,
   formatLastKickDescs,
+  readBrowserFgKicks,
   readKickSizes,
   readLastKickDescs,
+  summarizeBrowserFgKicks,
   summarizeKickSizes,
   type KickSizeSummary,
 } from './kick-histogram.js';
@@ -132,5 +135,90 @@ describe('readLastKickDescs', () => {
     expect(readLastKickDescs({
       lastWorkerExec: (): unknown => [{ frame: 0, seq: 0, job: 'rgb', descs: 1, kickBase: 0, kickDescs: 1, spans: 1, pixels: 1, tris: 'x' }],
     })).toBeNull();
+  });
+});
+
+describe('readBrowserFgKicks (browser async-FG flushes, no producer change)', () => {
+  // Synthetic browser-pool shapes: what BrowserBandPool.testBandExecStats()
+  // publishes when diag is armed (apps/web render-workers.ts
+  // appendExecSamples — frame/seq/job/worker/band/y-range/execMs/counts;
+  // world + async FG flushes all kick as the `rgb` job). The browser pool
+  // publishes NO lastWorkerExec, so kickBase/kickDescs never appear here.
+  function fgSample(over: Partial<WorkerExecSample> = {}): WorkerExecSample {
+    return {
+      frame: 0, seq: 0, job: 'rgb', worker: 0, band: 0, y0: 0, y1: 120,
+      execMs: 1.5, pixels: 100, spans: 10, tris: 2, ...over,
+    };
+  }
+  function browserPool(samples: WorkerExecSample[] | null): object {
+    return { testBandExecStats: (): unknown => samples };
+  }
+  function worldFgEmpty(): WorkerExecSample[] {
+    return [
+      // World kick (seq 0, drain order 0): real work on both bands.
+      fgSample({ seq: 0, band: 0, worker: 0, y0: 0, y1: 120, spans: 40, pixels: 4000, tris: 9, execMs: 3 }),
+      fgSample({ seq: 0, band: 1, worker: 1, y0: 120, y1: 240, spans: 30, pixels: 3000, tris: 7, execMs: 2 }),
+      // Async FG flush (seq 1, drain order 1): real work.
+      fgSample({ seq: 1, band: 0, worker: 0, y0: 0, y1: 120, spans: 6, pixels: 600, tris: 1, execMs: 0.4 }),
+      fgSample({ seq: 1, band: 1, worker: 1, y0: 120, y1: 240, spans: 4, pixels: 400, tris: 1, execMs: 0.3 }),
+      // Empty FG suffix flush (seq 2, drain order 2): zero work everywhere.
+      fgSample({ seq: 2, band: 0, worker: 0, y0: 0, y1: 120, spans: 0, pixels: 0, tris: 0, execMs: 0.01 }),
+      fgSample({ seq: 2, band: 1, worker: 1, y0: 120, y1: 240, spans: 0, pixels: 0, tris: 0, execMs: 0.01 }),
+    ];
+  }
+
+  it('slices world kick (order 0) from async FG flushes (order >= 1) with the empty suffix first-class', () => {
+    const frames = readBrowserFgKicks(browserPool(worldFgEmpty()));
+    expect(frames).toHaveLength(1);
+    const f = frames![0]!;
+    expect(f.frame).toBe(0);
+    expect(f.totalKicks).toBe(3);
+    expect(f.fgKicks).toHaveLength(2);
+    expect(f.fgKicks[0]).toMatchObject({ seq: 1, order: 1, spans: 10, pixels: 1000, tris: 2, empty: false });
+    expect(f.fgKicks[1]).toMatchObject({ seq: 2, order: 2, spans: 0, pixels: 0, tris: 0, empty: true });
+    expect(f.emptyFgKicks).toBe(1);
+    expect(f.emptyFgKickIds).toEqual(['f0s2:rgb']);
+    expect(formatBrowserFgKicks(frames!)).toMatch(/browserFg\[f0 rgb=3 fg=2 empty=1 \(f0s2:rgb\)/);
+  });
+  it('a frame with only the world kick has an empty fg slice (flushes did not run — never zero-evidence)', () => {
+    const frames = readBrowserFgKicks(browserPool([
+      fgSample({ seq: 0, band: 0, spans: 5, pixels: 50 }),
+      fgSample({ seq: 0, band: 1, spans: 5, pixels: 50 }),
+    ]));
+    expect(frames).toHaveLength(1);
+    expect(frames![0]).toMatchObject({ totalKicks: 1, emptyFgKicks: 0, emptyFgKickIds: [] });
+    expect(frames![0]!.fgKicks).toEqual([]);
+  });
+  it('scanout kicks never enter the fg slice (they carry no spans by construction)', () => {
+    const frames = readBrowserFgKicks(browserPool([
+      ...worldFgEmpty(),
+      fgSample({ seq: 3, job: 'scanout', band: 0, spans: 0, pixels: 76800, execMs: 2 }),
+    ]));
+    expect(frames).toHaveLength(1);
+    expect(frames![0]!.totalKicks).toBe(3);
+    expect(frames![0]!.fgKicks).toHaveLength(2);
+  });
+  it('groups per frame and returns null when nothing usable is published (never zero)', () => {
+    expect(summarizeBrowserFgKicks([])).toEqual([]);
+    expect(readBrowserFgKicks({})).toBeNull();
+    // Diag disarmed: the pool publishes null (unpublished — unknown).
+    expect(readBrowserFgKicks(browserPool(null))).toBeNull();
+    expect(readBrowserFgKicks(browserPool([]))).toBeNull();
+    // No rgb kick at all (scanout-only frame): no FG story to tell.
+    expect(readBrowserFgKicks(browserPool([
+      fgSample({ seq: 0, job: 'scanout', spans: 0, pixels: 76800, execMs: 2 }),
+    ]))).toBeNull();
+    // Malformed samples reject the whole read (never laundered).
+    expect(readBrowserFgKicks(browserPool([
+      fgSample({ seq: 0, spans: -1 }),
+    ]))).toBeNull();
+    // Two frames stay separate, oldest first.
+    const frames = readBrowserFgKicks(browserPool([
+      ...worldFgEmpty(),
+      fgSample({ frame: 1, seq: 0, band: 0, spans: 8, pixels: 800 }),
+      fgSample({ frame: 1, seq: 1, band: 0, spans: 0, pixels: 0, tris: 0 }),
+    ]));
+    expect(frames!.map((f) => f.frame)).toEqual([0, 1]);
+    expect(frames![1]).toMatchObject({ totalKicks: 2, emptyFgKicks: 1, emptyFgKickIds: ['f1s1:rgb'] });
   });
 });

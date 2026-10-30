@@ -492,6 +492,65 @@ class MuteWorker extends LiveBase {
   }
 }
 
+/**
+ * First-kick-then-silent worker: acks the FIRST kick with a real band
+ * execution (so an earlier kick can commit and advance the flushed
+ * watermark), then keeps performing the real band write on later kicks but
+ * drops every ack (partial-write realism: the timed-out kick really wrote
+ * worker rows before the timeout). terminate() honours the
+ * acknowledged-stop handshake (exit ack + halt) so the bounded join
+ * completes.
+ */
+class FirstAckThenSilentWorker extends LiveBase {
+  private kicksSeen = 0;
+
+  protected override poll(): void {
+    const seq = this.readSeq();
+    if (seq === this.lastSeq || seq <= 0 || !this.ctl || !this.rgb) return;
+    this.lastSeq = seq;
+    this.kicksSeen += 1;
+    const kickNo = this.kicksSeen;
+    const s = seq;
+    const job = Atomics.load(this.ctl, CTL_JOB);
+    this.later(() => {
+      if (this.dead || !this.ctl || !this.rgb) return;
+      const t0 = performance.now();
+      let pixels = 0;
+      let spans = 0;
+      if (job === JOB_RGB) {
+        const count = Atomics.load(this.ctl!, CTL_RGBCOUNT);
+        const base = Atomics.load(this.ctl!, CTL_RGBBASE);
+        const r = processRGBFrameJob(this.rgb!, this.w, this.h, count, this.y0, this.y1, base);
+        pixels = r.pixels;
+        spans = r.spans;
+        try {
+          Atomics.store(this.ctl!, CTL_PIXELS + this.band, pixels);
+          Atomics.store(this.ctl!, CTL_SPANS + this.band, spans);
+          Atomics.add(this.ctl!, CTL_DONE, 1);
+        } catch {
+          /* control torn down: bands still wrote */
+        }
+      }
+      const execMs = performance.now() - t0;
+      const b = this.band;
+      // Later kicks: the band write above really landed, but the ack is
+      // dropped — the kick times out over genuine partial worker writes.
+      if (kickNo === 1 && !this.dead) {
+        this.onmessage?.({ data: { seq: s, band: b, pixels, spans, execMs } });
+      }
+    }, 1);
+  }
+
+  override terminate(): void {
+    this.terminateCount += 1;
+    const b = this.band;
+    this.later(() => {
+      if (!this.dead) this.onmessage?.({ data: { exited: true, band: b } });
+      this.forceStop();
+    }, 1);
+  }
+}
+
 afterEach(() => {
   for (const f of Array.from(liveFakes)) {
     try {
@@ -509,6 +568,56 @@ function seedPools(pools: BrowserBandPool[]): void {
     p.beginFrame();
     recClear(p);
   }
+}
+
+/**
+ * Probe the post-quarantine full-replay fence (PERF-NEXT-9): true between
+ * quarantine isolation and the first recoverInlineRGBAll, false after the
+ * recovery consumes it. Same private-field probe pattern as the
+ * rgbChainSlots / testDropSnapshot seams (runtime-visible, no export).
+ */
+function fullReplayFence(pool: BrowserBandPool): boolean {
+  return (pool as unknown as Record<string, unknown>)['rgbNeedsFullReplay'] === true;
+}
+
+/**
+ * Reset the shared RGB planes to the isolation-fresh state (cover 0, depth
+ * far, black): models the applied prefix dying with the abandoned buffer
+ * when the checkpoint restore cannot run. A suffix-only replay then loses
+ * the prefix; only a fenced full-range replay converges.
+ */
+function wipeToIsolationFresh(pool: BrowserBandPool): void {
+  const p = pool.rgbPlanes;
+  p.cover.fill(0);
+  p.rgbDepth.fill(0xffff);
+  p.rgb565.fill(0);
+}
+
+/** Stage only the opaque world batch (one descriptor), mirroring the first
+ *  block of stageScene for two-kick prefix tests. */
+function stageWorldOnly(pool: BrowserBandPool): void {
+  const chain = tinyChain(7);
+  const world: Span[] = [];
+  for (let y = 0; y < H; y++) world.push(makeSpan(y, SPAN_OPAQUE, 0.2));
+  expect(pool.stageRGB({ spans: world, count: world.length }, 0, world.length,
+    chain, LUX, 1, 1, WORLD_FLAGS, 0, 0, 0)).toBe(true);
+}
+
+/** Stage the translucent + additive foreground suffix (descriptors 1..2),
+ *  mirroring the remaining blocks of stageScene. */
+function stageForegroundSuffix(pool: BrowserBandPool): void {
+  const fgChain = tinyChain(200);
+  const addChain = tinyChain(45);
+  const fg: Span[] = [];
+  for (let y = Math.floor(H / 4); y < Math.floor((3 * H) / 4); y++) {
+    fg.push(makeSpan(y, SPAN_TRANS66, 0.24));
+  }
+  expect(pool.stageRGB({ spans: fg, count: fg.length }, 0, fg.length,
+    fgChain, LUX, 1, 1, FG_FLAGS, 0, 0, 0)).toBe(true);
+  const add: Span[] = [];
+  for (let y = 0; y < Math.floor(H / 4); y++) add.push(makeSpan(y, SPAN_ADD, 0.26));
+  expect(pool.stageRGB({ spans: add, count: add.length }, 0, add.length,
+    addChain, LUX, 1, 1, ADD_FLAGS, 0, 0, 0)).toBe(true);
 }
 
 describe('PERF-NEXT-2 browser: recovery against a genuinely live writer', () => {
@@ -980,5 +1089,235 @@ describe('recovery isolation sizing', () => {
     expect(rgbAccumTotal(W, H)).toBeGreaterThan(W * H * 5);
     expect(W * H * 5).toBe(64 * 48 * 5);
     expect(640 * 480 * 5).toBe(1536000);
+  });
+});
+
+describe('post-quarantine full-replay fence (PERF-NEXT-9 browser mirror)', () => {
+  it('silent-worker timeout over partial main-band writes: fence set, full-range recovery converges, fence cleared', { timeout: 30000 }, async () => {
+    installFakeDom(SilentWorker);
+    const pal = testPalette();
+    try {
+      const pool = BrowserBandPool.create(2, W, H, { timeoutMs: 60 });
+      const ref = BrowserBandPool.create(2, W, H, { timeoutMs: 5000 });
+      expect(pool).not.toBeNull();
+      expect(ref).not.toBeNull();
+      try {
+        seedPools([pool!, ref!]);
+        stageScene(pool!);
+        stageScene(ref!);
+        seedForTest(pool!, SEED);
+        seedForTest(ref!, SEED);
+        ref!.drawInlineRGBAll(4, 32768, 0);
+        const expected = copyPlanes(ref!);
+        const expectedDisplay = resolveDisplayOf(ref!, pal);
+
+        // Silent workers ack readiness but never the kick: the timeout fires
+        // over genuine partial writes (the calling-thread band drained its
+        // rows inline before the wait).
+        const r = await pool!.flushRGBFrameAsync(4, 32768, 0);
+        expect(r).toBeNull();
+        expect(pool!.lastRGBFailure()).toBe('partial');
+        expect(pool!.kickStats().quarantined).toBe(true);
+        expect(pool!.kickStats().fallbacks.rgb).toBe(1);
+        expect(pool!.kickStats().kicks.rgb).toBe(0);
+        expect(pool!.recoveryEpoch()).toBe(1);
+        expect(pool!.kickStats().lastRgb!.workerCompleted).toBe(false);
+        expect(pool!.kickStats().lastRgb!.mainPixels).toBeGreaterThan(0);
+        // Main-band completion proof: the calling thread really ran its rows
+        // before the timeout (its partial writes were then undone by the
+        // checkpoint restore below — cover reads back the pre-kick state).
+        expect(pool!.rgbPlanes.cover.every((v) => v === 0)).toBe(true);
+        expect(pool!.rgbPlanes.rgb565.every((v) => v === SEED)).toBe(true);
+        // Fence proof: isolation set the full-replay fence.
+        expect(fullReplayFence(pool!)).toBe(true);
+
+        // Adversarial prefix loss: the applied prefix dies with the
+        // abandoned buffer (a suffix-only replay could never recover it).
+        wipeToIsolationFresh(pool!);
+        const tally = pool!.recoverInlineRGBAll(() => seedForTest(pool!, SEED), 4, 32768, 0);
+        expect(tally.spans).toBeGreaterThan(0);
+        // The fence is consumed by the first recovery (exactly once).
+        expect(fullReplayFence(pool!)).toBe(false);
+        expectPlanesEqual(copyPlanes(pool!), expected);
+        expect(Array.from(resolveDisplayOf(pool!, pal))).toEqual(Array.from(expectedDisplay));
+
+        // A second recovery is a no-op-shaped replay (fence stays cleared,
+        // planes stay converged): no wedge, no drift.
+        const again = pool!.recoverInlineRGBAll(() => seedForTest(pool!, SEED), 4, 32768, 0);
+        expect(again.spans).toBe(0);
+        expect(fullReplayFence(pool!)).toBe(false);
+        expectPlanesEqual(copyPlanes(pool!), expected);
+
+        // Next frame on the quarantined pool refuses fast and clean; the
+        // recovered planes are untouched by the refused frame.
+        pool!.beginFrame();
+        const t0 = Date.now();
+        await expect(pool!.flushRGBFrameAsync(4, 32768, 0)).resolves.toBeNull();
+        expect(Date.now() - t0).toBeLessThan(1000);
+        expect(pool!.lastRGBFailure()).toBe('clean');
+        expectPlanesEqual(copyPlanes(pool!), expected);
+      } finally {
+        await pool!.dispose();
+        await ref!.dispose();
+      }
+    } finally {
+      removeFakeDom();
+    }
+  });
+
+  it('fenced recovery replays the full retained range: suffix-only replay loses the committed world prefix', { timeout: 30000 }, async () => {
+    installFakeDom(FirstAckThenSilentWorker);
+    const pal = testPalette();
+    try {
+      const pool = BrowserBandPool.create(2, W, H, { timeoutMs: 60 });
+      const sibling = BrowserBandPool.create(2, W, H, { timeoutMs: 60 });
+      const ref = BrowserBandPool.create(2, W, H, { timeoutMs: 5000 });
+      expect(pool).not.toBeNull();
+      expect(sibling).not.toBeNull();
+      expect(ref).not.toBeNull();
+      try {
+        seedPools([pool!, sibling!, ref!]);
+        // Serial reference: the full scene inline.
+        stageScene(ref!);
+        seedForTest(ref!, SEED);
+        ref!.drawInlineRGBAll(4, 32768, 0);
+        const expected = copyPlanes(ref!);
+        const expectedDisplay = resolveDisplayOf(ref!, pal);
+
+        // Two-kick prefix on both pools: the world kick COMMITS on workers
+        // (flushed advances to 1), then the foreground kick is staged.
+        for (const p of [pool!, sibling!]) {
+          stageWorldOnly(p);
+          seedForTest(p, SEED);
+          const ok = await p.flushRGBFrameAsync(4, 32768, 0);
+          expect(ok).not.toBeNull();
+          expect(p.rgbFlushed()).toBe(1);
+          expect(p.kickStats().lastRgb!.workerCompleted).toBe(true);
+          stageForegroundSuffix(p);
+          expect(p.rgbPending()).toBe(3);
+        }
+
+        // The foreground kick times out over genuine partial worker + main
+        // band writes; both pools quarantine with the fence set.
+        for (const p of [pool!, sibling!]) {
+          const bad = await p.flushRGBFrameAsync(4, 32768, 0);
+          expect(bad).toBeNull();
+          expect(p.lastRGBFailure()).toBe('partial');
+          expect(p.kickStats().quarantined).toBe(true);
+          expect(p.kickStats().fallbacks.rgb).toBe(1);
+          expect(p.recoveryEpoch()).toBe(1);
+          expect(p.kickStats().lastRgb!.descs).toBe(3);
+          expect(p.kickStats().lastRgb!.workerCompleted).toBe(false);
+          expect(fullReplayFence(p)).toBe(true);
+          // The committed world prefix dies with the abandoned buffer.
+          wipeToIsolationFresh(p);
+        }
+
+        // Suffix-only replay (never consumes the fence) loses the world
+        // prefix: world rows outside the foreground rect stay cleared.
+        sibling!.drawInlineRGBAll(4, 32768, 0);
+        expect(fullReplayFence(sibling!)).toBe(true);
+        expect(Array.from(copyPlanes(sibling!).q)).not.toEqual(Array.from(expected.q));
+
+        // Fenced recovery replays the FULL retained range and converges to
+        // the serial reference across RGB565, depth, coverage and RGBA.
+        const tally = pool!.recoverInlineRGBAll(() => seedForTest(pool!, SEED), 4, 32768, 0);
+        expect(tally.spans).toBeGreaterThan(0);
+        expect(fullReplayFence(pool!)).toBe(false);
+        expectPlanesEqual(copyPlanes(pool!), expected);
+        expect(Array.from(resolveDisplayOf(pool!, pal))).toEqual(Array.from(expectedDisplay));
+
+        // Next frame runs on a rebooted pool and converges exactly (the
+        // fresh pool's first kick is acked, so it commits on workers).
+        const pool2 = BrowserBandPool.create(2, W, H, { timeoutMs: 2000 });
+        const ref2 = BrowserBandPool.create(2, W, H, { timeoutMs: 5000 });
+        expect(pool2).not.toBeNull();
+        expect(ref2).not.toBeNull();
+        try {
+          pool2!.beginFrame();
+          recClear(pool2!);
+          stageWorldOnly(pool2!);
+          seedForTest(pool2!, SEED);
+          const ok = await pool2!.flushRGBFrameAsync(4, 32768, 0);
+          expect(ok).not.toBeNull();
+          expect(pool2!.kickStats().lastRgb!.workerCompleted).toBe(true);
+          ref2!.beginFrame();
+          recClear(ref2!);
+          stageWorldOnly(ref2!);
+          seedForTest(ref2!, SEED);
+          ref2!.drawInlineRGBAll(4, 32768, 0);
+          expectPlanesEqual(copyPlanes(pool2!), copyPlanes(ref2!));
+          expect(pool2!.rgbFlushed()).toBe(1);
+          pool2!.commitRGB();
+          expect(pool2!.rgbPending()).toBe(0);
+        } finally {
+          await pool2!.dispose();
+          await ref2!.dispose();
+        }
+      } finally {
+        await pool!.dispose();
+        await sibling!.dispose();
+        await ref!.dispose();
+      }
+    } finally {
+      removeFakeDom();
+    }
+  });
+
+  it('disposal mid-flight: fast resolve, inline fallback converges, no late quarantine', { timeout: 30000 }, async () => {
+    installFakeDom(SilentWorker);
+    const pal = testPalette();
+    try {
+      const pool = BrowserBandPool.create(2, W, H, { timeoutMs: 120 });
+      const ref = BrowserBandPool.create(2, W, H, { timeoutMs: 5000 });
+      expect(pool).not.toBeNull();
+      expect(ref).not.toBeNull();
+      try {
+        seedPools([pool!, ref!]);
+        stageScene(pool!);
+        stageScene(ref!);
+        seedForTest(pool!, SEED);
+        seedForTest(ref!, SEED);
+        ref!.drawInlineRGBAll(4, 32768, 0);
+        const expected = copyPlanes(ref!);
+        const expectedDisplay = resolveDisplayOf(ref!, pal);
+
+        // Never-acking workers: the kick is in flight (main band drained)
+        // when teardown lands mid-wait.
+        const t0 = Date.now();
+        const pending = pool!.flushRGBFrameAsync(4, 32768, 0);
+        await sleep(20);
+        await pool!.dispose();
+        await expect(pending).resolves.toBeNull();
+        expect(Date.now() - t0).toBeLessThan(2000);
+        // Teardown aborts as 'partial' (writes may have been in flight)
+        // WITHOUT quarantining: no isolation, no fence, epoch unmoved.
+        expect(pool!.lastRGBFailure()).toBe('partial');
+        expect(pool!.kickStats().quarantined).toBe(false);
+        expect(pool!.kickStats().fallbacks.rgb).toBe(1);
+        expect(pool!.recoveryEpoch()).toBe(0);
+        expect(fullReplayFence(pool!)).toBe(false);
+
+        // The inline fallback converges to the serial reference.
+        const tally = pool!.recoverInlineRGBAll(() => seedForTest(pool!, SEED), 4, 32768, 0);
+        expect(tally.spans).toBeGreaterThan(0);
+        expectPlanesEqual(copyPlanes(pool!), expected);
+        expect(Array.from(resolveDisplayOf(pool!, pal))).toEqual(Array.from(expectedDisplay));
+
+        // No late quarantine mutation past the abandoned kick's deadline,
+        // and the recovered planes stay converged.
+        await sleep(300);
+        expect(pool!.kickStats().quarantined).toBe(false);
+        expect(pool!.recoveryEpoch()).toBe(0);
+        expectPlanesEqual(copyPlanes(pool!), expected);
+        // Dispose is idempotent.
+        await pool!.dispose();
+      } finally {
+        await pool!.dispose();
+        await ref!.dispose();
+      }
+    } finally {
+      removeFakeDom();
+    }
   });
 });

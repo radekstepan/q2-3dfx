@@ -212,7 +212,8 @@ export function describeWorkerSweep(workers: number[], h: number): string[] {
   );
 }
 
-async function runMovingConfig(
+/** Moving-camera sweep: exported for the gated test-only probe (no gate use). */
+export async function runMovingConfig(
   fw: RgbAttrWorld, W: number, H: number,
   mode: 'software' | 'rgb', workers: number,
   warmup: number, reps: number, yawStepDeg: number,

@@ -717,6 +717,16 @@ export class BandWorkerPool implements BandDispatcher {
    * flushFrameAsync instead). Resolves null when the pool is dead or the
    * wait times out — the caller replays inline via drawInlineAll, which
    * converges to the identical planes (all writes depth-guarded).
+   *
+   * NOTE (indexed-timeout gap, pinned by rgbDisposeMixed.test.ts): unlike
+   * the RGB path (flushRGBFrame quarantines + isolates onto a replacement
+   * SAB before any replay), this indexed timeout does NOT quarantine, does
+   * NOT isolate, and leaves the workers attached — a worker still
+   * mid-raster may keep writing the shared planes while the caller replays
+   * inline. Safe today only because every indexed write is depth-guarded
+   * (replay converges once stragglers finish) and the RGB plane fence is
+   * unaffected. Do not add quarantine here without a design review, and do
+   * not weaken the pin (null, workers retained, epoch unmoved) silently.
    */
   flushFrame(): { pixels: number; spans: number; mainExecMs?: number } | null {
     if (this.disposed || this.workers.length === 0) return null;

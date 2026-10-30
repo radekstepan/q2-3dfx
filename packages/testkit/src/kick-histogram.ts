@@ -271,3 +271,86 @@ export function formatLastKickDescs(k: LastKickDescs): string {
     `bands=${k.bands} visited=${k.descs} spans=${k.spans} px=${k.pixels} tris=${k.tris}${k.empty ? ' EMPTY' : ''}]`
   );
 }
+
+// --- Browser async-foreground kick sizes (TASK item 4 follow-up, testkit lane) ---
+//
+// The browser pool (`BrowserBandPool`, apps/web `render-workers.ts`) publishes
+// NO `lastWorkerExec` hook (no kickBase/kickDescs descriptor drain) and NO
+// per-flush labels: world + async foreground flushes all kick as the `rgb`
+// job through `flushRGBFrameAsync`, and `testBandExecStats()` (diag-armed
+// only — null while disarmed) accumulates per-band WorkerExecSample records
+// in the shared CritJobKind vocabulary (browser `rgb` maps to `rgb` via
+// `diagJobToCritJob`; unmappable `unknown` kicks are dropped pool-side, so
+// the consumer never sees them). The browser FG story is therefore recovered
+// from EXISTING published stats with NO producer contract change: within one
+// frame the `rgb` kicks drain in order — world kick first (order 0), async
+// foreground flushes after (order >= 1; see the `order` contract on
+// `summarizeKickSizes`). `order` is a drain position, never a flush-point
+// name the producer did not publish: a frame with a single rgb kick has an
+// EMPTY fg slice (the flushes did not run — not zero-evidence of emptiness).
+
+/** Async-foreground kick slice of one frame's `rgb` kicks (browser pool). */
+export interface BrowserFgKickSummary {
+  frame: number;
+  /** `rgb` kicks in this frame (world kick + FG flushes). */
+  totalKicks: number;
+  /** FG flushes: `rgb` kicks with drain order >= 1 (world kick excluded). */
+  fgKicks: KickSizeEntry[];
+  /** First-class empty-FG-flush counter (all bands zero work). */
+  emptyFgKicks: number;
+  /** `frame:seq:job` identity of every empty FG flush (forensics, not grep). */
+  emptyFgKickIds: string[];
+}
+
+/**
+ * Slice per-frame `rgb` kicks into world kick (order 0) + async FG flushes
+ * (order >= 1) (pure). Non-`rgb` jobs (scanout/resolve) never enter the
+ * slice — they carry no spans by construction. Empty input summarizes to
+ * zero frames (not null — the reader below maps "nothing published" to
+ * null instead of calling this).
+ */
+export function summarizeBrowserFgKicks(samples: WorkerExecSample[]): BrowserFgKickSummary[] {
+  const full = summarizeKickSizes(samples.filter((s) => s.job === 'rgb'));
+  const byFrame = new Map<number, KickSizeEntry[]>();
+  for (const k of full.kicks) {
+    const g = byFrame.get(k.frame);
+    if (g) g.push(k);
+    else byFrame.set(k.frame, [k]);
+  }
+  return [...byFrame.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([frame, kicks]) => {
+      const fg = kicks.filter((k) => k.order >= 1);
+      const empty = fg.filter((k) => k.empty);
+      return {
+        frame,
+        totalKicks: kicks.length,
+        fgKicks: fg,
+        emptyFgKicks: empty.length,
+        emptyFgKickIds: empty.map((k) => `f${k.frame}s${k.seq}:${k.job}`),
+      };
+    });
+}
+
+/**
+ * Read the browser pool's async-FG kick slice through the public
+ * `testBandExecStats()` hook. Null when the producer publishes nothing
+ * (diag disarmed, serial config, no kick yet, or no `rgb` kick) — the
+ * caller reports unknown, never zero.
+ */
+export function readBrowserFgKicks(source: object): BrowserFgKickSummary[] | null {
+  const samples = collectWorkerExec(source);
+  if (!samples || samples.length === 0) return null;
+  if (!samples.some((s) => s.job === 'rgb')) return null;
+  return summarizeBrowserFgKicks(samples);
+}
+
+/** One-line browser-FG ledger (unknown renders as —, never 0). */
+export function formatBrowserFgKicks(frames: BrowserFgKickSummary[]): string {
+  if (frames.length === 0) return 'browserFg[frames=0]';
+  return frames.map((f) =>
+    `browserFg[f${f.frame} rgb=${f.totalKicks} fg=${f.fgKicks.length} empty=${f.emptyFgKicks}` +
+    `${f.emptyFgKickIds.length > 0 ? ` (${f.emptyFgKickIds.join(',')})` : ''}` +
+    `${f.fgKicks.map((k) => ` s${k.seq}:${k.spans}sp/${k.pixels}px/${k.tris}tr${k.empty ? '!' : ''}`).join('')}]`,
+  ).join(' ');
+}
