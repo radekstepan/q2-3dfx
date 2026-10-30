@@ -423,13 +423,13 @@ completion (2026-10-29, integrated — two disjoint lanes, integrator reconciled
 ### GPU-FOLLOW-1 — Repair acceptance reporting and preserve reproducible evidence
 owns: `docs`, `BRAIN.md`, `tools/bench`, `packages/testkit`
 depends: GPU-FOLLOW-0
-status: in-progress(@integrator+follow1-lane 2026-10-29)
+status: done(@integrator 2026-10-29)
 done-when:
 - [x] Reconcile PROOF-4/5 report, ledger and acceptance predicates: implementation exists, headless throughput promising, fidelity FAILED, visible-display acceptance pending. Retain historical raw results; annotate superseded verdicts rather than deleting inconvenient evidence.
 - [x] Separate rAF/submission cadence, CPU frame work, asynchronous GPU duration (when supported) and displayed-frame evidence. Do not label submit time GPU work or infer display refresh from unthrottled BeginFrames.
 - [x] Repair manifests: capture actual asset identity, fidelity cvars, warmup, machine/graphics backend, source/build identity and dirty diff provenance. Existing 10-03-32 manifest has fidelity/warmup null, machine {}, asset marked missing and a dirty 8544883 tree. Preserve the measured artifacts with their limitations.
-- [ ] Add acceptance tests that reject failed fidelity, incomplete scene coverage and headless-only displayed-FPS claims. Keep tolerances fixed; no reclassification of a failed number as PASS.
-lane-note (2026-10-29): docs + tools/bench side landed (gpu-acceptance.ts 10/10, manifest provenance repair, report/ledger reconciliation). `packages/testkit` pins proposed in lane return, not yet applied — this box stays open until the testkit lane lands.
+- [x] Add acceptance tests that reject failed fidelity, incomplete scene coverage and headless-only displayed-FPS claims. Keep tolerances fixed; no reclassification of a failed number as PASS.
+completion (2026-10-29, integrator): testkit `gpu-acceptance.ts` + `gpu-acceptance.test.ts` 12/12 hermetic (fixed 0.02/3LSB/1px/warn24 by value, 0.912-vs-0.02 FAIL never reclassified, coverage/displayed predicates, compareGpuProofFrames wiring). Bench `gpu-acceptance.ts` 10/10 already landed. Changeset: `testkit-gpu-follow-1`. Ledger: GPU-FOLLOW-1 row appended.
 
 ### GPU-FOLLOW-2 — Correct moving-camera world visibility and draw order
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
