@@ -21,13 +21,14 @@
     "bench": "echo bench-ok"
   },
   "dependencies": {
-    "@q2/bsp": "workspace:*",
     "@q2/config": "workspace:*",
     "@q2/math": "workspace:*",
     "@q2/renderer-api": "workspace:*",
     "@q2/sw-renderer": "workspace:*"
   },
   "devDependencies": {
+    "@q2/bsp": "workspace:*",
+    "@q2/formats": "workspace:*",
     "tsup": "^8.3.5",
     "typescript": "^5.6.3",
     "vitest": "^2.1.8"

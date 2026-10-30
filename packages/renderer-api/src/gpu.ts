@@ -10,6 +10,7 @@
 // the only package besides browser integration allowed browser graphics
 // types). Nothing here imports `dom` lib types.
 import type { RefDef } from './index.js';
+import type { Vec3 } from '@q2/math';
 
 /** Experimental GPU backend id. The only GPU value `vid_renderer` accepts. */
 export type GpuBackendId = 'webgl2-experimental';
@@ -112,7 +113,32 @@ export interface GpuFrameInput {
   scene: GpuSceneInput;
   /** Level time in seconds (matches RefDef.time; carried for shader uniforms). */
   time: number;
+  /**
+   * Dynamic lights for this frame (world-space origin, linear-RGB color,
+   * intensity = radius in world units, R_MarkLights falloff spirit). Optional
+   * (absent = unlit beyond the baked lightmap) so existing callers keep
+   * compiling; the backend clamps to MAX_GPU_LIGHTS (8), first-come wins.
+   */
+  lights?: GpuLight[];
 }
+
+/**
+ * One GPU dynamic light (GPU-PROOF-3 additive input). Mirrors the
+ * sw-renderer DynamicLight shape (origin/intensity/color) in renderer-api
+ * vocabulary so backends stay DOM-free. The fragment shader evaluates
+ * (radius - dist) / radius per pixel; intensity doubles as the radius.
+ */
+export interface GpuLight {
+  /** World-space origin. */
+  origin: Vec3;
+  /** Linear-RGB color (already multiplied by any per-light scale). */
+  color: Vec3;
+  /** Radius in world units (also the brightness falloff range). */
+  intensity: number;
+}
+
+/** Maximum dynamic lights the GPU backend evaluates per frame (uniform array size). */
+export const MAX_GPU_LIGHTS = 8;
 
 /**
  * Lifecycle + submission observability. `framesSubmitted` counts real

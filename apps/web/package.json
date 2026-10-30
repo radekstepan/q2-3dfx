@@ -28,7 +28,8 @@
     "@q2/sound": "workspace:*",
     "@q2/sw-renderer": "workspace:*",
     "@q2/testkit": "workspace:*",
-    "@q2/voodoo": "workspace:*"
+    "@q2/voodoo": "workspace:*",
+    "@q2/webgl-renderer": "workspace:*"
   },
   "devDependencies": {
     "tsup": "^8.3.5",

@@ -57,7 +57,7 @@ q2ts/
 
 ```
 math ← formats ← bsp ← {sw-renderer, voodoo} ← renderer-api ← host
-{renderer-api, sw-renderer, bsp, math, config} ← webgl-renderer (GPU boundary impl)
+{renderer-api, sw-renderer, bsp, math, config} ← webgl-renderer (GPU boundary impl; + formats test-only)
 filesystem ← formats
 game ← {math, bsp, config}
 server ← {game, bsp}

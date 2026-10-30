@@ -99,7 +99,7 @@ import type { VoodooState } from '@q2/voodoo';
 import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import { SERVER_DT, getCVar, getCVarNumber, getCVarString, registerCVar } from '@q2/config';
-import type { Entity, RefDef, ResolvedBackend } from '@q2/renderer-api';
+import type { Entity, GpuLight, GpuRendererStatus, GpuSceneInput, RefDef, ResolvedBackend } from '@q2/renderer-api';
 import type { GpuCapability } from '@q2/renderer-api';
 
 /**
@@ -118,6 +118,8 @@ import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
 import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } from './render-workers.js';
 import type { BrowserForegroundDetail, DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
 import { detectGpuCapability, getGpuStatus, resolveBootRenderer } from './gpu-select.js';
+import { acquireGpuCanvas } from './gpu-canvas.js';
+import { WebGLRenderer, selectGpuScene } from '@q2/webgl-renderer';
 
 /**
  * Which resolve path the last `resolveDisplay` took (observability for
@@ -2971,6 +2973,34 @@ export interface PlayBoot {
   models: PakModelHandles | null;
   /** The pak this boot was built from (null = devroom): reboot reuses it. */
   pak: WebPak | null;
+  /**
+   * Live GPU backend (GPU-PROOF-3): non-null exactly when `renderer` is
+   * `webgl2-experimental` AND a GL canvas/context was acquired at boot (or
+   * hot-swap). `gpu.gpu` is the committed `WebGLRenderer` (clear-only today —
+   * the parallel GL lane makes `renderFrame` draw; this file programs ONLY
+   * against the committed `GpuRenderer` interface + `selectGpuScene`, never
+   * its internals), `gpu.scene` the last submitted scene, `gpu.loop` the
+   * async-loop sim clock for GPU frames. Null on every CPU path.
+   */
+  gpu: GpuBootState | null;
+}
+
+/**
+ * Owned GPU state for a `webgl2-experimental` boot (see `PlayBoot.gpu`).
+ * Browser glue owns `canvas`/`gl` acquisition (see `acquireGpuCanvas`); the
+ * backend owns GL resources; the shell owns the submitted scene + sim clock.
+ */
+export interface GpuBootState {
+  /** GL canvas element (HTMLCanvasElement in a browser, stub in tests). */
+  canvas: unknown;
+  /** WebGL2 context (WebGL2RenderingContext in a browser, stub in tests). */
+  gl: unknown;
+  /** Committed backend (programs against `GpuRenderer`, never internals). */
+  gpu: WebGLRenderer;
+  /** Last submitted scene (static world once + per-frame entity tail). */
+  scene: GpuSceneInput;
+  /** Sim clock for GPU frames (mirrors Host privates, like frameAsync). */
+  loop: AsyncLoopState;
 }
 
 /**
@@ -3058,7 +3088,20 @@ export interface PakModelHandles {
   skins: number[];
 }
 
-export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakModelHandles {
+/**
+ * GPU asset mirror sink (GPU-PROOF-3 live-loop hookup): the parsed MD2/PCX
+ * data `registerPakModels` already holds is registered into the GPU backend
+ * under the SAME handles the CPU refresh gets, so live renderables resolve.
+ * Fallback data (box-critter mesh, named skins without texels) mirrors too —
+ * the backend skips mesh-less models with a recorded warning, never a crash.
+ * Structural (not `WebGLRenderer`) so registration stays decoupled.
+ */
+export interface GpuAssetSink {
+  registerModelData(handle: number, kind: 'md2' | 'sp2' | 'tracer', data: unknown): void;
+  registerSkinPixels(handle: number, pixels: Uint8Array, width: number, height: number): number;
+}
+
+export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak, gpuSink?: GpuAssetSink | null): PakModelHandles {
   createDevroom(); // guarantees getDevMesh(0) exists for per-file fallbacks
   const skins: number[] = [];
   const ext = refresh as unknown as {
@@ -3071,6 +3114,8 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
         const pcx = parsePCX(bytes);
         const h = ext.registerSkinData(path, pcx.pixels, pcx.width, pcx.height);
         skins.push(h);
+        // GPU-PROOF-3 live-loop hookup: mirror parsed texels under the same handle.
+        try { gpuSink?.registerSkinPixels(h, pcx.pixels, pcx.width, pcx.height); } catch { /* CPU registration stands */ }
         return h;
       }
     } catch {
@@ -3083,11 +3128,20 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
   const loadModel = (path: string): number => {
     try {
       const bytes = tryPakEntry(pak, path);
-      if (bytes) return refresh.registerModel({ name: path, kind: 'md2', data: parseMD2(bytes) });
+      if (bytes) {
+        const md2 = parseMD2(bytes);
+        const h = refresh.registerModel({ name: path, kind: 'md2', data: md2 });
+        // GPU-PROOF-3 live-loop hookup: mirror parsed MD2 under the same handle.
+        try { gpuSink?.registerModelData(h, 'md2', md2); } catch { /* CPU registration stands */ }
+        return h;
+      }
     } catch {
       /* fall through to the box-critter fallback */
     }
-    return refresh.registerModel({ name: path, kind: 'md2', data: getDevMesh(0) });
+    const devmesh = getDevMesh(0);
+    const h = refresh.registerModel({ name: path, kind: 'md2', data: devmesh });
+    try { gpuSink?.registerModelData(h, 'md2', devmesh); } catch { /* CPU registration stands */ }
+    return h;
   };
   // Soldier first: skin handle 0 + model handle 0 (see contract above).
   const monsterSkin = loadSkin(skinForMonster('soldier'));
@@ -3178,6 +3232,43 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak): PakMo
   };
 }
 
+/**
+ * Spawn view for the boot-time STATIC GPU scene (`selectGpuScene` needs a
+ * `RefDef` for the camera setup/PVS seed; entities are empty at boot). Pure
+ * seed only — the per-frame entity tail refreshes in `frameGpuPlay`.
+ */
+function spawnViewFor(driver: LocalDriver): RefDef {
+  const sp = driver.spawn();
+  return {
+    origin: new Float32Array(sp.origin) as RefDef['origin'],
+    angles: new Float32Array(sp.angles ?? [0, 0, 0]) as RefDef['angles'],
+    fovX: 90,
+    time: 0,
+    lightStyles: new Float32Array(256).fill(1),
+  };
+}
+
+/**
+ * Attach the GPU backend for a `webgl2-experimental` boot/hot-swap: acquire
+ * the GL canvas (stacked under the 2D/HUD canvas), init the committed
+ * `WebGLRenderer`, and upload the STATIC world scene ONCE (empty entities at
+ * boot). Returns null when no GL canvas/context is available — the caller
+ * falls back to the CPU path WITH a warning, never silently. Never throws.
+ */
+function attachGpuBackend(driver: LocalDriver, width: number, height: number): GpuBootState | null {
+  const acquired = acquireGpuCanvas(undefined, width, height);
+  if (!acquired) return null;
+  try {
+    const gpu = new WebGLRenderer();
+    gpu.init(acquired.gl as unknown as WebGL2RenderingContext, width, height);
+    const scene = selectGpuScene(driver.mini, [], spawnViewFor(driver), width, height);
+    gpu.setScene(scene);
+    return { canvas: acquired.canvas, gl: acquired.gl, gpu, scene, loop: createAsyncLoopState() };
+  } catch {
+    return null;
+  }
+}
+
 export function bootPlay(opts: {
   width?: number;
   height?: number;
@@ -3190,16 +3281,35 @@ export function bootPlay(opts: {
   const width = opts.width ?? res.width;
   const height = opts.height ?? res.height;
   const resolved = resolveBootRenderer(opts.renderer);
-  const renderer = resolved.kind;
-  if (resolved.warning !== null) {
-    console.warn(`[q2ts-web] bootPlay: ${resolved.warning}`);
+  let renderer = resolved.kind;
+  let rendererWarning = resolved.warning;
+  if (rendererWarning !== null) {
+    console.warn(`[q2ts-web] bootPlay: ${rendererWarning}`);
   }
   const driver = new LocalDriver(opts.pak ?? null);
-  // PROOF-2 selection/plumbing only (no GPU drawing yet): when
-  // `webgl2-experimental` IS selected and capable the selection above is
-  // real (recorded on the boot, observable via `getGpuStatus`), but the
-  // boot still constructs the working SoftwareRenderer + CPU resolve path
-  // below — the pixels still come from CPU until PROOF-3 lands GPU drawing.
+  // GPU-PROOF-3 gameplay integration: when `webgl2-experimental` IS selected
+  // and capable, ALSO construct the committed `WebGLRenderer` on an acquired
+  // GL canvas (stacked under the 2D/HUD canvas — see gpu-canvas.ts) and build
+  // the STATIC world scene ONCE via `selectGpuScene` (empty entities at boot;
+  // the per-frame entity tail refreshes in `frameGpuPlay`). Acquisition
+  // failure degrades to the CPU path WITH an explicit warning (never silent).
+  let gpu: GpuBootState | null = null;
+  if (renderer === 'webgl2-experimental') {
+    gpu = attachGpuBackend(driver, width, height);
+    if (!gpu) {
+      renderer = 'software';
+      rendererWarning = `webgl2-experimental requested but unavailable (no WebGL2 context); staying on software`;
+      console.warn(`[q2ts-web] bootPlay: ${rendererWarning}`);
+    }
+  }
+  // GPU-PROOF-3 gameplay integration (see above): when
+  // `webgl2-experimental` IS selected and capable the selection is real
+  // (recorded on the boot, observable via `getGpuStatus`) AND the backend is
+  // attached (`boot.gpu`, static scene uploaded once). The CPU
+  // SoftwareRenderer below stays constructed regardless — it owns the
+  // HUD/resolve path (`resolveDisplay`/`drawPlayHud` paint the 2D overlay
+  // above the GL canvas), and `host.frame` keeps working for tests/debug. The
+  // live rAF loop submits through `frameGpuPlay` (no CPU world raster).
   const refresh = new SoftwareRenderer();
   let mainPalette: Uint8Array | null = null;
   if (opts.pak) {
@@ -3258,7 +3368,10 @@ export function bootPlay(opts: {
   // without one, keep the procedural box-critter exactly as before.
   let models: PakModelHandles | null = null;
   if (opts.pak) {
-    models = registerPakModels(refresh, opts.pak);
+    // GPU-PROOF-3: mirror parsed MD2/PCX into the GPU backend under the same
+    // handles when it is attached (boot-time webgl2 selection). The sink is
+    // guarded per call — CPU registration never depends on the mirror.
+    models = registerPakModels(refresh, opts.pak, gpu?.gpu ?? null);
     driver.models = models;
   } else if (driver.monsters.length > 0) {
     createDevroom();
@@ -3266,17 +3379,24 @@ export function bootPlay(opts: {
   }
   const n = width * height;
   const boot: PlayBoot = {
-    host, driver, refresh, renderer, lastRendererWarning: resolved.warning, source: driver.source,
+    host, driver, refresh, renderer, lastRendererWarning: rendererWarning, source: driver.source,
     display: new Uint32Array(n), fb565: new Uint16Array(n),
     strictVoodoo: true, lastResolveOrder: 'none', lastVoodooPath: 'none',
     lastRasterPolicy: { mode: renderer, rgbEnabled: false, hooked: false },
     browserPool: null,
     statScanoutKicks: 0, statScanoutFallbacks: 0, statAsyncFallbacks: 0,
-    models, pak: opts.pak ?? null,
+    models, pak: opts.pak ?? null, gpu,
   };
   // Arm the raster policy the cvar selects (RGB path on for voodoo, off for
   // software) so a voodoo boot never starts on the wrong backend.
   armRasterPolicy(boot);
+  // GPU-PROOF-3 live-loop hookup: the backend needs the world + palette for
+  // static uploads (models/skins mirrored during registerPakModels above).
+  // Without a pak there is nothing to attach (devroom stays CPU/clear-only).
+  if (boot.gpu && mainPalette) {
+    boot.gpu.gpu.attachWorld(driver.mini);
+    boot.gpu.gpu.setPalette(mainPalette);
+  }
   return boot;
 }
 
@@ -3298,6 +3418,22 @@ export function rebootPlay(prev: PlayBoot): PlayBoot {
 }
 
 /**
+ * Palette for a hot-swapped GPU backend (re-parsed from the pak; the boot
+ * path reuses the already-parsed `mainPalette`). Null in devroom (no pak) —
+ * the caller then leaves the backend clear-only. Never throws.
+ */
+function gpuPaletteFor(boot: PlayBoot): Uint8Array | null {
+  try {
+    if (!boot.pak) return null;
+    const bytes = tryPakEntry(boot.pak, 'pics/colormap.pcx');
+    if (!bytes) return null;
+    return parsePCX(bytes).palette;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Hot-swap the renderer backend in place (vid_renderer menu switch without
  * a reboot): re-resolves `boot.renderer` from the cvar via
  * `resolveBootRenderer` (shared with `bootPlay`) and returns it. The
@@ -3315,10 +3451,38 @@ export function rebootPlay(prev: PlayBoot): PlayBoot {
  */
 export function applyRendererCvar(boot: PlayBoot): RendererKind {
   const resolved = resolveBootRenderer();
-  boot.renderer = resolved.kind;
-  boot.lastRendererWarning = resolved.warning;
-  if (resolved.warning !== null) {
-    console.warn(`[q2ts-web] applyRendererCvar: ${resolved.warning}`);
+  let kind = resolved.kind;
+  let warning = resolved.warning;
+  // GPU-PROOF-3 hot-swap: entering `webgl2-experimental` attaches the GL
+  // backend (same path as boot); leaving it disposes the backend. Attach
+  // failure degrades to software WITH a warning, never silently.
+  if (kind === 'webgl2-experimental' && !boot.gpu) {
+    const attached = attachGpuBackend(boot.driver, boot.host.fb.width, boot.host.fb.height);
+    if (attached) {
+      boot.gpu = attached;
+      // World + palette for the static upload (models/skins were registered
+      // at boot without a GPU sink on this path, so entities stay mesh-less
+      // until a reboot — recorded backend warnings, never a crash; full
+      // hot-swap asset migration is EXPAND scope).
+      attached.gpu.attachWorld(boot.driver.mini);
+      const pal = gpuPaletteFor(boot);
+      if (pal) attached.gpu.setPalette(pal);
+    } else {
+      kind = 'software';
+      warning = `webgl2-experimental requested but unavailable (no WebGL2 context); staying on software`;
+    }
+  } else if (kind !== 'webgl2-experimental' && boot.gpu) {
+    try {
+      boot.gpu.gpu.dispose();
+    } catch {
+      /* dispose is idempotent by contract; belt-and-braces for hot-swap */
+    }
+    boot.gpu = null;
+  }
+  boot.renderer = kind;
+  boot.lastRendererWarning = warning;
+  if (warning !== null) {
+    console.warn(`[q2ts-web] applyRendererCvar: ${warning}`);
   }
   armRasterPolicy(boot);
   return boot.renderer;
@@ -4423,6 +4587,123 @@ export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: numb
   await boot.refresh.renderViewAsync(view, boot.host.world, renderables);
   await boot.refresh.endFrameAsync();
   return resolveDisplayAsync(boot, hud, frameState);
+}
+
+/**
+ * One GPU gameplay frame (GPU-PROOF-3): simulation + GPU submission WITHOUT
+ * the CPU world span rasterizer.
+ *
+ * - Simulation, doors, monsters, prediction run unchanged (same Host tick via
+ *   `stepAsyncSim`, the documented line-for-line twin of `Host.frame`).
+ * - The camera `RefDef` + entity list reuse the EXACT view construction the
+ *   CPU path would use (`buildAsyncView`, the same helper `frameAsync` uses).
+ * - CRITICAL: `refresh.renderView` is NEVER called here — no CPU world span
+ *   rasterization runs in parallel with the GPU submit. HUD painting continues
+ *   on the 2D overlay canvas (see `paintHudOverlay`, called by the rAF tick).
+ * - Entity tail: `selectGpuScene` per frame (conservative fallback; uploads
+ *   stay 1 via `staticGeneration`, so the per-frame `setScene` is a no-op
+ *   upload — the `updateGpuEntities` incremental switch is a PROOF-5
+ *   optimization candidate, not needed for correctness).
+ * - Dynamic lights/beams: the one-shot driver queues are drained HERE into
+ *   GPU inputs (`lights` + synthesized beam entities) instead of the CPU
+ *   pumps — the CPU pools would be purposeless since CPU renderView never
+ *   runs. Mappings mirror the CPU pumps exactly (muzzle [1,1,0], explosion
+ *   [1,.5,.5]/350, blaster [1,1,0]/150, bolt 200).
+ *
+ * Returns the live backend status (`framesSubmitted` counts real on-canvas
+ * submissions), or null when no GPU backend is attached (caller gates on
+ * `boot.gpu`). Returns null (no-op) without a GPU backend.
+ */
+export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus | null {
+  const g = boot.gpu;
+  if (!g) return null;
+  // GPU-side dynamic drains (mirror pumpMuzzleLight/pumpExplosionLights/
+  // pumpBoltLights/pumpTracers mappings; one-shot queues, so the CPU pumps
+  // are skipped — CPU renderView never runs in this path).
+  const lights: GpuLight[] = [];
+  const flash = boot.driver.drainFlash();
+  if (flash) {
+    lights.push({
+      origin: new Float32Array([flash[0]!, flash[1]!, flash[2]!]),
+      color: new Float32Array([1, 1, 0]),
+      intensity: boot.driver.peekFlashIntensity(),
+    });
+  }
+  for (const f of boot.driver.drainEnemyMuzzle()) {
+    lights.push({
+      origin: new Float32Array([f.pos[0]!, f.pos[1]!, f.pos[2]!]),
+      color: new Float32Array([1, 1, 0]),
+      intensity: f.intensity,
+    });
+  }
+  for (const f of boot.driver.drainExplosions()) {
+    const isBlast = f.kind === 'blaster';
+    lights.push({
+      origin: new Float32Array([f.pos[0]!, f.pos[1]!, f.pos[2]!]),
+      color: isBlast ? new Float32Array([1, 1, 0]) : new Float32Array([1, 0.5, 0.5]),
+      intensity: (isBlast ? 150 : 350) * f.alpha,
+    });
+  }
+  for (const bolt of boot.driver.bolts) {
+    lights.push({
+      origin: new Float32Array([bolt.pos[0]!, bolt.pos[1]!, bolt.pos[2]!]),
+      color: new Float32Array([1, 1, 0]),
+      intensity: 200,
+    });
+  }
+  stepAsyncSim(boot.host, g.loop, nowMs);
+  const { view, renderables } = buildAsyncView(boot.host, g.loop.serverAcc);
+  // Live beams: the driver tracer queue drains here into synthesized beam
+  // entities (origin=start, angles=dir, frame=length, skin=color — the
+  // contract-free beam convention `resolveBeam` reads). Negative model
+  // handles never collide with registry handles (>= 0); modelKinds marks
+  // them 'tracer' explicitly.
+  const beamKinds = new Map<number, 'md2' | 'sp2' | 'tracer'>();
+  const beams: Entity[] = boot.driver.drainTracers().map((t, i) => {
+    const model = -1000 - i;
+    beamKinds.set(model, 'tracer');
+    return {
+      model,
+      origin: new Float32Array([t.origin[0]!, t.origin[1]!, t.origin[2]!]),
+      angles: new Float32Array([t.dir[0]!, t.dir[1]!, t.dir[2]!]),
+      frame: t.length,
+      skin: t.color,
+    } as Entity;
+  });
+  const entities = beams.length > 0 ? [...renderables, ...beams] : renderables;
+  const scene = selectGpuScene(
+    boot.driver.mini,
+    entities,
+    view,
+    boot.host.fb.width,
+    boot.host.fb.height,
+  );
+  g.gpu.setScene(scene);
+  g.gpu.setEntities(entities, beamKinds.size > 0 ? beamKinds : undefined);
+  g.scene = scene;
+  g.gpu.renderFrame({ view, scene, time: view.time, lights });
+  return g.gpu.getStatus();
+}
+
+/**
+ * Transparent HUD overlay for the live GPU loop (GPU-PROOF-3): zeroes the
+ * shell-owned display plane (transparent black — the GL scene shows through
+ * everywhere except the HUD) and paints the SAME `drawPlayHud` pass the CPU
+ * path runs post-resolve. The caller blits the returned buffer to the 2D
+ * overlay canvas (`blitToCanvas` preserves alpha via putImageData), which sits
+ * ABOVE the GL canvas (see `acquireGpuCanvas` ordering) — so HUD presentation
+ * is preserved with zero HUD-code changes (no HUD redesign here; any richer
+ * GPU-resident HUD composition is a PROOF-4/EXPAND gap, documented in the
+ * PROOF-3 report).
+ */
+export function paintHudOverlay(boot: PlayBoot, hud: HudState): Uint32Array {
+  boot.display.fill(0);
+  drawPlayHud(
+    { width: boot.host.fb.width, height: boot.host.fb.height, color: boot.display },
+    boot,
+    hud,
+  );
+  return boot.display;
 }
 
 /* --- PERF-FINISH-B instrumented stage capture (never the production loop).

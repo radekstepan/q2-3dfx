@@ -33,10 +33,14 @@ export {
   buildAsyncView,
   createAsyncLoopState,
   frameAsync,
+  frameGpuPlay,
   measureFrameStages,
+  paintHudOverlay,
   stepAsyncSim,
 } from './play.js';
-export type { AsyncLoopState, HudState, StageReport } from './play.js';
+export type { AsyncLoopState, GpuBootState, HudState, StageReport } from './play.js';
+export { acquireGpuCanvas, GPU_CANVAS_ID, HUD_CANVAS_ID, GPU_CONTEXT_ATTRS } from './gpu-canvas.js';
+export type { GpuCanvas } from './gpu-canvas.js';
 export type { GpuCapability } from './play.js';
 export { BrowserBandPool, browserPoolAvailable, defaultBrowserWorkers, BROWSER_POOL_TIMEOUT_MS, selectVoodooBandPath, voodooStateToScanoutOpts } from './render-workers.js';
 export type { BrowserPoolOptions, VoodooBandPath, ScanoutBandOptions } from './render-workers.js';

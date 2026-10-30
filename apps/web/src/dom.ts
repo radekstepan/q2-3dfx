@@ -939,7 +939,9 @@ import {
   createAsyncLoopState,
   drawPlayHud,
   frameAsync,
+  frameGpuPlay,
   hudComposedPreScanout,
+  paintHudOverlay,
   pumpExplosionLights,
   pumpMuzzleLight,
   pumpTracers,
@@ -1710,11 +1712,13 @@ export function startPlayLoop(
   };
 
   /** Shared post-render tail (HUD + blit + sound/event cues), both paths. */
-  const finishFrame = (target: Uint32Array, hud: { fps: number; frame: number }): void => {    // V2d strict voodoo: HUD was already composed into the emulated target
+  const finishFrame = (target: Uint32Array, hud: { fps: number; frame: number }, hudDone = false): void => {    // V2d strict voodoo: HUD was already composed into the emulated target
     // BEFORE scanout (paintHudPreScanout via resolveDisplay/frameAsync) —
     // painting again here would double-paint and defeat the strict ordering.
     // Legacy/software paths paint HUD after resolve as before.
-    if (!hudComposedPreScanout(boot)) {
+    // GPU-PROOF-3: `hudDone` covers the live-GPU overlay path (HUD already
+    // painted transparently over the GL canvas via paintHudOverlay).
+    if (!hudDone && !hudComposedPreScanout(boot)) {
       drawPlayHud(
         { width: host.fb.width, height: host.fb.height, color: target },
         boot,
@@ -1761,6 +1765,16 @@ export function startPlayLoop(
       if (dt > 0) fps += (1000 / dt - fps) * 0.05;
     }
     lastT = nowMs;
+    const hud = { fps, frame: frame++ };
+    if (boot.gpu) {
+      // GPU-PROOF-3 live lane: sim + GPU submit with NO CPU world span
+      // rasterization (frameGpuPlay never calls refresh.renderView); HUD is
+      // painted transparently on the 2D overlay above the GL canvas.
+      frameGpuPlay(boot, nowMs);
+      const overlay = paintHudOverlay(boot, hud);
+      finishFrame(overlay, hud, true);
+      return;
+    }
     // Muzzle dlight + tracer beams must be registered before the renderer draws the frame.
     pumpMuzzleLight(boot);
     pumpExplosionLights(boot);
@@ -1768,7 +1782,6 @@ export function startPlayLoop(
     host.frame(nowMs);
     // V2d: hud threads into resolveDisplay so strict voodoo composes it
     // pre-scanout; finishFrame skips the post pass in that case (no double).
-    const hud = { fps, frame: frame++ };
     const target = resolveDisplay(boot, hud);
     finishFrame(target, hud);
   };

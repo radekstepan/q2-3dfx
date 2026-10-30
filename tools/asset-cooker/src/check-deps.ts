@@ -44,7 +44,9 @@ export const ALLOW: Record<string, string[]> = {
   // types it implements), sw-renderer (MiniWorld + camera helpers for scene
   // selection), bsp (asset loading in tests). Browser graphics types
   // (WebGL2RenderingContext) may appear ONLY here and in apps/web.
-  'webgl-renderer': ['bsp', 'config', 'math', 'renderer-api', 'sw-renderer'],
+  // formats: test-only real-asset parsing (parseMD2/WAL/PCX in Q2_PAK-gated
+  // tests, mirroring the game package's asset-data justification).
+  'webgl-renderer': ['bsp', 'config', 'formats', 'math', 'renderer-api', 'sw-renderer'],
   // math: Vec3 types (+config per §5, unused today).
   'renderer-api': ['config', 'math'],
   // formats: WAL/MD2 asset data (real use; §4 lists only math+bsp+config).

@@ -1,0 +1,409 @@
+// GPU-PROOF-3 gameplay integration (apps/web only).
+//
+// Wiring-proof: simulation ticks submit real GPU frames (stub GL records the
+// production call sequence) while the CPU world span rasterizer stays off.
+// Production pixels are proven by the real-browser suite
+// (`@q2/testkit` gpu-browser); this file proves the live-loop wiring.
+// Headless-safe: DOM/GL are stubbed exactly like gpu-select.test.ts.
+import { describe, expect, it, afterEach, vi } from 'vitest';
+import { resetCVars, setCVar } from '@q2/config';
+import { keyDown, keyUp } from '@q2/input';
+import {
+  bootPlay,
+  drawPlayHud,
+  frameGpuPlay,
+  paintHudOverlay,
+  applyRendererCvar,
+  resolveDisplay,
+} from './play.js';
+import { acquireGpuCanvas, GPU_CANVAS_ID, GPU_CONTEXT_ATTRS } from './gpu-canvas.js';
+
+const WEB_Q2_PAK = process.env.Q2_PAK;
+
+afterEach(() => {
+  resetCVars();
+  const g = globalThis as unknown as Record<string, unknown>;
+  delete g['document'];
+});
+
+// --- stub DOM/GL -----------------------------------------------------------
+// Recording stub with the full program/buffer/texture/state surface the
+// production `WebGLRenderer` uses (shaders compile/link clean, uploads and
+// draws are logged). Method calls record; handle-returning calls return
+// fresh objects, status queries succeed, info logs are empty. A Proxy keeps
+// the surface future-proof: production correctness is proven by the
+// real-browser suite (`gpu-browser.test.ts`), this stub proves wiring.
+
+const GL_NUM = {
+  VERSION: 7937,
+  VERTEX_SHADER: 35633,
+  FRAGMENT_SHADER: 35632,
+  COMPILE_STATUS: 35713,
+  LINK_STATUS: 35714,
+  ARRAY_BUFFER: 34962,
+  ELEMENT_ARRAY_BUFFER: 34963,
+  STATIC_DRAW: 35044,
+  DYNAMIC_DRAW: 35048,
+  TEXTURE_2D: 3553,
+  TEXTURE0: 33984,
+  RGBA: 6408,
+  UNSIGNED_BYTE: 5121,
+  UNSIGNED_INT: 5125,
+  FLOAT: 5126,
+  LINEAR: 9729,
+  NEAREST: 9728,
+  CLAMP_TO_EDGE: 33071,
+  TEXTURE_MIN_FILTER: 10241,
+  TEXTURE_MAG_FILTER: 10240,
+  TEXTURE_WRAP_S: 10242,
+  TEXTURE_WRAP_T: 10243,
+  UNPACK_FLIP_Y_WEBGL: 37440,
+  DEPTH_TEST: 2929,
+  BLEND: 3042,
+  LESS: 513,
+  SRC_ALPHA: 770,
+  ONE_MINUS_SRC_ALPHA: 771,
+  COLOR_BUFFER_BIT: 16384,
+  DEPTH_BUFFER_BIT: 256,
+  TRIANGLES: 4,
+  POINTS: 0,
+  MAX_TEXTURE_SIZE: 3379,
+} as const;
+
+function makeStubGL(log: string[]): Record<string, unknown> {
+  const target: Record<string, unknown> = { ...GL_NUM };
+  target['getParameter'] = (p: unknown): unknown => {
+    log.push('getParameter');
+    if (p === GL_NUM.VERSION) return 'WebGL 2.0 (stub)';
+    if (p === GL_NUM.MAX_TEXTURE_SIZE) return 4096;
+    return 1024;
+  };
+  const handler: ProxyHandler<Record<string, unknown>> = {
+    get(t, prop, receiver): unknown {
+      if (typeof prop === 'symbol') return undefined;
+      if (prop in t) return Reflect.get(t, prop, receiver);
+      return (...args: unknown[]): unknown => {
+        log.push(String(prop));
+        void args;
+        switch (prop) {
+          case 'getShaderParameter':
+          case 'getProgramParameter':
+            return true;
+          case 'getShaderInfoLog':
+          case 'getProgramInfoLog':
+            return '';
+          case 'getAttribLocation':
+            return 0;
+          case 'getUniformLocation':
+            return {};
+          case 'getError':
+            return 0;
+          case 'checkFramebufferStatus':
+            return 36053; // FRAMEBUFFER_COMPLETE
+          case 'createShader':
+          case 'createProgram':
+          case 'createBuffer':
+          case 'createTexture':
+          case 'createVertexArray':
+            return {};
+          default:
+            return undefined;
+        }
+      };
+    },
+  };
+  return new Proxy(target, handler);
+}
+
+interface StubCanvas {
+  id: string;
+  width: number;
+  height: number;
+  style: Record<string, string>;
+  setAttribute(k: string, v: string): void;
+  getContext(kind: string, attrs?: unknown): unknown;
+}
+
+/** A canvas factory whose contexts are the shared stub GL (or null). */
+function makeStubCanvasFactory(log: string[], gl: unknown): () => StubCanvas {
+  return () => {
+    const canvas: StubCanvas = {
+      id: '',
+      width: 0,
+      height: 0,
+      style: {},
+      setAttribute(k: string, v: string): void {
+        if (k === 'id') canvas.id = v;
+      },
+      getContext(kind: string, attrs?: unknown): unknown {
+        log.push(`getContext:${kind}:${JSON.stringify(attrs)}`);
+        return kind === 'webgl2' ? gl : null;
+      },
+    };
+    return canvas;
+  };
+}
+
+interface StubDoc {
+  log: string[];
+  hud: { id: string; style: Record<string, string>; parentNode: { inserted: unknown[] } };
+  canvases: StubCanvas[];
+}
+
+/** Install a stub document: capable (stub GL) unless `glNull` (incapable). */
+function installStubDoc(opts: { glNull?: boolean } = {}): StubDoc {
+  const g = globalThis as unknown as Record<string, unknown>;
+  const log: string[] = [];
+  const gl = opts.glNull ? null : makeStubGL(log);
+  const canvases: StubCanvas[] = [];
+  const factory = makeStubCanvasFactory(log, gl);
+  const hud = {
+    id: 'q2',
+    style: {} as Record<string, string>,
+    parentNode: { inserted: [] as unknown[] },
+  };
+  (hud.parentNode as { insertBefore?: unknown }).insertBefore = (c: unknown, ref: unknown): void => {
+    hud.parentNode.inserted.push([c, ref]);
+  };
+  const doc = {
+    createElement: (tag: string): unknown => {
+      if (tag !== 'canvas') return {};
+      const c = factory();
+      canvases.push(c);
+      return c;
+    },
+    getElementById: (id: string): unknown => {
+      if (id === 'q2') return hud;
+      if (id === GPU_CANVAS_ID) return canvases.find((c) => c.id === GPU_CANVAS_ID) ?? null;
+      return null;
+    },
+    body: { appendChild: (c: unknown): void => { log.push('body.appendChild'); void c; } },
+  };
+  g['document'] = doc;
+  return { log, hud, canvases };
+}
+
+function capableBoot(width = 64, height = 48): ReturnType<typeof bootPlay> {
+  setCVar('vid_renderer', 'webgl2-experimental');
+  return bootPlay({ width, height });
+}
+
+describe('GPU-PROOF-3 canvas glue (gpu-canvas.ts)', () => {
+  it('headless-safe: no DOM → null, never throws', () => {
+    expect(typeof document).toBe('undefined');
+    expect(() => acquireGpuCanvas(undefined, 64, 48)).not.toThrow();
+    expect(acquireGpuCanvas(undefined, 64, 48)).toBeNull();
+    expect(acquireGpuCanvas({}, 64, 48)).toBeNull();
+    expect(acquireGpuCanvas({ createElement: 42 }, 64, 48)).toBeNull();
+  });
+
+  it('creates the GL canvas stacked UNDER the HUD canvas with exact context attrs', () => {
+    const stub = installStubDoc();
+    const acquired = acquireGpuCanvas(undefined, 64, 48);
+    expect(acquired).not.toBeNull();
+    const glCanvas = stub.canvases[0]!;
+    expect(glCanvas.id).toBe(GPU_CANVAS_ID);
+    expect(glCanvas.width).toBe(64);
+    expect(glCanvas.height).toBe(48);
+    // Stacking: GL below (z 0, absolute), HUD on top (z 1, layout unchanged).
+    expect(glCanvas.style['position']).toBe('absolute');
+    expect(glCanvas.style['zIndex']).toBe('0');
+    expect(stub.hud.style['zIndex']).toBe('1');
+    // DOM order: inserted immediately BEFORE the HUD canvas.
+    expect(stub.hud.parentNode.inserted.length).toBe(1);
+    expect(stub.hud.parentNode.inserted[0]).toEqual([glCanvas, stub.hud]);
+    // Exact context acquisition (probe + real canvas).
+    const real = stub.log.filter((l) => l.startsWith('getContext:webgl2:'));
+    expect(real.length).toBeGreaterThanOrEqual(1);
+    for (const entry of real) {
+      expect(entry).toBe(`getContext:webgl2:${JSON.stringify({ ...GPU_CONTEXT_ATTRS })}`);
+    }
+    expect(GPU_CONTEXT_ATTRS).toEqual({
+      antialias: false, alpha: false, depth: true, stencil: false, preserveDrawingBuffer: false,
+    });
+  });
+
+  it('null context (incapable) → null, never throws', () => {
+    installStubDoc({ glNull: true });
+    expect(acquireGpuCanvas(undefined, 64, 48)).toBeNull();
+  });
+
+  it('reuses the GL canvas by id on the second acquire', () => {
+    const stub = installStubDoc();
+    const first = acquireGpuCanvas(undefined, 64, 48);
+    const second = acquireGpuCanvas(undefined, 64, 48);
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(second!.canvas).toBe(first!.canvas);
+    expect(stub.canvases.length).toBe(1);
+  });
+});
+
+describe('GPU-PROOF-3 boot wiring (play.ts)', () => {
+  it('capable webgl2 boot: GPU live, selection recorded, warning null, static scene uploaded once', () => {
+    installStubDoc();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const boot = capableBoot();
+      expect(boot.renderer).toBe('webgl2-experimental');
+      expect(boot.lastRendererWarning).toBeNull();
+      expect(warn).not.toHaveBeenCalled();
+      expect(boot.gpu).not.toBeNull();
+      const status = boot.gpu!.gpu.getStatus();
+      expect(status.initialized).toBe(true);
+      expect(status.width).toBe(64);
+      expect(status.height).toBe(48);
+      expect(status.framesSubmitted).toBe(0);
+      expect(status.contextLost).toBe(false);
+      // Static world scene uploaded ONCE at boot (empty entities).
+      expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
+      // CPU renderer still constructed (HUD/resolve path intact).
+      expect(boot.refresh).toBeDefined();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('incapable webgl2 boot: CPU path unchanged, gpu null, warning recorded', () => {
+    expect(typeof document).toBe('undefined');
+    setCVar('vid_renderer', 'webgl2-experimental');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const boot = bootPlay({ width: 64, height: 48 });
+      expect(boot.renderer).toBe('software');
+      expect(boot.lastRendererWarning).not.toBeNull();
+      expect(boot.gpu).toBeNull();
+      expect(warn).toHaveBeenCalled();
+      const stats = boot.host.frame(100);
+      expect(stats.pixels).toBeGreaterThan(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('CPU software boot: zero behavior change (gpu null, renderView runs)', () => {
+    setCVar('vid_renderer', 'software');
+    const boot = bootPlay({ width: 64, height: 48 });
+    expect(boot.renderer).toBe('software');
+    expect(boot.lastRendererWarning).toBeNull();
+    expect(boot.gpu).toBeNull();
+    expect(frameGpuPlay(boot, 16)).toBeNull();
+    const stats = boot.host.frame(100);
+    expect(stats.pixels).toBeGreaterThan(0);
+  });
+
+  it('hot-swap: leaving GPU disposes the backend; re-entering re-attaches', () => {
+    installStubDoc();
+    const boot = capableBoot();
+    expect(boot.gpu).not.toBeNull();
+    setCVar('vid_renderer', 'software');
+    expect(applyRendererCvar(boot)).toBe('software');
+    expect(boot.gpu).toBeNull();
+    expect(boot.lastRendererWarning).toBeNull();
+    setCVar('vid_renderer', 'webgl2-experimental');
+    expect(applyRendererCvar(boot)).toBe('webgl2-experimental');
+    expect(boot.gpu).not.toBeNull();
+    expect(boot.lastRendererWarning).toBeNull();
+    expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
+  });
+});
+
+describe('GPU-PROOF-3 per-frame gameplay (frameGpuPlay)', () => {
+  it('N frames: sim + combat advance, GPU submits, CPU renderView NEVER runs, upload stays 1', () => {
+    installStubDoc();
+    const boot = capableBoot();
+    const renderSpy = vi.spyOn(boot.refresh, 'renderView');
+    // Move forward + hold fire: movement AND combat in one run.
+    keyDown(boot.host.input, 'forward');
+    keyDown(boot.host.input, 'attack');
+    const N = 60;
+    for (let f = 0; f < N; f++) {
+      const st = frameGpuPlay(boot, f * 16);
+      expect(st).not.toBeNull();
+    }
+    keyUp(boot.host.input, 'forward');
+    keyUp(boot.host.input, 'attack');
+    const status = boot.gpu!.gpu.getStatus();
+    // One real on-canvas submission per GPU frame (clear-only today).
+    expect(status.framesSubmitted).toBe(N);
+    // Static scene upload once across N frames (generation-stable setScene).
+    expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
+    // CRITICAL: no CPU world span rasterization in parallel.
+    expect(renderSpy).not.toHaveBeenCalled();
+    // Same sim as the CPU path: server ticks advanced, player moved, shots fired.
+    expect(boot.host.serverTime).toBeGreaterThan(0);
+    expect(boot.host.playerOrigin[0]).toBeGreaterThan(-168);
+    expect(boot.driver.events).toContain('shot');
+    renderSpy.mockRestore();
+  });
+
+  it('GPU frames reuse the exact CPU view construction (same camera as host would render)', () => {
+    installStubDoc();
+    const boot = capableBoot();
+    keyDown(boot.host.input, 'forward');
+    for (let f = 0; f < 10; f++) frameGpuPlay(boot, f * 16);
+    keyUp(boot.host.input, 'forward');
+    // The CPU path renders from the same predicted view: drive a twin CPU
+    // boot with IDENTICAL input and compare simulated positions (frameGpuPlay
+    // steps via stepAsyncSim, the documented Host.frame twin).
+    setCVar('vid_renderer', 'software');
+    const cpu = bootPlay({ width: 64, height: 48 });
+    keyDown(cpu.host.input, 'forward');
+    for (let f = 0; f < 10; f++) cpu.host.frame(f * 16);
+    keyUp(cpu.host.input, 'forward');
+    expect(boot.host.playerOrigin).toEqual(cpu.host.playerOrigin);
+    expect(boot.host.serverTime).toBeCloseTo(cpu.host.serverTime, 6);
+  });
+
+  it('HUD smoke on a GPU boot: overlay paints HUD over transparency, GL shows through', () => {
+    installStubDoc();
+    const boot = capableBoot();
+    for (let f = 0; f < 5; f++) frameGpuPlay(boot, f * 16);
+    const overlay = paintHudOverlay(boot, { fps: 60, frame: 1 });
+    expect(overlay.length).toBe(64 * 48);
+    // HUD painted (crosshair/status/fps glyphs are opaque nonzero pixels)…
+    expect(overlay.some((px) => px !== 0)).toBe(true);
+    // …over transparency (alpha-0 regions where the GL canvas shows through).
+    expect(overlay.some((px) => (px >>> 24) === 0)).toBe(true);
+    // The classic HUD pass still runs on the CPU buffer (presentation preserved).
+    const target = resolveDisplay(boot);
+    drawPlayHud({ width: 64, height: 48, color: target }, boot, { fps: 60, frame: 1 });
+    expect(target.some((px) => px !== 0)).toBe(true);
+  });
+});
+
+describe.runIf(!!WEB_Q2_PAK)('GPU-PROOF-3 base1 combat (Q2_PAK)', () => {
+  it('base1: GPU frames advance combat, submit, and never touch CPU raster', { timeout: 180000 }, async () => {
+    const stub = installStubDoc();
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const pak = ingestPak(buf);
+    setCVar('vid_renderer', 'webgl2-experimental');
+    const boot = bootPlay({ width: 96, height: 72, pak });
+    expect(boot.renderer).toBe('webgl2-experimental');
+    expect(boot.gpu).not.toBeNull();
+    expect(boot.source).toBe('pak');
+    const renderSpy = vi.spyOn(boot.refresh, 'renderView');
+    keyDown(boot.host.input, 'attack');
+    const N = 20;
+    for (let f = 0; f < N; f++) frameGpuPlay(boot, f * 16);
+    keyUp(boot.host.input, 'attack');
+    const status = boot.gpu!.gpu.getStatus();
+    expect(status.framesSubmitted).toBe(N);
+    expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
+    expect(renderSpy).not.toHaveBeenCalled();
+    expect(boot.host.serverTime).toBeGreaterThan(0);
+    expect(boot.driver.events).toContain('shot');
+    // Real drawing, not the clear-only fallback: world+entities submitted
+    // draw calls with the attached assets (pixels proven in the browser).
+    expect(stub.log).toContain('drawElements');
+    expect(stub.log).toContain('bufferData');
+    // The normal rendering path never reads pixels back (test-only capture
+    // lives in the browser harness, never in src/).
+    expect(stub.log).not.toContain('readPixels');
+    renderSpy.mockRestore();
+  });
+});

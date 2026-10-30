@@ -84,7 +84,7 @@ Dependency flow (enforced by `yarn deps:check`):
 
 ```
 math ← formats ← bsp ← {sw-renderer, voodoo} ← renderer-api ← host
-{renderer-api, sw-renderer, bsp, math, config} ← webgl-renderer (GPU boundary impl, PROOF-2)
+{renderer-api, sw-renderer, bsp, math, config} ← webgl-renderer (GPU boundary impl, PROOF-2; + formats test-only)
 filesystem ← formats · game ← {math, bsp, config} · server ← {game, bsp}
 client ← {renderer-api, input, sound, config, game (pmove prediction)}
 host ← {server, client} · apps/web ← host
@@ -334,13 +334,21 @@ completion (2026-10-29, integrated — interface-first commit + three disjoint l
 ### GPU-PROOF-3 — Render the representative scene on WebGL2
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
 depends: GPU-PROOF-2
-status: ready
+status: done(@integrator 2026-10-29)
 done-when:
-- [ ] Draw the real base1 world with textures/lightmaps, depth testing and culling from persistent GPU resources; batch by compatible material/state without changing transparent ordering.
-- [ ] Draw the real textured animated viewmodel and representative entities, preserving interpolation, gun depth handling, near clipping, dynamic light and transparent draw order needed by the route.
-- [ ] Integrate with existing gameplay/camera and HUD presentation. Verify movement/combat work and that GPU drawing does not still invoke CPU world span rasterization in parallel.
-- [ ] Actual browser integration tests compile production shaders and render the scene; check geometry/gun presence, occlusion and transparency. Frame capture/readback is allowed in tests, not normal rendering.
-- [ ] Record initial end-to-end browser timings now, before embellishment. Do not treat a blank/partial scene or unlit triangle benchmark as success.
+- [x] Draw the real base1 world with textures/lightmaps, depth testing and culling from persistent GPU resources; batch by compatible material/state without changing transparent ordering.
+- [x] Draw the real textured animated viewmodel and representative entities, preserving interpolation, gun depth handling, near clipping, dynamic light and transparent draw order needed by the route.
+- [x] Integrate with existing gameplay/camera and HUD presentation. Verify movement/combat work and that GPU drawing does not still invoke CPU world span rasterization in parallel.
+- [x] Actual browser integration tests compile production shaders and render the scene; check geometry/gun presence, occlusion and transparency. Frame capture/readback is allowed in tests, not normal rendering.
+- [x] Record initial end-to-end browser timings now, before embellishment. Do not treat a blank/partial scene or unlit triangle benchmark as success.
+completion (2026-10-29, integrated — GL + wiring lanes in parallel, browser lane after, integrator reconciled + committed):
+- GL core (`packages/webgl-renderer`): `shaders.ts` (3 production GLSL ES 3.00 programs, compile errors carry info logs), `worldMesh.ts` (fan triangulation, per-texId opaque batches, order-preserving transparent runs, shelf-packed RGB lightmap atlas, palette-expanded diffuse), `alias.ts` (MD2 weld-order mesh, CPU mirror lerp), `entities.ts` (`updateGpuEntities` world-ref reuse + billboard/beam/particle emitters), `matrices.ts` (Quake-camera MVP, near=4). Passes: sky → opaque → alias/sprites → gun (uDepthScale 0.02/uDepthBias -0.9 NDC remap) → POINTS particles → blend (SRC_ALPHA/ONE_MINUS, depth test on, write off). `renderer-api` additive `GpuLight`/`MAX_GPU_LIGHTS`/optional `lights?` (frozen §5 untouched, DOM-free).
+- live loop (`apps/web`): GL canvas under the 2D HUD canvas (`gpu-canvas.ts`), boot attaches backend + static scene once, `frameGpuPlay` drives sim + buildAsyncView camera + per-frame entity tail, GPU-side dlight/beam drains (mirror CPU pump mappings), `setEntities` + `lights` submit, CPU `renderView` never called; HUD preserved on the transparent overlay. Asset hookup: `attachWorld`+`setPalette` at boot, MD2/PCX mirrored under CPU handles via `registerPakModels` sink (fallbacks skip with warnings, never crash). Hot-swap attaches world+palette only (entities mesh-less until reboot — documented EXPAND gap, recorded warnings).
+- browser proof (`packages/testkit` CDP harness, headless Chromium 156 SwiftShader): 3/3 programs compile clean; F1 coverage 87.6% (177 surfaces, 27 draws, uploads 1); f1-vs-f1b byte-identical after warmup; gun/beam/depth-off diffs pass at 12–33x margins; timings report-only (129 rAF frames median 100ms/p95 150ms software GL — supplement, never a gate); production `readPixels` pin (none in src/).
+- integrator changes: fixed a Y-sign defect the placement gates failed closed on (`m[5] = +fy`; view-up maps to NDC-up) + sign-pinning test; moved test-only `@q2/bsp`/`@q2/formats` to devDependencies; upgraded the web stub GL to the full production surface + draw/no-readback assertions; relaxed over-strict testkit ordering/material rules to the committed convention (transparent bit independent of kind; loss records-not-throws).
+- deferred by budget, not dropped: `updateGpuEntities` incremental switch (fallback `selectGpuScene` proven, uploads 1 — PROOF-5 optimization candidate); sprite/particle live-pool mirroring (renderer supports them, page proves them); GPU-resident HUD; resize handling; context-loss re-upload.
+- evidence: webgl-renderer 51/1 (Q2_PAK), renderer-api 6/6, web 97+27 (gpu-play/gpu-select/display/play/m71/combat/base1-gate/voodoo-regression), testkit 173 passed + 1 known fg-recovery load flake (green isolated ×N, identical at clean base); deps:check 623/16 ok. Changesets: webgl-renderer-gpu-proof-3 + renderer-api-gpu-proof-3 + testkit-gpu-proof-3 (web ignored).
+- PROOF-4 now eligible (depends PROOF-3 done).
 
 ### GPU-PROOF-4 — Implement and validate the Voodoo appearance
 owns: `packages/webgl-renderer`, `packages/voodoo`, `apps/web`, `packages/testkit`

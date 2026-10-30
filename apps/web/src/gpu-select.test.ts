@@ -116,14 +116,26 @@ describe('GPU-PROOF-2 selection/plumbing (headless, no real GL)', () => {
     }
   });
 
-  it("capable webgl2-experimental boot records the selection but keeps the CPU SoftwareRenderer path (PROOF-3 draws on GPU)", () => {
+  it("capable webgl2-experimental boot records the selection and wires the GPU backend (PROOF-3 draws on GPU)", () => {
     // Stub a minimal DOM canvas offering a WebGL2 context (no real GL).
+    // PROOF-3: the stub context is init/submit-shaped (viewport/clearColor/
+    // clear) because bootPlay now actually inits the committed WebGLRenderer
+    // on it; pixels for the live loop come from `frameGpuPlay`.
     const g = globalThis as unknown as Record<string, unknown>;
     g['__q2tsGpuStub'] = true;
     g['document'] = {
       createElement: () => ({
         getContext: (kind: string) =>
-          kind === 'webgl2' ? { getParameter: () => 'WebGL 2.0 (stub)', VERSION: 7937 } : null,
+          kind === 'webgl2'
+            ? {
+              getParameter: () => 'WebGL 2.0 (stub)',
+              VERSION: 7937,
+              COLOR_BUFFER_BIT: 16384,
+              viewport: () => undefined,
+              clearColor: () => undefined,
+              clear: () => undefined,
+            }
+            : null,
       }),
     };
     try {
@@ -138,7 +150,11 @@ describe('GPU-PROOF-2 selection/plumbing (headless, no real GL)', () => {
         expect(boot.renderer).toBe('webgl2-experimental');
         expect(boot.lastRendererWarning).toBeNull();
         expect(warn).not.toHaveBeenCalled();
-        // PROOF-2: the selection is real but pixels still come from CPU.
+        // PROOF-3: the selection is real AND the GPU backend is attached
+        // (static scene uploaded once at boot); the CPU SoftwareRenderer
+        // stays constructed for the HUD/resolve path.
+        expect(boot.gpu).not.toBeNull();
+        expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
         expect(boot.refresh).toBeInstanceOf(SoftwareRenderer);
         const stats = boot.host.frame(100);
         expect(stats.pixels).toBeGreaterThan(0);

@@ -1,13 +1,13 @@
-# @q2/webgl-renderer — WebGL2 backend (GPU-PROOF-2: boundary + resource ownership)
+# @q2/webgl-renderer — WebGL2 backend (GPU-PROOF-3: real scene drawing)
 
 Experimental GPU renderer for fast gameplay with a reviewed Voodoo-style
 appearance. This package owns the GPU scene/backend boundary and GPU
 resource lifetime. Browser glue (canvas/context acquisition) lives in
 `apps/web`; this package only ever receives an injected context.
 
-> PROOF-2 scope: NO scene drawing, NO appearance policy (PROOF-3/4).
-> `renderFrame` proves context/target ownership with a viewport + clear;
-> real scene buffers land in PROOF-3.
+> PROOF-3 scope: real scene drawing in plain linear RGB. Appearance policy
+> (dither/RGB565/fog/gamma/mip/LOD) is PROOF-4, explicitly out of scope —
+> LINEAR filtering, no mipmaps, no quantization selections here.
 
 ## What PROOF-2 owns
 
@@ -37,17 +37,43 @@ resource lifetime. Browser glue (canvas/context acquisition) lives in
   `testUploadStats()`). `init`/`resize`/`setScene`/`renderFrame`/
   `dispose`/`handleContextLost`/`handleContextRestored`/`getStatus` per
   the `GpuRenderer` contract. Wrong-state use records `lastError` AND
-  throws `Com_Error`. Normal rendering never reads pixels back
-  (no `readPixels` in `src/`).
+  throws `Com_Error`. Asset inputs (concrete methods): `attachWorld`,
+  `setPalette`, `registerModelData`, `registerSkinPixels`, `setEntities`
+  (per-frame entity list, stored by reference). `renderFrame` draws the
+  real passes — sky, opaque world (lit), opaque alias + sprites, gun pass
+  (depth-hack MVP), POINTS particles, blend pass (transparent world in
+  scene order, transparent alias, beams) — or the PROOF-2 clear-only
+  submit when no assets are attached (lifecycle contract preserved).
+  Normal rendering never reads pixels back (no `readPixels` in `src/`).
+- `src/shaders.ts`: production GLSL ES 3.00 sources (exported reviewable
+  consts) — lit world, alias, flat vertex-color programs — plus
+  `compileProgram` with explicit shader/program info-log errors.
+- `src/worldMesh.ts` (pure): fan triangulation, per-texId opaque batches,
+  order-preserving transparent runs, sky collection, one-RGB-atlas lightmap
+  pack with baked style scales, palette texture expansion.
+- `src/alias.ts` (pure): MD2→GPU mesh (same welded index order as the CPU),
+  per-frame frameA→frameB lerp + shade-dot base.
+- `src/entities.ts` (pure): `updateGpuEntities` (entity-ref tail refresh
+  only; world refs reused by reference) + CPU billboard/beam/particle
+  emitters.
+- `src/matrices.ts` (pure): Quake-camera MVP math (near=4 like the CPU).
 
-## What PROOF-3 / PROOF-4 will add
+## Documented PROOF-3 approximations (ROADMAP to PROOF-4/EXPAND)
 
-- PROOF-3: real drawing from the stored scene — persistent vertex/index
-  buffers uploaded once per `staticGeneration`, texture/lightmap upload,
-  depth testing, batching by material without disturbing transparent
-  order, animated viewmodel/entities, browser integration compiling real
-  shaders.
-- PROOF-4: the Voodoo appearance contract (sampling/mip policy, fog,
+- LINEAR filtering, no mipmaps (PROOF-4 owns LOD/bilinear policy).
+- Lightmap style scale baked per style-signature (re-baked on change).
+- Dynamic lights per-pixel in world + alias shaders (CPU: per-luxel bake).
+- Gun depth: NDC z remap (scale 0.02, bias -0.9) — GPU reading of
+  RF_DEPTHHACK 1/z x3 (wins except nose-to-wall).
+- Beams are ~1.5px camera-facing quads (CPU: 1px DDA core+glow).
+- No GL face culling (visibility = selectGpuScene's CPU backface rule).
+- Turbulent water draws unwarped (warp deferred to PROOF-4/EXPAND).
+- Translucency is true blending (CPU: screen-door on the 8-bit path).
+- Non-POT skins upload as-is with a warning (Voodoo 256 cap is PROOF-4).
+
+## What PROOF-4 will add
+
+- The Voodoo appearance contract (sampling/mip policy, fog,
   RGB565 quantization, ordered dither, reconstruction, gamma, HUD
   ordering) in shader/target passes, with shared policy reuse from
   `@q2/voodoo` where pure.
@@ -64,5 +90,10 @@ resource lifetime. Browser glue (canvas/context acquisition) lives in
 - `@q2/config`: `Com_Error` engine error convention (never silent).
 - `@q2/bsp`: world-source asset loading (`loadBsp` for the real-base1
   selection tests; world conversion itself reuses `bspToMiniWorld`).
+- `@q2/formats`: test-only real-asset parsing for the Q2_PAK-gated F1 leg
+  (`parseMD2` for soldier/gun meshes, `parseWAL` for diffuse texels,
+  `parsePCX` for palette/skins) — mirroring `game`, which also uses
+  formats for asset data. Needs the integrator's `deps:check` allowlist
+  entry (`'webgl-renderer': [..., 'formats']`, same justification).
 - Browser graphics types (`WebGL2RenderingContext`) appear ONLY in this
   package and `apps/web`; `src/scene.ts` stays GL-free and DOM-free.
