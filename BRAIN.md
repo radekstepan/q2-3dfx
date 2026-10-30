@@ -7,10 +7,11 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (reviewed 2026-10-29 at 3269c30): the WebGL2 prototype exists.
-> GPU-FOLLOW-0 fixed the black overlay. Execute GPU-FOLLOW-2, GPU-FOLLOW-2A/2B
-> first for missing world/textures/enemies; GPU-FOLLOW-1 reporting can run independently. Finish remaining cards to establish
-> establish acceptance. Keep it experimental; CPU optimization remains paused.**
+> **Current direction (reviewed 2026-10-29 at f05e0ba): moving-camera selection is repaired;
+> GPU-FOLLOW-0 fixed the black overlay. Execute GPU-FOLLOW-2A/2B next for missing
+> enemies/textures, then GPU-FOLLOW-2C for live scene validation. FOLLOW-1 can
+> finish independently. Keep the backend experimental until acceptance passes;
+> CPU optimization remains paused.**
 
 ---
 
@@ -303,7 +304,56 @@ Execution policy for follow-up:
   approval may be fabricated. If unavailable, finish independent work and record
   the exact blocked acceptance step.
 
-### Latest user-visible review — `4dd7fc0` (2026-10-29)
+### Review update — `f05e0ba` (2026-10-29): what to do next
+
+Supersedes the earlier review's frozen-spawn diagnosis as a CURRENT defect; retain
+that history below as the rationale for the completed code change.
+
+Verified in source:
+- Full world buffers/ranges are uploaded independently of camera selection;
+  `refreshGpuScene` selects current PVS/frustum/backfaces every frame. World and
+  entity blend refs are interleaved; selected moving brush vertices re-sync and
+  rotating door normals update. Do not reimplement these fixes.
+- FOLLOW-1 report/ledger corrections and bench verdict helpers landed. Its testkit
+  integration remains explicitly unfinished. The fidelity comparison remains
+  FAILED (~0.9124 versus 0.02); displayed-performance acceptance is still pending.
+- FOLLOW-2A/2B have NOT been implemented: `applyRendererCvar` still deliberately
+  leaves GPU entities mesh-less after a CPU→GPU switch; world textures still clamp;
+  short lightmaps still use a three-byte fallback for a larger image; RGB unpack
+  alignment and atlas filtering fixes are absent. These are next, not more tuning.
+- FOLLOW-2 tests prove turn/reselection and synthetic movers. Browser TURN compares
+  a reselected renderer against a fresh renderer with the same algorithm. This is
+  useful regression evidence, but cannot independently prove all walls/doors/lifts
+  are correct; both paths may omit the same geometry. The live multi-room and
+  semantic occlusion checkboxes were closed too broadly. FOLLOW-2C below owns them.
+
+Additional review risks to cover during the existing repairs (no new architecture):
+- Texture upload uses the currently active texture unit. The world pass binds the
+  lightmap on unit 1, then lazy `diffuseFor`/`whiteFor` may upload and bind a different
+  texture on that same unit before `bindDiffuse` selects unit 0. Explicitly restore
+  or bind both sampler units before each affected draw; test FIRST-use textures
+  when turning into a new room, not only warmed cached textures. Audit alias/sprite
+  interleaving too. This is a concrete state-leak path, not a lighting-policy choice.
+- The atlas now packs the FULL map into the same fixed 1024×2048 capacity. Measure
+  skipped/overflow counts on real base1; don't assume overflow occurs, but do not
+  silently sample atlas origin for any surface that cannot be packed. Add defined
+  paging/growth or a deliberate correct fallback if needed.
+- Beam refs with default alpha=1 still receive opaque classification/order 0 in
+  `refreshGpuScene`, while the renderer draws beams in its blend pass. Add a mixed
+  beam/glass/alias ordering fixture and classify/order by actual draw semantics.
+- `validateSceneCoverage` currently checks submission/upload counts, screenshot
+  presence and intervals. Those alone cannot reject a populated but incomplete
+  scene. Wire the new semantic coverage evidence into acceptance, not only tests
+  of absent uploads or absent screenshots.
+
+Review verification: `Q2_PAK=/home/radek/dev/q2-3dfx/external/q2/baseq2/pak0.pak yarn workspace @q2/webgl-renderer test` passed 93 tests, 2 skipped (11 files). These are package/stub-GL and real-asset selection checks, not a new composed-browser traversal or performance run.
+
+Next executable work: FOLLOW-2A → FOLLOW-2B → FOLLOW-2C → FOLLOW-3/4, while FOLLOW-1
+finishes independently. Do not block missing-enemy/material fixes behind reporting
+or claim performance acceptance while scene content is still incomplete. The one
+remaining speed-optimization iteration is not consumed by correctness repairs.
+
+### Historical user-visible review — `4dd7fc0` (2026-10-29)
 
 User can now see the GPU scene, but reports missing textures/elements, black spots,
 see-through “dollhouse” geometry and no enemies. FOLLOW-0 fixed presentation ONLY;
@@ -384,20 +434,53 @@ lane-note (2026-10-29): docs + tools/bench side landed (gpu-acceptance.ts 10/10,
 ### GPU-FOLLOW-2 — Correct moving-camera world visibility and draw order
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
 depends: GPU-FOLLOW-0
-status: done(@integrator 2026-10-29)
+status: review (implementation landed; live traversal/occlusion validation remains in GPU-FOLLOW-2C)
 starting-points: `play.ts: attachGpuBackend/frameGpuPlay`; `scene.ts: selectGpuScene`; `entities.ts: updateGpuEntities`; `renderer.ts: setScene/uploadStatic/drawScene`
 done-when:
 - [x] Separate persistent full-map geometry/material storage from current-camera draw selection. Update PVS/frustum/backface selection when relevant camera state changes; upload static data once or lazily with explicit residency, never omit surfaces permanently because they were invisible at spawn.
 - [x] Recompute transparent WORLD distance/order for the current view and combine with entity ordering where required; ensure actual draw calls follow the updated selection/order without rebuilding the whole mesh per frame.
 - [x] Add fail-before tests for a 180-degree turn, camera translation across PVS clusters and changing transparent overlap. Include pixel/capture checks from the real browser path, not only updated surface lists or an uploads==1 assertion.
-- [x] Traverse multiple rooms including doors/lifts; audit brush/submodel transforms and newly revealed geometry. Document missing dynamic-world support explicitly and implement the base1-required cases before claiming full-map coverage.
-- [x] Add semantic hole/occlusion checks: previously hidden wall/floor/ceiling surface IDs become drawable after a turn, no exterior background shows through a known opaque wall, and doors/lifts occlude/move correctly. Audit winding/normal signs, polygon triangulation and near clipping if holes remain; do not globally disable culling to mask errors.
-- [x] Remeasure the same route after correctness repair. No performance win may rely on rendering only the spawn subset.
-completion (2026-10-29, integrated — two disjoint lanes, integrator reconciled + committed): webgl-renderer full inventory + per-frame refreshGpuScene + interleaved blend pass + mover re-sync + door-normal fix; apps/web per-frame reselect; testkit TURN/reselect browser coverage. Evidence: webgl-renderer 93/2, bench 62/62, testkit 184/9, web targeted 40/40; base1 full 7663 / spawn 173 / turn 103 newly visible; F1 draws 179/frame uploads 1; fidelity still FAIL 0.9124 (FOLLOW-5, no regression); deps:check 598 ok. Changesets: webgl-renderer-gpu-follow-2 + testkit-gpu-follow-2. Ledger: GPU-FOLLOW-2 row appended. GPU-FOLLOW-2A now eligible (depends FOLLOW-2 done).
+- [ ] Traverse multiple rooms including doors/lifts; audit brush/submodel transforms and newly revealed geometry. Document missing dynamic-world support explicitly and implement the base1-required cases before claiming full-map coverage.
+- [ ] Add semantic hole/occlusion checks: previously hidden wall/floor/ceiling surface IDs become drawable after a turn, no exterior background shows through a known opaque wall, and doors/lifts occlude/move correctly. Audit winding/normal signs, polygon triangulation and near clipping if holes remain; do not globally disable culling to mask errors.
+- [ ] Remeasure the same route after correctness repair. No performance win may rely on rendering only the spawn subset.
+completion (2026-10-29, integrated — two disjoint lanes, integrator reconciled + committed): webgl-renderer full inventory + per-frame refreshGpuScene + interleaved blend pass + mover re-sync + door-normal fix; apps/web per-frame reselect; testkit TURN/reselect browser coverage. Evidence: webgl-renderer 93/2, bench 62/62, testkit 184/9, web targeted 40/40; base1 full 7663 / spawn 173 / turn 103 newly visible; F1 draws 179/frame uploads 1; fidelity still FAIL 0.9124 (FOLLOW-5, no regression); deps:check 598 ok. Changesets: webgl-renderer-gpu-follow-2 + testkit-gpu-follow-2. Ledger: GPU-FOLLOW-2 row appended. GPU-FOLLOW-2A is eligible on the landed implementation; FOLLOW-2C must finish the unchecked validation before final sign-off.
+
+### Required visual regressions from the user (2026-10-29)
+
+Current symptoms: barrels missing; infantry is entirely black; walls look smooth/
+untextured. These are mandatory named regressions for FOLLOW-2A/2B, not optional
+polish or accepted Voodoo approximations. Do not substitute soldier-only/gun-only
+fixtures for infantry or barrels. Source is still f05e0ba; fixes are not yet landed.
+
+- **Barrels (FOLLOW-2A):** trace a live `misc_explobox` from server state through
+  `extraEntities`, submitted entity, BARREL_MODEL/BARREL_SKIN handle registration,
+  GPU mesh/texture and composed pixels. Check cold GPU boot AND CPU→GPU switch.
+  Preserve the intentional distinction: `func_explosive` is brush geometry, not a
+  barrel MD2 proxy. Confirm intact barrels appear and destroyed ones disappear;
+  do not resurrect destroyed barrels or add duplicate proxies to satisfy the test.
+- **Black infantry (FOLLOW-2A/2B):** use the real infantry MD2/PCX and its animation
+  frames. Capture unlit skin, shade-only and final output on the same entity; inspect
+  texture upload errors/mips, UV range/source dimensions, palette, normal indices,
+  finite shade values and actual sampler bindings. Classify the first failing stage
+  before changing lighting. Global brightening, white fallback or disabling mipmaps
+  is not an acceptable repair. Prove textured infantry in shadow and under a light,
+  preserving intentionally black skin gutters and normal shading.
+- **Smooth walls (FOLLOW-2B):** the known world CLAMP_TO_EDGE defect is a strong
+  explanation: repeated BSP UVs sample a border color outside [0,1], flattening the
+  wall. Verify using the actual WAL and negative/multi-tile UVs. Compare unlit diffuse
+  and final lighting; test visible repeated texture landmarks at close/mid distances
+  and seams with the intended bilinear/mip policy. Do not just force nearest filtering
+  or a negative LOD bias to disguise wrong addressing or failed uploads.
+- Keep matched before/after composed-page crops for all three, at recorded position,
+  orientation, animation/time and cvars. Required-asset warnings and GL errors must
+  fail the relevant tests. Nonblack coverage or increased screenshot color count
+  cannot establish these fixes. Carry these named fixtures into FOLLOW-2C and final
+  acceptance so later changes cannot silently remove the content again.
 
 ### GPU-FOLLOW-2A — Restore enemies, gun and assets on every entry path
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
-depends: GPU-FOLLOW-2
+depends: GPU-FOLLOW-0
+prerequisite-evidence: FOLLOW-2 implementation landed in f05e0ba; its remaining validation must not block this repair
 status: ready
 starting-points: `play.ts: registerPakModels/applyRendererCvar`; `renderer.ts: registerModelData/registerSkinPixels/drawAlias`
 done-when:
@@ -418,14 +501,27 @@ done-when:
 - [ ] Expand missing/short lightmap fallback to every luxel or represent a deliberate uniform unlit material. Never index beyond a three-byte fallback; test no-light surfaces and atlas overflow. Audit surface lightId mapping and light-style handling against the CPU reference.
 - [ ] Fix/test luxel centre placement and bilinear isolation between adjacent atlas tiles (gutters/edge duplication or equivalent). Use contrasting tiles, last-row/column samples and actual map edges to detect dark bleeding.
 - [ ] Capture diffuse-only, lightmap-only and final output at the same camera for reported black regions; identify each region's cause. Test actual textured walls/floors and enemy/gun skins in the composed page. No global brightness boost, disabling lighting or changed goldens to hide black spots.
+- [ ] Pin sampler-unit isolation during first-use lazy world/skin uploads and mixed world/alias/sprite draws. Assert unit 0 diffuse and unit 1 lightmap bindings at actual draws with a real-GL image regression; no accidental atlas replacement by uploads. Measure full-map atlas capacity/overflow and implement correct handling rather than sampling unrelated atlas-origin pixels.
 - [ ] Retain intended genuinely dark texels and documented appearance policy. Report asset warnings and material/texture counts; no silently missing required textures or GL upload errors on the supported route.
 
-### GPU-FOLLOW-3 — Complete live effects and required world appearance
-owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
+### GPU-FOLLOW-2C — Prove live map completeness and close visibility validation
+owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`, `tools/bench`
 depends: GPU-FOLLOW-2B
 status: ready
 done-when:
+- [ ] Drive the production page through actual multi-room translation/PVS transitions, a 180-degree turn and opening/closing doors plus a lift. Record camera/cluster changes and mover state; selecting two synthetic views is not a live route.
+- [ ] Use independent expectations for named wall/floor/ceiling regions and opaque occlusion (CPU reference or known fixture geometry), plus real composed-page captures. A fresh and reselected GPU renderer agreeing does not prove either one is complete.
+- [ ] Prove specific alive enemies/viewmodel and textured surfaces persist through movement and switches; fail on missing required meshes/skins, upload errors or unexplained holes. Preserve the earlier TURN equality test as a narrower regression.
+- [ ] Feed semantic content/occlusion results into validateSceneCoverage and tests that reject a scene with an intentionally removed wall/enemy even when frames, uploads and screenshot counts look healthy. Keep helper/type ownership explicit across bench/testkit.
+- [ ] Record report-only route timings on the now-complete scene, not a new optimization campaign. Close FOLLOW-2's remaining traversal/occlusion/remeasure boxes only with this evidence; full final soak remains FOLLOW-6.
+
+### GPU-FOLLOW-3 — Complete live effects and required world appearance
+owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
+depends: GPU-FOLLOW-2C
+status: ready
+done-when:
 - [ ] Inventory actual live producers/consumers for sprites, particles, beams, explosions, lights and model/skin kinds. Connect game events and lifetimes to GPU drawing; rendering synthetic fixtures alone is insufficient. Verify event drains occur in the intended tick order without dropping or double-consuming effects.
+- [ ] Classify/order default-alpha beams for their actual blended draw pass; test beam/glass/translucent-alias overlap at changing camera positions.
 - [ ] Preserve model-kind metadata (not just the temporary tracer map), sprite animation/size, particle counts/lifetimes and weapon/light timing. Prove real combat event → submitted geometry → visible pixels with tests.
 - [ ] Implement base1-required sky and water/warp/transparent behavior; current sky is flat and turbulence unwarped. Test combined turbulent/translucent flags and draw/depth order. Audit remaining cvar behavior and label unsupported choices explicitly.
 - [ ] Exercise all supported weapons, enemies, pickups and relevant effects on the live path; no missing-mesh/skin warnings in supported scenes. Keep GPU-resident HUD optional unless measured CPU-overlay cost or correctness requires it.
@@ -463,7 +559,7 @@ done-when:
 
 ### GPU-FOLLOW-7 — Final acceptance and deliberate rollout
 owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config` (integrator)
-depends: GPU-FOLLOW-1, GPU-FOLLOW-2, GPU-FOLLOW-2A, GPU-FOLLOW-2B, GPU-FOLLOW-3, GPU-FOLLOW-4, GPU-FOLLOW-5, GPU-FOLLOW-6
+depends: GPU-FOLLOW-1, GPU-FOLLOW-2, GPU-FOLLOW-2A, GPU-FOLLOW-2B, GPU-FOLLOW-2C, GPU-FOLLOW-3, GPU-FOLLOW-4, GPU-FOLLOW-5, GPU-FOLLOW-6
 status: ready
 done-when:
 - [ ] Review integrated changes; run yarn verify, yarn deps:check, real-asset base1/voodoo gates and GPU lifecycle/image/gameplay suites. Record skips as missing coverage; retain CPU goldens and Node support.
