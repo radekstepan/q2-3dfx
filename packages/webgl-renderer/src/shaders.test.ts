@@ -14,6 +14,7 @@ import {
   VS_FLAT,
   VS_LIT,
 } from './shaders.js';
+import { FS_APPEARANCE, VS_POST } from './appearance.js';
 
 function stubGL(opts: { compileOk?: boolean; linkOk?: boolean; infoLog?: string } = {}): {
   calls: string[];
@@ -97,20 +98,46 @@ describe('proof-3 shader sources (reviewable consts)', () => {
     expect(FS_LIT).toContain('uNumLights');
   });
 
+  it('lit program carries the single-TMU mip + fog/overbright policy (PROOF-4)', () => {
+    expect(FS_LIT).toContain('textureLod');
+    expect(FS_LIT).toContain('uLodBias');
+    expect(FS_LIT).toContain('uMipDither');
+    expect(FS_LIT).toContain('uMaxLevel');
+    expect(FS_LIT).toContain('uOverbright');
+    expect(FS_LIT).toContain('uFogTable');
+    expect(FS_LIT).toContain('vFogW');
+    expect(VS_LIT).toContain('vFogW');
+  });
+
   it('alias program samples texture() with per-pixel dlights + shade base', () => {
-    expect(FS_ALIAS).toContain('texture(');
+    expect(FS_ALIAS).toContain('textureLod');
     expect(FS_ALIAS).toContain('uDiffuse');
     expect(FS_ALIAS).toContain('vShade');
     expect(FS_ALIAS).toContain('uLightPos');
     expect(FS_ALIAS).toContain('uAlpha');
+    expect(FS_ALIAS).toContain('uLodBias');
+    expect(FS_ALIAS).toContain('uFogTable');
     expect(VS_ALIAS).toContain('uUVScale');
   });
 
   it('flat program supports textured (sprite) and vertex-color (beam/particle) modes', () => {
-    expect(FS_FLAT).toContain('texture(');
+    expect(FS_FLAT).toContain('textureLod');
     expect(FS_FLAT).toContain('uTextured');
+    expect(FS_FLAT).toContain('uMap');
     expect(FS_FLAT).toContain('vColor');
+    expect(FS_FLAT).toContain('uFogTable');
     expect(VS_FLAT).toContain('gl_PointSize');
+  });
+
+  it('appearance pass is a reviewable fullscreen resolve (dither/565/recon/gamma)', () => {
+    expect(VS_POST).toContain('gl_VertexID');
+    expect(FS_APPEARANCE).toContain('#version 300 es');
+    expect(FS_APPEARANCE).toContain('texelFetch');
+    expect(FS_APPEARANCE).toContain('uReconMode');
+    expect(FS_APPEARANCE).toContain('uRgbMaxDelta');
+    expect(FS_APPEARANCE).toContain('uGamma');
+    expect(FS_APPEARANCE).toContain('u16bit');
+    expect(FS_APPEARANCE).toContain('gl_FragCoord');
   });
 });
 

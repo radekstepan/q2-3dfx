@@ -6,6 +6,7 @@ export * from './scene.js';
 export * from './capability.js';
 export * from './renderer.js';
 export * from './shaders.js';
+export * from './appearance.js';
 export * from './matrices.js';
 export * from './worldMesh.js';
 export * from './alias.js';

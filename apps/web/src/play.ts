@@ -3001,7 +3001,115 @@ export interface GpuBootState {
   scene: GpuSceneInput;
   /** Sim clock for GPU frames (mirrors Host privates, like frameAsync). */
   loop: AsyncLoopState;
+  /**
+   * Last per-frame appearance snapshot (GPU-PROOF-4 live-loop wiring): the
+   * pinned `vd_*` cvar values `frameGpuPlay` read that frame. Null until the
+   * first GPU frame. The committed `WebGLRenderer` dist exposes no
+   * appearance/uniform-setter method yet, so NOTHING consumes this today —
+   * it is the observable proof the cvars are re-read every frame (no stale
+   * profile). See `pushGpuAppearance` for the one-call-site follow-up when
+   * the parallel GL lane lands its setters.
+   */
+  appearance: GpuAppearanceSnapshot | null;
 }
+
+/**
+ * Pinned appearance cvars wired into the GPU live loop (contract §3: the 15
+ * `vd_*` + `sw_*` cvars; the GPU backend honors the `vd_*` subset with the
+ * same semantics as the CPU voodoo path). Read-only here: this module never
+ * registers or writes them, so defaults are untouched.
+ */
+export const GPU_APPEARANCE_CVARS = [
+  'vd_gamma',
+  'vd_dither',
+  'vd_16bit',
+  'vd_postfilter',
+  'vd_bilinear',
+  'vd_mipdither',
+  'vd_lodbias',
+  'vd_fog',
+  'vd_overbright',
+  'vd_palettetex',
+  'vd_maxtexsize',
+  'vd_zbits',
+  'vd_dithermode',
+  'vd_reconmode',
+  'vd_rgbmaxdelta',
+] as const;
+
+/** One frame's appearance inputs (stringified cvar values, observable in tests). */
+export type GpuAppearanceSnapshot = Record<string, string>;
+
+/** Snapshot every pinned `vd_*` cvar (same read-every-frame rule as `readVoodooState`). */
+export function readGpuAppearanceSnapshot(): GpuAppearanceSnapshot {
+  const snap: GpuAppearanceSnapshot = {};
+  for (const name of GPU_APPEARANCE_CVARS) snap[name] = getCVarString(name);
+  return snap;
+}
+
+/**
+ * Candidate future GL-lane appearance setters, probed in order. The committed
+ * `WebGLRenderer` reads `vd_*` cvars directly per frame (`resolveAppearanceFrame`
+ * — same practice as the CPU renderer), so NO setter is required and the probe
+ * below returns false: the frame keeps the recorded `boot.gpu.appearance`
+ * snapshot as the authoritative observable record. The probe stays as a pin:
+ * should a real setter ever appear, `pushGpuAppearance` routes through it
+ * (single call site; do NOT change cvar defaults).
+ */
+export const GPU_APPEARANCE_HOOKS = [
+  'setAppearance',
+  'applyAppearance',
+  'setVoodooState',
+  'setCvars',
+] as const;
+
+/** Structural signature of a future appearance setter (narrow — never `any`). */
+type GpuAppearanceHook = (snapshot: GpuAppearanceSnapshot) => void;
+
+/**
+ * Push the per-frame appearance snapshot into the backend when it exposes a
+ * known setter (feature-detected via `in` + `typeof`, structural — never
+ * `any`). Returns true when a setter consumed the snapshot, false when the
+ * backend has no such method (the snapshot on `boot.gpu.appearance` stays the
+ * authoritative record). Never throws: a throwing future hook must not break
+ * the frame loop.
+ */
+export function pushGpuAppearance(gpu: object, snapshot: GpuAppearanceSnapshot): boolean {
+  const rec = gpu as unknown as Record<string, unknown>;
+  for (const name of GPU_APPEARANCE_HOOKS) {
+    if (name in rec && typeof rec[name] === 'function') {
+      try {
+        (rec[name] as GpuAppearanceHook).call(gpu, snapshot);
+      } catch {
+        /* backend keeps its last good state; the snapshot stays authoritative */
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+/* --- GPU-PROOF-4 live-loop gaps (NOT done — none presented as done) ---------
+ *
+ * The live loop wires cvars + HUD order + submission proof ONLY (no shader
+ * work — that is the parallel GL lane's). Everything below is a concrete
+ * per-call-site follow-up with its owner:
+ * - Appearance uniforms: the backend reads `vd_*` cvars directly per frame
+ *   (`resolveAppearanceFrame`); `pushGpuAppearance` above is the single call
+ *   site if an explicit setter ever appears (settled PROOF-4 design).
+ * - Sprite/particle live-pool mirroring: the renderer supports them and the
+ *   page proves them, but the live loop drains only tracer beams per frame
+ *   (PROOF-3 report; owner: EXPAND).
+ * - Resize handling: boot-time size only; `WebGLRenderer.resize` exists but
+ *   the live loop never calls it on canvas change (owner: EXPAND).
+ * - Context-loss re-upload: loss records + skips per contract, but the live
+ *   loop never re-attaches world/palette/models after restore (owner: EXPAND).
+ * - Hot-swap asset migration: entering webgl2 mid-session attaches world +
+ *   palette only; entities stay mesh-less until a reboot (recorded backend
+ *   warnings; owner: EXPAND).
+ * - GPU-resident HUD: the overlay stays a CPU `paintHudOverlay` blit above
+ *   the GL canvas by design here (owner: EXPAND).
+ */
 
 /**
  * Register the real pak MD2 view/monster/bolt models + PCX skins
@@ -3263,7 +3371,7 @@ function attachGpuBackend(driver: LocalDriver, width: number, height: number): G
     gpu.init(acquired.gl as unknown as WebGL2RenderingContext, width, height);
     const scene = selectGpuScene(driver.mini, [], spawnViewFor(driver), width, height);
     gpu.setScene(scene);
-    return { canvas: acquired.canvas, gl: acquired.gl, gpu, scene, loop: createAsyncLoopState() };
+    return { canvas: acquired.canvas, gl: acquired.gl, gpu, scene, loop: createAsyncLoopState(), appearance: null };
   } catch {
     return null;
   }
@@ -4671,6 +4779,16 @@ export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus |
     } as Entity;
   });
   const entities = beams.length > 0 ? [...renderables, ...beams] : renderables;
+  // PROOF-4 appearance wiring (no shader work): re-read the pinned vd_*
+  // cvars EVERY frame (no stale profile) and make them effective WITHOUT new
+  // backend methods. `pushGpuAppearance` feature-detects a future GL-lane
+  // setter (none exists in the committed dist — returns false); either way
+  // the snapshot lands on `g.appearance`, observable in tests. The GL canvas
+  // is the ONLY appearance target: the HUD overlay plane is never touched
+  // here (see `paintHudOverlay`).
+  const appearance = readGpuAppearanceSnapshot();
+  g.appearance = appearance;
+  pushGpuAppearance(g.gpu, appearance);
   const scene = selectGpuScene(
     boot.driver.mini,
     entities,

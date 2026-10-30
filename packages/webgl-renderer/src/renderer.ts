@@ -1,36 +1,50 @@
-// @q2/webgl-renderer renderer — WebGL2 scene drawing (GPU-PROOF-3).
+// @q2/webgl-renderer renderer — WebGL2 scene drawing + Voodoo appearance (GPU-PROOF-4).
 //
-// Owns: the injected GL context handle, the DEFAULT framebuffer target
-// (viewport + clear state), per-generation static uploads (world batches,
-// diffuse/lightmap textures, model index/uv caches) and per-frame dynamic
+// Owns: the injected GL context handle, the linear SCENE render target
+// (RGBA16F when EXT_color_buffer_float renders it, else an RGBA8 fallback
+// with a recorded warning — a capability branch, tested both ways via stub),
+// per-generation static uploads (world batches, diffuse/lightmap textures
+// with CPU-built mip chains, model index/uv caches) and per-frame dynamic
 // buffers (alias interpolation, billboards, particles).
 //
 // Passes per frame (transparent ordering preserved, far->near):
-//   sky (flat, no depth write) -> opaque world (lit) -> opaque alias +
-//   opaque sprites (entity order) -> gun pass (depth-hack MVP) ->
-//   particles (POINTS, depth write) -> blend pass (SRC_ALPHA/ONE_MINUS,
-//   depth test on, depth write OFF): transparent world in scene order,
-//   transparent alias, beams.
+//   scene target: sky (flat, no depth write) -> opaque world (lit) ->
+//   opaque alias + opaque sprites (entity order) -> gun pass (depth-hack
+//   MVP) -> POINTS particles (depth write) -> blend pass (SRC_ALPHA /
+//   ONE_MINUS, depth test on, depth write OFF): transparent world in scene
+//   order, transparent alias, beams;
+//   appearance: ONE fullscreen pass to the canvas (VS_POST/FS_APPEARANCE):
+//   dither -> RGB565 quantize -> reconstruction taps -> display gamma.
+//   Output stays resident on GPU through presentation; the normal path
+//   never reads back (no readPixels anywhere in src/).
 //
-// Documented PROOF-3 approximations (appearance policy is PROOF-4):
-//   - LINEAR filtering everywhere, no mipmaps (no LOD/bilinear policy yet);
-//   - lightmap style scale baked per style-signature (re-baked on change);
+// Documented PROOF-4 appearance policy (PROOF-4.md: full vd_* table + gaps):
+//   - scene shaders sample with the single-TMU mip rule (fwidth rho +
+//   vd_lodbias + 0.375 dither mean, Bayer n/n+1 pick, textureLod into
+//   box-filtered clamp-addressed chains built at upload); lightmaps stay
+//   plain LINEAR (documented gap);
 //   - dynamic lights per-pixel in world + alias shaders (CPU bakes
-//     per-luxel; tolerances cover the difference);
-//   - gun depth: NDC z remapped by (scale 0.02, bias -0.9), the GPU
-//     interpretation of RF_DEPTHHACK 1/z x3 (wins except nose-to-wall);
+//   per-luxel; tolerances cover the difference);
+//   - gun depth: NDC z remap (scale 0.02, bias -0.9), the GPU interpretation
+//   of RF_DEPTHHACK 1/z x3 (wins except nose-to-wall);
 //   - beams are ~1.5px camera-facing quads (CPU: 1px DDA core+glow);
 //   - no GL face culling (visibility = selectGpuScene's CPU backface rule);
-//   - turbulent water draws unwarped (warp deferred to PROOF-4/EXPAND);
-//   - translucency is true blending (CPU: screen-door on the 8-bit path);
-//   - near plane near=4 like the CPU (automatic GL clip).
+//   - turbulent water draws unwarped (warp deferred to EXPAND);
+//   - translucency is true blending (documented screen-door deviation);
+//   - HUD is composited above by the apps/web overlay (already above GL);
+//   - vd_palettetex: always expanded-RGB uploads (no paletted textures in
+//   WebGL; filtering identical either way); vd_zbits selects the target
+//   depth format at creation (pre-test depth, unlike the CPU post-hoc
+//   banding helper);
 //   - small per-frame CPU garbage is accepted (lerp/scratch arrays for the
-//     handful of dynamic entities; static geometry never re-uploads).
+//   handful of dynamic entities; static geometry never re-uploads).
 //
 // Lifecycle/status/loss/restore/dispose semantics are EXACTLY the PROOF-2
 // pins (driveLifecycleContract): renderFrame before init throws Com_Error;
 // loss records + skips; empty world (no attached MiniWorld/palette) still
 // clears + submits so the boundary contract holds without assets.
+// Target (re)creation is NOT a texture upload: testUploadStats() counts only
+// static-generation uploads (the upload contract stays pinned).
 //
 // Normal rendering never reads pixels back (no readPixels anywhere in src/).
 
@@ -58,6 +72,18 @@ import {
   VS_FLAT,
   VS_LIT,
 } from './shaders.js';
+import {
+  buildFogLUT01,
+  buildMipChainRGB,
+  ditherModeToInt,
+  downsampleToCap,
+  FOG_DENSITY,
+  FS_APPEARANCE,
+  reconModeToInt,
+  resolveAppearanceFrame,
+  VS_POST,
+  type AppearanceFrame,
+} from './appearance.js';
 import {
   buildEntityModel,
   buildProjectionMatrix,
@@ -158,6 +184,40 @@ interface ProgLocs {
   uNumLights: WebGLUniformLocation | null;
   uAlpha: WebGLUniformLocation | null;
   uUVScale: WebGLUniformLocation | null;
+  // PROOF-4 live-policy uniforms (all set per frame/use; null when the stub
+  // or a program lacks them — setVoodooPolicy guards every one).
+  uLodBias: WebGLUniformLocation | null;
+  uMipDither: WebGLUniformLocation | null;
+  uMaxLevel: WebGLUniformLocation | null;
+  uOverbright: WebGLUniformLocation | null;
+  uFogEnabled: WebGLUniformLocation | null;
+  uFogAmount: WebGLUniformLocation | null;
+  uFogColor: WebGLUniformLocation | null;
+  uFogTable: WebGLUniformLocation | null;
+}
+
+/** Appearance-pass program locations (fullscreen resolve to the canvas). */
+interface PostLocs {
+  prog: WebGLProgram;
+  uScene: WebGLUniformLocation | null;
+  uDitherOn: WebGLUniformLocation | null;
+  uDitherMode: WebGLUniformLocation | null;
+  uPostfilter: WebGLUniformLocation | null;
+  uReconMode: WebGLUniformLocation | null;
+  uRgbMaxDelta: WebGLUniformLocation | null;
+  uGamma: WebGLUniformLocation | null;
+  u16bit: WebGLUniformLocation | null;
+}
+
+/** Linear scene render target (float when renderable, else RGBA8 fallback). */
+interface SceneTarget {
+  fbo: WebGLFramebuffer;
+  tex: WebGLTexture;
+  depth: WebGLRenderbuffer;
+  w: number;
+  h: number;
+  /** True when EXT_color_buffer_float rendered the RGBA16F target. */
+  float: boolean;
 }
 
 export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
@@ -183,6 +243,17 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
 
   // --- GL objects (cleared on init/restore/dispose: contexts die) ---
   private progs: { lit: ProgLocs; alias: ProgLocs; flat: ProgLocs } | null = null;
+  private postProg: PostLocs | null = null;
+  private target: SceneTarget | null = null;
+  private floatCap: boolean | null = null;
+  private targetFallbackWarned = false;
+  private fboUnsupportedWarned = false;
+  private apFrame: AppearanceFrame | null = null;
+  private fogLUT: Float32Array | null = null;
+  /** Forced-fog test hook (production: null => scene contribution 0, base1 rule). */
+  private fogOverride: { amount: number; color: [number, number, number] } | null = null;
+  /** Uploaded chain depth per texture (for the uMaxLevel LOD clamp). */
+  private texLevels = new Map<WebGLTexture, number>();
   private staticDirty = true;
   private opaqueBatches: GLBatch[] = [];
   private transparentBatches: GLBatch[] = [];
@@ -228,6 +299,9 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.width = width;
     this.height = height;
     if (this.gl !== null) this.gl.viewport(0, 0, width, height);
+    // The scene target is size-matched: drop it; the next real renderFrame
+    // re-creates it at the new size (no GL calls here — minimal-stub safe).
+    this.target = null;
   }
 
   setScene(scene: GpuSceneInput): void {
@@ -360,6 +434,29 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     return [...this.warnings];
   }
 
+  /**
+   * Forced-fog test hook (PROOF-4): overrides the scene fog contribution
+   * (amount 0..1 scaled over the 64-entry table, color linear RGB).
+   * Production never calls this (null => 0 contribution, the base1 rule);
+   * capability gating still honors vd_fog. Pass null to clear.
+   */
+  setFogOverride(amount: number | null, color?: [number, number, number]): void {
+    if (amount === null) {
+      this.fogOverride = null;
+      return;
+    }
+    this.fogOverride = {
+      amount: amount < 0 ? 0 : amount > 1 ? 1 : amount,
+      color: color ?? [0.5, 0.5, 0.5],
+    };
+  }
+
+  /** Scene-target introspection (test hook): float vs RGBA8 branch + size. */
+  testTargetInfo(): { float: boolean; w: number; h: number } | null {
+    if (!this.target) return null;
+    return { float: this.target.float, w: this.target.w, h: this.target.h };
+  }
+
   private warn(msg: string): void {
     if (!this.warnings.includes(msg)) this.warnings.push(msg);
   }
@@ -371,6 +468,12 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
 
   private clearGLCaches(): void {
     this.progs = null;
+    this.postProg = null;
+    this.target = null;
+    this.floatCap = null;
+    this.texLevels = new Map();
+    this.apFrame = null;
+    this.fogLUT = null;
     this.staticDirty = true;
     this.opaqueBatches = [];
     this.transparentBatches = [];
@@ -397,7 +500,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   }
 
   private ensurePrograms(gl: WebGL2RenderingContext): void {
-    if (this.progs) return;
+    if (this.progs && this.postProg) return;
     const locs = (vs: string, fs: string): ProgLocs => {
       const prog = compileProgram(gl, vs, fs);
       const L = (name: string): WebGLUniformLocation | null => gl.getUniformLocation(prog, name);
@@ -416,10 +519,35 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
         uNumLights: L('uNumLights'),
         uAlpha: L('uAlpha'),
         uUVScale: L('uUVScale'),
+        uLodBias: L('uLodBias'),
+        uMipDither: L('uMipDither'),
+        uMaxLevel: L('uMaxLevel'),
+        uOverbright: L('uOverbright'),
+        uFogEnabled: L('uFogEnabled'),
+        uFogAmount: L('uFogAmount'),
+        uFogColor: L('uFogColor'),
+        uFogTable: L('uFogTable'),
       };
     };
     try {
-      this.progs = { lit: locs(VS_LIT, FS_LIT), alias: locs(VS_ALIAS, FS_ALIAS), flat: locs(VS_FLAT, FS_FLAT) };
+      if (!this.progs) {
+        this.progs = { lit: locs(VS_LIT, FS_LIT), alias: locs(VS_ALIAS, FS_ALIAS), flat: locs(VS_FLAT, FS_FLAT) };
+      }
+      if (!this.postProg) {
+        const prog = compileProgram(gl, VS_POST, FS_APPEARANCE);
+        const L = (name: string): WebGLUniformLocation | null => gl.getUniformLocation(prog, name);
+        this.postProg = {
+          prog,
+          uScene: L('uScene'),
+          uDitherOn: L('uDitherOn'),
+          uDitherMode: L('uDitherMode'),
+          uPostfilter: L('uPostfilter'),
+          uReconMode: L('uReconMode'),
+          uRgbMaxDelta: L('uRgbMaxDelta'),
+          uGamma: L('uGamma'),
+          u16bit: L('u16bit'),
+        };
+      }
     } catch (err) {
       this.fail(`WebGLRenderer.ensurePrograms: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -499,16 +627,54 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     return buf;
   }
 
-  private uploadTexture(gl: WebGL2RenderingContext, rgb: Uint8Array, w: number, h: number): WebGLTexture {
+  private uploadTextureLevels(
+    gl: WebGL2RenderingContext,
+    rgb: Uint8Array,
+    w: number,
+    h: number,
+    mips: boolean,
+  ): WebGLTexture {
     const tex = gl.createTexture();
     if (!tex) this.fail('WebGLRenderer.uploadStatic: createTexture returned null');
+    const ap = this.apFrame;
+    const linear = ap ? ap.bilinear : true;
+    const min = linear ? gl.LINEAR : gl.NEAREST;
+    const mag = linear ? gl.LINEAR : gl.NEAREST;
     gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, min);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, mag);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, w, h, 0, gl.RGB, gl.UNSIGNED_BYTE, rgb);
+    if (mips) {
+      // CPU-built mip chain (Voodoo box-filter rule, clamp addressing):
+      // level 0 is the capped base, each step halves to 1x1. MIN stays
+      // LINEAR (no inter-level blend — single-TMU spirit); the shader picks
+      // the level explicitly via textureLod.
+      const chain = buildMipChainRGB(rgb, w, h);
+      for (let lvl = 0; lvl < chain.length; lvl++) {
+        const m = chain[lvl]!;
+        gl.texImage2D(gl.TEXTURE_2D, lvl, gl.RGB, m.w, m.h, 0, gl.RGB, gl.UNSIGNED_BYTE, m.data);
+      }
+      this.texLevels.set(tex, chain.length - 1);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, w, h, 0, gl.RGB, gl.UNSIGNED_BYTE, rgb);
+      this.texLevels.set(tex, 0);
+    }
     return tex;
+  }
+
+  /** Backwards-compatible single-level upload (lightmap atlas, white texel). */
+  private uploadTexture(gl: WebGL2RenderingContext, rgb: Uint8Array, w: number, h: number): WebGLTexture {
+    return this.uploadTextureLevels(gl, rgb, w, h, false);
+  }
+
+  /** Per-draw sampler mode (vd_bilinear is live: no re-upload, just params). */
+  private applyFilter(gl: WebGL2RenderingContext, tex: WebGLTexture): void {
+    const linear = this.apFrame ? this.apFrame.bilinear : true;
+    const f = linear ? gl.LINEAR : gl.NEAREST;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
   }
 
   /** Diffuse texture for a world texId (expanded via palette; null = skip). */
@@ -516,19 +682,22 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     if (this.diffuseTex.has(texId)) return this.diffuseTex.get(texId)!;
     const world = this.world;
     const palette = this.palette;
+    const max = this.apFrame ? this.apFrame.maxtexsize : 256;
     let out: WebGLTexture | null = null;
     if (world && palette) {
       const tex = world.textures[texId];
       if (tex) {
-        if (tex.width > 256 || tex.height > 256) {
-          this.warn(`diffuse texture ${texId} oversized ${tex.width}x${tex.height} (skipped)`);
+        const rgb = expandPaletteTexture(tex.texels, tex.width, tex.height, palette);
+        if (!rgb) {
+          this.warn(`diffuse texture ${texId} texel mismatch (skipped)`);
         } else {
-          const rgb = expandPaletteTexture(tex.texels, tex.width, tex.height, palette);
-          if (!rgb) {
-            this.warn(`diffuse texture ${texId} texel mismatch (skipped)`);
-          } else {
-            out = this.uploadTexture(gl, rgb, tex.width, tex.height);
+          // vd_maxtexsize enforced at upload: aspect-preserving box
+          // resample + recorded warning (GPU closes the CPU dims-only gap).
+          const capped = downsampleToCap(rgb, tex.width, tex.height, max);
+          if (capped.capped) {
+            this.warn(`diffuse texture ${texId} oversized ${tex.width}x${tex.height} (resampled to ${capped.w}x${capped.h})`);
           }
+          out = this.uploadTextureLevels(gl, capped.data, capped.w, capped.h, true);
         }
       }
     }
@@ -536,19 +705,23 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     return out;
   }
 
-  /** Skin texture for an entity skin handle (uploaded as-is; >256 warns). */
+  /** Skin texture for an entity skin handle (capped + resampled; null = fallback). */
   private skinFor(gl: WebGL2RenderingContext, handle: number): { tex: WebGLTexture; w: number; h: number } | null {
     if (this.skinTex.has(handle)) return this.skinTex.get(handle)!;
     const palette = this.palette;
+    const max = this.apFrame ? this.apFrame.maxtexsize : 256;
     let out: { tex: WebGLTexture; w: number; h: number } | null = null;
     const skin = this.skins.get(handle);
     if (skin && palette) {
       const rgb = expandPaletteTexture(skin.texels, skin.width, skin.height, palette);
       if (rgb) {
-        if (skin.width > 256 || skin.height > 256) {
-          this.warn(`skin ${handle} oversized ${skin.width}x${skin.height} (uploaded; Voodoo cap is PROOF-4)`);
+        // UV scale uses ORIGINAL dims (texel-space UVs address the source);
+        // the upload below is the capped resample of the same image.
+        const capped = downsampleToCap(rgb, skin.width, skin.height, max);
+        if (capped.capped) {
+          this.warn(`skin ${handle} oversized ${skin.width}x${skin.height} (resampled to ${capped.w}x${capped.h})`);
         }
-        out = { tex: this.uploadTexture(gl, rgb, skin.width, skin.height), w: skin.width, h: skin.height };
+        out = { tex: this.uploadTextureLevels(gl, capped.data, capped.w, capped.h, true), w: skin.width, h: skin.height };
       } else {
         this.warn(`skin ${handle} texel mismatch (white fallback)`);
       }
@@ -613,6 +786,10 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const world = this.world;
     const palette = this.palette;
     if (!world || !palette || !this.progs || !this.atlasTex) return;
+    // Live per-frame appearance snapshot (uniform updates only — no
+    // re-uploads) + the 64-entry fog LUT (uniform, refreshed per frame).
+    this.apFrame = resolveAppearanceFrame();
+    this.fogLUT = buildFogLUT01(FOG_DENSITY);
     const cam: Camera = setupCamera(input.view.origin, input.view.angles, input.view.fovX, this.width, this.height);
     const V = buildViewMatrix(cam.origin, cam.forward, cam.right, cam.up);
     const P = buildProjectionMatrix(input.view.fovX, this.width, this.height, GPU_NEAR, GPU_FAR);
@@ -622,6 +799,14 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       this.warn(`dynamic lights clamped to ${MAX_GPU_LIGHTS} (first-come wins)`);
     }
 
+    // Scene renders into the linear target; the appearance pass below
+    // resolves it to the canvas. Without FBO support (minimal stubs) fall
+    // back to direct rendering (documented stub-compat path).
+    const useTarget = this.ensureTargets(gl);
+    const target = useTarget ? this.target : null;
+    if (target) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    }
     gl.viewport(0, 0, this.width, this.height);
     gl.clearColor(CLEAR_R, CLEAR_G, CLEAR_B, CLEAR_A);
     gl.clearDepth(1);
@@ -634,6 +819,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       const flat = this.progs.flat;
       gl.useProgram(flat.prog);
       this.setMVP(gl, flat, VP, 1);
+      this.setVoodooPolicy(gl, flat);
       if (flat.uPointSize) gl.uniform1f(flat.uPointSize, 1);
       if (flat.uTextured) gl.uniform1i(flat.uTextured, 0);
       gl.depthMask(false);
@@ -653,6 +839,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       gl.useProgram(lit.prog);
       this.setMVP(gl, lit, VP, 1);
       this.setLights(gl, lit, lights);
+      this.setVoodooPolicy(gl, lit);
       this.bindLightmap(gl, lit);
       gl.depthMask(true);
       for (const b of this.opaqueBatches) {
@@ -715,6 +902,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       gl.useProgram(lit.prog);
       this.setMVP(gl, lit, VP, 1);
       this.setLights(gl, lit, lights);
+      this.setVoodooPolicy(gl, lit);
       this.bindLightmap(gl, lit);
       // Transparent world batches were built in scene order already.
       for (const b of this.transparentBatches) {
@@ -768,6 +956,140 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     }
     gl.depthMask(true);
     gl.disable(gl.BLEND);
+
+    // Appearance resolve: ONE fullscreen pass from the linear scene target
+    // to the canvas (dither -> 565 quantize -> reconstruction -> gamma).
+    // Resident on GPU through presentation; never a readback.
+    if (target) {
+      this.runAppearance(gl, target);
+    }
+  }
+
+  /**
+   * Ensure the linear scene target exists at the current size.
+   * RGBA16F when EXT_color_buffer_float renders it, else an RGBA8 fallback
+   * with ONE recorded warning (capability branch, tested both ways via
+   * stub). Depth format follows vd_zbits at creation time (>= 24 asks for
+   * DEPTH_COMPONENT24, else DEPTH_COMPONENT16). Returns false when the GL
+   * handle cannot provide FBOs at all (minimal stubs): the caller then
+   * renders direct (documented stub-compat path, never production).
+   * Target (re)creation is NOT a texture upload (upload contract pinned).
+   */
+  private ensureTargets(gl: WebGL2RenderingContext): boolean {
+    if (
+      typeof gl.createFramebuffer !== 'function' ||
+      typeof gl.createTexture !== 'function' ||
+      typeof gl.createRenderbuffer !== 'function' ||
+      typeof gl.getExtension !== 'function' ||
+      typeof gl.checkFramebufferStatus !== 'function'
+    ) {
+      if (!this.fboUnsupportedWarned) {
+        this.fboUnsupportedWarned = true;
+        this.warn('appearance: no FBO support on this GL handle — direct rendering (stub-compat path)');
+      }
+      return false;
+    }
+    if (this.floatCap === null) {
+      let ext: unknown = null;
+      try {
+        ext = gl.getExtension('EXT_color_buffer_float');
+      } catch {
+        ext = null;
+      }
+      this.floatCap = ext !== null && ext !== undefined;
+      if (!this.floatCap && !this.targetFallbackWarned) {
+        this.targetFallbackWarned = true;
+        this.warn('appearance: EXT_color_buffer_float unavailable — RGBA8 fallback target');
+      }
+    }
+    const wantFloat = this.floatCap === true;
+    if (this.target && this.target.w === this.width && this.target.h === this.height && this.target.float === wantFloat) {
+      return true;
+    }
+    // (Re)create at the current size. Old GL objects die with the context
+    // semantics here: same-context recreates leak by design (resize/map
+    // change only); contexts themselves are dropped on dispose/restore.
+    const tex = gl.createTexture();
+    const depth = gl.createRenderbuffer();
+    const fbo = gl.createFramebuffer();
+    if (!tex || !depth || !fbo) this.fail('WebGLRenderer.ensureTargets: target allocation returned null');
+    const ap = this.apFrame;
+    const zbits = ap ? ap.zbits : 16;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (wantFloat) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, this.width, this.height, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, this.width, this.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    }
+    gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+    gl.renderbufferStorage(
+      gl.RENDERBUFFER,
+      zbits >= 24 ? gl.DEPTH_COMPONENT24 : gl.DEPTH_COMPONENT16,
+      this.width,
+      this.height,
+    );
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      this.fail(`WebGLRenderer.ensureTargets: framebuffer incomplete (${status})`);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.target = { fbo, tex, depth, w: this.width, h: this.height, float: wantFloat };
+    return true;
+  }
+
+  /** Fullscreen appearance resolve from the scene target to the canvas. */
+  private runAppearance(gl: WebGL2RenderingContext, target: SceneTarget): void {
+    const post = this.postProg;
+    const ap = this.apFrame;
+    if (!post || !ap) return;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.width, this.height);
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(post.prog);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, target.tex);
+    if (post.uScene) gl.uniform1i(post.uScene, 0);
+    if (post.uDitherOn) gl.uniform1i(post.uDitherOn, ap.dither ? 1 : 0);
+    if (post.uDitherMode) gl.uniform1i(post.uDitherMode, ditherModeToInt(ap.ditherMode));
+    if (post.uPostfilter) gl.uniform1i(post.uPostfilter, ap.postfilter ? 1 : 0);
+    if (post.uReconMode) gl.uniform1i(post.uReconMode, reconModeToInt(ap.reconMode));
+    if (post.uRgbMaxDelta) {
+      gl.uniform3f(post.uRgbMaxDelta, ap.rgbMaxDelta[0], ap.rgbMaxDelta[1], ap.rgbMaxDelta[2]);
+    }
+    if (post.uGamma) gl.uniform1f(post.uGamma, ap.gamma);
+    if (post.u16bit) gl.uniform1i(post.u16bit, ap.use16bit ? 1 : 0);
+    // Buffer-less fullscreen triangle (gl_VertexID in VS_POST).
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.enable(gl.DEPTH_TEST);
+  }
+
+  /**
+   * Per-frame/per-program Voodoo policy uniforms (live vd_* state, no
+   * re-uploads). uMaxLevel is set per texture at bind time (bindDiffuse /
+   * skin binds), not here.
+   */
+  private setVoodooPolicy(gl: WebGL2RenderingContext, p: ProgLocs): void {
+    const ap = this.apFrame;
+    const lut = this.fogLUT;
+    if (!ap || !lut) return;
+    if (p.uLodBias) gl.uniform1f(p.uLodBias, ap.lodBias);
+    if (p.uMipDither) gl.uniform1i(p.uMipDither, ap.mipDither ? 1 : 0);
+    if (p.uOverbright) gl.uniform1f(p.uOverbright, ap.overbright ? 2 : 1);
+    if (p.uFogEnabled) gl.uniform1i(p.uFogEnabled, ap.fogEnabled ? 1 : 0);
+    const fog = this.fogOverride;
+    if (p.uFogAmount) gl.uniform1f(p.uFogAmount, fog ? fog.amount : 0);
+    if (p.uFogColor) {
+      const c = fog ? fog.color : ([0, 0, 0] as [number, number, number]);
+      gl.uniform3f(p.uFogColor, c[0], c[1], c[2]);
+    }
+    if (p.uFogTable) gl.uniform1fv(p.uFogTable, lut);
   }
 
   private drawAlias(
@@ -815,13 +1137,14 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.setMVP(gl, alias, MVP, gun ? GUN_DEPTH_SCALE : 1);
     if (alias.uDepthBias) gl.uniform1f(alias.uDepthBias, gun ? GUN_DEPTH_BIAS : 0);
     this.setLights(gl, alias, lights);
+    this.setVoodooPolicy(gl, alias);
     this.bindDiffuse(gl, alias, skin?.tex ?? this.whiteFor(gl));
     const alpha = alphaOverride ?? clamp01(e.alpha ?? 1);
     if (alias.uAlpha) gl.uniform1f(alias.uAlpha, alpha);
-    // Skin st are texel units; uUVScale normalizes by the bound skin dims.
-    // (CPU wraps with a POT mask; registered skins are POT-expanded with
-    // edge repeat, and st are pre-clamped to the header dims, so CLAMP is
-    // equivalent here.)
+    // Skin st are texel units; uUVScale normalizes by the ORIGINAL skin dims
+    // (upload may be a capped resample of the same image, so original dims
+    // keep the mapping exact). CLAMP addressing is equivalent here (CPU wraps
+    // with a POT mask; st are pre-clamped to the header dims).
     if (alias.uUVScale) gl.uniform2f(alias.uUVScale, 1 / (skin?.w ?? 1), 1 / (skin?.h ?? 1));
     this.bindAttrib(gl, 0, this.dynPos, 3);
     this.bindAttrib(gl, 1, mgl.uvBuf, 2);
@@ -867,13 +1190,17 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private bindDiffuse(gl: WebGL2RenderingContext, p: ProgLocs, tex: WebGLTexture): void {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, tex);
+    this.applyFilter(gl, tex);
     if (p.uDiffuse) gl.uniform1i(p.uDiffuse, 0);
+    // LOD clamp follows the uploaded chain depth of THIS texture.
+    if (p.uMaxLevel) gl.uniform1i(p.uMaxLevel, this.texLevels.get(tex) ?? 0);
   }
 
   private bindLightmap(gl: WebGL2RenderingContext, p: ProgLocs): void {
     if (!this.atlasTex) return;
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.atlasTex);
+    this.applyFilter(gl, this.atlasTex);
     if (p.uLightmap) gl.uniform1i(p.uLightmap, 1);
   }
 
@@ -906,12 +1233,15 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const flat = progs.flat;
     gl.useProgram(flat.prog);
     this.setMVP(gl, flat, VP, 1);
+    this.setVoodooPolicy(gl, flat);
     if (flat.uPointSize) gl.uniform1f(flat.uPointSize, 1);
     if (flat.uTextured) gl.uniform1i(flat.uTextured, tex ? 1 : 0);
     if (tex) {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tex);
+      this.applyFilter(gl, tex);
       if (flat.uMap) gl.uniform1i(flat.uMap, 0);
+      if (flat.uMaxLevel) gl.uniform1i(flat.uMaxLevel, this.texLevels.get(tex) ?? 0);
     }
     const n = batch.pos.length / 3;
     this.ensureFlatCapacity(gl, n, batch.idx.length);
@@ -941,6 +1271,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const flat = progs.flat;
     gl.useProgram(flat.prog);
     this.setMVP(gl, flat, VP, 1);
+    this.setVoodooPolicy(gl, flat);
     if (flat.uPointSize) gl.uniform1f(flat.uPointSize, 1);
     if (flat.uTextured) gl.uniform1i(flat.uTextured, 0);
     this.ensurePointCapacity(gl, positions.length / 3);

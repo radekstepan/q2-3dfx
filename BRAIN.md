@@ -353,12 +353,20 @@ completion (2026-10-29, integrated — GL + wiring lanes in parallel, browser la
 ### GPU-PROOF-4 — Implement and validate the Voodoo appearance
 owns: `packages/webgl-renderer`, `packages/voodoo`, `apps/web`, `packages/testkit`
 depends: GPU-PROOF-3
-status: ready
+status: done(@integrator 2026-10-29)
 done-when:
-- [ ] Implement the GPU appearance contract from GPU-PROOF-1: required sampling/mip policy, fog, RGB565 quantization, ordered dither, reconstruction and gamma, with correct HUD ordering. Use render targets/shader passes; keep output resident on GPU through presentation.
-- [ ] Reuse or extract pure shared policy/constants only where useful; do not rewrite the CPU reference or couple it to WebGL. Explain any GPU-specific interpretation of existing cvars.
-- [ ] Unit-test deterministic math/policy and run real-GPU fixtures for ramps/dither phase, fog, mip transitions, transparent overlap and depth. Compare fixed real-scene captures using the predeclared tolerances.
-- [ ] Review captures side by side for textured gun, geometry, transparency, dark areas and minification. Report all approximation differences explicitly; if human sign-off is needed, leave that acceptance pending rather than inventing approval.
+- [x] Implement the GPU appearance contract from GPU-PROOF-1: required sampling/mip policy, fog, RGB565 quantization, ordered dither, reconstruction and gamma, with correct HUD ordering. Use render targets/shader passes; keep output resident on GPU through presentation.
+- [x] Reuse or extract pure shared policy/constants only where useful; do not rewrite the CPU reference or couple it to WebGL. Explain any GPU-specific interpretation of existing cvars.
+- [x] Unit-test deterministic math/policy and run real-GPU fixtures for ramps/dither phase, fog, mip transitions, transparent overlap and depth. Compare fixed real-scene captures using the predeclared tolerances.
+- [x] Review captures side by side for textured gun, geometry, transparency, dark areas and minification. Report all approximation differences explicitly; if human sign-off is needed, leave that acceptance pending rather than inventing approval.
+completion (2026-10-29, integrated — GL + web lanes in parallel, testkit lane after, integrator reconciled + committed):
+- appearance core (`packages/webgl-renderer`: `appearance.ts` + `PROOF-4.md` cvar table; `packages/voodoo` untouched — values duplicated-by-value with source citations, no new dep edge): linear scene target (RGBA16F w/ float ext, RGBA8 fallback + warning), one fullscreen pass (absolute-phase Bayer → 565 quantize → matched `2x2sub+2x2box` w/ edge rejection → gamma 1.3, HUD stays composited above), CPU box-filter mip chains + dithered n/n+1 pick + `vd_lodbias`, 64-entry table fog (zero in base1, forced fixture proves the path), gun NDC remap, per-pixel dlights. Backend reads `vd_*` per frame itself (no stale profile); `setFogOverride`/`testTargetInfo` are test hooks only.
+- live loop (`apps/web`): per-frame `vd_*` snapshot recorded on the boot (observable record), HUD-overlay independence pinned (equality across appearance inputs), z-order/DOM-order pins, Q2_PAK appearance smoke (20 combat frames, draws logged, no readback). Zero behavior change for CPU paths.
+- validation (`packages/testkit` CDP harness): ramp/dither/565/flat-field/gamma fixtures, mip chain + dithered-transition checks, forced-fog hook, pinned F1 capture vs CPU voodoo-resolve reference with `GPU_PROOF_TOLERANCES`; resolve-coverage regression pin; side-by-side review logged with artifacts; acceptance explicitly pending (verdict pin fails closed on unapproved approval).
+- integrator fixes: VS_POST half-triangle covered only x+y<=0 (resolveCoverage 0.5) → covering triangle (-1,-1),(3,-1),(-1,3) + source/unit pins; stale void-era comments/bands re-baselined (sprite centroid band, covered-region mask, defect log text); settled cvar design (backend self-read; snapshot is the record); moved test-only bsp/formats to webgl-renderer devDependencies; upgraded the web stub GL to the full production surface.
+- F1-vs-CPU outside the 0.02 gate (0.912, maxΔ255) as EXPECTED for authorized differences (true blending vs screen-door, per-pixel vs per-luxel lights, single-level mip, unwarped turbulence, no per-draw 565 rounding, pre-test depth, resampled skins); artifacts kept, thresholds untouched, human sign-off pending — not auto-passed, not loosened.
+- evidence: webgl-renderer 75/1 (Q2_PAK), testkit 175/8 (Q2_PAK, incl. PROOF-3 + PROOF-4 browser proofs), web 129 (gpu/play/m71/combat/gates); deps:check 633/16 ok. Changesets: webgl-renderer-gpu-proof-4 + testkit-gpu-proof-4 (web ignored).
+- PROOF-5 now eligible (depends PROOF-4 done).
 
 ### GPU-PROOF-5 — Measure the complete prototype and make the decision
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`, `BRAIN.md`

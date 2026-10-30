@@ -1,13 +1,17 @@
-# @q2/webgl-renderer — WebGL2 backend (GPU-PROOF-3: real scene drawing)
+# @q2/webgl-renderer — WebGL2 backend (GPU-PROOF-4: Voodoo appearance)
 
 Experimental GPU renderer for fast gameplay with a reviewed Voodoo-style
 appearance. This package owns the GPU scene/backend boundary and GPU
 resource lifetime. Browser glue (canvas/context acquisition) lives in
 `apps/web`; this package only ever receives an injected context.
 
-> PROOF-3 scope: real scene drawing in plain linear RGB. Appearance policy
-> (dither/RGB565/fog/gamma/mip/LOD) is PROOF-4, explicitly out of scope —
-> LINEAR filtering, no mipmaps, no quantization selections here.
+> PROOF-4 scope: the Voodoo appearance contract rides in shader/target
+> passes: linear scene render target (RGBA16F w/ EXT_color_buffer_float,
+> else RGBA8 fallback) + ONE fullscreen appearance pass (absolute-phase
+> Bayer dither -> RGB565 quantize -> matched reconstruction -> display
+> gamma), single-TMU mip policy with CPU-built chains, 64-entry table fog
+> (inert in base1), per-frame live `vd_*` uniforms. Details + cvar table +
+> deviations: `PROOF-4.md`; pure policy mirrors: `src/appearance.ts`.
 
 ## What PROOF-2 owns
 
@@ -58,25 +62,29 @@ resource lifetime. Browser glue (canvas/context acquisition) lives in
   emitters.
 - `src/matrices.ts` (pure): Quake-camera MVP math (near=4 like the CPU).
 
-## Documented PROOF-3 approximations (ROADMAP to PROOF-4/EXPAND)
+## Documented approximations (PROOF-4 status; full list: PROOF-4.md §5)
 
-- LINEAR filtering, no mipmaps (PROOF-4 owns LOD/bilinear policy).
+- Single-TMU mip LOD (fwidth rho + vd_lodbias + dither-mean pick,
+  CPU-built box-filtered chains); lightmaps stay plain LINEAR (no LOD).
 - Lightmap style scale baked per style-signature (re-baked on change).
 - Dynamic lights per-pixel in world + alias shaders (CPU: per-luxel bake).
 - Gun depth: NDC z remap (scale 0.02, bias -0.9) — GPU reading of
   RF_DEPTHHACK 1/z x3 (wins except nose-to-wall).
 - Beams are ~1.5px camera-facing quads (CPU: 1px DDA core+glow).
 - No GL face culling (visibility = selectGpuScene's CPU backface rule).
-- Turbulent water draws unwarped (warp deferred to PROOF-4/EXPAND).
+- Turbulent water draws unwarped (warp deferred to EXPAND).
 - Translucency is true blending (CPU: screen-door on the 8-bit path).
-- Non-POT skins upload as-is with a warning (Voodoo 256 cap is PROOF-4).
+- Oversized diffuse/skins capped by box resample + warning (GPU closes the
+  CPU dims-only gap); HUD stays composited above by apps/web.
 
-## What PROOF-4 will add
+## What PROOF-4 added
 
-- The Voodoo appearance contract (sampling/mip policy, fog,
-  RGB565 quantization, ordered dither, reconstruction, gamma, HUD
-  ordering) in shader/target passes, with shared policy reuse from
-  `@q2/voodoo` where pure.
+- The Voodoo appearance contract (sampling/mip policy, 64-entry table fog,
+  RGB565 quantization, ordered dither, matched reconstruction, display
+  gamma, HUD ordering) in shader/target passes, with voodoo policy
+  duplicated-by-value in `src/appearance.ts` (no new dep edge — see
+  PROOF-4.md §1). `src/appearance.ts` also owns the fullscreen resolve
+  shaders + the per-frame `vd_*` snapshot.
 
 ## Dependency rationale
 

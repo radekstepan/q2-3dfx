@@ -10,13 +10,17 @@
 // DOCUMENTED SEAM: entity placement/light/particle numbers are duplicated BY
 // VALUE from packages/testkit/src/bench-workloads.ts (fixedBenchEntities,
 // combatBenchEntities, pumpBenchLights, benchSparkParticles), the camera from
-// gpuProofViewFor (packages/testkit/src/gpu-proof.ts), mirroring the F1 leg
-// of packages/webgl-renderer/src/proof3.test.ts. Those fixtures register
-// models through a live SoftwareRenderer; the GPU page registers through
+// gpuProofViewFor (packages/testkit/src/gpu-proof.ts), and the pinned cvars
+// from pinBenchCvars (same file) — mirroring the F1 leg of
+// packages/webgl-renderer/src/proof3.test.ts. Those fixtures register models
+// through a live SoftwareRenderer; the GPU page registers through
 // WebGLRenderer.registerModelData instead, so the numbers are inlined here
 // with their derivation (spawn-north origin [128,-320,54], yaw 90) rather
-// than imported. The RENDERER, SCENE SELECTOR, SHADERS, MESH BUILDERS and
-// PARSERS are the real production dists — no reimplementation.
+// than imported. The RENDERER, SCENE SELECTOR, SHADERS, MESH BUILDERS,
+// APPEARANCE SHADERS (VS_POST/FS_APPEARANCE), MIP-CHAIN BUILDER and PARSERS
+// are the real production dists — no reimplementation. The forced-fog hook
+// (setFogOverride) is the production test seam: production never calls it
+// (null => 0 scene contribution, the base1 rule).
 //
 // TEST-ONLY CAPTURE: the page calls readPixels to derive coverage/diff
 // stats. This is allowed in tests (PROOF-3 done-when). The normal
@@ -75,6 +79,8 @@ const PROOF_PAGE_JS = `
 'use strict';
 import { WebGLRenderer, selectGpuScene, compileProgram } from '@q2/webgl-renderer';
 import { VS_LIT, FS_LIT, VS_ALIAS, FS_ALIAS, VS_FLAT, FS_FLAT } from '@q2/webgl-renderer';
+import { VS_POST, FS_APPEARANCE, buildMipChainRGB } from '@q2/webgl-renderer';
+import { setCVar, setCVarFromString, resetCVars } from '@q2/config';
 import { bspToMiniWorld } from '@q2/sw-renderer';
 import { loadBsp } from '@q2/bsp';
 import { parseWAL, parsePCX, parseMD2 } from '@q2/formats';
@@ -193,7 +199,8 @@ function diffStats(a, b) {
   return { count: count, frac: count / N, bbox: [x0, y0, x1, y1], bboxArea: area, bboxFrac: count / area };
 }
 
-function makeRenderer(glImpl, world, palette, soldierMd2, gunMd2, soldierSkin, gunSkin, entities) {
+function makeRenderer(glImpl, world, palette, soldierMd2, gunMd2, soldierSkin, gunSkin, entities, view) {
+  var v = view || VIEW;
   var r = new WebGLRenderer();
   r.init(glImpl, W, H);
   r.attachWorld(world);
@@ -204,7 +211,7 @@ function makeRenderer(glImpl, world, palette, soldierMd2, gunMd2, soldierSkin, g
   r.registerModelData(3, 'md2', gunMd2);
   r.registerSkinPixels(0, soldierSkin.pixels, soldierSkin.width, soldierSkin.height);
   r.registerSkinPixels(1, gunSkin.pixels, gunSkin.width, gunSkin.height);
-  var scene = selectGpuScene(world, entities, VIEW, W, H, KINDS);
+  var scene = selectGpuScene(world, entities, v, W, H, KINDS);
   r.setScene(scene);
   return { renderer: r, scene: scene };
 }
@@ -372,6 +379,300 @@ async function main() {
   proof.uploadsF1 = rrF1.renderer.testUploadStats();
   log('stats: ' + JSON.stringify(proof.stats));
   log('warnings: ' + JSON.stringify(proof.warningsF1));
+
+  // --- PROOF-4 appearance fixtures (pinned profile + production pass) ---
+  // pinBenchCvars-equivalent in-page (values duplicated BY VALUE from
+  // bench-workloads.ts pinBenchCvars): the appearance backend reads vd_*
+  // live per frame (resolveAppearanceFrame), so driving cvars through
+  // @q2/config IS the supported seam — no setter API exists by design.
+  // Config defaults already match the pinned profile; the explicit pin
+  // proves seam neutrality (f1PinnedVsF1 below must equal the unpinned F1).
+  resetCVars();
+  setCVar('vd_gamma', 1.3);
+  setCVar('vd_dither', 1);
+  setCVar('vd_16bit', 1);
+  setCVar('vd_postfilter', 1);
+  setCVar('vd_bilinear', 1);
+  setCVar('vd_mipdither', 1);
+  setCVar('vd_lodbias', -0.35);
+  setCVar('vd_fog', 1);
+  setCVar('vd_overbright', 1);
+  setCVar('vd_palettetex', 1);
+  setCVar('vd_maxtexsize', 256);
+  setCVar('vd_zbits', 16);
+  setCVarFromString('vd_dithermode', '4x4');
+  setCVarFromString('vd_reconmode', '2x2sub+2x2box');
+  setCVarFromString('vd_rgbmaxdelta', '8,8,8');
+
+  // (a) gradient + flat-field ramps through the PRODUCTION appearance
+  // shader (VS_POST/FS_APPEARANCE from the built dist, postfilter OFF so
+  // the raw dither+565 quantum is observed, gamma 1.0 to isolate it).
+  var postProg = compileProgram(rawGL, VS_POST, FS_APPEARANCE);
+  function postUniforms(ditherOn, gamma) {
+    rawGL.useProgram(postProg);
+    rawGL.uniform1i(rawGL.getUniformLocation(postProg, 'uScene'), 0);
+    rawGL.uniform1i(rawGL.getUniformLocation(postProg, 'uDitherOn'), ditherOn ? 1 : 0);
+    rawGL.uniform1i(rawGL.getUniformLocation(postProg, 'uDitherMode'), 1);
+    rawGL.uniform1i(rawGL.getUniformLocation(postProg, 'uPostfilter'), 0);
+    rawGL.uniform1i(rawGL.getUniformLocation(postProg, 'uReconMode'), 1);
+    rawGL.uniform3f(rawGL.getUniformLocation(postProg, 'uRgbMaxDelta'), 0, 0, 0);
+    rawGL.uniform1f(rawGL.getUniformLocation(postProg, 'uGamma'), gamma);
+    rawGL.uniform1i(rawGL.getUniformLocation(postProg, 'u16bit'), 1);
+  }
+  function uploadGrayTex(w, h, fill) {
+    var data = new Uint8Array(w * h * 4);
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        var vv = fill(x, y), o = (y * w + x) * 4;
+        data[o] = vv; data[o + 1] = vv; data[o + 2] = vv; data[o + 3] = 255;
+      }
+    }
+    var tex = rawGL.createTexture();
+    rawGL.bindTexture(rawGL.TEXTURE_2D, tex);
+    rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_MIN_FILTER, rawGL.NEAREST);
+    rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_MAG_FILTER, rawGL.NEAREST);
+    rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_WRAP_S, rawGL.CLAMP_TO_EDGE);
+    rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_WRAP_T, rawGL.CLAMP_TO_EDGE);
+    rawGL.texImage2D(rawGL.TEXTURE_2D, 0, rawGL.RGBA8, w, h, 0, rawGL.RGBA, rawGL.UNSIGNED_BYTE, data);
+    return tex;
+  }
+  // Expand565 membership sets (voodoo expandRGB565 bit-replication values).
+  var SET5 = {}, SET6 = {};
+  for (var q5 = 0; q5 < 32; q5++) SET5[((q5 << 3) | (q5 >> 2))] = 1;
+  for (var q6 = 0; q6 < 64; q6++) SET6[((q6 << 2) | (q6 >> 4))] = 1;
+  // Resolved-region mask (PROOF-4 finding: VS_POST emits a HALF-screen
+  // triangle — NDC vertices (-1,-1),(1,-1),(-1,1), i.e. x+y<=0 — so the
+  // appearance pass resolves only that half; the rest is stale. Fixture
+  // stats below count COVERED pixels only; resolveCoverage pins the defect
+  // for the owning lane. Covered (pixel centers, gl_FragCoord space):
+  // (x+0.5)/vpW + (y+0.5)/vpH <= 1, y measured UP from the bottom row.
+  function coveredAt(x, y, vpW, vpH) {
+    return ((x + 0.5) / vpW + (y + 0.5) / vpH) <= 1;
+  }
+  function coveredCount(w, h, vpW, vpH) {
+    var n = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        if (coveredAt(x, y, vpW, vpH)) n++;
+      }
+    }
+    return n;
+  }
+  var RW = 256, RH = 8, FW = 64;
+  var rampTex = uploadGrayTex(RW, RH, function (x) { return x; });
+  var flatTex = uploadGrayTex(FW, RH, function () { return 100; });
+  var rampFBO = rawGL.createFramebuffer();
+  var rampTarget = rawGL.createTexture();
+  rawGL.bindTexture(rawGL.TEXTURE_2D, rampTarget);
+  rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_MIN_FILTER, rawGL.NEAREST);
+  rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_MAG_FILTER, rawGL.NEAREST);
+  rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_WRAP_S, rawGL.CLAMP_TO_EDGE);
+  rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_WRAP_T, rawGL.CLAMP_TO_EDGE);
+  rawGL.texImage2D(rawGL.TEXTURE_2D, 0, rawGL.RGBA8, RW, RH, 0, rawGL.RGBA, rawGL.UNSIGNED_BYTE, null);
+  rawGL.bindFramebuffer(rawGL.FRAMEBUFFER, rampFBO);
+  rawGL.framebufferTexture2D(rawGL.FRAMEBUFFER, rawGL.COLOR_ATTACHMENT0, rawGL.TEXTURE_2D, rampTarget, 0);
+  var rampStatus = rawGL.checkFramebufferStatus(rawGL.FRAMEBUFFER);
+  if (rampStatus !== rawGL.FRAMEBUFFER_COMPLETE) throw new Error('ramp FBO incomplete: ' + rampStatus);
+  function runPost(srcTex, w, h, ditherOn, gamma, dstFBO) {
+    rawGL.bindFramebuffer(rawGL.FRAMEBUFFER, dstFBO || rampFBO);
+    rawGL.viewport(0, 0, w, h);
+    rawGL.activeTexture(rawGL.TEXTURE0);
+    rawGL.bindTexture(rawGL.TEXTURE_2D, srcTex);
+    postUniforms(ditherOn, gamma);
+    rawGL.drawArrays(rawGL.TRIANGLES, 0, 3);
+    var px = new Uint8Array(w * h * 4);
+    rawGL.readPixels(0, 0, w, h, rawGL.RGBA, rawGL.UNSIGNED_BYTE, px);
+    return px;
+  }
+  // All small-field stats count COVERED pixels only (see coveredAt): the
+  // void half carries stale zeros, never shader output.
+  function triplesOfMasked(px, w, h, vpW, vpH) {
+    var seen = {}, n = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        if (!coveredAt(x, y, vpW, vpH)) continue;
+        var i = (y * w + x) * 4;
+        var k = px[i] * 65536 + px[i + 1] * 256 + px[i + 2];
+        if (!seen[k]) { seen[k] = 1; n++; }
+      }
+    }
+    return n;
+  }
+  function channelsOfMasked(px, w, h, vpW, vpH) {
+    var sr = {}, sg = {}, sb = {}, nr = 0, ng = 0, nb = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        if (!coveredAt(x, y, vpW, vpH)) continue;
+        var i = (y * w + x) * 4;
+        if (!sr[px[i]]) { sr[px[i]] = 1; nr++; }
+        if (!sg[px[i + 1]]) { sg[px[i + 1]] = 1; ng++; }
+        if (!sb[px[i + 2]]) { sb[px[i + 2]] = 1; nb++; }
+      }
+    }
+    return { r: nr, g: ng, b: nb };
+  }
+  function membershipViolationsMasked(px, w, h, vpW, vpH) {
+    var v = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        if (!coveredAt(x, y, vpW, vpH)) continue;
+        var i = (y * w + x) * 4;
+        if (!SET5[px[i]] || !SET6[px[i + 1]] || !SET5[px[i + 2]]) v++;
+      }
+    }
+    return v;
+  }
+  function periodViolationsMasked(px, w, h, vpW, vpH) {
+    var v = 0;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        if (!coveredAt(x, y, vpW, vpH)) continue;
+        var a = (y * w + x) * 4, b, c;
+        if (x + 4 < w && coveredAt(x + 4, y, vpW, vpH)) {
+          b = (y * w + x + 4) * 4;
+          if (px[a] !== px[b] || px[a + 1] !== px[b + 1] || px[a + 2] !== px[b + 2]) v++;
+        }
+        if (y + 4 < h && coveredAt(x, y + 4, vpW, vpH)) {
+          c = ((y + 4) * w + x) * 4;
+          if (px[a] !== px[c] || px[a + 1] !== px[c + 1] || px[a + 2] !== px[c + 2]) v++;
+        }
+      }
+    }
+    return v;
+  }
+  function diffStatsWHMasked(a, b, w, h, vpW, vpH) {
+    var n = 0, count = 0, x0 = w, y0 = h, x1 = -1, y1 = -1;
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) {
+        if (!coveredAt(x, y, vpW, vpH)) continue;
+        n++;
+        var o = (y * w + x) * 4;
+        if (a[o] !== b[o] || a[o + 1] !== b[o + 1] || a[o + 2] !== b[o + 2] || a[o + 3] !== b[o + 3]) {
+          count++;
+          if (x < x0) x0 = x;
+          if (x > x1) x1 = x;
+          if (y < y0) y0 = y;
+          if (y > y1) y1 = y;
+        }
+      }
+    }
+    if (count === 0) return { count: 0, frac: 0, bbox: null, bboxFrac: 0, covered: n };
+    var pad = 2;
+    x0 = Math.max(0, x0 - pad); y0 = Math.max(0, y0 - pad);
+    x1 = Math.min(w - 1, x1 + pad); y1 = Math.min(h - 1, y1 + pad);
+    var area = (x1 - x0 + 1) * (y1 - y0 + 1);
+    return { count: count, frac: n === 0 ? 0 : count / n, bbox: [x0, y0, x1, y1], bboxArea: area, bboxFrac: count / area, covered: n };
+  }
+  var flatOn = runPost(flatTex, FW, RH, true, 1.0, null);
+  var flatOff = runPost(flatTex, FW, RH, false, 1.0, null);
+  var rampOn = runPost(rampTex, RW, RH, true, 1.0, null);
+  var rampOff = runPost(rampTex, RW, RH, false, 1.0, null);
+  var rampGamma = runPost(rampTex, RW, RH, true, 1.3, null);
+  // Full-canvas resolve coverage: fresh 640x480 target (zeros) + flat field
+  // through the production pass. Resolved pixels are ~100 gray, never zero;
+  // stale zeros mark the unresolved region. A correct fullscreen pass reads
+  // ~1.0 (pinned by RESOLVE_COVERAGE_MIN in the test).
+  var covTex = uploadGrayTex(W, H, function () { return 100; });
+  var covTarget = rawGL.createTexture();
+  rawGL.bindTexture(rawGL.TEXTURE_2D, covTarget);
+  rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_MIN_FILTER, rawGL.NEAREST);
+  rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_MAG_FILTER, rawGL.NEAREST);
+  rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_WRAP_S, rawGL.CLAMP_TO_EDGE);
+  rawGL.texParameteri(rawGL.TEXTURE_2D, rawGL.TEXTURE_WRAP_T, rawGL.CLAMP_TO_EDGE);
+  rawGL.texImage2D(rawGL.TEXTURE_2D, 0, rawGL.RGBA8, W, H, 0, rawGL.RGBA, rawGL.UNSIGNED_BYTE, null);
+  var covFBO = rawGL.createFramebuffer();
+  rawGL.bindFramebuffer(rawGL.FRAMEBUFFER, covFBO);
+  rawGL.framebufferTexture2D(rawGL.FRAMEBUFFER, rawGL.COLOR_ATTACHMENT0, rawGL.TEXTURE_2D, covTarget, 0);
+  var covStatus = rawGL.checkFramebufferStatus(rawGL.FRAMEBUFFER);
+  if (covStatus !== rawGL.FRAMEBUFFER_COMPLETE) throw new Error('coverage FBO incomplete: ' + covStatus);
+  var covPx = runPost(covTex, W, H, true, 1.0, covFBO);
+  var covResolved = 0;
+  for (var ci = 0; ci < covPx.length; ci += 4) {
+    if (covPx[ci] !== 0 || covPx[ci + 1] !== 0 || covPx[ci + 2] !== 0) covResolved++;
+  }
+  rawGL.bindFramebuffer(rawGL.FRAMEBUFFER, null);
+  rawGL.viewport(0, 0, W, H);
+  // Small-field debug evidence (12 KB total): raw ramp/flat captures for
+  // Node-side root-cause analysis (fixture assumption vs shader behavior).
+  window.__q2rampDbg = {
+    flatOn: Array.prototype.slice.call(flatOn),
+    flatOff: Array.prototype.slice.call(flatOff),
+    rampOn: Array.prototype.slice.call(rampOn),
+    rampOff: Array.prototype.slice.call(rampOff),
+  };
+  var rampChOn = channelsOfMasked(rampOn, RW, RH, RW, RH);
+  proof.appearance = {
+    flatDistinctOn: triplesOfMasked(flatOn, FW, RH, FW, RH),
+    flatDistinctOff: triplesOfMasked(flatOff, FW, RH, FW, RH),
+    flatPeriodViolations: periodViolationsMasked(flatOn, FW, RH, FW, RH),
+    flatMembershipViolations: membershipViolationsMasked(flatOn, FW, RH, FW, RH),
+    flatOnVsOff: diffStatsWHMasked(flatOn, flatOff, FW, RH, FW, RH),
+    flatCovered: coveredCount(FW, RH, FW, RH),
+    rampDistinctR: rampChOn.r,
+    rampDistinctG: rampChOn.g,
+    rampDistinctB: rampChOn.b,
+    rampTriplesOn: triplesOfMasked(rampOn, RW, RH, RW, RH),
+    rampTriplesOff: triplesOfMasked(rampOff, RW, RH, RW, RH),
+    rampMembershipViolations: membershipViolationsMasked(rampOn, RW, RH, RW, RH),
+    rampGammaVsLinear: diffStatsWHMasked(rampGamma, rampOn, RW, RH, RW, RH),
+    rampCovered: coveredCount(RW, RH, RW, RH),
+    resolveCoverage: covResolved / (W * H),
+  };
+
+  // (c) mip chain through the PRODUCTION upload-time builder (asset-free
+  // 64x64 8px checker) + live dither contrast at a minified camera.
+  var checker = new Uint8Array(64 * 64 * 3);
+  for (var mcy = 0; mcy < 64; mcy++) {
+    for (var mcx = 0; mcx < 64; mcx++) {
+      var mcv = ((((mcx >> 3) + (mcy >> 3)) & 1) !== 0) ? 255 : 0;
+      var mco = (mcy * 64 + mcx) * 3;
+      checker[mco] = mcv; checker[mco + 1] = mcv; checker[mco + 2] = mcv;
+    }
+  }
+  var mipChain = buildMipChainRGB(checker, 64, 64);
+  var mipLast = mipChain[mipChain.length - 1];
+  proof.mipChain = {
+    levels: mipChain.length,
+    lastW: mipLast.w,
+    lastH: mipLast.h,
+    lastMean: [mipLast.data[0], mipLast.data[1], mipLast.data[2]],
+  };
+  var FAR_VIEW = {
+    origin: f32([OX - FX * 150, OY - FY * 150, OZ + 40]),
+    angles: VIEW.angles,
+    fovX: 90,
+    time: 1.5,
+    lightStyles: VIEW.lightStyles,
+  };
+  var rrFar = makeRenderer(counted.gl, worldF1, palette, soldierMd2, gunMd2, soldierSkin, gunSkin, ENT_F1, FAR_VIEW);
+  var capFarOn = renderCapture(rawGL, rrFar, counted.draws, ENT_F1, LIGHTS_F1);
+  setCVar('vd_mipdither', 0);
+  var capFarOff = renderCapture(rawGL, rrFar, counted.draws, ENT_F1, LIGHTS_F1);
+  setCVar('vd_mipdither', 1);
+
+  // (d) pinned F1 fixed-scene capture (the CPU-vs-GPU comparison input) +
+  // (b) FORCED-fog ramp (setFogOverride IS the supported seam: production
+  // never calls it; null => 0 contribution, the base1 rule) + pinned
+  // transparent-overlap / depth-tie re-captures through the appearance pass.
+  var capF1P = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
+  window.__q2capF1 = capF1P.px;
+  window.__q2capSlice = function (a, b) { return Array.prototype.slice.call(window.__q2capF1.subarray(a, b)); };
+  rrF1.renderer.setFogOverride(1, [0.4, 0.5, 0.6]);
+  var capFog = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
+  rrF1.renderer.setFogOverride(null);
+  var capFogOff = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
+  var capPinnedNoBeam = renderCapture(rawGL, rrF1, counted.draws, noBeam, LIGHTS_F1);
+  var capPinnedNoDepth = renderCapture(rawGL, rrNoDepth, noDepth.draws, ENT_F1, LIGHTS_F1);
+  proof.appearance.fogVsOff = summarize(diffStats(capFog.px, capFogOff.px));
+  proof.appearance.fogOffIdentity = summarize(diffStats(capFogOff.px, capF1P.px));
+  proof.appearance.farVsNear = summarize(diffStats(capFarOn.px, capF1P.px));
+  proof.appearance.mipOnOff = summarize(diffStats(capFarOn.px, capFarOff.px));
+  proof.appearance.f1PinnedVsF1 = summarize(diffStats(capF1P.px, capF1.px));
+  proof.appearance.pinnedBeam = summarize(diffStats(capF1P.px, capPinnedNoBeam.px));
+  proof.appearance.pinnedDepth = summarize(diffStats(capF1P.px, capPinnedNoDepth.px));
+  proof.appearance.drawsFar = capFarOn.draws;
+  log('appearance: ' + JSON.stringify(proof.appearance));
+  log('mipChain: ' + JSON.stringify(proof.mipChain));
 
   // Timing loop: production path only (renderFrame, no readPixels inside).
   // >=120 rAF samples of the F1 combat frame on the depth-on renderer.

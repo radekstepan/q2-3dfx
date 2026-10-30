@@ -64,6 +64,17 @@ const GLC = {
   TEXTURE_MAG_FILTER: 0x2800,
   TEXTURE_WRAP_S: 0x2802,
   TEXTURE_WRAP_T: 0x2803,
+  FRAMEBUFFER: 0x8d40,
+  RENDERBUFFER: 0x8d41,
+  COLOR_ATTACHMENT0: 0x8ce0,
+  DEPTH_ATTACHMENT: 0x8d00,
+  DEPTH_COMPONENT16: 0x81a5,
+  DEPTH_COMPONENT24: 0x81a6,
+  RGBA16F: 0x881a,
+  RGBA8: 0x8058,
+  RGBA: 0x1908,
+  HALF_FLOAT: 0x140b,
+  FRAMEBUFFER_COMPLETE: 0x8cd5,
 };
 
 export function stubGLFull(): StubGLState {
@@ -74,6 +85,8 @@ export function stubGLFull(): StubGLState {
   let nextTex = 1001;
   let nextShader = 2001;
   let nextProg = 3001;
+  let nextFb = 5001;
+  let nextRb = 6001;
   let boundArray = 0;
   let boundElement = 0;
   const modeName = (m: number): string => (m === GLC.TRIANGLES ? 'TRIANGLES' : m === GLC.POINTS ? 'POINTS' : String(m));
@@ -176,8 +189,45 @@ export function stubGLFull(): StubGLState {
       calls.push(`bindTexture ${t} ${(tex as { id: number } | null)?.id ?? 'null'}`);
     },
     texParameteri(): void {},
-    texImage2D(_t: number, _l: number, _i: number, w: number, h: number): void {
-      calls.push(`texImage2D ${w}x${h}`);
+    texImage2D(_t: number, l: number, i: number, w: number, h: number): void {
+      calls.push(`texImage2D lvl=${l} fmt=${i} ${w}x${h}`);
+    },
+    getExtension(name: string): unknown {
+      calls.push(`getExtension ${name}`);
+      return null; // no float rendering here: pins the RGBA8 fallback branch
+    },
+    createFramebuffer(): unknown {
+      calls.push(`createFramebuffer ${nextFb}`);
+      return { id: nextFb++ };
+    },
+    bindFramebuffer(t: number, fb: unknown): void {
+      calls.push(`bindFramebuffer ${t} ${(fb as { id: number } | null)?.id ?? 'null'}`);
+    },
+    framebufferTexture2D(): void {
+      calls.push('framebufferTexture2D');
+    },
+    framebufferRenderbuffer(): void {
+      calls.push('framebufferRenderbuffer');
+    },
+    checkFramebufferStatus(): unknown {
+      calls.push('checkFramebufferStatus');
+      return GLC.FRAMEBUFFER_COMPLETE;
+    },
+    createRenderbuffer(): unknown {
+      calls.push(`createRenderbuffer ${nextRb}`);
+      return { id: nextRb++ };
+    },
+    bindRenderbuffer(t: number, rb: unknown): void {
+      calls.push(`bindRenderbuffer ${t} ${(rb as { id: number } | null)?.id ?? 'null'}`);
+    },
+    renderbufferStorage(_t: number, fmt: number, w: number, h: number): void {
+      calls.push(`renderbufferStorage fmt=${fmt} ${w}x${h}`);
+    },
+    uniform1fv(l: unknown, v: Float32Array): void {
+      calls.push(`uniform1fv ${(l as UniformLoc).name} len=${v.length}`);
+    },
+    uniform3f(l: unknown, x: number, y: number, z: number): void {
+      calls.push(`uniform3f ${(l as UniformLoc).name} ${x} ${y} ${z}`);
     },
     activeTexture(t: number): void {
       calls.push(`activeTexture ${t === GLC.TEXTURE0 ? 0 : 1}`);
@@ -355,7 +405,10 @@ describe('proof-3 scene drawing (stub GL, asset-free)', () => {
     // No pixel readbacks anywhere.
     expect(log.some((c) => c.startsWith('readPixels'))).toBe(false);
     expect(r.getStatus().framesSubmitted).toBe(1);
-    expect(r.testWarnings()).toEqual([]);
+    // The only warning is the RGBA8 fallback (this stub has no float ext).
+    expect(r.testWarnings()).toEqual([
+      'appearance: EXT_color_buffer_float unavailable — RGBA8 fallback target',
+    ]);
   });
 
   it('uploads static buffers ONCE; dynamic buffers re-upload per frame (bounded)', () => {
@@ -615,6 +668,68 @@ describe.runIf(!!process.env.Q2_PAK)('proof-3 F1 combat scene (Q2_PAK base1)', (
     // totals, are the honest invariant.)
     expect(r.getStatus().framesSubmitted).toBe(3);
     expect(r.testUploadStats()).toEqual({ uploads: 1 });
+  });
+
+  it('F1 through the appearance pass: target, resolve, capped skins, order', { timeout: 180000 }, () => {
+    const pakPath = process.env.Q2_PAK as string;
+    const a = loadF1Assets(pakPath);
+    const state = stubGLFull();
+    const r = new WebGLRenderer();
+    r.init(state.gl, 640, 480);
+    const world = { ...a.world, particles: f1Particles() };
+    r.attachWorld(world);
+    r.setPalette(a.palette);
+    r.registerModelData(0, 'md2', parseMD2(a.soldierMd2.slice(0)));
+    r.registerModelData(1, 'tracer', null);
+    r.registerModelData(2, 'sp2', null);
+    r.registerModelData(3, 'md2', parseMD2(a.gunMd2.slice(0)));
+    r.registerSkinPixels(0, a.soldierSkin.pixels, a.soldierSkin.width, a.soldierSkin.height);
+    r.registerSkinPixels(1, a.gunSkin.pixels, a.gunSkin.width, a.gunSkin.height);
+    // Oversized skin (300x300 > vd_maxtexsize 256): must not crash — the
+    // upload caps it with a recorded warning. Rides a translucent alias so
+    // it flows through the blend pass.
+    r.registerSkinPixels(7, new Uint8Array(300 * 300).fill(11), 300, 300);
+    const entities = [...f1Entities(), { model: 0, origin: new Float32Array([136, -272, 24]), angles: new Float32Array([0, 270, 0]), frame: 4, skin: 7, alpha: 0.5 } as Entity];
+    const scene = selectGpuScene(world, entities, f1View(), 640, 480, f1Kinds());
+    r.setScene(scene);
+    r.setEntities(entities, f1Kinds());
+    const input: GpuFrameInput = { view: f1View(), scene, time: 1.5, lights: f1Lights() };
+    r.renderFrame(input);
+    r.renderFrame(input);
+    r.renderFrame(input);
+    const log = state.calls;
+
+    // Scene target created once at size (RGBA8 fallback: this stub has no
+    // EXT_color_buffer_float — the fallback branch is pinned here; the float
+    // branch is pinned in appearance.test.ts).
+    expect(r.testTargetInfo()).toEqual({ float: false, w: 640, h: 480 });
+    expect(log.some((c) => c.startsWith('createFramebuffer'))).toBe(true);
+    expect(log.some((c) => c.startsWith('texImage2D lvl=0 fmt=32856 '))).toBe(true); // RGBA8 target
+    expect(r.testWarnings().some((w) => w.includes('RGBA8 fallback'))).toBe(true);
+
+    // Appearance program (4th) linked; fullscreen resolve after the blend
+    // window; depth/blend state restored for the next frame.
+    expect(state.programs.length).toBe(4);
+    const blendOff = log.findIndex((c) => c === 'disable BLEND');
+    expect(blendOff).toBeGreaterThan(-1);
+    const postDraw = log.findIndex((c, i) => i > blendOff && c === 'drawArrays TRIANGLES 3');
+    expect(postDraw).toBeGreaterThan(blendOff);
+    expect(log.slice(postDraw)).toContain('enable DEPTH_TEST'); // next frame re-arms
+    expect(log).toContain('uniform1i uReconMode 1'); // matched 2x2 default
+    expect(log).toContain('uniform1f uGamma 1.3');
+    // Per-frame policy uniforms, no re-uploads: target creation is not a
+    // texture upload (upload contract pinned).
+    expect(r.testUploadStats()).toEqual({ uploads: 1 });
+
+    // Oversized skin capped, never crashed.
+    expect(r.testWarnings().some((w) => w.includes('skin 7 oversized 300x300'))).toBe(true);
+
+    // Blend order preserved through the appearance pass; no readbacks.
+    const blendOn = log.findIndex((c) => c === 'enable BLEND');
+    expect(blendOn).toBeGreaterThan(-1);
+    expect(log.slice(0, blendOn).filter((c) => c.startsWith('drawElements')).length).toBeGreaterThan(0);
+    expect(log.some((c) => c.startsWith('readPixels'))).toBe(false);
+    expect(r.getStatus().framesSubmitted).toBe(3);
   });
 
   it('F1 static-once / dynamic-bounded upload accounting', { timeout: 180000 }, () => {

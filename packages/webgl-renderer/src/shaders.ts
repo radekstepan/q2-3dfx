@@ -1,13 +1,22 @@
-// @q2/webgl-renderer shaders — production GLSL ES 3.00 sources (GPU-PROOF-3).
+// @q2/webgl-renderer shaders — production GLSL ES 3.00 sources (GPU-PROOF-4).
 //
-// Plain linear-RGB output is CORRECT for this card: dither/RGB565/fog/gamma
-// are PROOF-4 appearance policy, explicitly out of scope. Two lit programs
-// (world + alias, which have different lighting inputs) plus one flat
-// vertex-color program (beams/particles/sky, with an opt-in texture mode
-// for sprites) — the minimal variant set that covers the route.
+// Scene output is LINEAR into the scene render target; the fullscreen
+// appearance pass (VS_POST/FS_APPEARANCE in appearance.ts) applies dither,
+// RGB565 quantization, reconstruction and display gamma. Scene programs carry
+// the sampling/fog/overbright policy as live uniforms (see appearance.ts
+// GLSL_MIP_POLICY / GLSL_FOG_OVERBRIGHT + PROOF-4.md):
+//   - single-TMU mip LOD (fwidth rho + vd_lodbias + 0.375 dither mean,
+//     Bayer n/n+1 pick, textureLod into uploaded box-filtered chains);
+//   - 64-entry table fog AFTER overbright (CPU shadePixel order), inert in
+//     base1 (scene contribution 0);
+//   - overbright modulate x2 + clamp via uOverbright.
+// Lightmaps stay plain LINEAR texture() (no LOD): the CPU bakes per-miplevel
+// surface blocks, which has no GPU equivalent here (documented gap).
 //
 // Reviewability: sources are exported consts; tests assert the required
 // features (texture() sampling, lightmap uniform, alpha) are present.
+
+import { GLSL_FOG_OVERBRIGHT, GLSL_MIP_POLICY } from './appearance.js';
 
 /** Lit world vertex shader: MVP + diffuse/lightmap UVs + per-vertex alpha. */
 export const VS_LIT = `#version 300 es
@@ -21,6 +30,7 @@ out vec2 vUV;
 out vec2 vLightUV;
 out float vAlpha;
 out vec3 vWorldPos;
+out float vFogW;
 void main() {
   vec4 clip = uMVP * vec4(aPos, 1.0);
   clip.z *= uDepthScale;
@@ -29,24 +39,28 @@ void main() {
   vLightUV = aLightUV;
   vAlpha = aAlpha;
   vWorldPos = aPos;
+  vFogW = clamp(clip.z / max(clip.w, 1e-6) * 0.5 + 0.5, 0.0, 1.0);
 }
 `;
 
-/** Lit world fragment shader: diffuse x (lightmap + per-pixel dlights). */
+/** Lit world fragment shader: mipped diffuse x (lightmap + per-pixel dlights). */
 export const FS_LIT = `#version 300 es
 precision mediump float;
 in vec2 vUV;
 in vec2 vLightUV;
 in float vAlpha;
 in vec3 vWorldPos;
+in float vFogW;
 uniform sampler2D uDiffuse;
 uniform sampler2D uLightmap;
 uniform vec4 uLightPos[8];
 uniform vec3 uLightColor[8];
 uniform int uNumLights;
 out vec4 oColor;
+${GLSL_MIP_POLICY}
+${GLSL_FOG_OVERBRIGHT}
 void main() {
-  vec3 texel = texture(uDiffuse, vUV).rgb;
+  vec3 texel = voodooSampleMipped(uDiffuse, vUV);
   vec3 lm = texture(uLightmap, vLightUV).rgb;
   vec3 dyn = vec3(0.0);
   for (int i = 0; i < 8; i++) {
@@ -58,7 +72,8 @@ void main() {
       dyn += f * uLightColor[i];
     }
   }
-  vec3 col = texel * (lm + dyn);
+  vec3 col = voodooOverbright(texel * (lm + dyn));
+  col = voodooApplyFog(col, vFogW);
   oColor = vec4(col, vAlpha);
 }
 `;
@@ -76,6 +91,7 @@ out vec2 vUV;
 out float vShade;
 out float vAlpha;
 out vec3 vWorldPos;
+out float vFogW;
 void main() {
   vec4 clip = uMVP * vec4(aPos, 1.0);
   clip.z *= uDepthScale;
@@ -84,24 +100,28 @@ void main() {
   vShade = aShade;
   vAlpha = aAlpha;
   vWorldPos = aPos;
+  vFogW = clamp(clip.z / max(clip.w, 1e-6) * 0.5 + 0.5, 0.0, 1.0);
 }
 `;
 
-/** Alias fragment shader: skin x (shade base + per-pixel dlights). */
+/** Alias fragment shader: mipped skin x (shade base + per-pixel dlights). */
 export const FS_ALIAS = `#version 300 es
 precision mediump float;
 in vec2 vUV;
 in float vShade;
 in float vAlpha;
 in vec3 vWorldPos;
+in float vFogW;
 uniform sampler2D uDiffuse;
 uniform vec4 uLightPos[8];
 uniform vec3 uLightColor[8];
 uniform int uNumLights;
 uniform float uAlpha;
 out vec4 oColor;
+${GLSL_MIP_POLICY}
+${GLSL_FOG_OVERBRIGHT}
 void main() {
-  vec3 texel = texture(uDiffuse, vUV).rgb;
+  vec3 texel = voodooSampleMipped(uDiffuse, vUV);
   vec3 dyn = vec3(0.0);
   for (int i = 0; i < 8; i++) {
     if (i >= uNumLights) break;
@@ -112,7 +132,8 @@ void main() {
       dyn += f * uLightColor[i];
     }
   }
-  vec3 col = texel * (vec3(vShade) + dyn);
+  vec3 col = voodooOverbright(texel * (vec3(vShade) + dyn));
+  col = voodooApplyFog(col, vFogW);
   oColor = vec4(col, vAlpha * uAlpha);
 }
 `;
@@ -127,6 +148,7 @@ uniform float uDepthScale;
 uniform float uPointSize;
 out vec4 vColor;
 out vec2 vUV;
+out float vFogW;
 void main() {
   vec4 clip = uMVP * vec4(aPos, 1.0);
   clip.z *= uDepthScale;
@@ -134,6 +156,7 @@ void main() {
   gl_PointSize = uPointSize;
   vColor = aColor;
   vUV = aUV;
+  vFogW = clamp(clip.z / max(clip.w, 1e-6) * 0.5 + 0.5, 0.0, 1.0);
 }
 `;
 
@@ -142,14 +165,18 @@ export const FS_FLAT = `#version 300 es
 precision mediump float;
 in vec4 vColor;
 in vec2 vUV;
+in float vFogW;
 uniform sampler2D uMap;
 uniform int uTextured;
 out vec4 oColor;
+${GLSL_MIP_POLICY}
+${GLSL_FOG_OVERBRIGHT}
 void main() {
   vec3 base = vColor.rgb;
   if (uTextured != 0) {
-    base *= texture(uMap, vUV).rgb;
+    base *= voodooSampleMipped(uMap, vUV);
   }
+  base = voodooApplyFog(base, vFogW);
   oColor = vec4(base, vColor.a);
 }
 `;

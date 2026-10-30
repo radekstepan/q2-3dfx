@@ -15,9 +15,11 @@ import {
   paintHudOverlay,
   applyRendererCvar,
   resolveDisplay,
+  GPU_APPEARANCE_CVARS,
+  GPU_APPEARANCE_HOOKS,
+  readGpuAppearanceSnapshot,
 } from './play.js';
 import { acquireGpuCanvas, GPU_CANVAS_ID, GPU_CONTEXT_ATTRS } from './gpu-canvas.js';
-
 const WEB_Q2_PAK = process.env.Q2_PAK;
 
 afterEach(() => {
@@ -68,6 +70,13 @@ const GL_NUM = {
   TRIANGLES: 4,
   POINTS: 0,
   MAX_TEXTURE_SIZE: 3379,
+  RENDERBUFFER: 36161,
+  DEPTH_COMPONENT16: 33189,
+  DEPTH_COMPONENT24: 33190,
+  COLOR_ATTACHMENT0: 36064,
+  DEPTH_ATTACHMENT: 36096,
+  FRAMEBUFFER: 36160,
+  FRAMEBUFFER_COMPLETE: 36053,
 } as const;
 
 function makeStubGL(log: string[]): Record<string, unknown> {
@@ -104,6 +113,8 @@ function makeStubGL(log: string[]): Record<string, unknown> {
           case 'createProgram':
           case 'createBuffer':
           case 'createTexture':
+          case 'createRenderbuffer':
+          case 'createFramebuffer':
           case 'createVertexArray':
             return {};
           default:
@@ -369,6 +380,152 @@ describe('GPU-PROOF-3 per-frame gameplay (frameGpuPlay)', () => {
     const target = resolveDisplay(boot);
     drawPlayHud({ width: 64, height: 48, color: target }, boot, { fps: 60, frame: 1 });
     expect(target.some((px) => px !== 0)).toBe(true);
+  });
+});
+
+describe('GPU-PROOF-4 live-loop appearance wiring (play.ts)', () => {
+  it('reads the pinned vd_* cvars every frame, recorded on boot.gpu.appearance (no stale profile)', () => {
+    installStubDoc();
+    const boot = capableBoot();
+    // Null until the first GPU frame: the boot path uploads statics only.
+    expect(boot.gpu!.appearance).toBeNull();
+    frameGpuPlay(boot, 0);
+    const first = boot.gpu!.appearance;
+    expect(first).not.toBeNull();
+    // All 15 pinned cvars, defaults untouched by this module.
+    expect(Object.keys(first!).sort()).toEqual([...GPU_APPEARANCE_CVARS].sort());
+    expect(first!['vd_gamma']).toBe('1.3');
+    expect(first!['vd_lodbias']).toBe('-0.35');
+    expect(first!['vd_dithermode']).toBe('4x4');
+    // Mutate mid-run: the NEXT frame must observe the new values.
+    setCVar('vd_gamma', '2.2');
+    setCVar('vd_dither', 0);
+    setCVar('vd_lodbias', 0);
+    frameGpuPlay(boot, 16);
+    const second = boot.gpu!.appearance!;
+    expect(second['vd_gamma']).toBe('2.2');
+    expect(second['vd_dither']).toBe('0');
+    expect(second['vd_lodbias']).toBe('0');
+    // Untouched cvars ride along unchanged in the same snapshot.
+    expect(second['vd_16bit']).toBe(first!['vd_16bit']);
+    expect(readGpuAppearanceSnapshot()['vd_gamma']).toBe('2.2');
+  });
+
+  it('built dist exposes no appearance setter yet (follow-up path: snapshot authoritative)', () => {
+    installStubDoc();
+    const boot = capableBoot();
+    for (const name of GPU_APPEARANCE_HOOKS) {
+      expect(name in (boot.gpu!.gpu as object)).toBe(false);
+    }
+    // The probe is a no-op returning false; the snapshot is still recorded.
+    expect(boot.gpu!.appearance).toBeNull();
+    frameGpuPlay(boot, 0);
+    expect(boot.gpu!.appearance).not.toBeNull();
+    // When the GL lane lands a setter, this test fails closed on the probe
+    // above — replace it with a direct-call assertion (see pushGpuAppearance).
+  });
+
+  it('HUD overlay stays ABOVE the GL canvas across appearance frames (GL-only appearance target)', () => {
+    const stub = installStubDoc();
+    const boot = capableBoot();
+    // Non-default appearance inputs: the appearance pass must still write
+    // only to the GL canvas, never restack or touch the overlay contract.
+    setCVar('vd_gamma', '2.2');
+    setCVar('vd_postfilter', 0);
+    setCVar('vd_dither', 0);
+    for (let f = 0; f < 5; f++) frameGpuPlay(boot, f * 16);
+    // canvases[0] is the capability-probe canvas; the GL canvas is found by id.
+    const glCanvas = stub.canvases.find((c) => c.id === GPU_CANVAS_ID)!;
+    expect(glCanvas.style['position']).toBe('absolute');
+    expect(glCanvas.style['zIndex']).toBe('0');
+    expect(stub.hud.style['zIndex']).toBe('1');
+    expect(stub.hud.parentNode.inserted[0]).toEqual([glCanvas, stub.hud]);
+    // Overlay still paints HUD over transparency (GL shows through).
+    const overlay = paintHudOverlay(boot, { fps: 60, frame: 1 });
+    expect(overlay.some((px) => px !== 0)).toBe(true);
+    expect(overlay.some((px) => (px >>> 24) === 0)).toBe(true);
+  });
+
+  it('HUD paints identically with appearance on/off (overlay independent of the GL canvas)', () => {
+    installStubDoc();
+    // Boot A: default appearance.
+    const a = capableBoot();
+    const overA = paintHudOverlay(a, { fps: 60, frame: 1 }).slice();
+    // Boot B: only appearance inputs differ (no sim input on either boot).
+    setCVar('vd_gamma', '2.2');
+    setCVar('vd_dither', 0);
+    setCVar('vd_16bit', 0);
+    setCVar('vd_postfilter', 0);
+    setCVar('vd_bilinear', 0);
+    setCVar('vd_mipdither', 0);
+    setCVar('vd_lodbias', 0);
+    setCVar('vd_fog', 0);
+    setCVar('vd_overbright', 0);
+    setCVar('vd_palettetex', 0);
+    setCVar('vd_maxtexsize', 128);
+    setCVar('vd_zbits', 8);
+    setCVar('vd_dithermode', '2x2');
+    setCVar('vd_reconmode', 'legacy');
+    setCVar('vd_rgbmaxdelta', '16,16,16');
+    const b = capableBoot();
+    for (let f = 0; f < 3; f++) frameGpuPlay(b, f * 16);
+    const overB = paintHudOverlay(b, { fps: 60, frame: 1 }).slice();
+    // Appearance inputs change the recorded GL snapshot, never the overlay.
+    expect(b.gpu!.appearance!['vd_gamma']).toBe('2.2');
+    expect(a.gpu!.appearance).toBeNull(); // A never ran a GPU frame
+    expect(overB).toEqual(overA);
+  });
+});
+
+describe.runIf(!!WEB_Q2_PAK)('GPU-PROOF-4 base1 appearance smoke (Q2_PAK)', () => {
+  it('base1: 20 combat frames with appearance inputs submit 20, draw, no readPixels, HUD holds', { timeout: 180000 }, async () => {
+    const stub = installStubDoc();
+    const { readFileSync } = await import('fs');
+    const raw = readFileSync(WEB_Q2_PAK as string);
+    const buf = new ArrayBuffer(raw.length);
+    new Uint8Array(buf).set(raw);
+    const { ingestPak } = await import('./pak.js');
+    const pak = ingestPak(buf);
+    setCVar('vid_renderer', 'webgl2-experimental');
+    // Appearance inputs differ from the pinned defaults (cvar-only change:
+    // defaults in @q2/config are untouched; resetCVars restores them after).
+    setCVar('vd_gamma', '2.0');
+    setCVar('vd_lodbias', 0);
+    const boot = bootPlay({ width: 96, height: 72, pak });
+    expect(boot.renderer).toBe('webgl2-experimental');
+    expect(boot.gpu).not.toBeNull();
+    expect(boot.source).toBe('pak');
+    const renderSpy = vi.spyOn(boot.refresh, 'renderView');
+    keyDown(boot.host.input, 'attack');
+    const N = 20;
+    for (let f = 0; f < N; f++) frameGpuPlay(boot, f * 16);
+    keyUp(boot.host.input, 'attack');
+    const status = boot.gpu!.gpu.getStatus();
+    // Live-loop regression: N GPU frames still submit N frames, uploads
+    // stable, no CPU raster, movement/combat advance.
+    expect(status.framesSubmitted).toBe(N);
+    expect(boot.gpu!.gpu.testUploadStats().uploads).toBe(1);
+    expect(renderSpy).not.toHaveBeenCalled();
+    expect(boot.host.serverTime).toBeGreaterThan(0);
+    expect(boot.driver.events).toContain('shot');
+    // Appearance cvars were re-read every frame into the recorded snapshot.
+    expect(boot.gpu!.appearance!['vd_gamma']).toBe('2.0');
+    expect(boot.gpu!.appearance!['vd_lodbias']).toBe('0');
+    expect(Object.keys(boot.gpu!.appearance!).sort()).toEqual([...GPU_APPEARANCE_CVARS].sort());
+    // Real drawing, not the clear-only fallback, with the production surface.
+    expect(stub.log).toContain('drawElements');
+    expect(stub.log).toContain('bufferData');
+    // The normal rendering path never reads pixels back.
+    expect(stub.log).not.toContain('readPixels');
+    // HUD ordering holds on the pak boot: overlay paints HUD over
+    // transparency while the GL canvas stays below it.
+    const overlay = paintHudOverlay(boot, { fps: 60, frame: 1 });
+    expect(overlay.some((px) => px !== 0)).toBe(true);
+    expect(overlay.some((px) => (px >>> 24) === 0)).toBe(true);
+    const glCanvas = stub.canvases.find((c) => c.id === GPU_CANVAS_ID)!;
+    expect(glCanvas.style['zIndex']).toBe('0');
+    expect(stub.hud.style['zIndex']).toBe('1');
+    renderSpy.mockRestore();
   });
 });
 
