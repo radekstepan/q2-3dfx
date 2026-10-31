@@ -3,7 +3,7 @@
 // Browser-only. All functions no-op / return null without a DOM so Node
 // tests can import this module safely. Canvas code is isolated here —
 // `index.ts` and `devroom.ts` never touch `document`.
-import { getCVar, getCVarNumber, getCVarString, listCVars, registerCVar, setCVarFromString } from '@q2/config';
+import { getCVar, getCVarNumber, getCVarString, listCVars, registerCVar, setCVarFromString, sVolumeToOutputGain } from '@q2/config';
 import { availableMapSources } from './play.js';
 import type { Framebuffer } from '@q2/renderer-api';
 import { ingestPak } from './pak.js';
@@ -1059,15 +1059,12 @@ export async function decodeAndCacheSound(
 function blip(ctx: AudioContext, master: GainNode, freq: number, dur: number, when = 0): void {
   try {
     // RELEASE-1: menu/event blips obey the same quiet cap as mix().
-    // Peak equals the capped output gain 0..0.05 (max 0.05), never 0.25.
-    let peak = 0.05;
+    // Single scale point via shared helper: 0..0.05, mute on invalid.
+    let peak = 0;
     try {
-      const raw = getCVarNumber('s_volume');
-      const n = Number(raw);
-      const norm = !Number.isFinite(n) ? 0 : n <= 0 ? 0 : n >= 1 ? 1 : n;
-      peak = norm * 0.05;
+      peak = sVolumeToOutputGain(getCVarNumber('s_volume'));
     } catch {
-      peak = 0.05;
+      peak = 0;
     }
     if (!(peak > 0)) return; // mute: no blip
     const t = ctx.currentTime + when;

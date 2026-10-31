@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
+  S_VOLUME_DEFAULT,
+  S_VOLUME_REFERENCE_GAIN,
+  clampNormalizedVolume,
   getCVarBool,
   getCVarNumber,
   getCVarString,
@@ -8,6 +11,7 @@ import {
   resetCVars,
   setCVar,
   setCVarFromString,
+  sVolumeToOutputGain,
 } from './index.js';
 
 beforeEach(() => resetCVars());
@@ -67,5 +71,43 @@ describe('cvar registry', () => {
     registerCVar('x_new', 7, 'doc');
     registerCVar('x_new', 9, 'doc');
     expect(getCVarNumber('x_new')).toBe(7);
+  });
+});
+
+describe('RELEASE-1 quiet volume scale (config side)', () => {
+  it('default 1 equals old quiet gain 0.05; max cannot exceed 0.05', () => {
+    expect(getCVarNumber('s_volume')).toBe(S_VOLUME_DEFAULT);
+    expect(S_VOLUME_DEFAULT).toBe(1);
+    expect(S_VOLUME_REFERENCE_GAIN).toBe(0.05);
+    expect(sVolumeToOutputGain(getCVarNumber('s_volume'))).toBeCloseTo(0.05, 9);
+    expect(sVolumeToOutputGain(1)).toBeCloseTo(0.05, 9);
+  });
+
+  it('s_volume ships a mapping doc so the gain is applied exactly once', () => {
+    const def = listCVars().find((c) => c.name === 's_volume')!;
+    expect(def.doc.length).toBeGreaterThan(0);
+    expect(def.doc).toMatch(/0\.05/);
+  });
+
+  it('clamps finite values; invalid/legacy config mutes or maps quiet', () => {
+    expect(sVolumeToOutputGain(0)).toBe(0);
+    expect(sVolumeToOutputGain(5)).toBeCloseTo(0.05, 9);
+    expect(sVolumeToOutputGain(-2)).toBe(0);
+    expect(sVolumeToOutputGain(Number.NaN)).toBe(0);
+    expect(sVolumeToOutputGain(Number.POSITIVE_INFINITY)).toBe(0);
+    expect(sVolumeToOutputGain('loud')).toBe(0);
+    expect(sVolumeToOutputGain(undefined)).toBe(0);
+    // Legacy old-scale 0.8 is treated as normalized: quiet 0.04, never 0.8*0.05*0.05.
+    expect(sVolumeToOutputGain(0.8)).toBeCloseTo(0.04, 9);
+    expect(clampNormalizedVolume(0.8)).toBeCloseTo(0.8, 9);
+  });
+
+  it('console coercion flows through the same capped mapping', () => {
+    setCVarFromString('s_volume', '3');
+    expect(sVolumeToOutputGain(getCVarNumber('s_volume'))).toBeCloseTo(0.05, 9);
+    setCVarFromString('s_volume', 'not-a-number');
+    expect(sVolumeToOutputGain(getCVarNumber('s_volume'))).toBe(0);
+    setCVar('s_volume', 0);
+    expect(sVolumeToOutputGain(getCVarNumber('s_volume'))).toBe(0);
   });
 });

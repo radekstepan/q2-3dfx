@@ -61,7 +61,9 @@ export const ALLOW: Record<string, string[]> = {
   // Harness only, never shipped: may use anything except apps/*.
   testkit: ['*'],
   input: ['config'],
-  sound: [],
+  // RELEASE-1: sound reads s_volume scale + Com_Error from config (leaf,
+  // acyclic — config deps: none). Table was stale, not the code.
+  sound: ['config'],
 };
 
 const APP_OWNERS = ['app:web', 'app:devtools'];

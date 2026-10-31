@@ -465,6 +465,12 @@ neighbors green: testkit `gpu-presentation` 9/10 (1 env-skip; small-viewport leg
 changesets: `release-3-aim-hud.md` rewritten for the fit repair (web ignored; no versioned package touched). No perf-ledger row: display-CSS only, no raster/frame-time change.
 follow-ups left visible (not RELEASE-3 blockers): RELEASE-1/2 acceptance review, RELEASE-4/5 gameplay, FOLLOW-3B water, RELEASE-6/7/8, FOLLOW-5/6/7.
 
+### RELEASE-1 — Quiet, capped volume scale — DONE 2026-10-30
+owns: `packages/config`, `packages/sound`, `apps/web` · depends: none
+lane report (config+sound lane + integrator web blip): `s_volume` default 1 = output 0.05, max capped at 0.05, single scale point documented; `Mixer.mix()` is the single 0.05 application, per-channel clamped, mute preserved, attenuation intact; `blip()` now uses shared `sVolumeToOutputGain` (fail-muted). `sound→config` gate fixed via ALLOW (leaf, acyclic) — `deps:check` green.
+evidence: config 16/16 (incl. 4 new mapping/clamp/console tests), sound 13/13 (actual `mix()` gains ≈0.05, overlapping combat, near>far), web sound 14/14 + aim-hud 7/7, typecheck clean.
+changesets: `release-1-quiet-volume.md` (`@q2/config` patch + web blip; asset-cooker gate fix needs no version). No perf-ledger row: test-only + menu-blip gain (no frame-time change).
+
 ### RELEASE-3B — Verify blaster offset is intended muzzle parallax — DONE 2026-10-30
 owns: `apps/web`, `packages/game`, `packages/server`, `packages/webgl-renderer`, `packages/testkit` · depends: RELEASE-3 (archived)
 lane report (single writer, web-only test addition, no production edits to preserve display-fit/sky): all 3 done-when boxes evidenced with actual production bolts, not eye-ray stubs.

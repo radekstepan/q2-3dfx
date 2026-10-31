@@ -1,7 +1,6 @@
 ---
-"@q2/config": patch
-"@q2/sound": patch
-"web": patch
+'@q2/config': patch
+'web': patch
 ---
 
-RELEASE-1 quiet capped volume: s_volume default 1 maps to 0.05 output, single scale point in mix() with blip/menu audit.
+RELEASE-1 quiet volume: config-side regression for 1→0.05 mapping, clamping and legacy handling; web menu blips ride the shared capped helper (fail-muted). Deps gate: allow sound→config cvar reads (leaf, acyclic).

@@ -322,15 +322,6 @@ Expensive browser tests and benchmarks run sequentially. Intermediate targeted
 passes are not full-suite acceptance. Archive completed cards with evidence;
 commit validated implementation increments with changesets, no push.
 
-### RELEASE-1 — Quiet, capped volume scale
-owns: `packages/config`, `packages/sound`, `apps/web`
-depends: none
-status: review
-done-when:
-- [ ] Verify the landed replacement of the old `s_volume` default of 0.8 with the requested quiet level. Interpret the new normalized scale as 0..1 mapping to old gain 0..0.05: new default 1 equals old 0.05, and new maximum 1 cannot exceed old 0.05. Document this mapping so the old gain is not multiplied by 0.05 twice.
-- [ ] Clamp finite values and handle invalid/legacy configuration at the audio boundary; audit mixer, browser nodes, fallback sounds and menu help so no route bypasses the cap. Preserve positional attenuation and mute.
-- [ ] Verify default, zero, max, out-of-range and invalid settings, including overlapping combat sounds; demonstrate actual output gain, not only the cvar value.
-
 ### RELEASE-2 — Render the asset-free demo room in WebGL2
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
 depends: none
