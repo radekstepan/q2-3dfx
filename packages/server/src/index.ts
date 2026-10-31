@@ -319,6 +319,17 @@ export interface ServerState {
   playerHealth: number;
   playerMaxHealth: number;
   /**
+   * P_DamageFeedback totals for the driver (game/p_view.c): applied damage
+   * since the last drain plus the latest attacker origin (`damage_from`).
+   * The server records; the driver drains per tick via
+   * SV_DrainPlayerDamage and runs the blend/kick arithmetic. Additive: all
+   * previous callers keep working, new ones pass `from` for directional
+   * kicks. World damage (drowning/sizzle, C `vec3_origin`) records no
+   * direction — C's zero-vector normalize then yields a directionless kick.
+   */
+  lastPlayerDamage: number;
+  lastPlayerDamageFrom: Vec3 | null;
+  /**
    * P_WorldEffects drowning state (game/p_view.c): air supply, damage ramp,
    * 1s drown debounce, enter/exit sound latch, lava burn-sound debounce.
    * Ticked in SV_GameTick from the sampled waterlevel; the driver never
@@ -423,7 +434,7 @@ export interface ServerState {
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], timerRand: mulberry32(0x71E4), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0, lastPlayerShotAt: -10 };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], timerRand: mulberry32(0x71E4), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0, lastPlayerShotAt: -10, lastPlayerDamage: 0, lastPlayerDamageFrom: null };
 }
 
 /**
@@ -3665,12 +3676,32 @@ export function SV_AddBarrel(
   return b;
 }
 
-/** T_Damage on the player pool (g_combat.c easy-half scaling owned here). */
-export function SV_DamagePlayer(st: ServerState, dmg: number): number {
+/**
+ * T_Damage on the player pool (g_combat.c easy-half scaling owned here).
+ * Records the applied total + latest attacker origin for the driver's
+ * P_DamageFeedback port (drain via SV_DrainPlayerDamage). `from` is the
+ * C `damage_from` point (attacker origin); omit it for world damage.
+ */
+export function SV_DamagePlayer(st: ServerState, dmg: number, from?: Vec3 | null): number {
   if (st.playerHealth <= 0) return 0;
   const applied = Math.max(1, Math.round(dmg * skillMultiplier(st.skill)));
   st.playerHealth = Math.max(0, st.playerHealth - applied);
+  st.lastPlayerDamage += applied;
+  if (from) st.lastPlayerDamageFrom = v3(from[0], from[1], from[2]);
   return applied;
+}
+
+/**
+ * Drain the recorded player-damage totals (one-shot pump, like the muzzle
+ * / tracer drains): returns the applied sum + latest attacker origin since
+ * the last drain, or null when nothing landed. Clears both fields.
+ */
+export function SV_DrainPlayerDamage(st: ServerState): { amount: number; from: Vec3 | null } | null {
+  if (!(st.lastPlayerDamage > 0)) return null;
+  const out = { amount: st.lastPlayerDamage, from: st.lastPlayerDamageFrom };
+  st.lastPlayerDamage = 0;
+  st.lastPlayerDamageFrom = null;
+  return out;
 }
 
 /** Heal (pickup path writes back through here; clamped to the max pool). */
@@ -4002,7 +4033,7 @@ export function SV_RadiusDamage(
   if (pd < radius && canDamage(pcenter)) {
     // The attacker (us, who shot the barrel) takes half damage.
     const atk = radiusDamageAttackerPoints(radiusDamagePoints(dmg, pd));
-    if (atk > 0) SV_DamagePlayer(st, Math.max(1, Math.round(atk)));
+    if (atk > 0) SV_DamagePlayer(st, Math.max(1, Math.round(atk)), pos);
   }
   for (const b of st.barrels) {
     if (b.edict.freed) continue;
@@ -4259,7 +4290,7 @@ function resolveMonsterFire(
   // to the gunfire branches below with the guns' real sounds.
   if (m.kind === 'infantry' && move === 'attack2') {
     if (dist < 96) {
-      SV_DamagePlayer(st, infantryMeleeDamage(rand));
+      SV_DamagePlayer(st, infantryMeleeDamage(rand), m.edict.origin);
       st.sounds.push({ name: INFANTRY_MELEE_SOUND, pos: chest, born: st.time });
     }
     return;
@@ -4315,7 +4346,7 @@ function resolveMonsterFire(
     st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(shotDir[0], shotDir[1], shotDir[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
     st.sounds.push({ name: INFANTRY_GUN_SOUND, pos: chest, born: st.time });
     if (rand() < pHit) {
-      SV_DamagePlayer(st, INFANTRY_C.bulletDamage);
+      SV_DamagePlayer(st, INFANTRY_C.bulletDamage, m.edict.origin);
       st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
     }
     return;
@@ -4330,7 +4361,7 @@ function resolveMonsterFire(
     st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
     st.sounds.push({ name: SOLDIER_WEAPON_STATS.machinegun.sound, pos: chest, born: st.time });
     if (rand() < pHit) {
-      SV_DamagePlayer(st, SOLDIER_WEAPON_STATS.machinegun.damage);
+      SV_DamagePlayer(st, SOLDIER_WEAPON_STATS.machinegun.damage, m.edict.origin);
       st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
     }
     return;
@@ -4344,7 +4375,7 @@ function resolveMonsterFire(
   st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
   st.sounds.push({ name: sound, pos: chest, born: st.time });
   if (rand() < pHit) {
-    SV_DamagePlayer(st, dmg);
+    SV_DamagePlayer(st, dmg, m.edict.origin);
     st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
   }
 }
@@ -4511,7 +4542,7 @@ function stepBoltFlight(
       if (tPlayer !== null && tPlayer < tWall - eps && (tMonster === null || tPlayer <= tMonster) && (tBarrel === null || tPlayer <= tBarrel)) {
         // Foe bolt vs player (g_weapon.c blaster_touch takedamage branch):
         // T_Damage only, no temp entity — C sends no TE_BLASTER here.
-        if (st.playerHealth > 0) SV_DamagePlayer(st, bolt.damage);
+        if (st.playerHealth > 0) SV_DamagePlayer(st, bolt.damage, bolt.pos);
         dead = true;
       } else if (hitMonster !== null && tMonster !== null && tMonster < tWall - eps && (tBarrel === null || tMonster <= tBarrel) && (tCorpse === null || tMonster <= tCorpse)) {
         // Player bolt vs monster flesh: T_Damage only, no TE_BLASTER (C).

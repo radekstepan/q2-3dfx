@@ -18,6 +18,7 @@ import {
   buildHelpLayout,
   centerPrintPlacement,
   fillRect,
+  fillRectAlpha,
   helpIconFor,
   HELP_ICON_PIC,
   lerpAngle,
@@ -37,7 +38,6 @@ import {
   STAT_PICKUP_STRING,
   STAT_TIMER,
   STAT_HELPICON,
-  STAT_FLASHES,
 } from '@q2/client';
 import {
   SoftwareRenderer,
@@ -73,6 +73,18 @@ import {
   skinForWeaponModel,
   HITSCAN_TRACER_COLOR,
   deadsoldierFrameForSpawnflags,
+  DAMAGE_TIME,
+  accumulateDamageAlpha,
+  decayDamageAlpha,
+  mixDamageBlend,
+  damageKickAngles,
+  decayDamageKick,
+  velocityLean,
+  bobLean,
+  DEATH_PITCH,
+  DEATH_ROLL,
+  FLASH_HEALTH,
+  FLASH_ARMOR,
 } from '@q2/game';
 import type {
   PmoveState,
@@ -100,6 +112,7 @@ import {
   SV_PlayerFire,
   SV_UseButton,
   SV_DamagePlayer,
+  SV_DrainPlayerDamage,
   SV_SetPlayerHealth,
   SV_SetPlayerSuit,
   SV_DrainMuzzles,
@@ -1234,6 +1247,33 @@ export class LocalDriver implements HostDriver {
   private bobfracsin = 0;
   /** Previous-tick view angles for the turn-lag term (oldviewangles). */
   private oldview: Vec3 = v3();
+  /**
+   * P_DamageFeedback + SV_CalcBlend driver state (game/p_view.c), derived
+   * from the authoritative server pool via SV_DrainPlayerDamage each tick:
+   * - `dmgAlpha`/`dmgBlend`: the screen-blend wash (SV_AddBlend damage
+   *   term), decayed 0.06 per 10Hz tick like SV_CalcBlend. Rendered once
+   *   per frame as a 2D overlay in drawPlayHud (world only — HUD text
+   *   paints after, unblended, like id's post-render 2D pass). The frozen
+   *   RefDef contract carries no blend channel, so this deliberately stays
+   *   out of the renderer submissions instead of widening §5.
+   * - `vDmgPitch`/`vDmgRoll`/`vDmgTime`: the directional view kick,
+   *   decayed over DAMAGE_TIME in SV_CalcViewOffset fashion.
+   * - `flashHealth`/`flashArmor`: this tick's STAT_FLASHES latch (C sets
+   *   the bits from the frame's damage totals, then clears the totals —
+   *   so a flash reads for exactly one tick). Cleared at the top of the
+   *   next step; low-health blinking (no recent hit) is separate and keeps
+   *   working with the latch clear.
+   * The sim absorbs full damage into health (no CheckArmor port), so live
+   * contributions are blood-only red; the armor/white + power/green mix is
+   * ported in @q2/game and unit-pinned for a future absorption port.
+   */
+  private dmgAlpha = 0;
+  private dmgBlend: [number, number, number] = [0, 0, 0];
+  private vDmgPitch = 0;
+  private vDmgRoll = 0;
+  private vDmgTime = -10;
+  private flashHealth = false;
+  private flashArmor = false;
   /** Player death/respawn. */
   private deadUntil = -1;
   private spawnPoints: Array<{ origin: Vec3; yaw: number }> = [];
@@ -1343,6 +1383,13 @@ export class LocalDriver implements HostDriver {
     // via viewKick() during the last tick (compute-then-clear ordering), so
     // a kick is visible for exactly one 10Hz tick.
     this.kickPending = false;
+    // P_DamageFeedback/SV_CalcBlend per-tick decay (game/p_view.c): the
+    // screen-blend wash fades 0.06 per 10Hz tick, and the STAT_FLASHES latch
+    // lives exactly one tick (C recomputes the bits from each frame's fresh
+    // damage totals, then clears them).
+    this.dmgAlpha = decayDamageAlpha(this.dmgAlpha);
+    this.flashHealth = false;
+    this.flashArmor = false;
     // Previous tick's final angles (id oldviewangles): copied BEFORE this
     // tick's cmd overwrites pm.viewAngles, so gunAnglesDelta() reads the
     // real per-tick turn delta after the step (C computes gun angles before
@@ -1575,8 +1622,15 @@ export class LocalDriver implements HostDriver {
    * Mirror the authoritative server health pool into HUD state, synthesizing
    * the pain/death edges the old driver-side damage path used to emit
    * (pain event + sound, death event + message + 2s respawn timer).
+   *
+   * P_DamageFeedback runs first (drain + blend/kick/flash update): C
+   * applies feedback at the end of the same server frame that took the
+   * damage, so the drain must pair with every health mirror — both the
+   * per-tick drain below and the direct damagePlayer path funnel through
+   * here exactly once per call.
    */
   private syncHealthFromServer(): void {
+    this.consumeDamageFeedback();
     const h = this.server.playerHealth;
     if (h < this.ps.health) {
       this.ps.health = h;
@@ -1585,9 +1639,13 @@ export class LocalDriver implements HostDriver {
         // C P_DamageFeedback pain band (p_view.c): health<25→25, <50→50,
         // <75→75 else 100; r = 1+(rand&1); the `*` is the C client
         // sexed-sound prefix, resolved here to the default male lump.
-        const l = h < 25 ? 25 : h < 50 ? 50 : h < 75 ? 75 : 100;
-        const r = 1 + ((this.rand() * 2) | 0);
-        this.emitSound(`player/male/pain${l}_${r}.wav`, v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
+        // C suppresses the sound under FL_GODMODE / invulnerability
+        // (the pain event/anim edge above still fires).
+        if (!(this.server.time < this.ps.invulnUntil)) {
+          const l = h < 25 ? 25 : h < 50 ? 50 : h < 75 ? 75 : 100;
+          const r = 1 + ((this.rand() * 2) | 0);
+          this.emitSound(`player/male/pain${l}_${r}.wav`, v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
+        }
       }
     } else if (h > this.ps.health) {
       this.ps.health = h;
@@ -1606,6 +1664,83 @@ export class LocalDriver implements HostDriver {
       this.emitSound(snd, v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!));
       this.deadUntil = this.server.time + 2;
     }
+  }
+
+  /**
+   * P_DamageFeedback-lite (game/p_view.c) from the server's recorded totals:
+   * STAT_FLASHES latch, damage-alpha accumulation, blend-color overwrite and
+   * directional-kick arming. Runs once per health mirror (see above), mirroring
+   * C's once-per-server-frame application. Knockback is proxied by the applied
+   * damage (the sim tracks no separate knockback impulse; C bullet kicks scale
+   * with damage the same way). The kick is skipped once dead (C `health > 0`
+   * gate); flashes + blend still land on the lethal hit, like C.
+   */
+  private consumeDamageFeedback(): void {
+    const hit = SV_DrainPlayerDamage(this.server);
+    if (!hit || !(hit.amount > 0)) return;
+    const amount = hit.amount;
+    // STAT_FLASHES: blood bit always; the armor bit needs absorbed armor
+    // (CheckArmor is not ported — the sim takes full damage to health, so
+    // the live path stays blood-only and the bit stays clear; the white mix
+    // itself is ported + pinned in @q2/game for that future port).
+    this.flashHealth = true;
+    this.flashArmor = false;
+    // Blend wash: alpha accumulates (clamped), color overwrites with this
+    // hit's mix — exactly C's `damage_alpha +=` / `VectorCopy(damage_blend)`.
+    this.dmgAlpha = accumulateDamageAlpha(this.dmgAlpha, amount, 0, 0);
+    const mixed = mixDamageBlend(amount, 0, 0);
+    this.dmgBlend = [mixed[0], mixed[1], mixed[2]];
+    // Directional kick from `damage_from` vs the body origin (C uses the
+    // feet origin, not the eye). Unknown/world damage (null) still arms the
+    // window with zero angles — C's zero-vector normalize.
+    let dir: [number, number, number] | null = null;
+    if (hit.from) {
+      const dx = hit.from[0]! - this.pm.origin[0]!;
+      const dy = hit.from[1]! - this.pm.origin[1]!;
+      const dz = hit.from[2]! - this.pm.origin[2]!;
+      const len = Math.hypot(dx, dy, dz);
+      if (len > 1e-9) dir = [dx / len, dy / len, dz / len];
+    }
+    const fwd = v3();
+    const right = v3();
+    const up = v3();
+    AngleVectors(this.pm.viewAngles, fwd, right, up);
+    const kick = damageKickAngles(amount, this.server.playerHealth, amount, dir, fwd, right);
+    if (kick) {
+      this.vDmgPitch = kick.pitch;
+      this.vDmgRoll = kick.roll;
+      this.vDmgTime = this.server.time + DAMAGE_TIME;
+    }
+  }
+
+  /**
+   * This tick's STAT_FLASHES bits (P_DamageFeedback producer for the
+   * statusbar program): bit 0 blood, bit 1 armor. Live exactly one tick
+   * (cleared at the top of the next step); a low-health blink with no fresh
+   * hit reads 0 here, which is what distinguishes the just-hit `field_3`
+   * flash from the `(serverframe>>2)&1` low-value blink downstream.
+   */
+  damageFlashes(): number {
+    return (this.flashHealth ? FLASH_HEALTH : 0) | (this.flashArmor ? FLASH_ARMOR : 0);
+  }
+
+  /**
+   * Current screen-blend wash (P_DamageFeedback color + SV_CalcBlend alpha
+   * decay), 0..255 channels with 0..1 alpha; null once fully faded. Painted
+   * once per frame at the top of drawPlayHud (world only — HUD paints
+   * after, unblended). Pure read: rendering never mutates the state, so
+   * sharing the frame between the CPU and GPU builders cannot double-apply.
+   * Sub-1/255 alphas read null: float dust from the 0.06 decay (C keeps it
+   * in the field too) can never move a destination channel by a whole bit.
+   */
+  damageOverlay(): { r: number; g: number; b: number; a: number } | null {
+    if (!(this.dmgAlpha > 1 / 255)) return null;
+    return {
+      r: this.dmgBlend[0]! * 255,
+      g: this.dmgBlend[1]! * 255,
+      b: this.dmgBlend[2]! * 255,
+      a: this.dmgAlpha,
+    };
   }
 
   /**
@@ -2114,19 +2249,54 @@ export class LocalDriver implements HostDriver {
   }
 
   /**
-   * Firing view kick (HostDriver pairing, exact shape): p_weapon.c sets
-   * kickOrigin = -2*fwd and kickAngles = [-1,0,0] (blaster) / [-2,0,0]
-   * (shotgun); SV_CalcViewOffset adds kick_angles to the view. Non-null for
-   * exactly the one 10Hz tick that fired, then null (cleared at the top of
-   * the next step). The host adds `angles` to its view and `origin` to the
-   * view offset; gunAnglesDelta (sway) stays separate.
+   * Camera kick for the frame (HostDriver pairing): the C `ps.kick_angles`
+   * equivalent — firing kick (p_weapon.c, exactly one 10Hz tick) PLUS the
+   * P_DamageFeedback directional kick decayed over DAMAGE_TIME PLUS the
+   * SV_CalcViewOffset velocity lean (run_pitch/run_roll, unclamped) and bob
+   * lean (duck x6, roll flipped on odd bob cycles). The host adds `angles`
+   * to its view and `origin` to the view offset; gunAnglesDelta (sway) stays
+   * gun-only — weapon sway is NOT camera lean. Null when the total is
+   * exactly zero (idle still-life), so the old one-tick firing contract
+   * reads unchanged at rest. Pure read: rendering never mutates feedback
+   * state, so the CPU + GPU builders sharing a tick cannot double-apply.
+   *
+   * Aim consistency: the sim fires from the unleaned pm.viewAngles — lean
+   * is render-only, exactly like C (kick_angles enter in CL_CalcViewValues
+   * at render time, never into v_angle). The crosshair stays centered.
    */
   viewKick(): { angles: [number, number, number]; origin: [number, number, number] } | null {
-    if (!this.kickPending) return null;
-    return {
-      angles: [this.kickAngles[0]!, this.kickAngles[1]!, this.kickAngles[2]!],
-      origin: [this.kickOrigin[0]!, this.kickOrigin[1]!, this.kickOrigin[2]!],
-    };
+    // Dead: C's deadflag branch poses the camera (pitch -15, roll 40, yaw
+    // = killer_yaw — untracked here, so yaw holds) with no kick or lean.
+    // Additive hook, so return the delta from the current base view.
+    if (this.playerDead) {
+      const base = this.pm.viewAngles;
+      const dp = DEATH_PITCH - base[0]!;
+      const dr = DEATH_ROLL - base[2]!;
+      if (dp === 0 && dr === 0) return null;
+      return { angles: [dp, 0, dr], origin: [0, 0, 0] };
+    }
+    const fwd = v3();
+    const right = v3();
+    const up = v3();
+    AngleVectors(this.pm.viewAngles, fwd, right, up);
+    const dk = decayDamageKick(this.vDmgPitch, this.vDmgRoll, this.vDmgTime, this.server.time);
+    const vel = this.pm.velocity;
+    const vl = velocityLean(vel, fwd, right);
+    const ducked = (this.pm.pmFlags & PMF_DUCKED) !== 0;
+    const xyspeed = Math.hypot(vel[0]!, vel[1]!);
+    const bl = bobLean(xyspeed, this.bobfracsin, this.bobcycle, ducked);
+    const fa = this.kickPending ? this.kickAngles : null;
+    const fo = this.kickPending ? this.kickOrigin : null;
+    // C kick_angles has no yaw component from damage/velocity/bob (damage
+    // kicks pitch+roll only; lean is pitch+roll): yaw is the firing kick's.
+    const pitch = (fa ? fa[0]! : 0) + dk.pitch + vl.pitch + bl.pitch;
+    const yaw = fa ? fa[1]! : 0;
+    const roll = (fa ? fa[2]! : 0) + dk.roll + vl.roll + bl.roll;
+    const ox = fo ? fo[0]! : 0;
+    const oy = fo ? fo[1]! : 0;
+    const oz = fo ? fo[2]! : 0;
+    if (pitch === 0 && yaw === 0 && roll === 0 && ox === 0 && oy === 0 && oz === 0) return null;
+    return { angles: [pitch, yaw, roll], origin: [ox, oy, oz] };
   }
 
   /**
@@ -2525,10 +2695,11 @@ export class LocalDriver implements HostDriver {
   /** Apply damage to the player; death parks a 2s respawn timer. */
   damagePlayer(dmg: number, from?: Vec3 | [number, number, number]): void {
     if (this.playerDead || this.exited) return;
-    void from;
     // Authoritative pool lives server-side (skill-scaled there); the driver
-    // only mirrors it and synthesizes the pain/death edges.
-    SV_DamagePlayer(this.server, dmg);
+    // only mirrors it and synthesizes the pain/death edges. `from` is C's
+    // `damage_from` for the directional kick (server records it for the
+    // per-tick drain in syncHealthFromServer).
+    SV_DamagePlayer(this.server, dmg, from ? v3(from[0], from[1], from[2]) : null);
     this.syncHealthFromServer();
   }
 
@@ -2544,6 +2715,15 @@ export class LocalDriver implements HostDriver {
     this.pm.velocity = v3();
     SV_SetPlayerHealth(this.server, this.ps.maxHealth);
     this.ps.health = this.ps.maxHealth;
+    // RELEASE-14 reset: a new life clears the damage-feedback state outright
+    // (blend, kick window, flash latch) instead of letting it decay out.
+    this.dmgAlpha = 0;
+    this.dmgBlend = [0, 0, 0];
+    this.vDmgPitch = 0;
+    this.vDmgRoll = 0;
+    this.vDmgTime = -10;
+    this.flashHealth = false;
+    this.flashArmor = false;
     // C p_client.c respawn: breather/enviro framenums clear with the rest.
     this.ps.breatherUntil = 0;
     this.ps.enviroUntil = 0;
@@ -5322,10 +5502,10 @@ export function statusbarStateFor(boot: PlayBoot): StatusbarState {
     hasAmmoRow ? 2 : 0, ammoCount,
     armorIcon ? 4 : 0, d.ps.armor,
     6, 0, 0, 0, 0, helpPic ? 11 : 0,
-    0, 0, 0, 0,
+    0, 0, 0, d.damageFlashes(),
   ];
   void STAT_SELECTED_ICON; void STAT_PICKUP_ICON; void STAT_PICKUP_STRING;
-  void STAT_TIMER; void STAT_HELPICON; void STAT_FLASHES;
+  void STAT_TIMER; void STAT_HELPICON;
   void STAT_AMMO; void STAT_ARMOR; void STAT_HEALTH;
   void HELP_ICON_PIC;
   return {
@@ -5528,6 +5708,16 @@ export function drawPlayHud(
   boot: PlayBoot,
   hud: HudState,
 ): void {
+  // RELEASE-14 damage blend (P_DamageFeedback color + SV_CalcBlend alpha):
+  // fullscreen translucent wash FIRST — id blends the 3D view inside the
+  // renderer and draws every 2D element (crosshair, statusbar, text) after,
+  // unblended. This is the single application point for both the CPU
+  // resolve path and the GPU overlay path (paintHudOverlay funnels through
+  // here), so the wash can never apply twice in one frame.
+  const dmg = boot.driver.damageOverlay();
+  if (dmg) {
+    fillRectAlpha(target, 0, 0, target.width, target.height, dmg.r, dmg.g, dmg.b, dmg.a);
+  }
   // In-canvas readouts first, so later HUD rows paint over them on tiny
   // buffers instead of the reverse.
   if (fpsVisible() && Number.isFinite(hud.fps) && hud.fps > 0) {

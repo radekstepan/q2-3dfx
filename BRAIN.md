@@ -356,11 +356,11 @@ done-when:
 ### RELEASE-14 — Source-faithful damage feedback and strafe view roll
 owns: `packages/game`, `packages/server`, `packages/client`, `apps/web`, `packages/webgl-renderer`, `packages/renderer-api`
 depends: none
-status: ready
+status: done (repaired 2026-10-31; see docs/tasks-archive.md RELEASE-14 entry)
 done-when:
-- [ ] Port/audit original `p_view.c: P_DamageFeedback` and `p_hud.c` damage flashes: health-number flash, damage color/alpha blend, decay and directional view kick. Cover armor/blood contributions, repeated hits, immunity/death and reset. Distinguish low-health blinking from a just-hit flash; render feedback on Software and WebGL2.
-- [ ] Compare `SV_CalcRoll`/`SV_CalcViewOffset` lateral-velocity roll and bob with the actual submitted camera. Weapon sway is not camera lean. Verify magnitude, sign, speed clamp, grounded/air/water cases and decay against source, including aim/crosshair consistency.
-- [ ] Use deterministic damage and strafe sequences with pixel/camera evidence at multiple resolutions; keep HUD readable and avoid applying blend/kick twice. Any shared contract changes follow §5.
+- [x] Port/audit original `p_view.c: P_DamageFeedback` and `p_hud.c` damage flashes: health-number flash, damage color/alpha blend, decay and directional view kick. Cover armor/blood contributions, repeated hits, immunity/death and reset. Distinguish low-health blinking from a just-hit flash; render feedback on Software and WebGL2.
+- [x] Compare `SV_CalcRoll`/`SV_CalcViewOffset` lateral-velocity roll and bob with the actual submitted camera. Weapon sway is not camera lean. Verify magnitude, sign, speed clamp, grounded/air/water cases and decay against source, including aim/crosshair consistency.
+- [x] Use deterministic damage and strafe sequences with pixel/camera evidence at multiple resolutions; keep HUD readable and avoid applying blend/kick twice. Any shared contract changes follow §5.
 
 ### RELEASE-15 — Underwater view distortion and transitions
 owns: `packages/client`, `apps/web`, `packages/webgl-renderer`, `packages/sw-renderer`, `packages/renderer-api`, `packages/testkit`

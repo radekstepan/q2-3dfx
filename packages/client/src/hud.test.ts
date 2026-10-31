@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createFramebuffer } from '@q2/renderer-api';
-import { drawChar, drawString, fillRect, getConcharsFont, makeConcharsFont, stringWidth } from './hud.js';
+import { drawChar, drawString, fillRect, fillRectAlpha, getConcharsFont, makeConcharsFont, stringWidth } from './hud.js';
 
 describe('conchars HUD text renderer', () => {
   it('font is deterministic and non-blank', () => {
@@ -88,5 +88,18 @@ describe('conchars HUD text renderer', () => {
     let count = 0;
     for (const v of fb.color) if (v === 0xff112233) count++;
     expect(count).toBe(16);
+  });
+  it('fillRectAlpha composites red at 0.2 over black like the damage floor', () => {
+    const fb = createFramebuffer(4, 4, false);
+    fb.color.fill(0xff000000);
+    fillRectAlpha(fb, 0, 0, 4, 4, 255, 0, 0, 0.2);
+    // 255*0.2 = 51 = 0x33 in the R lane (0xAABBGGRR), alpha stays opaque.
+    expect(fb.color[0]).toBe(0xff000033);
+  });
+  it('fillRectAlpha with zero alpha leaves the buffer untouched', () => {
+    const fb = createFramebuffer(4, 4, false);
+    fb.color.fill(0xff445566);
+    fillRectAlpha(fb, 0, 0, 4, 4, 255, 0, 0, 0);
+    expect(fb.color[0]).toBe(0xff445566);
   });
 });

@@ -266,6 +266,49 @@ export function fillRect(
   }
 }
 
+/**
+ * Alpha-composite a solid color rect over the buffer (SRC_OVER, per
+ * channel, rounded + clamped; destination alpha stays opaque). Used for
+ * the P_DamageFeedback screen blend: id's `SV_AddBlend` damage term is a
+ * fullscreen translucent wash, and the 2D HUD path has no other way to
+ * apply it without widening the frozen RefDef contract.
+ */
+export function fillRectAlpha(
+  fb: Framebuffer | BlitSurface,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+  g: number,
+  b: number,
+  alpha: number,
+): void {
+  if (!(alpha > 0)) return;
+  const a = Math.min(1, alpha);
+  const s = toSurface(fb);
+  const x0 = Math.max(0, x);
+  const y0 = Math.max(0, y);
+  const x1 = Math.min(s.width, x + w);
+  const y1 = Math.min(s.height, y + h);
+  const sr = Math.max(0, Math.min(255, Math.round(r)));
+  const sg = Math.max(0, Math.min(255, Math.round(g)));
+  const sb = Math.max(0, Math.min(255, Math.round(b)));
+  for (let py = y0; py < y1; py++) {
+    const row = py * s.width;
+    for (let px = x0; px < x1; px++) {
+      const dst = s.color[row + px]!;
+      const dr = dst & 255;
+      const dg = (dst >> 8) & 255;
+      const db = (dst >> 16) & 255;
+      const or = Math.min(255, Math.round(sr * a + dr * (1 - a)));
+      const og = Math.min(255, Math.round(sg * a + dg * (1 - a)));
+      const ob = Math.min(255, Math.round(sb * a + db * (1 - a)));
+      s.color[row + px] = 0xff000000 | (ob << 16) | (og << 8) | or;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Asset-based HUD blitting (RELEASE-6): 8-bit `pics/*.pcx` art expanded
 // through the game palette. `drawPic` is the `re.DrawPic` equivalent for

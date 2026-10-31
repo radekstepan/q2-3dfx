@@ -32,6 +32,7 @@ export {
   drawString,
   stringWidth,
   fillRect,
+  fillRectAlpha,
   drawPic,
   formatField,
   drawField,
