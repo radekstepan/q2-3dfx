@@ -2,8 +2,8 @@
 // shader/sampling fix + unit/pixel evidence; browser captures ride the
 // integrator lane in apps/web + testkit).
 //
-// Demonstrated cause (recorded from real base1 before the fix; Q2_PAK leg
-// below re-proves it on retail art):
+// Demonstrated cause, first half (recorded from real base1 before the fix;
+// the Q2_PAK leg below re-proves it on retail art):
 //   map base1, water material textures/e1u1/bluwter.wal (all 102 turbulent
 //   faces share one 64x64 WAL, texId 11), faces 117/118 share world pos
 //   [448,1280,-252] with IDENTICAL uv [448,-1280] and lux [16,0] —
@@ -24,6 +24,27 @@
 // voodooSampleMippedWarped (warp offsets only the tap; diffuse wrap,
 // lighting, mip chain and animation unchanged) + highp in FS_LIT
 // (FS_APPEARANCE parity).
+//
+// Demonstrated cause, second half (GPU-FOLLOW-3B lane finding, 2026-10-31):
+// the FS_LIT lightmap multiply on TURBULENT water. Both references draw
+// warp faces UNLIT — ref_soft R_BuildPolygonFromSurface serves SURF_WARP
+// faces raw texels to R_DrawSpanletTurbulentBlended66 (no surface cache,
+// no lightmap, no colormap), and ref_gl R_RenderBrushPoly says "warp
+// texture, no lightmaps" (flat gray, opaque and alpha paths alike). But the
+// GPU multiplied every turbulent tap by its per-face baked block, and
+// adjacent base1 water faces carry hugely different baked values at shared
+// edges (measured: 134 coplanar shared edges, 130 with steps >8/255, mean
+// step 134, max 247 at faces 1215/1219; e.g. face 117 edge luxel
+// [120,60,12] vs coplanar neighbour 174 [255,220,140] at the same world
+// vertex). Diffuse UVs are bit-identical at all 149 shared verts and
+// REPEAT sampling is continuous, so the lightmap was the only
+// boundary-discontinuous term — it drew grid seams along every
+// water-face boundary. (Faces 117/118 are the exception that hid it: a
+// coincident up/down double sheet with identical baked blocks.)
+// Fix (production): warp-gated unlit branch in FS_LIT (col = texel; no
+// lm/dyn/overbright on the uWarpOn path). Non-turbulent translucent glass
+// stays lit — both refs light it. Motion, mipmapping, transparency and
+// texture scale are untouched.
 //
 // Regression shape (formula mirrors alone are insufficient per review):
 // sampled pixels across repeat/face boundaries at multiple times, with an
@@ -46,6 +67,7 @@ import {
   warpPhaseFor,
   warpTableValue,
   warpUv,
+  type MipLevelRGB,
 } from './appearance.js';
 import { expandPaletteTexture, packLightAtlas, TRANS66_ALPHA } from './worldMesh.js';
 import { buildFullWorldStore } from './worldMesh.js';
@@ -53,6 +75,50 @@ import { FS_LIT } from './shaders.js';
 
 /** Times probed (level-time seconds; 15.984375/16.0 straddle turb phase wrap 1023->0). */
 const TIMES = [0, 0.5, 1.5, 7.25, 15.984375, 16.0, 33.3125];
+
+/**
+ * View-distance proxy sweep (GPU-FOLLOW-3B unlit-water leg): the shader's
+ * only view-dependent water inputs are rho (fwidth of the unwarped UVs)
+ * and the Bayer pick phase, so sweeping rho 0.75..6 (LOD ~0..3 at the
+ * pinned bias) plus all 16 dither phases covers stationary + moving views
+ * without a GL context. Camera geometry beyond rho only selects faces.
+ */
+const WATER_RHOS = [0.75, 1.5, 3, 6];
+
+/**
+ * Fixed-path FS_LIT turbulent mirror (GPU-FOLLOW-3B): unwarped LOD, warped
+ * REPEAT tap, UNLIT (no lightmap, no dlights, no overbright). Source-pinned
+ * by the 'turbulent water is unlit' shader test below.
+ */
+function sampleWaterFixed(
+  chain: MipLevelRGB[], maxLevel: number,
+  u: number, v: number, t: number, rho: number, px: number, py: number,
+): [number, number, number] {
+  const lod = mipLevelFor(rho, PINNED_LOD_BIAS, maxLevel, true);
+  const lvl = pickMipLevelFor(lod, px, py, true, maxLevel);
+  const [wu, wv] = warpUv(u, v, t);
+  const m = chain[lvl]!;
+  const s = m.w / 64;
+  return sampleLevelBilinearRepeat(m.data, m.w, m.h, wu * s, wv * s);
+}
+
+/**
+ * Pre-fix FS_LIT turbulent mirror (the injected seam control): the same
+ * tap multiplied by a per-face baked light with overbright x2 + clamp
+ * (vd_overbright=1 default), no dlights. Feeding the fixed and broken
+ * variants through the SAME continuity assertion proves the test is
+ * seam-sensitive: the broken variant must exceed the bar the fixed path
+ * clears.
+ */
+function sampleWaterLit(
+  chain: MipLevelRGB[], maxLevel: number,
+  u: number, v: number, t: number, rho: number, px: number, py: number,
+  light: readonly [number, number, number],
+): [number, number, number] {
+  const [r, g, b] = sampleWaterFixed(chain, maxLevel, u, v, t, rho, px, py);
+  const cl = (x: number): number => (x > 255 ? 255 : x);
+  return [cl(r * light[0] * 2), cl(g * light[1] * 2), cl(b * light[2] * 2)];
+}
 
 function pakReadFile(pakPath: string, name: string): ArrayBuffer {
   const data = readFileSync(pakPath);
@@ -198,6 +264,112 @@ describe('GPU-FOLLOW-3B shader pins (fixed path is the shipped path)', () => {
     expect(GLSL_MIP_POLICY).toContain('voodooSampleMippedWarped');
     expect(GLSL_MIP_POLICY).toContain('float lod = voodooLod(map, lodUv)');
     expect(GLSL_MIP_POLICY).toContain('textureLod(map, sampleUv, float(lvl))');
+  });
+});
+
+describe('GPU-FOLLOW-3B turbulent water is unlit (source pin)', () => {
+  it('FS_LIT gates an unlit branch on the warp identity', () => {
+    expect(FS_LIT).toContain('if (uWarpOn != 0)');
+    expect(FS_LIT).toContain('col = texel');
+  });
+
+  it('the warp branch skips lightmap, dynamic lights and overbright', () => {
+    const start = FS_LIT.indexOf('if (uWarpOn != 0)');
+    expect(start).toBeGreaterThan(-1);
+    const elseAt = FS_LIT.indexOf('} else {', start);
+    expect(elseAt).toBeGreaterThan(start);
+    const branch = FS_LIT.slice(start, elseAt);
+    expect(branch).not.toContain('uLightmap');
+    expect(branch).not.toContain('uLightPos');
+    expect(branch).not.toContain('uNumLights');
+    expect(branch).not.toContain('voodooOverbright');
+  });
+
+  it('the non-warp (opaque + glass) path stays lit', () => {
+    expect(FS_LIT).toContain('voodooOverbright(texel * (lm + dyn))');
+    expect(FS_LIT).toContain('texture(uLightmap, vLightUV)');
+  });
+});
+
+describe('GPU-FOLLOW-3B injected seam control (synthetic art)', () => {
+  const W = 64;
+  const chain = buildMipChainRGB(tileableWater64(), W, W);
+  const maxLevel = chain.length - 1;
+  // Real baked values from base1 faces 117 (edge luxel) and coplanar
+  // neighbour 174 at the same world vertex: the step the old shader drew.
+  const LIGHT_A: [number, number, number] = [120 / 255, 60 / 255, 12 / 255];
+  const LIGHT_B: [number, number, number] = [255 / 255, 220 / 255, 140 / 255];
+
+  function continuity(
+    sample: (u: number, v: number, t: number, rho: number, px: number, py: number) => [number, number, number],
+  ): number {
+    let worst = 0;
+    for (const t of TIMES) {
+      for (const rho of WATER_RHOS) {
+        for (const [u0, v0] of [[64, 20.5], [-64, -33.7], [128, 200.4]] as const) {
+          for (let pi = 0; pi < 16; pi++) {
+            const a = sample(u0 - 0.1, v0, t, rho, pi & 3, (pi >> 2) & 3);
+            const b = sample(u0 + 0.1, v0, t, rho, pi & 3, (pi >> 2) & 3);
+            worst = Math.max(worst, Math.abs(a[0]! - b[0]!), Math.abs(a[1]! - b[1]!), Math.abs(a[2]! - b[2]!));
+          }
+        }
+      }
+    }
+    return worst;
+  }
+
+  it('fixed (unlit) path clears the continuity bar the lit path exceeds', () => {
+    const fixed = continuity((u, v, t, rho, px, py) => sampleWaterFixed(chain, maxLevel, u, v, t, rho, px, py));
+    expect(fixed).toBeLessThan(6);
+    // Injected seam: same probes, but the two sides carry different
+    // per-face baked lights (the pre-fix shader behavior at a face edge).
+    let worst = 0;
+    for (const t of TIMES) {
+      for (const rho of WATER_RHOS) {
+        for (let pi = 0; pi < 16; pi++) {
+          const px = pi & 3;
+          const py = (pi >> 2) & 3;
+          const a = sampleWaterLit(chain, maxLevel, 63.9, 10.2, t, rho, px, py, LIGHT_A);
+          const b = sampleWaterLit(chain, maxLevel, 64.1, 10.2, t, rho, px, py, LIGHT_B);
+          worst = Math.max(worst, Math.abs(a[0]! - b[0]!), Math.abs(a[1]! - b[1]!), Math.abs(a[2]! - b[2]!));
+        }
+      }
+    }
+    // Control proof: the broken variant exceeds the bar by an order of
+    // magnitude, so the continuity assertion above is seam-sensitive.
+    expect(worst).toBeGreaterThan(40);
+  });
+
+  it('fixed path still animates (flow preserved, not frozen)', () => {
+    let anim = 0;
+    for (const rho of WATER_RHOS) {
+      const a = sampleWaterFixed(chain, maxLevel, 10.25, -7.5, TIMES[0]!, rho, 0, 0);
+      const b = sampleWaterFixed(chain, maxLevel, 10.25, -7.5, TIMES[3]!, rho, 0, 0);
+      anim = Math.max(anim, Math.abs(a[0]! - b[0]!), Math.abs(a[1]! - b[1]!), Math.abs(a[2]! - b[2]!));
+    }
+    expect(anim).toBeGreaterThan(1);
+  });
+
+  it('even-size mip chains are wrap-exact at every level (tile addressing)', () => {
+    let w = W;
+    let h = W;
+    for (let lvl = 1; lvl <= maxLevel; lvl++) {
+      w = w >> 1;
+      h = h >> 1;
+      expect(chain[lvl]!.w).toBe(w);
+      expect(chain[lvl]!.h).toBe(h);
+    }
+    expect(chain[maxLevel]!.w).toBe(1);
+    // REPEAT sampling is continuous across the tile edge at every level:
+    // probes are 0.2 LEVEL-0 texels apart (offset scaled into each level,
+    // as textureLod does), so every level sees the same content gradient.
+    for (let lvl = 0; lvl <= maxLevel; lvl++) {
+      const m = chain[lvl]!;
+      const s = m.w / W;
+      const a = sampleLevelBilinearRepeat(m.data, m.w, m.h, (64 - 0.1) * s, 10.2 * s);
+      const b = sampleLevelBilinearRepeat(m.data, m.w, m.h, (64 + 0.1) * s, 10.2 * s);
+      for (let c = 0; c < 3; c++) expect(Math.abs(a[c]! - b[c]!)).toBeLessThan(8);
+    }
   });
 });
 
@@ -421,6 +593,165 @@ describe.runIf(!!process.env.Q2_PAK)('GPU-FOLLOW-3B on real base1 water (Q2_PAK)
         }
       }
     }
+  });
+
+  it('real bluwter chain: all halves exact, level-1 corner is the exact 2x2 average', { timeout: 180000 }, () => {
+    // Candidate (d): CPU-built box chains clamp only on odd sizes; 64x64 is
+    // all-even, so every level must be the exact 2x2 mean (no edge bleed).
+    const { palette, bluwter } = loadReal();
+    const rgb = expandPaletteTexture(bluwter, 64, 64, palette)!;
+    const chain = buildMipChainRGB(rgb, 64, 64);
+    expect(chain.length).toBe(7);
+    const l0 = chain[0]!;
+    const l1 = chain[1]!;
+    expect(l1.w).toBe(32);
+    expect(l1.h).toBe(32);
+    for (const [x, c] of [[0, 0], [1, 1], [2, 2]] as const) {
+      const avg = Math.round((l0.data[c]! + l0.data[3 + c]! + l0.data[192 + c]! + l0.data[195 + c]!) / 4);
+      expect(l1.data[c]!).toBe(avg);
+    }
+    expect(chain[6]!.w).toBe(1);
+    expect(chain[6]!.h).toBe(1);
+  });
+
+  it('real water edges: baked-light steps are huge (the drawn seam source)', { timeout: 180000 }, () => {
+    // Defect-source census (GPU-FOLLOW-3B cause (b)): coplanar turbulent
+    // faces sharing a world vertex with identical diffuse UVs, compared by
+    // the baked atlas light each face would multiply under the pre-fix
+    // shader. Recorded: 288 pairs, max at-vert step 76, 150 pairs >20.
+    const { world } = loadReal();
+    const styles = new Float32Array(256).fill(1);
+    const { atlas } = packLightAtlas(world, world.surfaces.map((s) => s.id), styles);
+    const baked = (f: number, vi: number): [number, number, number] => {
+      const s = world.surfaces[f]!;
+      const r = atlas.rectOf.get(f)!;
+      const lx = Math.min(r.w - 1, Math.max(0, Math.round(s.lux[vi * 2]!)));
+      const ly = Math.min(r.h - 1, Math.max(0, Math.round(s.lux[vi * 2 + 1]!)));
+      const o = ((r.y + ly) * atlas.width + (r.x + lx)) * 3;
+      return [atlas.pixels[o]! / 255, atlas.pixels[o + 1]! / 255, atlas.pixels[o + 2]! / 255];
+    };
+    const turb = world.surfaces.filter((s) => s.turbulent);
+    const vmap = new Map<string, Array<{ f: number; i: number }>>();
+    for (const s of turb) {
+      for (let i = 0; i < s.n; i++) {
+        const k = `${s.verts[i * 3]!.toFixed(1)},${s.verts[i * 3 + 1]!.toFixed(1)},${s.verts[i * 3 + 2]!.toFixed(1)}`;
+        const l = vmap.get(k) ?? [];
+        l.push({ f: s.id, i });
+        vmap.set(k, l);
+      }
+    }
+    let pairs = 0;
+    let over20 = 0;
+    let maxStep = 0;
+    for (const [, l] of vmap) {
+      if (l.length < 2) continue;
+      for (let x = 0; x < l.length; x++) {
+        for (let y = x + 1; y < l.length; y++) {
+          const A = l[x]!;
+          const B = l[y]!;
+          const sa = world.surfaces[A.f]!;
+          const sb = world.surfaces[B.f]!;
+          // Same visible sheet only (coplanar, same normal).
+          const dot = sa.fn[0]! * sb.fn[0]! + sa.fn[1]! * sb.fn[1]! + sa.fn[2]! * sb.fn[2]!;
+          if (dot < 0.999) continue;
+          // Identical diffuse UVs (candidate (e) excluded: measured maxDiff 0).
+          if (Math.abs(sa.uvs[A.i * 2]! - sb.uvs[B.i * 2]!) > 1e-6) continue;
+          if (Math.abs(sa.uvs[A.i * 2 + 1]! - sb.uvs[B.i * 2 + 1]!) > 1e-6) continue;
+          pairs++;
+          const ca = baked(A.f, A.i);
+          const cb = baked(B.f, B.i);
+          const d = Math.max(Math.abs(ca[0] - cb[0]), Math.abs(ca[1] - cb[1]), Math.abs(ca[2] - cb[2])) * 255;
+          maxStep = Math.max(maxStep, d);
+          if (d > 20) over20++;
+        }
+      }
+    }
+    expect(pairs).toBeGreaterThanOrEqual(200);
+    expect(maxStep).toBeGreaterThan(50);
+    expect(over20).toBeGreaterThanOrEqual(100);
+  });
+
+  it('real water edges: fixed path seamless, old lit path jumps (tiles x times x views)', { timeout: 180000 }, () => {
+    // Sampled-pixel regression on transparent TRANS66 water: at every
+    // coplanar uv-matched shared vertex, the fixed (unlit) path sees only
+    // the diffuse gradient across the edge (small), while the pre-fix lit
+    // mirror multiplies each side by its own face block (large). Sweeps all
+    // TIMES x WATER_RHOS (stationary + moving view proxy) x dither phases.
+    const { world, palette, bluwter } = loadReal();
+    const rgb = expandPaletteTexture(bluwter, 64, 64, palette)!;
+    const chain = buildMipChainRGB(rgb, 64, 64);
+    const maxLevel = chain.length - 1;
+    const styles = new Float32Array(256).fill(1);
+    const { atlas } = packLightAtlas(world, world.surfaces.map((s) => s.id), styles);
+    const baked = (f: number, vi: number): [number, number, number] => {
+      const s = world.surfaces[f]!;
+      const r = atlas.rectOf.get(f)!;
+      const lx = Math.min(r.w - 1, Math.max(0, Math.round(s.lux[vi * 2]!)));
+      const ly = Math.min(r.h - 1, Math.max(0, Math.round(s.lux[vi * 2 + 1]!)));
+      const o = ((r.y + ly) * atlas.width + (r.x + lx)) * 3;
+      return [atlas.pixels[o]! / 255, atlas.pixels[o + 1]! / 255, atlas.pixels[o + 2]! / 255];
+    };
+    const turb = world.surfaces.filter((s) => s.turbulent);
+    expect(turb.length).toBe(102);
+    expect(turb.every((s) => s.translucent === 2)).toBe(true);
+    const probes: Array<{ uv: [number, number]; lightA: [number, number, number]; lightB: [number, number, number] }> = [];
+    const vmap = new Map<string, Array<{ f: number; i: number }>>();
+    for (const s of turb) {
+      for (let i = 0; i < s.n; i++) {
+        const k = `${s.verts[i * 3]!.toFixed(1)},${s.verts[i * 3 + 1]!.toFixed(1)},${s.verts[i * 3 + 2]!.toFixed(1)}`;
+        const l = vmap.get(k) ?? [];
+        l.push({ f: s.id, i });
+        vmap.set(k, l);
+      }
+    }
+    for (const [, l] of vmap) {
+      if (l.length < 2) continue;
+      for (let x = 0; x < l.length; x++) {
+        for (let y = x + 1; y < l.length; y++) {
+          const A = l[x]!;
+          const B = l[y]!;
+          const sa = world.surfaces[A.f]!;
+          const sb = world.surfaces[B.f]!;
+          const dot = sa.fn[0]! * sb.fn[0]! + sa.fn[1]! * sb.fn[1]! + sa.fn[2]! * sb.fn[2]!;
+          if (dot < 0.999) continue;
+          const ua = sa.uvs[A.i * 2]!;
+          const va = sa.uvs[A.i * 2 + 1]!;
+          if (Math.abs(ua - sb.uvs[B.i * 2]!) > 1e-6) continue;
+          if (Math.abs(va - sb.uvs[B.i * 2 + 1]!) > 1e-6) continue;
+          probes.push({ uv: [ua, va], lightA: baked(A.f, A.i), lightB: baked(B.f, B.i) });
+        }
+      }
+    }
+    expect(probes.length).toBeGreaterThanOrEqual(200);
+    let maxFixed = 0;
+    let maxOld = 0;
+    let maxAnim = 0;
+    for (const p of probes) {
+      const [eu, ev] = p.uv;
+      for (const t of TIMES) {
+        for (const rho of WATER_RHOS) {
+          for (let pi = 0; pi < 16; pi++) {
+            const px = pi & 3;
+            const py = (pi >> 2) & 3;
+            const f0 = sampleWaterFixed(chain, maxLevel, eu - 0.1, ev, t, rho, px, py);
+            const f1 = sampleWaterFixed(chain, maxLevel, eu + 0.1, ev, t, rho, px, py);
+            maxFixed = Math.max(maxFixed, Math.abs(f0[0]! - f1[0]!), Math.abs(f0[1]! - f1[1]!), Math.abs(f0[2]! - f1[2]!));
+            const o0 = sampleWaterLit(chain, maxLevel, eu - 0.1, ev, t, rho, px, py, p.lightA);
+            const o1 = sampleWaterLit(chain, maxLevel, eu + 0.1, ev, t, rho, px, py, p.lightB);
+            maxOld = Math.max(maxOld, Math.abs(o0[0]! - o1[0]!), Math.abs(o0[1]! - o1[1]!), Math.abs(o0[2]! - o1[2]!));
+          }
+        }
+      }
+      const a0 = sampleWaterFixed(chain, maxLevel, eu, ev, TIMES[0]!, 1.5, 0, 0);
+      const a1 = sampleWaterFixed(chain, maxLevel, eu, ev, TIMES[3]!, 1.5, 0, 0);
+      maxAnim = Math.max(maxAnim, Math.abs(a0[0]! - a1[0]!), Math.abs(a0[1]! - a1[1]!), Math.abs(a0[2]! - a1[2]!));
+    }
+    // Fixed path: only the 0.2-texel diffuse gradient (no seam).
+    expect(maxFixed).toBeLessThan(8);
+    // Old path: per-face light steps draw the seam (order of magnitude up).
+    expect(maxOld).toBeGreaterThan(50);
+    // Flow is preserved (liveness, not seam proof).
+    expect(maxAnim).toBeGreaterThan(10);
   });
 });
 

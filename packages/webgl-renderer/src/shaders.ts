@@ -12,6 +12,8 @@
 //   - overbright modulate x2 + clamp via uOverbright.
 // Lightmaps stay plain LINEAR texture() (no LOD): the CPU bakes per-miplevel
 // surface blocks, which has no GPU equivalent here (documented gap).
+// Turbulent water skips the lightmap tap entirely (GPU-FOLLOW-3B): both
+// refs draw warp faces unlit (ref_soft raw texels, ref_gl "no lightmaps").
 //
 // Reviewability: sources are exported consts; tests assert the required
 // features (texture() sampling, lightmap uniform, alpha) are present.
@@ -102,17 +104,29 @@ void main() {
     oColor = vec4(lm, vAlpha);
     return;
   }
-  vec3 dyn = vec3(0.0);
-  for (int i = 0; i < 8; i++) {
-    if (i >= uNumLights) break;
-    vec4 L = uLightPos[i];
-    float d = distance(vWorldPos, L.xyz);
-    if (L.w > 0.0 && d < L.w) {
-      float f = (L.w - d) / L.w;
-      dyn += f * uLightColor[i];
+  // GPU-FOLLOW-3B: turbulent water is UNLIT (ref_soft
+  // R_BuildPolygonFromSurface serves SURF_WARP faces raw texels to
+  // R_DrawSpanletTurbulentBlended66 — no surface cache, no lightmap;
+  // ref_gl R_RenderBrushPoly: "warp texture, no lightmaps"). The per-face
+  // lightmap multiply drew the baked blocks' face-boundary steps (up to
+  // 247/255 at shared edges on real base1 water) as tile seams.
+  // Non-turbulent translucent glass stays lit (both refs light it).
+  vec3 col;
+  if (uWarpOn != 0) {
+    col = texel;
+  } else {
+    vec3 dyn = vec3(0.0);
+    for (int i = 0; i < 8; i++) {
+      if (i >= uNumLights) break;
+      vec4 L = uLightPos[i];
+      float d = distance(vWorldPos, L.xyz);
+      if (L.w > 0.0 && d < L.w) {
+        float f = (L.w - d) / L.w;
+        dyn += f * uLightColor[i];
+      }
     }
+    col = voodooOverbright(texel * (lm + dyn));
   }
-  vec3 col = voodooOverbright(texel * (lm + dyn));
   col = voodooApplyFog(col, vFogW);
   oColor = vec4(col, vAlpha);
 }

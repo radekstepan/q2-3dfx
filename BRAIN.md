@@ -280,7 +280,7 @@ FAIL and a proposed, unapproved tone-normalized threshold. Reopen acceptance;
 no threshold change is authorized. Historical full verify was reported 78/80,
 and deps:check 676 passed after the sound/config fix; neither was rerun here.
 
-Priority (2026-10-31: RELEASE-7/RELEASE-6 repaired + archived; RELEASE-4 boxes 1–2 landed, box 3 blocked on map-truth prerequisite; next): GPU-FOLLOW-3B → RELEASE-9/10/11,
+Priority (2026-10-31: RELEASE-7/RELEASE-6/3B repaired + archived; RELEASE-4 boxes 1–2 landed, box 3 blocked on map-truth prerequisite; next): RELEASE-9 → RELEASE-10/11,
 then FOLLOW-5/6/7. Independent cards can proceed with disjoint ownership.
 Claim one card; preserve software goldens and sky/lifecycle behavior. Expensive
 validation runs sequentially. Require actual production-path regressions and
@@ -300,20 +300,10 @@ done-when:
 - [x] Repair stale/incorrect collision, activation or geometry state against map/original behavior; never disable all mover collision or teleport the player to pass the test.
 - [ ] Extend real-base1 gate to walk from outside through the doorway, board, operate intended control, ride and finish. Assert no invisible obstruction and no premature departure; capture the complete route. Tests starting on the platform do not close boarding acceptance.
 
-### GPU-FOLLOW-3B — Remove the remaining visible water tile seams
-owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
-depends: none
-status: ready (reopened)
-user-verdict: flow is good; tile seams remain after unwarped-LOD/highp repair. Prior wrap/ROI metrics did not reject the reported defect.
-done-when:
-- [ ] Locate the actual visible seam, recording map/camera/material/time and close crops. Distinguish repeat boundaries, adjacent BSP faces, lightmap borders, source art and warp/LOD behavior. Keep existing useful LOD work, but do not assert it solved every seam.
-- [ ] Add sampled-pixel and real-map regressions that fail on this current defect, across multiple tiles, times and view angles with transparent water. Include an injected seam control; animation-difference thresholds alone are not seam proof.
-- [ ] Fix demonstrated cause without disabling motion, lighting, mipmapping, transparency or intended texture scale; confirm stationary and moving views plus sky/occlusion remain correct.
-
 ### RELEASE-9 — Audit explosion, blaster impact and map electrical effects
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/webgl-renderer`, `packages/testkit`
 depends: none
-status: ready
+status: in-progress(@opencode)
 review-scope: appearance concerns require original-source/art comparison; no new claim that these effects are absent or incorrectly scaled has been established. No `target_splash` handler was found in the reviewed server source; identify the map's actual mechanism before choosing an implementation.
 done-when:
 - [ ] Compare barrel explosion fullness against original barrel/temporary-entity behavior: correct model/skin, frames/frame interpolation, lifetime, alpha, particles, debris, light, sound and occlusion. Capture frame sequences at matched distance/time; avoid simply enlarging the effect to make it fuller.
