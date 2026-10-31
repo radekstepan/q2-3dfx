@@ -4,11 +4,11 @@
 // (gracefully degrading when @q2/server has no world sim yet), feed client
 // snapshots into the Predictor, and render through any Refresh backend.
 // Everything heavy is injected; this file only glues.
-import { SERVER_DT, getCVarNumber } from '@q2/config';
+import { Com_Error, SERVER_DT, getCVarNumber } from '@q2/config';
 import type { Framebuffer, Refresh, RefDef, WorldModel, FrameStats, Entity } from '@q2/renderer-api';
 import { createFramebuffer, devroomWorld } from '@q2/renderer-api';
 import { Predictor, GameConsole, Configstrings, calcViewOrigin } from '@q2/client';
-import type { Snapshot, PredictCmd } from '@q2/client';
+import type { EntityState, Snapshot, PredictCmd } from '@q2/client';
 
 import { Mixer } from '@q2/sound';
 import { createInput, buildUserCmd } from '@q2/input';
@@ -117,6 +117,98 @@ export interface ExtraRenderable {
  */
 export const VIEWMODEL_FORWARD = 0;
 
+// --- Display-size coordination (RELEASE-7 host lane) ------------------------
+//
+// The menu persists `vid_resolution` as a 'WxH' string. The app shell owns
+// that cvar; the Host owns the framebuffer. These pure helpers let the Host
+// reserve/validate the SAME dimensions the shell passes in, so the selected
+// size is allocated synchronously at construction (the loading surface is
+// correctly sized before any async asset load) and `resize()` accepts
+// exactly the same inputs. No DOM, no canvas, no GPU imports: cold paths
+// only (menu/boot/resize), allocation is fine here.
+
+/** Parsed internal framebuffer dimensions. */
+export interface DisplaySize {
+  width: number;
+  height: number;
+}
+
+/** Hard cap per dimension: 4096px (4096x4096 RGBA = 64 MiB per plane). */
+export const MAX_DISPLAY_DIMENSION = 4096;
+
+/**
+ * True for allocatable framebuffer dimensions: positive integers within
+ * the hard cap. Mirrors the GPU backend's resize guard plus the OOM cap.
+ */
+export function isValidDisplaySize(width: number, height: number): boolean {
+  return (
+    Number.isInteger(width) &&
+    Number.isInteger(height) &&
+    width > 0 &&
+    height > 0 &&
+    width <= MAX_DISPLAY_DIMENSION &&
+    height <= MAX_DISPLAY_DIMENSION
+  );
+}
+
+/**
+ * Parse a 'WxH' resolution string (the `vid_resolution` cvar shape);
+ * null when malformed, non-positive, non-integer or over the hard cap.
+ * Self-contained (host cannot import the app shell's parser).
+ */
+export function parseDisplaySize(value: string): DisplaySize | null {
+  if (typeof value !== 'string') return null;
+  const m = /^\s*(\d+)\s*x\s*(\d+)\s*$/.exec(value);
+  if (!m) return null;
+  const width = Number.parseInt(m[1]!, 10);
+  const height = Number.parseInt(m[2]!, 10);
+  if (!isValidDisplaySize(width, height)) return null;
+  return { width, height };
+}
+
+/**
+ * Plain-data simulation snapshot for resize/context-loss coordination
+ * (RELEASE-7). Captures everything the Host owns that a renderer rebuild
+ * must NOT disturb: tick clock, authoritative player state, in-flight cmd,
+ * input angles, audio listener/gain, and the interpolation pair. The world
+ * (`world`), driver, refresh and console/configstrings identities are NOT
+ * part of the snapshot — resize never replaces them (asserted by test).
+ * Cross-check with `channelCount`: resize must leave mixer channels alone.
+ */
+export interface HostSimSnapshot {
+  serverTime: number;
+  serverAcc: number;
+  playerOrigin: [number, number, number];
+  playerVelocity: [number, number, number];
+  lastCmd: UserCmdT | null;
+  inputAngles: [number, number, number];
+  listenerOrigin: [number, number, number];
+  listenerRight: [number, number, number];
+  masterVol: number;
+  channelCount: number;
+  prevSnapshot: Snapshot | null;
+  nextSnapshot: Snapshot | null;
+}
+
+function copySnapshot(snap: Snapshot | null): Snapshot | null {
+  if (!snap) return null;
+  return {
+    serverTime: snap.serverTime,
+    entities: snap.entities.map(
+      (e): EntityState => ({
+        ...e,
+        origin: [e.origin[0], e.origin[1], e.origin[2]],
+        velocity: [e.velocity[0], e.velocity[1], e.velocity[2]],
+      }),
+    ),
+  };
+}
+
+function copyCmd(cmd: UserCmdT | null): UserCmdT | null {
+  if (!cmd) return null;
+  return { ...cmd, angles: [cmd.angles[0], cmd.angles[1], cmd.angles[2]] };
+}
+
 export class Host {
   readonly fb: Framebuffer;
   readonly refresh: Refresh;
@@ -133,6 +225,18 @@ export class Host {
   private serverAcc = 0;
   private lastNow = -1;
   /**
+   * Successful `resize()` reallocations (same-size no-ops do not count).
+   * Lets the shell verify repeated resize/switch cycles stay 1:1 with
+   * reallocations (no duplicate work, no missed resizes).
+   */
+  resizeCount = 0;
+  /**
+   * True after `dispose()`. The Host installs no DOM listeners, no rAF
+   * loop and no timers — `frame()` is synchronous and caller-driven — so
+   * teardown is mixer silence plus this guard; there is nothing to unwire.
+   */
+  disposed = false;
+  /**
    * Owned cmds since the newest acked snapshot, replayed through pmove by
    * the Predictor (friction-exact local prediction instead of linear
    * extrapolation). Cleared on every ingested snapshot, extended every
@@ -146,7 +250,13 @@ export class Host {
   constructor(opts: HostOptions) {
     const width = opts.width ?? 320;
     const height = opts.height ?? 240;
+    if (!isValidDisplaySize(width, height)) {
+      Com_Error('error', `Host: invalid display size ${String(width)}x${String(height)} (positive integers <= ${MAX_DISPLAY_DIMENSION})`);
+    }
     this.refresh = opts.refresh;
+    // Reserved synchronously at construction: the loading surface is the
+    // selected/persisted size BEFORE any async asset load, so first paint
+    // never shows a small black box or jumps layout when assets land.
     this.fb = createFramebuffer(width, height, opts.indexed ?? true);
     this.refresh.init(this.fb);
     this.world = opts.world ?? devroomWorld();
@@ -157,6 +267,11 @@ export class Host {
       this.playerOrigin = [...spawn.origin] as [number, number, number];
       if (spawn.angles) this.input.angles = [...spawn.angles] as [number, number, number];
     }
+  }
+
+  /** Guard: every public sim/render entry point rejects use-after-dispose. */
+  private ensureLive(op: string): void {
+    if (this.disposed) Com_Error('error', `Host.${op}: host is disposed`);
   }
 
   /** Server tick via the attached driver when present, else advance time only. */
@@ -176,6 +291,7 @@ export class Host {
 
   /** Feed an authoritative snapshot (server -> client). */
   ingestSnapshot(snap: Snapshot): void {
+    this.ensureLive('ingestSnapshot');
     this.predictor.pushSnapshot(snap);
     // New acked state: drop the replayed stream (rebuilt below each frame).
     this.ownedCmds = [];
@@ -197,6 +313,7 @@ export class Host {
    * Returns render stats.
    */
   frame(nowMs: number): FrameStats {
+    this.ensureLive('frame');
     if (this.lastNow < 0) this.lastNow = nowMs;
     let dt = (nowMs - this.lastNow) / 1000;
     this.lastNow = nowMs;
@@ -264,6 +381,7 @@ export class Host {
 
   /** Render the current predicted/interpolated view. */
   renderCurrentView(): FrameStats {
+    this.ensureLive('renderCurrentView');
     // Continuous render clock: serverTime only advances on 10Hz ticks, so
     // add the sub-tick remainder. Passing the stepped serverTime here would
     // freeze the camera between ticks (slideshow) while the angles (fresh
@@ -374,10 +492,119 @@ export class Host {
     return stats;
   }
 
-  /** Resize the framebuffer (web shell renderer switcher). */
+  /**
+   * Resize the framebuffer WITHOUT rebuilding the game simulation
+   * (RELEASE-7: `vid_resolution` changes must not reboot the level).
+   * Preserved across the realloc: serverTime/serverAcc, player
+   * origin/velocity, predictor pair + staged cmds, lastCmd, input angles,
+   * mixer channels/listener/gain, and the world/driver/refresh/console
+   * object identities. The overlapping framebuffer region is copied into
+   * the new planes (color, index, depth) so the first post-resize present
+   * reuses live pixels instead of flashing a black box; newly exposed
+   * pixels read zero until the next `frame()` paints them. Same-size calls
+   * are no-ops (no re-init, no count bump). Invalid sizes raise Com_Error
+   * and leave the previous framebuffer and all sim state untouched.
+   */
   resize(width: number, height: number): void {
-    const next = createFramebuffer(width, height, this.fb.index !== undefined);
+    this.ensureLive('resize');
+    if (!isValidDisplaySize(width, height)) {
+      Com_Error('error', `Host.resize: invalid display size ${String(width)}x${String(height)} (positive integers <= ${MAX_DISPLAY_DIMENSION})`);
+    }
+    const prev = this.fb;
+    if (prev.width === width && prev.height === height) return;
+    const next = createFramebuffer(width, height, prev.index !== undefined);
+    const copyW = Math.min(prev.width, width);
+    const copyH = Math.min(prev.height, height);
+    for (let y = 0; y < copyH; y++) {
+      const src = y * prev.width;
+      const dst = y * width;
+      next.color.set(prev.color.subarray(src, src + copyW), dst);
+      next.depth.set(prev.depth.subarray(src, src + copyW), dst);
+      if (next.index && prev.index) next.index.set(prev.index.subarray(src, src + copyW), dst);
+    }
     this.refresh.init(next);
     (this as { fb: Framebuffer }).fb = next;
+    this.resizeCount++;
+  }
+
+  /**
+   * Capture the live sim state for resize/context-loss coordination. The
+   * shell calls this before tearing down a renderer backend and asserts
+   * equality after reattaching: any drift means the switch path rebuilt
+   * sim state it must preserve (map, position, health, enemies, elapsed
+   * time, audio). `channelCount` pins the audio rule: resize/switch must
+   * never drop or restart mixer channels.
+   */
+  captureSimState(): HostSimSnapshot {
+    this.ensureLive('captureSimState');
+    return {
+      serverTime: this.serverTime,
+      serverAcc: this.serverAcc,
+      playerOrigin: [...this.playerOrigin] as [number, number, number],
+      playerVelocity: [...this.playerVelocity] as [number, number, number],
+      lastCmd: copyCmd(this.lastCmd),
+      inputAngles: [...this.input.angles] as [number, number, number],
+      listenerOrigin: [...this.mixer.listenerOrigin] as [number, number, number],
+      listenerRight: [...this.mixer.listenerRight] as [number, number, number],
+      masterVol: this.mixer.masterVol,
+      channelCount: this.mixer.channelCount,
+      prevSnapshot: copySnapshot(this.predictor.prev),
+      nextSnapshot: copySnapshot(this.predictor.next),
+    };
+  }
+
+  /**
+   * Restore a snapshot from `captureSimState()` (context-loss/restore
+   * coordination). Replaces clock, player state, in-flight cmd, input
+   * angles, audio listener/gain and the interpolation pair; drops the
+   * staged owned-cmd stream (the next `frame()` re-stages from the
+   * restored `lastCmd`, so no pre-restore replay leaks in). World, driver,
+   * refresh and console/configstrings identities are never touched — a
+   * restore must not swap the level out from under the game. Mixer
+   * channels are NOT rebuilt here: renderer teardown must preserve them
+   * (see `channelCount`), so there is nothing to replay. Malformed
+   * snapshots raise Com_Error and leave live state untouched.
+   */
+  restoreSimState(snap: HostSimSnapshot): void {
+    this.ensureLive('restoreSimState');
+    if (snap === null || typeof snap !== 'object') Com_Error('error', 'Host.restoreSimState: malformed snapshot');
+    const triples = [snap.playerOrigin, snap.playerVelocity, snap.inputAngles, snap.listenerOrigin, snap.listenerRight];
+    const ok =
+      Number.isFinite(snap.serverTime) &&
+      Number.isFinite(snap.serverAcc) &&
+      snap.serverAcc >= 0 &&
+      triples.every((t) => Array.isArray(t) && t.length === 3 && t.every(Number.isFinite)) &&
+      Number.isFinite(snap.masterVol) &&
+      Number.isInteger(snap.channelCount);
+    if (!ok) Com_Error('error', 'Host.restoreSimState: malformed snapshot');
+    this.serverTime = snap.serverTime;
+    this.serverAcc = snap.serverAcc;
+    this.playerOrigin = [...snap.playerOrigin] as [number, number, number];
+    this.playerVelocity = [...snap.playerVelocity] as [number, number, number];
+    this.lastCmd = copyCmd(snap.lastCmd);
+    this.input.angles = [...snap.inputAngles] as [number, number, number];
+    this.mixer.setListener(snap.listenerOrigin, snap.listenerRight);
+    this.mixer.masterVol = snap.masterVol;
+    this.predictor.prev = copySnapshot(snap.prevSnapshot);
+    this.predictor.next = copySnapshot(snap.nextSnapshot);
+    this.predictor.clearPendingCmds();
+    this.ownedCmds = [];
+  }
+
+  /**
+   * Idempotent teardown. Stops all mixer channels (silence) and arms the
+   * use-after-dispose guard on every sim/render entry point. The Host
+   * owns no DOM listeners, no rAF loop and no timers — `frame()` is
+   * synchronous and caller-driven, `input` carries no bindings (the app
+   * shell owns its `DomBindings.dispose`) — so repeated dispose calls and
+   * repeated resize/switch cycles cannot leak or double-fire here. Full
+   * level teardowns (map/skill switches) still construct a fresh Host;
+   * this path exists for renderer switches and context loss, which must
+   * NOT take the sim down with them.
+   */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.mixer.stopAll();
   }
 }

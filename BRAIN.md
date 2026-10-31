@@ -365,8 +365,9 @@ done-when:
 ### RELEASE-7 — Change display settings without restarting; stable startup size
 owns: `apps/web`, `packages/host`, `packages/webgl-renderer`, `packages/testkit`
 depends: RELEASE-3
-status: ready
+status: in-progress(@opencode)
 review-findings: `dom.ts: REBOOT_CVARS` includes resolution; renderer already uses `applyRendererCvar` hot-swap; `resizeGpuBackend` exists.
+lane-2026-10-30 (@opencode): host lane DONE (20/20, sim-preserving resize + snapshot/dispose hooks); apps/web + webgl-renderer + testkit wiring still open.
 done-when:
 - [ ] Wire resolution changes through coordinated framebuffer/viewport/HUD resizing without rebuilding the game simulation. Preserve map, position, health, enemies, elapsed time and audio. Confirm renderer changes also preserve these states in the actual menu; diagnose any remaining restart rather than adding another switch path.
 - [ ] Reserve the selected/persisted display dimensions before async asset loading. Show a correctly sized loading surface immediately, then present the first valid frame without a small black box or layout jump. Cover cold cache, cached pak, no pak and failed GPU initialization.
