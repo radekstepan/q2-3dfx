@@ -38,9 +38,8 @@ q2ts/
 │  ├─ formats/                   ← BSP38, WAL, PCX, MD2, SP2, WAV parsers → plain typed arrays
 │  ├─ bsp/                       ← node/leaf traversal, PVS decompression, trace/clip hulls
 │  ├─ sw-renderer/               ← ref_soft: colormap, surface cache, edges, spans, alias, particles
-│  ├─ voodoo/                    ← Voodoo3/Glide emulation layer (post-processing + sampler rules)
-│  ├─ webgl-renderer/            ← WebGL2 backend (GPU-PROOF-2: scene boundary + resource ownership; draws in PROOF-3)
-│  ├─ renderer-api/              ← the Refresh interface both CPU renderers implement + the additive GPU boundary
+│  ├─ webgl-renderer/            ← WebGL2 backend (scene boundary + resource ownership; Voodoo3 appearance in shader/target passes)
+│  ├─ renderer-api/              ← the Refresh interface the software backend implements + the additive GPU boundary
 │  ├─ game/                      ← gamex86: entities, pmove, items, doors, monsters, weapons
 │  ├─ server/                    ← SV_: world state, entity spawning, 10 Hz tick
 │  ├─ client/                    ← CL_: prediction, interpolation, view, HUD, console
@@ -56,7 +55,7 @@ q2ts/
 ### Dependency rules (enforced by `eslint-plugin-boundaries` + `yarn deps:check`)
 
 ```
-math ← formats ← bsp ← {sw-renderer, voodoo} ← renderer-api ← host
+math ← formats ← bsp ← sw-renderer ← renderer-api ← host
 {renderer-api, sw-renderer, bsp, math, config} ← webgl-renderer (GPU boundary impl; + formats test-only)
 filesystem ← formats
 game ← {math, bsp, config}
@@ -69,8 +68,12 @@ apps/web ← host
 - **Nothing** imports from `apps/*`.
 - `sw-renderer` must not import `dom` types; it writes into an `ArrayBuffer` it is handed. This is
   what lets it run in a worker and in Node tests.
-- `voodoo` is a *post-process + sampling policy* package, not a second renderer: it reuses the same
-  geometry front end. See §7.
+- RELEASE-8 retired the legacy CPU Voodoo execution mode (`@q2/voodoo` resolve/scanout
+  path). The Voodoo3 appearance policy (RGB565 + ordered dither, matched reconstruction,
+  LOD policy, table fog, `vd_*` uniforms) is implemented by `webgl-renderer` in
+  shader/target passes, with the policy tables duplicated by value in
+  `src/appearance.ts` — there is no `webgl-renderer → voodoo` edge. `vd_*` cvars
+  remain as WebGL appearance uniforms. See §7.2.
 - `webgl-renderer` owns the injected WebGL2 context, GPU buffers/textures/programs/targets and the
   persistent-upload bookkeeping; browser glue owns canvas/context acquisition and forwards
   context loss/restoration. Only this package and `apps/web` may depend on browser graphics types.

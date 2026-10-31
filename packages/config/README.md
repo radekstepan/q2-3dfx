@@ -21,7 +21,7 @@ removed `voodoo` from both (persisted `voodoo` → `software` with a warning).
 
 ## Usage
 
-Consumed by every package (cvar reads in `@q2/voodoo`, `@q2/input`,
+Consumed by every package (appearance-uniform reads in `@q2/webgl-renderer`, `@q2/input`,
 `@q2/client` console, `SERVER_DT` in `@q2/host`/`@q2/server`, error
 handling everywhere).
 

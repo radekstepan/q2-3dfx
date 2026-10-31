@@ -18,8 +18,11 @@ pak0.pak ──PAK reader──┬─ maps/base1.bsp ──parseBSP38──┬�
 - **BSP38 lumps** (19): entities, planes, vertexes, visibility, nodes, texinfo, faces, lighting,
   leafs, leaffaces, leafbrushes, edges, surfedges, models, brushes, brushsides, pop, areas,
   areaportals. Parse into flat typed arrays (`Int32Array` of nodes, etc.) — **never** arrays of objects.
-- **Cooking:** `tools/asset-cooker` converts a pak into `.q2pkg`: a single deflate-compressed binary
-  with an index, pre-split per map, so the web app streams ~8 MB for base1 instead of 180 MB.
+- **Cooking:** `tools/asset-cooker` converts a pak into `.q2pkg` (`Q2PKG1`: whole pak,
+  per-file deflate + index, byte-identical round-trip). It does **not** split per map
+  and nothing in the tree consumes `.q2pkg` yet — the web app ingests the dropped pak
+  client-side and caches blobs in IndexedDB. Per-map subset streaming is future work,
+  not a shipped path.
 - **Caching:** `@q2/filesystem` stores cooked blobs in IndexedDB keyed by pak SHA-1.
 - **Fallback:** if no pak is present, boot `maps/devroom` — the procedural room used by the demo page
   and the golden-frame tests. This keeps CI and the public demo asset-free. `maps/devroom`

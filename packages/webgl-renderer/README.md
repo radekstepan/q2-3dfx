@@ -12,6 +12,12 @@ resource lifetime. Browser glue (canvas/context acquisition) lives in
 > gamma), single-TMU mip policy with CPU-built chains, 64-entry table fog
 > (inert in base1), per-frame live `vd_*` uniforms. Details + cvar table +
 > deviations: `PROOF-4.md`; pure policy mirrors: `src/appearance.ts`.
+>
+> RELEASE-8: the legacy CPU Voodoo execution mode is retired — this package is
+> now the sole implementation of the Voodoo3 appearance. Policy tables are
+> duplicated by value in `src/appearance.ts`; there is deliberately no
+> `webgl-renderer → voodoo` dependency edge. Normative checklist:
+> `docs/renderers.md` §7.2.
 
 ## What PROOF-2 owns
 

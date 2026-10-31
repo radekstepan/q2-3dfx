@@ -38,11 +38,19 @@ export const ALLOW: Record<string, string[]> = {
   // reads as geometry-front-end reuse, and the implementer must see the
   // interface it implements.
   'sw-renderer': ['bsp', 'config', 'formats', 'math', 'renderer-api'],
-  // §7: voodoo reuses the same geometry front end (subset used today).
-  voodoo: ['bsp', 'config', 'math', 'renderer-api', 'sw-renderer'],
+  // RELEASE-8 (retired): the legacy CPU Voodoo execution mode is retired; the
+  // Voodoo3 appearance policy is implemented by `webgl-renderer` (duplicated by
+  // value in `appearance.ts`, no dep edge). This row is residual — the only
+  // real edges left from the remaining sources are `config` (`vd_*` cvar
+  // reads) and `sw-renderer` (test-only scanout band helper). No package may
+  // (re)gain a `voodoo` edge; delete this row with the package.
+  voodoo: ['config', 'sw-renderer'],
   // GPU-PROOF-2: WebGL2 boundary implementation. renderer-api (boundary
   // types it implements), sw-renderer (MiniWorld + camera helpers for scene
-  // selection), bsp (asset loading in tests). Browser graphics types
+  // selection — KEEP this edge; RELEASE-8 reuses the CPU front end, it does
+  // not fork it), bsp (asset loading in tests). RELEASE-8: this package owns
+  // the Voodoo3 appearance policy (duplicated by value in `appearance.ts`;
+  // `@q2/voodoo` is NOT an allowed edge). Browser graphics types
   // (WebGL2RenderingContext) may appear ONLY here and in apps/web.
   // formats: test-only real-asset parsing (parseMD2/WAL/PCX in Q2_PAK-gated
   // tests, mirroring the game package's asset-data justification).
@@ -89,6 +97,10 @@ export function checkGraph(edges: DepEdge[]): string[] {
     }
     if (e.from.startsWith('app:') || e.from.startsWith('tool:')) {
       // apps/tools may use any package (never apps/*, enforced above).
+      // Leaf convenience, NOT a sanction: RELEASE-8 retires every
+      // app:web/tool:bench → voodoo edge (resolve/scanout/RGB legs move to
+      // the code lanes; the final tree has zero `voodoo`-target edges
+      // outside testkit's harness `*`). Do not add new ones.
       if (e.to.startsWith('app:') || e.to.startsWith('tool:')) {
         out.push(`${e.file}: ${e.from} imports ${e.to} (apps/tools may only use packages/*)`);
       }
@@ -127,7 +139,17 @@ export function collectEdges(root: string): DepEdge[] {
   const walk = (dir: string): void => {
     for (const name of readdirSync(dir)) {
       const full = join(dir, name);
-      const st = statSync(full);
+      let st: { isDirectory(): boolean };
+      try {
+        st = statSync(full);
+      } catch {
+        // Dangling symlink or otherwise unreadable entry (e.g. gitignored
+        // test-output browser profiles): skip it instead of aborting the
+        // whole tree walk — an abort silently blinds the gate to every owner
+        // walked after the failure (RELEASE-8: `voodoo`/`webgl-renderer`
+        // went unscanned, hiding exactly the retirement edges).
+        continue;
+      }
       if (st.isDirectory()) {
         walk(full);
         continue;

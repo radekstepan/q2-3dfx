@@ -21,8 +21,7 @@ Rules that make the difference between 200 Mpixel/s and 5 Mpixel/s:
 - Fixed point 16.16 for texture coordinates, exactly as `d_scan.c` did.
 - One division per 16 pixels (affine subdivision), never per pixel.
 - Preallocated scratch buffers on the renderer instance; zero garbage per frame.
-- Avoid polymorphic call sites: separate `spanSoftware` / `spanVoodoo` functions, never a
-  `mode === 'x'` branch *inside* the pixel loop (branch on the span, not the pixel).
+- Avoid polymorphic call sites: branch on the span, never a mode check *inside* the pixel loop.
 - `ImageData` backed by a `Uint32Array` view; one `putImageData` + one `drawImage` upscale per frame.
 
 ### Scaling ladder (apply in this order, only when the perf ledger says you must)
@@ -72,7 +71,8 @@ without touching call sites (`@q2/sw-renderer` exposes `RasterBackend`).
 1. **Unit** (vitest): parsers against byte fixtures, math against C-captured values.
 2. **Golden frames**: `packages/testkit` renders fixed cameras in `devroom` + `base1` headlessly
    (the renderer never touches the DOM) and compares PNGs. Software path = exact index match.
-   Voodoo path = ≤0.5% pixels differing by ≤1 LSB (dither is deterministic, so this is tight).
+   GPU-vs-CPU parity is judged by the `docs/gpu-proof-1-contract.md` tolerances with mandatory
+   human review, never auto-pass. The legacy CPU Voodoo resolve leg is retired (RELEASE-8).
 3. **Determinism**: `demo1.dm2` playback and a recorded usercmd stream must reproduce identical
    entity origins; this is how we catch pmove/physics regressions.
 4. **Bench**: `tools/bench` prints Mpixel/s, ms/frame, overdraw, cache hit rate; CI posts the delta
@@ -135,6 +135,6 @@ yarn cook ~/q2/pak0.pak   # produce .q2pkg locally (never committed)
 ## 14. Glossary — C file → TS module
 
 `qcommon/` → `@q2/host` + `@q2/config` · `client/cl_*.c` → `@q2/client` · `server/sv_*.c` → `@q2/server`
-`game/g_*.c`, `p_*.c`, `m_*.c` → `@q2/game` · `ref_soft/*` → `@q2/sw-renderer` · `ref_gl/*` → `@q2/voodoo`
+`game/g_*.c`, `p_*.c`, `m_*.c` → `@q2/game` · `ref_soft/*` → `@q2/sw-renderer` · `ref_gl`-on-Voodoo3 look → `@q2/webgl-renderer` appearance (legacy `@q2/voodoo` CPU path retired, RELEASE-8)
 `qcommon/cmodel.c` → `@q2/bsp` · `qcommon/files.c` → `@q2/filesystem` · `qcommon/pmove.c` → `@q2/game/pmove.ts`
 

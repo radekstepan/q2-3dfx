@@ -1,4 +1,11 @@
-# @q2/voodoo
+# @q2/voodoo — RETIRED (RELEASE-8)
+
+> The legacy CPU Voodoo execution mode (per-frame resolve/scanout on the CPU) is
+> retired. The Voodoo3 appearance policy now lives in `@q2/webgl-renderer`
+> (`src/appearance.ts`, duplicated by value — no `webgl-renderer → voodoo` dep
+> edge); `vd_*` cvars remain as per-frame WebGL appearance uniforms
+> (`docs/renderers.md` §7.2). What follows is the historical record of this
+> package, kept until the code lane removes it. Do not add new importers.
 
 Voodoo3/Glide emulation: per-frame post-process + texture-sampling policy (M4.1/M4.2).
 Ports the `ref_gl` Voodoo path's resolve chain and sampler rules; not a second renderer —
@@ -22,10 +29,12 @@ Entry point: `src/index.ts:1`. Re-exports `bayer.js`, `capture.js`, `profile.js`
 - `VOODOO_APPROX_PROFILE` (`src/profile.ts`) — the documented approximation profile: every non-calibrated setting with its source tag (`manual:fbzMode` / `manual:vidProcCfg` / `manual:tLOD` / `approx:chosen` / `preset:appearance`). Nothing here is "hardware-calibrated" (reserved for later HW comparison). Scanout order is linear-pack → reconstruct/box → display gamma for all modes with matched pairs only (`2x2sub+2x2box` default, `4x4sub+4x1`; `legacy` alias = unconditional box, no subtraction). LOD compensation (+0.375) applies exactly once in `mipLevel` for the tlodDither path only — never in the round-to-nearest `pickMipLevel` path.
 - `captureCVarTable()` (`src/capture.ts:16`) — the 12 `vd_*` cvars at capture values; single source for `packages/testkit/CAPTURE-M4.1.md`.
 
-## How it is used
+## How it is used (historical — retired)
 
-No in-repo package imports `@q2/voodoo` yet; it is designed for the host/web shell resolve
-stage: rasterise in 8:8:8, sample via `sampleTexture`, then `resolveFrame` per frame.
+No package may import `@q2/voodoo`; the remaining static/dynamic references
+(`apps/web` resolve/scanout, `tools/bench` RGB legs, `testkit` resolve probes)
+are removed by the RELEASE-8 code lanes. The snippet below is the retired
+calling convention, kept for the record:
 
 ```ts
 import { readVoodooState, resolveFrame } from '@q2/voodoo';
@@ -42,5 +51,8 @@ resolveFrame(fb, fb565, display, w, h, st);
 
 ## Constraints
 
-- Dependency direction (BRAIN.md §4): sits beside `sw-renderer` above `bsp`/`formats`/`math`; reads (never writes) `vd_*` cvars from `@q2/config`. Nothing may import `apps/*`.
+- Dependency direction (BRAIN.md §4, RELEASE-8 residual): sat beside `sw-renderer`
+  above `bsp`/`formats`/`math`; read (never wrote) `vd_*` cvars from `@q2/config`.
+  Nothing may import `apps/*`. No new importers; this package is deleted on
+  retirement completion.
 - Platform: DOM-free, zero-alloc inner loops, typed arrays only — runs in a worker and in Node tests.

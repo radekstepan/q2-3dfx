@@ -1,15 +1,22 @@
 # Voodoo working-baseline approximations
 
+> RETIRED under RELEASE-8. The legacy CPU Voodoo execution mode is retired; this
+> document and `baseline-manifests/voodoo-baseline.json` are retained as the
+> pre-retirement working-baseline record. Do not re-pin or regenerate. Live GPU
+> appearance evidence is captured under GPU-FOLLOW-5 against
+> `docs/renderers.md` §7.2.
+
+
 Working visual baseline only — **not hardware-calibrated**. The word
 "hardware-calibrated" is reserved for a future comparison against a
 documented Voodoo3/MiniGL capture (see `CAPTURE-M4.1.md`). Base pinned at
 `5e13d42`.
 
-Regenerate: `yarn workspace @q2/testkit baseline` — writes
-`test-output/voodoo-baseline/` (gitignored `.rgba` blobs + sidecar JSON)
-and refreshes the committed hash manifest
+Historical procedure (do NOT run — retired): `yarn workspace @q2/testkit baseline`
+wrote `test-output/voodoo-baseline/` (gitignored `.rgba` blobs + sidecar JSON)
+and refreshed the committed hash manifest
 `baseline-manifests/voodoo-baseline.json` (hashes + settings, no pixels).
-Tests gate on the committed hashes, never on blobs.
+The retired suite gated on the committed hashes, never on blobs.
 
 ## 1. Pinned profile (duplicated by value, not imported)
 

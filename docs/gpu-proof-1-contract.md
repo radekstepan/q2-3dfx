@@ -20,6 +20,10 @@
   Node-test behavior. Any shared-policy extraction (voodoo constants,
   LOD helpers) copies pure values into the GPU backend; the CPU path
   keeps its own copies and pins.
+- RELEASE-8 note: the legacy CPU Voodoo resolve/scanout execution mode is
+  retired. The appearance authority is `docs/renderers.md` §7.2 as implemented
+  by `@q2/webgl-renderer`; the `voodoo-resolve` CPU display leg below is a
+  pre-retirement baseline record, not a live path.
 
 ## 2. Fixed proof scene + route
 
@@ -88,9 +92,10 @@ Cvar behavior: all 15 `vd_*` + `sw_*` cvars in §2 apply; the GPU
 backend honors `vd_16bit / vd_dither / vd_postfilter / vd_bilinear /
 vd_mipdither / vd_lodbias / vd_fog / vd_gamma / vd_maxtexsize /
 vd_zbits / vd_palettetex / vd_overbright / vd_dithermode /
-vd_reconmode / vd_rgbmaxdelta` with the same semantics as the CPU
-voodoo path. Any GPU-specific interpretation is documented in the
-GPU-PROOF-4 report, not silently redefined.
+vd_reconmode / vd_rgbmaxdelta` with the Voodoo appearance semantics in
+§4 / `docs/renderers.md` §7.2 (the legacy CPU voodoo path those semantics
+were first pinned against is retired under RELEASE-8). Any GPU-specific
+interpretation is documented in the GPU-PROOF-4 report, not silently redefined.
 
 Raster tolerances (predeclared review gates, `GPU_PROOF_TOLERANCES`):
 `maxFractionDiff 0.02` at `perChannelLsb 3`, `edgeExcludePx 1`,
@@ -138,6 +143,9 @@ voodoo-resolve display leg); slots `packages/testkit/gpu-proof-ref/`
 written only with `GPU_PROOF_WRITE_REF=1` (never overwrite by
 default); meta sidecars carry width/height/label/workload/rep/yaw,
 display leg, fidelity snapshot, `colorHash` + `displayHash`.
+(RELEASE-8: the `voodoo-resolve` CPU display leg is retired; the hashes
+below are the pre-retirement baseline record. Live GPU appearance
+evidence is re-captured under FOLLOW-5.)
 
 Fixed-frame reference hashes (serial, pinned profile, voodoo-resolve):
 

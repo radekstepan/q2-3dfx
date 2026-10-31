@@ -1,8 +1,14 @@
-# Renderers — software + Voodoo3 fidelity spec
+# Renderers — software reference + WebGL2 Voodoo appearance
 
 > Extracted from BRAIN.md §7. Normative for renderer behaviour and cvars.
 
 ## 7. The two renderers
+
+The software backend is the CPU reference. The WebGL2 backend is the fast path with a
+reviewed Voodoo-style appearance. The legacy CPU Voodoo execution mode is retired
+(RELEASE-8): no CPU path quantises to RGB565 or runs scanout reconstruction; the
+appearance policy below is implemented by the WebGL2 backend in shader/target passes,
+driven per frame by the same `vd_*` uniforms.
 
 ### 7.1 Software (`@q2/sw-renderer`) — the `ref_soft` port map
 
@@ -39,24 +45,25 @@ for (let i = 0; i < n; i++, o++) {
 Light is interpolated **per span**, not per pixel sample of the lightmap — that is what gives the
 unmistakable soft 16-unit light gradient of the software renderer.
 
-### 7.2 Voodoo 3 3000 (`@q2/voodoo`) — fidelity checklist
+### 7.2 Voodoo 3 3000 appearance (`@q2/webgl-renderer`) — fidelity checklist
 
 The Voodoo3 3000 is: 2 pixel pipelines × 1 TMU, 16 MB SDRAM, 166 MHz, 16-bit rendering only,
 max 256×256 textures, 16-bit Z, no stencil, table fog, bilinear/trilinear-by-mip-dither.
-Emulate **all** of the following; each is a cvar in `@q2/config` so we can A/B them:
+The WebGL2 backend implements **all** of the following; each is a cvar in `@q2/config`
+(read per frame as appearance uniforms) so we can A/B them:
 
-| Hardware behaviour | Our implementation | cvar |
+| Hardware behaviour | WebGL implementation | cvar |
 | --- | --- | --- |
 | 16-bit RGB565 framebuffer | quantise 8:8:8 → 5:6:5 at resolve; `vd_16bit=0` is a genuine RGB888 debug bypass (gamma stays on, dither/reconstruction off) | `vd_16bit` |
 | 4×4 ordered dither before quantise | Bayer matrix, ±4 on R/B, ±2 on G; colour dither at target writes, independent of mip dithering | `vd_dither` |
-| 2×2 "22-bit" RAMDAC post filter | matched scanout reconstruction on output; off still displays the current target (never stale) | `vd_postfilter` |
+| 2×2 "22-bit" RAMDAC post filter | matched reconstruction on output (single fullscreen appearance pass) | `vd_postfilter` |
 | Bilinear filtering | 4-tap, 8-bit fractional weights, fixed point; works in paletted or expanded storage | `vd_bilinear` |
 | Single-TMU "trilinear" | mipmap dithering: per-pixel pick LOD *n* or *n+1* by Bayer threshold vs LOD fraction (avg +0.375, needs bias comp) | `vd_mipdither` |
 | LOD bias (Glide default ≈ -0.35) | added to computed `log2(rho)` (tLOD.lodbias convention; negative favours finer) | `vd_lodbias` |
 | Table fog (64 entries, exp²) | capability gate: per-pixel table lookup on w, blend to fog colour; scene contribution is zero unless a scene/material/profile enables it (no haze in `base1`) | `vd_fog` |
 | Glide gamma ≈ 1.3 | display-stage transfer LUT after reconstruction (RAMDAC placement); 1.3 is a project preset, not a hardware constant | `vd_gamma` |
-| 256×256 texture cap | asset cooker downsamples oversized WALs; helper currently returns capped dimensions — real texel resampling + mip/UV adjustment pending | `vd_maxtexsize` |
-| 16-bit Z precision at visibility tests | 16 for the hardware profile; the per-frame helper is a banding-only approximation (post-hoc, cannot affect visibility) — true emulation must quantise before test/write | `vd_zbits` |
+| 256×256 texture cap | GPU uploader resamples oversized diffuse/skins preserving aspect (box filter + warning); the asset cooker itself ships plain per-file deflate with no resampling | `vd_maxtexsize` |
+| 16-bit Z precision at visibility tests | 16-bit depth at test/write for the hardware profile | `vd_zbits` |
 | 8-bit palettised textures (GL_EXT_shared_texture_palette) | texture storage/upload policy (paletted vs expanded RGB); expand through the palette at sample time; never gates filtering | `vd_palettetex` |
 | No per-pixel colour overbright, lightmap modulate ×2 | explicit compat policy: multiply, then clamp — clipping highlights like the real thing; blanket ×2 pending `gl_image.c` upload-intensity/`inverse_intensity` audit for strict mode | `vd_overbright` |
 | Dither matrix profile data (read-path only) | `2x2` \| `4x4`; current approximation is `4x4` | `vd_dithermode` |
