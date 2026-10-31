@@ -517,11 +517,12 @@ describe('infantry spin/cock combat loop (m_infantry.c cock_gun + fire + death2)
   it('burst tracers originate at the live muzzle every 10Hz tick', () => {
     // Sustained-fire hold (AI_HOLD_FRAME): one bullet per tick through the
     // expiry tick. Every round's tracer must leave the CURRENT gun muzzle
-    // (the body keeps stepping through locomotion while frozen on the fire
-    // frame) — never a stale first-tick origin, never more than one round
-    // per tick, never the cock frame (no fabricated bullet). Floored trace
-    // (combat.test.ts pattern): the stub floor holds the body at z=24 so
-    // the C dist>1000 resolver cutoff never trips mid-burst.
+    // (frozen holds fire in place now — C M_MoveFrame runs the aifunc with
+    // dist 0, so the origin only moves on non-hold frames) — never a stale
+    // first-tick origin, never more than one round per tick, never the
+    // cock frame (no fabricated bullet). Floored trace (combat.test.ts
+    // pattern): the stub floor holds the body at z=24 so the C dist>1000
+    // resolver cutoff never trips mid-burst.
     resetEdictNums();
     const st = SV_Init();
     const m = SV_SpawnMonster(st, 'monster_infantry', v3(0, 0, 24));

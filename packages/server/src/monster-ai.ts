@@ -493,9 +493,16 @@ export function duckHoldFrozen(m: ServerMonster, now: number): boolean {
  * skips monsterThink (the frame stays) and re-emits the fire event,
  * exactly like M_MoveFrame skipping the frame++ and re-running the
  * thinkfunc.
+ *
+ * Boundary dust: level.time accumulates 0.1 per tick in floating point
+ * while the pausetime is armed as cock-time + n*0.1 in one multiply, so
+ * the two disagree by ~1e-16 at the expiry tick (C has the same float
+ * shape with its own dust). The 1e-9 slack absorbs the accumulation so
+ * the intended window — and only it — re-fires: without it the expiry
+ * randomly costs or grants a 10Hz replay depending on magnitude dust.
  */
 export function burstHoldFrozen(m: ServerMonster, now: number): boolean {
-  if (!m.burstHeld || m.burstUntil <= 0 || now >= m.burstUntil) return false;
+  if (!m.burstHeld || m.burstUntil <= 0 || now >= m.burstUntil - 1e-9) return false;
   return sustainedFireFrame(m.kind, m.state.move, m.state.frame);
 }
 

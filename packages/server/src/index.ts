@@ -85,6 +85,7 @@ import {
   INFANTRY_GUN_SOUND,
   INFANTRY_COCK_SOUND,
   INFANTRY_MELEE_SOUND,
+  INFANTRY_SWING_SOUND,
   GUNNER_GRENADE_SOUND,
   MZ2_INFANTRY_MACHINEGUN_1,
   MZ2_INFANTRY_MACHINEGUN_2,
@@ -722,14 +723,13 @@ export function SV_MonsterClipBox(
  * passedict skip (a monster stepping itself must not clip its own hull);
  * the player is never a monster edict, so pmove callers leave it default.
  *
- * The monster pass defaults OFF (includeMonsters: false): monster
- * locomotion shares this trace object (SV_MonsterTick runs on game.trace),
- * and a mover always starts inside its own hull — with the pass on, every
- * sub-hull step reads allsolid and bodies freeze in place (pinned by the
- * pursuit tests). The single-sim driver feeds ONE trace to both pmove and
- * the monster tick, so flipping the default needs the web-lane PR that
- * splits the pmove trace from the monster trace; until then the solid flags
- * + SV_MonsterClipBox below carry the C state and unit tests pin the pass.
+ * The monster pass defaults OFF (includeMonsters: false): callers that
+ * feed one shared trace to both pmove and the monster tick would freeze
+ * every mover inside its own hull (a mover always starts inside it) unless
+ * they pass the mover's own edict as ignoreNum. SV_MonsterTick does that
+ * per monster internally (moveTraceFor), so the tick is freeze-free on a
+ * shared trace; pmove-only callers pass includeMonsters + leave ignoreNum
+ * at the player (never a monster num, so no self-skip needed there).
  */
 export function SV_ClipTrace(
   st: ServerState,
@@ -2087,6 +2087,15 @@ export interface MonsterTickOpts {
    * pass SV_TraceFor(map, MASK_OPAQUE_C) when glass sits between bodies.
    */
   sightTrace?: TraceFn;
+  /**
+   * Player hull for C MASK_MONSTERSOLID movement blocking (sv_world.c
+   * SV_ClipMoveToEntities clips every SOLID_BBOX except DEADMONSTER, so
+   * walkers stop on the player instead of entering them). pos comes from
+   * the playerPos arg; pass the hull here so the per-monster move trace
+   * also clips the player box. Absent keeps the legacy world-only move.
+   * SV_GameTick always passes it.
+   */
+  playerBody?: { mins: Vec3; maxs: Vec3 };
 }
 
 export function SV_MonsterTick(
@@ -2101,6 +2110,56 @@ export function SV_MonsterTick(
   const sightTrace = opts?.sightTrace ?? trace;
   const playerView = opts?.playerViewheight ?? PLAYER_VIEWHEIGHT;
   const now = st.time;
+  // Per-monster move trace (C g_phys.c SV_Move + server/sv_world.c
+  // SV_ClipMoveToEntities): the world/clip trace PLUS every OTHER live
+  // monster hull (self skipped via ignoreNum — a mover always starts inside
+  // its own hull) PLUS the player box, so walkers stop on bodies instead
+  // of entering them. Corpses never block (C SVF_DEADMONSTER skip without
+  // CONTENTS_DEADMONSTER — SV_MonsterClipBox drops them the same way),
+  // gibbed/dormant bodies are already skipped there. The player box always
+  // clips while provided (C keeps the client edict SOLID_BBOX after death;
+  // SP restarts on death anyway). Sight still runs on sightTrace.
+  let playerMins: Float32Array | null = null;
+  let playerMaxs: Float32Array | null = null;
+  if (opts?.playerBody) {
+    playerMins = new Float32Array([
+      playerPos[0]! + opts.playerBody.mins[0]!,
+      playerPos[1]! + opts.playerBody.mins[1]!,
+      playerPos[2]! + opts.playerBody.mins[2]!,
+    ]);
+    playerMaxs = new Float32Array([
+      playerPos[0]! + opts.playerBody.maxs[0]!,
+      playerPos[1]! + opts.playerBody.maxs[1]!,
+      playerPos[2]! + opts.playerBody.maxs[2]!,
+    ]);
+  }
+  const moveTraceFor = (self: ServerMonster): TraceFn => {
+    const base = SV_ClipTrace(st, trace, self.edict.num, true);
+    if (!playerMins || !playerMaxs) return base;
+    const pmins = playerMins;
+    const pmaxs = playerMaxs;
+    return (s: Vec3, mins: Vec3, maxs: Vec3, e: Vec3) => {
+      const best = base(s, mins, maxs, e);
+      const hit = sweepBrushBox(s, e, mins, maxs, pmins, pmaxs);
+      if (hit.allsolid || hit.fraction < best.fraction) {
+        return {
+          fraction: hit.fraction,
+          endpos: v3(
+            s[0]! + (e[0]! - s[0]!) * hit.fraction,
+            s[1]! + (e[1]! - s[1]!) * hit.fraction,
+            s[2]! + (e[2]! - s[2]!) * hit.fraction,
+          ),
+          planeNormal: hit.normal,
+          allsolid: hit.allsolid,
+          startsolid: hit.startsolid,
+          entityNum: best.entityNum,
+          contents: best.contents,
+          surfaceFlags: best.surfaceFlags,
+        };
+      }
+      return best;
+    };
+  };
   // Player-trail upkeep (p_client.c): record the spot when it leaves sight
   // of the last marker, so blind pursuit follows the path, not a beeline.
   // Lives here (not just SV_GameTick) so direct-tick callers get the same
@@ -2131,6 +2190,11 @@ export function SV_MonsterTick(
     // Woken bodies stamp their sight delay against the clock (SV_UseMonster
     // carries no time, so the use only parks -1).
     if (m.reactionAt < 0) m.reactionAt = reactionAt(st.skill, now);
+    // Body-aware move trace for this monster (world/clips + other live
+    // monsters + the live player box, self skipped): steering probes and
+    // locomotion share it, so pursuit rounds bodies instead of entering
+    // them. Sight still runs on sightTrace.
+    const moveTrace = moveTraceFor(m);
     const pos = m.edict.origin;
     const dx = playerPos[0]! - pos[0]!;
     const dy = playerPos[1]! - pos[1]!;
@@ -2173,14 +2237,14 @@ export function SV_MonsterTick(
         goal = m.combatGoal;
       } else if (m.combatHold) {
         standGround = true;
-        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), trace) : playerPos;
+        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), moveTrace) : playerPos;
       } else {
-        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), trace) : playerPos;
+        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), moveTrace) : playerPos;
       }
     } else {
       if (m.combatHold) standGround = true;
       goal = m.seen
-        ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), trace)
+        ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), moveTrace)
         : playerPos;
       goal = separationOffset(st, m, goal);
     }
@@ -2228,9 +2292,9 @@ export function SV_MonsterTick(
       });
     }
     const loco = monsterLocomotion(ms, pos, playerPos, (s, e) => {
-      const h = stepHullTrace(trace, s, e, monsterHullMaxs(m));
+      const h = stepHullTrace(moveTrace, s, e, monsterHullMaxs(m));
       return { fraction: h.fraction, endpos: h.endpos };
-    }, goal, { newChaseDir: true, slideSign: m.slideDir });
+    }, goal, { newChaseDir: true, slideSign: m.slideDir, frozen: holdLive });
     // Commit the sweep's hand: a sliding body keeps sliding the same way
     // (deterministic wall-following). Cleared direct legs do NOT drop it —
     // near a face a full step can fit without touching, and resetting there
@@ -2272,11 +2336,19 @@ export function SV_MonsterTick(
     // Infantry chaingun spin (m_infantry.c infantry_cock_gun, attak104):
     // the cock frame plays infatck3 and arms the 1.0-2.5s burst pausetime
     // (no bullet — the fire frame does that). Anim-committed like C: the
-    // move was entered with LOS, so the cock always plays.
+    // move was entered with LOS, so the cock always plays. The melee
+    // wind-up (m_infantry.c infantry_swing, attak203) plays infatck2 the
+    // same way — no damage, just the C cue the smack test pins.
     if (action === 'cock') {
       armInfantryCock(m, now, rand);
       st.sounds.push({
         name: INFANTRY_COCK_SOUND,
+        pos: v3(pos[0], pos[1], pos[2]! + 32),
+        born: st.time,
+      });
+    } else if (action === 'swing' && m.kind === 'infantry') {
+      st.sounds.push({
+        name: INFANTRY_SWING_SOUND,
         pos: v3(pos[0], pos[1], pos[2]! + 32),
         born: st.time,
       });
@@ -3195,9 +3267,15 @@ function spawnBarrelDebris(
  * the soldier weapon is skin-determined (never random); blaster skins spawn
  * a real foe bolt, shotgun/machinegun skins draw short yellow muzzle
  * streaks and roll id's pHit, grenades leave the tube only on the C
- * frames, infantry melee (attack2) resolves the true smack while
- * soldier/gunner point-blank events resolve as gunfire (their C melee is
- * NULL). Every shot carries its enemy muzzle dlight.
+ * frames, infantry melee (attack2) resolves the true smack flashlessly
+ * (C fire_hit emits no muzzle/dlight/tracer) while soldier/gunner
+ * point-blank events resolve as gunfire (their C melee is NULL). Every
+ * ballistic shot carries its enemy muzzle dlight.
+ *
+ * Tracer verdict vs the original: C fire_lead draws NO beam — bullets are
+ * instant traces with a TE_GUNSHOT impact puff only. The short muzzle
+ * streaks here are a deliberate readability aid (never muzzle→eye beams);
+ * muzzle offsets, dlight, sounds and impact sparks follow the C tables.
  */
 function resolveMonsterFire(
   st: ServerState,
@@ -3242,6 +3320,22 @@ function resolveMonsterFire(
           Math.max(0, Math.min(11, ev.frame - INFANTRY_DEATH_SPRAY_FIRST_FRAME))
         : MZ2_INFANTRY_MACHINEGUN_1;
   }
+  const chest = v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]! + 32);
+  // True melee belongs to infantry only (m_infantry.c: attack2 frames into
+  // infantry_smack, fire_hit dmg 5+(rand%5) kick 50, melee2.wav on connect;
+  // the swing (infatck2.wav) plays at the wind-up frame, which the lite sim
+  // collapses into the smack event). C fire_hit emits no muzzle flash,
+  // dlight or tracer, so the smack resolves BEFORE the muzzle push and
+  // stays flashless. Soldier/gunner melee is NULL in C — at melee range
+  // they fire their guns point-blank, so non-infantry events fall through
+  // to the gunfire branches below with the guns' real sounds.
+  if (m.kind === 'infantry' && move === 'attack2') {
+    if (dist < 96) {
+      SV_DamagePlayer(st, infantryMeleeDamage(rand));
+      st.sounds.push({ name: INFANTRY_MELEE_SOUND, pos: chest, born: st.time });
+    }
+    return;
+  }
   const muzzle = projectSource(
     v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]),
     monsterFlashOffset(flashId),
@@ -3252,7 +3346,6 @@ function resolveMonsterFire(
   st.muzzles.push({ pos: muzzle, intensity: 200 + ((rand() * 32) | 0), born: st.time, foe: true });
   const dirToEye = v3(eye[0]! - muzzle[0]!, eye[1]! - muzzle[1]!, eye[2]! - muzzle[2]!);
   const dirLen = Math.hypot(dirToEye[0]!, dirToEye[1]!, dirToEye[2]!) || 1;
-  const chest = v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]! + 32);
   // Soldier blaster skin: a real projectile, not a damage roll.
   if (skinWeapon === 'blaster') {
     st.bolts.push({
@@ -3272,25 +3365,14 @@ function resolveMonsterFire(
     st.muzzles.splice(flashIdx, 1);
     return;
   }
-  // True melee belongs to infantry only (m_infantry.c: attack2 frames into
-  // infantry_smack, fire_hit dmg 5+(rand%5) kick 50, melee2.wav on connect;
-  // the swing (infatck2.wav) plays at the wind-up frame, which the lite sim
-  // collapses into the smack event). Soldier/gunner melee is NULL in C — at
-  // melee range they fire their guns point-blank, so non-infantry events
-  // fall through to the gunfire branches below with the guns' real sounds.
-  if (m.kind === 'infantry' && move === 'attack2') {
-    if (dist < 96) {
-      SV_DamagePlayer(st, infantryMeleeDamage(rand));
-      st.sounds.push({ name: INFANTRY_MELEE_SOUND, pos: chest, born: st.time });
-    }
-    return;
-  }
   const pHit = dist < 500 ? 0.6 : 0.25;
   // Infantry machinegun: single bullet per trigger (m_infantry.c
   // InfantryMachineGun -> monster_fire_bullet dmg 3 kick 4 spread 300/500,
   // infatck1.wav). The C AI_HOLD_FRAME hold re-fires this frame across
-  // ticks for the remainder of the cock pausetime (3-18 rounds); the tick
-  // owns the freeze (burstHoldFrozen), so each event resolves one bullet.
+  // ticks for the remainder of the cock pausetime (4-19 rounds: the fire
+  // frame plays 7 frames after the cock and the hold fires through the
+  // expiry tick, so n-6 for the 10-25 cock window); the tick owns the
+  // freeze (burstHoldFrozen), so each event resolves one bullet.
   // Attack1 aims at the enemy (with the -0.2 velocity lead folded into
   // the resolver's eye target); the death2 spray is blind — each round
   // leaves along angles - aimangles[] (see infantryDeathSprayAngles), so
@@ -3312,9 +3394,10 @@ function resolveMonsterFire(
   }
   // Soldier machinegun skin: ONE bullet per trigger (m_soldier.c
   // soldier_fire4 -> monster_fire_bullet dmg 2 kick 4). The sustained
-  // burst is the AI_HOLD_FRAME re-fire across 10Hz ticks (3-10 shots),
-  // never a same-tick fan: each tick draws its own SHORT muzzle streak
-  // (never a muzzle→eye beam) and rolls pHit once.
+  // burst is the AI_HOLD_FRAME re-fire across 10Hz ticks (4-11 shots:
+  // the arming tick plus k=3+rand()%8 frozen replays plus the expiry
+  // replay), never a same-tick fan: each tick draws its own SHORT muzzle
+  // streak (never a muzzle→eye beam) and rolls pHit once.
   if (skinWeapon === 'machinegun') {
     st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
     st.sounds.push({ name: SOLDIER_WEAPON_STATS.machinegun.sound, pos: chest, born: st.time });
@@ -3703,7 +3786,7 @@ function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
     SV_TouchDoorsAt(st, { origin: m.edict.origin, mins: MONSTER_HULL_MINS, maxs: MONSTER_HULL_MAXS }, 'monster');
   }
   // Think + C-cadence return fire (damage, bolts, tracers, muzzles, sounds).
-  for (const ev of SV_MonsterTick(st, game.player.pos, game.trace, game.nav ?? null, rand, { sightTrace, playerViewheight: game.player.view })) {
+  for (const ev of SV_MonsterTick(st, game.player.pos, game.trace, game.nav ?? null, rand, { sightTrace, playerViewheight: game.player.view, playerBody: { mins: game.player.mins, maxs: game.player.maxs } })) {
     const m = st.monsters.find((mm) => mm.edict.num === ev.num);
     if (!m) continue;
     resolveMonsterFire(st, m, ev, game.player, rand);

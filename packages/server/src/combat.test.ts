@@ -321,13 +321,13 @@ describe('Phase 2: TTK proof (skill 1 = medium)', () => {
 });
 
 describe('sustained fire: ss burst is C-true (attack4 + hold, not a fan)', () => {
-  it('attack4 pass: 3-10 single-bullet events at 10Hz on the C fire frame', () => {
+  it('attack4 pass: single-bullet events at 10Hz on the C fire frame (k+1 rounds)', () => {
     // m_soldier.c: soldier_attack always picks soldier_move_attack4 for
     // skinnum 4+ (6 frames, soldier_fire4 at index 2 = attak403, flash
     // machinegun_flash[3]); soldier_fire arms pausetime = level.time +
     // (3 + rand()%8) * FRAMETIME on the first fire frame, and M_MoveFrame
-    // (g_monster.c) freezes + re-fires the frame every 0.1s — 3-10 single
-    // 2dmg bullets, no wind-up, no spin, no same-tick fan.
+    // (g_monster.c) freezes + re-fires the frame every 0.1s — k+1 single
+    // 2dmg bullets (4-11), no wind-up, no spin, no same-tick fan.
     resetEdictNums();
     const st = SV_Init();
     expect(st.skill).toBe(1);
@@ -353,9 +353,8 @@ describe('sustained fire: ss burst is C-true (attack4 + hold, not a fan)', () =>
     // tick, every frozen tick, and the expiry tick all fire (C: the
     // thinkfunc runs on the expiry tick too, then clears AI_HOLD_FRAME):
     // k+1 = 8 single rounds, all on the C fire frame (attak403, index 2),
-    // one per consecutive tick — plus the float-boundary tick the 0.1s
-    // accumulation buys (deterministic: 9). No same-tick fan, no spin-up.
-    expect(fired).toHaveLength(9);
+    // one per consecutive tick. No same-tick fan, no spin-up.
+    expect(fired).toHaveLength(8);
     expect(fired.every((f) => f === 2)).toBe(true);
     for (let k = 1; k < tickOf.length; k++) expect(tickOf[k]! - tickOf[k - 1]!).toBe(1);
     expect(tickOf[0]).toBe(2); // first shot on the attak403 pass
@@ -383,15 +382,14 @@ describe('sustained fire: ss burst is C-true (attack4 + hold, not a fan)', () =>
     const hp0 = st.playerHealth;
     // rand 0: hold k = 3 frames (0.3s); every round connects (pHit 0.6 at
     // 300u, rand 0 always beats it). The arming tick, the frozen ticks,
-    // and the expiry tick all fire (C thinkfunc tail): k+1 = 4 rounds plus
-    // the float-boundary tick (deterministic: 5). 8 ticks cover the pass
-    // without tripping the next M_CheckAttack roll.
+    // and the expiry tick all fire (C thinkfunc tail): k+1 = 4 rounds.
+    // 8 ticks cover the pass without tripping the next M_CheckAttack roll.
     for (let i = 0; i < 8; i++) SV_Tick(st, 0.1, { player, trace, rand: () => 0 });
-    expect(st.playerHealth).toBe(hp0 - 5 * 2);
+    expect(st.playerHealth).toBe(hp0 - 4 * 2);
     // One tracer + muzzle + solatck3 per round — single bullets, no fan.
-    expect(st.tracers).toHaveLength(5);
-    expect(st.muzzles.filter((z) => z.foe)).toHaveLength(5);
-    expect(st.sounds.filter((s) => s.name === 'soldier/solatck3.wav')).toHaveLength(5);
+    expect(st.tracers).toHaveLength(4);
+    expect(st.muzzles.filter((z) => z.foe)).toHaveLength(4);
+    expect(st.sounds.filter((s) => s.name === 'soldier/solatck3.wav')).toHaveLength(4);
   });
 });
 

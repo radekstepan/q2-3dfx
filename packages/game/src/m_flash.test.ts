@@ -6,6 +6,9 @@ import { v3 } from '@q2/math';
 import {
   monsterFlashOffset,
   projectSource,
+  MZ2_INFANTRY_MACHINEGUN_1,
+  MZ2_INFANTRY_MACHINEGUN_2,
+  MZ2_INFANTRY_MACHINEGUN_13,
   MZ2_SOLDIER_BLASTER_1,
   MZ2_SOLDIER_BLASTER_2,
   MZ2_SOLDIER_BLASTER_8,
@@ -38,6 +41,16 @@ describe('m_flash (id monster_flash_offset soldier/gunner slices)', () => {
   it('gunner offsets keep the *1.15 scale', () => {
     expectOffset(MZ2_GUNNER_MACHINEGUN_1, 30.1 * 1.15, 3.9 * 1.15, 19.6 * 1.15);
     expectOffset(MZ2_GUNNER_GRENADE_1, 4.6 * 1.15, -16.8 * 1.15, 7.3 * 1.15);
+  });
+
+  it('infantry rows are raw (no *1.2 bake — verbatim m_flash.c)', () => {
+    // m_flash.c monster_flash_offset[] rows 26-38: only the soldier rows
+    // carry the MODEL_SCALE factor. The resolver keys the attack1 fire
+    // frame (attak111) to row 26 and the death2 spray (death211-222) to
+    // rows 27-38 through aimangles[].
+    expectOffset(MZ2_INFANTRY_MACHINEGUN_1, 26.6, 7.1, 13.1);
+    expectOffset(MZ2_INFANTRY_MACHINEGUN_2, 18.2, 7.5, 15.4);
+    expectOffset(MZ2_INFANTRY_MACHINEGUN_13, -12.4, 13.0, 20.2);
   });
 
   it('unknown flash ids fall back to the origin (flash 0 is unused)', () => {

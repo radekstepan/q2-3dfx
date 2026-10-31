@@ -334,7 +334,8 @@ done-when:
 ### RELEASE-5 — Monster collision, wall movement and infantry fire
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
 depends: none
-status: ready
+status: in-progress(@opencode)
+lane-2026-10-30 (@opencode): game+server+testkit lane DONE (game 211/211, server 202/202, testkit 3/3; per-monster trace, frozen hold, flashless smack + swing cue, n-6/k+1 windows, real-base1 t38/*19 regression); apps/web visible replay + burst capture + monster-block *31 update still open for integrator.
 done-when:
 - [ ] Reproduce player clipping into live infantry. Audit server entity hulls/linking, player prediction and movement traces; test stationary/moving infantry, close contact and doorways. Keep legitimate corpse/death collision behavior faithful to source.
 - [ ] Revisit the soldier behind the door at player position **(-1148.1, 1542.3, -24)** in base1, recording facing, soldier identity, skill and door state. Confirm with a regression and visible replay that it cannot climb up the wall then descend. Audit step height, ground checks, hull traces and moving-door interaction; a generic chase test is not confirmation at this location.

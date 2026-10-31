@@ -125,6 +125,32 @@ describe('monsterLocomotion (pure, headless)', () => {
     // horizontal step stayed level; gravity snapped down to the lower floor
     expect(origin[2]).toBeCloseTo(-10, 6);
   });
+
+  it('frozen hold (C AI_HOLD_FRAME): yaws but never steps, gravity still holds', () => {
+    // g_monster.c M_MoveFrame runs the aifunc with dist 0 while HOLD is set:
+    // ai_charge still turns (M_ChangeYaw) but M_walkmove never steps, so a
+    // sustained burst fires in place instead of drifting one frame-dist per
+    // 10Hz tick.
+    const ms = spawnMonster('infantry');
+    ms.move = 'attack1';
+    ms.frame = 10; // fire frame (dist 1)
+    ms.yaw = 90;
+    const origin = v3(0, 0, 0);
+    monsterLocomotion(ms, origin, v3(100, 0, 0), floorTrace(), undefined, { frozen: true });
+    expect(origin[0]).toBeCloseTo(0, 6);
+    expect(origin[1]).toBeCloseTo(0, 6);
+    expect(origin[2]).toBeCloseTo(0, 6);
+    // still turned toward the goal (90 -> ~70 at yaw_speed 20)
+    expect(ms.yaw).toBeCloseTo(70, 1);
+    // control: unfrozen, the same frame steps its dist
+    const ms2 = spawnMonster('infantry');
+    ms2.move = 'attack1';
+    ms2.frame = 10;
+    ms2.yaw = 90;
+    const origin2 = v3(0, 0, 0);
+    monsterLocomotion(ms2, origin2, v3(100, 0, 0), floorTrace());
+    expect(origin2[0]).toBeCloseTo(1, 6);
+  });
 });
 
 describe('monsterLocomotion SV_NewChaseDir-lite sweep (opt-in)', () => {

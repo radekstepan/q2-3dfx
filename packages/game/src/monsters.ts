@@ -405,7 +405,9 @@ export const INFANTRY_C: InfantryCStats = {
  * C infantry_cock_gun burst window (m_infantry.c: pausetime = level.time +
  * ((rand() & 15) + 3 + 7) * FRAMETIME): 10-25 frames of 0.1s. The fire
  * frame (attak111, index 10) plays 7 frames after the cock (attak104,
- * index 3), so the AI_HOLD_FRAME hold re-fires 3-18 single bullets.
+ * index 3), so the AI_HOLD_FRAME hold re-fires 4-19 single bullets
+ * (arming tick + frozen replays + the C expiry replay: n-6 for the
+ * 10-25-frame cock window, the fire frame playing 7 frames after the cock).
  */
 export function infantryCockBurstFrames(rand: () => number): number {
   return 10 + Math.floor(rand() * 16);
@@ -487,7 +489,9 @@ function taggedMove(
 //   (attak111 = md2 194) — InfantryMachineGun single bullet
 //   (monster_fire_bullet dmg 3 kick 4 spread 300/500, infatck1.wav) plus
 //   AI_HOLD_FRAME, which re-fires the frame every 0.1s until the cock
-//   pausetime expires (a 3-18 round burst). The lite table tags both frames
+//   pausetime expires (a 4-19 round burst: the cock-to-fire gap is 7 frames,
+//   and the hold re-fires through the expiry tick, so n-6 for the 10-25
+//   cock window). The lite table tags both frames
 //   ('cock' + 'fire'); the tick owns the C loop (armInfantryCock on the
 //   cock frame, burstHoldFrozen re-emitting the fire frame).
 // - attack2 (FRAME_attak201-208 = md2 199-206, the melee): infantry_swing
@@ -612,10 +616,16 @@ export const MONSTER_FALL_PROBE = 50;
  *   keeps the same hand instead of dithering back — the deterministic
  *   counterpart of C's randomized sweep order, which breaks the same
  *   symmetry stochastically. A fresh 0 means undecided.
+ * - frozen: C AI_HOLD_FRAME (g_monster.c M_MoveFrame): while the gun
+ *   pausetime runs, the frame's aifunc runs with dist 0 (ai_charge still
+ *   yaws via M_ChangeYaw, but M_walkmove never steps). Set while a
+ *   sustained-fire hold owns the body so the burst fires in place instead
+ *   of drifting one frame-dist per 10Hz tick. Gravity still applies.
  */
 export interface LocomotionOpts {
   newChaseDir?: boolean;
   slideSign?: number;
+  frozen?: boolean;
 }
 
 /** What the locomotion step did (drives the tick's slide commitment). */
@@ -673,10 +683,12 @@ export function monsterLocomotion(
   let result: LocomotionResult = { slide: 0, blocked: true };
   // Face the steering target every tick via id M_ChangeYaw (shortest-arc,
   // clamped by yaw_speed) — never an instant snap; only translate when the
-  // frame carries a dist so stand/attack frames never moonwalk.
+  // frame carries a dist so stand/attack frames never moonwalk. A frozen
+  // hold (C AI_HOLD_FRAME) still yaws (ai_charge runs M_ChangeYaw with
+  // dist 0) but never steps, so the burst fires in place.
   if (len > 1e-9) {
     state.yaw = changeYaw(state.yaw, monsterYawTo(origin, goal), MONSTER_YAW_SPEED[state.kind]);
-    if (fr.dist !== 0) {
+    if (fr.dist !== 0 && !(opts?.frozen ?? false)) {
       const step = (
         yawDeg: number,
       ): { fraction: number; endpos: Vec3 } => {
