@@ -280,7 +280,7 @@ FAIL and a proposed, unapproved tone-normalized threshold. Reopen acceptance;
 no threshold change is authorized. Historical full verify was reported 78/80,
 and deps:check 676 passed after the sound/config fix; neither was rerun here.
 
-Priority (2026-10-31: RELEASE-7 repaired + archived, RELEASE-6 repaired + archived, next): RELEASE-4 → GPU-FOLLOW-3B → RELEASE-9/10/11,
+Priority (2026-10-31: RELEASE-7/RELEASE-6 repaired + archived; RELEASE-4 boxes 1–2 landed, box 3 blocked on map-truth prerequisite; next): GPU-FOLLOW-3B → RELEASE-9/10/11,
 then FOLLOW-5/6/7. Independent cards can proceed with disjoint ownership.
 Claim one card; preserve software goldens and sky/lifecycle behavior. Expensive
 validation runs sequentially. Require actual production-path regressions and
@@ -292,11 +292,12 @@ here. A missing display blocks displayed-performance acceptance, not code repair
 ### RELEASE-4 — Make the waiting final elevator physically enterable
 owns: `packages/server`, `packages/game`, `apps/web`, `packages/testkit`
 depends: none
-status: ready (reopened)
+status: blocked (boxes 1–2 landed 2026-10-31; box 3 needs the boarding prerequisite below)
+blocker: live boarding of the *12 deck is geometrically impossible in the original base1 map. Verified with brush data + gameplay traces: the deck slot (x -2064..-2048, z -48..0) sits inside world rock (hull-face at x=-2048 spanning z 0..190+); the SP call button *13 is entombed under the walkway; the autostart (trigger_always → t91) is skill-inhibited in SP. Boarding would require altering id's map. Recorded evidence: server sweep/button repairs, game pmove-clean audit, testkit trace legs, web approach gate pinning the rock face (ent 0). Awaiting user direction: re-scope box 3 to the original pit exit (tunnel → *27 → t37, already covered by base1-gate (w) except its documented teleport descent) vs map surgery.
 user-verdict: elevator now stays open/waits, but an invisible obstruction prevents entry. Preserve the waiting repair.
 done-when:
-- [ ] Reproduce approach and blocked boarding through normal movement, identify exact brush/entity blocking the player trace (fraction/startsolid/allsolid, model, origin, bounds, solid flags). Compare rendered door/platform pose with authoritative collision transform and target chain; inspect retained *31 plug and surrounding sliders without assuming which is responsible.
-- [ ] Repair stale/incorrect collision, activation or geometry state against map/original behavior; never disable all mover collision or teleport the player to pass the test.
+- [x] Reproduce approach and blocked boarding through normal movement, identify exact brush/entity blocking the player trace (fraction/startsolid/allsolid, model, origin, bounds, solid flags). Compare rendered door/platform pose with authoritative collision transform and target chain; inspect retained *31 plug and surrounding sliders without assuming which is responsible.
+- [x] Repair stale/incorrect collision, activation or geometry state against map/original behavior; never disable all mover collision or teleport the player to pass the test.
 - [ ] Extend real-base1 gate to walk from outside through the doorway, board, operate intended control, ride and finish. Assert no invisible obstruction and no premature departure; capture the complete route. Tests starting on the platform do not close boarding acceptance.
 
 ### GPU-FOLLOW-3B — Remove the remaining visible water tile seams

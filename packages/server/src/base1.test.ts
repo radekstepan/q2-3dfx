@@ -56,12 +56,14 @@ import {
   SV_ClipTrace,
   SV_DropTraceFor,
   SV_MonsterTick,
+  SV_MoverClipBox,
   SV_RemoveBrushClip,
   SV_SetPmoveWorldFromBsp,
   SV_SetSkill,
   SV_TouchButtonsAt,
   SV_TouchDoorsAt,
   SV_TraceFor,
+  SV_TrainClipBox,
   SV_UseButton,
   dmOnlyInSP,
   droptofloor,
@@ -1648,9 +1650,12 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(SV_TouchButtonsAt(st, lean, 'player').map((m) => m.ent.model)).toContain('*34');
     expect(b34.state).toBe('going_up');
     expect(st.firedThisTick).not.toContain('t4'); // not yet: fires at the top
-    SV_Tick(st, 0.1);
-    expect(st.firedThisTick).toContain('t4');
+    // C travel is |movedir| . size - lip = 5 at speed 40 (0.125s), so TOP
+    // arrival — and the t4 fire — lands on the second tick, not the first.
     let guard = 0;
+    while (!st.firedThisTick.includes('t4') && guard++ < 5) SV_Tick(st, 0.1);
+    expect(st.firedThisTick).toContain('t4');
+    guard = 0;
     while (d31.state !== 'waiting' && d31.state !== 'top' && guard++ < 100) SV_Tick(st, 0.1);
     expect(d31.ent.origin[2]!).toBeCloseTo(d31.pos2[2]!, 3); // down 156
     expect(train.started).toBe(false); // the plug cycle never starts the lift
@@ -1845,6 +1850,149 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       expect(train.arrived).toBe(true);
       expect(train.ent.origin[0]!).toBeCloseTo(-16, 6);
       expect(train.ent.origin[2]!).toBeCloseTo(40, 6);
+    } finally {
+      resetPmoveWorld();
+    }
+  });
+
+  it('RELEASE-4: walk the boarding approach with no phantom obstruction', { timeout: 180000 }, () => {
+    // Regression for the invisible boarding obstruction (server lane). Two
+    // C-parity collision defects froze normal walking near the exit complex
+    // while every visual stayed correct:
+    // 1. sweepBrushBox missed id's "completely in front of face" early-out
+    //    (qcommon/cmodel.c CM_ClipBoxToBrush: d1 > 0 && d2 >= d1 → return),
+    //    so any mover/button/train clip sharing the body's y/z band BEHIND
+    //    the walk direction reported a fraction-0 + startsolid phantom that
+    //    SV_ClipTrace preferred over the real world hit — e.g. the walkway
+    //    leg below (world-clear) froze owned by the *34 button 40u behind.
+    //    startsolid was also forged from the entry fraction; C sets it only
+    //    from the inside test.
+    // 2. func_button travel was lip, not C's |movedir| . size - lip
+    //    (game/g_func.c SP_func_button): the pressed *34 stopped 1 unit
+    //    proud and its expanded hull pinned the walker at the walkway step
+    //    (start-inside allsolid) after the button visibly sank flush.
+    // Neither fix disables mover collision or teleports. The *31 plug keeps
+    // NO touch trigger, the lift still waits for *13/t91, and the waiting
+    // train's own clip is untouched (it sits exactly on its brush — the
+    // deck-top/pit-floor 48 gap was never a step-up either way).
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    SV_SpawnEntities(st, map.entities, (model) => {
+      if (!model.startsWith('*')) return null;
+      const n = Number.parseInt(model.slice(1), 10);
+      if (!Number.isFinite(n)) return null;
+      return modelBounds(map, n);
+    });
+    try {
+      SV_SetPmoveWorldFromBsp(map);
+      const prod = SV_ClipTrace(st, SV_TraceFor(map));
+      setPmoveWorld(prod, bspContentsFor(map));
+      const plug = st.movers.find((m) => m.ent.model === '*31')!;
+      const d32 = st.movers.find((m) => m.ent.model === '*32')!;
+      const d33 = st.movers.find((m) => m.ent.model === '*33')!;
+      const b34 = st.movers.find((m) => m.ent.model === '*34')!;
+      const train = st.trains.find((t) => !t.ship)!;
+      // Park the sliders open by leaning at the slot mouth (touch only).
+      const lean = { origin: v3(-1669, 1514, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS };
+      for (let i = 0; i < 60; i++) {
+        SV_Tick(st, 0.1);
+        SV_TouchDoorsAt(st, lean, 'player');
+      }
+      expect(d32.ent.origin[1]! - d32.pos1[1]!).toBeCloseTo(-64, 0);
+      expect(d33.ent.origin[1]! - d33.pos1[1]!).toBeCloseTo(64, 0);
+      // Rendered pose == collision transform: the parked-slider clip is the
+      // rest brush bounds shifted by the travelled offset (map truth).
+      const d32box = SV_MoverClipBox(st, d32)!;
+      expect([...d32box.mins]).toEqual([-1688, 1376, 96]);
+      expect([...d32box.maxs]).toEqual([-1680, 1472, 224]);
+      // Lower the plug through the C-intended *34 lean press (touch only).
+      // Per the fireTargets end-of-game rule this press finishes the level
+      // via the plug-platform 'lift' path (operating the end control with
+      // the map behind you) — while the train lift itself stays parked.
+      SV_TouchButtonsAt(
+        st,
+        { origin: v3(-1862, 1536, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+        'player',
+      );
+      expect(b34.state).toBe('going_up');
+      // C travel: |movedir| . size - lip = 9 - 4 = 5 (not lip 4).
+      expect(b34.pos2[0]! - b34.pos1[0]!).toBeCloseTo(-5, 6);
+      let guard = 0;
+      while (plug.state !== 'waiting' && plug.state !== 'top' && guard++ < 100) {
+        SV_Tick(st, 0.1);
+        SV_TouchDoorsAt(st, lean, 'player');
+      }
+      expect(plug.ent.origin[2]!).toBeCloseTo(-156, 0);
+      // The pressed *34 sits flush: clip == bounds + travelled offset.
+      expect([...b34.ent.origin]).toEqual([...b34.pos2]);
+      const b34box = SV_MoverClipBox(st, b34)!;
+      expect([...b34box.mins]).toEqual([-1853, 1520, 120]);
+      expect([...b34box.maxs]).toEqual([-1844, 1552, 152]);
+      // The waiting train's clip sits exactly on its brush (no stale
+      // offset); deck top 0 over pit floor -48 was never a step-up.
+      expect(train.started).toBe(false);
+      expect([...train.ent.origin]).toEqual([0, 0, 0]);
+      const tbox = SV_TrainClipBox(st, train)!;
+      expect([...tbox.mins]).toEqual([-2064, 1472, -48]);
+      expect([...tbox.maxs]).toEqual([-2048, 1600, 0]);
+      // Swept pin: the walkway leg with *34 behind is world-clear and must
+      // stay clear (pre-fix: fraction 0 owned by *34 with startsolid).
+      const walk = prod(v3(-1900, 1536, 120), PLAYER_MINS, PLAYER_MAXS, v3(-2000, 1536, 120));
+      expect(walk.fraction).toBe(1);
+      expect(walk.entityNum).toBe(0);
+      // The walk: hall -> doorway sill (step-up) -> open-slider seam ->
+      // down-plug platform top -> walkway end. No teleports: one pmove body
+      // walking west, touching doors/buttons en route like a player.
+      const bot = makePmoveState();
+      bot.origin = v3(-1560, 1536, 150);
+      bot.velocity = v3(0, 0, 0);
+      let minX = Infinity;
+      let stall = 0;
+      let lastX = bot.origin[0]!;
+      let sawDoorway = false;
+      let sawPlugTop = false;
+      let reached = false;
+      for (let i = 0; i < 150; i++) {
+        SV_Tick(st, 0.1);
+        const body = { origin: bot.origin, mins: PLAYER_MINS, maxs: PLAYER_MAXS };
+        SV_TouchDoorsAt(st, body, 'player');
+        SV_TouchButtonsAt(st, body, 'player');
+        pmoveFull(bot, {
+          msec: 100,
+          angles: v3(0, 180, 0),
+          forwardmove: 200,
+          sidemove: 0,
+          upmove: 0,
+          buttons: 0,
+        });
+        minX = Math.min(minX, bot.origin[0]!);
+        if (bot.origin[0]! < -1700) sawDoorway = true;
+        if (bot.groundEntity === plug.ent.num && Math.abs(bot.origin[2]! - 112) < 3) sawPlugTop = true;
+        if (bot.origin[0]! > lastX - 0.5) stall++;
+        else stall = 0;
+        lastX = bot.origin[0]!;
+        if (stall > 30) break;
+        if (bot.origin[0]! < -1825) {
+          reached = true;
+          break;
+        }
+      }
+      expect(sawDoorway).toBe(true); // passed the slider doorway
+      expect(sawPlugTop).toBe(true); // boarded the lowered plug platform
+      expect(reached).toBe(true); // reached the walkway end past *34
+      expect(minX).toBeLessThan(-1825);
+      expect(bot.onGround).toBe(true);
+      // Waiting repair preserved: the plug holds down, the train lift never
+      // starts off the walk (it still waits for *13/t91). The *34 setup
+      // press already finished the level via the plug-platform 'lift' path;
+      // the walk adds no exit and starts no train.
+      expect(plug.state).toBe('waiting');
+      expect(train.started).toBe(false);
+      expect([...train.ent.origin]).toEqual([0, 0, 0]);
+      expect(st.firedThisTick).not.toContain('t91');
+      expect(st.finished).toBe(true);
+      expect(st.finishReason).toBe('lift');
     } finally {
       resetPmoveWorld();
     }

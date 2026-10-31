@@ -22,6 +22,7 @@ import {
   blasterSpawn,
   bspPointContentsFor,
   doorTravel,
+  moveDirForAngle,
   explosionBaseframe,
   explosionFrames,
   findWeapon,
@@ -621,10 +622,19 @@ export function sweepBrushBox(
     }
     return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: true };
   }
-  // C enterfrac starts at -1 so a contact entry (biased fraction <= 0)
-  // still records the hit axis and clamps to fraction 0 (grounded); only
-  // a trace that never approaches (all entries <= -1) misses.
-  let tmin = -1, tmax = 1, tminRaw = 0, axis = -1, sign = 0;
+  // Slab sweep (qcommon/cmodel.c CM_ClipBoxToBrush, axial case): enterfrac
+  // starts at -1 so a contact entry (biased fraction <= 0) still records
+  // the hit axis and clamps to fraction 0 (grounded). Per C, starting
+  // outside a slab and moving away (or parallel) can never enter — "if
+  // completely in front of face, no intersection" (d1 > 0 && d2 >= d1) —
+  // so the whole sweep misses right away. Without this a clip sitting
+  // behind the walk direction reports a fraction-0 phantom block (with a
+  // spurious startsolid) that SV_ClipTrace prefers over the real world
+  // hit — an invisible obstruction that freezes walking near the exit
+  // complex, where the *31/*32/*33/*34/train clips share the body's y/z
+  // band. startsolid is false throughout: C sets it only when the start
+  // is inside (our inside() branch above), never from an entry fraction.
+  let tmin = -1, tmax = 1, axis = -1, sign = 0;
   for (let i = 0; i < 3; i++) {
     const d = end[i]! - start[i]!;
     if (Math.abs(d) < 1e-9) {
@@ -632,6 +642,9 @@ export function sweepBrushBox(
         return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: false };
       }
       continue;
+    }
+    if ((start[i]! < lo[i]! && d < 0) || (start[i]! > hi[i]! && d > 0)) {
+      return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: false };
     }
     let t1 = (lo[i]! - start[i]!) / d;
     let t2 = (hi[i]! - start[i]!) / d;
@@ -649,7 +662,6 @@ export function sweepBrushBox(
     const bias = DIST_EPSILON / Math.abs(d);
     const t1b = t1 - bias;
     const t2b = t2 + bias;
-    if (t1 > tminRaw) tminRaw = t1;
     if (t1b > tmin) {
       tmin = t1b;
       axis = i;
@@ -661,7 +673,7 @@ export function sweepBrushBox(
   if (axis < 0) return { fraction: 1, normal: v3(0, 0, 1), allsolid: false, startsolid: false };
   const n = v3(0, 0, 0);
   n[axis] = sign;
-  return { fraction: Math.max(0, Math.min(1, tmin)), normal: n, allsolid: false, startsolid: tminRaw <= 0 };
+  return { fraction: Math.max(0, Math.min(1, tmin)), normal: n, allsolid: false, startsolid: false };
 }
 
 /**
@@ -1257,12 +1269,31 @@ export function SV_SpawnEntities(
       }
       case 'func_button': {
         const m = spawnButton(e, angle);
-        SV_SpawnMover(st, m);
         const model = dict['model'];
         if (modelSizes && model) {
           const bounds = modelSizes(model);
-          if (bounds) st.moverBounds.set(e.num, { mins: bounds.mins, maxs: bounds.maxs });
+          if (bounds) {
+            st.moverBounds.set(e.num, { mins: bounds.mins, maxs: bounds.maxs });
+            // C SP_func_button travel is |movedir| . brushSize - lip
+            // (g_func.c), not lip: spawnButton's lip-only pos2 leaves the
+            // pressed *34 one unit proud, and its expanded hull then pins a
+            // walker at the walkway step (start-inside allsolid) after the
+            // button visibly sank flush. Correct pos2 when bounds are known.
+            const size = v3(
+              bounds.maxs[0]! - bounds.mins[0]!,
+              bounds.maxs[1]! - bounds.mins[1]!,
+              bounds.maxs[2]! - bounds.mins[2]!,
+            );
+            const travel = doorTravel(size, angle, m.lip);
+            const dir = moveDirForAngle(angle);
+            m.pos2 = v3(
+              m.pos1[0]! + dir[0]! * travel,
+              m.pos1[1]! + dir[1]! * travel,
+              m.pos1[2]! + dir[2]! * travel,
+            );
+          }
         }
+        SV_SpawnMover(st, m);
         break;
       }
       case 'trigger_once':
