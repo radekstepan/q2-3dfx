@@ -3,8 +3,8 @@
 // Every fidelity row from BRAIN.md §7.2 is switchable through its vd_* cvar
 // in @q2/config (read, never written, here). The per-frame pattern is:
 //   const st = readVoodooState();   // one cvar snapshot per frame
-//   ... rasterise in 8:8:8 / sample with sampleTexture ...
-//   resolveFrame(fb, fb565, display, w, h, st);
+//   ... sample with sampleTexture / shadePixel (pure policy helpers) ...
+// (no frame driver: WebGL2 appearance lives in webgl-renderer/appearance.ts).
 // Low-level functions take explicit parameters so unit tests are deterministic
 // without touching global cvars.
 
@@ -17,7 +17,7 @@ export * from './resolve.js';
 export * from './sampler.js';
 export * from './upload.js';
 
-import { parseDitherMode, parseReconMode, parseRgbMaxDelta, quantiseDepth, resolveFusedFrame, resolveRGB565, resolveRGB888 } from './resolve.js';
+import { parseDitherMode, parseReconMode, parseRgbMaxDelta, quantiseDepth } from './resolve.js';
 import { applyFog, capTextureSize, modulateLightmap, samplePalette, sampleRGBTexture } from './sampler.js';
 import type { DitherMode, ReconMode, RgbMaxDelta } from './resolve.js';
 
@@ -86,66 +86,6 @@ export function readVoodooState(): VoodooState {
   };
 }
 
-/**
- * Full M4.1 frame resolve. Single hardware-correct ordering (guide §7.2)
- * for ALL reconmodes: LINEAR dither+quant (gamma 1) -> reconstruction /
- * box -> display gamma LUT on the display plane (guide §7.2 RAMDAC order).
- * Postfilter-off follows the same rule with no reconstruction: linear pack
- * -> expand -> display gamma (direct-view path). Zero-alloc inner loops;
- * pass display = null to skip the display plane (then the 565 target stays
- * linear-transfer — display gamma is a scanout-stage operation and is
- * dropped with the display plane).
- *
- * Display contract:
- * - quantise on, postfilter on: display = matched reconstruction
- *   ('2x2sub+2x2box' / '4x4sub+4x1', subtract matrix forced by the MODE —
- *   see matched-reconforcement comment below), or the unconditional 2x2 box
- *   under the 'legacy' alias (no subtraction, no edge rejection), then
- *   display gamma via applyDisplayGamma.
- * - quantise on, postfilter off: display = per-pixel expandRGB565 of the
- *   freshly packed linear target (NEVER stale — every pixel rewritten),
- *   then display gamma via applyDisplayGamma.
- * - quantise off (vd_16bit=0 debug bypass): display = resolveRGB888
- *   output (gamma on source, dither/postfilter bypassed); dst565 is still
- *   packed via resolveRGB565 for compat readers. Pass display = null to
- *   skip the display plane entirely.
- */
-export function resolveFrame(
-  src: Uint32Array,
-  dst565: Uint16Array,
-  display: Uint32Array | null,
-  w: number,
-  h: number,
-  st: VoodooState = readVoodooState(),
-): void {
-  if (!st.quantise) {
-    // Genuine RGB888 debug bypass: gamma stays on source, dither/postfilter off.
-    resolveRGB565(src, dst565, w, h, { gamma: st.gamma, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
-    if (display !== null) resolveRGB888(src, display, w, h, { gamma: st.gamma, dither: false });
-    return;
-  }
-  // SINGLE HARDWARE-CORRECT PATH (guide §7.2 RAMDAC order): linear
-  // dither+quant, reconstruct/box, display gamma. The 'legacy' alias below
-  // keeps the unconditional 2x2 box (no subtraction) with the same
-  // linear-pack + display-gamma placement.
-  //
-  // PERF-3: the pack→recon→gamma chain runs fused (resolveFusedFrame):
-  // pack rows into dst565 on demand, reconstruct from the hot rows, gamma
-  // LUT inline. Byte-identical to the manual 3-pass pipeline (pinned by
-  // src/fused.test.ts); the stage functions above stay as the oracle.
-  if (display === null) {
-    resolveRGB565(src, dst565, w, h, { gamma: 1, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
-    return;
-  }
-  resolveFusedFrame(src, dst565, display, w, h, {
-    dither: st.dither,
-    ditherMode: st.dithermode,
-    postfilter: st.postfilter,
-    reconmode: st.reconmode,
-    rgbmaxdelta: st.rgbmaxdelta,
-    gamma: st.gamma,
-  });
-}
 /**
  * Cvar-aware depth banding: quantise stored 1/z to st.zbits (vd_zbits).
  * bits >= 24 (or <= 0) is a pass-through.
