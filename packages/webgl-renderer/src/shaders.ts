@@ -45,7 +45,11 @@ void main() {
 
 /** Lit world fragment shader: mipped diffuse x (lightmap + per-pixel dlights). */
 export const FS_LIT = `#version 300 es
-precision mediump float;
+// highp (FS_APPEARANCE parity): world UVs span many tiles (base1 water
+// covers ~30 tiles with negative coords); mediump's min-spec mantissa
+// quantizes the varying to whole texels at that magnitude, snapping warp
+// indices and bilinear fractions on a tile grid.
+precision highp float;
 in vec2 vUV;
 in vec2 vLightUV;
 in float vAlpha;
@@ -78,8 +82,14 @@ vec2 voodooWarp(vec2 uv) {
 }
 void main() {
   // vUV is normalized 0..1 (world batches); warp runs in texel units.
-  vec2 wuv = voodooWarp(vUV * vec2(textureSize(uDiffuse, 0)));
-  vec3 texel = voodooSampleMipped(uDiffuse, wuv / vec2(textureSize(uDiffuse, 0)));
+  // LOD comes from the UNWARPED vUV (CPU spanLod parity: spans.ts derives
+  // spanLod from unwarped gradients and warps only the diffuse lookup);
+  // the warped coords offset only the textureLod tap (REPEAT wrap holds).
+  // Sampling LOD from warped coords folds floor() steps into fwidth and
+  // flips the mip pick along integer texel lines (GPU-FOLLOW-3B repair).
+  vec2 tsz = vec2(textureSize(uDiffuse, 0));
+  vec2 wuv = voodooWarp(vUV * tsz);
+  vec3 texel = voodooSampleMippedWarped(uDiffuse, vUV, wuv / tsz);
   // FOLLOW-2B test-only diagnostic views (debug-gated, production stays 0):
   // 1 = unlit diffuse (repeat/wrap + upload triage), 2 = lightmap block only
   // (atlas placement/bleed triage). Final (0) is the shipped path.

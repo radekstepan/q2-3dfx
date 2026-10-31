@@ -269,6 +269,51 @@ export function mipUVScale(lvl: number): number {
   return 1 / (1 << lvl);
 }
 
+/**
+ * CPU mirror of the GPU `textureLod(map, sampleUv, lvl)` tap with REPEAT
+ * wrap (the `voodooSampleMippedWarped` sample arm): bilinear in the picked
+ * level, every tap positive-modulo wrapped. Texel units: texel (i, j)
+ * occupies [i, i+1) x [j, j+1) (centre i+0.5), matching GL's (i+0.5)/w
+ * convention, so i0 = floor(x - 0.5). Pure, typed arrays, no allocation;
+ * GPU float rounding may differ by ~1 LSB. Used by the FOLLOW-3B pixel
+ * regression to sample across repeat/face boundaries at fixed times.
+ */
+export function sampleLevelBilinearRepeat(
+  data: Uint8Array,
+  w: number,
+  h: number,
+  u: number,
+  v: number,
+): [number, number, number] {
+  if (data.length < w * h * 3 || w < 1 || h < 1) {
+    throw new Error(`[webgl-renderer] sampleLevelBilinearRepeat: bad ${w}x${h} level`);
+  }
+  const wrap = (i: number, n: number): number => ((i % n) + n) % n;
+  const tap = (ix: number, iy: number): [number, number, number] => {
+    const o = (wrap(iy, h) * w + wrap(ix, w)) * 3;
+    return [data[o]!, data[o + 1]!, data[o + 2]!];
+  };
+  const x = u - 0.5;
+  const y = v - 0.5;
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const fx = x - x0;
+  const fy = y - y0;
+  const a = tap(x0, y0);
+  const b = tap(x0 + 1, y0);
+  const c = tap(x0, y0 + 1);
+  const d = tap(x0 + 1, y0 + 1);
+  const w00 = (1 - fx) * (1 - fy);
+  const w10 = fx * (1 - fy);
+  const w01 = (1 - fx) * fy;
+  const w11 = fx * fy;
+  return [
+    a[0] * w00 + b[0] * w10 + c[0] * w01 + d[0] * w11,
+    a[1] * w00 + b[1] * w10 + c[1] * w01 + d[1] * w11,
+    a[2] * w00 + b[2] * w10 + c[2] * w01 + d[2] * w11,
+  ];
+}
+
 // --- Upload-time resampling (duplicates of voodoo/src/upload.ts RGB arms) ---
 
 /**
@@ -556,9 +601,18 @@ int voodooPickLevel(float lod, ivec2 px) {
   return min(lvl, uMaxLevel);
 }
 vec3 voodooSampleMipped(sampler2D map, vec2 uv) {
-  float lod = voodooLod(map, uv);
+  return voodooSampleMippedWarped(map, uv, uv);
+}
+// Turbulent-water tap (GPU-FOLLOW-3B): LOD/level from the UNWARPED coords
+// (CPU spanLod parity — spans.ts builds spanLod from unwarped screen-space
+// gradients, then warps only the diffuse lookup), sample at the warped
+// coords. The old single-arg call on warped UVs folded the warp's
+// floor() steps into fwidth derivatives, flipping the Bayer n/n+1 pick
+// along integer texel lines (tile-grid seams). Warp offsets only the tap.
+vec3 voodooSampleMippedWarped(sampler2D map, vec2 lodUv, vec2 sampleUv) {
+  float lod = voodooLod(map, lodUv);
   int lvl = voodooPickLevel(lod, ivec2(gl_FragCoord.xy));
-  return textureLod(map, uv, float(lvl)).rgb;
+  return textureLod(map, sampleUv, float(lvl)).rgb;
 }
 `;
 

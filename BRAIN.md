@@ -383,9 +383,10 @@ done-when:
 ### GPU-FOLLOW-3B — Remove visible water tile boundaries
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
 depends: GPU-FOLLOW-3A
-status: ready
+status: in-progress(@opencode)
 starting-points: `shaders.ts: FS_LIT/voodooWarp`, world UVs, diffuse mip generation/sampling
 review-finding: `2c4c162` only added formula tests; no shader repair or sampled-pixel diagnostic landed. LOD/lightmap cause is unproven; the prior TODO claiming diagnostics established it is withdrawn.
+lane-2026-10-30 (@opencode): webgl-renderer lane DONE (water-seam 16/1skip, full pkg 151pass, typecheck clean; LOD-unwarped + highp fix, warp/scale/REPEAT/lighting intact); apps/web stationary/moving captures + testkit coverage still open for integrator.
 done-when:
 - [ ] Preserve the now-satisfactory water motion. Reproduce the remaining visible tile seams in real water; record map, camera, material, time and crops. Distinguish texture-repeat boundaries from BSP-face/lightmap seams and warp/LOD/precision effects using fixed-time, fixed-LOD and diffuse/unlit diagnostics. Compare adjacent faces at the same world position and the CPU/reference appearance. Record the demonstrated cause before changing the algorithm.
 - [ ] Fix that cause while retaining animated turbulence, intended texture scale, repeat behavior and transparent/depth ordering. Check original versus resized texture dimensions and derivatives if implicated. Do not mask seams by disabling warp, lighting or mipmapping, or globally blurring water.
