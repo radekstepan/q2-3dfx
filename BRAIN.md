@@ -7,11 +7,11 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-29, reviewed at `ff2e232`): user reports none of
-> the outstanding visual issues fixed. Sky asset replay is committed, but is
-> not visual acceptance; fix skybox borders, black sky through windows and water
-> seams next. Active order: 3A → 3B → 5/6 → 7. CPU optimization stays paused.
-> Only §8 contains the active task queue.**
+> **Current direction (2026-10-30, reviewed at `73c3076`): sky borders and
+> sky through windows are fixed and user-confirmed. Repair water seams,
+> presentation, audio and gameplay issues below; retire the legacy CPU Voodoo
+> renderer in favor of WebGL2. CPU optimization stays paused. §8 is the only
+> active queue; old TASK.md and historical reviews do not override it.**
 
 ---
 
@@ -49,7 +49,8 @@ Rebuild Quake II so that it:
   colormap shading, perspective-correct spans subdivided every 16 pixels, surface cache,
   edge/span rasteriser, affine alias models. Preserve this CPU-only reference/fallback;
   do not require a GPU for its Node tests or change its goldens for the new backend.
-- **Renders in "3dfx Voodoo 3 3000" mode.** Emulation of `ref_gl`-on-Voodoo3: RGB565 + 4×4
+- **Preserves the "3dfx Voodoo 3 3000" look in WebGL2.** Retire the legacy
+  CPU Voodoo mode under RELEASE-8; shared policy is not automatically obsolete. Emulation of `ref_gl`-on-Voodoo3: RGB565 + 4×4
   ordered dither, 2×2 "22-bit" post filter, bilinear, mip LOD with mip-dithering, 64-entry
   table fog, LOD bias, 256×256 max texture size, 16-bit depth, ~1.3 Glide gamma lift.
   Full checklist + cvars: `docs/renderers.md`. RGB mip sampling scales UVs
@@ -95,7 +96,9 @@ host ← {server, client} · apps/web ← host
 
 - **Nothing** imports from `apps/*`.
 - `sw-renderer` must not import `dom` types; it writes into a handed `ArrayBuffer`.
-- `voodoo` is a post-process + sampling policy, not a second renderer.
+- `voodoo` currently supplies post-process/sampling policy. RELEASE-8 retires the
+  legacy CPU Voodoo execution mode; audit shared consumers before deleting modules.
+  The map below describes the current tree, not the completed retirement.
 - Implemented (GPU-PROOF-2): `packages/webgl-renderer`, a browser GPU renderer with an
   explicit injected WebGL2 context; only this backend and browser integration may
   depend on browser graphics types. Keep sw-renderer/math/bsp/renderer-api DOM-free.
@@ -117,7 +120,8 @@ host ← {server, client} · apps/web ← host
 - **Colour:** the following exact rules apply to the existing CPU reference. The new
   GPU backend follows the explicit fidelity contract in GPU-PROOF-1, with reviewed
   tolerances for documented rasterization differences.
-  Software path never leaves 8-bit until resolve. Voodoo path rasters
+  Software path never leaves 8-bit until resolve. Until RELEASE-8 retires it,
+  the legacy CPU Voodoo path rasters
   authoritatively to RGB565 + window-Z (16-bit depth) planes and scanout
   reconstructs from that target (matched `2x2sub+2x2box` by default; `vd_16bit=0`
   is an RGB888 debug bypass). No path uses floats per channel in the inner loop.
@@ -256,75 +260,110 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ## 8. Actionable queue
 
-Read `docs/gpu-review-d934fdc-sky-water.md` for current findings and test limits.
-Earlier dirty-file ownership and lifecycle reviews are historical. Completed cards/evidence live in
-`docs/tasks-archive.md` and `docs/performance-gpu-history-2026-10-29.md`.
-This queue supersedes old task lists and the archived snapshot.
+### Current status and execution rules
 
-### Review checkpoint — 2026-10-29, `ff2e232`
+Reviewed source/history at `73c3076`; user feedback dated 2026-10-30 is the
+current visual verdict. This documentation review did not run browser captures,
+benchmarks or tests. Do not describe its diagnoses as reproduced fixes.
 
-**User verdict: the reported issues remain unresolved.** No sky/water card is
-closed by the latest commit. This checkpoint is a source/history review, not a
-new browser reproduction or a test pass; no browser capture, benchmark or full
-`yarn verify` was run for this documentation update.
+- **Done: GPU-FOLLOW-3A.** Skybox black borders and sky missing through windows
+  are fixed, explicitly confirmed by the user. `73c3076` isolates sky faces and
+  removes the selected-sky-ref background gate. Details and implementation
+  evidence are in `docs/tasks-archive.md`; preserve cold boot/switch/restore and
+  opaque occlusion. The older `d934fdc` review is historical, not current status.
+- **Open:** water seams and all RELEASE cards below. Water motion is satisfactory.
+- **Backend terminology:** the user's “new webgpu renderer” refers to the new
+  GPU path; this tree implements WebGL2 (`packages/webgl-renderer`), not WebGPU.
+- **Acceptance remains open:** the latest archived sky report records a failing
+  full verify (PROOF-4 far/mip and a foreground-recovery timeout under suite load).
+  Earlier reports also mention PROOF-3 CDP timeout. Reproduce current failures
+  under FOLLOW-5 rather than assuming every historical failure remains current.
 
-- `ff2e232` adds CPU recovery/disposal coverage, foreground diagnostics and a
-  moving-camera benchmark probe. The diff from `d934fdc` through `ff2e232`
-  contains no changes to `packages/webgl-renderer`, the web sky test or the
-  testkit sky validator. Those changes do not repair the reported GPU visuals.
-- **Skybox borders — open (3A).** `renderer.ts: skyStripFor` still uploads an
-  unguttered six-face vertical strip with whole-texture clamp;
-  `entities.ts: emitSkyBoxFaces` still reuses CPU `skyUvOnFace` bounds. Face-local
-  bilinear isolation remains unaddressed. Its contribution to the specific
-  reported border must still be established with rendered pixels.
-- **Black sky through windows — open (3A).** `drawScene` still gates the sky
-  texture on selected world sky refs (`hasSky`). The failing camera's PVS,
-  background draw and glass depth/blend behavior still need pixel-backed
-  diagnosis; the conditional alone is not proof of the cause.
-- **Water tile seams — open (3B).** The GPU warp/sampling implementation is
-  unchanged. No new seam repair or real-map before/after evidence landed.
-  Preserve the water motion the user previously found satisfactory.
-- **Visual proof — missing (3A/3B/5).** `gpu-sky.test.ts` still describes stub-GL
-  bookkeeping as a “sky-image check.” Asset diversity and draw logs cannot
-  establish correct borders, window backgrounds or opaque occlusion.
-- **Integrated acceptance — open (5/6/7).** The latest ledger reports verify
-  79/80 with the PROOF-4 appearance failure; this is not a green full gate.
-  It also reports CPU pooled combat at 50.30 ms, above the 16 ms target, and
-  missing final-code five-minute visible-browser evidence. These are historical
-  reported results, not measurements rerun here and not GPU display acceptance.
-  “FAIL budget by design” in that ledger does not waive the target.
+Priority: RELEASE-1 (volume), RELEASE-2 (black devroom), RELEASE-3 (aim/HUD),
+RELEASE-4/5 (gameplay), GPU-FOLLOW-3B (water), RELEASE-6 (asset UI), RELEASE-7
+(settings/startup), RELEASE-8 (legacy retirement), then FOLLOW-5/6 → FOLLOW-7.
+Independent cards may proceed with disjoint package ownership; this priority
+is not an artificial dependency chain. Claim one card before implementation.
+Keep GPU experimental until integrated acceptance; preserve software/Node support.
+Expensive browser tests and benchmarks run sequentially. Intermediate targeted
+passes are not full-suite acceptance. Archive completed cards with evidence;
+commit validated implementation increments with changesets, no push.
 
-`TASK.md` is the older CPU campaign rooted at `460232d`, not the active queue.
-Do not execute it merely because it remains in the tree or because the latest
-commit references it. A task list explicitly supplied by the user in a new
-session can change priorities under §7; this review does not resume CPU work.
-Next eligible implementation is **GPU-FOLLOW-3A**, then 3B, then 5/6, then 7.
-Preserve useful landed CPU work without treating it as visual repair. Leave all
-acceptance boxes below open until their stated evidence exists.
-
-Execution: 3A → 3B → 5/6 → 7. FOLLOW-4 landed in `dfc58d9`; sky asset replay
-landed in `d934fdc`. Preserve both; 3A below is only the remaining sky repair.
-Working tree was clean at review start. Treat `review` as resumable
-work; claim ownership before editing. One writer per package. Preserve the landed
-lifecycle machinery. Commit validated increments with changesets, no push. Archive completed cards
-with evidence rather than growing this queue with implementation narratives.
-Keep GPU experimental and CPU reference/goldens intact. Stop speculative
-optimization; only a measured final gate miss permits the one remaining measured
-optimization iteration. Unit/mirror tests and draw counts do not prove visible
-correctness. Expensive validation runs sequentially. Known full-suite failures
-are assigned to FOLLOW-5 below: record them on intermediate repairs and continue
-independent work; never call a failing full run green. Final FOLLOW-7 requires
-the integrated gate to pass.
-
-### GPU-FOLLOW-3A — Fix skybox borders and black sky through windows — DONE 2026-10-30
-owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit` · depends: GPU-FOLLOW-4 (landed)
-status: done (all 5 boxes evidenced; archived in `docs/tasks-archive.md`, commit in this stack)
+### RELEASE-1 — Quiet, capped volume scale
+owns: `packages/config`, `packages/sound`, `apps/web`
+depends: none
+status: ready
 done-when:
-- [x] Reproduce both symptoms in actual rendered pixels: capture an affected skybox edge/corner and a window looking outside, recording map/camera/FOV/cvars. Keep the successful retained-asset boot/switch/restore wiring; do not rebuild it.
-- [x] Fix sky-face border sampling. Audit the six-face strip's bilinear footprint and face-local texel-center bounds: whole-texture CLAMP does not isolate adjacent faces, and the reused CPU UV bounds are not half-texel GPU bounds. Use a suitable face-isolated sampling/layout solution. Distinguish atlas bleed, source-art dark pixels, orientation and clipping/fog before attributing the user's black border to one cause. Test edges/corners during yaw/pitch, with filtering on/off; preserve intended artwork and foreground occlusion.
-- [x] Fix absent sky through windows. At the failing view log selected sky refs/PVS, whether the sky pass runs, and glass alpha/depth state. Audit the `hasSky` gate (currently no selected sky refs means no background box). Ensure valid exterior background survives transparent windows and relevant visibility transitions, while opaque walls remain opaque. Do not disable PVS, backface culling, depth or transparency globally to hide the issue.
-- [x] Add real-WebGL pixel regressions for face-edge isolation and a window with known sky behind it. Include negative controls that introduce a border or omit the background draw, plus opaque occluders. Capture real-map views before/after switch and context restore. Existing asset-statistics and stub 36-index-draw tests remain wiring tests, not image or occlusion proof; correct misleading test/report descriptions.
-- [x] Run relevant sky/lifecycle/gameplay gates, record full-verify outcome and any already-assigned FOLLOW-5 failures, add required changesets and commit the bounded fix. Both reported sky defects must have pixel evidence before closing this card.
+- [ ] Replace the current `s_volume` default of 0.8 with the requested quiet level. Interpret the new normalized scale as 0..1 mapping to old gain 0..0.05: new default 1 equals old 0.05, and new maximum 1 cannot exceed old 0.05. Document this mapping so the old gain is not multiplied by 0.05 twice.
+- [ ] Clamp finite values and handle invalid/legacy configuration at the audio boundary; audit mixer, browser nodes, fallback sounds and menu help so no route bypasses the cap. Preserve positional attenuation and mute.
+- [ ] Verify default, zero, max, out-of-range and invalid settings, including overlapping combat sounds; demonstrate actual output gain, not only the cvar value.
+
+### RELEASE-2 — Render the asset-free demo room in WebGL2
+owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
+depends: none
+status: ready
+starting-points: `play.ts: bootPlay/applyRendererCvar`, `devroom.ts`, `devroom-fallback.test.ts`
+done-when:
+- [ ] Reproduce the black room on GPU cold boot and switching. Review finding: boot GPU world/palette setup is guarded by `mainPalette`; without a pak the current code explicitly leaves the devroom CPU/clear-only. Supply the procedural world, palette and models required by GPU, including restore/replay.
+- [ ] Real-WebGL pixels show expected room geometry/materials and entities without pak assets; verify cold boot, map switch, renderer switch and context restoration. Check that an intentional missing-world control fails; nonblack clear color alone is insufficient.
+
+### RELEASE-3 — Align aim and overlays at every resolution
+owns: `apps/web`, `packages/webgl-renderer`, `packages/input`, `packages/testkit`
+depends: none
+status: ready
+starting-points: `play.ts: drawPlayHud`, `gpu-canvas.ts`, `gpu-presentation.test.ts`, `dom.ts`
+done-when:
+- [ ] Reproduce at 1024×768: crosshair/cursor does not match shot direction; FPS, position and messages are displaced from screen edges. Trace internal framebuffer, GPU viewport, HUD buffer, CSS display rectangle, pointer coordinates and device pixel ratio; do not assume the cause from the symptom.
+- [ ] Use consistent dimensions/projection and anchoring for world, HUD and input. Verify shot ray/impact against crosshair with a known target (accounting for intended weapon muzzle parallax), and top/bottom HUD placement at all offered resolutions, CSS scaling/fullscreen and representative DPRs.
+- [ ] Add production presentation coverage before/after resize and renderer switch; include 1024×768 visual evidence and no clipped overlays.
+
+### RELEASE-4 — Correct final elevator activation and waiting
+owns: `packages/server`, `packages/game`, `apps/web`
+depends: none
+starting-points: `packages/server/src/doors.ts`, base1 entity lump and target chain
+status: ready
+done-when:
+- [ ] Reproduce the final elevator descending as its door opens before the player can board. Identify its actual map classname, targets, button, spawnflags and wait values; compare the local original Quake II mover/trigger implementation. Determine intended activation from the map/source rather than forcing every lift to wait indefinitely.
+- [ ] Repair the specific trigger/state/timing discrepancy. Verify approach, door opening, boarding, button use, ride and level exit, plus repeat use and blocked movement where applicable. Assert the intended wait at the top and no premature departure in a real-base1 tick-loop regression and visible route.
+
+### RELEASE-5 — Monster collision, wall movement and infantry fire
+owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
+depends: none
+status: ready
+done-when:
+- [ ] Reproduce player clipping into live infantry. Audit server entity hulls/linking, player prediction and movement traces; test stationary/moving infantry, close contact and doorways. Keep legitimate corpse/death collision behavior faithful to source.
+- [ ] Revisit the soldier behind the door at player position **(-1148.1, 1542.3, -24)** in base1, recording facing, soldier identity, skill and door state. Confirm with a regression and visible replay that it cannot climb up the wall then descend. Audit step height, ground checks, hull traces and moving-door interaction; a generic chase test is not confirmation at this location.
+- [ ] Compare infantry firing with local `game/m_infantry.c`, muzzle offsets and original client effects/assets. The source uses `monster_fire_bullet`; verify hitscan behavior, burst timing, muzzle flash/light, impact effects, sound and any rendered tracer against the original. Do not substitute soldier blaster/projectile visuals. Capture a representative burst with negative controls for missing/wrong effects.
+- [ ] Pass real-asset `base1-gate.test.ts` and focused monster/collision tests; record observed visual verdict separately from unit-test success.
+
+### RELEASE-6 — Use game assets for HUD, F1 and level completion
+owns: `apps/web`, `packages/client`, `packages/formats`, `packages/testkit`
+depends: none
+status: ready
+starting-points: `play.ts: drawPlayHud`, browser F1/menu handler, pak `pics/` and original client screen/layout code
+review-finding: current HUD draws text such as `hp` and weapon classname; completion uses a custom text block.
+done-when:
+- [ ] Compare startup/F1 help, health/ammo/armor and level-completion/intermission layout with original game assets and layout semantics. Inventory required pak pictures/fonts and stats; implement the appropriate asset-based screens instead of placeholder styling.
+- [ ] Preserve readable asset-free devroom fallback and distinguish game HUD from optional FPS/position diagnostics. Verify real assets, values, transparency, scaling and placement at 640×480 and 1024×768, including death and level completion.
+
+### RELEASE-7 — Change display settings without restarting; stable startup size
+owns: `apps/web`, `packages/host`, `packages/webgl-renderer`, `packages/testkit`
+depends: RELEASE-3
+status: ready
+review-findings: `dom.ts: REBOOT_CVARS` includes resolution; renderer already uses `applyRendererCvar` hot-swap; `resizeGpuBackend` exists.
+done-when:
+- [ ] Wire resolution changes through coordinated framebuffer/viewport/HUD resizing without rebuilding the game simulation. Preserve map, position, health, enemies, elapsed time and audio. Confirm renderer changes also preserve these states in the actual menu; diagnose any remaining restart rather than adding another switch path.
+- [ ] Reserve the selected/persisted display dimensions before async asset loading. Show a correctly sized loading surface immediately, then present the first valid frame without a small black box or layout jump. Cover cold cache, cached pak, no pak and failed GPU initialization.
+- [ ] Verify repeated resize/switch, context loss/restore, resource disposal and no duplicate loop/listeners; keep explicit restart behavior only for settings that genuinely require a new level (e.g. map/skill).
+
+### RELEASE-8 — Retire the old CPU Voodoo renderer
+owns: `apps/web`, `packages/config`, `packages/renderer-api`, `packages/sw-renderer`, `packages/voodoo`, `packages/host`, `packages/testkit`, `tools/bench`, `tools/asset-cooker`, `docs`, root workspace configuration
+depends: RELEASE-2, RELEASE-7
+status: ready
+done-when:
+- [ ] Remove the legacy CPU Voodoo execution mode and its menu/config selection in favor of WebGL2; map persisted legacy selections deliberately and report unsupported-GPU fallback accurately. Preserve the software reference/Node renderer and the WebGL Voodoo appearance.
+- [ ] Inventory shared imports first: WebGL currently reuses `sw-renderer` helpers and `voodoo` is a policy/post-process package. Remove obsolete mode-specific code, workers, controls and benchmarks; retain or relocate shared utilities. Do not delete whole packages blindly or silently turn WebGL into a CPU path.
+- [ ] Update frozen contracts with required major changesets if changed, dependency rules, scripts, docs and tests. Retire obsolete tests explicitly while preserving meaningful software goldens and GPU parity/lifecycle coverage. Update §§2–6 to describe the final architecture, not a planned deletion.
 
 ### GPU-FOLLOW-3B — Remove visible water tile boundaries
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
@@ -339,10 +378,10 @@ done-when:
 
 ### GPU-FOLLOW-5 — Refresh final fidelity evidence
 owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`
-depends: GPU-FOLLOW-3B
+depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
 status: ready
 done-when:
-- [ ] Resolve the reported full-suite PROOF-3 CDP 30-second timeout under load: reproduce and isolate resource/process contention, run expensive browser tests with controlled concurrency, and retain bounded useful timeouts. Do not skip the gate or merely inflate timeouts without evidence.
+- [ ] Reproduce current full-suite failures, including reported foreground-recovery pool and PROOF-3 CDP timeouts under load: reproduce and isolate resource/process contention, run expensive browser tests with controlled concurrency, and retain bounded useful timeouts. Do not skip the gate or merely inflate timeouts without evidence.
 - [ ] Capture matched F0/F1/F2 CPU/GPU scene/time/cvars on the repaired renderer; report new full-frame and region/material metrics. Repair the degenerate PROOF-4 far/mip fixture so it actually exercises its intended content. Keep historical pre-repair failures labelled historical.
 - [ ] Strengthen lifecycle image evidence with matched deterministic before/after scene crops or independent world/model/skin expectations and negative controls removing a required asset. Existing nonblack, gun-region brightness and distinct-color counts can pass with missing textures; do not label them semantic proof.
 - [ ] Investigate remaining unexplained UV/lighting/depth/transparency differences and add meaningful regression fixtures. Include repaired sky/water. Do not loosen assertions or replace goldens to conceal defects.
@@ -350,7 +389,7 @@ done-when:
 
 ### GPU-FOLLOW-6 — Verify complete gameplay on a visible display
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
-depends: GPU-FOLLOW-3B
+depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
 status: ready
 done-when:
 - [ ] Run a hardware-backed visible-browser 640×480 soak ≥5 minutes: stationary, multi-room/PVS movement, doors/lifts and combat, real viewmodel/effects and sky/water. Record actual route state, visible captures, bounded resources and absence of silent fallback.
@@ -360,10 +399,10 @@ done-when:
 
 ### GPU-FOLLOW-7 — Final integrated acceptance
 owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config` (integrator)
-depends: GPU-FOLLOW-4, GPU-FOLLOW-3A, GPU-FOLLOW-3B, GPU-FOLLOW-5, GPU-FOLLOW-6
+depends: RELEASE-1 through RELEASE-8, GPU-FOLLOW-3B, GPU-FOLLOW-5, GPU-FOLLOW-6
 status: ready
 done-when:
-- [ ] Run `yarn verify`, `yarn deps:check`, real-asset base1/voodoo and GPU lifecycle/image/gameplay gates on the integrated result. Record skipped coverage and preserve CPU/Node support.
+- [ ] Run `yarn verify`, `yarn deps:check`, real-asset base1, retained software and GPU lifecycle/image/gameplay gates after legacy retirement on the integrated result. Record skipped coverage and preserve CPU/Node support.
 - [ ] Publish separate implementation, correctness, fidelity and displayed-performance verdicts with commits/artifacts; reconcile contradictory PASS/GO claims in existing reports. Carry forward precise unresolved blockers.
 - [ ] Only after all required gates pass, close GPU-EXPAND-1 and decide default rollout with accurate selection/fallback labels. Otherwise keep GPU experimental.
 - [ ] Commit validated remaining changes with required changesets, no push; move completed cards to the archive. Keep deferred CPU/hardware-oracle/demo work in the review/history docs, not silently marked complete.
@@ -384,6 +423,6 @@ done-when:
 | `docs/performance-gpu-history-2026-10-29.md` | Archived reviews/cards/evidence, including unresolved deferred work; not an active queue |
 | `docs/gpu-follow-1-reconciliation.md` | Corrected interpretation of prototype evidence |
 | `docs/lessons.md` | dual-sim root cause, single-sim rule, base1 play-verified gate, closed/open lists |
-| `docs/gpu-review-d934fdc-sky-water.md` | Current sky/water findings, evidence limits and prior card snapshot |
+| `docs/gpu-review-d934fdc-sky-water.md` | Historical pre-73c3076 sky/water review; sky findings superseded, water still open |
 | `docs/gpu-review-2026-10-29-lifecycle-sky-water.md` | Dirty-file ownership, review evidence, diagnoses and superseded queue |
 | `docs/tasks-archive.md` | all DONE cards (M0–M9 + TODOs) with lane reports |
