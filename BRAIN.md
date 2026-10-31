@@ -324,7 +324,8 @@ commit validated implementation increments with changesets, no push.
 ### GPU-FOLLOW-6 — Verify complete gameplay on a visible display
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
 depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-3B, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
-status: ready
+status: blocked
+gate-record 2026-10-31: DISPLAY_ABSENT — X.Org :0.0 + Vega 11 DRI, headed Chromium real hardware GL, but 0 connected monitors (virtual 2560x1440, no mode/refresh/vsync); no scanout path, displayed-frame claims VOID. Headed hardware-GL route smoke (webgl2-experimental, no fallback, cells 1→3→4, +1148 submitted, uploads 1) reported as headroom-only; startup 3.05s harness-path exceeds 2.5s pending display-backed rerun. Full ≥5min soak + all boxes BLOCKED pending vsync-measurable display. See docs/gpu-follow-6-gate-record.md.
 done-when:
 - [ ] Run a hardware-backed visible-browser 640×480 soak ≥5 minutes: stationary, multi-room/PVS movement, doors/lifts and combat, real viewmodel/effects and sky/water. Record actual route state, visible captures, bounded resources and absence of silent fallback.
 - [ ] Record immutable build, device, refresh/vsync, raw timing samples, p50/p95/p99 and dropped frames. Check median work ≤16 ms, ≥59 FPS at nominal 60 Hz and p95 interval ≤20 ms separately. Describe completed/display cadence evidence accurately; submitted frames/headless throughput are not scanout proof. Use matched settings for CPU/GPU comparisons.
