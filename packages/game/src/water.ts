@@ -9,7 +9,7 @@
 // LAVA 8, LADDER 16); the Q2 BSP leaf space (q_shared.h) shares the SOLID
 // bit (1) and carries WATER 32 / SLIME 16 / LAVA 8 / LADDER 0x20000000.
 
-import { LEAF_STRIDE, pointLeaf } from '@q2/bsp';
+import { BRUSH_STRIDE, BRUSHSIDE_STRIDE, LEAF_STRIDE, pointLeaf } from '@q2/bsp';
 import type { Bsp38 } from '@q2/formats';
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
@@ -39,6 +39,78 @@ export function mapWaterContents(contents: number): number {
   if (contents & BSP_CONTENTS_LAVA) out |= CONTENTS_LAVA;
   if (contents & BSP_CONTENTS_LADDER) out |= CONTENTS_LADDER;
   return out;
+}
+
+/**
+ * True when a BSP texinfo texture name denotes id brown water
+ * (g_weapon.c fire_lead strcmp on the "*brwater" surface). Stock maps
+ * store the texture with its unit path (e1u1/brwater), so match the
+ * brwater suffix case-insensitively — star-brwater and path-brwater both
+ * count, bluwter/brlava/broken textures do not.
+ */
+export function isBrownWaterTexture(name: string): boolean {
+  return name.toLowerCase().endsWith('brwater');
+}
+
+/**
+ * Brown-water surface query for the hitscan pellet path (C g_weapon.c
+ * fire_lead water branch). Returns a point query: true when `p` sits inside
+ * a WATER-contents brush whose sides carry a brown-water texture. Built from
+ * the loaded BspMap through the existing @q2/bsp views only (pointLeaf +
+ * leaf/brush/side/plane/texinfo arrays) — no @q2/bsp contract change.
+ *
+ * The pellet impact samples slightly *inside* the water volume (the trace
+ * endpos sits on the entry plane in the air leaf), so callers nudge the
+ * hit point forward along the shot before querying here.
+ */
+export function bspBrownWaterFor(world: Bsp38): (p: Vec3) => boolean {
+  return (p: Vec3): boolean => {
+    let leaf: number;
+    try {
+      leaf = pointLeaf(world, p);
+    } catch {
+      return false;
+    }
+    if (leaf < 0) return false;
+    const w = world as unknown as {
+      leafs?: Int32Array;
+      leafbrushes?: Uint16Array;
+      brushes?: Int32Array;
+      brushsides?: Int32Array;
+      planes?: Float32Array;
+      texinfoNames?: string[];
+    };
+    if (!w.leafs || !w.leafbrushes || !w.brushes || !w.brushsides || !w.planes || !w.texinfoNames) return false;
+    const d = leaf * LEAF_STRIDE;
+    const firstBrush = w.leafs[d + 11] ?? 0;
+    const nBrush = w.leafs[d + 12] ?? 0;
+    for (let k = 0; k < nBrush; k++) {
+      const brushNum = w.leafbrushes[firstBrush + k] ?? -1;
+      if (brushNum < 0) continue;
+      if ((w.brushes[brushNum * BRUSH_STRIDE + 2]! & BSP_CONTENTS_WATER) === 0) continue;
+      const firstSide = w.brushes[brushNum * BRUSH_STRIDE]!;
+      const nSides = w.brushes[brushNum * BRUSH_STRIDE + 1]!;
+      let inside = true;
+      for (let i = 0; i < nSides; i++) {
+        const plane = w.brushsides[(firstSide + i) * BRUSHSIDE_STRIDE]!;
+        const nx = w.planes[plane * 4]!;
+        const ny = w.planes[plane * 4 + 1]!;
+        const nz = w.planes[plane * 4 + 2]!;
+        const dist = w.planes[plane * 4 + 3]!;
+        if (p[0]! * nx + p[1]! * ny + p[2]! * nz - dist > 0.1) {
+          inside = false;
+          break;
+        }
+      }
+      if (!inside) continue;
+      for (let i = 0; i < nSides; i++) {
+        const texinfo = w.brushsides[(firstSide + i) * BRUSHSIDE_STRIDE + 1]!;
+        const name = w.texinfoNames[texinfo] ?? '';
+        if (isBrownWaterTexture(name)) return true;
+      }
+    }
+    return false;
+  };
 }
 
 /**

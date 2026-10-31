@@ -25,6 +25,7 @@ class StubNode {
   readonly pan: { value: number } = { value: 0 };
   readonly frequency: { value: number } = { value: 0 };
   buffer: AudioBuffer | null = null;
+  loop = false;
   readonly connected: unknown[] = [];
   started = false;
   stopped = false;
@@ -280,6 +281,51 @@ describe('syncMixerToBrowser with stub AudioContext', () => {
     syncMixerToBrowser(sound, mixer);
     expect(sound.channels.size).toBe(0);
     expect(nodeOf(rec, 'osc').stopped).toBe(true);
+  });
+
+  it('loop channels use looping buffer sources; one-shots stay one-shot', () => {
+    const { sound, rec } = makeStubSound(pakOf('sound/world/amb1.wav'), fakeBuffer());
+    const cached = fakeBuffer();
+    sound.sounds.set('sound/world/amb1.wav', cached);
+    const mixer = new Mixer();
+    mixer.setListener([0, 0, 0], [0, 1, 0]);
+    // A world-fixed loop speaker (driver syncLoopChannels shape).
+    const loopId = mixer.startSound({
+      origin: [100, 0, 0],
+      fixedOrigin: true,
+      entnum: 0,
+      attenuation: 1,
+      masterVol: 1,
+      loop: true,
+      name: 'world/amb1.wav',
+    });
+    // A one-shot on the same cached wav for the one-shot control.
+    mixer.startSound({
+      origin: [100, 0, 0],
+      fixedOrigin: true,
+      entnum: 0,
+      attenuation: 1,
+      masterVol: 1,
+      loop: false,
+      name: 'world/amb1.wav',
+    });
+    syncMixerToBrowser(sound, mixer);
+    expect(sound.channels.size).toBe(2);
+    const srcOf = (id: number): StubNode => sound.channels.get(id)!.src as unknown as StubNode;
+    // The loop channel's source loops; the one-shot's does not.
+    expect(srcOf(loopId).loop).toBe(true);
+    for (const [id] of sound.channels) {
+      if (id !== loopId) expect(srcOf(id).loop).toBe(false);
+    }
+    // Live loops update gains in place (listener moved) — no node restart.
+    const gainOf = (id: number): number => (sound.channels.get(id)!.gain as unknown as StubNode).gain.value;
+    const gainsBefore = gainOf(loopId);
+    const nodesBefore = rec.nodes.length;
+    mixer.setListener([900, 0, 0], [0, 1, 0]);
+    syncMixerToBrowser(sound, mixer);
+    expect(sound.channels.size).toBe(2);
+    expect(rec.nodes.length).toBe(nodesBefore);
+    expect(gainOf(loopId)).not.toBe(gainsBefore);
   });
 });
 

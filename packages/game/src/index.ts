@@ -422,6 +422,8 @@ export {
 } from './collision.js';
 export {
   bspPointContentsFor,
+  bspBrownWaterFor,
+  isBrownWaterTexture,
   mapWaterContents,
   sampleWaterLevel,
   makeWorldEffectsState,

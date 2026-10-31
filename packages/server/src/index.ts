@@ -3146,17 +3146,20 @@ export const BUTTON_SOUND_START = 'switches/butn2.wav';
 
 /**
  * id water-contents bits for hitscan splash color (game/q_shared.h BSP
- * space, the space traceBox reports through SV_TraceFor): WATER 32 blue,
- * SLIME 16, LAVA 8. Brown water is a surface-name property ("*brwater",
- * g_weapon.c fire_lead) with no channel in TraceResult, so WATER maps to
- * blue here (documented follow-up, not silent miscolor).
+ * space, the space traceBox reports through SV_TraceFor): WATER 32 blue
+ * (or brown when the hit surface is `*brwater`, g_weapon.c fire_lead),
+ * SLIME 16, LAVA 8. Brown is a surface-name property with no channel in
+ * TraceResult, so the pellet path resolves it through the optional
+ * `SVFireOpts.brownWaterAt` surface query (route R9F-10b, server/game-owned
+ * — no renderer-api or TraceResult change); WATER without the query stays
+ * blue for legacy callers.
  */
 export const BSP_WATER_BIT = 32;
 export const BSP_SLIME_BIT = 16;
 export const BSP_LAVA_BIT = 8;
 
 /** Hitscan-vs-water splash color (g_weapon.c fire_lead water branch). */
-export type WaterSplashKind = 'blue' | 'slime' | 'lava';
+export type WaterSplashKind = 'blue' | 'brown' | 'slime' | 'lava';
 
 /** Flying blaster bolt (g_weapon.c fire_blaster / monster_fire_blaster). */
 export interface ServerBolt {
@@ -4558,6 +4561,16 @@ export interface SVFireOpts {
   /** Caller-seeded RNG (spread, muzzle radius, gibs). */
   rand: () => number;
   /**
+   * Brown-water surface query (C g_weapon.c fire_lead
+   * `strcmp(tr.surface->name, "*brwater")`): when a pellet stops in WATER
+   * contents, true maps to the brown splash class, false to blue. Sampled
+   * just inside the water volume along the shot. Absent = legacy behavior
+   * (WATER always blue). Backed by `bspBrownWaterFor` in @q2/game for real
+   * maps; tests inject synthetic true/false. Optional so existing callers
+   * and frozen TraceFn/TraceResult shapes are untouched.
+   */
+  brownWaterAt?: (p: Vec3) => boolean;
+  /**
    * Pre-trigger machinegun burst count (client->machinegun_shots, p_weapon.c
    * Machinegun_Fire). The driver owns the counter across ticks; default 0
    * (fresh trigger pull). Ignored for non-machinegun weapons.
@@ -4821,12 +4834,33 @@ export function SV_PlayerFire(
       // (BSP contents WATER/SLIME/LAVA, the space traceBox reports) draws
       // TE_SPLASH — 8 particles in the contents color — instead of a dry
       // puff. Brown is a surface-name property ("*brwater") with no channel
-      // in TraceResult, so WATER maps to blue (see BSP_*_BIT).
+      // in TraceResult, so the WATER branch resolves it through the optional
+      // `brownWaterAt` surface query (sampled just inside the volume along
+      // the shot; the trace endpos sits on the entry plane in the air leaf).
+      // Absent query = legacy blue. SLIME/LAVA stay contents-driven.
       const wc = wall.contents;
-      const splashKind: WaterSplashKind | null =
-        wc & BSP_WATER_BIT ? 'blue' : wc & BSP_SLIME_BIT ? 'slime' : wc & BSP_LAVA_BIT ? 'lava' : null;
+      let splashKind: WaterSplashKind | null = null;
+      if (wc & BSP_WATER_BIT) {
+        let brown = false;
+        if (opts.brownWaterAt) {
+          const segLen = Math.hypot(seg[0]!, seg[1]!, seg[2]!) || 1;
+          const sample = v3(
+            hitPos[0]! + (seg[0]! / segLen) * 0.5,
+            hitPos[1]! + (seg[1]! / segLen) * 0.5,
+            hitPos[2]! + (seg[2]! / segLen) * 0.5,
+          );
+          try {
+            brown = opts.brownWaterAt(sample) ?? false;
+          } catch {
+            brown = false;
+          }
+        }
+        splashKind = brown ? 'brown' : 'blue';
+      } else if (wc & BSP_SLIME_BIT) splashKind = 'slime';
+      else if (wc & BSP_LAVA_BIT) splashKind = 'lava';
       if (splashKind !== null) {
-        const base = splashKind === 'blue' ? 0xb0 : splashKind === 'slime' ? 0xd0 : 0xe0;
+        const base =
+          splashKind === 'blue' ? 0xb0 : splashKind === 'brown' ? 0x50 : splashKind === 'slime' ? 0xd0 : 0xe0;
         for (let i = 0; i < 8; i++) {
           st.sparks.push({
             pos: v3(

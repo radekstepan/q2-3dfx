@@ -20,7 +20,9 @@ import type { TraceResult } from './pmove.js';
 import {
   AIR_GRACE,
   DROWN_DAMAGE_CAP,
+  bspBrownWaterFor,
   bspPointContentsFor,
+  isBrownWaterTexture,
   makeWorldEffectsState,
   mapWaterContents,
   sampleWaterLevel,
@@ -170,6 +172,46 @@ describe('solid-aware contents + sampler', () => {
   it('bspPointContentsFor carries SOLID through a real map leaf', () => {
     void bspPointContentsFor;
     void MASK_WATER;
+  });
+
+  it('isBrownWaterTexture matches id *brwater plus stock unit paths', () => {
+    expect(isBrownWaterTexture('*brwater')).toBe(true);
+    expect(isBrownWaterTexture('e1u1/brwater')).toBe(true);
+    expect(isBrownWaterTexture('E1U3/BRWATER')).toBe(true);
+    expect(isBrownWaterTexture('e1u1/bluwter')).toBe(false);
+    expect(isBrownWaterTexture('e2u2/brlava')).toBe(false);
+    expect(isBrownWaterTexture('e1u1/broken2_4')).toBe(false);
+    expect(isBrownWaterTexture('')).toBe(false);
+  });
+
+  it('bspBrownWaterFor hits brown brushes, misses blue and air', () => {
+    const boxFor = (name: string): Record<string, unknown> => {
+      // Single water brush: axis box +/-10 around the origin (6 planes).
+      const planes = new Float32Array([
+        1, 0, 0, 10, -1, 0, 0, 10,
+        0, 1, 0, 10, 0, -1, 0, 10,
+        0, 0, 1, 10, 0, 0, -1, 10,
+      ]);
+      return {
+        visibility: new Uint8Array(0),
+        visBitofs: new Int32Array(0),
+        numClusters: 0,
+        nodes: new Int32Array(0),
+        modelsExtra: new Int32Array([0, 0, 0]),
+        leafs: new Int32Array([32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]),
+        leafbrushes: new Uint16Array([0]),
+        brushes: new Int32Array([0, 6, 32]),
+        brushsides: new Int32Array([0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0]),
+        planes,
+        texinfoNames: [name],
+      };
+    };
+    const inside = v3(0, 0, 0);
+    const outside = v3(50, 0, 0);
+    expect(bspBrownWaterFor(boxFor('e1u1/brwater') as never)(inside)).toBe(true);
+    expect(bspBrownWaterFor(boxFor('*brwater') as never)(inside)).toBe(true);
+    expect(bspBrownWaterFor(boxFor('e1u1/bluwter') as never)(inside)).toBe(false);
+    expect(bspBrownWaterFor(boxFor('e1u1/brwater') as never)(outside)).toBe(false);
   });
 });
 

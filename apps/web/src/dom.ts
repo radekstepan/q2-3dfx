@@ -1996,6 +1996,14 @@ function soundFreqFor(name: string): number {
  * exactly the M7.2 behaviour. Vanished channels are stopped and
  * disconnected. Positional shots/door moves/pickups therefore come through
  * the mixer — no fixed one-shot cue path remains for them.
+ *
+ * Loop channels (R9F-9 server loop records: prestarted/toggled speakers)
+ * need distinct node handling: their buffer source loops (`buf.loop =
+ * true`, on both the cached-wav and the shot-fallback paths — the synth
+ * oscillator fallback is continuous by construction) so the node never
+ * ends mid-record, and no ended-cleanup is installed (only a vanished
+ * record stops its node). Gains/pans of live loops update in place, never
+ * restarted.
  */
 export function syncMixerToBrowser(sound: BrowserSound, mixer: Mixer): MixedChannel[] {
   const mixed = mixer.mix();
@@ -2035,6 +2043,9 @@ export function syncMixerToBrowser(sound: BrowserSound, mixer: Mixer): MixedChan
           sound.sounds.set(entryName, cached);
           const buf = sound.ctx.createBufferSource();
           buf.buffer = cached;
+          // R9F-9: loop channels persist until their record vanishes — loop
+          // the buffer; one-shots keep the default one-shot play.
+          if (ch.loop === true) buf.loop = true;
           buf.connect(gain);
           src = buf;
         } else {
@@ -2056,6 +2067,10 @@ export function syncMixerToBrowser(sound: BrowserSound, mixer: Mixer): MixedChan
           if (sound.shot && SHOT_FALLBACK_RE.test(ch.name)) {
             const buf = sound.ctx.createBufferSource();
             buf.buffer = sound.shot;
+            // R9F-9: loop channels persist until their record vanishes —
+            // loop even the fallback buffer; one-shots keep one-shot play.
+            // (The synth-osc path below is continuous by construction.)
+            if (ch.loop === true) buf.loop = true;
             buf.connect(gain);
             src = buf;
           } else {

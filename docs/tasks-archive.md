@@ -500,7 +500,19 @@ changesets: `release-9-server-producers.md` + `release-9-game-te-tables.md` + `r
 owns: `packages/server`, `packages/testkit`, `packages/host`, `apps/web` · depends: RELEASE-9 inventory
 lane report (single sequential lane, disjoint in time): loop-channel speaker records (prestart + toggle, driver-consumable), DelayedUse delay thinks, light_use style records, door/button leg sounds (silent variants silent), fire_lead blood + water-splash classes (blue/slime/lava), G_UseTargets centerprints + talk1, door_use_areaportals records. Integrator: removed the duplicated driver ambient replication (single-sim), wired centerprints → status line, wired style records → both live RefDefs via a host lightStyleScale hook (C (c-'a')/('m'-'a')); quiescent settle for fuse/chain timing in the boom prune control.
 evidence: server 234 (incl. 9 new R9F pins + 15 release-9), testkit 18/18 (all M flipped, roster open 0; E3 covers the 2s relay delay), host 21, web release-9 18/18 + render-consumption legs (style toggle → both builders; centerprint → status + talk1) + release-11/elevator/base1-gate greens (sole (q) failure pre-existing, identical on clean HEAD); typecheck 19/19; deps:check clean.
-changesets: `r9f-server-batch.md` + `r9f-testkit-flips.md` + `r9f-host-lightstyles.md` (apps/web wiring private, ignored). No perf-ledger row. Follow-ups filed: R9F-9 (loop playback), R9F-10 (brown splash). 8 follow-ups filed as R9F-1..8 in BRAIN.md §8.
+changesets: `r9f-server-batch.md` + `r9f-testkit-flips.md` + `r9f-host-lightstyles.md` (apps/web wiring private, ignored). No perf-ledger row. Follow-ups filed: R9F-9 (loop playback, done below), R9F-10 (brown splash, done below).
+
+### R9F-9 — Play looped speaker channels in the browser mixer — DONE 2026-10-31
+owns: `apps/web`, `packages/sound` · depends: R9F-1
+lane report: driver reconciles server loop records to Mixer loop channels (start/stop/position by name@pos key; loop ids never enter one-shot paths); syncMixerToBrowser sets looping buffers; Mixer.updateSoundOrigin retargets in place. One-shot mixing + 0.05 master scale intact.
+evidence: sound 18 (5 loop + attenuation + volume), web loop-channels + sound 16 (57 prestarted loops, loud positioning, toggle flips, double-fire restore; skips cleanly without pak), resize + web legs green; typecheck clean; deps:check clean.
+changesets: `r9f9-sound-loop-origin.md` (apps/web private, ignored). No perf-ledger row.
+
+### R9F-10 — Hitscan-vs-brown-water splash color — DONE 2026-10-31
+owns: `packages/game`, `packages/server` · depends: R9F-7
+lane report: contract-safe route (b) — narrow optional `SVFireOpts.brownWaterAt` on the owned server type + `WaterSplashKind 'brown'`; game `bspBrownWaterFor`/`isBrownWaterTexture` over existing bsp views (no frozen-contract change, deps:check clean). Base1 has no brown water (0 brwater texinfos); real cover on train.bsp.
+evidence: game 231, server 239 (incl. 5 brown-water legs: synthetic + base1-blue/train-brown/dry; skips cleanly without pak); WATER-without-query stays blue, slime/lava/dry unchanged.
+changesets: `r9f10-brown-water.md` (game + server patch). No perf-ledger row. 8 follow-ups filed as R9F-1..8 in BRAIN.md §8.
 
 ### RELEASE-2 — Render the asset-free demo room in WebGL2 — DONE 2026-10-30
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit` · depends: none

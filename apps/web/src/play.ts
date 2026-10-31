@@ -110,7 +110,7 @@ import {
   SV_ClearFinished,
   MASK_OPAQUE_C,
 } from '@q2/server';
-import type { ServerState, ServerMonster, ServerBarrel, ServerBolt, ServerExplosion, ServerDebris, ServerGib } from '@q2/server';
+import type { ServerState, ServerMonster, ServerBarrel, ServerBolt, ServerExplosion, ServerDebris, ServerGib, ServerSound } from '@q2/server';
 import { ATTN_NORM, Mixer } from '@q2/sound';
 import { parseMD2, parseWAL, parsePCX } from '@q2/formats';
 import type { Pcx } from '@q2/formats';
@@ -1012,6 +1012,14 @@ function tryPakEntry(pak: WebPak, name: string): ArrayBuffer | null {
   }
 }
 
+/**
+ * Stable key for a server loop record (R9F-9): the toggle match is exact
+ * name + exact pos, so the key carries both. Pure and headless-safe.
+ */
+function loopChannelKey(name: string, pos: Vec3): string {
+  return `${name}@${pos[0]},${pos[1]},${pos[2]}`;
+}
+
 export class LocalDriver implements HostDriver {
   readonly source: 'devroom' | 'pak';
   readonly pm: PmoveState = makePmoveState();
@@ -1185,6 +1193,12 @@ export class LocalDriver implements HostDriver {
   /** mover state snapshot for door-move sound edges. */
   private moverStates = new Map<Mover, string>();
   private soundBorn = new Map<number, number>();
+  /**
+   * Mixer ids for live server loop channels (R9F-9), keyed by
+   * `name@x,y,z` (see loopChannelKey). One-shot ids live in soundBorn,
+   * never here, so expiry and loop sync can never disturb each other.
+   */
+  private loopChannels = new Map<string, number>();
   /**
    * Real-pak MD2/skin handles (set by bootPlay after registerPakModels).
    * Null in devroom: viewModel() hides the 3D gun, HUD keeps the 2D icon.
@@ -1577,6 +1591,11 @@ export class LocalDriver implements HostDriver {
       }
     }
     if (monshot) this.events.push('monshot');
+    // Loop speakers (R9F-9): prestarted/toggled loop records persist in
+    // st.sounds (SV_DrainSounds never consumes them) — reconcile the
+    // Mixer's loop:true channels against them every tick. One-shots above
+    // are untouched by the sync below.
+    this.syncLoopChannels();
     // Trigger/entity centerprints (R9F-6, G_UseTargets message branch):
     // driver-readable queue → status line (kind 'status', so the RELEASE-11
     // toggle gates these hints like other cosmetic text; death/finish never
@@ -2298,6 +2317,58 @@ export class LocalDriver implements HostDriver {
         this.mixer.stopSound(id);
         this.soundBorn.delete(id);
       }
+    }
+  }
+
+  /**
+   * Live server loop-channel keys (test hook, R9F-9): one `name@x,y,z`
+   * per Mixer loop channel reconciled from the server records.
+   * Independent of mix() audibility (distance-silent loops stay keyed).
+   */
+  get loopChannelKeys(): string[] {
+    return [...this.loopChannels.keys()];
+  }
+
+  /**
+   * Reconcile Mixer loop channels against the server's persistent loop
+   * records (R9F-9: game/g_target.c SP_target_speaker spawnflags&1 sets
+   * ent->s.sound at spawn, Use_Target_Speaker toggles it; the server keeps
+   * start = added / stop = removed / position = pos entries in st.sounds
+   * with loop:true, never drained, never 5s-pruned). Each tick: start a
+   * loop:true channel for every unrepresented record (position + ATTN_NORM,
+   * the C default when the key is unset, + name), refresh the origin of
+   * live ones, and stop channels whose record vanished (toggled off).
+   * One-shot channels are never touched (their ids live in soundBorn,
+   * never here); loop records never reach heardSounds; mix() stays the
+   * single 0.05 scale point.
+   */
+  private syncLoopChannels(): void {
+    const wanted = new Map<string, ServerSound>();
+    for (const s of this.server.sounds) {
+      if (s.loop !== true) continue;
+      wanted.set(loopChannelKey(s.name, s.pos), s);
+    }
+    for (const [key, id] of [...this.loopChannels]) {
+      const rec = wanted.get(key);
+      if (rec === undefined) {
+        this.mixer.stopSound(id);
+        this.loopChannels.delete(key);
+        continue;
+      }
+      this.mixer.updateSoundOrigin(id, rec.pos);
+    }
+    for (const [key, rec] of wanted) {
+      if (this.loopChannels.has(key)) continue;
+      const id = this.mixer.startSound({
+        origin: [rec.pos[0]!, rec.pos[1]!, rec.pos[2]!],
+        fixedOrigin: true,
+        entnum: 0,
+        attenuation: ATTN_NORM,
+        masterVol: 1,
+        loop: true,
+        name: rec.name,
+      });
+      this.loopChannels.set(key, id);
     }
   }
 

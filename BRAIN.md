@@ -280,7 +280,7 @@ FAIL and a proposed, unapproved tone-normalized threshold. Reopen acceptance;
 no threshold change is authorized. Historical full verify was reported 78/80,
 and deps:check 676 passed after the sound/config fix; neither was rerun here.
 
-Priority (2026-10-31: RELEASE-7/6/9/10/11/3B + R9F-1..8 done + archived; RELEASE-4 boxes 1–2 landed, box 3 blocked on map-truth prerequisite; next): R9F-9 → R9F-10 → FOLLOW-5,
+Priority (2026-10-31: RELEASE-7/6/9/10/11/3B + R9F-1..10 done + archived; RELEASE-4 boxes 1–2 landed, box 3 blocked on map-truth prerequisite; next): FOLLOW-5,
 then FOLLOW-5/6/7. Independent cards can proceed with disjoint ownership.
 Claim one card; preserve software goldens and sky/lifecycle behavior. Expensive
 validation runs sequentially. Require actual production-path regressions and
@@ -299,22 +299,6 @@ done-when:
 - [x] Reproduce approach and blocked boarding through normal movement, identify exact brush/entity blocking the player trace (fraction/startsolid/allsolid, model, origin, bounds, solid flags). Compare rendered door/platform pose with authoritative collision transform and target chain; inspect retained *31 plug and surrounding sliders without assuming which is responsible.
 - [x] Repair stale/incorrect collision, activation or geometry state against map/original behavior; never disable all mover collision or teleport the player to pass the test.
 - [ ] Extend real-base1 gate to walk from outside through the doorway, board, operate intended control, ride and finish. Assert no invisible obstruction and no premature departure; capture the complete route. Tests starting on the platform do not close boarding acceptance.
-
-### R9F-9 — Play looped speaker channels in the browser mixer
-owns: `apps/web`, `packages/sound`
-depends: R9F-1
-status: ready (filed 2026-10-31; server loop records exist, nothing consumes them audibly)
-done-when:
-- [ ] Sync server loop-channel records to Mixer loop channels (start/stop/position) and through syncMixerToBrowser (looping buffers), without breaking one-shot mixing or the 0.05 master scale point.
-- [ ] Test loop start/stop/toggle with the existing headless Mixer + a browser wiring leg; no `any` in exported signatures.
-
-### R9F-10 — Hitscan-vs-brown-water splash color
-owns: `packages/game`, `packages/server`
-depends: R9F-7
-status: ready (filed 2026-10-31; blue/slime/lava done, brown needs the surface name TraceResult does not carry)
-done-when:
-- [ ] Carry the hit surface name (or water color class) to the pellet-impact path and emit the brown-water splash class for *brwater hits; dry puffs unchanged.
-- [ ] Test with real base1 brown water; no contract change without the §5 major procedure.
 
 ### GPU-FOLLOW-5 — Complete fidelity and automated gate repairs
 owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`

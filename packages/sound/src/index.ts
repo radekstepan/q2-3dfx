@@ -147,6 +147,19 @@ export class Mixer {
     this.channels.delete(id);
   }
 
+  /**
+   * Retarget a live channel's origin in place (R9F-9 loop-speaker sync:
+   * the server loop-record position is authoritative, re-read every tick
+   * so drift is impossible). Unknown ids are a no-op; gains recompute on
+   * the next mix(). One-shot expiry and the master scale are untouched.
+   */
+  updateSoundOrigin(id: number, origin: Vec3Like): void {
+    const ch = this.channels.get(id);
+    if (ch === undefined) return;
+    const next: [number, number, number] = [origin[0]!, origin[1]!, origin[2]!];
+    ch.origin = next;
+  }
+
   stopAll(): void {
     this.channels.clear();
   }
