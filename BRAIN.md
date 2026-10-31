@@ -278,9 +278,9 @@ Sky fixes remain preserved. FOLLOW-5 tone/structural acceptance is recorded in
 `9d99612`/`c3396ab`; it does not close current gameplay/UI defects. GPU remains
 experimental pending FOLLOW-6/7. No runtime tests were rerun in this review.
 
-Priority: RELEASE-4 (boarding) → RELEASE-12
-(movement) → RELEASE-6 (help) → RELEASE-13 (dying collision/patrols) →
-RELEASE-10/14/15 (RELEASE-11 message repair landed this session). Independent bounded fixes can proceed without waiting for
+Priority: RELEASE-4 (boarding, box 3 open with recorded blockers) →
+RELEASE-6 (help) → RELEASE-13 (dying collision/patrols) →
+RELEASE-10/14/15 (RELEASE-11 message and RELEASE-12 movement repairs landed this session). Independent bounded fixes can proceed without waiting for
 the elevator investigation; do not leave the rest untouched after one diagnostic.
 Use disjoint ownership for independent work. Claim one card, run expensive tests
 sequentially, and keep implementation/test/user verdicts separate. Real-map
@@ -305,12 +305,12 @@ done-when:
 ### RELEASE-12 — Ladder climbing, water exits and slopes
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
 depends: none
-status: ready
+status: done (repaired 2026-10-31; see docs/tasks-archive.md RELEASE-12 entry)
 review-finding: pmove checks compact `CONTENTS_LADDER = 16`; `SV_TraceFor` returns raw BSP trace contents (`0x20000000` for ladder), and the live driver feeds it through `SV_ClipTrace` to pmove. `game/collision.ts` has a mapping helper, but the live trace boundary needs auditing. Raw bits must remain correct for weapon/effect consumers; do not change every trace indiscriminately.
 done-when:
-- [ ] Reproduce a real base1 ladder with the hint visible but no climb; fix the contents/trace integration and verify up/down, sideways departure, top/bottom transitions, hull collisions and client prediction. Include an actual raw-BSP ladder regression so compact-bit mock tests cannot mask failure.
-- [ ] Revisit the water secret at the supplied position **“1057-9 865.3 -207.9”** (provisional interpretation x=1057.9, y=865.3, z=-207.9; verify against map geometry). Record jump/swim input, water levels, hull, edge height, velocity and ground normal. Compare original `qcommon/pmove.c` water-jump, jump-held, friction/acceleration, step-slide and slope clipping behavior.
-- [ ] Test escaping that pool and traversing the reported angled wall through normal input; fix demonstrated divergence, not difficulty that matches original physics. Cover submerged/edge transitions, steep versus walkable slopes, frame/tick variations and both renderers. Preserve source movement constants unless evidence justifies a change.
+- [x] Reproduce a real base1 ladder with the hint visible but no climb; fix the contents/trace integration and verify up/down, sideways departure, top/bottom transitions, hull collisions and client prediction. Include an actual raw-BSP ladder regression so compact-bit mock tests cannot mask failure.
+- [x] Revisit the water secret at the supplied position **“1057-9 865.3 -207.9”** (provisional interpretation x=1057.9, y=865.3, z=-207.9; verify against map geometry). Record jump/swim input, water levels, hull, edge height, velocity and ground normal. Compare original `qcommon/pmove.c` water-jump, jump-held, friction/acceleration, step-slide and slope clipping behavior.
+- [x] Test escaping that pool and traversing the reported angled wall through normal input; fix demonstrated divergence, not difficulty that matches original physics. Cover submerged/edge transitions, steep versus walkable slopes, frame/tick variations and both renderers. Preserve source movement constants unless evidence justifies a change.
 
 ### RELEASE-6 — F1 startup flash and live secret progression
 owns: `apps/web`, `packages/client`, `packages/server`, `packages/testkit`

@@ -410,6 +410,7 @@ export {
   bspTraceFor,
   bspContentsFor,
   mapBspContents,
+  withPmoveContents,
   traceHitSky,
   SURF_SKY,
   setPmoveWorldFromBsp,

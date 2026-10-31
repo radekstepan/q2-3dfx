@@ -22,6 +22,7 @@ import {
   blasterMuzzle,
   blasterSpawn,
   bspPointContentsFor,
+  withPmoveContents,
   doorTravel,
   moveDirForAngle,
   explosionBaseframe,
@@ -607,7 +608,11 @@ export function SV_DropTraceFor(map: BspMap): TraceFn {
 export function SV_SetPmoveWorldFromBsp(map: BspMap): void {
   const contents = bspPointContentsFor(map);
   SV_WorldContents = contents;
-  setPmoveWorld(SV_TraceFor(map), contents);
+  // Pmove-only contents mapping (game withPmoveContents): the C-mask trace
+  // reports raw BSP bits (LADDER 0x20000000) that the pmove ladder probe
+  // cannot read unmapped. SV_TraceFor itself stays raw for weapon/effect
+  // consumers (hitscan water checks key on WATER 32).
+  setPmoveWorld(withPmoveContents(SV_TraceFor(map)), contents);
 }
 
 /**

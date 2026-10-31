@@ -56,6 +56,7 @@ import {
   pmoveFull,
   PMF_DUCKED,
   setPmoveWorld,
+  withPmoveContents,
   bspPointContentsFor,
   findWeapon,
   mulberry32,
@@ -1254,7 +1255,12 @@ export class LocalDriver implements HostDriver {
       // the vault stayed inert (the SOLID probe is always false without the
       // bit). Dry-land consumers test MASK_WATER only: bit-identical there.
       this.worldContents = bspPointContentsFor(built.map);
-      setPmoveWorld(this.pmoveTrace, this.worldContents);
+      // Pmove-only contents mapping (RELEASE-12): the C-mask pmoveTrace
+      // reports raw BSP bits (LADDER 0x20000000) that the pmove ladder probe
+      // (compact LADDER 16) cannot read unmapped. worldTrace/sightTrace stay
+      // raw for weapon/effect consumers; the devroom synthetic trace is
+      // already compact-space and unwrapped.
+      setPmoveWorld(withPmoveContents(this.pmoveTrace), this.worldContents);
       // Skill latch (id CVAR_LATCH, g_spawn.c): the server filters spawns,
       // damage scale, and the roster from st.skill — set it before spawning.
       SV_SetSkill(this.server, getSkill());

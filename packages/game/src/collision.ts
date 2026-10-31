@@ -64,6 +64,37 @@ export function mapBspContents(contents: number): number {
   return out;
 }
 
+/**
+ * Wrap a raw-BSP world trace for pmove consumption (contents mapping).
+ *
+ * Trace layers (@q2/bsp traceBox, server SV_TraceFor/SV_ClipTrace) report
+ * RAW Q2 BSP contents bits (q_shared.h: LADDER 0x20000000, WATER 32, ...),
+ * while pmove tests its compact port bits (pmove.ts: LADDER 16, WATER 2,
+ * ...). Without this mapping the PM_CheckSpecialMovement ladder probe
+ * (`trace.contents & CONTENTS_LADDER`) reads 0 on the live path and the
+ * base1 ladder never engages. Weapon/effect traces must stay RAW (hitscan
+ * water checks key on WATER 32, sky on surfaceFlags) — so this wrapper
+ * applies ONLY to the trace handed to setPmoveWorld, never inside the
+ * shared SV_TraceFor/SV_ClipTrace layers. Sweep geometry
+ * (fraction/endpos/planeNormal/allsolid/startsolid/entityNum/surfaceFlags)
+ * passes through untouched: only the contents word is translated.
+ */
+export function withPmoveContents(trace: TraceFn): TraceFn {
+  return (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => {
+    const t = trace(start, mins, maxs, end);
+    return {
+      fraction: t.fraction,
+      endpos: t.endpos,
+      planeNormal: t.planeNormal,
+      allsolid: t.allsolid,
+      startsolid: t.startsolid,
+      entityNum: t.entityNum,
+      contents: mapBspContents(t.contents),
+      surfaceFlags: t.surfaceFlags,
+    };
+  };
+}
+
 /** Build the point-contents query pmove consumes (leaf contents mapping). */
 export function bspContentsFor(world: Bsp38): PointContentsFn {
   return (p: Vec3): number => {
@@ -81,7 +112,7 @@ export function bspContentsFor(world: Bsp38): PointContentsFn {
  * Call resetPmoveWorld() afterwards to restore the empty world.
  */
 export function setPmoveWorldFromBsp(world: Bsp38, mask: number = MASK_PLAYERSOLID): void {
-  setPmoveWorld(bspTraceFor(world, mask), bspContentsFor(world));
+  setPmoveWorld(withPmoveContents(bspTraceFor(world, mask)), bspContentsFor(world));
 }
 
 export { resetPmoveWorld };

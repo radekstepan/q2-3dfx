@@ -593,8 +593,14 @@ function waterMove(st: PmoveState, cmd: UserCmd, frametime: number): void {
 }
 
 function applyLadder(st: PmoveState, cmd: UserCmd, wishvel: Vec3): void {
-  void st;
-  if (cmd.upmove > 0) wishvel[2] = 200;
+  // qcommon/pmove.c PM_AddCurrents ladder block: looking up/down past 15
+  // degrees while holding forward climbs/descends at 200u/s; otherwise
+  // move-up/down drives; with neither held the vertical wish zeroes and the
+  // body hangs on the rungs (airMove damps residual velocity to zero).
+  const pitch = st.viewAngles[0]!;
+  if (pitch <= -15 && cmd.forwardmove > 0) wishvel[2] = 200;
+  else if (pitch >= 15 && cmd.forwardmove > 0) wishvel[2] = -200;
+  else if (cmd.upmove > 0) wishvel[2] = 200;
   else if (cmd.upmove < 0) wishvel[2] = -200;
   else wishvel[2] = 0;
   if (wishvel[0]! < -25) wishvel[0] = -25;
