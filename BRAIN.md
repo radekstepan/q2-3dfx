@@ -7,11 +7,11 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-30, reviewed at `873c0d4`): fix live resize,
-> HUD/help/intermission, elevator access and water seams; audit effects and
-> renderer-specific controls. Preserve sky fixes, software support and legacy
-> Voodoo retirement. User feedback overrides archived completion claims.
-> §8 is the only active queue; CPU optimization remains paused.**
+> **Current direction (2026-10-31, reviewed at `c3396ab`): repair elevator
+> boarding, ladder/water movement, F1 notification/live secrets and message UI;
+> audit monster behavior, damage feedback, view roll and underwater appearance.
+> Preserve landed resize, effects and renderer retirement. §8 is the only active
+> queue; archived completion claims do not override current user feedback.**
 
 ---
 
@@ -261,48 +261,108 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ### Review checkpoint and rules
 
-Source/history reviewed at `873c0d4` against current user feedback (2026-10-30).
-This is a documentation/source review: no new browser reproduction or full-suite
-run. Archived implementation/test reports remain historical evidence, not user
-acceptance. In particular, RELEASE-4/6/7 and GPU-FOLLOW-3B are reopened below.
+Source/history reviewed at `c3396ab` on 2026-10-31. No runtime/browser tests or
+full verification were rerun in this review. Findings below distinguish direct
+code observations from symptoms still needing a production reproduction.
 
-Landed: asset HUD/help wiring; sim-preserving resize; mover and monster changes;
-water LOD/highp changes; legacy CPU Voodoo retirement; fidelity fixtures.
-Preserve these increments where valid. Sky fixes remain user-confirmed. Volume,
-devroom, monster collision/wall/fire and blaster-parallax reports are archived;
-latest feedback does not supply a new verdict on them. Do not revive old
-implementation tasks merely because this file previously had a stale heading.
+Latest batch landed resize/blit repairs, live help counters, collision changes,
+unlit water, effect producers/loop audio, message toggle and renderer capability
+controls. Preserve these increments; latest feedback does not re-report every
+older defect. Sky fixes and legacy CPU Voodoo retirement remain preserved.
+FOLLOW-5 now records approved tone/structural acceptance in `9d99612`/`c3396ab`
+and the archive; the old “unapproved proposal” paragraph was stale and is removed.
+That fidelity decision does not close new gameplay/UI defects or displayed FPS.
+GPU remains experimental pending FOLLOW-6/7; display absence does not block repairs.
 
-Current renderer vocabulary is `software | webgl2-experimental`; `voodoo` is
-retained shared policy, not an offered CPU renderer. GPU remains experimental.
-Fidelity acceptance is still open: FOLLOW-5 was archived DONE despite automated
-FAIL and a proposed, unapproved tone-normalized threshold. Reopen acceptance;
-no threshold change is authorized. Historical full verify was reported 78/80,
-and deps:check 676 passed after the sound/config fix; neither was rerun here.
+Priority: RELEASE-4 → RELEASE-12 → RELEASE-6 → RELEASE-11/10 → RELEASE-13/14/15.
+Use disjoint ownership for independent work. Claim one card, run expensive tests
+sequentially, and keep implementation/test/user verdicts separate. Real-map
+movement and visible behavior require end-to-end regressions, not helper-only
+assertions. Reopened cards supersede their archived DONE versions. Do not erase
+valid prior fixes or silently waive newly reported symptoms.
 
-Priority (2026-10-31: RELEASE-7/6/9/10/11/3B + R9F-1..10 + FOLLOW-5 done + archived; RELEASE-4 boxes 1–2 landed, box 3 punted; next): FOLLOW-6 (needs display) → FOLLOW-7 (needs R4 + FOLLOW-6),
-then FOLLOW-5/6/7. Independent cards can proceed with disjoint ownership.
-Claim one card; preserve software goldens and sky/lifecycle behavior. Expensive
-validation runs sequentially. Require actual production-path regressions and
-before/after captures for visible defects, not only helper arithmetic, nonblack
-pixels or counts. Distinguish implementation, automated results and user verdict.
-Historical DONE cards in `docs/tasks-archive.md` are superseded by reopened cards
-here. A missing display blocks displayed-performance acceptance, not code repairs.
-
-### RELEASE-4 — Make the waiting final elevator physically enterable
+### RELEASE-4 — Walk into the final elevator and show completion help
 owns: `packages/server`, `packages/game`, `apps/web`, `packages/testkit`
 depends: none
-status: blocked (boxes 1–2 landed 2026-10-31; box 3 needs the boarding prerequisite below)
-blocker: live boarding of the *12 deck is geometrically impossible in the original base1 map (verified: deck slot x -2064..-2048 sits in world rock; *13 entombed; trigger_always DM-only). PUNTED per user 2026-10-31 — revisit later. User eyewitness (same pak0.pak, Q2/Linux): entering the elevator, IT SLIDES DOWN, then base2 loads — matches the *31 plug (drops 156) + t37 changelevel, NOT the *12 train (which rises 40). Open question for the revisit: what opens the plug live (*34 is the only t4 source and looks unreachable; C confirms targetnamed messageless doors get no touch/trigger — so find the live *34 touch path or the missed chain). Preserved: server sweep/button repairs, game pmove-clean audit, testkit trace legs, web approach gate (rock face ent 0).
-user-verdict: elevator now stays open/waits, but an invisible obstruction prevents entry. Preserve the waiting repair.
+status: ready (reactivated by current user request)
+user-verdict: original game allows walking onto the elevator and then loads the next level. This project must allow boarding, then show the F1/help screen stating the level is finished. Invisible blockage persists; preserve the repaired waiting/open behavior.
+review-finding: the previous blocker analyzed the *12 train/rock slot and punted the route. That does not establish that the user’s actual exit is impossible. Prior notes identify *31 descending plug and t37 changelevel as a different candidate; re-identify from the visible approach.
 done-when:
-- [x] Reproduce approach and blocked boarding through normal movement, identify exact brush/entity blocking the player trace (fraction/startsolid/allsolid, model, origin, bounds, solid flags). Compare rendered door/platform pose with authoritative collision transform and target chain; inspect retained *31 plug and surrounding sliders without assuming which is responsible.
-- [x] Repair stale/incorrect collision, activation or geometry state against map/original behavior; never disable all mover collision or teleport the player to pass the test.
-- [ ] Extend real-base1 gate to walk from outside through the doorway, board, operate intended control, ride and finish. Assert no invisible obstruction and no premature departure; capture the complete route. Tests starting on the platform do not close boarding acceptance.
+- [ ] Trace normal walking from the final doorway to the actual exit platform; record player/camera, hit brush/edict/model, origin/bounds, startsolid/fraction and mover state. Follow real map targets/buttons and original source; distinguish *12/*13 from *31/*34 and the exit trigger instead of assuming the wrong elevator.
+- [ ] Fix the blocking collision/transform/activation chain without noclip, teleport, globally disabling solids or prematurely moving the elevator. Keep prior sweep/button repairs where valid.
+- [ ] End-to-end base1 gate must approach, enter and stand on the platform through player input, then trigger finish at the intended transition. Show the requested F1 completion panel with frozen final kills/secrets/goals/time and an explicit finished state; next-map loading is not required by this task. No test may start inside the elevator to claim boarding passed.
+
+### RELEASE-12 — Ladder climbing, water exits and slopes
+owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
+depends: none
+status: ready
+review-finding: pmove checks compact `CONTENTS_LADDER = 16`; `SV_TraceFor` returns raw BSP trace contents (`0x20000000` for ladder), and the live driver feeds it through `SV_ClipTrace` to pmove. `game/collision.ts` has a mapping helper, but the live trace boundary needs auditing. Raw bits must remain correct for weapon/effect consumers; do not change every trace indiscriminately.
+done-when:
+- [ ] Reproduce a real base1 ladder with the hint visible but no climb; fix the contents/trace integration and verify up/down, sideways departure, top/bottom transitions, hull collisions and client prediction. Include an actual raw-BSP ladder regression so compact-bit mock tests cannot mask failure.
+- [ ] Revisit the water secret at the supplied position **“1057-9 865.3 -207.9”** (provisional interpretation x=1057.9, y=865.3, z=-207.9; verify against map geometry). Record jump/swim input, water levels, hull, edge height, velocity and ground normal. Compare original `qcommon/pmove.c` water-jump, jump-held, friction/acceleration, step-slide and slope clipping behavior.
+- [ ] Test escaping that pool and traversing the reported angled wall through normal input; fix demonstrated divergence, not difficulty that matches original physics. Cover submerged/edge transitions, steep versus walkable slopes, frame/tick variations and both renderers. Preserve source movement constants unless evidence justifies a change.
+
+### RELEASE-6 — F1 startup flash and live secret progression
+owns: `apps/web`, `packages/client`, `packages/server`, `packages/testkit`
+depends: none
+status: ready (reopened)
+review-findings: HUD uses `boot.helpChangedSeq/helpSeenSeq`; boot initializes both to zero and no advancing assignment was found. Server now has a target_help producer and independent helpChangedSeq, but the boot comment still says that producer is absent. Live F1 already reads `foundSecrets`; therefore the repeated secret-count symptom needs trigger/counter/presentation tracing, not another blind replacement of finish counters.
+done-when:
+- [ ] Show the startup F1/help notification flashing until the first F1 acknowledgment, as requested. Reconcile server help-change state with HUD acknowledgment, initial map help, actual icon visibility and the original `p_view.c`/`p_hud.c` cadence; new help changes should notify again. Verify a real cold boot rather than manually altering counters in tests.
+- [ ] Follow a real secret discovery from trigger/target chain through single-use `foundSecrets` increment to F1 rendering. With help open and closed, verify multiple discoveries update immediately and never double-count. Preserve final frozen counters once finished.
+- [ ] Use current help text/map name, remove stale producer comments, and verify icon/panel across resolutions, resize/switch and respawn. Coordinate the final help screen with RELEASE-4.
+
+### RELEASE-11 — Discoverable status toggle and faithful center messages
+owns: `apps/web`, `packages/client`, `packages/config`, `packages/server`
+depends: none
+status: ready (reopened)
+review-findings: `cl_showmessages` already exists, is persisted and gates status text. The driver drains server centerprints into `setMessage(..., 'status')`, sharing the cosmetic one-line channel; this loses original centered presentation and lets the status toggle hide hints/secrets.
+done-when:
+- [ ] Make the existing gameplay-status toggle easy to find and verify it hides/shows messages such as “soldier minced” immediately, across both renderers and reloads. Diagnose why the user still requests it; do not add a duplicate cvar.
+- [ ] Give trigger/ladder/secret messages their own centerprint presentation with white game-font text, source-matched centering, multiline handling and lifetime. Verify original source/message assets and real trigger routes. Keep these messages distinct from cosmetic kill/status text, F1 and completion; explicitly test toggle behavior for each channel.
+- [ ] Add rendered regressions for ladder hint, secret discovery, kill status on/off, message expiry and simultaneous events without overwriting essential completion/errors.
+
+### RELEASE-10 — Tooltip-only disabled explanations; matching checkbox styling
+owns: `apps/web`
+depends: none
+status: ready (reopened)
+review-finding: `renderCvarRow: noteDisabled` appends a visible `q2-cvar-why` span even though the row/control already has the full reason in its title.
+done-when:
+- [ ] Remove visible reason paragraphs; put explanations in hover/focus-accessible tooltips on the control/label or wrapper, with an accessible description. Disabled native inputs may not receive focus/hover events, so verify the wrapper path.
+- [ ] Keep disabled checkbox geometry, custom styling, alignment and size identical to enabled checkboxes; only disabled affordance/interaction changes. Preserve renderer capability decisions, saved values and switch/fallback updates.
+- [ ] Check the real sidebar on both renderers at representative viewport sizes, mouse and keyboard; no layout shift or duplicated visible explanation text.
+
+### RELEASE-13 — Infantry death variety and soldier patrol behavior
+owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
+depends: none
+status: ready
+review-finding: infantry already defines death1/death2/death3 and chooses via `floor(rand()*3)` in monster damage; soldier lite currently pins death1. The user’s infantry observation may concern RNG delivery, frame submission or identity rather than missing tables.
+done-when:
+- [ ] Exercise all three non-gib infantry deaths through the production damage→server→snapshot→renderer path with controlled RNG, then sample normal play. Compare original frames, timing, movement, death2 firing and final corpse bounds; distinguish soldiers from infantry and gib deaths. Fix actual selection/rendering omissions.
+- [ ] Audit base1 soldier spawn targets/path_corner chains, idle/walk patrol, facing, ambush flags, sight/hearing and wake-up against original `g_monster.c`/`g_ai.c` and map entities. Identify which soldiers should patrol and be approachable from behind; do not make every idle soldier patrol or detect players omnidirectionally.
+- [ ] Record real-map routes and visible death sequences; add regressions for patrol→detection/combat and rear approach with appropriate source sight/noise behavior.
+
+### RELEASE-14 — Source-faithful damage feedback and strafe view roll
+owns: `packages/game`, `packages/server`, `packages/client`, `apps/web`, `packages/webgl-renderer`, `packages/renderer-api`
+depends: none
+status: ready
+done-when:
+- [ ] Port/audit original `p_view.c: P_DamageFeedback` and `p_hud.c` damage flashes: health-number flash, damage color/alpha blend, decay and directional view kick. Cover armor/blood contributions, repeated hits, immunity/death and reset. Distinguish low-health blinking from a just-hit flash; render feedback on Software and WebGL2.
+- [ ] Compare `SV_CalcRoll`/`SV_CalcViewOffset` lateral-velocity roll and bob with the actual submitted camera. Weapon sway is not camera lean. Verify magnitude, sign, speed clamp, grounded/air/water cases and decay against source, including aim/crosshair consistency.
+- [ ] Use deterministic damage and strafe sequences with pixel/camera evidence at multiple resolutions; keep HUD readable and avoid applying blend/kick twice. Any shared contract changes follow §5.
+
+### RELEASE-15 — Underwater view distortion and transitions
+owns: `packages/client`, `apps/web`, `packages/webgl-renderer`, `packages/sw-renderer`, `packages/renderer-api`, `packages/testkit`
+depends: none
+status: ready
+done-when:
+- [ ] Inspect original renderer/client handling of submerged view, contents flags, blend and underwater warp; distinguish being underwater from looking through an animated surface at submerged objects. Compare matched scene/camera/time to the original OpenGL behavior before assuming distortion is wrong or adding surface refraction.
+- [ ] Audit current view/projection/render flags and implement missing or repair excessive distortion to match the source. Preserve Software reference semantics, water-surface motion, HUD/crosshair alignment and source FOV behavior.
+- [ ] Verify above/below/partially submerged transitions, opaque submerged objects and moving views with deterministic captures and an omitted-warp control. Record backend differences explicitly.
 
 ### GPU-FOLLOW-6 — Verify gameplay on a visible display
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
-depends: RELEASE-4, RELEASE-6, RELEASE-7, RELEASE-9, GPU-FOLLOW-3B
+depends: RELEASE-4, RELEASE-6, RELEASE-10, RELEASE-11, RELEASE-12, RELEASE-13, RELEASE-14, RELEASE-15
 status: blocked (displayed-performance evidence only)
 blocker: archived `docs/gpu-follow-6-gate-record.md` reports hardware GL but no connected monitor/vsync/scanout. This review did not recheck display availability. Submitted-frame throughput is not displayed FPS. Historical startup 3.05s exceeds the 2.5s target.
 done-when:
@@ -313,7 +373,7 @@ done-when:
 ### GPU-FOLLOW-7 — Final integrated acceptance
 owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config`
 depends: all active repair cards above, GPU-FOLLOW-5, GPU-FOLLOW-6
-status: blocked (repair, fidelity and display prerequisites)
+status: blocked (active repairs and display prerequisites; FOLLOW-5 acceptance archived)
 done-when:
 - [ ] Run full `yarn verify`, `yarn deps:check`, real-asset base1, software/Node and GPU lifecycle/image/gameplay gates after integration. Record skips, failures and exact artifacts; no claim of completion based on archived partial greens.
 - [ ] Reconcile archive claims with current user verdicts; publish separate implementation/correctness/fidelity/display-performance results. Close cards only with their required evidence.
