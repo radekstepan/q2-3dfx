@@ -453,7 +453,10 @@ describe.runIf(!!WEB_Q2_PAK)('base1 640x480 web-layer stage table (Q2_PAK, repor
         expect(rep.pooled).toBe(true);
         expect(rep.bands).toBe(8);
         expect(rep.rasterFallbacks).toBe(0);
-        expect(rep.scannedSpans).toBeGreaterThanOrEqual(0);
+        // Node stand-in pool exposes no kickStats/scanned counters:
+        // unknown (-1), never a silent zero. BrowserBandPool scanned
+        // proof is pinned in worker-timing with the real entry.
+        expect(rep.scannedSpans).toBe(-1);
       }
       console.log(`[web-stage] base1 640x480 pooled-7 stationary\n  ${rows.join('\n  ')}`);
       expect(boot.statAsyncFallbacks).toBe(0);

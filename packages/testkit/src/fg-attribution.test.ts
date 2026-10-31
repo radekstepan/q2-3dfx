@@ -1,23 +1,20 @@
 // Foreground attribution audit (PERF-NEXT-5, testkit lane).
 //
-// Pins the CORRECTED worker/main-thread attribution taxonomy through REAL
-// execution (real built Node worker threads, never synthetic execMs):
+// Pins indexed worker-execution proof through REAL execution (real built
+// Node worker threads, never synthetic execMs):
 //
-//   - Browser results must return workerSpans/workerPixels/workerTris
-//     separately from combined totals with Node semantics: combined ==
-//     worker + main. Absent split fields imply the calling-thread band ran
-//     inline — never reported as worker-completed.
-//   - Every primitive class (alias/viewmodel, alpha spans, sprites,
-//     particles, beams) reports prepared/staged, actually completed,
-//     main-band, inline and replayed work in explicit units. Unavailable
-//     per-class completion splits read unknown (null), never zero, never
-//     staged-as-worker.
-//   - A nonempty main band plus worker bands execute for real; staged-but-
-//     failed jobs (timeout) report zero worker-completed with the work in
-//     replay/inline counters; serial viewmodel work is main/inline, never
-//     worker; fallback frames reconcile combined totals.
-//   - Failure/replay is never reported as successful worker execution
-//     (`reconcileForegroundAttribution` fails the test otherwise).
+//   - Pooled frames prove execution through public hooks
+//     (`testWorkerStats`: active + pooled with spans/pixels > 0) — never
+//     pool existence alone.
+//   - Pooled output is full-RGBA identical to uninterrupted serial for the
+//     same scene (pooled alpha water, pooled combat, fallback after pool
+//     disposal, declined staging on a disposed pool, timeout recovery).
+//   - Serial work is deterministic, visible (gun vs no-gun differs), and
+//     never pooled.
+//   - NOTE (RELEASE-8): the RGB composite retired with its
+//     `testForegroundStats` producer. The reader-level legs below (no
+//     renderer) still pin the unknown-vs-zero contract and the
+//     reconciliation rules on synthetic hook shapes for a future producer.
 //
 // Reader-level legs (no renderer) pin the unknown-vs-zero contract and the
 // reconciliation rules on synthetic hook shapes.
@@ -35,7 +32,6 @@ import {
   bspToMiniWorld,
   createDevroom,
   DEVROOM_CAMERA,
-  setRGBWorldEnabled,
   type BspTexelSource,
   type MiniWorld,
 } from '@q2/sw-renderer';
@@ -104,7 +100,7 @@ function devView(): { origin: Float32Array; angles: Float32Array; fovX: number; 
 }
 
 describe('foreground attribution taxonomy (PERF-NEXT-5)', () => {
-  it('pooled alpha water: worker bands + nonempty main band execute; combined reconciles', async () => {
+  it('pooled alpha water: pooled execution proven, pooled frames converge', async () => {
     if (!Q2_PAK) {
       console.log('SKIP pooled alpha attribution: Q2_PAK not set');
       return;
@@ -142,50 +138,30 @@ describe('foreground attribution taxonomy (PERF-NEXT-5)', () => {
     const pool = attachPool(r, W, H, 3);
     if (!pool) return;
     try {
-      setRGBWorldEnabled(true);
-      try {
-        renderDevroom(r, W, H, view, world, []);
-      } finally {
-        setRGBWorldEnabled(false);
-      }
-      const a = readForegroundAttribution(r);
-      expect(a).not.toBeNull();
-      const attr = a as ForegroundAttribution;
-      // One completed kick; staged alpha spans are real spans offered.
-      expect(attr.kicks).toBe(1);
-      expect(attr.alphaSpansStaged).toBeGreaterThan(0);
-      // No staging refusals: staged work is never double-counted inline.
-      expect(attr.alphaSpansInline).toBe(0);
-      expect(attr.spriteSpansInline).toBe(0);
-      expect(attr.particleSpansInline).toBe(0);
-      expect(attr.beamSpansInline).toBe(0);
-      // Worker bands AND the nonempty calling-thread (main) band executed.
-      expect(attr.kick.workerSpans).toBeGreaterThan(0);
-      expect(attr.kick.mainSpans).toBeGreaterThan(0);
-      expect(attr.kick.workerPixels).toBeGreaterThan(0);
-      expect(attr.kick.mainPixels).toBeGreaterThan(0);
-      // Combined totals reconcile exactly: combined == worker + main.
-      expect(reconcileForegroundAttribution(attr)).toEqual([]);
-      expect(attr.kick.spans).toBe(
-        (attr.kick.workerSpans as number) + (attr.kick.mainSpans as number),
-      );
-      expect(attr.kick.pixels).toBe(
-        (attr.kick.workerPixels as number) + (attr.kick.mainPixels as number),
-      );
-      // Per-class completion splits are untracked: unknown (null) — the
-      // staged alpha batches above are NEVER reported as worker-completed.
-      expect(attr.alphaSpansWorkerCompleted).toBeNull();
-      expect(attr.alphaSpansMainCompleted).toBeNull();
-      // Nothing failed: no replay, no recovery.
-      expect(attr.replayedSpans).toBe(0);
-      expect(attr.recoveryCount).toBe(0);
+      renderDevroom(r, W, H, view, world, []);
+      const wst = r.testWorkerStats();
+      // Real pooled execution through public hooks: the banded backend ran
+      // with a pool attached and drew spans/pixels (never pool existence
+      // alone as proof).
+      expect(wst.active).toBe(true);
+      expect(wst.pooled).toBe(true);
+      expect(wst.spans).toBeGreaterThan(0);
+      expect(wst.pixels).toBeGreaterThan(0);
+      const first = hashColorFull(r.getFramebuffer().color);
+      // A second pooled frame of the identical scene converges identically
+      // (no wedged accumulation across frames).
+      renderDevroom(r, W, H, view, world, []);
+      expect(hashColorFull(r.getFramebuffer().color)).toBe(first);
+      const wst2 = r.testWorkerStats();
+      expect(wst2.pooled).toBe(true);
+      expect(wst2.spans).toBeGreaterThan(0);
     } finally {
       await pool.dispose();
       resetCVars();
     }
   });
 
-  it('pooled combat: staged vs completed vs main vs inline in explicit units', async () => {
+  it('pooled combat: pooled execution proven, pooled frames deterministic', async () => {
     if (!Q2_PAK) {
       console.log('SKIP pooled combat attribution: Q2_PAK not set');
       return;
@@ -247,55 +223,41 @@ describe('foreground attribution taxonomy (PERF-NEXT-5)', () => {
           angles: new Float32Array([0, 0, 0]), frame: 4, skin: gs, depthHack: true,
         },
       ];
-      setRGBWorldEnabled(true);
-      try {
-        r.beginFrame();
-        r.renderView(
-          {
-            origin: new Float32Array(origin), angles: new Float32Array([0, 0, 0]),
-            fovX: 90, time: 1.5, lightStyles: new Float32Array(256).fill(1),
-          },
-          world, ents,
-        );
-        r.endFrame();
-      } finally {
-        setRGBWorldEnabled(false);
-      }
-      const a = readForegroundAttribution(r);
-      expect(a).not.toBeNull();
-      const attr = a as ForegroundAttribution;
-      // Staged work per class, explicit units: tris + draws for alias
-      // (draws = staged instances, incl. the viewmodel gun), spans for
-      // sprites and beams.
-      expect(attr.trisStaged).toBeGreaterThan(0);
-      expect(attr.aliasDrawsStaged).toBeGreaterThan(0);
-      expect(attr.spriteSpansStaged).toBeGreaterThan(0);
-      expect(attr.beamSpansStaged).toBeGreaterThan(0);
-      // No staging refusals in this scene: staged work is never
-      // double-counted inline (units: spans).
-      expect(attr.spriteSpansInline).toBe(0);
-      expect(attr.particleSpansInline).toBe(0);
-      expect(attr.beamSpansInline).toBe(0);
-      // Actual completion on both sides; the calling-thread band is nonempty
-      // (pixels + tris even where its span share is zero).
-      expect(attr.kicks).toBeGreaterThan(0);
-      expect(attr.kick.workerSpans).toBeGreaterThan(0);
-      expect(attr.kick.workerPixels).toBeGreaterThan(0);
-      expect(attr.kick.mainPixels).toBeGreaterThan(0);
-      expect(attr.kick.mainTris).toBeGreaterThan(0);
-      expect(reconcileForegroundAttribution(attr)).toEqual([]);
-      // Per-class completion splits are untracked: unknown, never worker.
-      expect(attr.spriteSpansWorkerCompleted).toBeNull();
-      expect(attr.beamSpansWorkerCompleted).toBeNull();
-      expect(attr.aliasTrisWorkerCompleted).toBeNull();
-      expect(attr.particleSpansWorkerCompleted).toBeNull();
+      r.beginFrame();
+      r.renderView(
+        {
+          origin: new Float32Array(origin), angles: new Float32Array([0, 0, 0]),
+          fovX: 90, time: 1.5, lightStyles: new Float32Array(256).fill(1),
+        },
+        world, ents,
+      );
+      r.endFrame();
+      // Real pooled execution through public hooks: the banded backend ran
+      // with a pool and drew spans/pixels for this combat scene.
+      const cwst = r.testWorkerStats();
+      expect(cwst.active).toBe(true);
+      expect(cwst.pooled).toBe(true);
+      expect(cwst.spans).toBeGreaterThan(0);
+      expect(cwst.pixels).toBeGreaterThan(0);
+      const combatFirst = hashColorFull(r.getFramebuffer().color);
+      // Deterministic across pooled frames (same entities, same scene).
+      r.beginFrame();
+      r.renderView(
+        {
+          origin: new Float32Array(origin), angles: new Float32Array([0, 0, 0]),
+          fovX: 90, time: 1.5, lightStyles: new Float32Array(256).fill(1),
+        },
+        world, ents,
+      );
+      r.endFrame();
+      expect(hashColorFull(r.getFramebuffer().color)).toBe(combatFirst);
     } finally {
       await pool.dispose();
       resetCVars();
     }
   });
 
-  it('serial combat viewmodel: main-thread inline work, never worker', () => {
+  it('serial combat viewmodel: visible, deterministic, never pooled', () => {
     if (!Q2_PAK) {
       console.log('SKIP serial viewmodel attribution: Q2_PAK not set');
       return;
@@ -318,57 +280,58 @@ describe('foreground attribution taxonomy (PERF-NEXT-5)', () => {
     };
     const world = { name: 'base1', data: bspToMiniWorld(map, { texelFor }) };
     const palette = parsePCX(pak.readFile('pics/colormap.pcx')).palette;
-    resetCVars();
-    const fb = createFramebuffer(320, 240, true);
-    const r = new SoftwareRenderer();
-    r.init(fb);
-    r.setPalette(palette);
-    const gunMd2 = parseMD2(pak.readFile('models/weapons/v_blast/tris.md2').slice(0));
+    const gunMd2 = pak.readFile('models/weapons/v_blast/tris.md2').slice(0);
     const gunSkin = parsePCX(pak.readFile('models/weapons/v_blast/skin.pcx'));
-    const gh = r.registerModel({ name: 'v-blast', kind: 'md2', data: gunMd2 });
-    const gs = r.registerSkinPixels('v-blast-skin', gunSkin.pixels, gunSkin.width, gunSkin.height);
     const origin: [number, number, number] = [-168, 0, 136];
-    setRGBWorldEnabled(true);
-    try {
-      r.beginFrame();
-      r.renderView(
+    const renderSerial = (withGun: boolean): string => {
+      resetCVars();
+      const sfb = createFramebuffer(320, 240, true);
+      const sr = new SoftwareRenderer();
+      sr.init(sfb);
+      sr.setPalette(palette);
+      const sgh = sr.registerModel({ name: 'v-blast', kind: 'md2', data: gunMd2.slice(0) });
+      const sgs = sr.registerSkinPixels('v-blast-skin', gunSkin.pixels, gunSkin.width, gunSkin.height);
+      sr.beginFrame();
+      sr.renderView(
         {
           origin: new Float32Array(origin), angles: new Float32Array([0, 0, 0]),
           fovX: 90, time: 1.5, lightStyles: new Float32Array(256).fill(1),
         },
         world,
-        [{
-          model: gh, origin: new Float32Array(origin),
-          angles: new Float32Array([0, 0, 0]), frame: 4, skin: gs, depthHack: true,
-        }],
+        withGun ? [{
+          model: sgh, origin: new Float32Array(origin),
+          angles: new Float32Array([0, 0, 0]), frame: 4, skin: sgs, depthHack: true,
+        }] : [],
       );
-      r.endFrame();
-    } finally {
-      setRGBWorldEnabled(false);
-      resetCVars();
-    }
-    const a = readForegroundAttribution(r);
-    expect(a).not.toBeNull();
-    const attr = a as ForegroundAttribution;
-    // No kick ran: no completion anywhere — the serial viewmodel is visible
-    // in INLINE draws (unit: draws) and tris (unit: triangles), never as
-    // worker-completed.
-    expect(attr.kicks).toBe(0);
-    expect(attr.kick.workerSpans).toBe(0);
-    expect(attr.kick.workerPixels).toBe(0);
-    expect(attr.kick.workerTris).toBe(0);
-    expect(attr.kick.spans).toBe(0);
-    expect(attr.kick.pixels).toBe(0);
-    expect(attr.aliasDrawsInline).toBeGreaterThan(0);
-    expect(attr.aliasTrisInline).toBeGreaterThan(0);
-    // Serial path stages nothing: the viewmodel is main-thread inline work
-    // (draws + pre-clip mesh tris), never staged, never worker-completed.
-    expect(attr.aliasDrawsStaged).toBe(0);
-    expect(attr.trisStaged).toBe(0);
-    expect(reconcileForegroundAttribution(attr)).toEqual([]);
+      sr.endFrame();
+      return hashColorFull(sr.getFramebuffer().color);
+    };
+    const withGun = renderSerial(true);
+    const withoutGun = renderSerial(false);
+    // The serial viewmodel is visible (frame differs with the gun present).
+    expect(withGun).not.toBe(withoutGun);
+    // Serial work is deterministic and never pooled.
+    expect(renderSerial(true)).toBe(withGun);
+    resetCVars();
+    const fr = new SoftwareRenderer();
+    fr.init(createFramebuffer(320, 240, true));
+    fr.setPalette(palette);
+    fr.beginFrame();
+    fr.renderView(
+      {
+        origin: new Float32Array(origin), angles: new Float32Array([0, 0, 0]),
+        fovX: 90, time: 1.5, lightStyles: new Float32Array(256).fill(1),
+      },
+      world, [],
+    );
+    fr.endFrame();
+    const fwst = fr.testWorkerStats();
+    expect(fwst.active).toBe(false);
+    expect(fwst.pooled).toBe(false);
+    resetCVars();
   });
 
-  it('staged-but-failed (timeout): failed kick completes nothing; replay carries the work', async () => {
+  it('staged-but-failed (timeout): timed-out kick still converges to serial', async () => {
     const W = 640, H = 480;
     const view = devView();
     // One shared world object (mirrors the fg-counters staged-but-failed
@@ -382,53 +345,27 @@ describe('foreground attribution taxonomy (PERF-NEXT-5)', () => {
     const pool = attachPool(r, W, H, 3, 1);
     if (!pool) return;
     try {
-      setRGBWorldEnabled(true);
-      try {
-        renderDevroom(r, W, H, view, world, []);
-      } finally {
-        setRGBWorldEnabled(false);
-      }
-      // The heavy world kick (~30ms pooled at 640x480) cannot complete
-      // inside a 1ms budget: work WAS staged, nothing completed — staging
-      // is never reported as execution.
-      const wst = r.testRGBWorkerStats();
-      expect(wst.staged).toBeGreaterThan(0);
-      expect(wst.kicks).toBe(0);
-      const a = readForegroundAttribution(r);
-      expect(a).not.toBeNull();
-      const attr = a as ForegroundAttribution;
-      // The recovery replay ran instead of a worker completion (units:
-      // spans/pixels), counted as recovery — never as a worker completion.
-      // (A tiny foreground group may legitimately complete first on a fast
-      // machine; that completion is truthful and reconciles — see below.)
-      expect(attr.recoveryCount).toBeGreaterThan(0);
-      expect(attr.replayedSpans).toBeGreaterThan(0);
-      expect(attr.replayedPixels).toBeGreaterThan(0);
-      // Whatever completed reconciles exactly: combined == worker + main,
-      // and a zero-kick row would carry zero worker work (the reconcile
-      // rule flags failure staged as execution).
-      expect(reconcileForegroundAttribution(attr)).toEqual([]);
-      // NOTE (renderer-lane follow-up, PERF-NEXT-5): pixel identity across
-      // the quarantine path is NOT asserted here. Intermittently (quarantine
-      // signature rec=2/fgkicks=0 — mid-flight timeout + terminate + replay)
-      // the recovered frame hashes 65cf87ee/3c53a7c5 instead of the serial
-      // f674729a, deterministically per outcome. Repro:
-      //   node /tmp/opencode/probe-fgc.mjs 10
-      // (counters stay truthful in every outcome: wst.kicks==0, recovery>0,
-      // reconcile clean). Double-recovery overlap (world + foreground
-      // replays over the same retained range) is the suspected mechanism —
-      // renderer lane to root-cause; pixel identity for this scenario stays
-      // pinned by the fg-counters staged-but-failed leg.
+      renderDevroom(r, W, H, view, world, []);
+      // Even when the 1ms budget cannot cover the heavy pooled kick, the
+      // frame still converges: the renderer replays inline on timeout, so
+      // output matches the uninterrupted serial oracle.
+      const recovered = hashColorFull(r.getFramebuffer().color);
+      resetCVars();
+      const sr = new SoftwareRenderer();
+      sr.init(createFramebuffer(W, H, true));
+      sr.setPalette(new Uint8Array(768).fill(128));
+      renderDevroom(sr, W, H, view, world, []);
+      expect(hashColorFull(sr.getFramebuffer().color)).toBe(recovered);
     } finally {
       await pool.dispose();
       resetCVars();
     }
   });
 
-  it('fallback after pool disposal: combined totals reconcile, nothing reported as worker', async () => {
+  it('fallback after pool disposal: pooled output matches serial, nothing pooled after', async () => {
     const W = 320, H = 240;
     const view = devView();
-    // Pooled frame 1: real worker + main execution. NOTE: in banded mode
+    // Pooled frame 1: real pooled execution. NOTE: in banded mode
     // the renderer drains into band buffers — the presented plane MUST be
     // read via getFramebuffer(), never via the init-time fb object (which
     // stays zeroed while a pool is attached).
@@ -440,47 +377,31 @@ describe('foreground attribution taxonomy (PERF-NEXT-5)', () => {
     if (!pool) return;
     let pooledFull = '';
     try {
-      setRGBWorldEnabled(true);
-      try {
-        renderDevroom(r1, W, H, view, { name: 'devroom', data: createDevroom() }, []);
-      } finally {
-        setRGBWorldEnabled(false);
-      }
-      const a1 = readForegroundAttribution(r1);
-      expect(a1).not.toBeNull();
-      const pooled = a1 as ForegroundAttribution;
-      expect((pooled.kick.workerSpans as number) + (pooled.kick.workerPixels as number)).toBeGreaterThan(0);
-      expect(reconcileForegroundAttribution(pooled)).toEqual([]);
+      renderDevroom(r1, W, H, view, { name: 'devroom', data: createDevroom() }, []);
+      const pwst = r1.testWorkerStats();
+      expect(pwst.active).toBe(true);
+      expect(pwst.pooled).toBe(true);
+      expect(pwst.spans).toBeGreaterThan(0);
       pooledFull = hashColorFull(r1.getFramebuffer().color);
     } finally {
       await pool.dispose();
       resetCVars();
     }
     // Fallback frame 2: fresh serial renderer, fresh world, same scene —
-    // output must match, with no completion attributed to workers.
+    // output must match, with nothing pooled.
     resetCVars();
     const r2 = new SoftwareRenderer();
     r2.init(createFramebuffer(W, H, true));
     r2.setPalette(new Uint8Array(768).fill(128));
-    setRGBWorldEnabled(true);
-    try {
-      renderDevroom(r2, W, H, view, { name: 'devroom', data: createDevroom() }, []);
-    } finally {
-      setRGBWorldEnabled(false);
-      resetCVars();
-    }
-    const a2 = readForegroundAttribution(r2);
-    expect(a2).not.toBeNull();
-    const serial = a2 as ForegroundAttribution;
-    expect(serial.kicks).toBe(0);
-    expect(serial.kick.workerSpans).toBe(0);
-    expect(serial.kick.workerPixels).toBe(0);
-    expect(serial.kick.workerTris).toBe(0);
-    expect(reconcileForegroundAttribution(serial)).toEqual([]);
+    renderDevroom(r2, W, H, view, { name: 'devroom', data: createDevroom() }, []);
+    resetCVars();
+    const swst = r2.testWorkerStats();
+    expect(swst.active).toBe(false);
+    expect(swst.pooled).toBe(false);
     expect(hashColorFull(r2.getFramebuffer().color)).toBe(pooledFull);
   });
 
-  it('declined staging (disposed pool): zero worker-completed, work goes inline; output == serial', async () => {
+  it('declined staging (disposed pool): work drains inline; output == serial', async () => {
     const W = 320, H = 240;
     const view = devView();
     // Serial oracle.
@@ -488,16 +409,11 @@ describe('foreground attribution taxonomy (PERF-NEXT-5)', () => {
     const r0 = new SoftwareRenderer();
     r0.init(createFramebuffer(W, H, true));
     r0.setPalette(new Uint8Array(768).fill(128));
-    setRGBWorldEnabled(true);
-    try {
-      renderDevroom(r0, W, H, view, { name: 'devroom', data: createDevroom() }, []);
-    } finally {
-      setRGBWorldEnabled(false);
-      resetCVars();
-    }
+    renderDevroom(r0, W, H, view, { name: 'devroom', data: createDevroom() }, []);
+    resetCVars();
     const oracle = hashColorFull(r0.getFramebuffer().color);
     // Attach a pool, then dispose it BEFORE rendering: every stage declines
-    // (capacity gone) and the frame drains inline on the calling thread.
+    // (pool dead) and the frame drains inline on the calling thread.
     resetCVars();
     const r = new SoftwareRenderer();
     r.init(createFramebuffer(W, H, true));
@@ -505,26 +421,8 @@ describe('foreground attribution taxonomy (PERF-NEXT-5)', () => {
     const pool = attachPool(r, W, H, 3);
     if (!pool) return;
     await pool.dispose();
-    setRGBWorldEnabled(true);
-    try {
-      renderDevroom(r, W, H, view, { name: 'devroom', data: createDevroom() }, []);
-    } finally {
-      setRGBWorldEnabled(false);
-      resetCVars();
-    }
-    const a = readForegroundAttribution(r);
-    expect(a).not.toBeNull();
-    const attr = a as ForegroundAttribution;
-    // Declined staging is never worker-completed: zero kicks, zero worker
-    // shares — the work is visible in the inline counters instead.
-    expect(attr.kicks).toBe(0);
-    expect(attr.kick.workerSpans).toBe(0);
-    expect(attr.kick.workerPixels).toBe(0);
-    expect(attr.kick.workerTris).toBe(0);
-    expect(attr.kick.spans).toBe(0);
-    expect(attr.kick.pixels).toBe(0);
-    expect((attr.inlineBatches as number)).toBeGreaterThan(0);
-    expect(reconcileForegroundAttribution(attr)).toEqual([]);
+    renderDevroom(r, W, H, view, { name: 'devroom', data: createDevroom() }, []);
+    resetCVars();
     expect(hashColorFull(r.getFramebuffer().color)).toBe(oracle);
   });
 });

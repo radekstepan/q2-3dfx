@@ -298,14 +298,16 @@ describe('indexed worker execution through the real entry', () => {
         const boot = bootPlay({ width: REC_W, height: REC_H });
         (boot as unknown as { browserPool: unknown }).browserPool = pool;
         const s = publishQ2Stats(boot, 60, 3);
-        // Pool present but foreign (no kickStats probe): counted outcomes
-        // degrade to the healthy defaults, never a silent nonzero.
+        // Pool present (BrowserBandPool): probes read live state —
+        // the frozen last-kick staging snapshot, zero counted fallbacks,
+        // no quarantine, and the disarmed timing sentinels.
+        expect(s.stageBytes).toBe(pool!.kickBytes()!.total);
+        expect(s.stageBytes).toBeGreaterThan(0);
         expect(s.rasterFallbacks).toBe(0);
         expect(s.quarantined).toBe(false);
         expect(s.lastKickJob).toBe('none');
         expect(s.rasterSlowestMs).toBe(-1);
         expect(s.resolveSlowestMs).toBe(-1);
-        expect(s.stageBytes).toBe(-1);
         // A throwing testWorkerStats hook degrades to unpooled defaults,
         // never a throw on the present path.
         const rec = boot.refresh as unknown as Record<string, unknown>;
@@ -315,6 +317,15 @@ describe('indexed worker execution through the real entry', () => {
         const t = publishQ2Stats(boot, 60, 4);
         expect(t.pooled).toBe(false);
         expect(t.bands).toBe(1);
+        // A foreign pool without the probe surface degrades to the same
+        // healthy sentinels (unknown, never worker-completed, never a
+        // silent nonzero).
+        (boot as unknown as { browserPool: unknown }).browserPool = {};
+        const v = publishQ2Stats(boot, 60, 6);
+        expect(v.stageBytes).toBe(-1);
+        expect(v.rasterFallbacks).toBe(0);
+        expect(v.quarantined).toBe(false);
+        expect(v.lastKickJob).toBe('none');
         // Unpooled boot (no pool probe): healthy defaults.
         const bare = bootPlay({ width: REC_W, height: REC_H });
         const u = publishQ2Stats(bare, 60, 5);

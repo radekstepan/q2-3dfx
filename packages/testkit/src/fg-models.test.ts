@@ -34,7 +34,6 @@ import {
   SW_ACCUM_CVAR,
   SW_WORKERS_CVAR,
   bspToMiniWorld,
-  setRGBWorldEnabled,
   type BspTexelSource,
   type MiniWorld,
 } from '@q2/sw-renderer';
@@ -55,6 +54,16 @@ function swRendererEsmPath(): string | null {
   } catch {
     return null;
   }
+}
+
+/** Depth-written pixels (drawn cover) for the serial indexed oracle.
+ *  The depth plane clears to 0; palette index 0 is a legitimate texel,
+ *  so the index plane cannot prove coverage. */
+function indexCover(r: SoftwareRenderer): number {
+  const depth = r.getFramebuffer().depth!;
+  let cover = 0;
+  for (let i = 0; i < depth.length; i++) if (depth[i] !== 0) cover++;
+  return cover;
 }
 
 /**
@@ -205,15 +214,16 @@ function renderSerial(
   const r = new SoftwareRenderer();
   r.init(fb);
   r.setPalette(b.palette);
-  setRGBWorldEnabled(true);
   try {
     mutate?.(r);
     r.beginFrame();
     r.renderView(spawnView(), b.world, entities);
     r.endFrame();
-    return { full: hashColorFull(r.getFramebuffer().color), cover: r.testRGBStats().coverPixels };
+    const live = r.getFramebuffer();
+    let cover = 0;
+    for (let i = 0; i < live.index!.length; i++) if (live.index![i] !== 0) cover++;
+    return { full: hashColorFull(live.color), cover };
   } finally {
-    setRGBWorldEnabled(false);
     resetCVars();
   }
 }
@@ -229,15 +239,13 @@ describe.runIf(!!Q2_PAK)('fg model/gun serial oracle (worker parity target)', ()
       const r = new SoftwareRenderer();
       r.init(fb);
       r.setPalette(b.palette);
-      setRGBWorldEnabled(true);
       try {
         const ents = sceneEntities(r, b, { gun: true });
         r.beginFrame();
         r.renderView(spawnView(), b.world, ents);
         r.endFrame();
-        return { full: hashColorFull(r.getFramebuffer().color), cover: r.testRGBStats().coverPixels };
+        return { full: hashColorFull(r.getFramebuffer().color), cover: indexCover(r) };
       } finally {
-        setRGBWorldEnabled(false);
         resetCVars();
       }
     };
@@ -255,24 +263,22 @@ describe.runIf(!!Q2_PAK)('fg model/gun serial oracle (worker parity target)', ()
       const fb = createFramebuffer(320, 240, true);
       const r = new SoftwareRenderer();
       r.init(fb); r.setPalette(b.palette);
-      setRGBWorldEnabled(true);
       try {
         const ents = sceneEntities(r, b, { frame: 0 });
         r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
         return hashColorFull(r.getFramebuffer().color);
-      } finally { setRGBWorldEnabled(false); resetCVars(); }
+      } finally { resetCVars(); }
     })();
     const f9 = (() => {
       resetCVars();
       const fb = createFramebuffer(320, 240, true);
       const r = new SoftwareRenderer();
       r.init(fb); r.setPalette(b.palette);
-      setRGBWorldEnabled(true);
       try {
         const ents = sceneEntities(r, b, { frame: 9 });
         r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
         return hashColorFull(r.getFramebuffer().color);
-      } finally { setRGBWorldEnabled(false); resetCVars(); }
+      } finally { resetCVars(); }
     })();
     expect(f9).not.toBe(f0);
   });
@@ -284,7 +290,6 @@ describe.runIf(!!Q2_PAK)('fg model/gun serial oracle (worker parity target)', ()
       const fb = createFramebuffer(320, 240, true);
       const r = new SoftwareRenderer();
       r.init(fb); r.setPalette(b.palette);
-      setRGBWorldEnabled(true);
       try {
         const ents = sceneEntities(r, b, gunFrame === null ? {} : { gun: true });
         if (gunFrame !== null) ents[ents.length - 1]!.frame = gunFrame;
@@ -296,8 +301,8 @@ describe.runIf(!!Q2_PAK)('fg model/gun serial oracle (worker parity target)', ()
           });
         }
         r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
-        return { full: hashColorFull(r.getFramebuffer().color), cover: r.testRGBStats().coverPixels };
-      } finally { setRGBWorldEnabled(false); resetCVars(); }
+        return { full: hashColorFull(r.getFramebuffer().color), cover: indexCover(r) };
+      } finally { resetCVars(); }
     };
     // Gun pose frame 4 changes pixels vs the same scene without the gun
     // (no dlight either way — the difference is the viewmodel alone).
@@ -319,12 +324,11 @@ describe.runIf(!!Q2_PAK)('fg model/gun serial oracle (worker parity target)', ()
       const fb = createFramebuffer(321, 241, true);
       const r = new SoftwareRenderer();
       r.init(fb); r.setPalette(b.palette);
-      setRGBWorldEnabled(true);
       try {
         const ents = sceneEntities(r, b, { gun: true, overlap: true });
         r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
         return hashColorFull(r.getFramebuffer().color);
-      } finally { setRGBWorldEnabled(false); resetCVars(); }
+      } finally { resetCVars(); }
     };
     expect(mkOdd()).toBe(mkOdd());
   });
@@ -344,7 +348,6 @@ describe.runIf(!!Q2_PAK && modelWorkerProtocolAvailable())('fg model/gun worker 
       const fb = createFramebuffer(320, 240, true);
       const r = new SoftwareRenderer();
       r.init(fb); r.setPalette(b.palette);
-      setRGBWorldEnabled(true);
       try {
         const ents = sceneEntities(r, b, { gun: true, overlap: true });
         r.testExpireDynamicLights();
@@ -353,8 +356,8 @@ describe.runIf(!!Q2_PAK && modelWorkerProtocolAvailable())('fg model/gun worker 
           intensity: 250, color: new Float32Array([1, 0.55, 0.15]),
         });
         r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
-        return { full: hashColorFull(r.getFramebuffer().color), cover: r.testRGBStats().coverPixels };
-      } finally { setRGBWorldEnabled(false); resetCVars(); }
+        return { full: hashColorFull(r.getFramebuffer().color), cover: indexCover(r) };
+      } finally { resetCVars(); }
     };
     const ref = serialOf();
     resetCVars();
@@ -368,23 +371,20 @@ describe.runIf(!!Q2_PAK && modelWorkerProtocolAvailable())('fg model/gun worker 
     expect(pool).not.toBeNull();
     r.attachWorkerPool(pool);
     try {
-      setRGBWorldEnabled(true);
-      try {
-        const ents = sceneEntities(r, b, { gun: true, overlap: true });
-        r.testExpireDynamicLights();
-        r.testAddDynamicLight({
-          origin: new Float32Array([SPAWN.origin[0] + 48, SPAWN.origin[1], SPAWN.origin[2] - 20]),
-          intensity: 250, color: new Float32Array([1, 0.55, 0.15]),
-        });
-        r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
-      } finally { setRGBWorldEnabled(false); }
+      const ents = sceneEntities(r, b, { gun: true, overlap: true });
+      r.testExpireDynamicLights();
+      r.testAddDynamicLight({
+        origin: new Float32Array([SPAWN.origin[0] + 48, SPAWN.origin[1], SPAWN.origin[2] - 20]),
+        intensity: 250, color: new Float32Array([1, 0.55, 0.15]),
+      });
+      r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
       expect(hashColorFull(r.getFramebuffer().color)).toBe(ref.full);
-      expect(r.testRGBStats().coverPixels).toBe(ref.cover);
+      expect(indexCover(r)).toBe(ref.cover);
       const stats = readModelWorkerStats(r);
       expect(stats).not.toBeNull();
       expect(stats!.completedTris).toBeGreaterThan(0);
       expect(stats!.kicks).toBeGreaterThan(0);
-      expect(r.testRGBPending()).toBe(0);
+      expect(pool!.accumPending()).toBe(0);
     } finally {
       await pool!.dispose();
       resetCVars();
@@ -400,13 +400,12 @@ describe.runIf(!!Q2_PAK && modelWorkerProtocolAvailable())('fg model/gun worker 
     const sfb = createFramebuffer(W, H, true);
     const s = new SoftwareRenderer();
     s.init(sfb); s.setPalette(b.palette);
-    setRGBWorldEnabled(true);
     let ref = '';
     try {
       const ents = sceneEntities(s, b, { gun: true });
       s.beginFrame(); s.renderView(spawnView(), b.world, ents); s.endFrame();
       ref = hashColorFull(s.getFramebuffer().color);
-    } finally { setRGBWorldEnabled(false); resetCVars(); }
+    } finally { resetCVars(); }
     const fb = createFramebuffer(W, H, true);
     const r = new SoftwareRenderer();
     r.init(fb); r.setPalette(b.palette);
@@ -417,13 +416,10 @@ describe.runIf(!!Q2_PAK && modelWorkerProtocolAvailable())('fg model/gun worker 
     expect(pool).not.toBeNull();
     r.attachWorkerPool(pool);
     try {
-      setRGBWorldEnabled(true);
-      try {
-        const ents = sceneEntities(r, b, { gun: true });
-        r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
-      } finally { setRGBWorldEnabled(false); }
+      const ents = sceneEntities(r, b, { gun: true });
+      r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
       expect(hashColorFull(r.getFramebuffer().color)).toBe(ref);
-      expect(r.testRGBPending()).toBe(0);
+      expect(pool!.accumPending()).toBe(0);
     } finally {
       await pool!.dispose();
       resetCVars();
@@ -438,13 +434,12 @@ describe.runIf(!!Q2_PAK && modelWorkerProtocolAvailable())('fg model/gun worker 
     const sfb = createFramebuffer(320, 240, true);
     const s = new SoftwareRenderer();
     s.init(sfb); s.setPalette(b.palette);
-    setRGBWorldEnabled(true);
     let ref = '';
     try {
       const ents = sceneEntities(s, b, { gun: true, overlap: true });
       s.beginFrame(); s.renderView(spawnView(), b.world, ents); s.endFrame();
       ref = hashColorFull(s.getFramebuffer().color);
-    } finally { setRGBWorldEnabled(false); resetCVars(); }
+    } finally { resetCVars(); }
     const fb = createFramebuffer(320, 240, true);
     const r = new SoftwareRenderer();
     r.init(fb); r.setPalette(b.palette);
@@ -455,13 +450,10 @@ describe.runIf(!!Q2_PAK && modelWorkerProtocolAvailable())('fg model/gun worker 
     expect(pool).not.toBeNull();
     r.attachWorkerPool(pool);
     try {
-      setRGBWorldEnabled(true);
-      try {
-        const ents = sceneEntities(r, b, { gun: true, overlap: true });
-        r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
-      } finally { setRGBWorldEnabled(false); }
+      const ents = sceneEntities(r, b, { gun: true, overlap: true });
+      r.beginFrame(); r.renderView(spawnView(), b.world, ents); r.endFrame();
       expect(hashColorFull(r.getFramebuffer().color)).toBe(ref);
-      expect(r.testRGBPending()).toBe(0);
+      expect(pool!.accumPending()).toBe(0);
       const stats = readModelWorkerStats(r);
       if (stats) expect(stats.kicks).toBe(0);
     } finally {

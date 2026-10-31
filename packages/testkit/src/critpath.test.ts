@@ -5,8 +5,13 @@
 //    rep's segments) — never median-of-medians subtraction.
 // 3. Timebase rule: KickSample.execMs stays null unless measured where the
 //    work ran; message-arrival deltas must never be stored as execMs.
-// 4. collectStageCounters: serial devroom RGB shows used + cover with
-//    staged == kicks == 0 (execution proof reads through public hooks).
+// 4. Serial indexed execution proof (asset-free devroom): the frame is
+//    deterministic across runs, draws cover (nonzero index entries), and
+//    runs unpooled (testWorkerStats: active == pooled == false) —
+//    execution proof reads through public hooks.
+// NOTE (RELEASE-8): the RGB composite retired; staging/skip accounting now
+// lives behind bench-owned readers. This file pins the pure helpers plus
+// the serial indexed proof only.
 import { describe, expect, it } from 'vitest';
 import { createFramebuffer } from '@q2/renderer-api';
 import { resetCVars } from '@q2/config';
@@ -14,17 +19,16 @@ import {
   SoftwareRenderer,
   createDevroom,
   DEVROOM_CAMERA,
-  setRGBWorldEnabled,
 } from '@q2/sw-renderer';
 import {
   bandRanges,
-  collectStageCounters,
   formatBandRanges,
   formatLatency,
   frameSplit,
   summarizeBandExec,
   summarizeLatencies,
 } from './critpath.js';
+import { hashColorFull } from './index.js';
 
 describe('summarizeLatencies', () => {
   it('reports median/p95/max over caller-clock samples', () => {
@@ -76,16 +80,15 @@ describe('bandRanges', () => {
   });
 });
 
-describe('collectStageCounters (asset-free devroom serial RGB)', () => {
-  it('reads execution proof through public hooks: used + cover, staged == kicks == 0', () => {
+describe('serial indexed execution proof (asset-free devroom)', () => {
+  it('renders deterministically with cover, unpooled (public hooks)', () => {
     resetCVars();
     const W = 160, H = 120;
-    const fb = createFramebuffer(W, H, true);
-    const r = new SoftwareRenderer();
-    r.init(fb);
-    r.setPalette(new Uint8Array(768).fill(128));
-    setRGBWorldEnabled(true);
-    try {
+    const renderOnce = (): { full: string; cover: number; pooled: boolean; active: boolean } => {
+      const fb = createFramebuffer(W, H, true);
+      const r = new SoftwareRenderer();
+      r.init(fb);
+      r.setPalette(new Uint8Array(768).fill(128));
       r.beginFrame();
       r.renderView(
         {
@@ -99,15 +102,30 @@ describe('collectStageCounters (asset-free devroom serial RGB)', () => {
         [],
       );
       r.endFrame();
-      const s = collectStageCounters(r);
-      expect(s.rgbUsed).toBe(true);
-      expect(s.coverPixels).toBeGreaterThan(0);
-      expect(s.stagedBatches).toBe(0);
-      expect(s.kicks).toBe(0);
-      expect(s.pending).toBe(0);
-    } finally {
-      setRGBWorldEnabled(false);
-      resetCVars();
-    }
+      const live = r.getFramebuffer();
+      // Cover = depth-written pixels (the depth plane clears to 0;
+      // palette index 0 is a legitimate texel, so the index plane
+      // cannot prove coverage).
+      let cover = 0;
+      const depth = live.depth!;
+      for (let i = 0; i < depth.length; i++) if (depth[i] !== 0) cover++;
+      const wst = r.testWorkerStats();
+      return {
+        full: hashColorFull(live.color),
+        cover,
+        pooled: wst.pooled,
+        active: wst.active,
+      };
+    };
+    const a = renderOnce();
+    const b = renderOnce();
+    // Deterministic across runs with real cover (execution happened).
+    expect(b.full).toBe(a.full);
+    expect(a.cover).toBeGreaterThan(0);
+    expect(b.cover).toBe(a.cover);
+    // Serial: no banded backend, nothing pooled.
+    expect(a.pooled).toBe(false);
+    expect(a.active).toBe(false);
+    resetCVars();
   });
 });

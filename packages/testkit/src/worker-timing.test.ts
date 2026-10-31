@@ -22,8 +22,6 @@ import {
   SW_WORKERS_CVAR,
   createDevroom,
   DEVROOM_CAMERA,
-  setRGBWorldEnabled,
-  type ScanoutBandOptions,
 } from '@q2/sw-renderer';
 import {
   KickJournal,
@@ -100,23 +98,18 @@ describe('collectWorkerExec (renderer in-worker timestamps)', () => {
     const r = new SoftwareRenderer();
     r.init(fb);
     r.setPalette(new Uint8Array(768).fill(128));
-    setRGBWorldEnabled(true);
-    try {
-      r.beginFrame();
-      r.renderView(
-        {
-          origin: DEVROOM_CAMERA.origin, angles: DEVROOM_CAMERA.angles,
-          fovX: DEVROOM_CAMERA.fovX, time: 1.5, lightStyles: new Float32Array(256).fill(1),
-        },
-        { name: 'devroom', data: createDevroom() },
-        [],
-      );
-      r.endFrame();
-      expect(collectWorkerExec(r)).toBeNull();
-    } finally {
-      setRGBWorldEnabled(false);
-      resetCVars();
-    }
+    r.beginFrame();
+    r.renderView(
+      {
+        origin: DEVROOM_CAMERA.origin, angles: DEVROOM_CAMERA.angles,
+        fovX: DEVROOM_CAMERA.fovX, time: 1.5, lightStyles: new Float32Array(256).fill(1),
+      },
+      { name: 'devroom', data: createDevroom() },
+      [],
+    );
+    r.endFrame();
+    resetCVars();
+    expect(collectWorkerExec(r)).toBeNull();
   });
 
   it('rejects malformed samples instead of laundering them', () => {
@@ -149,36 +142,31 @@ describe('caller dispatch-to-completion on a real frame', () => {
     const r = new SoftwareRenderer();
     r.init(fb);
     r.setPalette(new Uint8Array(768).fill(128));
-    setRGBWorldEnabled(true);
-    try {
-      const journal = new KickJournal();
-      const tF = nowNs();
-      r.beginFrame();
-      r.renderView(
-        {
-          origin: DEVROOM_CAMERA.origin, angles: DEVROOM_CAMERA.angles,
-          fovX: DEVROOM_CAMERA.fovX, time: 1.5, lightStyles: new Float32Array(256).fill(1),
-        },
-        { name: 'devroom', data: createDevroom() },
-        [],
-      );
-      r.endFrame();
-      const frameMs = nsToMs(nowNs() - tF);
-      journal.record({
-        frame: 0, seq: 0, job: 'indexed-frame', workers: 0, band: 'all',
-        y0: 0, y1: H, latencyMs: frameMs, ok: true, execMs: null,
-        pixels: W * H, spans: r.testTranslucentSpans(),
-      });
-      const s = journal.summarize('indexed-frame');
-      expect(s.n).toBe(1);
-      expect(s.max).toBe(frameMs);
-      // The serial frame ran on the caller — but this record fenced the
-      // whole frame, not one band's compute, so no per-band exec claim.
-      expect(journal.entries()[0]!.execMs).toBeNull();
-    } finally {
-      setRGBWorldEnabled(false);
-      resetCVars();
-    }
+    const journal = new KickJournal();
+    const tF = nowNs();
+    r.beginFrame();
+    r.renderView(
+      {
+        origin: DEVROOM_CAMERA.origin, angles: DEVROOM_CAMERA.angles,
+        fovX: DEVROOM_CAMERA.fovX, time: 1.5, lightStyles: new Float32Array(256).fill(1),
+      },
+      { name: 'devroom', data: createDevroom() },
+      [],
+    );
+    r.endFrame();
+    const frameMs = nsToMs(nowNs() - tF);
+    journal.record({
+      frame: 0, seq: 0, job: 'indexed-frame', workers: 0, band: 'all',
+      y0: 0, y1: H, latencyMs: frameMs, ok: true, execMs: null,
+      pixels: W * H, spans: r.testTranslucentSpans(),
+    });
+    const s = journal.summarize('indexed-frame');
+    expect(s.n).toBe(1);
+    expect(s.max).toBe(frameMs);
+    // The serial frame ran on the caller — but this record fenced the
+    // whole frame, not one band's compute, so no per-band exec claim.
+    expect(journal.entries()[0]!.execMs).toBeNull();
+    resetCVars();
   });
 });
 
@@ -257,7 +245,7 @@ describe('summarizeWorkerImbalance (PERF-NEXT-6 straggler input)', () => {
 });
 
 describe('real built Node worker (PERF-NEXT-4 integration)', () => {
-  it('executes a real scanout band in a real worker thread with measured execMs + identity', async () => {
+  it('executes a real indexed resolve band in a real worker thread with measured execMs + identity', async () => {
     const esm = swRendererEsmPath();
     if (!esm) {
       console.log('SKIP real-worker exec: sw-renderer dist not built (run yarn build first)');
@@ -265,27 +253,28 @@ describe('real built Node worker (PERF-NEXT-4 integration)', () => {
     }
     const W = 320, H = 240, y0 = 120, y1 = 240;
     const frame = 7, seq = 3, band = 1;
-    // The worker imports the REAL built bundle and runs the REAL scanout
-    // band kernel over a real buffer, timing the job where it runs. No
-    // synthetic durations: execMs is an hrtime delta around actual work.
+    // The worker imports the REAL built bundle and runs the REAL indexed
+    // resolve band kernel (palette expand over a real index plane),
+    // timing the job where it runs. No synthetic durations: execMs is an
+    // hrtime delta around actual work.
     const src = `
       const { parentPort, workerData } = require('node:worker_threads');
       import(workerData.esm).then((m) => {
         const W = workerData.W, H = workerData.H;
-        const src = new Uint32Array(W * H);
-        for (let i = 0; i < src.length; i++) {
-          src[i] = (0xff000000 | (i & 255) | (((i >> 2) & 255) << 8) | (((i >> 4) & 255) << 16)) >>> 0;
+        const idx = new Uint8Array(W * H);
+        for (let i = 0; i < idx.length; i++) idx[i] = (i * 7 + (i >> 8)) & 255;
+        const pal = new Uint8Array(768);
+        for (let i = 0; i < 256; i++) {
+          pal[i * 3] = (i * 5) & 255; pal[i * 3 + 1] = (i * 3 + 40) & 255; pal[i * 3 + 2] = (i * 2 + 80) & 255;
         }
-        const dst565 = new Uint16Array(W * H);
-        const disp = new Uint32Array(W * H);
-        const opts = { gamma: 1.3, dither: true, ditherMode: 0, postfilter: true, reconmode: 1, maxR: 8, maxG: 8, maxB: 8, quantise: true };
-        m.processScanoutBand(src, dst565, disp, W, H, opts, workerData.y0, workerData.y1);
+        const color = new Uint32Array(W * H);
+        m.resolveBand(color, pal, idx, workerData.y0, workerData.y1, W, H);
         const t0 = process.hrtime.bigint();
-        m.processScanoutBand(src, dst565, disp, W, H, opts, workerData.y0, workerData.y1);
+        m.resolveBand(color, pal, idx, workerData.y0, workerData.y1, W, H);
         const execMs = Number(process.hrtime.bigint() - t0) / 1e6;
         let h = 2166136261;
-        for (let i = 0; i < disp.length; i++) {
-          const px = disp[i];
+        for (let i = 0; i < color.length; i++) {
+          const px = color[i];
           h ^= px & 255; h = Math.imul(h, 16777619);
           h ^= (px >>> 8) & 255; h = Math.imul(h, 16777619);
           h ^= (px >>> 16) & 255; h = Math.imul(h, 16777619);
@@ -293,7 +282,7 @@ describe('real built Node worker (PERF-NEXT-4 integration)', () => {
         }
         parentPort.postMessage({
           seq: workerData.seq, band: workerData.band, frame: workerData.frame,
-          job: 'scanout', y0: workerData.y0, y1: workerData.y1,
+          job: 'resolve', y0: workerData.y0, y1: workerData.y1,
           pixels: W * (workerData.y1 - workerData.y0), spans: 0, execMs,
           hash: (h >>> 0).toString(16).padStart(8, '0'),
         });
@@ -314,33 +303,31 @@ describe('real built Node worker (PERF-NEXT-4 integration)', () => {
       // Correct identity: the exact frame/seq/job/band the kick dispatched.
       const c = readCompletionMessage(msg);
       expect(c).not.toBeNull();
-      expect(c).toMatchObject({ seq, band, frame, job: 'scanout', y0, y1, pixels: W * (y1 - y0), spans: 0 });
+      expect(c).toMatchObject({ seq, band, frame, job: 'indexed-resolve', y0, y1, pixels: W * (y1 - y0), spans: 0 });
       // Finite measured duration for the executed job — not null, not
       // synthetic: an hrtime delta around the real kernel in the worker.
       expect(c!.execMs).not.toBeNull();
       expect(Number.isFinite(c!.execMs!)).toBe(true);
       expect(c!.execMs!).toBeGreaterThanOrEqual(0);
-      // Real work proof: the worker's display hash matches the same kernel
+      // Real work proof: the worker's color hash matches the same kernel
       // run serially on the caller over identical inputs.
       const esmMod = await import(esm) as {
-        processScanoutBand(
-          src: Uint32Array, dst565: Uint16Array, display: Uint32Array,
-          w: number, h: number, o: ScanoutBandOptions, y0: number, y1: number,
+        resolveBand(
+          color: Uint32Array, pal: Uint8Array, idx: Uint8Array,
+          y0: number, y1: number, w: number, h: number,
         ): void;
       };
-      const s2 = new Uint32Array(W * H);
-      for (let i = 0; i < s2.length; i++) {
-        s2[i] = (0xff000000 | (i & 255) | (((i >> 2) & 255) << 8) | (((i >> 4) & 255) << 16)) >>> 0;
+      const s2 = new Uint8Array(W * H);
+      for (let i = 0; i < s2.length; i++) s2[i] = (i * 7 + (i >> 8)) & 255;
+      const pal2 = new Uint8Array(768);
+      for (let i = 0; i < 256; i++) {
+        pal2[i * 3] = (i * 5) & 255; pal2[i * 3 + 1] = (i * 3 + 40) & 255; pal2[i * 3 + 2] = (i * 2 + 80) & 255;
       }
-      const d565 = new Uint16Array(W * H), dd = new Uint32Array(W * H);
-      esmMod.processScanoutBand(
-        s2, d565, dd, W, H,
-        { gamma: 1.3, dither: true, ditherMode: 0, postfilter: true, reconmode: 1, maxR: 8, maxG: 8, maxB: 8, quantise: true },
-        y0, y1,
-      );
+      const cc = new Uint32Array(W * H);
+      esmMod.resolveBand(cc, pal2, s2, y0, y1, W, H);
       let h = 2166136261;
-      for (let i = 0; i < dd.length; i++) {
-        const px = dd[i]!;
+      for (let i = 0; i < cc.length; i++) {
+        const px = cc[i]!;
         h ^= px & 255; h = Math.imul(h, 16777619);
         h ^= (px >>> 8) & 255; h = Math.imul(h, 16777619);
         h ^= (px >>> 16) & 255; h = Math.imul(h, 16777619);
@@ -350,7 +337,7 @@ describe('real built Node worker (PERF-NEXT-4 integration)', () => {
       // And the measured sample flows through the consumer validator.
       const samples = collectWorkerExec({
         testBandExecStats: () => ([{
-          frame, seq, job: 'scanout', worker: band, band, y0, y1,
+          frame, seq, job: 'resolve', worker: band, band, y0, y1,
           execMs: c!.execMs!, pixels: c!.pixels, spans: c!.spans,
         }]),
       });
@@ -388,32 +375,29 @@ describe('real built Node worker (PERF-NEXT-4 integration)', () => {
     }
     r.attachWorkerPool(pool);
     try {
-      setRGBWorldEnabled(true);
       const view = {
         origin: DEVROOM_CAMERA.origin, angles: DEVROOM_CAMERA.angles,
         fovX: DEVROOM_CAMERA.fovX, time: 1.5, lightStyles: new Float32Array(256).fill(1),
       };
+      const journal = new KickJournal();
+      const t0 = nowNs();
       r.beginFrame();
       r.renderView(view, { name: 'devroom', data: createDevroom() }, []);
       r.endFrame();
-      const opts: ScanoutBandOptions = {
-        gamma: 1.3, dither: true, ditherMode: 0, postfilter: true,
-        reconmode: 1, maxR: 8, maxG: 8, maxB: 8, quantise: true,
-      };
-      const journal = new KickJournal();
-      const t0 = nowNs();
-      const ok = pool.flushScanout(opts);
       const latencyMs = nsToMs(nowNs() - t0);
       // Real pooled execution proof through public hooks (staging, not
-      // message arrival): the kick covered worker bands and completed.
-      expect(ok).toBe(true);
+      // message arrival): the indexed raster kick drew spans/pixels.
+      const wst = r.testWorkerStats();
+      expect(wst.active).toBe(true);
+      expect(wst.pooled).toBe(true);
+      expect(wst.spans).toBeGreaterThan(0);
+      expect(wst.pixels).toBeGreaterThan(0);
       expect(Number.isFinite(latencyMs)).toBe(true);
-      expect(r.testRGBWorkerStats().kicks).toBeGreaterThan(0);
       journal.record({
-        frame: 0, seq: 0, job: 'scanout', workers: 1, band: 'all',
-        y0: 0, y1: H, latencyMs, ok, execMs: null, pixels: W * H, spans: 0,
+        frame: 0, seq: 0, job: 'indexed-frame', workers: 1, band: 'all',
+        y0: 0, y1: H, latencyMs, ok: true, execMs: null, pixels: W * H, spans: wst.spans,
       });
-      expect(journal.summarize('scanout').n).toBe(1);
+      expect(journal.summarize('indexed-frame').n).toBe(1);
       expect(journal.bandsSeen()).toEqual([{ band: 'all', y0: 0, y1: H }]);
       // Worker-local exec: the renderer lane owns the producer. When it
       // publishes, every sample must carry finite durations + identity;
@@ -436,7 +420,6 @@ describe('real built Node worker (PERF-NEXT-4 integration)', () => {
       if (gcMs !== null) expect(gcMs).toBeGreaterThanOrEqual(0);
     } finally {
       await pool.dispose();
-      setRGBWorldEnabled(false);
       resetCVars();
     }
   });
