@@ -888,8 +888,9 @@ defineQ2Elements();
  * Capability source of truth is `@q2/config` (`RENDERER_CVAR_SUPPORT` +
  * `isCVarSupportedBy`/`supportReason`, audited against real consumers box 1):
  * every control the EFFECTIVE renderer cannot honor renders DISABLED (never
- * hidden) with the support reason as its visible + screen-reader explanation.
- * Keyed on the effective renderer INCLUDING fallback (failed-GPU requests run
+ * hidden) with the support reason as its tooltip + screen-reader explanation
+ * (no visible reason text — RELEASE-10 tooltip-only). Keyed on the effective
+ * renderer INCLUDING fallback (failed-GPU requests run
  * the software path, so they use the software mapping — never stale GPU
  * labels). Saved values are retained: disabling never resets a cvar, so the
  * value is live again when its renderer returns. Shared cvars (HUD, boot,
@@ -914,10 +915,14 @@ export function effectivePanelRenderer(active?: string | null): EffectiveRendere
 
 /**
  * Disable one panel control with its capability reason: a real `disabled`
- * attribute (focusable-read, not operable) + `aria-label` carrying the
- * reason for screen readers + extended tooltip. Returns the full tooltip
- * text (also applied to the row/label by the caller). Headless-safe: fake
- * nodes get the expando + a recorded attribute. Never throws.
+ * attribute (not operable) + `aria-label` carrying the reason for screen
+ * readers + extended tooltip on the WRAPPER (the q2-* custom element, which
+ * still receives hover/focus — the disabled native input inside does not) +
+ * `tabindex="0"` so keyboard users can focus the wrapper and read the reason
+ * + `aria-disabled="true"`. Tooltip-only: no visible reason text is added
+ * (RELEASE-10). Returns the full tooltip text (also applied to the row/label
+ * by the caller). Headless-safe: fake nodes get the expando + recorded
+ * attributes. Never throws.
  */
 function disablePanelControl(
   control: unknown,
@@ -945,6 +950,15 @@ function disablePanelControl(
     } catch { /* fake node: expando below covers it */ }
     (control as Record<string, unknown>)['ariaLabel'] = label;
     el.title = full;
+    // Wrapper path: the disabled native input inside cannot receive
+    // hover/focus, so the wrapper itself must be keyboard-focusable.
+    try {
+      el.setAttribute?.('tabindex', '0');
+    } catch { /* fake node: expando below covers it */ }
+    (control as Record<string, unknown>)['tabIndex'] = 0;
+    try {
+      el.setAttribute?.('aria-disabled', 'true');
+    } catch { /* non-critical affordance */ }
   } catch {
     /* non-object stub: row/label tooltips still carry the reason */
   }
@@ -1001,7 +1015,8 @@ function renderCvarRow(
   const row = document.createElement('q2-cvar-row');
   row.className = 'q2-cvar-row';
   // Capability gate: unsupported controls are DISABLED (never hidden, never
-  // reset) with the support reason as the visible + screen-reader note.
+  // reset) with the support reason as the tooltip + screen-reader note
+  // (tooltip-only — no visible reason text, so row geometry never shifts).
   const supported = isCVarSupportedBy(name, effective);
   const reason = supported ? null : supportReason(name, effective);
   // On-hover description for the row (tooltip source: the cvar registry
@@ -1021,14 +1036,13 @@ function renderCvarRow(
   const options = cvarOptions(name);
   const current = getCVarString(name);
   // Disabled rows keep their saved value on the control (retained for when
-  // the renderer supports them again) and gain a visible reason note.
+  // the renderer supports them again). Tooltip-only: the reason lives in the
+  // row/label/control-wrapper tooltips + the wrapper's accessible
+  // description — no visible `q2-cvar-why` node is appended, so disabled rows
+  // keep exactly the enabled row's geometry.
   const noteDisabled = (control: unknown): void => {
     if (reason === null) return;
     disablePanelControl(control, name, effective, reason);
-    const why = document.createElement('span');
-    why.className = 'q2-cvar-why';
-    why.textContent = `Disabled on ${effective}: ${reason}`;
-    row.appendChild(why);
   };
   // A disabled control is not operable: real DOM never fires `change` on it;
   // the guard below makes headless dispatches match (no-ops, never clobber).

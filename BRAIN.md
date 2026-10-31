@@ -335,12 +335,12 @@ done-when:
 ### RELEASE-10 — Tooltip-only disabled explanations; matching checkbox styling
 owns: `apps/web`
 depends: none
-status: ready (reopened)
+status: done (repaired 2026-10-31; see docs/tasks-archive.md RELEASE-10 repair entry)
 review-finding: `renderCvarRow: noteDisabled` appends a visible `q2-cvar-why` span even though the row/control already has the full reason in its title.
 done-when:
-- [ ] Remove visible reason paragraphs; put explanations in hover/focus-accessible tooltips on the control/label or wrapper, with an accessible description. Disabled native inputs may not receive focus/hover events, so verify the wrapper path.
-- [ ] Keep disabled checkbox geometry, custom styling, alignment and size identical to enabled checkboxes; only disabled affordance/interaction changes. Preserve renderer capability decisions, saved values and switch/fallback updates.
-- [ ] Check the real sidebar on both renderers at representative viewport sizes, mouse and keyboard; no layout shift or duplicated visible explanation text.
+- [x] Remove visible reason paragraphs; put explanations in hover/focus-accessible tooltips on the control/label or wrapper, with an accessible description. Disabled native inputs may not receive focus/hover events, so verify the wrapper path.
+- [x] Keep disabled checkbox geometry, custom styling, alignment and size identical to enabled checkboxes; only disabled affordance/interaction changes. Preserve renderer capability decisions, saved values and switch/fallback updates.
+- [x] Check the real sidebar on both renderers at representative viewport sizes, mouse and keyboard; no layout shift or duplicated visible explanation text.
 
 ### RELEASE-13 — Dying-enemy collision, death variety and soldier patrols
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`

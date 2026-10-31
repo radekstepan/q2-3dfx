@@ -1,7 +1,7 @@
 // RELEASE-10 apps/web lane (boxes 2–3): the settings panel disables controls
 // unsupported by the EFFECTIVE renderer (never hides, never resets), with the
-// support reason as the visible + screen-reader explanation, and refreshes on
-// switch/fallback/restore. Headless: real panel enablement is pinned via a
+// support reason as the tooltip + screen-reader explanation (tooltip-only: no
+// visible reason text), and refreshes on switch/fallback/restore. Headless: real panel enablement is pinned via a
 // fake DOM around `renderCvarPanel` (same pattern as pos.test.ts); GPU-live
 // legs stay browser-gated, so the webgl2 mapping is exercised through the
 // explicit `active` override plus the live failed-GPU fallback path.
@@ -153,18 +153,25 @@ function expectMatrix(active: 'software' | 'webgl2-experimental'): void {
     expect(control.disabled, `${name} disabled on ${active}`).toBe(!expected);
     if (expected) {
       expect(control.getAttribute('disabled'), `${name} has no disabled attribute`).toBeNull();
+      expect(control.getAttribute('tabindex'), `${name} has no wrapper tab stop`).toBeNull();
       expect(row.children.some((c) => c.className === 'q2-cvar-why')).toBe(false);
     } else {
-      // Real `disabled` attribute + visible reason + screen-reader label.
+      // Real `disabled` attribute + tooltip-only reason (no visible text) +
+      // screen-reader label + keyboard-focusable wrapper (tabindex) for the
+      // wrapper path (disabled native inputs take no hover/focus).
       expect(control.getAttribute('disabled'), `${name} carries real disabled`).toBe('');
       const reason = supportReason(name, active);
       expect(reason.length).toBeGreaterThan(0);
-      const why = row.children.find((c) => c.className === 'q2-cvar-why');
-      expect(why, `${name} shows a visible reason`).toBeDefined();
-      expect(why!.textContent).toContain(reason);
-      expect((control as unknown as { ariaLabel?: string }).ariaLabel ?? '').toContain(reason);
+      expect(row.children.some((c) => c.className === 'q2-cvar-why'), `${name} has no visible reason text`).toBe(false);
       expect(control.title).toContain(reason);
       expect(row.title).toContain(reason);
+      // Row child count is identical to the enabled shape (label + control —
+      // no extra visible note node, so no layout shift).
+      expect(row.children).toHaveLength(2);
+      expect((control as unknown as { ariaLabel?: string }).ariaLabel ?? '').toContain(reason);
+      expect(control.getAttribute('aria-label') ?? '').toContain(reason);
+      expect(control.getAttribute('tabindex'), `${name} wrapper is keyboard-focusable`).toBe('0');
+      expect(control.getAttribute('aria-disabled'), `${name} exposes aria-disabled`).toBe('true');
     }
   }
   // The mapping agrees with the config source of truth on every row.
@@ -367,17 +374,49 @@ describe('RELEASE-10 panel fallback refresh + value retention', () => {
       expect(enabled.control.disabled).toBe(false);
       expect(enabled.control.getAttribute('disabled')).toBeNull();
       expect(enabled.row.children.some((c) => c.className === 'q2-cvar-why')).toBe(false);
-      // Switch back: disabled again with a fresh reason (no duplication).
+      // Switch back: disabled again with a fresh tooltip reason (no visible
+      // text, no duplication — row keeps the 2-child label+control shape).
       rendered = renderFor('software');
       const back = findRow(rendered.container, 'vd_dither');
       expect(back.control.disabled).toBe(true);
-      expect(back.row.children.filter((c) => c.className === 'q2-cvar-why')).toHaveLength(1);
+      expect(back.row.children.filter((c) => c.className === 'q2-cvar-why')).toHaveLength(0);
+      expect(back.row.children).toHaveLength(2);
+      expect(back.control.title).toContain(supportReason('vd_dither', 'software'));
+      expect(back.control.getAttribute('tabindex')).toBe('0');
       // rebootPlay preserves the mapping (renderer unchanged headless).
       const boot = bootPlay({ width: 64, height: 64 });
       const next = rebootPlay(boot);
       expect(next.renderer).toBe(boot.renderer);
       rendered = renderFor(next.renderer);
       expect(findRow(rendered.container, 'vd_dither').control.disabled).toBe(true);
+    } finally {
+      (globalThis as unknown as { document?: unknown }).document = prev;
+    }
+  });
+
+  it('disabled checkbox rows keep the enabled row geometry (label + control only)', () => {
+    const { prev } = install();
+    try {
+      resetCVars();
+      ensurePanelCvars();
+      // vd_dither is a checkbox disabled on software; cl_predict is a checkbox
+      // enabled on software — both must share the same row shape.
+      expect(cvarIsCheckbox('vd_dither')).toBe(true);
+      expect(cvarIsCheckbox('cl_predict')).toBe(true);
+      const { container } = renderFor('software');
+      const off = findRow(container, 'vd_dither');
+      const on = findRow(container, 'cl_predict');
+      expect(off.control.disabled).toBe(true);
+      expect(on.control.disabled).toBe(false);
+      for (const [which, found] of [['disabled', off], ['enabled', on]] as const) {
+        expect(found.row.children, `${which} row shape`).toHaveLength(2);
+        expect(found.row.children[0]?.textContent).toBe(found === off ? 'vd_dither' : 'cl_predict');
+        expect(found.control.tag, `${which} control kind`).toBe('q2-checkbox');
+        expect(found.row.children.some((c) => c.className === 'q2-cvar-why'), `${which} has no visible note`).toBe(false);
+      }
+      // Same saved-value display contract on both sides.
+      expect(typeof off.control.checked).toBe('boolean');
+      expect(typeof on.control.checked).toBe('boolean');
     } finally {
       (globalThis as unknown as { document?: unknown }).document = prev;
     }

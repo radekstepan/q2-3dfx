@@ -70,9 +70,18 @@ q2-cvar-row:hover{background:rgba(255,255,255,.015)}
 q2-cvar-row label{width:132px;flex:none;font-family:var(--font-mono);font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:default}
 q2-checkbox,q2-select,q2-text{display:inline-flex;flex:1;min-width:0}
 q2-checkbox input[type=checkbox]{width:16px;height:16px;accent-color:var(--amber);cursor:pointer}
+/* RELEASE-10 tooltip-only disabled affordance: interaction/cursor + opacity
+ * only — geometry, size, alignment and custom styling stay identical to
+ * enabled (no padding/margin/width/height/border changes, so no layout shift). */
+q2-checkbox[disabled],q2-select[disabled],q2-text[disabled]{cursor:not-allowed;opacity:.55}
+q2-checkbox[disabled] input,q2-select[disabled] select,q2-text[disabled] input{cursor:not-allowed}
 q2-select select,q2-text input{flex:1;min-width:0;font:11px var(--font-mono);background:var(--void);color:var(--bone);border:1px solid var(--line);padding:5px 8px}
 q2-select select:hover,q2-text input:hover{border-color:var(--linehi)}
 q2-select select:focus-visible,q2-text input:focus-visible,q2-checkbox input:focus-visible{outline:1px solid var(--amber);outline-offset:1px}
+/* RELEASE-10: disabled wrappers are keyboard-focusable (tabindex=0 — the
+ * disabled native input inside cannot take focus), so they need the same
+ * focus ring when focused directly. */
+q2-checkbox:focus-visible,q2-select:focus-visible,q2-text:focus-visible{outline:1px solid var(--amber);outline-offset:1px}
 #q2-ui button.silkbtn{background:none;border:0;cursor:pointer}
 :focus-visible{outline:1px solid var(--amber);outline-offset:1px}
 @media(min-width:1024px){
