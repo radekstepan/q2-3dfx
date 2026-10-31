@@ -79,7 +79,7 @@ describe('RELEASE-7 sim-preserving resize (asset-free)', () => {
     expect(boot.host.fb.width).toBe(640);
     expect(boot.host.fb.height).toBe(480);
     expect(boot.display.length).toBe(640 * 480);
-    expect(boot.fb565.length).toBe(640 * 480);
+    expect(boot.display.length).toBe(640 * 480);
     expect(boot.host.resizeCount).toBe(resizes + 1);
     const after = simFingerprint(boot);
     expect(after.serverTime).toBe(before.serverTime);
@@ -156,9 +156,9 @@ describe('RELEASE-7 sim-preserving resize (asset-free)', () => {
   it('renderer hot-swap preserves the sim across repeated switches', () => {
     const boot = bootPlay({ width: 320, height: 240 });
     stepFrames(boot, 3);
-    setCVar('vid_renderer', 'voodoo');
+    setCVar('vid_renderer', 'software');
     const host = boot.host;
-    expect(applyRendererCvar(boot)).toBe('voodoo');
+    expect(applyRendererCvar(boot)).toBe('software');
     expect(boot.host).toBe(host);
     setCVar('vid_renderer', 'software');
     expect(applyRendererCvar(boot)).toBe('software');
@@ -360,7 +360,8 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-7 sim-preserving resize (real pak, Q2_PAK)
     expect(resizePlay(boot, 1024, 768)).toBe(true);
     expect(boot.driver.playerHealth).toBe(hp);
     setCVar('vid_renderer', 'voodoo');
-    expect(applyRendererCvar(boot)).toBe('voodoo');
+    // RELEASE-8: retired `voodoo` migrates to software WITH a warning.
+    expect(applyRendererCvar(boot)).toBe('software');
     expect(boot.driver.playerHealth).toBe(hp);
     expect(resizePlay(boot, 640, 480)).toBe(true);
     expect(boot.driver.playerHealth).toBe(hp);

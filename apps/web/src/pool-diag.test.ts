@@ -1,19 +1,15 @@
-// Production-loop worker diagnostics (item 9, apps/web lane).
+// Production-loop worker diagnostics (item 9, apps/web lane, RELEASE-8).
 //
 // Shell-level pins for the pooled production path (frameAsync +
-// resolveDisplayAsync), complementing the renderer-level parity in
-// @q2/sw-renderer (renderAsync/rgbWorkers/scanoutPool tests):
+// resolveDisplay), complementing the renderer-level parity in
+// @q2/sw-renderer:
 //  - publishQ2Stats shape + never-throws (the window.__q2stats contract
 //    soaks and CDP probes read).
-//  - pooled scanout kick accounting (statScanoutKicks) and kick-failure
-//    fallback accounting (statScanoutFallbacks): fallbacks are counted,
-//    never silent, and converge to serial-identical pixels.
-//  - odd-dimension pooled scanout parity.
-//  - renderer switching with a pool attached (no stale frame).
-//  - Q2_PAK-gated base1 frameAsync-vs-sync parity WITH RGB workers engaged
-//    (staged/kicks prove the workers executed in the production async path,
-//    not just that sw_workers was nonzero).
-//  - long-run cache ownership: steady kicks, zero fallbacks, sane output.
+//  - pooled indexed-raster engagement: frameAsync through an attached pool
+//    matches the sync sim+resolve pixels, and the stats report pooled.
+//  - renderer switching zeroes the shell scratch display.
+//  - Q2_PAK-gated base1 frameAsync-vs-sync parity with the pool attached.
+//  - long-run pool stability: 60 frames, real pixels, zero async fallbacks.
 import { describe, expect, it, afterEach } from 'vitest';
 import { getCVarNumber, resetCVars, setCVar, setCVarFromString } from '@q2/config';
 import { BandWorkerPool } from '@q2/sw-renderer';
@@ -26,7 +22,6 @@ import {
   pumpMuzzleLight,
   pumpTracers,
   resolveDisplay,
-  resolveDisplayAsync,
   type PlayBoot,
 } from './play.js';
 import { publishQ2Stats, type Q2Stats } from './dom.js';
@@ -62,22 +57,7 @@ afterEach(() => {
   resetCVars();
 });
 
-/** Smooth gradient stressing dither phase (never flat-field trivial). */
-function paintLive(boot: PlayBoot): void {
-  const w = boot.host.fb.width;
-  const h = boot.host.fb.height;
-  const live = boot.refresh.getFramebuffer().color;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const r = Math.round((x * 255) / Math.max(1, w - 1));
-      const g = Math.round((y * 255) / Math.max(1, h - 1));
-      const b = Math.round(((x + y) * 255) / Math.max(1, w + h - 2));
-      live[y * w + x] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
-    }
-  }
-}
-
-/** Attach a Node worker pool as this boot's browserPool (Track A stand-in). */
+/** Attach a Node worker pool as this boot's browserPool (pool stand-in). */
 function attachNodePool(boot: PlayBoot, workers: number): BandWorkerPool {
   const w = boot.host.fb.width;
   const h = boot.host.fb.height;
@@ -85,9 +65,6 @@ function attachNodePool(boot: PlayBoot, workers: number): BandWorkerPool {
   if (!pool) throw new Error('pool unavailable (need worker_threads + SAB)');
   boot.refresh.attachWorkerPool(pool as unknown as never);
   (boot as unknown as Record<string, unknown>).browserPool = pool;
-  const sp = pool.scanoutPlanes;
-  boot.fb565 = sp.scan565;
-  boot.display = sp.scanDisplay;
   return pool;
 }
 
@@ -101,26 +78,17 @@ describe('publishQ2Stats (window.__q2stats contract)', () => {
     expect(s.fps).toBe(60);
     expect(s.frame).toBe(7);
     expect(s.pooled).toBe(false);
-    expect(s.rgbStaged).toBe(0);
-    expect(s.rgbKicks).toBe(0);
-    expect(s.rgbInline).toBe(0);
-    expect(s.voodooPath).toBe('none');
-    expect(s.resolveOrder).toBe('none');
-    expect(s.scanoutKicks).toBe(0);
-    expect(s.scanoutFallbacks).toBe(0);
-    expect(s.asyncFallbacks).toBe(0);
-    // Foreground worker fields: sync software boot stages no foreground
-    // (hook present, healthy zeros), no pool — never guesses.
-    expect(s.fgStaged).toBe(0);
-    expect(s.fgWorker).toBe(0);
-    expect(s.fgInlineRgb).toBe(0);
-    expect(s.fgKicks).toBe(0);
-    expect(s.rgbFallbacks).toBe(0);
+    expect(s.bands).toBe(1);
+    expect(s.poolSpans).toBe(0);
+    expect(s.poolPixels).toBe(0);
+    expect(s.stageBytes).toBe(-1);
+    expect(s.rasterFallbacks).toBe(0);
     expect(s.quarantined).toBe(false);
-    // Skip-hook fields: software boot never arms the skip (zeros), and the
-    // hook-absent fallback is identical (older renderer safe).
-    expect(s.classicSkipped).toBe(0);
-    expect(s.skipArmed).toBe(false);
+    expect(s.lastKickJob).toBe('none');
+    expect(s.rasterSlowestMs).toBe(-1);
+    expect(s.resolveSlowestMs).toBe(-1);
+    expect(s.resolveOrder).toBe('none');
+    expect(s.asyncFallbacks).toBe(0);
     // After one software resolve the path records the passthrough branch.
     resolveDisplay(boot);
     expect(publishQ2Stats(boot, 60, 7).resolveOrder).toBe('software-passthrough');
@@ -134,28 +102,6 @@ describe('publishQ2Stats (window.__q2stats contract)', () => {
     expect((globalThis as unknown as { __q2stats?: Q2Stats }).__q2stats!.frame).toBe(8);
   });
 
-  it('reflects voodoo resolve path + scanout counters after a pooled kick', async () => {
-    sandbox();
-    setCVarFromString('vid_renderer', 'voodoo');
-    setCVar('sw_workers', 4);
-    const boot = bootPlay({ width: 64, height: 48 });
-    const pool = attachNodePool(boot, 3);
-    try {
-      paintLive(boot);
-      await resolveDisplayAsync(boot);
-      expect(boot.lastVoodooPath).toBe('worker');
-      expect(boot.statScanoutKicks).toBe(1);
-      const s = publishQ2Stats(boot, 60, 1);
-      expect(s.pooled).toBe(true);
-      expect(s.voodooPath).toBe('worker');
-      expect(s.resolveOrder).toBe('strict-hud-first');
-      expect(s.scanoutKicks).toBe(1);
-      expect(s.scanoutFallbacks).toBe(0);
-    } finally {
-      await pool.dispose();
-    }
-  });
-
   it('never throws when renderer stat hooks throw (production present path safe)', () => {
     sandbox();
     const boot = bootPlay({ width: 32, height: 24 });
@@ -165,123 +111,60 @@ describe('publishQ2Stats (window.__q2stats contract)', () => {
     };
     const s = publishQ2Stats(boot, 60, 3);
     expect(s.pooled).toBe(false);
-    expect(s.rgbStaged).toBe(0);
-    expect(s.rgbKicks).toBe(0);
-    expect(s.rgbInline).toBe(0);
-    expect(s.voodooPath).toBe(boot.lastVoodooPath);
-    expect(s.scanoutKicks).toBe(boot.statScanoutKicks);
+    expect(s.bands).toBe(1);
+    expect(s.poolSpans).toBe(0);
+    expect(s.poolPixels).toBe(0);
+    expect(s.resolveOrder).toBe(boot.lastResolveOrder);
+  });
+
+  it('pooled indexed raster engages through frameAsync: stats report pooled', async () => {
+    sandbox();
+    setCVarFromString('vid_renderer', 'software');
+    setCVar('sw_workers', 4);
+    const boot = bootPlay({ width: 64, height: 48 });
+    const pool = attachNodePool(boot, 3);
+    try {
+      const st = createAsyncLoopState();
+      const out = await frameAsync(boot, st, 16.7);
+      expect(out.some((v) => v !== 0)).toBe(true);
+      const s = publishQ2Stats(boot, 60, 1);
+      // The attached pool executed the indexed raster (never inferred from
+      // the cvar alone).
+      expect(s.pooled).toBe(true);
+      expect(s.bands).toBeGreaterThan(1);
+      expect(s.resolveOrder).toBe('software-passthrough');
+      expect(s.rasterFallbacks).toBe(0);
+      expect(s.asyncFallbacks).toBe(0);
+    } finally {
+      await pool.dispose();
+    }
   });
 });
 
-describe('resolveDisplayAsync accounting (kicks counted, fallbacks counted)', () => {
-  it('kick-failure (false) falls back to serial-identical pixels and counts once', async () => {
+describe('renderer switching zeroes shell scratch', () => {
+  it('applyRendererCvar zeroes display; software resolve returns the live plane', async () => {
     sandbox();
-    setCVarFromString('vid_renderer', 'voodoo');
+    setCVarFromString('vid_renderer', 'software');
     setCVar('sw_workers', 4);
     const boot = bootPlay({ width: 64, height: 48 });
     const pool = attachNodePool(boot, 3);
     try {
-      paintLive(boot);
-      const serial = Array.from(resolveDisplay(boot));
-      expect(boot.lastVoodooPath).toBe('serial');
-      // Dead pool: every kick refuses, exercising the fallback counter.
-      (boot as unknown as Record<string, unknown>).browserPool = {
-        flushScanoutAsync: async (): Promise<boolean> => false,
-      };
-      paintLive(boot);
-      const fb = Array.from(await resolveDisplayAsync(boot));
-      expect(fb).toEqual(serial);
-      expect(boot.lastVoodooPath).toBe('serial');
-      expect(boot.lastResolveOrder).toBe('strict-hud-first');
-      expect(boot.statScanoutKicks).toBe(0);
-      expect(boot.statScanoutFallbacks).toBe(1);
-      const s = publishQ2Stats(boot, 60, 2);
-      expect(s.scanoutFallbacks).toBe(1);
-      expect(s.voodooPath).toBe('serial');
-    } finally {
-      await pool.dispose();
-    }
-  });
-
-  it('kick-throw falls back to serial-identical pixels and counts once', async () => {
-    sandbox();
-    setCVarFromString('vid_renderer', 'voodoo');
-    setCVar('sw_workers', 4);
-    const boot = bootPlay({ width: 64, height: 48 });
-    const pool = attachNodePool(boot, 3);
-    try {
-      paintLive(boot);
-      const serial = Array.from(resolveDisplay(boot));
-      (boot as unknown as Record<string, unknown>).browserPool = {
-        flushScanoutAsync: async (): Promise<boolean> => {
-          throw new Error('simulated dead worker');
-        },
-      };
-      paintLive(boot);
-      const fb = Array.from(await resolveDisplayAsync(boot));
-      expect(fb).toEqual(serial);
-      expect(boot.statScanoutFallbacks).toBe(1);
-      expect(boot.statScanoutKicks).toBe(0);
-    } finally {
-      await pool.dispose();
-    }
-  });
-
-  it('odd dimensions (65x49) pooled scanout matches serial', async () => {
-    sandbox();
-    setCVarFromString('vid_renderer', 'voodoo');
-    setCVar('sw_workers', 4);
-    const boot = bootPlay({ width: 65, height: 49 });
-    const pool = attachNodePool(boot, 3);
-    try {
-      paintLive(boot);
-      const serial = Array.from(resolveDisplay(boot));
-      paintLive(boot);
-      const pooled = Array.from(await resolveDisplayAsync(boot));
-      expect(pooled).toEqual(serial);
-      expect(boot.lastVoodooPath).toBe('worker');
-      expect(boot.statScanoutKicks).toBe(1);
-      expect(boot.statScanoutFallbacks).toBe(0);
-    } finally {
-      await pool.dispose();
-    }
-  });
-
-  it('renderer switching with a pool zeroes scratch and re-arms the worker path', async () => {
-    sandbox();
-    setCVarFromString('vid_renderer', 'voodoo');
-    setCVar('sw_workers', 4);
-    const boot = bootPlay({ width: 64, height: 48 });
-    const pool = attachNodePool(boot, 3);
-    try {
-      paintLive(boot);
-      await resolveDisplayAsync(boot);
-      expect(boot.lastVoodooPath).toBe('worker');
-      // Switch to software: passthrough of the live plane, no voodoo path.
-      setCVarFromString('vid_renderer', 'software');
-      applyRendererCvar(boot);
-      expect(boot.display.every((v) => v === 0)).toBe(true);
       const live = boot.refresh.getFramebuffer().color;
       live.fill(0xff00ff00);
-      expect(resolveDisplay(boot)).toBe(live);
-      expect(boot.lastVoodooPath).toBe('none');
-      // Switch back: the pooled worker path re-arms, scratch was zeroed.
-      setCVarFromString('vid_renderer', 'voodoo');
+      resolveDisplay(boot);
+      // Re-latch the same renderer: scratch is zeroed, live plane intact.
       applyRendererCvar(boot);
       expect(boot.display.every((v) => v === 0)).toBe(true);
-      paintLive(boot);
-      const serial = Array.from(resolveDisplay(boot));
-      paintLive(boot);
-      const pooled = Array.from(await resolveDisplayAsync(boot));
-      expect(pooled).toEqual(serial);
-      expect(boot.lastVoodooPath).toBe('worker');
+      live.fill(0xff00ff00);
+      expect(resolveDisplay(boot)).toBe(live);
+      expect(boot.lastResolveOrder).toBe('software-passthrough');
     } finally {
       await pool.dispose();
     }
   });
 });
 
-describe.runIf(!!WEB_Q2_PAK)('base1 production-loop parity (Q2_PAK, RGB workers)', () => {
+describe.runIf(!!WEB_Q2_PAK)('base1 production-loop parity (Q2_PAK, pooled indexed raster)', () => {
   async function bootBase1Pooled(w: number, h: number): Promise<{ boot: PlayBoot; pool: BandWorkerPool }> {
     const { readFileSync } = await import('fs');
     const raw = readFileSync(WEB_Q2_PAK as string);
@@ -293,9 +176,9 @@ describe.runIf(!!WEB_Q2_PAK)('base1 production-loop parity (Q2_PAK, RGB workers)
     return { boot, pool };
   }
 
-  it('frameAsync (pooled RGB + pooled scanout) matches sync sim+resolve, RGB kicks engaged', { timeout: 300000 }, async () => {
+  it('frameAsync (pooled) matches sync sim+resolve, pool engaged', { timeout: 300000 }, async () => {
     sandbox();
-    setCVarFromString('vid_renderer', 'voodoo');
+    setCVarFromString('vid_renderer', 'software');
     setCVar('sw_workers', 4);
     const { boot: a, pool: pa } = await bootBase1Pooled(96, 72);
     const { boot: b, pool: pb } = await bootBase1Pooled(96, 72);
@@ -319,36 +202,28 @@ describe.runIf(!!WEB_Q2_PAK)('base1 production-loop parity (Q2_PAK, RGB workers)
         pumpExplosionLights(a);
         pumpTracers(a);
         a.host.frame(t);
-        const hud = { fps: 60, frame: f };
-        const ref = Array.from(resolveDisplay(a, hud));
-        // Production path: pumps + sim + async RGB/scanout kicks inside.
-        const out = Array.from(await frameAsync(b, stb, t, hud));
+        const ref = Array.from(resolveDisplay(a));
+        // Production path: pumps + sim + pooled indexed raster inside.
+        const out = Array.from(await frameAsync(b, stb, t));
         expect(out).toEqual(ref);
-        // RGB workers executed in the production path (not inferred from
-        // the cvar): batches staged and exactly one RGB kick this frame.
-        const rs = b.refresh.testRGBWorkerStats();
-        expect(rs.staged).toBeGreaterThan(0);
-        expect(rs.kicks).toBe(1);
       }
       expect(b.host.serverTime).toBe(a.host.serverTime);
       expect([...b.host.playerOrigin]).toEqual([...a.host.playerOrigin]);
-      expect(b.statScanoutFallbacks).toBe(0);
-      expect(b.statScanoutKicks).toBe(FRAMES);
       expect(b.statAsyncFallbacks).toBe(0);
+      // The pool executed the production frames (not inferred from cvar).
+      expect(b.refresh.testWorkerStats().pooled).toBe(true);
       const s = publishQ2Stats(b, 60, FRAMES);
       expect(s.pooled).toBe(true);
-      expect(s.voodooPath).toBe('worker');
-      expect(s.scanoutKicks).toBe(FRAMES);
-      expect(s.scanoutFallbacks).toBe(0);
+      expect(s.asyncFallbacks).toBe(0);
     } finally {
       await pa.dispose();
       await pb.dispose();
     }
   });
 
-  it('long-run cache ownership: 60 pooled frames, steady kicks, zero fallbacks', { timeout: 300000 }, async () => {
+  it('long-run pool stability: 60 pooled frames, real pixels, zero async fallbacks', { timeout: 300000 }, async () => {
     sandbox();
-    setCVarFromString('vid_renderer', 'voodoo');
+    setCVarFromString('vid_renderer', 'software');
     setCVar('sw_workers', 4);
     const { boot, pool } = await bootBase1Pooled(96, 72);
     try {
@@ -362,17 +237,11 @@ describe.runIf(!!WEB_Q2_PAK)('base1 production-loop parity (Q2_PAK, RGB workers)
         boot.host.input.buttons = f % 10 < 3 ? 1 : 0;
         if (f % 10 === 0) boot.host.input.keys.add('forward');
         if (f % 10 === 5) boot.host.input.keys.delete('forward');
-        const out = await frameAsync(boot, st, t, { fps: 60, frame: f });
-        const rs = boot.refresh.testRGBWorkerStats();
-        expect(rs.staged).toBeGreaterThan(0);
-        expect(rs.kicks).toBe(1);
-        expect(rs.inline).toBe(0);
+        const out = await frameAsync(boot, st, t);
         if (out.some((v) => v !== 0)) nonzero++;
       }
       // Every frame drew real pixels (no wedged/blank worker output).
       expect(nonzero).toBe(60);
-      expect(boot.statScanoutKicks).toBe(60);
-      expect(boot.statScanoutFallbacks).toBe(0);
       expect(boot.statAsyncFallbacks).toBe(0);
     } finally {
       await pool.dispose();

@@ -7,7 +7,7 @@ import { Host } from '@q2/host';
 import { NullRefresh, devroomWorld } from '@q2/renderer-api';
 import { hashFrame } from '@q2/testkit';
 
-export type RendererKind = 'software' | 'voodoo';
+export type RendererKind = 'software' | 'webgl2-experimental';
 
 export interface DevroomBoot {
   host: Host;

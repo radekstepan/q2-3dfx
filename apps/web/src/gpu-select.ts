@@ -59,10 +59,12 @@ export function detectGpuCapability(): GpuCapability {
 
 /**
  * Selection resolver shared by `bootPlay` and `applyRendererCvar`: exact
- * `software`/`voodoo`/`webgl2-experimental` strings map directly (GPU only
- * when capable, via `resolveRendererSelection`); anything else — including a
- * GPU request without capability — resolves to `software` WITH an explicit
- * warning (never a silent CPU fallback). Defaults to the live
+ * `software`/`webgl2-experimental` strings map directly (GPU only
+ * when capable, via `resolveRendererSelection`); the retired `voodoo` id
+ * migrates one-time to `software` WITH an explicit warning (never
+ * auto-promoted); anything else — including a GPU request without
+ * capability — resolves to `software` WITH an explicit warning (never a
+ * silent CPU fallback). Defaults to the live
  * `vid_renderer` cvar; callers may pass an explicit request (e.g. the
  * `bootPlay` opts.renderer override) which goes through the same
  * capability check.

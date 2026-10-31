@@ -297,7 +297,7 @@ export function attachDropZone(
  * select-vs-input logic without a DOM.
  */
 export const CVAR_OPTIONS: Readonly<Record<string, readonly string[]>> = {
-  vid_renderer: ['software', 'voodoo', 'webgl2-experimental'],
+  vid_renderer: ['software', 'webgl2-experimental'],
   vid_resolution: ['320x240', '640x480', '800x600', '1024x768'],
   skill: ['0', '1', '2', '3'],
   map_source: ['devroom', 'pak'],
@@ -405,7 +405,6 @@ export const ZBITS_LABELS = ['8-bit (banded)', '16-bit (Voodoo3)'] as const;
  */
 export const VID_RENDERER_LABELS = [
   'Software (default)',
-  'Voodoo 3 3000 (emulated)',
   'WebGL2 (experimental)',
 ] as const;
 
@@ -478,7 +477,7 @@ export const CVAR_DESCRIPTIONS: Readonly<Record<string, string>> = {
   skill: 'difficulty 0 easy 1 medium 2 hard 3 nightmare (latched at boot)',
   map_source: 'map source: cached pak0.pak game (pak) or built-in devroom (devroom); changing it reboots the level',
   vid_resolution: 'internal framebuffer WxH (resizes in place, no reboot)',
-  vid_renderer: 'active refresh backend: software | voodoo | webgl2-experimental (experimental, needs WebGL2; incapable Falls back to software WITH a warning)',
+  vid_renderer: 'active refresh backend: software | webgl2-experimental (experimental, needs WebGL2; incapable falls back to software WITH a warning). Legacy "voodoo" migrates to software with a warning.',
   vd_16bit: 'quantise 8:8:8 to RGB565 at resolve',
   vd_dither: '4x4 ordered dither before quantise',
   vd_postfilter: '2x2 "22-bit" RAMDAC post filter',
@@ -917,14 +916,23 @@ function renderCvarRow(
   node.appendChild(row);
 }
 
-/** Renderer switcher state (software/voodoo/webgl2-experimental), persisted to cvar. */
+/** Renderer switcher state (software/webgl2-experimental), persisted to cvar. */
 export function getRendererChoice(): string {
   return getCVarString('vid_renderer') || 'software';
 }
 
 export function setRendererChoice(kind: string): void {
-  if (kind === 'voodoo' || kind === 'webgl2-experimental') {
+  if (kind === 'webgl2-experimental') {
     setCVarFromString('vid_renderer', kind);
+    return;
+  }
+  if (kind === 'voodoo') {
+    // RELEASE-8: the legacy CPU id migrates one-time to software WITH an
+    // explicit warning — never silently, never auto-promoted to webgl2.
+    setCVarFromString('vid_renderer', 'software');
+    console.warn(
+      '[q2ts-web] setRendererChoice: "voodoo" was retired (RELEASE-8); migrated to software (never auto-promoted to webgl2-experimental)',
+    );
     return;
   }
   setCVarFromString('vid_renderer', 'software');
@@ -935,13 +943,11 @@ export function setRendererChoice(kind: string): void {
 import type { Host } from '@q2/host';
 import type { LocalDriver, PlayBoot } from './play.js';
 import {
-  applyVoodooPresentation,
   attachBrowserPool,
   createAsyncLoopState,
   drawPlayHud,
   frameAsync,
   frameGpuPlay,
-  hudComposedPreScanout,
   paintHudOverlay,
   pumpExplosionLights,
   pumpMuzzleLight,
@@ -952,7 +958,7 @@ import {
 import type { AsyncLoopState } from './play.js';
 import { syncGpuCanvasToHud } from './gpu-canvas.js';
 import { browserPoolAvailable, defaultBrowserWorkers } from './render-workers.js';
-import type { BrowserBandPool, BrowserForegroundDetail } from './render-workers.js';
+import type { BrowserBandPool } from './render-workers.js';
 import { attachToCanvas } from '@q2/input/dom';
 import { readPakEntry, findPakSoundEntry } from './pak.js';
 import type { Mixer, MixedChannel } from '@q2/sound';
@@ -1087,50 +1093,30 @@ function blip(ctx: AudioContext, master: GainNode, freq: number, dur: number, wh
 /**
  * Browser-loop frame statistics published to `window.__q2stats` once per
  * presented frame (CDP/soak observability, zero behavior change).
+ * RELEASE-8: indexed-pool + software-resolve observability only. The CPU
+ * voodoo scanout and RGB worker execution paths are retired; WebGL2 owns
+ * appearance via `vd_*` uniforms.
  *
  * - `fps`/`frame`: the loop's fps EMA + presented-frame counter. Acceptance
  *   FPS is ALWAYS derived from `frame` deltas over wall-clock time
  *   (presented frames, sim+HUD+blit included) — never from phase medians.
- * - `pooled`/`rgbStaged`/`rgbKicks`/`rgbInline`: the RGB raster worker path
- *   executed this frame (staged batches + completed kicks + inline
- *   fallbacks, per-frame since the last beginFrame).
+ * - `pooled`: the indexed raster worker pool executed this frame.
  * - `bands`/`poolSpans`/`poolPixels`: pool geometry (bands = workers + the
  *   main-thread band; 1 when unpooled) + the indexed-lane tally the pool
  *   drained this frame (spans/pixels drawn across all bands).
- * - `rgbPending`/`stageBytes`: batches still staged at present time
- *   (healthy: 0 — every kick flushed) + bytes staged for the frame kick
- *   (indexed spans/tex/light + RGB spans/chains/luxels; -1 when unpooled).
- * - `fgInline`: entity-foreground classic spans elided where the RGB twin
- *   drew (foreground always rides inline today — the RGB twins are the
- *   displayed values, so a healthy pooled voodoo frame shows this > 0
- *   alongside rgbKicks = 1; -1 = renderer has no foreground counter yet
- *   — see the PERF-FINISH-B contract note in publishQ2Stats).
- * - `fgStaged`/`fgWorker`/`fgInlineRgb`/`fgKicks`: foreground RGB
- *   execution proof when the renderer publishes it (optional
- *   `testRGBForegroundStats` hook: batches offered to workers, batches
- *   actually rasterised on workers, batches drawn inline, kicks
- *   completed; falls back to the renderer-lane `testForegroundWorkerStats`
- *   `{ staged, inline, kicks }` with worker derived as staged-when-kicks>0).
- *   -1 = hook absent (older renderer). Never guessed.
- * - `rgbFallbacks`: pooled RGB-kick failures this boot (timeout/dead
+ * - `stageBytes`: bytes staged for the frame kick (indexed spans/tex/light;
+ *   -1 when unpooled).
+ * - `rasterFallbacks`: pooled raster-kick failures this boot (timeout/dead
  *   worker → inline replay, bit-identical). Healthy: 0.
- * - `lastKickJob`/`rgbMainMs`/`rgbExecMs`/`rgbExecMaxMs`/
- *   `rgbExecMedianMs`/`rgbImbalanceMs`/`rgbSlowestMs`/
- *   `scanoutSlowestMs`/`resolveSlowestMs`: instrumented-only worker
- *   timing (see the field docs): per-band worker compute for the last rgb
- *   kick, its max-vs-median imbalance, the calling-thread band share and
- *   the per-lane dispatch-to-completion critical paths. All -1/empty
- *   unless diag is armed — never medians summed across kicks.
  * - `quarantined`: the pool timed out a kick and terminated its workers
  *   (stale-write guard fired — later kicks refuse fast until reboot).
  *   Healthy: false.
- * - `voodooPath`/`resolveOrder`: which scanout path the last resolve took
- *   (`worker` = pooled Track A kick, `serial` = main-thread resolve,
- *   `none` = software mode) and the HUD ordering. Proves the pooled
- *   scanout executed instead of silently falling back.
- * - `scanoutKicks`/`scanoutFallbacks`: monotonic pooled-scanout outcomes
- *   (healthy pooled soak: kicks == frames, fallbacks == 0; any fallback is
- *   counted here, never silent).
+ * - `lastKickJob`/`rasterSlowestMs`/`resolveSlowestMs`: instrumented-only
+ *   worker timing (see the field docs): the most recent kick kind and the
+ *   per-lane dispatch-to-completion critical paths. -1/'none' unless diag
+ *   is armed — never medians summed across kicks.
+ * - `resolveOrder`: which software resolve path the last resolve took
+ *   (`software-passthrough` at brightness 1.0, `software-lifted` above).
  * - `asyncFallbacks`: `frameAsync` throws the tick absorbed via the classic
  *   sync path (healthy: 0).
  */
@@ -1138,146 +1124,45 @@ export interface Q2Stats {
   fps: number;
   frame: number;
   pooled: boolean;
-  rgbStaged: number;
-  rgbKicks: number;
-  rgbInline: number;
-  /**
-   * Worker/main attribution for this frame's COMPLETED RGB kicks (world +
-   * foreground), in native units (PERF-NEXT-5, pool surface):
-   * - `rgbWorkerSpans`/`rgbWorkerPixels`/`rgbWorkerTris`: WORKER-band
-   *   completed work (actual execution, never staging).
-   * - `rgbMainSpans`/`rgbMainPixels`/`rgbMainTris`: the calling-thread
-   *   band's completed share of the same kicks (main-band/inline work,
-   *   never worker-completed).
-   * Combined kick totals reconcile as worker + main per unit. `tris` are
-   * per-band tri executions (viewmodel/alias tris straddling a band
-   * boundary fill disjoint rows in both bands and count once per band, so
-   * completed tris can slightly exceed staged tris). Failed/refused kicks
-   * contribute nothing here — their work is recounted by the renderer's
-   * inline/replay counters (`rgbInline`, `fgInlineRgb`,
-   * `fgDetail.replayed*`), never by the pool.
-   * -1 each when the pool probe is unavailable (unpooled boot, foreign
-   * pool without the accumulator, throwing probe): unavailable
-   * attribution is unknown — never worker-completed, never a silent
-   * zero. 0 with a live pool is the known idle state (no RGB kick
-   * completed this frame); `pooled`/`bands` disambiguate unpooled.
-   */
-  rgbWorkerSpans: number;
-  rgbWorkerPixels: number;
-  rgbWorkerTris: number;
-  rgbMainSpans: number;
-  rgbMainPixels: number;
-  rgbMainTris: number;
   bands: number;
   poolSpans: number;
   poolPixels: number;
-  rgbPending: number;
   stageBytes: number;
   /**
-   * Foreground classic spans elided where the RGB twin drew (-1 = the
-   * renderer publishes no foreground counter — see the PERF-FINISH-B
-   * contract note in publishQ2Stats). Under the authoritative RGB skip the
-   * displayed foreground is the RGB twin, so a healthy pooled voodoo frame
-   * shows this > 0 alongside rgbKicks = 1.
-   */
-  fgInline: number;
-  /**
-   * Foreground RGB execution proof (renderer lane owns the hook): batches
-   * offered to workers, batches actually rasterised on workers, batches
-   * drawn inline on the main thread, kicks completed. -1 = the renderer
-   * publishes no foreground counter (this HEAD: foreground always rides
-   * inline after the world kick — absence is healthy; the world-lane
-   * counters plus fgInline > 0 are the foreground proof). Never guessed.
-   *
-   * Units are batches (NOT triangles or pixels — do not compare fgStaged
-   * with pixel counters). `fgWorker` is worker-completed batches only:
-   * the legacy-hook fallback reports -1 (unknown) whenever anything
-   * staged, because staging is not execution proof — only the new hook's
-   * separately-measured worker count proves worker rendering.
-   */
-  fgStaged: number;
-  fgWorker: number;
-  fgInlineRgb: number;
-  fgKicks: number;
-  /**
-   * Per-primitive-class foreground audit (renderer lane owns the hook and
-   * its units — see BrowserForegroundDetail): prepared/staged vs
-   * worker-completed vs calling-thread vs inline vs replayed work in
-   * native units (spans, draws, triangles, particles, pixels, kicks, ms —
-   * never mixed). Null when the renderer publishes no breakdown (older
-   * builds) or the probe throws: unknown, never worker-completed, never
-   * a silent zero. Present-hook zeros are known (nothing completed).
-   */
-  fgDetail: BrowserForegroundDetail | null;
-  /**
-   * Authoritative-skip observability (PERF-FINISH-A): classic world spans
-   * elided where the RGB overlay drew + whether the skip armed this frame.
-   * 0/false when the hook is absent (older renderer) or the oracle pinned.
-   */
-  classicSkipped: number;
-  skipArmed: boolean;
-  /**
-   * Worker-execution timing for the last kicks (PERF-NEXT-4, harness
-   * only): world + foreground rgb flushes share the rgb lane (the last
-   * one is usually a foreground flush — every FG flush including the
-   * placed pass carries the same fields; see the pool's `kickTimings()`
-   * ledger for the per-frame list). `rgbExecMs` holds the last rgb
-   * kick's per-band worker-compute durations (arrival order); `rgbMainMs`
-   * is the calling-thread band's execution for the same kick;
-   * `rgbExecMaxMs`/`rgbExecMedianMs` expose the max-vs-median imbalance
-   * and `rgbImbalanceMs` the max-minus-min gap (within-kick stats only);
-   * `rgbSlowestMs`/`scanoutSlowestMs`/`resolveSlowestMs` are the
-   * dispatch-to-completion critical paths per lane. `lastKickJob` names
-   * the most recent kick ('none' when disarmed or kickless). All -1/empty
-   * when diag is disarmed or the lane never kicked — acceptance runs
-   * disarmed by design, so production __q2stats carries no worker timing
-   * and these fields stay at their sentinels with zero per-frame cost
-   * beyond the guarded probes below.
-   */
-  lastKickJob: string;
-  rgbMainMs: number;
-  rgbExecMs: number[];
-  rgbExecMaxMs: number;
-  rgbExecMedianMs: number;
-  rgbImbalanceMs: number;
-  rgbSlowestMs: number;
-  scanoutSlowestMs: number;
-  resolveSlowestMs: number;
-  /**
-   * Pooled RGB-kick failures this boot (timeout/dead worker → counted
+   * Pooled raster-kick failures this boot (timeout/dead worker → counted
    * inline replay, bit-identical). 0 = none (healthy, or unpooled).
    */
-  rgbFallbacks: number;
+  rasterFallbacks: number;
   /**
    * The browser pool timed out a kick and terminated its workers
    * (stale-write guard fired — later kicks refuse fast until reboot).
    * False = healthy (or unpooled).
    */
   quarantined: boolean;
-  voodooPath: string;
+  /**
+   * Most recent kick kind (PERF-NEXT-4, harness only): 'raster',
+   * 'resolve', or 'none' when disarmed or kickless. Acceptance runs
+   * disarmed by design, so production __q2stats carries no worker timing.
+   */
+  lastKickJob: string;
+  /**
+   * Dispatch-to-completion critical paths per indexed lane (PERF-NEXT-4,
+   * harness only): -1 when diag is disarmed or the lane never kicked.
+   */
+  rasterSlowestMs: number;
+  resolveSlowestMs: number;
   resolveOrder: string;
-  scanoutKicks: number;
-  scanoutFallbacks: number;
   asyncFallbacks: number;
 }
 
-/** Shared empty worker-timing list (production sentinel, never mutated). */
-const NO_EXEC_TIMING: number[] = [];
-
 const Q2STATS_ZERO: Q2Stats = {
-  fps: 0, frame: 0, pooled: false, rgbStaged: 0, rgbKicks: 0, rgbInline: 0,
-  rgbWorkerSpans: -1, rgbWorkerPixels: -1, rgbWorkerTris: -1,
-  rgbMainSpans: -1, rgbMainPixels: -1, rgbMainTris: -1,
-  bands: 1, poolSpans: 0, poolPixels: 0, rgbPending: 0, stageBytes: -1,
-  fgInline: -1, fgStaged: -1, fgWorker: -1, fgInlineRgb: -1, fgKicks: -1,
-  fgDetail: null,
-  classicSkipped: 0, skipArmed: false,
-  lastKickJob: 'none', rgbMainMs: -1, rgbExecMs: NO_EXEC_TIMING, rgbExecMaxMs: -1,
-  rgbExecMedianMs: -1, rgbImbalanceMs: -1, rgbSlowestMs: -1,
-  scanoutSlowestMs: -1, resolveSlowestMs: -1,
-  rgbFallbacks: 0, quarantined: false,
-  voodooPath: 'none', resolveOrder: 'none',
-  scanoutKicks: 0, scanoutFallbacks: 0, asyncFallbacks: 0,
+  fps: 0, frame: 0, pooled: false,
+  bands: 1, poolSpans: 0, poolPixels: 0, stageBytes: -1,
+  rasterFallbacks: 0, quarantined: false,
+  lastKickJob: 'none',
+  rasterSlowestMs: -1, resolveSlowestMs: -1,
+  resolveOrder: 'none',
+  asyncFallbacks: 0,
 };
 
 /**
@@ -1300,16 +1185,10 @@ function numOr(v: unknown, fallback: number): number {
  * breakdowns live in instrumented harnesses only (measureFrameStages +
  * pool diag, clearly labeled report-only).
  *
- * Contract note (PERF-FINISH-B → renderer lane): `fgInline` reads the
- * renderer's `testClassicSkipStats` hook (`{ classicFgSkipped }`) when
- * present — foreground classic spans elided where the RGB twin drew — and
- * reports -1 when the hook is absent (older renderer), never a guess.
- * `classicSkipped`/`skipArmed` carry the world-span twin of the same hook.
- * `fgStaged`/`fgWorker`/`fgInlineRgb`/`fgKicks` read the optional
- * `testRGBForegroundStats` hook (`{ staged, worker, inline, kicks }`)
- * the same way (-1 each when absent), falling back to the renderer-lane
- * `testForegroundWorkerStats` shape (worker derived, documented at the
- * probe); the renderer lane owns those hooks.
+ * RELEASE-8: indexed-pool + software-resolve observability only. The
+ * `testWorkerStats` hook is the renderer's only stat surface; every other
+ * probe is pool-side and guarded, so a throwing/future shape degrades to
+ * the healthy sentinels above — never a guess, never a throw.
  */
 export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2Stats {
   const snap: Q2Stats = { ...Q2STATS_ZERO, fps, frame };
@@ -1319,29 +1198,20 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
     rec.fps = fps;
     rec.frame = frame;
     // Single kickStats() probe per presented frame (PERF-NEXT-6 Lane B):
-    // the fallback counters and the per-frame worker/main attribution
-    // below previously probed twice (one fresh object per call). This
-    // function is fully synchronous (no awaits between the consumers),
-    // so one snapshot is exactly equivalent and halves the probe
-    // garbage. A foreign pool without the accumulator degrades to the
-    // same sentinels as before (unknown, never a silent zero).
+    // the fallback counters below previously probed twice (one fresh object
+    // per call). This function is fully synchronous (no awaits between the
+    // consumers), so one snapshot is exactly equivalent and halves the
+    // probe garbage. A foreign pool without the accumulator degrades to
+    // the same sentinels as before (unknown, never a silent zero).
     let kickSnapshot: {
-      fallbacks: { rgb: number };
+      fallbacks: { raster: number };
       quarantined: boolean;
-      frameCompleted?: {
-        workerPixels?: unknown; workerSpans?: unknown; workerTris?: unknown;
-        mainPixels?: unknown; mainSpans?: unknown; mainTris?: unknown;
-      };
     } | null = null;
     try {
       const pool = boot.browserPool as unknown as {
         kickStats?: () => {
-          fallbacks: { rgb: number };
+          fallbacks: { raster: number };
           quarantined: boolean;
-          frameCompleted?: {
-            workerPixels?: unknown; workerSpans?: unknown; workerTris?: unknown;
-            mainPixels?: unknown; mainSpans?: unknown; mainTris?: unknown;
-          };
         };
       } | null;
       if (pool && typeof pool.kickStats === 'function') {
@@ -1352,271 +1222,70 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
     }
     try {
       const ws = boot.refresh.testWorkerStats();
-      const rs = boot.refresh.testRGBWorkerStats();
       rec.pooled = ws.pooled;
       rec.bands = ws.bands;
       rec.poolSpans = ws.spans;
       rec.poolPixels = ws.pixels;
-      rec.rgbStaged = rs.staged;
-      rec.rgbKicks = rs.kicks;
-      rec.rgbInline = rs.inline;
     } catch {
       rec.pooled = false;
       rec.bands = 1;
       rec.poolSpans = 0;
       rec.poolPixels = 0;
-      rec.rgbStaged = 0;
-      rec.rgbKicks = 0;
-      rec.rgbInline = 0;
     }
     try {
       const pool = boot.browserPool as unknown as {
-        rgbPending?: () => number;
         kickBytes?: () => { total: number } | null;
         stagingBytes?: () => { total: number };
       } | null;
-      rec.rgbPending = pool && typeof pool.rgbPending === 'function'
-        ? pool.rgbPending() : 0;
       // Frozen last-kick snapshot first (post-kick live offsets are zeros).
       const kb = pool && typeof pool.kickBytes === 'function' ? pool.kickBytes() : null;
       rec.stageBytes = kb !== null && kb !== undefined ? kb.total
         : pool && typeof pool.stagingBytes === 'function'
           ? pool.stagingBytes().total : -1;
-      // Pool-level RGB kick outcomes (counted, never silent). A Node-pool
+      // Pool-level raster-kick outcomes (counted, never silent). A Node-pool
       // stand-in (headless tests) has no kickStats — guarded, stays 0/false.
       // Read from the single per-frame snapshot above (never a second probe).
       if (kickSnapshot !== null) {
-        rec.rgbFallbacks = kickSnapshot.fallbacks.rgb | 0;
+        rec.rasterFallbacks = kickSnapshot.fallbacks.raster | 0;
         rec.quarantined = kickSnapshot.quarantined === true;
       } else {
-        rec.rgbFallbacks = 0;
+        rec.rasterFallbacks = 0;
         rec.quarantined = false;
       }
     } catch {
-      rec.rgbPending = 0;
       rec.stageBytes = -1;
-      rec.rgbFallbacks = 0;
+      rec.rasterFallbacks = 0;
       rec.quarantined = false;
     }
-    // Per-frame worker/main attribution (PERF-NEXT-5, pool surface): the
-    // pool accumulates every COMPLETED RGB kick's worker vs calling-thread
-    // split since the last beginFrame (world + foreground kicks). Guarded
-    // probes only: an unpooled boot, a foreign pool without the
-    // accumulator, or a throwing probe degrades to the -1 unknown
-    // sentinels (never worker-completed, never a silent zero). A live
-    // pool reporting 0 is the known idle state (no completed kick).
-    // Read from the single per-frame snapshot above (never a second probe).
-    try {
-      const fc = kickSnapshot !== null ? kickSnapshot.frameCompleted : undefined;
-      if (fc !== undefined && fc !== null) {
-        rec.rgbWorkerSpans = numOr(fc.workerSpans, -1);
-        rec.rgbWorkerPixels = numOr(fc.workerPixels, -1);
-        rec.rgbWorkerTris = numOr(fc.workerTris, -1);
-        rec.rgbMainSpans = numOr(fc.mainSpans, -1);
-        rec.rgbMainPixels = numOr(fc.mainPixels, -1);
-        rec.rgbMainTris = numOr(fc.mainTris, -1);
-      } else {
-        rec.rgbWorkerSpans = -1;
-        rec.rgbWorkerPixels = -1;
-        rec.rgbWorkerTris = -1;
-        rec.rgbMainSpans = -1;
-        rec.rgbMainPixels = -1;
-        rec.rgbMainTris = -1;
-      }
-    } catch {
-      rec.rgbWorkerSpans = -1;
-      rec.rgbWorkerPixels = -1;
-      rec.rgbWorkerTris = -1;
-      rec.rgbMainSpans = -1;
-      rec.rgbMainPixels = -1;
-      rec.rgbMainTris = -1;
-    }
-    // Per-primitive-class foreground audit (PERF-NEXT-5, renderer surface):
-    // pass-through of the renderer's testForegroundStats hook (which owns
-    // the units: see BrowserForegroundDetail). Null when the hook is
-    // absent or throws (unknown, never worker-completed); present-hook
-    // zeros are known. Per-field -1 guards a partial future shape without
-    // breaking the present path.
-    try {
-      const fg = (boot.refresh as unknown as {
-        testForegroundStats?: () => Record<string, unknown>;
-      }).testForegroundStats;
-      if (typeof fg === 'function') {
-        const fs = fg.call(boot.refresh) as Record<string, unknown>;
-        rec.fgDetail = {
-          stagedBatches: numOr(fs.stagedBatches, -1),
-          inlineBatches: numOr(fs.inlineBatches, -1),
-          kicks: numOr(fs.kicks, -1),
-          alphaSpansStaged: numOr(fs.alphaSpansStaged, -1),
-          alphaSpansInline: numOr(fs.alphaSpansInline, -1),
-          spriteSpansStaged: numOr(fs.spriteSpansStaged, -1),
-          spriteSpansInline: numOr(fs.spriteSpansInline, -1),
-          spriteDrawsInline: numOr(fs.spriteDrawsInline, -1),
-          aliasDrawsStaged: numOr(fs.aliasDrawsStaged, -1),
-          aliasDrawsInline: numOr(fs.aliasDrawsInline, -1),
-          aliasTrisInline: numOr(fs.aliasTrisInline, -1),
-          particleDrawsInline: numOr(fs.particleDrawsInline, -1),
-          particlesInline: numOr(fs.particlesInline, -1),
-          particleSpansInline: numOr(fs.particleSpansInline, -1),
-          beamDrawsInline: numOr(fs.beamDrawsInline, -1),
-          beamSpansInline: numOr(fs.beamSpansInline, -1),
-          workerSpansCompleted: numOr(fs.workerSpansCompleted, -1),
-          workerPixelsCompleted: numOr(fs.workerPixelsCompleted, -1),
-          mainSpansCompleted: numOr(fs.mainSpansCompleted, -1),
-          mainPixelsCompleted: numOr(fs.mainPixelsCompleted, -1),
-          trisStaged: numOr(fs.trisStaged, -1),
-          trisCompleted: numOr(fs.trisCompleted, -1),
-          trisMainCompleted: numOr(fs.trisMainCompleted, -1),
-          trisReplayed: numOr(fs.trisReplayed, -1),
-          particleSpansStaged: numOr(fs.particleSpansStaged, -1),
-          beamSpansStaged: numOr(fs.beamSpansStaged, -1),
-          replayedSpans: numOr(fs.replayedSpans, -1),
-          replayedPixels: numOr(fs.replayedPixels, -1),
-          recoveryCount: numOr(fs.recoveryCount, -1),
-          entityMs: numOr(fs.entityMs, -1),
-          directInlineWrites: fs.directInlineWrites === true,
-        };
-      } else {
-        rec.fgDetail = null;
-      }
-    } catch {
-      rec.fgDetail = null;
-    }
-    // Instrumented-only worker timing (PERF-NEXT-4): per-band compute for
-    // the last rgb kick, its max-vs-median imbalance, the calling-thread
-    // band share and the per-lane dispatch-to-completion critical paths.
-    // Guarded probes only (a foreign/older pool degrades to the sentinels,
-    // never a throw, never an allocation on the production path: the
-    // per-band list is assigned — a fresh array — solely when diag is
-    // armed and an rgb kick ran, and the shared frozen empty otherwise).
+    // Instrumented-only worker timing (PERF-NEXT-4): per-lane
+    // dispatch-to-completion critical paths. Guarded probes only (a
+    // foreign/older pool degrades to the sentinels, never a throw, never
+    // an allocation on the production path).
     try {
       const pool = boot.browserPool as unknown as {
         lastKickJob?: () => unknown;
         diagSnapshot?: (job?: unknown) => {
-          mainMs?: unknown;
-          workerExecMs?: unknown;
-          execMaxMs?: unknown;
-          execMedianMs?: unknown;
-          execImbalanceMs?: unknown;
           slowestMs?: unknown;
         } | null;
       } | null;
       const last = pool && typeof pool.lastKickJob === 'function' ? pool.lastKickJob() : 'unknown';
       rec.lastKickJob = typeof last === 'string' && last !== 'unknown' ? last : 'none';
       if (pool && typeof pool.diagSnapshot === 'function') {
-        const rgb = pool.diagSnapshot('rgb');
-        if (rgb !== null && rgb !== undefined) {
-          rec.rgbMainMs = numOr(rgb.mainMs, -1);
-          rec.rgbExecMs = Array.isArray(rgb.workerExecMs)
-            ? rgb.workerExecMs.filter((v): v is number =>
-              typeof v === 'number' && Number.isFinite(v) && v >= 0)
-            : NO_EXEC_TIMING;
-          rec.rgbExecMaxMs = numOr(rgb.execMaxMs, -1);
-          rec.rgbExecMedianMs = numOr(rgb.execMedianMs, -1);
-          rec.rgbImbalanceMs = numOr(rgb.execImbalanceMs, -1);
-          rec.rgbSlowestMs = numOr(rgb.slowestMs, -1);
-        } else {
-          rec.rgbMainMs = -1;
-          rec.rgbExecMs = NO_EXEC_TIMING;
-          rec.rgbExecMaxMs = -1;
-          rec.rgbExecMedianMs = -1;
-          rec.rgbImbalanceMs = -1;
-          rec.rgbSlowestMs = -1;
-        }
-        const scan = pool.diagSnapshot('scanout');
-        rec.scanoutSlowestMs = scan !== null && scan !== undefined ? numOr(scan.slowestMs, -1) : -1;
+        const raster = pool.diagSnapshot('raster');
+        rec.rasterSlowestMs = raster !== null && raster !== undefined ? numOr(raster.slowestMs, -1) : -1;
         const res = pool.diagSnapshot('resolve');
         rec.resolveSlowestMs = res !== null && res !== undefined ? numOr(res.slowestMs, -1) : -1;
       } else {
         rec.lastKickJob = 'none';
-        rec.rgbMainMs = -1;
-        rec.rgbExecMs = NO_EXEC_TIMING;
-        rec.rgbExecMaxMs = -1;
-        rec.rgbExecMedianMs = -1;
-        rec.rgbImbalanceMs = -1;
-        rec.rgbSlowestMs = -1;
-        rec.scanoutSlowestMs = -1;
+        rec.rasterSlowestMs = -1;
         rec.resolveSlowestMs = -1;
       }
     } catch {
       rec.lastKickJob = 'none';
-      rec.rgbMainMs = -1;
-      rec.rgbExecMs = NO_EXEC_TIMING;
-      rec.rgbExecMaxMs = -1;
-      rec.rgbExecMedianMs = -1;
-      rec.rgbImbalanceMs = -1;
-      rec.rgbSlowestMs = -1;
-      rec.scanoutSlowestMs = -1;
+      rec.rasterSlowestMs = -1;
       rec.resolveSlowestMs = -1;
     }
-    try {
-      const boot2 = boot.refresh as unknown as {
-        testRGBForegroundStats?: () => {
-          staged: number; worker: number; inline: number; kicks: number;
-        };
-        testForegroundWorkerStats?: () => {
-          staged: number; inline: number; kicks: number;
-        };
-      };
-      const fg = boot2.testRGBForegroundStats;
-      const fgLegacy = boot2.testForegroundWorkerStats;
-      if (typeof fg === 'function') {
-        const fs = fg.call(boot.refresh);
-        rec.fgStaged = numOr(fs.staged, -1);
-        rec.fgWorker = numOr(fs.worker, -1);
-        rec.fgInlineRgb = numOr(fs.inline, -1);
-        rec.fgKicks = numOr(fs.kicks, -1);
-      } else if (typeof fgLegacy === 'function') {
-        // Renderer-lane hook shape: { staged, inline, kicks }. Staged
-        // batches ride the same JOB_RGB kick as the world batches — but
-        // staging is NOT execution proof (TASK item 3): a completed kick
-        // only proves the batches it covered, and a failed kick replays
-        // inline. Without the testRGBForegroundStats hook the renderer
-        // cannot attribute completions, so worker-completed is unknown
-        // (-1) whenever anything staged, 0 only when nothing staged.
-        // Never derive worker from staged/kicks.
-        const fs = fgLegacy.call(boot.refresh);
-        rec.fgStaged = numOr(fs.staged, -1);
-        rec.fgKicks = numOr(fs.kicks, -1);
-        rec.fgInlineRgb = numOr(fs.inline, -1);
-        rec.fgWorker = rec.fgStaged > 0 ? -1 : 0;
-      } else {
-        rec.fgStaged = -1;
-        rec.fgWorker = -1;
-        rec.fgInlineRgb = -1;
-        rec.fgKicks = -1;
-      }
-    } catch {
-      rec.fgStaged = -1;
-      rec.fgWorker = -1;
-      rec.fgInlineRgb = -1;
-      rec.fgKicks = -1;
-    }
-    try {
-      const fg = (boot.refresh as unknown as {
-        testClassicSkipStats?: () => {
-          classicSpansSkipped: number; classicFgSkipped: number; skipArmed: boolean;
-        };
-      }).testClassicSkipStats;
-      if (typeof fg === 'function') {
-        const sk = fg.call(boot.refresh);
-        rec.fgInline = sk.classicFgSkipped;
-        rec.classicSkipped = sk.classicSpansSkipped;
-        rec.skipArmed = sk.skipArmed === true;
-      } else {
-        rec.fgInline = -1;
-        rec.classicSkipped = 0;
-        rec.skipArmed = false;
-      }
-    } catch {
-      rec.fgInline = -1;
-      rec.classicSkipped = 0;
-      rec.skipArmed = false;
-    }
-    rec.voodooPath = boot.lastVoodooPath;
     rec.resolveOrder = boot.lastResolveOrder;
-    rec.scanoutKicks = boot.statScanoutKicks;
-    rec.scanoutFallbacks = boot.statScanoutFallbacks;
     rec.asyncFallbacks = boot.statAsyncFallbacks;
     return { ...rec };
   } catch {
@@ -1627,7 +1296,7 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
 
 /**
  * Drive a booted game on a canvas: pointer-lock input, rAF frames,
- * voodoo resolve, HUD, blit, and gesture-unlocked sound. No-op without DOM.
+ * software resolve, HUD, blit, and gesture-unlocked sound. No-op without DOM.
  *
  * Display geometry (RELEASE-3): the CSS display box is FITTED to the stage
  * at the framebuffer aspect (see `fitPlayCanvas`), never framebuffer-x2
@@ -1856,22 +1525,17 @@ export function startPlayLoop(
   };
 
   /** Shared post-render tail (HUD + blit + sound/event cues), both paths. */
-  const finishFrame = (target: Uint32Array, hud: { fps: number; frame: number }, hudDone = false): void => {    // V2d strict voodoo: HUD was already composed into the emulated target
-    // BEFORE scanout (paintHudPreScanout via resolveDisplay/frameAsync) —
-    // painting again here would double-paint and defeat the strict ordering.
-    // Legacy/software paths paint HUD after resolve as before.
-    // GPU-PROOF-3: `hudDone` covers the live-GPU overlay path (HUD already
-    // painted transparently over the GL canvas via paintHudOverlay).
-    if (!hudDone && !hudComposedPreScanout(boot)) {
+  const finishFrame = (target: Uint32Array, hud: { fps: number; frame: number }, hudDone = false): void => {
+    // RELEASE-8: HUD is always painted post-resolve (no CPU voodoo
+    // pre-scanout composition). `hudDone` covers the live-GPU overlay path
+    // (HUD already painted transparently over the GL canvas via
+    // paintHudOverlay).
+    if (!hudDone) {
       drawPlayHud(
         { width: host.fb.width, height: host.fb.height, color: target },
         boot,
         hud,
       );
-    } else {
-      // Strict presentation: controlled upscale only (pixelated, no second
-      // smoothing pass); debug controls stay DOM-side, outside the image.
-      applyVoodooPresentation(el);
     }
     blitFb.color = target;
     blitToCanvas(el, blitFb);

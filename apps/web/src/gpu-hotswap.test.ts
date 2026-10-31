@@ -423,15 +423,15 @@ describe.runIf(!!WEB_Q2_PAK)('GPU-FOLLOW-2A cold boot + hot-swap (Q2_PAK)', () =
     }
   });
 
-  it('voodoo→GPU + repeated switches incl. GPU→CPU→GPU keep working', { timeout: 180000 }, async () => {
+  it('software→GPU + repeated switches incl. GPU→CPU→GPU keep working', { timeout: 180000 }, async () => {
     installStubDoc();
     const pak = await readRealPak();
-    setCVar('vid_renderer', 'voodoo');
+    setCVar('vid_renderer', 'software');
     const boot = bootPlay({ width: 96, height: 72, pak });
-    expect(boot.renderer).toBe('voodoo');
+    expect(boot.renderer).toBe('software');
     for (let f = 0; f < 10; f++) boot.host.frame(f * 16);
     const before = snapshotGameplay(boot);
-    // voodoo→GPU: full migration without reboot.
+    // software→GPU: full migration without reboot.
     setCVar('vid_renderer', 'webgl2-experimental');
     expect(applyRendererCvar(boot)).toBe('webgl2-experimental');
     expect(boot.gpu).not.toBeNull();

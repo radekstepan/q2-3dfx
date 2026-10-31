@@ -63,10 +63,14 @@ describe('menu reboot: skill + resolution (headless)', () => {
     const hostRef = b.host;
     const driverRef = b.driver;
     // "Change the dropdown": re-latch only, no boot rebuild.
+    // RELEASE-8: the retired `voodoo` id migrates to `software` WITH a
+    // warning (never auto-promoted to webgl2-experimental).
     setCVar('vid_renderer', 'voodoo');
     expect(cvarNeedsReboot('vid_renderer')).toBe(false);
-    expect(applyRendererCvar(b)).toBe('voodoo');
-    expect(b.renderer).toBe('voodoo');
+    expect(applyRendererCvar(b)).toBe('software');
+    expect(b.renderer).toBe('software');
+    expect(b.lastRendererWarning).not.toBeNull();
+    expect(b.lastRendererWarning).toContain('voodoo');
     expect(b.host).toBe(hostRef);
     expect(b.driver).toBe(driverRef);
     expect([...b.host.playerOrigin]).toEqual(px);
@@ -79,11 +83,13 @@ describe('menu reboot: skill + resolution (headless)', () => {
   });
 
   it('bootPlay honors the persisted vid_renderer cvar; rebootPlay keeps it', () => {
-    setCVar('vid_renderer', 'voodoo');
+    setCVar('vid_renderer', 'webgl2-experimental');
     const b = bootPlay({});
-    expect(b.renderer).toBe('voodoo');
+    // Incapable headless boot falls back to software WITH a warning.
+    expect(b.renderer).toBe('software');
+    expect(b.lastRendererWarning).not.toBeNull();
     const c = rebootPlay(b);
-    expect(c.renderer).toBe('voodoo');
+    expect(c.renderer).toBe('software');
     setCVar('vid_renderer', 'software');
     expect(rebootPlay(c).renderer).toBe('software');
   });
@@ -149,7 +155,7 @@ describe('menu reboot: skill + resolution (headless)', () => {
     expect(d.host.fb.width).toBe(1024);
     expect(d.host.fb.height).toBe(768);
     expect(d.display.length).toBe(1024 * 768);
-    expect(d.fb565.length).toBe(1024 * 768);
+    expect(d.display.length).toBe(1024 * 768);
     void neutralCmd;
   });
 

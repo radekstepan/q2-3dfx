@@ -10,7 +10,7 @@ panel, `requestAnimationFrame` loop (`apps/web`).
 server-authoritative `LocalDriver` (BSP pmove collision, doors/triggers/
 movers, static shootable monsters, blaster/shotgun/machinegun hitscan,
 exit detection); `dom.ts` owns the rAF loop, pointer-lock input, HUD blit,
-voodoo resolve, and gesture-unlocked sound. All engine imports resolve to
+software resolve, and gesture-unlocked sound. All engine imports resolve to
 real ESM (`dist/index.mjs` via `exports`, no Vite pre-bundling needed).
 
 ## Public API
@@ -20,11 +20,11 @@ real ESM (`dist/index.mjs` via `exports`, no Vite pre-bundling needed).
 - `bootPlay({ width?, height?, renderer?, pak? }): PlayBoot` — real
   `SoftwareRenderer` + `LocalDriver` + display buffers.
 - `startPlayLoop(canvas, boot, { pak? }): PlayLoop` (in `dom.ts`) —
-  rAF driver: input attach, frame, voodoo resolve, HUD, blit, sound cues.
+  rAF driver: input attach, frame, software resolve, HUD, blit, sound cues.
 - `LocalDriver` (`play.ts`): `HostDriver` over devroom analytic collision
   (floor/walls/pillar swept-box trace) or `loadBsp` base1 (static BSP trace).
-- `drawPlayHud` / `resolveDisplay` — crosshair + status lines, software or
-  `vd_*` voodoo resolve path.
+- `drawPlayHud` / `resolveDisplay` — crosshair + status lines, software
+  resolve path (`vd_*` cvars are WebGL2 appearance uniforms).
 
 ## How it is used
 

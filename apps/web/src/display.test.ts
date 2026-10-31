@@ -172,7 +172,7 @@ describe('display path (fps anchor, brightness, cvar controls)', () => {
 
   it('cvar panel uses checkboxes for booleans, <select> for known domains, text otherwise', () => {
     expect(cvarControlKind('vid_renderer')).toBe('select');
-    expect(cvarOptions('vid_renderer')).toEqual(['software', 'voodoo', 'webgl2-experimental']);
+    expect(cvarOptions('vid_renderer')).toEqual(['software', 'webgl2-experimental']);
     expect(cvarControlKind('sw_workers')).toBe('select');
     expect(cvarOptions('sw_workers')).toEqual(['0', '2', '4']);
     expect(cvarControlKind('cl_showfps')).toBe('checkbox');

@@ -30,11 +30,16 @@ describe('GPU-PROOF-2 selection/plumbing (headless, no real GL)', () => {
     expect(cap!.reason.length).toBeGreaterThan(0);
   });
 
-  it('software/voodoo requests are honored with no warning', () => {
+  it('software requests are honored with no warning; retired voodoo migrates to software WITH a warning', () => {
     setCVar('vid_renderer', 'software');
     expect(resolveBootRenderer()).toEqual({ kind: 'software', warning: null });
+    // RELEASE-8: persisted `voodoo` migrates one-time to software WITH an
+    // explicit warning — never silently, never auto-promoted to webgl2.
     setCVar('vid_renderer', 'voodoo');
-    expect(resolveBootRenderer()).toEqual({ kind: 'voodoo', warning: null });
+    const sel = resolveBootRenderer();
+    expect(sel.kind).toBe('software');
+    expect(sel.warning).not.toBeNull();
+    expect(sel.warning).toContain('voodoo');
   });
 
   it('webgl2-experimental + incapable probe falls back to software WITH a recorded warning', () => {
@@ -91,23 +96,21 @@ describe('GPU-PROOF-2 selection/plumbing (headless, no real GL)', () => {
     }
   });
 
-  it('software/voodoo boots and hot-swaps stay warning-free (zero behavior change)', () => {
+  it('software boots and hot-swaps stay warning-free (zero behavior change)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       setCVar('vid_renderer', 'software');
       const boot = bootPlay({ width: 64, height: 48 });
       expect(boot.renderer).toBe('software');
       expect(boot.lastRendererWarning).toBeNull();
-      // armRasterPolicy with a real renderer hooks the RGB path silently.
       expect(warn).not.toHaveBeenCalled();
-      setCVar('vid_renderer', 'voodoo');
-      expect(applyRendererCvar(boot)).toBe('voodoo');
-      expect(boot.renderer).toBe('voodoo');
+      setCVar('vid_renderer', 'software');
+      expect(applyRendererCvar(boot)).toBe('software');
+      expect(boot.renderer).toBe('software');
       expect(boot.lastRendererWarning).toBeNull();
       expect(warn).not.toHaveBeenCalled();
-      // Voodoo boots still render a working CPU frame (host stats report
-      // pixels: 0 on the RGB path by construction — the proof is nonzero
-      // resolveDisplay output, as the voodoo-display suites assert).
+      // Software boots render a working CPU frame (nonzero resolveDisplay
+      // output proves pixels flow through the software resolve).
       for (let t = 0; t <= 500; t += 16) boot.host.frame(t);
       const out = resolveDisplay(boot);
       expect(out.some((px) => px !== 0 && px !== 0xff000000)).toBe(true);
@@ -158,10 +161,8 @@ describe('GPU-PROOF-2 selection/plumbing (headless, no real GL)', () => {
         expect(boot.refresh).toBeInstanceOf(SoftwareRenderer);
         const stats = boot.host.frame(100);
         expect(stats.pixels).toBeGreaterThan(0);
-        // RGB world path stays OFF for the GPU selection (the GPU path does
-        // not use CPU RGB planes); voodoo is the only RGB-ON mode.
-        expect(boot.lastRasterPolicy.mode).toBe('webgl2-experimental');
-        expect(boot.lastRasterPolicy.rgbEnabled).toBe(false);
+        // The selection is recorded on the boot (no silent fallback).
+        expect(boot.renderer).toBe('webgl2-experimental');
       } finally {
         warn.mockRestore();
       }
@@ -187,12 +188,30 @@ describe('GPU-PROOF-2 selection/plumbing (headless, no real GL)', () => {
     expect(status.warning).not.toBeNull();
   });
 
+  it('retired voodoo hot-swap migrates to software WITH a warning (never silent, never GPU)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      setCVar('vid_renderer', 'software');
+      const boot = bootPlay({ width: 64, height: 48 });
+      expect(boot.lastRendererWarning).toBeNull();
+      setCVar('vid_renderer', 'voodoo');
+      expect(applyRendererCvar(boot)).toBe('software');
+      expect(boot.renderer).toBe('software');
+      expect(boot.gpu).toBeNull();
+      expect(boot.lastRendererWarning).not.toBeNull();
+      expect(boot.lastRendererWarning).toContain('voodoo');
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('display panel lists the experimental GPU option with a short experimental label', () => {
-    expect(cvarOptions('vid_renderer')).toEqual(['software', 'voodoo', 'webgl2-experimental']);
+    expect(cvarOptions('vid_renderer')).toEqual(['software', 'webgl2-experimental']);
     const labels = cvarOptionLabels('vid_renderer');
     expect(labels).not.toBeNull();
-    expect(labels!.length).toBe(3);
-    expect(labels![2]).toContain('experimental');
+    expect(labels!.length).toBe(2);
+    expect(labels![1]).toContain('experimental');
     setRendererChoice('webgl2-experimental');
     expect(cvarOptions('vid_renderer')).toContain('webgl2-experimental');
   });

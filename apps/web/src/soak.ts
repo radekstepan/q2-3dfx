@@ -27,7 +27,7 @@ export const SOAK_WIDTH = 640;
 export const SOAK_HEIGHT = 480;
 
 /** Renderer ids accepted by the soak hook (mirrors the vid_renderer domain). */
-export const SOAK_RENDERERS = ['software', 'voodoo', 'webgl2-experimental'] as const;
+export const SOAK_RENDERERS = ['software', 'webgl2-experimental'] as const;
 
 /** Soak renderer request (validated against SOAK_RENDERERS). */
 export type SoakRenderer = (typeof SOAK_RENDERERS)[number];

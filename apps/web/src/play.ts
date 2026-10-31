@@ -111,8 +111,7 @@ import type { ServerState, ServerMonster, ServerBarrel, ServerBolt, ServerExplos
 import { ATTN_NORM, Mixer } from '@q2/sound';
 import { parseMD2, parseWAL, parsePCX } from '@q2/formats';
 import type { Pcx } from '@q2/formats';
-import { expandRGB565, gammaLUT, readVoodooState, resolveFrame } from '@q2/voodoo';
-import type { VoodooState } from '@q2/voodoo';
+
 import { AngleVectors, v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import { SERVER_DT, getCVar, getCVarNumber, getCVarString, registerCVar } from '@q2/config';
@@ -120,11 +119,11 @@ import type { Entity, GpuLight, GpuRendererStatus, GpuSceneInput, RefDef, Resolv
 import type { GpuCapability } from '@q2/renderer-api';
 
 /**
- * Renderer selection (GPU-PROOF-2): `software` | `voodoo` |
- * `webgl2-experimental` (alias of `ResolvedBackend` from
- * `@q2/renderer-api`, the single source of truth). The GPU id is
- * experimental and capability-gated — see `resolveBootRenderer` in
- * `./gpu-select.ts`.
+ * Renderer selection (RELEASE-8): `software` | `webgl2-experimental`
+ * (alias of `ResolvedBackend` from `@q2/renderer-api`, the single source
+ * of truth — the legacy CPU `voodoo` id migrates to `software` with a
+ * warning, never auto-promoted). The GPU id is experimental and
+ * capability-gated — see `resolveBootRenderer` in `./gpu-select.ts`.
  */
 export type RendererKind = ResolvedBackend;
 export { detectGpuCapability, getGpuStatus, resolveBootRenderer };
@@ -132,8 +131,7 @@ export type { GpuCapability };
 import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
-import { selectVoodooBandPath, snapshotVoodooState, voodooStateToScanoutOpts } from './render-workers.js';
-import type { BrowserForegroundDetail, DiagSnapshot, KickTiming, ScanoutBandOptions, VoodooBandPath } from './render-workers.js';
+import type { DiagSnapshot, KickTiming } from './render-workers.js';
 import { detectGpuCapability, getGpuStatus, resolveBootRenderer } from './gpu-select.js';
 import { acquireGpuCanvas, attachGpuCanvasLifecycle, hasGpuCanvasLifecycle, removeGpuCanvas, setGpuCanvasSize, setHudTransparent, syncGpuCanvasToHud } from './gpu-canvas.js';
 import { modelKindsForFrame, synthesizeBeamEntities } from './gpu-effects.js';
@@ -154,30 +152,15 @@ if (typeof refreshGpuScene !== 'function') {
 
 /**
  * Which resolve path the last `resolveDisplay` took (observability for
- * tests/debug; V2d). `strict-hud-first` = HUD composed into the emulated
- * pre-scanout target before reconstruction; `legacy-hud-last` = current
- * paint-HUD-after behaviour; `software-*` = direct engine buffer paths.
+ * tests/debug). RELEASE-8: the CPU software resolve only —
+ * `software-passthrough` (brightness 1.0, engine buffer by reference) or
+ * `software-lifted` (post-resolve `r_brightness` copy). The legacy CPU
+ * voodoo scanout is retired; WebGL2 owns appearance via `vd_*` uniforms.
  */
 export type ResolveOrder =
   | 'none'
-  | 'strict-hud-first'
-  | 'legacy-hud-last'
   | 'software-passthrough'
   | 'software-lifted';
-
-/**
- * Last `armRasterPolicy` outcome (P1 observability: the old hook-probe
- * silently no-oped, leaving voodoo mode on the indexed rasterizer).
- * `mode` echoes the boot renderer the policy armed for, `rgbEnabled` is the
- * requested RGB-world state (true in voodoo mode), and `hooked` reports
- * whether a real renderer hook consumed the request. When `hooked` is false
- * `armRasterPolicy` `console.warn`s and keeps the indexed fallback.
- */
-export interface RasterPolicyStatus {
-  mode: RendererKind;
-  rgbEnabled: boolean;
-  hooked: boolean;
-}
 
 /**
  * Rotate a baked brush-model vertex about a pivot by Quake delta angles
@@ -218,10 +201,8 @@ export function rotateDoorVert(base: Vec3, pivot: Vec3, delta: Vec3, out?: Vec3)
 // `r_brightness` is a pure presentation lift applied post-resolve in
 // `resolveDisplay` (0xAABBGGRR scale + clamp). It never touches lightmaps,
 // the palette, the pak, or the renderer internals — the framebuffer the
-// engine produced is unchanged. Strict voodoo is EXEMPT (effective 1.0):
-// `vd_gamma` inside `resolveFrame` is already the display-gamma stage, so
-// stacking the lift would double-apply gamma; legacy voodoo + software keep
-// it. Registered here (apps/web owns the display path); `getBrightness`
+// engine produced is unchanged. Registered here (apps/web owns the display
+// path); `getBrightness`
 // treats an absent cvar (e.g. after `resetCVars()` in tests) as the default
 // so headless boots stay deterministic.
 export const BRIGHTNESS_DEFAULT = 2.0;
@@ -3108,48 +3089,15 @@ export interface PlayBoot {
   lastRendererWarning: string | null;
   source: 'devroom' | 'pak';
   display: Uint32Array;
-  fb565: Uint16Array;
-  /**
-   * Strict Voodoo presentation (V2d, default ON): HUD is composed into the
-   * emulated pre-scanout target BEFORE reconstruction + display gamma
-   * (astra §4 pipeline). When false the legacy path paints HUD after
-   * resolve (same as the software path). Flip per-boot in tests; the live
-   * loop keeps the default.
-   */
-  strictVoodoo: boolean;
   /** Which resolve path the last `resolveDisplay` took (see ResolveOrder). */
   lastResolveOrder: ResolveOrder;
   /**
-   * Explicit raster-policy selection for the last voodoo resolve (V2d):
-   * `serial` = supported main-thread `resolveFrame` after all bands
-   * completed; never a silent software fallback (see selectVoodooBandPath).
-   */
-  lastVoodooPath: VoodooBandPath | 'none';
-  /**
-   * Last `armRasterPolicy` outcome (P1: `{mode, rgbEnabled, hooked}` for
-   * tests; `hooked === false` means no renderer hook consumed the request
-   * and the indexed fallback is active — see `armRasterPolicy`).
-   */
-  lastRasterPolicy: RasterPolicyStatus;
-  /**
    * Browser worker pool attached by `attachBrowserPool` (null = sync /
    * single-threaded path: headless, no SAB, or `sw_workers` 0). Set once
-   * per boot; `frameAsync` feature-detects `broadcastVoodooState` on it to
-   * transfer the frame's single VoodooState snapshot to every band.
+   * per boot. The pool carries indexed raster/resolve kicks only
+   * (RELEASE-8: no CPU voodoo resolve); WebGL2 owns appearance.
    */
   browserPool: BrowserBandPool | null;
-  /**
-   * Monotonic pooled-scanout kick outcomes (Track A soak observability):
-   * `statScanoutKicks` counts frames the browser pool scanout completed
-   * (display == shared scanout buffers, zero copy); `statScanoutFallbacks`
-   * counts frames the pooled kick was attempted but failed (timeout/dead
-   * worker → serial `resolveDisplay`, bit-identical pixels). A healthy
-   * pooled soak shows kicks == frames and fallbacks == 0; any nonzero
-   * fallback count proves the fallback path executed (never silent).
-   * Written only by `resolveDisplayAsync`, read by `publishQ2Stats`.
-   */
-  statScanoutKicks: number;
-  statScanoutFallbacks: number;
   /**
    * `frameAsync` failures the dom.ts rAF tick absorbed via the classic sync
    * fallback (worker timeout, torn-down pool). Incremented in the tick
@@ -3265,8 +3213,9 @@ export interface GpuBootState {
 
 /**
  * Pinned appearance cvars wired into the GPU live loop (contract §3: the 15
- * `vd_*` + `sw_*` cvars; the GPU backend honors the `vd_*` subset with the
- * same semantics as the CPU voodoo path). Read-only here: this module never
+ * `vd_*` + `sw_*` cvars; the GPU backend honors the `vd_*` subset as its
+ * appearance uniforms (RELEASE-8: the CPU voodoo execution path these cvars
+ * once drove is retired). Read-only here: this module never
  * registers or writes them, so defaults are untouched.
  */
 export const GPU_APPEARANCE_CVARS = [
@@ -3290,7 +3239,7 @@ export const GPU_APPEARANCE_CVARS = [
 /** One frame's appearance inputs (stringified cvar values, observable in tests). */
 export type GpuAppearanceSnapshot = Record<string, string>;
 
-/** Snapshot every pinned `vd_*` cvar (same read-every-frame rule as `readVoodooState`). */
+/** Snapshot every pinned `vd_*` cvar (same read-every-frame rule the retired CPU path used). */
 export function readGpuAppearanceSnapshot(): GpuAppearanceSnapshot {
   const snap: GpuAppearanceSnapshot = {};
   for (const name of GPU_APPEARANCE_CVARS) snap[name] = getCVarString(name);
@@ -3309,7 +3258,6 @@ export function readGpuAppearanceSnapshot(): GpuAppearanceSnapshot {
 export const GPU_APPEARANCE_HOOKS = [
   'setAppearance',
   'applyAppearance',
-  'setVoodooState',
   'setCvars',
 ] as const;
 
@@ -4147,19 +4095,15 @@ export function bootPlay(opts: {
   const hudPics = opts.pak && mainPalette ? buildHudPicCache(opts.pak) : null;
   const boot: PlayBoot = {
     host, driver, refresh, renderer, lastRendererWarning: rendererWarning, source: driver.source,
-    display: new Uint32Array(n), fb565: new Uint16Array(n),
-    strictVoodoo: true, lastResolveOrder: 'none', lastVoodooPath: 'none',
-    lastRasterPolicy: { mode: renderer, rgbEnabled: false, hooked: false },
+    display: new Uint32Array(n),
+    lastResolveOrder: 'none',
     browserPool: null,
-    statScanoutKicks: 0, statScanoutFallbacks: 0, statAsyncFallbacks: 0,
+    statAsyncFallbacks: 0,
     models, pak: opts.pak ?? null, sky: retainedSky, skyWarning, gpu,
     palette: mainPalette,
     hudPics,
     showHelp: false,
   };
-  // Arm the raster policy the cvar selects (RGB path on for voodoo, off for
-  // software) so a voodoo boot never starts on the wrong backend.
-  armRasterPolicy(boot);
   // GPU-FOLLOW-4 (1): wire the real canvas contextlost/restored pair now that
   // the boot exists (no-op without a GPU backend; exactly-once per canvas).
   if (boot.gpu) wireGpuLifecycle(boot);
@@ -4241,13 +4185,10 @@ export function resizePlay(boot: PlayBoot, width: number, height: number): boole
     const copyW = Math.min(prev.width, width);
     const copyH = Math.min(prev.height, height);
     const nextDisplay = new Uint32Array(width * height);
-    const next565 = new Uint16Array(width * height);
     for (let y = 0; y < copyH; y++) {
       nextDisplay.set(boot.display.subarray(y * prev.width, y * prev.width + copyW), y * width);
-      next565.set(boot.fb565.subarray(y * prev.width, y * prev.width + copyW), y * width);
     }
     boot.display = nextDisplay;
-    boot.fb565 = next565;
     if (boot.gpu) resizeGpuBackend(boot, width, height);
     try {
       boot.refresh.syncWorkersFromCvar?.();
@@ -4326,13 +4267,8 @@ function gpuPaletteFor(boot: PlayBoot): Uint8Array | null {
  * Host/LocalDriver/server state is touched — player pos, health, ammo and
  * monsters survive the switch. Records the fallback warning on the boot
  * (`lastRendererWarning`, null when honored) and `console.warn`s it —
- * fallbacks are never silent. Headless-safe.
- *
- * V2d raster policy: the switch also arms/disarms the sw-renderer RGB world
- * path (voodoo ON, everything else OFF — see `armRasterPolicy`) via the
- * optional hooks below, invalidates incompatible texture/light caches, and
- * zeroes the shell-owned scratch planes so the next frame can never show
- * previous-mode pixels.
+ * fallbacks are never silent. Headless-safe. The shell-owned display
+ * scratch is zeroed so the next frame can never show previous-mode pixels.
  */
 export function applyRendererCvar(boot: PlayBoot): RendererKind {
   const resolved = resolveBootRenderer();
@@ -4405,253 +4341,43 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
   if (warning !== null) {
     console.warn(`[q2ts-web] applyRendererCvar: ${warning}`);
   }
-  armRasterPolicy(boot);
+  // Shell-owned scratch: zero so the next frame can never show
+  // previous-mode pixels (engine planes are repainted by the next render).
+  boot.display.fill(0);
   return boot.renderer;
 }
 
-/* --- V2d raster-policy hooks (feature-detected, never imported) ---------
+/* --- resolve ownership (RELEASE-8) --------------------------------------
  *
- * The sw-renderer RGB-world switch exists as BOTH the module-level
- * `setRGBWorldEnabled(bool)` / `isRGBWorldEnabled()` pair and the
- * `SoftwareRenderer.setRGBWorldEnabled/isRGBWorldEnabled/invalidateCaches`
- * instance methods (`packages/sw-renderer/src/frame.ts`). The shell probes
- * the instance first (correct per-renderer state + cache drop); the hook
- * names below are probed with `as unknown as` so this file passes with or
- * without future renames. A miss records `hooked: false` and warns LOUDLY
- * instead of silently running the indexed rasterizer in voodoo mode (P1).
- *
- * Hook names (tried in order):
- *   RGB arm/disarm: setRGBWorldEnabled(bool)
- *   cache invalidate: invalidateCaches() | invalidateTextureCaches() |
- *     clearTextureCache() | invalidateLightCaches() | clearCaches()
- *   scanout-done flag: voodooScanoutDone() -> boolean (see resolveDisplay)
- */
-const RGB_ENABLE_HOOKS = [
-  'setRGBWorldEnabled',
-  'setRGBWorld',
-  'enableRGBWorld',
-  'setVoodooRGBEnabled',
-] as const;
-
-const CACHE_INVALIDATE_HOOKS = [
-  'invalidateCaches',
-  'invalidateTextureCaches',
-  'clearTextureCache',
-  'invalidateLightCaches',
-  'clearCaches',
-] as const;
-
-/** Probe an optional no-arg/boolean hook set; call the first one present. */
-function callFirstHook(target: object, names: readonly string[], arg?: boolean): boolean {
-  const rec = target as unknown as Record<string, unknown>;
-  for (const name of names) {
-    const fn = rec[name];
-    if (typeof fn === 'function') {
-      try {
-        if (arg === undefined) (fn as () => void).call(target);
-        else (fn as (on: boolean) => void).call(target, arg);
-      } catch {
-        /* a throwing future hook must never break the hot-swap */
-      }
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Arm/disarm the raster policy for `boot.renderer` (shared by bootPlay and
- * applyRendererCvar): voodoo arms the sw-renderer RGB world path, everything
- * else disarms it. `webgl2-experimental` boots with the RGB path OFF on
- * purpose: the GPU path does not use the CPU RGB planes (PROOF-2 draws
- * nothing on the GPU; PROOF-3 will own its own resources), so arming the
- * CPU RGB world for a GPU selection would only burn CPU raster work the
- * scanout never reads. Invalidates incompatible texture/light caches when a hook is
- * present (TODO(V2d): no public cache-invalidate hook exists on
- * SoftwareRenderer yet — `surfaceCache.invalidateAll` is internal — so this
- * currently documents the need; the scratch-plane zeroing below is what
- * guarantees no stale frame today).
- *
- * Returns whether a real renderer hook consumed the request and records the
- * outcome on `boot.lastRasterPolicy` (P1 observability). When no hook is
- * present it `console.warn`s (loud, not silent) and keeps the indexed
- * fallback. Never throws.
- */
-export function armRasterPolicy(boot: PlayBoot): boolean {
-  const voodoo = boot.renderer === 'voodoo';
-  const hooked = callFirstHook(boot.refresh, RGB_ENABLE_HOOKS, voodoo);
-  boot.lastRasterPolicy = { mode: boot.renderer, rgbEnabled: voodoo, hooked };
-  if (!hooked) {
-    console.warn(
-      `[q2ts-web] armRasterPolicy(${boot.renderer}): no RGB-world hook on ` +
-        `SoftwareRenderer (tried ${RGB_ENABLE_HOOKS.join(', ')}) — indexed ` +
-        `fallback stays active until the sw-renderer instance hook lands`,
-    );
-  }
-  // TODO(V2d): call the real texture/light cache invalidate hooks once the
-  // sw-renderer card publishes them; no public hook exists at this HEAD.
-  callFirstHook(boot.refresh, CACHE_INVALIDATE_HOOKS);
-  // Shell-owned scratch: zero so the next resolve can never show
-  // previous-mode pixels (engine planes are repainted by the next render).
-  boot.display.fill(0);
-  boot.fb565.fill(0);
-  return hooked;
-}
-
-/* --- V2d resolve ownership (astra §5) ------------------------------------
- *
- * SINGLE OWNER: the SHELL owns scanout. `SoftwareRenderer.endFrame` /
- * `endFrameAsync` own only the palette-expand into the live `color` plane
- * (the pre-scanout target for voodoo mode too — no @q2/voodoo call there);
- * `resolveDisplay` below runs the ONE voodoo resolve (`resolveFrame`) per
- * frame. If a future renderer-side voodoo backend ever performs its own
- * scanout it must flag it via the optional `voodooScanoutDone() -> boolean`
- * hook; when present and true the shell skips its resolve so exactly one
- * resolve runs (double-resolve guard).
- *
- * Strict voodoo path (`boot.strictVoodoo`, default ON for voodoo mode):
- * HUD is composed into the emulated target BEFORE scanout reconstruction
- * + display gamma (astra §4 pipeline). Legacy/software path keeps the
- * current paint-HUD-after + `r_brightness` behaviour. The legacy
- * `r_brightness` lift is retained post-scanout in the LEGACY voodoo branch
- * only: strict voodoo skips it (effective brightness 1.0) because
- * `vd_gamma` inside `resolveFrame` is already the display-gamma stage —
- * stacking the lift on top would double-apply gamma.
+ * SINGLE OWNER: the SHELL owns the presented frame. `SoftwareRenderer.endFrame` /
+ * `endFrameAsync` own only the palette expand into the live `color` plane;
+ * `resolveDisplay` below applies the display-only `r_brightness` lift (or
+ * returns the engine buffer untouched at 1.0). No `@q2/voodoo` code runs on
+ * the CPU path; WebGL2 owns appearance via `vd_*` uniforms.
  */
 
-/** Optional renderer-side scanout-done flag (see ownership note above). */
-function rendererDidScanout(boot: PlayBoot): boolean {
-  const rec = boot.refresh as unknown as Record<string, unknown>;
-  const fn = rec['voodooScanoutDone'];
-  if (typeof fn !== 'function') return false;
-  try {
-    return (fn as () => unknown).call(boot.refresh) === true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Compose HUD into the live pre-scanout target (strict voodoo only): the
- * same `drawPlayHud` pass the legacy path runs post-resolve, but painted
- * onto the engine `color` plane BEFORE `resolveFrame` so HUD pixels travel
- * through dither/quantise/reconstruction/gamma like the scene. The next
- * renderView repaints the plane, so no HUD ghost survives.
- */
-export function paintHudPreScanout(boot: PlayBoot, hud: HudState): void {
-  const { host } = boot;
-  const live = boot.refresh.getFramebuffer().color;
-  drawPlayHud(
-    { width: host.fb.width, height: host.fb.height, color: live },
-    boot,
-    hud,
-  );
-}
-
-/**
- * True when the shell composes HUD pre-scanout (strict voodoo): callers
- * (dom finishFrame) must NOT paint HUD again post-resolve — that would
- * double-paint and defeat the strict ordering.
- *
- * PROOF-2: `webgl2-experimental` intentionally reads false here (like
- * software) — HUD composition and the resolve path stay on the CPU until
- * PROOF-3 lands GPU drawing.
- */
-export function hudComposedPreScanout(boot: PlayBoot): boolean {
-  return getCVarString('vid_renderer') === 'voodoo' && boot.strictVoodoo;
-}
-
-/** Resolve the software framebuffer for display (voodoo post chain or direct).
+/** Resolve the software framebuffer for display (software path only).
  *
  * Display-only `r_brightness` lift (see `getBrightness`) is applied to the
- * scene copy here, *before* `drawPlayHud` paints on top — so HUD text keeps
- * its full authored colour and is never dimmed or clipped by the lift.
- * At 1.0 the software path returns the engine buffer untouched
+ * scene copy here, *before* the caller paints HUD on top via `drawPlayHud` —
+ * so HUD text keeps its full authored colour and is never dimmed or clipped
+ * by the lift. At 1.0 the software path returns the engine buffer untouched
  * (byte-identical, same reference).
  *
- * Strict voodoo (`boot.strictVoodoo`, default ON) SKIPS the `r_brightness`
- * post-scanout lift (effective brightness 1.0): `vd_gamma` inside
- * `resolveFrame` is already the display-gamma stage, so stacking the lift
- * would double-apply gamma. The legacy voodoo branch keeps the lift.
- *
- * V2d: `hud` enables the strict-voodoo pre-scanout HUD composition (painted
- * into the emulated target before `resolveFrame`). Omit it (headless/tests)
- * to resolve the scene alone; the legacy post-resolve HUD pass is unchanged.
- *
- * `frameState` is the frame's single VoodooState snapshot (astra §5): when
- * provided (the `frameAsync` path snapshots once per frame and shares it
- * with every band via `broadcastBandVoodoo`) the resolve reuses it instead
- * of taking a second `readVoodooState()`, so bands and scanout can never
- * disagree mid-frame. Omit it and the resolve snapshots itself (sync path).
+ * RELEASE-8: the CPU voodoo scanout is retired. `hud` is accepted for
+ * signature compatibility (bench + historical callers) and ignored — HUD
+ * is always painted post-resolve by the caller. `frameState` is accepted
+ * for the same reason and ignored.
  */
-export function resolveDisplay(boot: PlayBoot, hud?: HudState, frameState?: VoodooState): Uint32Array {
-  const { host } = boot;
+export function resolveDisplay(boot: PlayBoot, hud?: HudState, frameState?: unknown): Uint32Array {
+  void hud;
+  void frameState;
   const brightness = getBrightness();
   // Source the LIVE renderer color plane, not host.fb.color: with a worker
   // pool attached the renderer adopts the pool's shared color plane (and
   // the wasm backend draws into wasm memory), so host.fb.color is stale
   // there. Classic path: the same array (behaviour unchanged).
   const live = boot.refresh.getFramebuffer().color;
-  if (getCVarString('vid_renderer') === 'voodoo') {
-    const w = host.fb.width;
-    const h = host.fb.height;
-    const n = w * h;
-    // One VoodooState snapshot per frame, passed explicitly (astra §5): no
-    // per-pixel cvar reads inside the resolve, and the same object selects
-    // the band envelopes (see render-workers.ts). The async path passes its
-    // already-broadcast snapshot in; the sync path snapshots here.
-    const st: VoodooState = frameState ?? readVoodooState();
-    // Sync resolve always runs the serial main-thread scanout (the pooled
-    // parallel path is async-only via resolveDisplayAsync, since the browser
-    // main thread must never block). Record 'serial' explicitly.
-    boot.lastVoodooPath = selectVoodooBandPath(false);
-    // Double-resolve guard (see ownership note): a renderer-side scanout
-    // wins when flagged; the shell resolve below is then skipped.
-    if (!rendererDidScanout(boot)) {
-      if (boot.strictVoodoo) {
-        // STRICT: HUD into the emulated target BEFORE scanout so the
-        // reconstruction filter taps cross HUD/scene edges with absolute
-        // screen-coordinate dither phase (global frame, never per-band).
-        // NO r_brightness post-scanout lift here (effective 1.0): vd_gamma
-        // inside resolveFrame is already the display-gamma stage, so
-        // stacking the lift would double-apply gamma.
-        if (hud !== undefined) paintHudPreScanout(boot, hud);
-        boot.lastResolveOrder = 'strict-hud-first';
-        resolveFrame(live, boot.fb565, boot.display, w, h, st);
-      } else {
-        // LEGACY: scanout first, HUD painted after by the caller. Keeps the
-        // r_brightness post-scanout lift (compat); strict mode above skips it.
-        boot.lastResolveOrder = 'legacy-hud-last';
-        // Canary for pre-fix `resolveFrame` (astra §2 defect #1): it only fills
-        // `display` when `vd_postfilter` is on, leaving last frame's
-        // (HUD-painted) pixels stale when off. The sentinel alpha (0x12) can
-        // never occur in real resolve output (always opaque 0xFF), so a
-        // surviving sentinel proves `display` was left untouched and the web
-        // side backfills the current frame below. Once the voodoo fix lands,
-        // `resolveFrame` overwrites the canary with real output (565 expand
-        // when `vd_16bit` is on, `resolveRGB888` when off) and the backfill
-        // never runs — robust to both behaviours with zero extra passes.
-        let canary = false;
-        if (getCVarNumber('vd_postfilter') === 0 && n > 0) {
-          boot.display[0] = VOODOO_STALE_SENTINEL;
-          canary = true;
-        }
-        resolveFrame(live, boot.fb565, boot.display, w, h, st);
-        if (canary && boot.display[0] === VOODOO_STALE_SENTINEL) {
-          if (getCVarNumber('vd_16bit') !== 0) {
-            for (let i = 0; i < n; i++) boot.display[i] = expandRGB565(boot.fb565[i]!);
-          } else {
-            backfillRGB888(live, boot.display, n);
-          }
-        }
-      }
-    }
-    // r_brightness post-scanout lift: LEGACY voodoo branch only. Strict
-    // voodoo skips it (vd_gamma is the display-gamma stage there).
-    if (!boot.strictVoodoo) applyBrightness(boot.display, brightness);
-    return boot.display;
-  }
-  boot.lastVoodooPath = 'none';
   if (brightness === 1) {
     boot.lastResolveOrder = 'software-passthrough';
     return live;
@@ -4662,167 +4388,6 @@ export function resolveDisplay(boot: PlayBoot, hud?: HudState, frameState?: Vood
   return boot.display;
 }
 
-/**
- * Async voodoo resolve (Track A parallel scanout): same ordering + fidelity
- * as resolveDisplay, but the scanout runs across the browser worker pool
- * when available (disjoint row bands, halo-safe, global dither phase,
- * HUD-before-scanout preserved). Exactly one scanout runs per frame; on any
- * pool failure it falls back to the serial resolveDisplay path (identical).
- * Software mode delegates directly (no scanout).
- */
-export async function resolveDisplayAsync(boot: PlayBoot, hud?: HudState, frameState?: VoodooState): Promise<Uint32Array> {
-  const { host } = boot;
-  if (getCVarString('vid_renderer') !== 'voodoo') {
-    return resolveDisplay(boot, hud, frameState);
-  }
-  const w = host.fb.width;
-  const h = host.fb.height;
-  const st: VoodooState = frameState ?? readVoodooState();
-  if (rendererDidScanout(boot)) {
-    return resolveDisplay(boot, hud, frameState);
-  }
-  // HUD-before-scanout preserved (strict mode): paint into the live shared
-  // color plane before the pooled kick reads it (immutable input for the kick).
-  if (boot.strictVoodoo && hud !== undefined) {
-    paintHudPreScanout(boot, hud);
-  }
-  const pool = boot.browserPool;
-  const pooled = boot.refresh.testWorkerStats().pooled && pool !== null;
-  if (pooled && pool !== null) {
-    try {
-      const opts = voodooStateToScanoutOpts(st);
-      const ok = await (pool as unknown as {
-        flushScanoutAsync(o: ScanoutBandOptions): Promise<boolean>;
-      }).flushScanoutAsync(opts);
-      if (ok) {
-        // Pooled scanout wrote the shared buffers adopted as boot.fb565 /
-        // display at attach time. When the boot still owns separate buffers
-        // (headless/test boots without attach), copy over so callers always
-        // observe boot.display/fb565.
-        try {
-          const sp = (pool as unknown as {
-            scanoutPlanes: { scan565: Uint16Array; scanDisplay: Uint32Array };
-          }).scanoutPlanes;
-          if (boot.display !== sp.scanDisplay) {
-            boot.fb565.set(sp.scan565.subarray(0, boot.fb565.length));
-            boot.display.set(sp.scanDisplay.subarray(0, boot.display.length));
-          }
-        } catch {
-          /* alias check failed: display already correct via shared write */
-        }
-        boot.statScanoutKicks += 1;
-        boot.lastVoodooPath = selectVoodooBandPath(true);
-        boot.lastResolveOrder = boot.strictVoodoo ? 'strict-hud-first' : 'legacy-hud-last';
-        if (!boot.strictVoodoo) {
-          applyBrightness(boot.display, getBrightness());
-        }
-        return boot.display;
-      }
-    } catch {
-      /* fall through to serial */
-    }
-    // Pooled kick attempted but failed (false/timeout/throw): exactly one
-    // serial scanout below, pixels bit-identical. Count it so soaks prove
-    // the fallback path executed instead of inferring health from fps.
-    boot.statScanoutFallbacks += 1;
-  }
-  // Fallback / legacy branch: exactly one serial scanout. HUD was already
-  // painted above in strict mode, so call the scene-only resolve then skip
-  // the duplicate HUD paint inside resolveDisplay by passing no hud.
-  // Legacy mode still needs its HUD-after behaviour, handled by the caller.
-  const out = resolveDisplay(boot, boot.strictVoodoo ? undefined : hud, st);
-  // resolveDisplay painted HUD again in strict mode (we pre-painted); the
-  // double-paint is idempotent for conchars glyphs (same pixels), but record
-  // the pooled-attempt path correctly.
-  if (boot.strictVoodoo) {
-    boot.lastVoodooPath = selectVoodooBandPath(false);
-  }
-  return out;
-}
-
-/**
- * Sentinel marking an unwritten voodoo display pixel (see `resolveDisplay`).
- * Alpha 0x12 is impossible in resolve output (always opaque), so a survivor
- * unambiguously detects the pre-fix `resolveFrame` stale path.
- */
-const VOODOO_STALE_SENTINEL = 0x12345678;
-
-/**
- * Genuine RGB888 backfill for the `vd_16bit`-off + postfilter-off corner
- * under pre-fix `resolveFrame`: gamma-lifted copy of the live frame, no
- * dither, no reconstruction. The bypass keeps the gamma stage and skips the
- * quantiser (astra §2 defect #2), mirroring `resolveRGB888` semantics so the
- * web side converges to the same pixels once the voodoo fix lands.
- * Zero-alloc; display-only, never renderer state.
- */
-function backfillRGB888(src: Uint32Array, dst: Uint32Array, n: number): void {
-  const gamma = getCVarNumber('vd_gamma');
-  const lut = gamma !== 1 && gamma > 0 && Number.isFinite(gamma) ? gammaLUT(gamma) : null;
-  for (let i = 0; i < n; i++) {
-    const px = src[i]!;
-    let r = px & 255;
-    let g = (px >> 8) & 255;
-    let b = (px >> 16) & 255;
-    if (lut !== null) {
-      r = lut[r]!;
-      g = lut[g]!;
-      b = lut[b]!;
-    }
-    dst[i] = (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
-  }
-}
-
-/* --- V2d strict-voodoo presentation (astra §4) ---------------------------
- *
- * The emulated image presents fixed 640×480 4:3 (the first capture
- * resolution) with a CONTROLLED upscale only: the canvas is blitted with
- * putImageData (exact pixels, never filtered) and CSS-scaled with
- * `image-rendering: pixelated`, so there is no second smoothing pass after
- * the scanout reconstruction filter. Browser debug controls (the cvar
- * panel, menus) are DOM elements OUTSIDE the canvas — never part of the
- * emulated image. Strict mode expects a 4:3 framebuffer (the menu only
- * offers 4:3 sizes); non-4:3 sizes keep the legacy CSS stretch and are
- * reported by isVoodooAspect.
- */
-
-/** Strict-voodoo capture resolution (fixed 4:3 emulated image). */
-export const VOODOO_FRAME_WIDTH = 640;
-/** Strict-voodoo capture resolution (fixed 4:3 emulated image). */
-export const VOODOO_FRAME_HEIGHT = 480;
-
-/**
- * True when a framebuffer is 4:3 within rounding (the strict-voodoo
- * presentation contract). Pure/headless-safe.
- */
-export function isVoodooAspect(w: number, h: number): boolean {
-  if (!(w > 0) || !(h > 0)) return false;
-  return Math.abs((w / h) / (VOODOO_FRAME_WIDTH / VOODOO_FRAME_HEIGHT) - 1) < 0.01;
-}
-
-/**
- * Apply the strict-voodoo canvas presentation (pixelated controlled
- * upscale, no smoothing). Feature-detected no-op headless (unknown canvas
- * shape); safe to call every frame (idempotent style writes). Browser
- * debug controls stay DOM-side — this never touches them.
- */
-export function applyVoodooPresentation(canvas: unknown): void {
-  try {
-    const el = canvas as { style?: Record<string, string> } | null;
-    if (!el || typeof el !== 'object' || !el.style) return;
-    el.style['imageRendering'] = 'pixelated';
-  } catch {
-    /* headless: presentation is a no-op without DOM */
-  }
-}
-
-/**
- * Pump the one-shot muzzle-flash dynamic light into the renderer. Call
- * before the frame renders (the dom rAF tick does this; headless tests call
- * it directly). Clears the renderer's dlight list first so the flash can
- * never accumulate — exactly one add per shot, baseline restored on expiry.
- * The clear hook is feature-detected (a future expiry hook wins when
- * present). No-op once the flash window expires or was already drained.
- */
 export function pumpMuzzleLight(boot: PlayBoot): boolean {
   const hooks = boot.refresh as unknown as {
     testExpireDynamicLights?: () => void;
@@ -5523,8 +5088,6 @@ export function createAsyncLoopState(): AsyncLoopState {
  */
 export function attachBrowserPool(boot: PlayBoot, workers?: number): BrowserBandPool | null {
   const { refresh, host } = boot;
-  // The boot records the pool (or its absence) so frameAsync can transfer
-  // the frame's VoodooState snapshot to every band (see broadcastBandVoodoo).
   const drop = (pool: BrowserBandPool | null): BrowserBandPool | null => {
     boot.browserPool = pool;
     return pool;
@@ -5543,46 +5106,7 @@ export function attachBrowserPool(boot: PlayBoot, workers?: number): BrowserBand
   const pool = BrowserBandPool.create(n, host.fb.width, host.fb.height);
   if (!pool) return drop(null);
   refresh.attachWorkerPool(pool);
-  // Track A: adopt the pool's shared scanout buffers as the boot's presented
-  // buffers (zero copy). Workers write scanout directly into these; the
-  // serial fallback writes into the same arrays from the main thread, so
-  // both paths converge without extra copies. Sizes match by construction
-  // (pool created for this WxH).
-  try {
-    const sp = pool.scanoutPlanes;
-    if (sp.scan565.length === host.fb.width * host.fb.height &&
-      sp.scanDisplay.length === host.fb.width * host.fb.height) {
-      boot.fb565 = sp.scan565;
-      boot.display = sp.scanDisplay;
-    }
-  } catch {
-    /* keep owned buffers; pooled scanout copies (slower but identical) */
-  }
   return drop(pool);
-}
-
-/**
- * Transfer the frame's single VoodooState snapshot to every worker band
- * (astra §5 shell side): same snapshot values + absolute y0/y1 per band,
- * so a future worker-side voodoo backend rasterises with global dither
- * phase. Feature-detected (`as unknown as`) so the shell works with or
- * without a pool (or with a pool predating `broadcastVoodooState`):
- * absent/unavailable → 0, never throws. The current raster loop ignores
- * the stash — the shell still waits for ALL bands, then runs the ONE
- * global serial resolve in `resolveDisplay`.
- */
-export function broadcastBandVoodoo(boot: PlayBoot, st: VoodooState): number {
-  try {
-    const pool = boot.browserPool as unknown as {
-      broadcastVoodooState?: (state: VoodooState) => unknown;
-    } | null;
-    const fn = pool?.broadcastVoodooState;
-    if (typeof fn !== 'function') return 0;
-    const sent = fn.call(pool, st);
-    return typeof sent === 'number' && Number.isFinite(sent) ? sent : 0;
-  } catch {
-    return 0;
-  }
 }
 
 /**
@@ -5741,20 +5265,11 @@ export function buildAsyncView(host: Host, remainder = 0): { view: RefDef; rende
  * One async play-loop frame (the browser rAF body): pumps, sim, async
  * render, resolve. Returns the display buffer (same contract as
  * resolveDisplay). The dom tick keeps HUD + blit + sound after the await.
- *
- * V2d: `hud` threads through to `resolveDisplay` for the strict-voodoo
- * pre-scanout HUD composition; omit it (or run legacy/software) and HUD is
- * painted post-resolve by the caller as before.
- *
- * Voodoo modes snapshot ONE VoodooState per frame (astra §5): the snapshot
- * is broadcast to every worker band BEFORE the raster kick
- * (`broadcastBandVoodoo`, absolute y0/y1) and threaded into
- * `resolveDisplay`, so bands and the single global serial scanout share one
- * frame state. Software mode snapshots nothing.
+ * HUD is always painted post-resolve by the caller (RELEASE-8: no CPU
+ * voodoo pre-scanout composition).
  */
 export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: number, hud?: HudState): Promise<Uint32Array> {
-  const frameState = getCVarString('vid_renderer') === 'voodoo' ? snapshotVoodooState() : undefined;
-  if (frameState !== undefined) broadcastBandVoodoo(boot, frameState);
+  void hud;
   pumpMuzzleLight(boot);
   pumpExplosionLights(boot);
   pumpTracers(boot);
@@ -5763,7 +5278,7 @@ export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: numb
   boot.refresh.beginFrame();
   await boot.refresh.renderViewAsync(view, boot.host.world, renderables);
   await boot.refresh.endFrameAsync();
-  return resolveDisplayAsync(boot, hud, frameState);
+  return resolveDisplay(boot);
 }
 
 /* --- GPU-PROOF-5 iteration-1 work-split instrumentation -------------------
@@ -6089,91 +5604,39 @@ export interface StageReport {
   renderInternalMs: number;
   endMs: number;
   resolveMs: number;
-  /** Post-resolve HUD draw (0 when HUD rode pre-scanout: strict voodoo). */
+  /** Post-resolve HUD draw (0 when no HUD was passed). */
   hudMs: number;
   /** Optional blit stage (0 when no blit callback was passed). */
   blitMs: number;
   spans: number;
   pixels: number;
   overdraw: number;
-  /** RGB worker execution proof (staged/kicks per frame, inline fallbacks). */
-  staged: number;
-  inline: number;
-  kicks: number;
   pooled: boolean;
   bands: number;
-  /**
-   * Worker/main attribution for this frame's COMPLETED RGB kicks (world +
-   * foreground), in native units (PERF-NEXT-5, pool surface): worker-band
-   * completed work (`rgbWorker*`: actual execution, never staging) vs the
-   * calling-thread band's completed share (`rgbMain*`: main-band/inline,
-   * never worker). Combined kick totals reconcile as worker + main per
-   * unit; `tris` are per-band tri executions (boundary straddle can
-   * slightly exceed staged). Failed/refused kicks contribute nothing —
-   * their work is recounted by the renderer's inline/replay counters.
-   * -1 each when the pool probe is unavailable (unpooled boot, foreign
-   * pool without the accumulator): unknown, never worker-completed,
-   * never a silent zero. 0 with a live pool is the known idle state.
-   */
-  rgbWorkerSpans: number;
-  rgbWorkerPixels: number;
-  rgbWorkerTris: number;
-  rgbMainSpans: number;
-  rgbMainPixels: number;
-  rgbMainTris: number;
   /** Bytes staged for the frame kick (pool probe; -1 when unpooled). */
   stageBytes: number;
   /**
    * Staging breakdown (null when unpooled): transient = per-frame uploads
-   * (spans/tex/light/lux, freed after the kick); chains =
-   * persistent chain-cache residency (copy-on-first-use, NOT re-uploaded
-   * per frame — the steady-state upload is transient only); descs =
-   * indexed + RGB descriptor count inspected by the kick.
+   * (spans/tex/light, freed after the kick); descs = indexed descriptor
+   * count inspected by the kick.
    */
-  stageDetail: { transientBytes: number; chainBytes: number; descs: number } | null;
-  /** Pooled-scanout kick deltas across the resolve stage. */
-  scanoutKicks: number;
-  scanoutFallbacks: number;
-  /** Pool RGB-kick failures across this frame's raster stage (0 healthy). */
-  rgbFallbacks: number;
+  stageDetail: { transientBytes: number; descs: number } | null;
+  /** Pool raster-kick failures across this frame's raster stage (0 healthy). */
+  rasterFallbacks: number;
   /**
    * Span entries actually inspected by this frame's successful pool kicks
-   * (workers + main band, raster + RGB lanes). -1 when the build exposes
+   * (workers + main band, raster lane). -1 when the build exposes
    * no inspected-span counters (older builds — never mistake 0 for proof;
    * see kickStats.scannedAvailable). Compare against `stageDetail.descs`
    * and `spans` to prove ordered subranges skip non-owned rows.
    */
   scannedSpans: number;
   /**
-   * Foreground RGB execution detail (null when the renderer publishes no
-   * foreground counter — this HEAD: foreground always rides inline after
-   * the world kick, so null is healthy; see the Q2Stats contract note).
-   * Units are batches (not triangles/pixels). `worker` is worker-completed
-   * batches only (legacy-hook fallback: -1 whenever anything staged —
-   * staging is not execution proof).
-   */
-  fg: { staged: number; worker: number; inline: number; kicks: number } | null;
-  /**
-   * Per-primitive-class foreground audit (renderer lane owns the hook and
-   * its units — see BrowserForegroundDetail): prepared/staged vs
-   * worker-completed vs calling-thread vs inline vs replayed work in
-   * native units. Null when the renderer publishes no breakdown (older
-   * builds) or the probe throws: unknown, never worker-completed.
-   */
-  fgDetail: BrowserForegroundDetail | null;
-  /**
    * JS heap delta across the instrumented frame in MiB (null without
    * `performance.memory` — Chromium only; harness trend signal, not a
    * budget gate; production frames never sample it).
    */
   heapDeltaMB: number | null;
-  /**
-   * Authoritative-skip detail (null when the hook is absent): whether the
-   * skip armed + classic world/foreground spans elided where the RGB twin
-   * drew. Under the skip, FrameStats.pixels/overdraw (classic-tracked) go
-   * quiet — these counters + staged/kicks are the execution proof instead.
-   */
-  skip: { armed: boolean; classicSkipped: number; classicFgSkipped: number } | null;
   /**
    * Last-kick diagnostic snapshot when armed (see DiagSnapshot: frame/seq
    * + job identity, rank-ordered dispatch-to-completion arrivals with band
@@ -6185,25 +5648,13 @@ export interface StageReport {
   /**
    * This frame's kick attempts in issue order (empty when disarmed):
    * per-kick (frame, seq, job) identity + outcome + within-kick worker
-   * max/median + dispatch critical path + inter-kick gap. The rgb
-   * entries beyond the first are the foreground flushes in
-   * drawForegroundAsync order (world flush first, then alpha, placed and
-   * entity flushes) — every foreground flush including the placed pass
-   * carries the same timing fields. Independent medians are never summed
+   * max/median + dispatch critical path + inter-kick gap (raster flush
+   * first, then the resolve kick). Independent medians are never summed
    * or subtracted across entries: the frame's story is the list, and
    * cross-rep analysis belongs to the bench/testkit lanes.
    */
   kickTimings: KickTiming[];
   resolveOrder: ResolveOrder;
-  voodooPath: VoodooBandPath | 'none';
-}
-
-/**
- * Finite-number probe with a 0 fallback (foreground-stat hooks may return
- * partial shapes on future renderer builds — never NaN into the report).
- */
-function numOrFinite(v: unknown): number {
-  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
 /** Current JS heap in MiB, or null without Chromium's performance.memory. */
@@ -6229,9 +5680,10 @@ function heapDelta(before: number | null): number | null {
  * Run one frame exactly like `frameAsync`, timing each stage. Call from
  * harnesses only (tests, `__q2bench.measure`); never from the rAF tick.
  * Mutates exactly like `frameAsync` plus the optional post-resolve HUD
- * draw (mirrors `finishFrame`: skipped when HUD rode pre-scanout) and the
- * optional `blit` callback (the harness blits the resolved target to the
- * real canvas to time presentation; production never passes it).
+ * draw and the optional `blit` callback (the harness blits the resolved
+ * target to the real canvas to time presentation; production never
+ * passes it). RELEASE-8: HUD is always painted post-resolve (no CPU
+ * voodoo pre-scanout composition).
  */
 export async function measureFrameStages(
   boot: PlayBoot, st: AsyncLoopState, nowMs: number, hud?: HudState,
@@ -6240,8 +5692,6 @@ export async function measureFrameStages(
   const t00 = performance.now();
   // JS heap baseline (Chromium-only; null everywhere else — see heapDelta).
   const heapBefore = heapNowMB();
-  const frameState = getCVarString('vid_renderer') === 'voodoo' ? snapshotVoodooState() : undefined;
-  if (frameState !== undefined) broadcastBandVoodoo(boot, frameState);
   pumpMuzzleLight(boot);
   pumpExplosionLights(boot);
   pumpTracers(boot);
@@ -6252,22 +5702,21 @@ export async function measureFrameStages(
   const t03 = performance.now();
   // Pool kick outcomes + per-kick timing baseline BEFORE the frame's kicks
   // run (PERF-NEXT-4 true per-frame attribution): the render stage below
-  // is where the indexed/world/foreground RGB kicks happen, so sampling
-  // here — not after — makes the deltas below cover exactly this frame.
-  // resolveDisplayAsync only adds scanout outcomes, never RGB ones.
+  // is where the indexed raster kick happens, so sampling here — not
+  // after — makes the deltas below cover exactly this frame.
   // `scanned` needs the same before snapshot (monotonic counters);
   // `kickKeysBefore` identifies this frame's ledger entries by
   // (frame, seq, job, outcome) identity afterward. -1/empty downstream
   // when unavailable or disarmed.
-  let rgbFbBefore = 0;
+  let rasterFbBefore = 0;
   let scannedBefore = 0;
   let scannedAvailBefore = false;
   let kickKeysBefore: Set<string> | null = null;
   try {
     const pool = boot.browserPool as unknown as {
       kickStats?: () => {
-        fallbacks: { rgb: number };
-        scanned: { raster: number; rgb: number };
+        fallbacks: { raster: number };
+        scanned: { raster: number };
         scannedAvailable: boolean;
       };
       kickTimings?: () => Array<{
@@ -6276,8 +5725,8 @@ export async function measureFrameStages(
     } | null;
     if (pool && typeof pool.kickStats === 'function') {
       const ks = pool.kickStats();
-      rgbFbBefore = ks.fallbacks.rgb | 0;
-      scannedBefore = (ks.scanned.raster | 0) + (ks.scanned.rgb | 0);
+      rasterFbBefore = ks.fallbacks.raster | 0;
+      scannedBefore = ks.scanned.raster | 0;
       scannedAvailBefore = ks.scannedAvailable === true;
     }
     if (pool && typeof pool.kickTimings === 'function') {
@@ -6292,12 +5741,10 @@ export async function measureFrameStages(
   const t05 = performance.now();
   await boot.refresh.endFrameAsync();
   const t06 = performance.now();
-  const kicksBefore = boot.statScanoutKicks;
-  const fallbacksBefore = boot.statScanoutFallbacks;
-  const target = await resolveDisplayAsync(boot, hud, frameState);
+  const target = resolveDisplay(boot);
   const t07 = performance.now();
   let hudMs = 0;
-  if (hud !== undefined && !hudComposedPreScanout(boot)) {
+  if (hud !== undefined) {
     const t08 = performance.now();
     drawPlayHud(
       { width: boot.host.fb.width, height: boot.host.fb.height, color: target },
@@ -6311,11 +5758,7 @@ export async function measureFrameStages(
     blit(target);
     blitMs = performance.now() - t09;
   }
-  let staged = 0, inline = 0, kicks = 0, pooled = false, bands = 1;
-  try {
-    const rs = boot.refresh.testRGBWorkerStats();
-    staged = rs.staged; inline = rs.inline; kicks = rs.kicks;
-  } catch { /* renderer without RGB stats: zeros stand */ }
+  let pooled = false, bands = 1;
   try {
     const ws = boot.refresh.testWorkerStats();
     pooled = ws.pooled; bands = ws.bands;
@@ -6326,13 +5769,11 @@ export async function measureFrameStages(
     const pool = boot.browserPool as unknown as {
       kickBytes?: () => {
         total: number; idxSpans: number; idxTex: number; idxLight: number;
-        idxDescs: number; rgbSpans: number; rgbLux: number; rgbChains: number;
-        rgbDescs: number;
+        idxDescs: number;
       } | null;
       stagingBytes?: () => {
         total: number; idxSpans: number; idxTex: number; idxLight: number;
-        idxDescs: number; rgbSpans: number; rgbLux: number; rgbChains: number;
-        rgbDescs: number;
+        idxDescs: number;
       };
     } | null;
     // Prefer the frozen last-kick snapshot (post-kick live offsets read
@@ -6342,9 +5783,8 @@ export async function measureFrameStages(
     if (sb) {
       stageBytes = sb.total;
       stageDetail = {
-        transientBytes: sb.idxSpans + sb.idxTex + sb.idxLight + sb.rgbSpans + sb.rgbLux,
-        chainBytes: sb.rgbChains,
-        descs: (sb.idxDescs | 0) + (sb.rgbDescs | 0),
+        transientBytes: sb.idxSpans + sb.idxTex + sb.idxLight,
+        descs: sb.idxDescs | 0,
       };
     }
   } catch { /* unpooled: -1/null stand */ }
@@ -6357,160 +5797,30 @@ export async function measureFrameStages(
       diag = pool.diagSnapshot();
     }
   } catch { /* disarmed: null stands */ }
-  let skip: StageReport['skip'] = null;
-  try {
-    const hook = (boot.refresh as unknown as {
-      testClassicSkipStats?: () => {
-        classicSpansSkipped: number; classicFgSkipped: number; skipArmed: boolean;
-      };
-    }).testClassicSkipStats;
-    if (typeof hook === 'function') {
-      const sk = hook.call(boot.refresh);
-      skip = {
-        armed: sk.skipArmed === true,
-        classicSkipped: sk.classicSpansSkipped,
-        classicFgSkipped: sk.classicFgSkipped,
-      };
-    }
-  } catch { /* hook absent: null stands */ }
-  // Foreground RGB execution detail: prefers the browser-lane hook shape
-  // { staged, worker, inline, kicks }; falls back to the renderer-lane
-  // testForegroundWorkerStats { staged, inline, kicks } with worker
-  // reported as unknown (-1) whenever anything staged — staging is not
-  // execution proof, and only the new hook's separately-measured worker
-  // count proves worker rendering (TASK item 3).
-  let fg: StageReport['fg'] = null;
-  try {
-    const hooks = boot.refresh as unknown as {
-      testRGBForegroundStats?: () => {
-        staged: number; worker: number; inline: number; kicks: number;
-      };
-      testForegroundWorkerStats?: () => {
-        staged: number; inline: number; kicks: number;
-      };
-    };
-    const hook = hooks.testRGBForegroundStats;
-    const legacy = hooks.testForegroundWorkerStats;
-    if (typeof hook === 'function') {
-      const fs = hook.call(boot.refresh);
-      fg = {
-        staged: numOrFinite(fs.staged),
-        worker: numOrFinite(fs.worker),
-        inline: numOrFinite(fs.inline),
-        kicks: numOrFinite(fs.kicks),
-      };
-    } else if (typeof legacy === 'function') {
-      const fs = legacy.call(boot.refresh);
-      const staged = numOrFinite(fs.staged);
-      const kicks = numOrFinite(fs.kicks);
-      // Staging is not execution proof (TASK item 3): report worker as
-      // unknown (-1) whenever anything staged, 0 only when nothing staged.
-      // Only the testRGBForegroundStats hook's separately-measured worker
-      // count proves worker rendering.
-      fg = {
-        staged,
-        worker: staged > 0 ? -1 : 0,
-        inline: numOrFinite(fs.inline),
-        kicks,
-      };
-    }
-  } catch { /* hook absent: null stands */ }
-  // Pool RGB-kick fallback + inspected-span deltas across this frame's
+  // Pool raster-kick fallback + inspected-span deltas across this frame's
   // raster stage (0 healthy): the before baselines above ran pre-render,
-  // so these deltas cover exactly this frame (previously the baseline was
-  // sampled post-render, pinning the fallback delta at 0).
-  let rgbFallbacks = 0;
+  // so these deltas cover exactly this frame.
+  let rasterFallbacks = 0;
   let scannedSpans = -1;
-  // Per-frame worker/main attribution (PERF-NEXT-5, pool surface): the
-  // pool reset its completed-work split in this frame's beginFrame (called
-  // above), so the post-render read below covers exactly this frame's
-  // completed RGB kicks (world + foreground). -1 when the pool probe is
-  // unavailable (unpooled/foreign pool): unknown, never worker-completed.
-  let rgbWorkerSpans = -1;
-  let rgbWorkerPixels = -1;
-  let rgbWorkerTris = -1;
-  let rgbMainSpans = -1;
-  let rgbMainPixels = -1;
-  let rgbMainTris = -1;
-  let fgDetail: StageReport['fgDetail'] = null;
-  try {
-    const hooks = boot.refresh as unknown as {
-      testForegroundStats?: () => Record<string, unknown>;
-    };
-    const detail = hooks.testForegroundStats;
-    if (typeof detail === 'function') {
-      const fs = detail.call(boot.refresh) as Record<string, unknown>;
-      const pick = (v: unknown): number =>
-        typeof v === 'number' && Number.isFinite(v) ? v : -1;
-      fgDetail = {
-        stagedBatches: pick(fs.stagedBatches),
-        inlineBatches: pick(fs.inlineBatches),
-        kicks: pick(fs.kicks),
-        alphaSpansStaged: pick(fs.alphaSpansStaged),
-        alphaSpansInline: pick(fs.alphaSpansInline),
-        spriteSpansStaged: pick(fs.spriteSpansStaged),
-        spriteSpansInline: pick(fs.spriteSpansInline),
-        spriteDrawsInline: pick(fs.spriteDrawsInline),
-        aliasDrawsStaged: pick(fs.aliasDrawsStaged),
-        aliasDrawsInline: pick(fs.aliasDrawsInline),
-        aliasTrisInline: pick(fs.aliasTrisInline),
-        particleDrawsInline: pick(fs.particleDrawsInline),
-        particlesInline: pick(fs.particlesInline),
-        particleSpansInline: pick(fs.particleSpansInline),
-        beamDrawsInline: pick(fs.beamDrawsInline),
-        beamSpansInline: pick(fs.beamSpansInline),
-        workerSpansCompleted: pick(fs.workerSpansCompleted),
-        workerPixelsCompleted: pick(fs.workerPixelsCompleted),
-        mainSpansCompleted: pick(fs.mainSpansCompleted),
-        mainPixelsCompleted: pick(fs.mainPixelsCompleted),
-        trisStaged: pick(fs.trisStaged),
-        trisCompleted: pick(fs.trisCompleted),
-        trisMainCompleted: pick(fs.trisMainCompleted),
-        trisReplayed: pick(fs.trisReplayed),
-        particleSpansStaged: pick(fs.particleSpansStaged),
-        beamSpansStaged: pick(fs.beamSpansStaged),
-        replayedSpans: pick(fs.replayedSpans),
-        replayedPixels: pick(fs.replayedPixels),
-        recoveryCount: pick(fs.recoveryCount),
-        entityMs: pick(fs.entityMs),
-        directInlineWrites: fs.directInlineWrites === true,
-      };
-    }
-  } catch { /* hook absent/throwing: null stands (unknown) */ }
   // This frame's kick attempts in issue order (PERF-NEXT-4 per-frame
   // attribution): ledger entries absent from the pre-render baseline are
-  // this frame's kicks — world flush first, then the foreground flushes
-  // (alpha, placed, entity), then resolve/scanout. Empty when disarmed.
+  // this frame's kicks — the raster flush first, then the resolve kick.
+  // Empty when disarmed.
   let kickTimings: KickTiming[] = [];
   try {
     const pool = boot.browserPool as unknown as {
       kickStats?: () => {
-        fallbacks: { rgb: number };
-        scanned: { raster: number; rgb: number };
+        fallbacks: { raster: number };
+        scanned: { raster: number };
         scannedAvailable: boolean;
-        frameCompleted?: {
-          workerPixels?: unknown; workerSpans?: unknown; workerTris?: unknown;
-          mainPixels?: unknown; mainSpans?: unknown; mainTris?: unknown;
-        };
       };
       kickTimings?: () => KickTiming[];
     } | null;
     if (pool && typeof pool.kickStats === 'function') {
       const ks = pool.kickStats();
-      rgbFallbacks = (ks.fallbacks.rgb | 0) - rgbFbBefore;
+      rasterFallbacks = (ks.fallbacks.raster | 0) - rasterFbBefore;
       if (scannedAvailBefore || ks.scannedAvailable === true) {
-        scannedSpans = ((ks.scanned.raster | 0) + (ks.scanned.rgb | 0)) - scannedBefore;
-      }
-      const fc = ks.frameCompleted;
-      if (fc !== undefined && fc !== null) {
-        const pick = (v: unknown): number =>
-          typeof v === 'number' && Number.isFinite(v) ? v : -1;
-        rgbWorkerSpans = pick(fc.workerSpans);
-        rgbWorkerPixels = pick(fc.workerPixels);
-        rgbWorkerTris = pick(fc.workerTris);
-        rgbMainSpans = pick(fc.mainSpans);
-        rgbMainPixels = pick(fc.mainPixels);
-        rgbMainTris = pick(fc.mainTris);
+        scannedSpans = (ks.scanned.raster | 0) - scannedBefore;
       }
     }
     if (pool && typeof pool.kickTimings === 'function') {
@@ -6529,20 +5839,12 @@ export async function measureFrameStages(
     renderInternalMs: stats.ms, endMs: t06 - t05,
     resolveMs: t07 - t06, hudMs, blitMs,
     spans: stats.spans, pixels: stats.pixels, overdraw: stats.overdraw,
-    staged, inline, kicks, pooled, bands, stageBytes, stageDetail,
-    rgbWorkerSpans, rgbWorkerPixels, rgbWorkerTris,
-    rgbMainSpans, rgbMainPixels, rgbMainTris,
-    scanoutKicks: boot.statScanoutKicks - kicksBefore,
-    scanoutFallbacks: boot.statScanoutFallbacks - fallbacksBefore,
-    rgbFallbacks,
+    pooled, bands, stageBytes, stageDetail,
+    rasterFallbacks,
     scannedSpans,
-    skip,
-    fg,
-    fgDetail,
     diag,
     kickTimings,
     heapDeltaMB,
     resolveOrder: boot.lastResolveOrder,
-    voodooPath: boot.lastVoodooPath,
   };
 }

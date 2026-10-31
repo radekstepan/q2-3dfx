@@ -80,13 +80,13 @@ describe('soak cvar overrides', () => {
   });
 
   it('collectSoakStatus builds the pre-boot record', () => {
-    const p = parseSoakParams('?q2soak=1&q2pak=http://x/pak&q2renderer=voodoo')!;
+    const p = parseSoakParams('?q2soak=1&q2pak=http://x/pak&q2renderer=software')!;
     const st = collectSoakStatus(p, 'ANGLE (AMD, test)', 1234.5);
     expect(st).toEqual({
       soak: true,
       booted: false,
-      requestedRenderer: 'voodoo',
-      actualRenderer: 'voodoo',
+      requestedRenderer: 'software',
+      actualRenderer: 'software',
       warning: null,
       width: SOAK_WIDTH,
       height: SOAK_HEIGHT,
@@ -122,7 +122,7 @@ describe.runIf(!!WEB_Q2_PAK)('soak-geometry boot (Q2_PAK)', () => {
     const raw = readFileSync(WEB_Q2_PAK as string);
     const buf = raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer;
     const pak = ingestPak(buf);
-    for (const renderer of ['software', 'voodoo'] as const) {
+    for (const renderer of ['software'] as const) {
       const boot = bootPlay({ width: SOAK_WIDTH, height: SOAK_HEIGHT, renderer, pak });
       expect(boot.host.fb.width).toBe(SOAK_WIDTH);
       expect(boot.host.fb.height).toBe(SOAK_HEIGHT);
