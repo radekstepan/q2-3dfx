@@ -7,7 +7,7 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-31, reviewed at `c3396ab`): repair elevator
+> **Current direction (2026-10-31, reviewed at `b55fec0`): repair elevator
 > boarding, ladder/water movement, F1 notification/live secrets and message UI;
 > audit monster behavior, damage feedback, view roll and underwater appearance.
 > Preserve landed resize, effects and renderer retirement. §8 is the only active
@@ -261,20 +261,27 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ### Review checkpoint and rules
 
-Source/history reviewed at `c3396ab` on 2026-10-31. No runtime/browser tests or
+Source/history reviewed at `b55fec0` on 2026-10-31. No runtime/browser tests or
 full verification were rerun in this review. Findings below distinguish direct
 code observations from symptoms still needing a production reproduction.
 
-Latest batch landed resize/blit repairs, live help counters, collision changes,
-unlit water, effect producers/loop audio, message toggle and renderer capability
-controls. Preserve these increments; latest feedback does not re-report every
-older defect. Sky fixes and legacy CPU Voodoo retirement remain preserved.
-FOLLOW-5 now records approved tone/structural acceptance in `9d99612`/`c3396ab`
-and the archive; the old “unapproved proposal” paragraph was stale and is removed.
-That fidelity decision does not close new gameplay/UI defects or displayed FPS.
-GPU remains experimental pending FOLLOW-6/7; display absence does not block repairs.
+**Current user verdict: the repeated issues are still unresolved.** `b55fec0`
+only adds an elevator approach/obstruction test and an F1 completion headline;
+it does not implement boarding or repair help, messages, movement, patrols,
+damage/view effects or sidebar styling. Do not call that increment a gameplay
+fix. The message flicker and dying-enemy collision reports are now explicit
+acceptance requirements below. These remain active work, not display blockers.
 
-Priority: RELEASE-4 → RELEASE-12 → RELEASE-6 → RELEASE-11/10 → RELEASE-13/14/15.
+Earlier resize/blit, unlit-water, effects/audio and renderer-retirement work is
+retained; latest feedback does not establish a new verdict on every old issue.
+Sky fixes remain preserved. FOLLOW-5 tone/structural acceptance is recorded in
+`9d99612`/`c3396ab`; it does not close current gameplay/UI defects. GPU remains
+experimental pending FOLLOW-6/7. No runtime tests were rerun in this review.
+
+Priority: RELEASE-11 (message regression) → RELEASE-4 (boarding) → RELEASE-12
+(movement) → RELEASE-6 (help) → RELEASE-13 (dying collision/patrols) →
+RELEASE-10/14/15. Independent bounded fixes can proceed without waiting for
+the elevator investigation; do not leave the rest untouched after one diagnostic.
 Use disjoint ownership for independent work. Claim one card, run expensive tests
 sequentially, and keep implementation/test/user verdicts separate. Real-map
 movement and visible behavior require end-to-end regressions, not helper-only
@@ -284,16 +291,15 @@ valid prior fixes or silently waive newly reported symptoms.
 ### RELEASE-4 — Walk into the final elevator and show completion help
 owns: `packages/server`, `packages/game`, `apps/web`, `packages/testkit`
 depends: none
-status: in-progress(@opencode)
+status: ready (diagnostic landed; boarding fix outstanding)
 user-verdict: original game allows walking onto the elevator and then loads the next level. This project must allow boarding, then show the F1/help screen stating the level is finished. Invisible blockage persists; preserve the repaired waiting/open behavior.
 review-finding: the previous blocker analyzed the *12 train/rock slot and punted the route. That does not establish that the user’s actual exit is impossible. Prior notes identify *31 descending plug and t37 changelevel as a different candidate; re-identify from the visible approach.
 done-when:
 - [x] Trace normal walking from the final doorway to the actual exit platform; record player/camera, hit brush/edict/model, origin/bounds, startsolid/fraction and mover state. Follow real map targets/buttons and original source; distinguish *12/*13 from *31/*34 and the exit trigger instead of assuming the wrong elevator.
-  - Landed 2026-11-01 (@opencode): `apps/web/src/release-4-trace.test.ts` walks the hall to the plug face and the walkway east on real base1 with production driver ticks. East blocker is the shut *31 plug mover (entityNum = plug edict, +X normal, fraction < 1, no startsolid — C-correct shut door, not a phantom, not *12, not world); entry sliders genuinely cycle open (travel > 30, waiting/open repair preserved); train parked [0,0,0] unstarted; *13/*34 unfired; no t91/t4/t37. Walkway-east blocker is WORLD geometry (entityNum 0) west of the plug west face. F1 overlay now states the finish explicitly (LEVEL COMPLETE + frozen time over frozen kills/secrets/goals, with an unfinished negative control).
+  Evidence: `b55fec0` approach trace reaches a closed *31 mover or a world wall on the tested routes; entry sliders open, but *13/*34 and t91/t4/t37 remain unfired. This identifies tested obstructions, not the complete intended route. F1 headline is implemented; actual boarding and automatic finish presentation are not verified.
 - [ ] Fix the blocking collision/transform/activation chain without noclip, teleport, globally disabling solids or prematurely moving the elevator. Keep prior sweep/button repairs where valid.
-  - TODO(RELEASE-4): remaining route per the trace: reach the *34 alcove (walkway wall blocks the straight walk — needs a gap/route at another y/z or E-use LOS), cycle the plug DOWN (top 88 flush-ish with hall/walkway floor 96), traverse the plug top, enter the pit (*27/t37) through a plug-state window (parked plug lets the fall pass via the leaving-miss rule; plug-down parks a rider on top 88). No code change in this increment; box stays open.
 - [ ] End-to-end base1 gate must approach, enter and stand on the platform through player input, then trigger finish at the intended transition. Show the requested F1 completion panel with frozen final kills/secrets/goals/time and an explicit finished state; next-map loading is not required by this task. No test may start inside the elevator to claim boarding passed.
-  - TODO(RELEASE-4): extend the trace into a board/ride/finish gate (hall -> doors -> *34 -> plug-down -> board -> ride/cross -> pit t37 -> LEVEL COMPLETE + F1 headline). Gate (w) still covers pit->finish via the documented above-pit descent; the new trace test covers the F1 headline presentation. Pre-existing unrelated failure noted: base1-gate (q) death-fire timing (boltSeenAt 14 vs >= 16) fails identically on clean master `b3fbb59`.
+  Do not prescribe a speculative *34/pit route as fact or require hidden E-use unless the original supports it. Establish the route the user verified in the original. The prior above-pit descent test cannot substitute for walking aboard. Historical base1-gate death-fire timing failure (boltSeenAt 14 vs >=16) remains a reported test issue, not a boarding prerequisite.
 
 ### RELEASE-12 — Ladder climbing, water exits and slopes
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
@@ -315,15 +321,16 @@ done-when:
 - [ ] Follow a real secret discovery from trigger/target chain through single-use `foundSecrets` increment to F1 rendering. With help open and closed, verify multiple discoveries update immediately and never double-count. Preserve final frozen counters once finished.
 - [ ] Use current help text/map name, remove stale producer comments, and verify icon/panel across resolutions, resize/switch and respawn. Coordinate the final help screen with RELEASE-4.
 
-### RELEASE-11 — Discoverable status toggle and faithful center messages
+### RELEASE-11 — Fix message flicker, centered hints and status toggle
 owns: `apps/web`, `packages/client`, `packages/config`, `packages/server`
 depends: none
 status: ready (reopened)
-review-findings: `cl_showmessages` already exists, is persisted and gates status text. The driver drains server centerprints into `setMessage(..., 'status')`, sharing the cosmetic one-line channel; this loses original centered presentation and lets the status toggle hide hints/secrets.
+review-findings: successful firing calls `setMessage('', 'status')`, clearing the shared string; `setMessage` has no duration/deadline. Continued shooting can therefore erase “soldier minced” almost immediately. This is a concrete clearing path, not a browser reproduction. `cl_showmessages` already exists, is persisted and gates status text. The driver drains server centerprints into `setMessage(..., 'status')`, sharing the cosmetic one-line channel; this loses original centered presentation and lets the status toggle hide hints/secrets.
 done-when:
+- [ ] Give transient status messages an explicit readable lifetime and deterministic expiry. Successful shots and unrelated empty updates must not erase a fresh kill/status message. Verify duration under held fire, automatic weapons, varying FPS and successive events, with screenshots/time samples; preserve deliberate death/respawn/finish transitions.
 - [ ] Make the existing gameplay-status toggle easy to find and verify it hides/shows messages such as “soldier minced” immediately, across both renderers and reloads. Diagnose why the user still requests it; do not add a duplicate cvar.
 - [ ] Give trigger/ladder/secret messages their own centerprint presentation with white game-font text, source-matched centering, multiline handling and lifetime. Verify original source/message assets and real trigger routes. Keep these messages distinct from cosmetic kill/status text, F1 and completion; explicitly test toggle behavior for each channel.
-- [ ] Add rendered regressions for ladder hint, secret discovery, kill status on/off, message expiry and simultaneous events without overwriting essential completion/errors.
+- [ ] Add rendered regressions for “crouch here,” ladder hint, secret discovery, kill status on/off, message expiry and simultaneous events without overwriting essential completion/errors.
 
 ### RELEASE-10 — Tooltip-only disabled explanations; matching checkbox styling
 owns: `apps/web`
@@ -335,14 +342,15 @@ done-when:
 - [ ] Keep disabled checkbox geometry, custom styling, alignment and size identical to enabled checkboxes; only disabled affordance/interaction changes. Preserve renderer capability decisions, saved values and switch/fallback updates.
 - [ ] Check the real sidebar on both renderers at representative viewport sizes, mouse and keyboard; no layout shift or duplicated visible explanation text.
 
-### RELEASE-13 — Infantry death variety and soldier patrol behavior
+### RELEASE-13 — Dying-enemy collision, death variety and soldier patrols
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
 depends: none
 status: ready
-review-finding: infantry already defines death1/death2/death3 and chooses via `floor(rand()*3)` in monster damage; soldier lite currently pins death1. The user’s infantry observation may concern RNG delivery, frame submission or identity rather than missing tables.
+review-findings: `monsterClipBox` returns null on `state.dead`, while monster damage sets that flag immediately at health <= 0, before death animation completes. Audit the source dying→dead transition and collision masks; do not equate lethal damage with finished corpse state. Infantry already defines death1/death2/death3 and chooses via `floor(rand()*3)` in monster damage; soldier lite currently pins death1. The user’s infantry observation may concern RNG delivery, frame submission or identity rather than missing tables.
 done-when:
+- [ ] Keep enemies blocking the player while downed/dying but not yet fully dead, as requested. Separate lethal-hit, active death animation/last-shot, final corpse and gib states; audit source `Killed`, species dead callbacks and SVF_DEADMONSTER timing. Preserve appropriate final-corpse behavior and shootability. Test walking into each state, including infantry death2 firing, on real server/prediction paths; never make all corpses permanently solid.
 - [ ] Exercise all three non-gib infantry deaths through the production damage→server→snapshot→renderer path with controlled RNG, then sample normal play. Compare original frames, timing, movement, death2 firing and final corpse bounds; distinguish soldiers from infantry and gib deaths. Fix actual selection/rendering omissions.
-- [ ] Audit base1 soldier spawn targets/path_corner chains, idle/walk patrol, facing, ambush flags, sight/hearing and wake-up against original `g_monster.c`/`g_ai.c` and map entities. Identify which soldiers should patrol and be approachable from behind; do not make every idle soldier patrol or detect players omnidirectionally.
+- [ ] Reproduce the missing patrol behavior the user sees in the original; audit base1 soldier spawn targets/path_corner chains, idle/walk patrol, facing, ambush flags, sight/hearing and wake-up against original `g_monster.c`/`g_ai.c` and map entities. Identify which soldiers should patrol and be approachable from behind; do not make every idle soldier patrol or detect players omnidirectionally.
 - [ ] Record real-map routes and visible death sequences; add regressions for patrol→detection/combat and rear approach with appropriate source sight/noise behavior.
 
 ### RELEASE-14 — Source-faithful damage feedback and strafe view roll
