@@ -303,10 +303,11 @@ done-when:
 ### GPU-FOLLOW-5 — Complete fidelity and automated gate repairs
 owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`
 depends: RELEASE-4, RELEASE-6, RELEASE-7, RELEASE-9, GPU-FOLLOW-3B
-status: ready (acceptance reopened; archived implementation retained)
+status: blocked (boxes 1–2 landed 2026-10-31 as evidence + harness; box 1 mip repair and box 3 need the prerequisites below)
+blocker: (a) PROOF-4 scene mip-dither gate is deterministically 0/0-invariant at the shipped MID view AND three further minifying candidates (lod-bias +3.35 shift also 0/0) — close flat walls dominate, distant detail converges below post quanta; hermetic synthetic fixture proves the plumbing bites, so this is a fixture-content blocker, not a code defect. (b) Box 3 needs explicit user approval: meet the contract or accept the restated tone-normalized 0.02 proposal (unapproved, no rollout). Contention-class CDP/pose flakes need a display for contention-free runs (FOLLOW-6). Historical full verify 78/80 stands; this session re-verified 78/80 with the same classes.
 done-when:
 - [ ] Repair remaining degenerate mip fixture and reproducible browser/pool contention failures with meaningful coverage; do not skip tests, loosen thresholds or label isolated passes a green integrated suite.
-- [ ] Refresh matched scene/time/cvar evidence after current visual repairs, including UI/effects/water and lifecycle negative controls. Keep automated failures explicit.
+- [x] Refresh matched scene/time/cvar evidence after current visual repairs, including UI/effects/water and lifecycle negative controls. Keep automated failures explicit.
 - [ ] Meet the current contract or present precise side-by-sides and a proposed change for explicit user approval. The archived tone-normalized 0.02 proposal is unapproved; no implicit acceptance or rollout.
 
 ### GPU-FOLLOW-6 — Verify gameplay on a visible display

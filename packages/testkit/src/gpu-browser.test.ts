@@ -557,6 +557,35 @@ const FAR_MIN_FRAC = 0.05;
 // Mip-dither on-vs-off at the minified camera: the pick must change
 // minified texels (>=200 px) and scatter across surfaces (bbox covers >=5%
 // of the frame — a single hard band edge would stay thin and localized).
+//
+// GPU-FOLLOW-5 box-1 BLOCKER (2026-10-31, testkit lane; thresholds frozen,
+// fixture NOT re-homed — do not force it). The shipped MID view
+// ([128,-390,73] yaw 90 fov 90) reads 0/0 with propagation alive
+// (mipFlagsMid=[true,false], policyUploads on=92/off=8), and so does every
+// other in-page camera (near F1, farView, FAR pair: all 0/0). Three further
+// candidate views were tried in real Chromium/SwiftShader (one session,
+// entities/lights/time/cvars identical, only the view varied), each with a
+// dither on/off pair AND a vd_lodbias +3.35 shift pair (minification
+// detector — nonzero proves level-dependent content exists in the view):
+//   c1 [128,-430,73] yaw 115 fov 90: nonblack 0.968, vsNear 0.9921,
+//      mipOnOff 0/0, lodShift 0/0 (Node census: 50.8% straddle weight)
+//   c2 [128,-430,73] yaw 90  fov 90: nonblack 0.974, vsNear 0.9907,
+//      mipOnOff 0/0, lodShift 0/0 (Node census: 42.4% straddle weight)
+//   c3 [128,-390,73] pitch -25 yaw 90 (ceiling-light field): nonblack 0.947,
+//      vsNear 0.9948, mipOnOff 0/0, lodShift 0/0
+// Diagnosis: lodShift 0/0 at ALL views means no sampled pixel is
+// level-dependent — the tested cameras sit in open pockets off the spawn
+// room whose frames are dominated by close flat corridor walls (magnified,
+// per-tile-converged), while distant detail converges below the
+// lightmap/overbright/565/gamma quanta. The Node census overpredicts (no
+// occlusion, center-rho + grazing inflation: shipped MID 79.7% LOD-0 vs
+// 19.3% straddle, near VIEW 82.7% straddle yet browser 0/0). uMaxLevel
+// plumbing is sound (CPU chains uploaded per level, per-texture clamp;
+// dist is current) — this is a scene-regime fact, not probe blindness (the
+// webgl-lane mirror sees on/off effects on real art at straddle rhos, and
+// the synthetic 8px checker bites). Next step belongs to whoever owns a
+// camera fixture with proven minified high-frequency content; until then
+// this gate fails loudly and no threshold moves.
 const MIP_ONOFF_MIN_PX = 200;
 const MIP_SCATTER_MIN_FRAC = 0.05;
 

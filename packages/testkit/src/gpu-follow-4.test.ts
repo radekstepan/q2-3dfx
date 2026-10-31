@@ -555,12 +555,17 @@ async function readOneGlError(cdp: CdpConnection, canvasId: string): Promise<num
 }
 
 async function pollContextEvents(cdp: CdpConnection, want: 'lost' | 'restored', timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  const start = Date.now();
+  let polls = 0;
   for (;;) {
+    polls++;
     const cur = await readRecorderCounts(cdp);
     if (cur && cur[want] >= 1) return;
-    if (Date.now() > deadline) {
-      throw new Error(`[follow-4] context ${want} event never recorded within ${timeoutMs}ms (got ${JSON.stringify(cur)})`);
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `[follow-4] context ${want} event never recorded within ${timeoutMs}ms ` +
+        `(polls=${polls} last=${JSON.stringify(cur)} pool=${JSON.stringify(cdp.pendingCalls())})`,
+      );
     }
     await new Promise<void>((r) => setTimeout(r, 500));
   }

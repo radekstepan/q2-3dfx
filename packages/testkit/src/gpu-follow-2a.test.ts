@@ -813,15 +813,20 @@ interface Follow2aLegCrop {
 }
 
 async function waitForFramesSubmitted(cdp: CdpConnection, timeoutMs: number): Promise<number> {
-  const deadline = Date.now() + timeoutMs;
+  const start = Date.now();
+  let polls = 0;
   for (;;) {
+    polls++;
     const n = await cdp.evaluate<number | null>(
       'window.__q2soakState ? window.__q2soakState().framesSubmitted : null',
       30000,
     );
     if (typeof n === 'number' && n > 0) return n;
-    if (Date.now() > deadline) {
-      throw new Error(`[follow-2a] framesSubmitted never exceeded 0 within ${timeoutMs}ms (got ${String(n)})`);
+    if (polls % 5 === 1) {
+      console.log(`[follow-2a] framesSubmitted waiting: polls=${polls} elapsed=${Date.now() - start}ms last=${String(n)}`);
+    }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`[follow-2a] framesSubmitted never exceeded 0 within ${timeoutMs}ms (polls=${polls} last=${String(n)})`);
     }
     await new Promise<void>((r) => setTimeout(r, 2000));
   }
@@ -832,21 +837,37 @@ async function waitForFramesSubmitted(cdp: CdpConnection, timeoutMs: number): Pr
  * equal pose reads), never wall-clock: under a loaded machine rAF can
  * stall, and two wall-clock reads 2s apart may agree mid-fall. */
 async function waitForPoseStable(cdp: CdpConnection, timeoutMs: number): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
+  const start = Date.now();
   const read = (): Promise<{ pos: string | null; frame: number }> =>
     cdp.evaluate<{ pos: string | null; frame: number }>(
       'window.__q2soakState ? { pos: window.__q2soakState().pos, frame: window.__q2soakState().frame } : { pos: null, frame: -1 }',
       30000,
     );
+  // Trajectory evidence: every poll is logged on change (falling vs stalled
+  // vs rAF-starved reads differently) and the timeout error carries the full
+  // trail. Stability rule unchanged: same pos + >=10 rendered frames between
+  // two reads (frame-counted, never wall-clock).
+  const trail: Array<{ elapsed: number; pos: string | null; frame: number }> = [];
   let prev = await read();
+  trail.push({ elapsed: Date.now() - start, pos: prev.pos, frame: prev.frame });
+  let polls = 0;
   for (;;) {
     await new Promise<void>((r) => setTimeout(r, 2000));
+    polls++;
     const cur = await read();
+    trail.push({ elapsed: Date.now() - start, pos: cur.pos, frame: cur.frame });
     if (cur.pos !== null && cur.pos === prev.pos && cur.frame >= prev.frame + 10) return cur.pos;
+    if (cur.pos !== prev.pos || polls % 5 === 0) {
+      console.log(
+        `[follow-2a] pose waiting: polls=${polls} elapsed=${Date.now() - start}ms ` +
+        `pos=${String(cur.pos)} frame=${cur.frame} prevFrame=${prev.frame}`,
+      );
+    }
     prev = cur;
-    if (Date.now() > deadline) {
+    if (Date.now() - start > timeoutMs) {
       throw new Error(
-        `[follow-2a] spawn pose never stabilized within ${timeoutMs}ms (last=${String(cur.pos)} frame=${cur.frame})`,
+        `[follow-2a] spawn pose never stabilized within ${timeoutMs}ms ` +
+        `(polls=${polls} last=${String(cur.pos)} frame=${cur.frame}; trail=${JSON.stringify(trail.slice(-12))})`,
       );
     }
   }
@@ -949,8 +970,15 @@ describe.runIf(BROWSER_GATE)('FOLLOW-2A composed page: cold GPU boot vs CPU boot
       if (!BROWSER_GATE) throw new Error('unreachable (suite is gated)');
       const { pakPath, webRoot, viteBin } = BROWSER_RESOLVED.deps;
       const testDir = dirname(fileURLToPath(import.meta.url));
-      const scratchProfile = join(testDir, '..', 'test-output', '.q2-follow2a-profile');
-      mkdirSync(scratchProfile, { recursive: true });
+      // Unique profile per leg (isolated browser contexts): a fixed dir
+      // shared across kill-then-relaunch keeps a stale SingletonLock and
+      // makes the next launch abort or boot dirty (cf. FOLLOW-4, which
+      // already uses pid+Date.now dirs for the same reason).
+      const profileFor = (leg: string): string => {
+        const dir = join(testDir, '..', 'test-output', `.q2-follow2a-profile-${leg}-${process.pid}-${Date.now()}`);
+        mkdirSync(dir, { recursive: true });
+        return dir;
+      };
 
       let pakServer: { url: string; close(): Promise<void> } | null = null;
       let vite: { url: string; close(): Promise<void> } | null = null;
@@ -963,7 +991,7 @@ describe.runIf(BROWSER_GATE)('FOLLOW-2A composed page: cold GPU boot vs CPU boot
         // Leg 1: cold GPU boot (webgl2-experimental from the boot query).
         chromium = await launchProductionChromium(
           soakPageUrl(vite.url, pakServer.url, 'webgl2-experimental'),
-          scratchProfile,
+          profileFor('cold-gpu-boot'),
           chromiumFlagsForRenderer('webgl2-experimental'),
         );
         cdp = await connectCdp(chromium.port);
@@ -979,7 +1007,7 @@ describe.runIf(BROWSER_GATE)('FOLLOW-2A composed page: cold GPU boot vs CPU boot
         // Leg 2: CPU boot (software) — same spawn pose, the "before" crop.
         chromium = await launchProductionChromium(
           soakPageUrl(vite.url, pakServer.url, 'software'),
-          scratchProfile,
+          profileFor('cpu-boot'),
           chromiumFlagsForRenderer('software'),
         );
         cdp = await connectCdp(chromium.port);

@@ -484,13 +484,13 @@ describe('RELEASE-10 GPU audit: toggles reach live GL state (stub legs)', () => 
     }
   });
 
-  it('vd_dithermode contradicts its config "read-path only" doc: the GPU honors it live', () => {
-    // Config registry still documents vd_dithermode as read-path-only profile
-    // data ("current approx is 4x4"); the webgl2 backend instead uploads it as
-    // the live uDitherMode uniform every frame. This test pins BOTH facts so
-    // the config lane can reconcile the stale doc (not silent agreement).
+  it('vd_dithermode doc matches live behavior: the GPU honors it via uDitherMode', () => {
+    // Reconciled (RELEASE-10 integrator): the config registry documents
+    // vd_dithermode as a live WebGL uniform (the old "read-path only"
+    // wording was stale). This test pins the reconciled doc AND the live
+    // uniform so the two can never silently disagree again.
     const doc = listCVars().find((c) => c.name === 'vd_dithermode')?.doc ?? '';
-    expect(doc).toContain('read-path only');
+    expect(doc).toContain('live');
     try {
       const def = stubGLRecording();
       driveFrame(def);

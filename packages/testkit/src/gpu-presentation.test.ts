@@ -289,9 +289,13 @@ describe.runIf(GATE)('gpu-presentation production page (GPU-FOLLOW-0 lane B)', (
           chromium.kill();
           chromium = null;
         }
+        const leg4Profile = join(testDir, '..', 'test-output', `.q2-presentation-profile-leg4-${process.pid}-${Date.now()}`);
+        mkdirSync(leg4Profile, { recursive: true });
         chromium = await launchProductionChromium(
           soakPageUrl(vite.url, pakServer.url, 'webgl2-experimental'),
-          scratchProfile,
+          // Unique profile for the fresh leg-4 chromium: the legs 1-3
+          // profile may still hold a SingletonLock from the killed process.
+          leg4Profile,
           [...chromiumFlagsForRenderer('webgl2-experimental'), '--window-size=384,256', '--force-device-scale-factor=1'],
         );
         cdp = await connectCdp(chromium.port);
@@ -330,16 +334,21 @@ describe.runIf(GATE)('gpu-presentation production page (GPU-FOLLOW-0 lane B)', (
 
 /** Poll until the GPU leg reports submitted frames (real on-canvas work). */
 async function waitForFramesSubmitted(cdp: CdpConnection, timeoutMs: number): Promise<number> {
-  const deadline = Date.now() + timeoutMs;
+  const start = Date.now();
+  let polls = 0;
   for (;;) {
+    polls++;
     const n = await cdp.evaluate<number | null>(
       'window.__q2soakState ? window.__q2soakState().framesSubmitted : null',
       30000,
     );
     if (typeof n === 'number' && n > 0) return n;
-    if (Date.now() > deadline) {
+    if (polls % 5 === 1) {
+      console.log(`[gpu-presentation] framesSubmitted waiting: polls=${polls} elapsed=${Date.now() - start}ms last=${String(n)}`);
+    }
+    if (Date.now() - start > timeoutMs) {
       throw new Error(
-        `[gpu-presentation] framesSubmitted never exceeded 0 within ${timeoutMs}ms (got ${String(n)})`,
+        `[gpu-presentation] framesSubmitted never exceeded 0 within ${timeoutMs}ms (polls=${polls} last=${String(n)})`,
       );
     }
     await new Promise<void>((r) => setTimeout(r, 2000));

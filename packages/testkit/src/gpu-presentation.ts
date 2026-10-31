@@ -452,21 +452,35 @@ export function probePresentation(cdp: CdpConnection, timeoutMs = 60000): Promis
  * Evaluate faults (e.g. mid-navigation) count as "not booted yet".
  */
 export async function waitForSoakBoot(cdp: CdpConnection, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
+  const start = Date.now();
+  let polls = 0;
+  let lastFault: string | null = null;
   for (;;) {
+    polls++;
     let s: { booted?: boolean; error?: string | null } | null = null;
     try {
       s = await cdp.evaluate<{ booted?: boolean; error?: string | null } | null>(
         'window.__q2soak ? { booted: !!window.__q2soak.booted, error: window.__q2soak.error || null } : null',
         30000,
       );
-    } catch {
+      lastFault = null;
+    } catch (err) {
+      lastFault = err instanceof Error ? err.message : String(err);
       s = null;
     }
     if (s && s.booted) return;
     if (s && s.error) throw new Error(`[gpu-presentation] soak boot error: ${s.error}`);
-    if (Date.now() > deadline) {
-      throw new Error(`[gpu-presentation] soak boot timeout (${timeoutMs}ms): __q2soak.booted never true`);
+    if (polls % 5 === 1) {
+      console.log(
+        `[gpu-presentation] soak boot waiting: polls=${polls} elapsed=${Date.now() - start}ms ` +
+        `lastFault=${lastFault ?? 'none'}`,
+      );
+    }
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `[gpu-presentation] soak boot timeout (${timeoutMs}ms, polls=${polls}): ` +
+        `__q2soak.booted never true; lastFault=${lastFault ?? 'none'}`,
+      );
     }
     await new Promise<void>((r) => setTimeout(r, 2000));
   }

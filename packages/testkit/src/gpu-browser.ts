@@ -439,6 +439,14 @@ export interface CdpConnection {
   evaluate<T>(expression: string, timeoutMs?: number): Promise<T>;
   screenshot(timeoutMs?: number): Promise<Uint8Array>;
   consoleLines(): string[];
+  /**
+   * In-flight CDP calls (method + age at call time): pool-state evidence for
+   * triage. A transport timeout with an empty pool + clean console is a
+   * wedged page; a busy pool under parallel-suite load is contention.
+   */
+  pendingCalls(): Array<{ method: string; elapsedMs: number }>;
+  /** Last completed CDP call (method + round-trip): slow-transport signal. */
+  lastCompletedCall(): { method: string; durationMs: number } | null;
   close(): Promise<void>;
 }
 
@@ -474,9 +482,20 @@ function openCdpSocket(wsUrl: string, timeoutMs: number): Promise<CdpConnection>
     const ws = new WebSocket(wsUrl);
     const lines: string[] = [];
     const pending = new Map<number, PendingCall>();
+    const inflight = new Map<number, { method: string; started: number }>();
+    let lastCompleted: { method: string; durationMs: number } | null = null;
     let nextId = 1;
     let open = false;
     let closed = false;
+
+    const poolState = (): string => {
+      const now = Date.now();
+      const waiting = [...inflight.values()].map(
+        (c) => `${c.method}+${now - c.started}ms`,
+      );
+      const last = lastCompleted ? `${lastCompleted.method} ${lastCompleted.durationMs}ms` : 'none';
+      return `pool=[${waiting.join(', ') || 'idle'}] last=${last}`;
+    };
 
     const send = (method: string, params: Record<string, unknown>, callTimeout: number): Promise<Record<string, unknown>> => {
       return new Promise<Record<string, unknown>>((res, rej) => {
@@ -485,15 +504,19 @@ function openCdpSocket(wsUrl: string, timeoutMs: number): Promise<CdpConnection>
           return;
         }
         const id = nextId++;
+        const started = Date.now();
         const timer = setTimeout(() => {
           pending.delete(id);
-          rej(new Error(`[gpu-browser] CDP timeout: ${method} after ${callTimeout}ms`));
+          inflight.delete(id);
+          rej(new Error(`[gpu-browser] CDP timeout: ${method} after ${callTimeout}ms (${poolState()})`));
         }, callTimeout);
         pending.set(id, { resolve: res, reject: rej, timer });
+        inflight.set(id, { method, started });
         try {
           ws.send(JSON.stringify({ id, method, params }));
         } catch (err) {
           pending.delete(id);
+          inflight.delete(id);
           clearTimeout(timer);
           rej(new Error(`[gpu-browser] CDP send failed: ${String(err)}`));
         }
@@ -535,13 +558,28 @@ function openCdpSocket(wsUrl: string, timeoutMs: number): Promise<CdpConnection>
         }
         const conn: CdpConnection = {
           evaluate: async <T>(expression: string, callTimeout = 240000): Promise<T> => {
-            const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, callTimeout);
-            const ex = r['exceptionDetails'] as { text?: string; exception?: { description?: string } } | undefined;
-            if (ex) {
-              throw new Error('[gpu-browser] page evaluate threw: ' + (ex.text ?? ex.exception?.description ?? 'unknown'));
+            const started = Date.now();
+            try {
+              const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, callTimeout);
+              const ex = r['exceptionDetails'] as { text?: string; exception?: { description?: string } } | undefined;
+              if (ex) {
+                throw new Error('[gpu-browser] page evaluate threw: ' + (ex.text ?? ex.exception?.description ?? 'unknown'));
+              }
+              const result = r['result'] as { value?: unknown } | undefined;
+              return (result?.value ?? null) as T;
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              // Page errors (exceptionDetails above) fail loudly as-is: they
+              // are code-defect evidence. Transport faults get the harness
+              // state needed to tell contention from a wedged page: the CDP
+              // call head, pool state, elapsed, and the page console tail.
+              if (msg.includes('page evaluate threw') || msg.includes('CDP error')) throw err;
+              const head = expression.length > 160 ? expression.slice(0, 160) + '...' : expression;
+              const tail = lines.slice(-3).join(' | ') || 'no-console-yet';
+              throw new Error(
+                `${msg} | expr=${head} | elapsed=${Date.now() - started}ms | ${poolState()} | consoleTail=${tail}`,
+              );
             }
-            const result = r['result'] as { value?: unknown } | undefined;
-            return (result?.value ?? null) as T;
           },
           screenshot: async (callTimeout = 60000): Promise<Uint8Array> => {
             const r = await send('Page.captureScreenshot', { format: 'png', fromSurface: true }, callTimeout);
@@ -550,6 +588,11 @@ function openCdpSocket(wsUrl: string, timeoutMs: number): Promise<CdpConnection>
             return base64ToBytes(data);
           },
           consoleLines: () => [...lines],
+          pendingCalls: () => {
+            const now = Date.now();
+            return [...inflight.values()].map((c) => ({ method: c.method, elapsedMs: now - c.started }));
+          },
+          lastCompletedCall: () => (lastCompleted ? { ...lastCompleted } : null),
           close: () => {
             finish(null);
             return Promise.resolve();
@@ -571,7 +614,12 @@ function openCdpSocket(wsUrl: string, timeoutMs: number): Promise<CdpConnection>
       if (typeof env.id === 'number' && pending.has(env.id)) {
         const p = pending.get(env.id)!;
         pending.delete(env.id);
+        const started = inflight.get(env.id);
+        inflight.delete(env.id);
         clearTimeout(p.timer);
+        if (started) {
+          lastCompleted = { method: started.method, durationMs: Date.now() - started.started };
+        }
         if (env.error) p.reject(new Error('[gpu-browser] CDP error: ' + (env.error.message ?? 'unknown')));
         else p.resolve(env.result ?? {});
         return;
@@ -604,15 +652,23 @@ function openCdpSocket(wsUrl: string, timeoutMs: number): Promise<CdpConnection>
  * page always sets proof.error before done on failure paths.
  */
 export async function waitForProofDone<T>(cdp: CdpConnection, timeoutMs: number): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
+  const start = Date.now();
+  let polls = 0;
   for (;;) {
+    polls++;
     const done = await cdp.evaluate<boolean>(
       '!!(window.__q2proof && window.__q2proof.done)',
       30000,
     );
     if (done) break;
-    if (Date.now() > deadline) {
-      throw new Error(`[gpu-browser] proof page did not finish within ${timeoutMs}ms`);
+    if (Date.now() - start > timeoutMs) {
+      const tail = cdp.consoleLines().slice(-5).join(' | ') || 'no-console-yet';
+      const pending = cdp.pendingCalls().map((c) => `${c.method}+${c.elapsedMs}ms`).join(', ') || 'idle';
+      const last = cdp.lastCompletedCall();
+      throw new Error(
+        `[gpu-browser] proof page did not finish within ${timeoutMs}ms ` +
+        `(polls=${polls} pool=[${pending}] last=${last ? `${last.method} ${last.durationMs}ms` : 'none'} consoleTail=${tail})`,
+      );
     }
     await new Promise<void>((r) => setTimeout(r, 2000));
   }
