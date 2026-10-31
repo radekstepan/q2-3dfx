@@ -280,7 +280,7 @@ FAIL and a proposed, unapproved tone-normalized threshold. Reopen acceptance;
 no threshold change is authorized. Historical full verify was reported 78/80,
 and deps:check 676 passed after the sound/config fix; neither was rerun here.
 
-Priority (2026-10-31: RELEASE-7 repaired + archived, next): RELEASE-6 → RELEASE-4 → GPU-FOLLOW-3B → RELEASE-9/10/11,
+Priority (2026-10-31: RELEASE-7 repaired + archived, RELEASE-6 repaired + archived, next): RELEASE-4 → GPU-FOLLOW-3B → RELEASE-9/10/11,
 then FOLLOW-5/6/7. Independent cards can proceed with disjoint ownership.
 Claim one card; preserve software goldens and sky/lifecycle behavior. Expensive
 validation runs sequentially. Require actual production-path regressions and
@@ -288,17 +288,6 @@ before/after captures for visible defects, not only helper arithmetic, nonblack
 pixels or counts. Distinguish implementation, automated results and user verdict.
 Historical DONE cards in `docs/tasks-archive.md` are superseded by reopened cards
 here. A missing display blocks displayed-performance acceptance, not code repairs.
-
-### RELEASE-6 — Correct HUD, live F1 help and completion presentation
-owns: `apps/web`, `packages/client`, `packages/formats`, `packages/server`, `packages/testkit`
-depends: none
-status: ready (reopened)
-review-findings: `drawHelpOverlay` reads `finishKills/finishGoals/finishSecrets`, which are populated only by `SV_FinishLevel`; live counters are `killedMonsters/foundGoals/foundSecrets`. `statusbarStateFor` supplies a constant help icon. Completion still renders `centerPrintPlacement(driver.message)` in FINISH_BLUE, not the appropriate original intermission presentation.
-done-when:
-- [ ] Reproduce broken/misaligned icons and text outside 640×480. Audit layout coordinates, image dimensions, digit spacing, font rendering and shared UI scale; preserve original relative placement. Verify HUD/F1/death/completion at 320×240, 640×480, 800×600 and 1024×768 on Software/WebGL2, before/after resize. Real-art captures must show aligned text/icons, not merely in-bounds pixels.
-- [ ] Use live kills/goals/secrets during play, retaining frozen finish snapshots for completion. Kill an enemy/find a secret/complete a goal with F1 open and closed; verify counts update without reopening or restarting.
-- [ ] Compare startup F1/help notification with original `p_view.c` helpchanged tracking and `p_hud.c` flashing help icon; implement correct initial/change notification and acknowledgment on opening help. Test flash cadence and stop/reset conditions, not an unconditional permanent blink.
-- [ ] Replace the remaining custom blue finish summary with source/asset-faithful single-player completion/intermission behavior. Inspect original layout, camera, totals and timing; do not substitute a multiplayer scoreboard or victory asset without establishing that it belongs here. Keep asset-free devroom fallback.
 
 ### RELEASE-4 — Make the waiting final elevator physically enterable
 owns: `packages/server`, `packages/game`, `apps/web`, `packages/testkit`

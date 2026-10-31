@@ -18,6 +18,8 @@ import {
   buildHelpLayout,
   centerPrintPlacement,
   fillRect,
+  helpIconFor,
+  HELP_ICON_PIC,
   lerpAngle,
   makeConcharsFont,
   parseStatusbar,
@@ -25,7 +27,7 @@ import {
   stringWidth,
   loadConcharsFont as loadConcharsPixels,
 } from '@q2/client';
-import type { ConcharsFont, DigitPics, IndexedPic, StatusbarState } from '@q2/client';
+import type { ConcharsFont, DigitPics, HelpFacts, IndexedPic, StatusbarState } from '@q2/client';
 import {
   STAT_AMMO,
   STAT_ARMOR,
@@ -1789,9 +1791,13 @@ export class LocalDriver implements HostDriver {
    * live Weapon_Generic-lite gunframe (fire frame on the firing tick, then
    * +1 per server tick until idle-first holds READY) — never a frozen fire
    * frame. Null without a pak — the caller falls back to the 2D silhouette.
+   * Null once the level finishes (RELEASE-6 intermission-lite: id
+   * `MoveClientToIntermission` drops `ps.gunindex` to 0 — gun down, no world
+   * interaction; the 2D silhouette honors the same gate in `drawViewModel`).
    * The 0.09s muzzleLit window is dlight/HUD-only (flash + 2D icon glow).
    */
   viewModel(): { model: number; skin: number; frame: number } | null {
+    if (this.server.finished) return null;
     const model = this.models?.weapons[this.weapon.classname];
     const skin = this.models?.weaponSkins[this.weapon.classname];
     if (model === undefined || skin === undefined) return null;
@@ -2187,6 +2193,10 @@ export class LocalDriver implements HostDriver {
    * the lump dict in extra — the numeric field is C-stripped post-spawn). */
   private checkPickups(): void {
     if (this.playerDead) return;
+    // RELEASE-6 intermission-lite: a finished level takes no more input —
+    // id `MoveClientToIntermission` drops the body to SOLID_NOT so touches
+    // stop; pickups/items freeze with the stats screen.
+    if (this.server.finished) return;
     const px = this.pm.origin[0]!;
     const py = this.pm.origin[1]!;
     const pz = this.pm.origin[2]!;
@@ -2641,6 +2651,8 @@ export class LocalDriver implements HostDriver {
    */
   private pressUseButton(): void {
     if (this.playerDead) return;
+    // RELEASE-6 intermission-lite: no world interaction once finished.
+    if (this.server.finished) return;
     const eye = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + this.pm.viewheight);
     const fwd = v3();
     const right = v3();
@@ -2661,6 +2673,9 @@ export class LocalDriver implements HostDriver {
    */
   private handleAttack(cmd: UserCmdT): void {    if (!(cmd.buttons & BUTTON_ATTACK)) return;
     if (this.playerDead) return;
+    // RELEASE-6 intermission-lite: the trigger goes dead with the level
+    // (gun down via `viewModel`, no shots, no dry-fire, no refire latch).
+    if (this.server.finished) return;
     // Weapon_Generic: WEAPON_DROPPING / WEAPON_ACTIVATING ignore attack —
     // the gun is mid-switch (lower/raise), not READY, so the trigger does
     // nothing (no shot, no dry-fire, no refire latch).
@@ -3070,7 +3085,12 @@ export interface HudPicCache {
   /** Scoreboard dogtags (`tag1`/`tag2`, 128x32). */
   tag1: IndexedPic | null;
   tag2: IndexedPic | null;
-  /** End-of-unit plaque (`victory`, 320x240). */
+  /**
+   * End-of-unit plaque (`victory`, 320x240). Decoded for inventory only —
+   * NEVER drawn for single-player completion: it is the coop `victory.pcx`
+   * plaque (`sv_init.c` gates it on the coop victory level), not SP
+   * presentation (RELEASE-6).
+   */
   victory: IndexedPic | null;
 }
 
@@ -3150,6 +3170,20 @@ export interface PlayBoot {
    * `toggleHelpOverlay`; dom.ts wires the browser key). False = HUD only.
    */
   showHelp: boolean;
+  /**
+   * RELEASE-6 help-change tracking (id `game.helpchanged` vs
+   * `pers.game_helpchanged`, `p_view.c` / `p_hud.c: Cmd_Help_f`):
+   * `helpChangedSeq` counts help-content changes published for this boot,
+   * `helpSeenSeq` the seq acked by opening F1 (`pers.helpchanged = 0`).
+   * The server lane carries no `target_help` producer yet, so the counter
+   * stays 0 and the statusbar slot never blinks on its own — `helpIconFor`
+   * flashes `i_help` only while the seqs differ, at `(serverframe & 8)`.
+   * TODO(RELEASE-6): advance `helpChangedSeq` from the server lane when a
+   * `target_help` equivalent lands (plus the `misc/pc_up.wav` ≤3 beep path
+   * from `G_SetClientSound`, which has no clean driver-sound route yet).
+   */
+  helpChangedSeq: number;
+  helpSeenSeq: number;
 }
 
 /**
@@ -4103,6 +4137,8 @@ export function bootPlay(opts: {
     palette: mainPalette,
     hudPics,
     showHelp: false,
+    helpChangedSeq: 0,
+    helpSeenSeq: 0,
   };
   // GPU-FOLLOW-4 (1): wire the real canvas contextlost/restored pair now that
   // the boot exists (no-op without a GPU backend; exactly-once per canvas).
@@ -4774,6 +4810,15 @@ export function buildHudPicCache(pak: WebPak): HudPicCache {
  * Frame state for the retail statusbar program, derived from the live
  * driver/server (health, ammo, armor, selected weapon, pickup, timer, help).
  * `serverframe` drives the low-health/ammo blink (`(serverframe>>2)&1`).
+ *
+ * The help slot (stat 11, `if 11 xv 148 pic 11`) follows id `G_SetStats`
+ * via the shared `helpIconFor` pure helper (`@q2/client`): `i_help` flashes
+ * only while an unacked help change exists (`helpChangedSeq !== helpSeenSeq`,
+ * the web stand-in for `pers.helpchanged`) at `(serverframe & 8)` — never an
+ * unconditional blink. Frame convention is `Math.floor(serverTime * 10)`,
+ * the 10Hz server tick (`HelpIconArgs.frame`). Hand/fov pass the id
+ * defaults (right-handed, fov 90, so the slot hides when nothing is pending);
+ * TODO(RELEASE-6): forward real hand/fov state if those settings ever land.
  */
 export function statusbarStateFor(boot: PlayBoot): StatusbarState {
   const d = boot.driver;
@@ -4782,25 +4827,35 @@ export function statusbarStateFor(boot: PlayBoot): StatusbarState {
   const ammoCount = ammoKind ? (d.ps.ammo[ammoKind] ?? 0) : 0;
   const hasAmmoRow = ammoKind !== null && ammoCount >= 0;
   const armorIcon = d.ps.armor > 0 ? 'i_bodyarmor' : null;
+  const weaponIcon = weaponIconFor(d.weapon.classname);
+  const serverframe = Math.floor(boot.host.serverTime * 10);
+  const helpPic = helpIconFor({
+    helpChanged: boot.helpChangedSeq !== boot.helpSeenSeq ? 1 : 0,
+    frame: serverframe,
+    centerHanded: false,
+    fov: 90,
+    weaponIcon,
+  });
   const images = [
     'i_health', '', ammoIcon ?? '', '', armorIcon ?? '', '',
-    weaponIconFor(d.weapon.classname), '', '', 'i_help', '', 'i_help',
+    weaponIcon, '', '', '', '', helpPic ?? '',
   ];
   const stats = [
     0, d.playerHealth,
     hasAmmoRow ? 2 : 0, ammoCount,
     armorIcon ? 4 : 0, d.ps.armor,
-    6, 0, 0, 0, 0, 11,
+    6, 0, 0, 0, 0, helpPic ? 11 : 0,
     0, 0, 0, 0,
   ];
   void STAT_SELECTED_ICON; void STAT_PICKUP_ICON; void STAT_PICKUP_STRING;
   void STAT_TIMER; void STAT_HELPICON; void STAT_FLASHES;
   void STAT_AMMO; void STAT_ARMOR; void STAT_HEALTH;
+  void HELP_ICON_PIC;
   return {
     stats,
     images,
     configstrings: [],
-    serverframe: Math.floor(boot.host.serverTime * 10),
+    serverframe,
     clientInfo: () => null,
   };
 }
@@ -4844,6 +4899,28 @@ export function drawStatusbarCmds(
 }
 
 /**
+ * F1 help-computer facts (RELEASE-6): id `HelpComputer` (`game/p_hud.c`)
+ * sends the LIVE `level.killed_monsters/found_goals/found_secrets` over
+ * totals — the `finish*` snapshot (frozen at `SV_FinishLevel`, zero during
+ * play) is only for the completion screen. While the level runs this reads
+ * the live counters; once finished it reads the frozen snapshot so the
+ * totals stay put under post-finish play.
+ */
+export function helpFactsFor(boot: PlayBoot): HelpFacts {
+  const s = boot.driver.server;
+  const frozen = s.finished;
+  return {
+    skill: getSkill(),
+    levelName: boot.source === 'pak' ? 'Outer Base' : 'devroom',
+    help1: 'Find the exit.',
+    help2: 'Watch for soldiers.',
+    kills: [frozen ? s.finishKills : s.killedMonsters, s.totalMonsters],
+    goals: [frozen ? s.finishGoals : s.foundGoals, s.totalGoals],
+    secrets: [frozen ? s.finishSecrets : s.foundSecrets, s.totalSecrets],
+  };
+}
+
+/**
  * F1 help-computer overlay (RELEASE-6): the 256x192 `help` background
  * centered, plus the `buildHelpLayout` rows executed through the production
  * path (skill label, level name, help text, kills/goals/secrets). Without
@@ -4868,15 +4945,7 @@ export function drawHelpOverlay(
   } else {
     fillRect(target, hx, hy, 256, 192, 0xcc101010);
   }
-  const layout = buildHelpLayout({
-    skill: getSkill(),
-    levelName: boot.source === 'pak' ? 'Outer Base' : 'devroom',
-    help1: 'Find the exit.',
-    help2: 'Watch for soldiers.',
-    kills: [boot.driver.server.finishKills, boot.driver.server.totalMonsters],
-    goals: [boot.driver.server.finishGoals, boot.driver.server.totalGoals],
-    secrets: [boot.driver.server.finishSecrets, boot.driver.server.totalSecrets],
-  });
+  const layout = buildHelpLayout(helpFactsFor(boot));
   let cmds;
   try {
     cmds = executeStatusbar(parseStatusbar(layout), statusbarStateFor(boot), w, h);
@@ -4898,9 +4967,25 @@ export function drawHelpOverlay(
   }
 }
 
-/** Toggle the F1 help-computer overlay (browser F1 key calls this). */
+/**
+ * Toggle the F1 help-computer overlay (id `Cmd_Help_f`, `game/p_hud.c`):
+ * if open AND no help change arrived since it was opened → close; otherwise
+ * open + ack (`pers.helpchanged = 0`, i.e. `helpSeenSeq = helpChangedSeq`)
+ * + resend the layout (the draw path re-executes `buildHelpLayout` every
+ * frame while open, so the resent rows are live on the next present).
+ * TODO(RELEASE-6): help-change beep (`misc/pc_up.wav`, ≤3 times at
+ * `(framenum & 63) == 0` per `G_SetClientSound`) — no clean driver-sound
+ * route exists from this free function (`emitSound` is driver-private, the
+ * server sound queue is tick-drained); do not invent audio plumbing until
+ * the server lane carries the beep event.
+ */
 export function toggleHelpOverlay(boot: PlayBoot): boolean {
-  boot.showHelp = !boot.showHelp;
+  if (boot.showHelp && boot.helpSeenSeq >= boot.helpChangedSeq) {
+    boot.showHelp = false;
+    return boot.showHelp;
+  }
+  boot.showHelp = true;
+  boot.helpSeenSeq = boot.helpChangedSeq;
   return boot.showHelp;
 }
 
@@ -4956,8 +5041,23 @@ export function drawPlayHud(
     }
   }
   if (boot.driver.server.finished) {
-    // Completion via centerPrintPlacement (SCR_DrawCenterString semantics):
-    // each line centered at 35% screen height (or y=48 for long scrolls).
+    // RELEASE-6 completion (single-player intermission stand-in): id
+    // `BeginIntermission` with `level.exitintermission = 1` exits to the next
+    // map IMMEDIATELY — no scoreboard/layout screen is ever sent in SP
+    // (`MoveClientToIntermission` only uncasts a layout for deathmatch/coop;
+    // the totals live in the F1 help computer, frozen here via
+    // `helpFactsFor`). base2 is not shipped so there is no next map: the
+    // stand-in keeps the player in-world with the frozen `finish*` totals
+    // centered in FINISH_BLUE, the gun down (`viewModel` null +
+    // `drawViewModel` skipped below), and no world interaction (attack/use/
+    // pickup gates on `server.finished`). Deliberate deviations from id:
+    // the body keeps its world pose (no intermission-point teleport — there
+    // is no intermission spot wired), movement still simulates so the
+    // end-lift finishes its leg under a standing rider, and the
+    // multiplayer scoreboard is never drawn. `pics/victory.pcx` is never
+    // used here: it is the coop end-of-unit plaque (gated in `sv_init.c` on
+    // the coop `victory.pcx` level), not SP completion. Asset-free devroom
+    // keeps the same text block (no asset dependency).
     const lines = centerPrintPlacement(boot.driver.message, target.width, target.height);
     for (const line of lines) {
       drawString(target, line.x, line.y, line.text, FINISH_BLUE);
@@ -5012,6 +5112,9 @@ function drawViewModel(
   target: { width: number; height: number; color: Uint32Array },
   boot: PlayBoot,
 ): void {
+  // RELEASE-6 intermission-lite: gun down once finished (mirrors the
+  // `viewModel` null gate for the 3D path above).
+  if (boot.driver.server.finished) return;
   const w = target.width;
   const h = target.height;
   const cls = boot.driver.weapon.classname;

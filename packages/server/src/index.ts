@@ -299,6 +299,24 @@ export interface ServerState {
   totalGoals: number;
   /** Single-use goal completions (C use_target_goal + G_FreeEdict). */
   foundGoals: number;
+  // --- C game.* help-notification state (g_target.c Use_Target_Help) ---------
+  //
+  // RELEASE-6 server lane (no HUD code here): the server owns ONLY the
+  // game-side sequence + message strings. The per-client ack
+  // (pers.game_helpchanged / pers.helpchanged / showhelp in C) lives in the
+  // driver (SP, in-process — see apps/web PlayBoot.showHelp): on each frame
+  // the driver latches `helpSeenSeq = helpChangedSeq; helpChanged = 1` when
+  // they differ (G_SetClientSound), beeps via helpBeepDue, flashes the
+  // i_help icon via helpIconVisible, and on F1-open zeroes its helpChanged
+  // (Cmd_Help_f). The HelpComputer layout itself reads the LIVE
+  // killedMonsters/foundGoals/foundSecrets counters above (finish* only
+  // freezes the completion screen — SV_FinishLevel semantics unchanged).
+  /** C game.helpchanged: bumped by every target_help firing. */
+  helpChangedSeq: number;
+  /** C game.helpmessage1 (Use_Target_Help, spawnflags & 1). */
+  helpMessage1: string;
+  /** C game.helpmessage2 (Use_Target_Help, spawnflags & 1 clear). */
+  helpMessage2: string;
   /**
    * Server-owned finished state. Set once: 'exit' when a target_changelevel
    * fires (C BeginIntermission-lite for SP — no map change, base2 is not
@@ -320,7 +338,7 @@ export interface ServerState {
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0 };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0 };
 }
 
 /**
@@ -346,6 +364,27 @@ export function SV_ClearFinished(st: ServerState): void {
   st.finishKills = 0;
   st.finishSecrets = 0;
   st.finishGoals = 0;
+}
+
+/**
+ * C G_SetStats help-icon flash (game/p_hud.c): STAT_HELPICON is `i_help`
+ * iff the client still has an unacknowledged change AND (level.framenum&8).
+ * `helpChanged` is the driver-side pers.helpchanged counter (1..4 unacked,
+ * 0 acked on F1-open); `framenum` is the 10Hz frame (web lane derives it
+ * as floor(serverTime * 10)). Pure — no HUD code, the web lane consumes it.
+ */
+export function helpIconVisible(helpChanged: number, framenum: number): boolean {
+  return helpChanged !== 0 && (framenum & 8) !== 0;
+}
+
+/**
+ * C G_SetClientSound help beep (game/p_view.c): while the unacknowledged
+ * counter is 1..3, beep once every 64th frame (`misc/pc_up.wav`); the caller
+ * then increments its counter (pers.helpchanged++), so the beep stops after
+ * three plays. Pure — the driver owns the counter and the sound request.
+ */
+export function helpBeepDue(helpChanged: number, framenum: number): boolean {
+  return helpChanged !== 0 && helpChanged <= 3 && (framenum & 63) === 0;
 }
 
 /** Link an edict into the world (SV_LinkEdict: register + solid bookkeeping). */
@@ -1350,6 +1389,13 @@ export function SV_SpawnEntities(
         });
         break;
       }
+      case 'target_help': {
+        // C SP_target_help (g_target.c): deathmatch removal is N/A (this
+        // sim is SP-only); edicts with no message are freed at spawn
+        // (G_FreeEdict) so a later use can never latch an empty string.
+        if (!e.message) e.freed = true;
+        break;
+      }
       case 'misc_deadsoldier': {
         // C SP_misc_deadsoldier (g_misc.c): a corpse in a fixed pose
         // (spawnflags bits -> deadbod dude MD2 frame, resolved view-side),
@@ -1619,6 +1665,17 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
   for (const e of st.entities) {
     if (e.freed || e.targetname !== user.target) continue;
     st.firedThisTick.push(e.targetname);
+    if (e.classname === 'target_help') {
+      // C Use_Target_Help (g_target.c): spawnflags & 1 selects
+      // game.helpmessage1, else game.helpmessage2; every firing bumps
+      // game.helpchanged (the driver's pers.* ack lives outside this
+      // package — see the ServerState help block). Unlike secrets/goals
+      // this is NOT single-use: repeated firings re-latch + re-bump.
+      if (e.spawnflags & 1) st.helpMessage1 = e.message;
+      else st.helpMessage2 = e.message;
+      st.helpChangedSeq++;
+      continue;
+    }
     if (e.classname === 'target_secret') {
       // C use_target_secret: single-use (G_FreeEdict) with the secret sound
       // (default misc/secret.wav). The loop skips freed edicts, so freeing

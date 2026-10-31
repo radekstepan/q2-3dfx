@@ -20,7 +20,15 @@ export function skillName(skill: number): string {
   return 'hard+';
 }
 
-/** Facts rendered on the F1 help computer. */
+/** Facts rendered on the F1 help computer.
+ *
+ * The kills/goals/secrets pairs are LIVE counters (`level.killed_monsters`,
+ * `level.found_goals`, `level.found_secrets` over their totals) — the same
+ * values `HelpComputer` (`game/p_hud.c`) formats into the layout string every
+ * time F1 opens. Callers must pass the live counters here, NOT the
+ * `SV_FinishLevel` frozen finish snapshots (which exist only for the
+ * completion/intermission presentation).
+ */
 export interface HelpFacts {
   readonly skill: number;
   readonly levelName: string;
@@ -40,6 +48,10 @@ export function pad3(value: number): string {
  * Build the exact F1 layout string id sends (`HelpComputer`): help-pic
  * background, skill label, centered level name and help texts, and the
  * kills/goals/secrets progress rows. Parseable by `parseStatusbar`.
+ *
+ * Format pins id's `Com_sprintf`: kills use `%3i/%3i` (see `pad3`), goals and
+ * secrets use bare `%i/%i` (no padding). The counters are the LIVE values
+ * from `HelpFacts` — see its docs.
  */
 export function buildHelpLayout(f: HelpFacts): string {
   return (
@@ -52,4 +64,60 @@ export function buildHelpLayout(f: HelpFacts): string {
     `xv 50 yv 172 string2 "${pad3(f.kills[0])}/${pad3(f.kills[1])}     ` +
     `${f.goals[0]}/${f.goals[1]}       ${f.secrets[0]}/${f.secrets[1]}" `
   );
+}
+
+// ---------------------------------------------------------------------------
+// Help-icon flash (`game/p_hud.c: G_SetStats` STAT_HELPICON).
+// ---------------------------------------------------------------------------
+
+/** Pic drawn while the F1 help notification flashes (`i_help`). */
+export const HELP_ICON_PIC = 'i_help';
+
+/**
+ * Inputs for `helpIconFor` — the client-visible slice of `G_SetStats` state.
+ * Pure data; the integrator resolves the returned pic name to an image.
+ */
+export interface HelpIconArgs {
+  /**
+   * `pers.helpchanged` (nonzero = unacknowledged help change pending).
+   * Cleared when the player opens help; while nonzero the icon flashes.
+   */
+  readonly helpChanged: number;
+  /**
+   * Server frame number (`level.framenum`, 10 Hz). Callers holding
+   * `level.time` seconds pass `Math.floor(serverTime * 10)`.
+   */
+  readonly frame: number;
+  /** `pers.hand == CENTER_HANDED`. */
+  readonly centerHanded: boolean;
+  /** `ps.fov`. */
+  readonly fov: number;
+  /**
+   * Current weapon icon pic name (`pers.weapon->icon`), or null/undefined/
+   * '' when unarmed (`pers.weapon == null`).
+   */
+  readonly weaponIcon: string | null | undefined;
+}
+
+/**
+ * Pure `STAT_HELPICON` semantics from `G_SetStats`:
+ *
+ * ```
+ * if (helpchanged && (framenum & 8)) STAT_HELPICON = imageindex("i_help");
+ * else if ((centerHanded || fov > 91) && weapon) STAT_HELPICON = imageindex(weapon->icon);
+ * else STAT_HELPICON = 0;
+ * ```
+ *
+ * Returns the pic name to draw, or null for 0 (nothing drawn). Never throws:
+ * non-integer frames are truncated, `NaN` behaves as 0, and a missing/empty
+ * weapon icon falls through to null. No rendering, no state.
+ */
+export function helpIconFor(args: HelpIconArgs): string | null {
+  if (args.helpChanged !== 0 && (Math.trunc(args.frame) & 8) !== 0) {
+    return HELP_ICON_PIC;
+  }
+  if ((args.centerHanded || args.fov > 91) && args.weaponIcon) {
+    return args.weaponIcon;
+  }
+  return null;
 }

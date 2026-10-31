@@ -21,8 +21,10 @@ import { readFileSync } from 'fs';
 import {
   bootPlay,
   buildHudPicCache,
+  drawHelpOverlay,
   drawPlayHud,
   drawStatusbarCmds,
+  helpFactsFor,
   RETAIL_SINGLE_STATUSBAR,
   statusbarStateFor,
   toggleHelpOverlay,
@@ -31,6 +33,7 @@ import {
   POS_GREY,
 } from './play.js';
 import type { PlayBoot } from './play.js';
+import type { UserCmdT } from '@q2/input';
 import {
   buildHelpLayout,
   centerPrintPlacement,
@@ -271,5 +274,150 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-6 web HUD (real pak, Q2_PAK)', () => {
     const target = blank(320, 240);
     expect(() => drawPlayHud(target, boot, { fps: 0, frame: 1 })).not.toThrow();
     expect(paintedIn(target, 0, 190, 320, 240)).toBeGreaterThan(0);
+  });
+});
+
+describe('RELEASE-6 web lane (live counters / help ack / completion)', () => {
+  const attackCmd: UserCmdT = { msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 1 };
+
+  it('F1 rows read live counters during play, frozen snapshot at completion', () => {
+    const boot = bootPlay({ width: 320, height: 240 });
+    boot.driver.server.totalMonsters = 12;
+    boot.driver.server.killedMonsters = 3;
+    boot.driver.server.totalSecrets = 2;
+    boot.driver.server.foundSecrets = 1;
+    boot.driver.server.totalGoals = 1;
+    boot.driver.server.foundGoals = 0;
+    // Live during play (id HelpComputer reads level.* — never finish*).
+    expect(helpFactsFor(boot).kills).toEqual([3, 12]);
+    expect(helpFactsFor(boot).secrets).toEqual([1, 2]);
+    expect(helpFactsFor(boot).goals).toEqual([0, 1]);
+    // Frozen once finished: post-finish kills don't move the F1 rows.
+    boot.driver.server.finished = true;
+    boot.driver.server.finishKills = 3;
+    boot.driver.server.finishSecrets = 1;
+    boot.driver.server.finishGoals = 0;
+    boot.driver.server.killedMonsters = 9;
+    boot.driver.server.foundSecrets = 2;
+    expect(helpFactsFor(boot).kills).toEqual([3, 12]);
+    expect(helpFactsFor(boot).secrets).toEqual([1, 2]);
+    expect(helpFactsFor(boot).goals).toEqual([0, 1]);
+    // The production overlay path renders those rows without throwing.
+    toggleHelpOverlay(boot);
+    const target = blank(320, 240);
+    expect(() => drawPlayHud(target, boot, { fps: 0, frame: 1 })).not.toThrow();
+    expect(paintedIn(target, 32, 24, 288, 216)).toBeGreaterThan(200);
+  });
+
+  it('help icon flashes only while a change is unacked, at (serverframe & 8)', () => {
+    const boot = bootPlay({ width: 320, height: 240 });
+    // Startup: seqs equal → slot hidden at every flash phase (no
+    // unconditional permanent blink).
+    for (const t of [0, 0.8, 1.6, 8.0]) {
+      boot.host.serverTime = t;
+      const st = statusbarStateFor(boot);
+      expect(st.stats[11]).toBe(0);
+      expect(st.images[11]).toBe('');
+    }
+    // A published change: i_help exactly when (frame & 8), hidden otherwise.
+    boot.helpChangedSeq = 1;
+    boot.host.serverTime = 0; // frame 0
+    expect(statusbarStateFor(boot).stats[11]).toBe(0);
+    boot.host.serverTime = 0.8; // frame 8
+    const flashing = statusbarStateFor(boot);
+    expect(flashing.stats[11]).toBe(11);
+    expect(flashing.images[11]).toBe('i_help');
+    boot.host.serverTime = 1.6; // frame 16: (16 & 8) === 0
+    expect(statusbarStateFor(boot).stats[11]).toBe(0);
+    // Opening F1 acks (pers.helpchanged = 0) → slot hides on flash frames.
+    expect(toggleHelpOverlay(boot)).toBe(true);
+    expect(boot.helpSeenSeq).toBe(1);
+    expect(statusbarStateFor(boot).stats[11]).toBe(0);
+    // Open + no new change → F1 closes (id Cmd_Help_f).
+    expect(toggleHelpOverlay(boot)).toBe(false);
+    // Open with a new change pending → stays open + acks.
+    boot.helpChangedSeq = 2;
+    expect(toggleHelpOverlay(boot)).toBe(true);
+    expect(boot.showHelp).toBe(true);
+    expect(boot.helpSeenSeq).toBe(2);
+    expect(statusbarStateFor(boot).stats[11]).toBe(0);
+  });
+
+  it('completion freezes interaction and drops the gun (intermission-lite)', () => {
+    const boot = bootPlay({ width: 320, height: 240 });
+    const { driver } = boot;
+    setCVar('cl_showfps', 0);
+    setCVar('cl_showpos', 0);
+    // Sanity: the trigger fires before the finish.
+    // The 2D blaster silhouette paints pre-finish (receiver body tone).
+    const live = blank(320, 240);
+    drawPlayHud(live, boot, { fps: 0, frame: 1 });
+    const bodyTone = 0xff3a3f44;
+    const countTone = (t: { color: Uint32Array }): number => t.color.filter((c) => c === bodyTone).length;
+    expect(countTone(live)).toBeGreaterThan(0);
+    driver.step(attackCmd, 0.1);
+    expect(driver.events).toContain('shot');
+    // Finish: gun down, trigger dead, message frozen.
+    driver.server.finished = true;
+    driver.server.finishKills = driver.server.killedMonsters;
+    driver.server.finishSecrets = driver.server.foundSecrets;
+    driver.server.finishGoals = driver.server.foundGoals;
+    // Let the step mirror the frozen snapshot, then attack: the screen stays.
+    driver.step(
+      { msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 },
+      0.1,
+    );
+    const msg = driver.message;
+    expect(msg).toContain('LEVEL COMPLETE');
+    const eventsBefore = driver.events.length;
+    driver.step(attackCmd, 0.1);
+    // No new player-input events (in-flight projectiles may still resolve —
+    // the sim keeps running; the trigger itself is dead).
+    expect(driver.events.slice(eventsBefore)).not.toContain('shot');
+    expect(driver.events.slice(eventsBefore)).not.toContain('empty');
+    expect(driver.events.slice(eventsBefore)).not.toContain('use');
+    expect(driver.message).toBe(msg);
+    expect(driver.message).toContain('LEVEL COMPLETE');
+    expect(driver.viewModel()).toBeNull();
+    const done = blank(320, 240);
+    drawPlayHud(done, boot, { fps: 0, frame: 1 });
+    expect(countTone(done)).toBe(0);
+    expect(done.color.some((c) => c === FINISH_BLUE)).toBe(true);
+    setCVar('cl_showfps', 1);
+    setCVar('cl_showpos', 1);
+  });
+
+  it('HUD/F1/death/completion align at 320x240, 640x480, 800x600 and 1024x768', () => {
+    for (const [w, h] of [[320, 240], [640, 480], [800, 600], [1024, 768]] as const) {
+      const boot = bootPlay({ width: w, height: h });
+      setCVar('cl_showfps', 0);
+      setCVar('cl_showpos', 0);
+      // HUD: no throw, bottom text band paints (asset-free fallback rows).
+      const hud = blank(w, h);
+      expect(() => drawPlayHud(hud, boot, { fps: 0, frame: 1 })).not.toThrow();
+      expect(paintedIn(hud, 0, h - 60, w, h)).toBeGreaterThan(0);
+      // F1: 256x192 backdrop centered ((w-256)/2, (h-192)/2), rows paint.
+      toggleHelpOverlay(boot);
+      const hx = Math.max(0, ((w - 256) / 2) | 0);
+      const hy = Math.max(0, ((h - 192) / 2) | 0);
+      const help = blank(w, h);
+      expect(() => drawHelpOverlay(help, boot)).not.toThrow();
+      expect(paintedIn(help, hx, hy, hx + 256, hy + 192)).toBeGreaterThan(200);
+      toggleHelpOverlay(boot);
+      // Death keeps the hp row; completion centers FINISH_BLUE text.
+      boot.driver.damagePlayer(1000);
+      expect(boot.driver.playerDead).toBe(true);
+      const dead = blank(w, h);
+      expect(() => drawPlayHud(dead, boot, { fps: 0, frame: 1 })).not.toThrow();
+      expect(dead.color.some((c) => c === 0xffff3333 || c === 0xffffffff)).toBe(true);
+      boot.driver.server.finished = true;
+      boot.driver.server.finishKills = 0;
+      boot.driver.message = 'LEVEL COMPLETE — done';
+      const done = blank(w, h);
+      drawPlayHud(done, boot, { fps: 0, frame: 1 });
+      expect(done.color.some((c) => c === FINISH_BLUE)).toBe(true);
+    }
+    setCVar('cl_showfps', 1);
+    setCVar('cl_showpos', 1);
   });
 });

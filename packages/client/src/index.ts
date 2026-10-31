@@ -71,8 +71,8 @@ export {
   Configstrings,
 } from './statusbar.js';
 export type { StatusOp, LayoutXMode, LayoutYMode, DigitStyle, StatusbarState, StatusDrawCmd, StatusClientInfo } from './statusbar.js';
-export { HELP_PIC, HELP_W, HELP_H, skillName, pad3, buildHelpLayout } from './help.js';
-export type { HelpFacts } from './help.js';
+export { HELP_PIC, HELP_W, HELP_H, HELP_ICON_PIC, skillName, pad3, buildHelpLayout, helpIconFor } from './help.js';
+export type { HelpFacts, HelpIconArgs } from './help.js';
 export {
   INTERMISSION_MIN_TIME,
   VICTORY_PIC,

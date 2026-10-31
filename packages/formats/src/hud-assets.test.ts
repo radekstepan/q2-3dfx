@@ -92,6 +92,33 @@ describe.runIf(!!Q2_PAK && existsSync(Q2_PAK as string))('real HUD pics (Q2_PAK)
     }
   });
 
+  it('pins key production dims (help/F1, field_3, digit cells, conchars)', () => {
+    // Explicit pins for the dims production code hardcodes elsewhere —
+    // keep in sync with @q2/client `HELP_W/HELP_H` (256/192),
+    // `FIELD_DIGIT_W/FIELD_DIGIT_H` (16/24), `CONCHARS_PIC_SIZE` (128)
+    // and the 8px `drawString`/`stringWidth` advance. The manifest loop
+    // above checks manifest-vs-art; this test names the values the
+    // renderers depend on so a bad constant fails loudly here too.
+    const dims = (name: string): [number, number] => {
+      const lump = loadReal(name);
+      const buf = new ArrayBuffer(lump.length);
+      new Uint8Array(buf).set(lump);
+      const pcx = parsePCX(buf);
+      return [pcx.width, pcx.height];
+    };
+    expect(dims('pics/help.pcx')).toEqual([256, 192]);
+    expect(dims('pics/inventory.pcx')).toEqual([256, 192]);
+    expect(dims('pics/field_3.pcx')).toEqual([48, 24]);
+    for (const style of ['num', 'anum'] as const) {
+      for (let d = 0; d <= 9; d++) expect(dims(`pics/${style}_${d}.pcx`), style).toEqual([16, 24]);
+      expect(dims(`pics/${style}_minus.pcx`), style).toEqual([16, 24]);
+    }
+    expect(dims('pics/conchars.pcx')).toEqual([128, 128]);
+    expect(dims('pics/tag1.pcx')).toEqual([128, 32]);
+    expect(dims('pics/tag2.pcx')).toEqual([128, 32]);
+    expect(dims('pics/victory.pcx')).toEqual([320, 240]);
+  });
+
   it('digit sets differ between normal and alert, icons are opaque blocks', () => {
     const num = loadReal('pics/num_0.pcx');
     const anum = loadReal('pics/aNum_0.pcx'.toLowerCase());
