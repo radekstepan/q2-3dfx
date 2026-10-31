@@ -600,19 +600,21 @@ int voodooPickLevel(float lod, ivec2 px) {
   }
   return min(lvl, uMaxLevel);
 }
-vec3 voodooSampleMipped(sampler2D map, vec2 uv) {
-  return voodooSampleMippedWarped(map, uv, uv);
-}
 // Turbulent-water tap (GPU-FOLLOW-3B): LOD/level from the UNWARPED coords
 // (CPU spanLod parity — spans.ts builds spanLod from unwarped screen-space
 // gradients, then warps only the diffuse lookup), sample at the warped
 // coords. The old single-arg call on warped UVs folded the warp's
 // floor() steps into fwidth derivatives, flipping the Bayer n/n+1 pick
 // along integer texel lines (tile-grid seams). Warp offsets only the tap.
+// NOTE: Warped is defined BEFORE Mipped — GLSL ES requires declaration
+// before use (ANGLE rejects forward references that stub-GL tolerates).
 vec3 voodooSampleMippedWarped(sampler2D map, vec2 lodUv, vec2 sampleUv) {
   float lod = voodooLod(map, lodUv);
   int lvl = voodooPickLevel(lod, ivec2(gl_FragCoord.xy));
   return textureLod(map, sampleUv, float(lvl)).rgb;
+}
+vec3 voodooSampleMipped(sampler2D map, vec2 uv) {
+  return voodooSampleMippedWarped(map, uv, uv);
 }
 `;
 

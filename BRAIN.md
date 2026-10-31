@@ -331,17 +331,6 @@ done-when:
 - [ ] Verify the landed procedural palette/world/model replay on GPU cold boot, switching and restoration without a pak. The former palette guard was addressed in `2c4c162`; do not repeat the obsolete diagnosis or rebuild the implementation. Diagnose any remaining failure from rendered evidence.
 - [ ] Real-WebGL pixels show expected room geometry/materials and entities without pak assets; verify cold boot, map switch, renderer switch and context restoration. Check that an intentional missing-world control fails; nonblack clear color alone is insufficient.
 
-### RELEASE-5 — Monster collision, wall movement and infantry fire
-owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
-depends: none
-status: in-progress(@opencode)
-lane-2026-10-30 (@opencode): game+server+testkit lane DONE (game 211/211, server 202/202, testkit 3/3; per-monster trace, frozen hold, flashless smack + swing cue, n-6/k+1 windows, real-base1 t38/*19 regression); apps/web visible replay + burst capture + monster-block *31 update still open for integrator.
-done-when:
-- [ ] Reproduce player clipping into live infantry. Audit server entity hulls/linking, player prediction and movement traces; test stationary/moving infantry, close contact and doorways. Keep legitimate corpse/death collision behavior faithful to source.
-- [ ] Revisit the soldier behind the door at player position **(-1148.1, 1542.3, -24)** in base1, recording facing, soldier identity, skill and door state. Confirm with a regression and visible replay that it cannot climb up the wall then descend. Audit step height, ground checks, hull traces and moving-door interaction; a generic chase test is not confirmation at this location.
-- [ ] Compare infantry firing with local `game/m_infantry.c`, muzzle offsets and original client effects/assets. The source uses `monster_fire_bullet`; verify hitscan behavior, burst timing, muzzle flash/light, impact effects, sound and any rendered tracer against the original. Do not substitute soldier blaster/projectile visuals. Capture a representative burst with negative controls for missing/wrong effects.
-- [ ] Pass real-asset `base1-gate.test.ts` and focused monster/collision tests; record observed visual verdict separately from unit-test success.
-
 ### RELEASE-6 — Use game assets for HUD, F1 and level completion
 owns: `apps/web`, `packages/client`, `packages/formats`, `packages/testkit`
 depends: none

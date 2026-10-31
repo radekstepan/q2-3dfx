@@ -3,19 +3,24 @@
 // Report: "as door opens elevator rides down". Server audit (real-data, in
 // tree): the *12 func_train waits on t91 (target t88 → t89 (wait .5) → t90,
 // one-way); the *13 func_button (wait -1) fires t91; the *32/*33 entry doors
-// carry no train target (*32's t75 dangles); the *31 plug rides DOWN 156 on
-// touch (pos2 z -156) and returns when clear — all C-correct. So the only
-// moving "elevator" on door-open is the plug (156 down), never the lift:
-// the reporter conflated the plug with the lift (or saw the plug's C-correct
-// descent). This file pins the C-correct behavior in the driver loop:
-// - opening *31/*32/*33 fires no t91 and the *12 sim origin + rendered mesh
-//   stay parked while the doors cycle;
+// carry no train target (*32's t75 dangles). RELEASE-4 C-parity: the
+// targetname'd *31 plug owns NO touch trigger in C SP_func_door, so camping
+// the hall opens and parks the *32/*33 sliders while the plug sits at pos1
+// (pre-R4 revisions asserting touch opens the plug encoded the bug, not the
+// pin). The plug's C-intended opener is the *34 platform button: it rides
+// DOWN 156 on t4 and returns after the C-default hold. So the only moving
+// "elevator" on door-open is never the lift: the reporter conflated the
+// plug with the lift (or saw the plug's C-correct descent). This file pins
+// the C-correct behavior in the driver loop:
+// - camping the hall parks the sliders, leaves the plug shut, fires no t91,
+//   and the *12 sim origin + rendered mesh stay parked while the doors cycle;
+// - walking in through *32 cycles the entry doors with the lift parked;
+// - the *34 press drops the plug 156, holds ~3s, and returns (default wait),
+//   i.e. "ride up and wait for button" = the TRAIN waits for *13; the plug
+//   never auto-runs the lift;
 // - E-USEing *13 fires t91, the train traverses the full leg (mid-leg motion
 //   observed — not a teleport), arrives (-16,0,40), and parks; the wait -1
-//   button holds TOP (offset [0,0,4]);
-// - the plug drops 156 on touch and auto-closes when clear (default wait),
-//   i.e. "ride up and wait for button" = the TRAIN waits for *13; the plug
-//   never auto-runs the lift.
+//   button holds TOP (offset [0,0,4]).
 // No driver fan-out was found: no fix, just pins (gates (r)/(t)/(u)/(v) cover
 // the same complex and stay green).
 import { describe, expect, it, afterEach } from 'vitest';
@@ -81,24 +86,36 @@ describe.runIf(!!WEB_Q2_PAK)('final elevator report repro (Q2_PAK)', () => {
     expect(train.started).toBe(false);
     expect(off('*12')).toEqual([0, 0, 0]);
 
-    // Phase 1 — open the plug through its touch volume (real driver tick).
+    // Phase 1 — camp the hall the way the game does (RELEASE-4 C-parity:
+    // the targetname'd *31 plug owns no touch trigger in C SP_func_door,
+    // so the body overlaps the *32/*33 rest volumes while the plug sits
+    // at pos1 and the lift never starts — pre-R4 revisions of this phase
+    // parked at (-1774,1536,104) asserting touch opens the plug, which was
+    // the bug, not the pin).
     const fired = new Set<string>();
-    driver.pm.origin = v3(-1774, 1536, 104);
+    driver.pm.origin = v3(-1669, 1514, 120);
     driver.pm.velocity = v3();
+    let sliderTravel = 0;
     let plugTravel = 0;
     for (let i = 0; i < 100; i++) {
       SV_SetPlayerHealth(driver.server, 100); // setup: hold the camper alive
       driver.step(neutralCmd(), 0.1);
       for (const t of driver.server.firedThisTick) fired.add(t);
+      sliderTravel = Math.max(
+        sliderTravel,
+        mag3(off('*32')),
+        mag3(off('*33')),
+      );
       plugTravel = Math.max(plugTravel, mag3(off('*31')));
-      // The lift never starts while the plug cycles.
+      // The lift never starts while the doors park.
       expect(train.started).toBe(false);
       expect([...train.ent.origin]).toEqual([0, 0, 0]);
       expect(off('*12')).toEqual([0, 0, 0]);
     }
-    // Non-vacuous: the plug genuinely rode its 156u DOWN leg (the reported
-    // "elevator rides down" — C-correct plug motion, not the lift).
-    expect(plugTravel).toBeGreaterThan(100);
+    // Non-vacuous: the sliders genuinely travelled open (64u sideways) and
+    // parked — while the plug never moved a unit and no relay fired.
+    expect(sliderTravel).toBeGreaterThan(30);
+    expect(plugTravel).toBeLessThan(0.01);
     expect(fired.has('t91')).toBe(false);
 
     // Phase 2 — walk in through the *32/*33 entry doors (real walk-in).
@@ -117,17 +134,57 @@ describe.runIf(!!WEB_Q2_PAK)('final elevator report repro (Q2_PAK)', () => {
     expect(doorCycle).toBeGreaterThan(30);
     expect(fired.has('t91')).toBe(false);
 
-    // Phase 3 — plug auto-closes when clear (default wait returns it; only
-    // the wait -1 BUTTON holds). Leave the complex and wait out the return.
-    driver.pm.origin = v3(128, -320, 32);
+    // Phase 3 — the C-intended plug opener: press the *34 platform button
+    // (gate (t) pattern). The plug drops the full 156 on the press, holds
+    // the C-default ~3s at the top, and returns — while the lift sits out
+    // the whole cycle. The reported "elevator rides down" is this
+    // C-correct plug motion, never the lift.
+    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
+    const btn34 = driver.server.movers.find((m) => m.ent.model === '*34')!;
+    expect(btn34.wait).toBe(3); // C SP_func_button default (not 1)
+    driver.pm.origin = v3(-1860, 1536, 150);
     driver.pm.velocity = v3();
-    let shut = plugTravel;
-    let n = 0;
-    while (shut >= 0.5 && n++ < 300) {
+    let t4seen = false;
+    for (let i = 0; i < 10 && !t4seen; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
       driver.step(neutralCmd(), 0.1);
-      shut = mag3(off('*31'));
+      for (const t of driver.server.firedThisTick) fired.add(t);
+      if (driver.server.firedThisTick.includes('t4')) t4seen = true;
     }
-    expect(shut).toBeLessThan(0.5);
+    expect(t4seen, 'the alcove press fired t4').toBe(true);
+    expect(btn34.state).not.toBe('bottom');
+    // Leave the overlap at once: a parked rider would re-fire t4 every
+    // button cycle and stretch the door's hold.
+    driver.pm.origin = v3(-1669, 1514, 120);
+    driver.pm.velocity = v3();
+    let guard = 0;
+    while (plug.ent.origin[2]! > -155 && guard++ < 100) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+      for (const t of driver.server.firedThisTick) fired.add(t);
+      expect(driver.server.firedThisTick.includes('t4')).toBe(false);
+    }
+    expect(plug.ent.origin[2]!).toBeCloseTo(-156, 0);
+    plugTravel = Math.max(plugTravel, mag3(off('*31')));
+    expect(plugTravel).toBeGreaterThan(100);
+    expect(train.started).toBe(false);
+    expect([...train.ent.origin]).toEqual([0, 0, 0]);
+    // Intended wait at the top: the C-default hold (~3s), then the return.
+    let holdTicks = 0;
+    guard = 0;
+    while (plug.state !== 'bottom' && guard++ < 400) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+      for (const t of driver.server.firedThisTick) fired.add(t);
+      expect(driver.server.firedThisTick.includes('t4')).toBe(false);
+      if (plug.state === 'waiting' || plug.state === 'top') holdTicks++;
+      expect(train.started).toBe(false);
+    }
+    expect(holdTicks).toBeGreaterThanOrEqual(28);
+    expect(holdTicks).toBeLessThanOrEqual(32);
+    expect([...plug.ent.origin]).toEqual([...plug.pos1]);
+    expect(off('*31')).toEqual([0, 0, 0]);
+    expect(fired.has('t91')).toBe(false);
 
     // Phase 4 — E-USE the *13 call button in reach, aimed (gate (v) pattern:
     // reach + facing cone + wall-checked LOS through SV_UseButton).

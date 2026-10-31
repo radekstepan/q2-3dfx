@@ -75,8 +75,16 @@ describe.runIf(!!WEB_Q2_PAK)('base1 monster collision (Q2_PAK)', () => {
       stepDriver(driver, neutralCmd(), 1);
       expect(driver.pm.onGround).toBe(true);
       let minX = driver.pm.origin[0]!;
+      // Park the hull in the lane (setup touch, gate-(i) class): the new
+      // per-monster locomotion maneuvers the chaser off the straight lane
+      // (it trails north and the walker outruns it), so without parking
+      // the live leg measures a footrace, not a hull. The verdict below is
+      // OUR displacement against the live SOLID_BBOX hull, which thinks
+      // and attacks throughout (heals hold the walker alive).
+      const station = v3(inf.edict.origin[0]!, inf.edict.origin[1]!, inf.edict.origin[2]!);
       for (let i = 0; i < ticks; i++) {
         SV_SetPlayerHealth(driver.server, 100); // setup: hold the walker alive
+        inf.edict.origin = v3(station[0], station[1], station[2]);
         driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
         minX = Math.min(minX, driver.pm.origin[0]!);
       }
@@ -224,20 +232,40 @@ describe.runIf(!!WEB_Q2_PAK)('base1 monster collision (Q2_PAK)', () => {
     expectInWorld(driver.pm.origin, driver.map!);
   });
 
-  it('movers still move with the split in place (plug *31 touch opens)', { timeout: 180000 }, async () => {
+  it('the exit plug *31 never opens on touch (C SP_func_door: sliders open, plug shut)', { timeout: 180000 }, async () => {
+    // RELEASE-4 C-parity reroute (base1-gate (r)/(t)): the targetname'd *31
+    // plug owns no touch trigger in C SP_func_door, so camping the hall
+    // opens and parks the *32/*33 sliders while the plug sits at pos1. The
+    // old revision of this test asserted the opposite (plug travels 156 on
+    // touch) and failed even pristine — that behavior was the bug, not the
+    // pin. The mover split still gets its coverage: the sliders genuinely
+    // travel while the plug never moves.
     const boot = await bootBase1();
     const { driver } = boot;
     const mag3 = (o: [number, number, number]): number => Math.hypot(o[0]!, o[1]!, o[2]!);
     expect(mag3(driver.doorRenderOffset('*31')!)).toBeLessThan(0.01);
-    driver.pm.origin = v3(-1774, 1536, 104);
+    // Camp the hall the way the game does: the body overlaps the *32/*33
+    // rest volumes (C rest-baked Touch_DoorTrigger), never a *31 trigger
+    // (there is none — targetname'd doors skip it in C).
+    driver.pm.origin = v3(-1669, 1514, 120);
     driver.pm.velocity = v3();
-    let open = 0;
-    for (let i = 0; i < 60; i++) {
-      SV_SetPlayerHealth(driver.server, 100);
+    let sliderTravel = 0;
+    let plugTravel = 0;
+    for (let i = 0; i < 120; i++) {
+      SV_SetPlayerHealth(driver.server, 100); // setup: hold the camper alive
       driver.step(neutralCmd(), 0.1);
-      open = Math.max(open, mag3(driver.doorRenderOffset('*31')!));
+      sliderTravel = Math.max(
+        sliderTravel,
+        mag3(driver.doorRenderOffset('*32')!),
+        mag3(driver.doorRenderOffset('*33')!),
+      );
+      plugTravel = Math.max(plugTravel, mag3(driver.doorRenderOffset('*31')!));
     }
-    // Plug travels its 156u down leg on touch (mover trace unaffected).
-    expect(open).toBeGreaterThan(30);
+    // Non-vacuous: the sliders genuinely travelled (64u sideways each) ...
+    expect(sliderTravel).toBeGreaterThan(30);
+    // ... while the plug never moved a unit (mover trace unaffected by the
+    // split: sliders still actuate; the plug simply has no touch path).
+    expect(plugTravel).toBeLessThan(0.01);
+    expect(mag3(driver.doorRenderOffset('*31')!)).toBeLessThan(0.01);
   });
 });

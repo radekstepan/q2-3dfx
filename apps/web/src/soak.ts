@@ -12,6 +12,7 @@
 // runner can verify inputs took effect. No renderer/backend/policy changes.
 import { getCVarString, setCVarFromString } from '@q2/config';
 import { v3 } from '@q2/math';
+import { SV_SetPlayerHealth } from '@q2/server';
 import { cameraCluster } from '@q2/webgl-renderer';
 import { readLiveEffects } from './gpu-effects.js';
 import type { LiveEffects } from './gpu-effects.js';
@@ -246,6 +247,14 @@ declare global {
      * it; the FOLLOW-2C `__q2soakRoute` shape above is untouched).
      */
     __q2soakLifecycle?: () => SoakGpuLifecycle | null;
+    /**
+     * RELEASE-5 visual-leg setup hook (test readers only): teleport the
+     * player body to (x,y,z), zero velocity, top health to 100 unless
+     * heal === false. Returns false before the soak boot lands. Same
+     * setup-touch class as the headless SV_SetPlayerHealth staging (never
+     * a verdict input); every verdict below reads polled route state.
+     */
+    __q2soakTeleport?: (x: number, y: number, z: number, heal?: boolean) => boolean;
   }
 }
 
@@ -327,6 +336,47 @@ export interface SoakRouteSnapshot {
    * muzzle state, monster kinds, pickups and world/scene material censuses.
    */
   effects?: LiveEffects | null;
+  /**
+   * RELEASE-5 additive monster detail (OPTIONAL so older readers ignore it):
+   * per-monster authoritative origin/yaw/move/seen for the t38 pursuit
+   * render pass. Null before the soak boot lands.
+   */
+  monsters?: SoakRouteMonster[] | null;
+  /** RELEASE-5 additive player health (OPTIONAL; null before boot lands). */
+  playerHealth?: number | null;
+  /**
+   * RELEASE-5 additive combat counters (OPTIONAL): cumulative foe-fire
+   * observations for the in-page infantry burst capture. `monshot` counts
+   * driver 'monshot' edges (any monster ranged fire), `infantryShots`
+   * counts heard `infantry/infatck1.wav` emissions (machinegun rounds only
+   * — cock/swing/smack use different cues), `bolts` is the live foe/player
+   * bolt roster length. Monotonic within a boot; null before boot lands.
+   */
+  combat?: { monshot: number; infantryShots: number; bolts: number } | null;
+}
+
+/** One live-route monster sample (RELEASE-5 t38 pursuit render pass). */
+export interface SoakRouteMonster {
+  /** Server edict number. */
+  id: number;
+  /** Spawn targetname (`t38` for the wall-guard soldier, null when none). */
+  targetname: string | null;
+  /** Monster kind (`soldier`, `infantry`, ...). */
+  kind: string;
+  /** Authoritative server origin (world units). */
+  origin: [number, number, number];
+  /** Current facing yaw in degrees. */
+  yaw: number;
+  /** Current move name (`stand1`, `run`, `attack1`, ...). */
+  move: string;
+  /** True once the ambush has acquired the player (FoundTarget). */
+  seen: boolean;
+  /** True once dead (corpse still submits its death frame). */
+  dead: boolean;
+  /** C TRIGGER_SPAWN dormant (SOLID_NOT, never attacks until woken). */
+  triggered: boolean;
+  /** True once a use/pickup woke the body (SOLID_BBOX again). */
+  woken: boolean;
 }
 
 /** Cap for the mover list in a route snapshot (bounded, never truncated silently in tests). */
@@ -519,10 +569,48 @@ export function readSoakRoute(): SoakRouteSnapshot | null {
   } catch {
     effects = null;
   }
+  // RELEASE-5 additive monster detail (optional field above): best-effort.
+  let monsters: SoakRouteMonster[] | null = null;
+  try {
+    monsters = boot.driver.monsters.map((m) => {
+      const e = m.edict.origin;
+      const tn = typeof m.edict.targetname === 'string' ? m.edict.targetname : null;
+      return {
+        id: m.edict.num,
+        targetname: tn,
+        kind: String(m.state.kind),
+        origin: [e[0] as number, e[1] as number, e[2] as number],
+        yaw: m.state.yaw,
+        move: String(m.state.move),
+        seen: m.seen === true,
+        dead: m.state.dead === true,
+        triggered: m.triggered === true,
+        woken: m.woken === true,
+      };
+    });
+  } catch {
+    monsters = null;
+  }
+  let playerHealth: number | null = null;
+  try {
+    playerHealth = boot.driver.playerHealth;
+  } catch {
+    playerHealth = null;
+  }
+  let combat: SoakRouteSnapshot['combat'] = null;
+  try {
+    let monshot = 0;
+    for (const e of boot.driver.events) if (e === 'monshot') monshot++;
+    let infantryShots = 0;
+    for (const s of boot.driver.heardSounds) if (s === 'infantry/infatck1.wav') infantryShots++;
+    combat = { monshot, infantryShots, bolts: boot.driver.bolts.length };
+  } catch {
+    combat = null;
+  }
   return {
     frame, camera, cluster, movers, trains, aliveMonsters, monsterKinds,
     viewmodel, handles, registeredModels, registeredSkins, uploads, framesSubmitted,
-    warnings, materials, scene, effects,
+    warnings, materials, scene, effects, monsters, playerHealth, combat,
   };
 }
 
@@ -728,6 +816,17 @@ export async function runSoakBoot(params: SoakParams): Promise<void> {
         win.__q2soakCvars = () => readSoakCvarSnapshot(SOAK_CVAR_SNAPSHOT_KEYS);
         win.__q2soakRoute = () => readSoakRoute();
         win.__q2soakLifecycle = () => readSoakGpuLifecycle();
+        win.__q2soakTeleport = (x: number, y: number, z: number, heal = true): boolean => {
+          try {
+            if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return false;
+            boot.driver.pm.origin = v3(x, y, z);
+            boot.driver.pm.velocity = v3();
+            if (heal !== false) SV_SetPlayerHealth(boot.driver.server, 100);
+            return true;
+          } catch {
+            return false;
+          }
+        };
       }
     } catch {
       /* readers best-effort */

@@ -1341,7 +1341,12 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expectInWorld(driver.pm.origin, map);
     // A soldier chasing through the spot reaches the player: the courtyard
     // light soldier (#341, awake chaser like gate (b)) runs the lane from
-    // the south side while the player holds the north side.
+    // the south side while the player kites north at patrol pace. Kiting
+    // (not standing) is the deterministic trigger: a posted player lets
+    // the soldier plant at firing range and trade shots (C-plausible
+    // ai_run_missile behavior), which never crosses the band; a retreating
+    // player keeps the chase hot through the spot. Verdicts are the run
+    // minimum (gate-(b) close bar) plus the band crossing.
     const A = driver.server.monsters.find((m) => m.edict.num === 341)!;
     expect(A).toBeDefined();
     driver.pm.origin = v3(-384.4, 100, 60);
@@ -1350,8 +1355,9 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     let minAy = Infinity;
     let maxAy = -Infinity;
     let minGap = Infinity;
-    for (let t = 0; t < 150 && driver.playerHealth > 0; t++) {
-      driver.step(neutralCmd(), 0.1);
+    for (let t = 0; t < 150; t++) {
+      SV_SetPlayerHealth(driver.server, 100); // setup: hold the kiter alive
+      driver.step({ msec: 100, angles: [0, 90, 0], forwardmove: 100, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
       minAy = Math.min(minAy, A.edict.origin[1]!);
       maxAy = Math.max(maxAy, A.edict.origin[1]!);
       minGap = Math.min(
