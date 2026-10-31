@@ -77,6 +77,14 @@ export interface HostDriver {
    */
   gunAnglesDelta?(): [number, number, number] | null;
   /**
+   * Light-style brightness scale for a style index (R9F-3: id
+   * `CL_SetLightstyle` maps style letters to `(c-'a')/('m'-'a')`, so 'm'
+   * is 1 and 'a' is 0; unrecorded styles read 1). The host fills
+   * RefDef.lightStyles through this hook (absent → all 1s); both the
+   * software surface cache and the GPU atlas re-bake key off the array.
+   */
+  lightStyleScale?(style: number): number;
+  /**
    * Extra world entities the snapshot omits (flying bolts, live barrels,
    * explosion flashes). Absent/null → none. Plain data, no web imports.
    */
@@ -418,12 +426,22 @@ export class Host {
     const ducked = drvView !== null ? drvView !== 22 : (this.lastCmd ? (this.lastCmd.buttons & 8) !== 0 || this.lastCmd.upmove < 0 : false);
     let eye = calcViewOrigin(base, ducked);
     if (kick) eye = [eye[0] + kick.origin[0], eye[1] + kick.origin[1], eye[2] + kick.origin[2]];
+    // Style scales for this frame (R9F-3): the driver resolves server
+    // light-style records through lightStyleScale; absent → all 1s.
+    const lightStyles = new Float32Array(256).fill(1);
+    const drv = this.driver;
+    if (drv && typeof drv.lightStyleScale === 'function') {
+      for (let i = 0; i < 256; i++) {
+        const v = drv.lightStyleScale(i);
+        if (Number.isFinite(v)) lightStyles[i] = v;
+      }
+    }
     const view: RefDef = {
       origin: new Float32Array(eye) as RefDef['origin'],
       angles: new Float32Array(angles) as RefDef['angles'],
       fovX: 90,
       time: this.serverTime,
-      lightStyles: new Float32Array(256).fill(1),
+      lightStyles,
     };
     const renderables: Entity[] = entities
       // Never draw the local player's own body (it sits at the camera).

@@ -11,6 +11,7 @@ import {
   MONSTER_HULL_MINS,
   MONSTER_STEP_HEIGHT,
   MOVER_BOTTOM,
+  MOVER_GOING_DOWN,
   MOVER_GOING_UP,
   MOVER_TOP,
   MOVER_WAITING,
@@ -147,6 +148,7 @@ import { DIST_EPSILON, traceBox } from '@q2/bsp';
 import type { BspMap } from '@q2/bsp';
 import {
   CRUSH_DAMAGE,
+  DOOR_SOUND_END,
   DOOR_SOUND_START,
   MOVER_TOUCH_DEBOUNCE,
   applyTeamMoveSpeeds,
@@ -192,6 +194,38 @@ export interface ServerState {
   monsters: ServerMonster[];
   /** fired targetnames this tick (test/diagnostics hook) */
   firedThisTick: string[];
+  /**
+   * Pending DelayedUse thinks (game/g_utils.c:173 G_UseTargets delay branch):
+   * entities used with a `delay` key fire at level.time + delay, not
+   * synchronously. Processed at the head of SV_Tick through fireTargets.
+   */
+  delayed: ServerDelayedUse[];
+  /**
+   * Centerprint lines for the driver (game/g_utils.c G_UseTargets message
+   * branch: ent->message + misc/talk1.wav for every used entity carrying a
+   * message). The driver drains/displays these; help/secret counters are
+   * unaffected (their messages latch game state, never centerprint).
+   */
+  centerprints: string[];
+  /**
+   * Persistent light-style switch positions (game/g_misc.c light_use:
+   * CS_LIGHTS+style flipped between "m" on and "a" off). Keyed by style
+   * number (base1 targeted strobes are styles 32-36); the render path
+   * consumes this for the lightStyles it submits.
+   */
+  lightStyles: Record<number, string>;
+  /**
+   * Style-toggle event log (one entry per light_use firing, in order): the
+   * strobe cadence over unattended ticks is observable here.
+   */
+  lightToggles: ServerLightToggle[];
+  /**
+   * Persistent areaportal open/closed state by func_areaportal targetname
+   * (game/g_func.c door_use_areaportals: doors open/close the portals they
+   * target as they travel). Initialized closed at spawn; the PVS consumer
+   * follows this record.
+   */
+  areaPortals: Record<string, boolean>;
   /** per-tick mover displacement by edict num (SV_Push rider carrying) */
   moverDeltas: Map<number, Vec3>;
   /** brush-model bounds by mover edict num (for rider stand tests) */
@@ -259,8 +293,9 @@ export interface ServerState {
   /**
    * Positional speakers (target_speaker, g_target.c Use_Target_Speaker) by
    * targetname. One-shot (no loop spawnflags) pushes the noise; looped
-   * (spawnflags & 3) toggles a configstring loop sound the one-shot sound
-   * queue cannot carry — deferred to the audio lane.
+   * (spawnflags & 3) toggles a persistent loop-channel entry in st.sounds
+   * (start = added, stop = removed); prestarted loops (spawnflags & 1) are
+   * seeded at spawn.
    */
   speakers: Map<string, Array<{ origin: Vec3; noise: string; looped: boolean }>>;
   /** Ambient map timers (func_timer, g_func.c func_timer_think). */
@@ -360,7 +395,7 @@ export interface ServerState {
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0 };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0 };
 }
 
 /**
@@ -1485,6 +1520,26 @@ export function SV_SpawnEntities(
         e.maxs = v3(16, 16, 16);
         break;
       }
+      case 'light': {
+        // C SP_light (g_misc.c): targeted style>=32 lights install light_use;
+        // untargeted ones bake into the lightmap (their edicts are decorative
+        // here). The initial CS_LIGHTS payload is "a" under START_OFF(1),
+        // else "m" — light_use flips it from there.
+        if (e.targetname) {
+          const style = Number.parseInt(dict['style'] ?? '', 10);
+          if (Number.isFinite(style) && style >= 32) {
+            st.lightStyles[style] = (e.spawnflags & 1) !== 0 ? 'a' : 'm';
+          }
+        }
+        break;
+      }
+      case 'func_areaportal': {
+        // C SP_func_areaportal: the portal starts closed
+        // (gi.SetAreaPortalState(style, false) at spawn); door travel opens
+        // and closes it from here on (see setDoorPortals).
+        if (e.targetname) st.areaPortals[e.targetname] = false;
+        break;
+      }
       default:
         break;
     }
@@ -1550,6 +1605,23 @@ export function SV_SpawnEntities(
           looped: (e.spawnflags & 3) !== 0,
         });
         st.speakers.set(e.targetname, list);
+      }
+    }
+    // Prestarted loop ambience (game/g_target.c SP_target_speaker:
+    // spawnflags&1 sets ent->s.sound at spawn, named or not): a persistent
+    // loop-channel entry the audio lane consumes (start = added, stop =
+    // removed, position = pos). Base1's 57 unnamed ambients ride this path;
+    // named prestarted loops join the toggle table below as well.
+    if (e.classname === 'target_speaker' && (e.spawnflags & 1) !== 0) {
+      let prestart = dict['noise'] ?? '';
+      if (prestart && !prestart.includes('.wav')) prestart += '.wav';
+      if (prestart) {
+        st.sounds.push({
+          name: prestart,
+          pos: v3(e.origin[0], e.origin[1], e.origin[2]),
+          born: st.time,
+          loop: true,
+        });
       }
     }
     // Ambient timer (func_timer, g_func.c SP_func_timer): wait defaults to
@@ -1750,15 +1822,22 @@ export function SV_UseTargetname(st: ServerState, targetname: string): void {
  * stop instead of overflowing the stack (a deliberate safety deviation).
  */
 export function SV_UseMover(st: ServerState, m: Mover, depth = 0): void {
-  const wasUp = m.state === MOVER_GOING_UP;
+  const before = m.state;
   moverUse(m, st.time);
+  // C door_go_up / door_go_down / button_fire: a newly started leg plays
+  // sound_start (doorLegStartSound) and — for an opening door — fires the
+  // door's target (G_UseTargets the moment the door starts moving, not on
+  // arrival) plus door_use_areaportals(true).
+  const legStarted =
+    (m.state === MOVER_GOING_UP || m.state === MOVER_GOING_DOWN) && m.state !== before;
+  if (legStarted) doorLegStartSound(st, m);
   if (
-    !wasUp &&
+    before !== MOVER_GOING_UP &&
     m.state === MOVER_GOING_UP &&
-    m.ent.classname === 'func_door' &&
-    m.ent.target
+    m.ent.classname === 'func_door'
   ) {
-    fireTargets(st, m.ent, depth + 1);
+    if (m.ent.target) fireTargets(st, m.ent, depth + 1);
+    setDoorPortals(st, m.ent, true);
   }
 }
 
@@ -1783,13 +1862,105 @@ export function SV_UseRotDoor(st: ServerState, rm: RotMover): 'opened' | 'closed
       });
     }
     fireTargets(st, rm.ent);
+    setDoorPortals(st, rm.ent, true);
   }
   return res;
 }
 
-/** G_UseTargets equivalent: use every entity targeted by `user`. */
+/**
+ * Positive `delay` seconds on an edict (game/g_utils.c G_UseTargets: any
+ * nonzero delay spawns the DelayedUse think at level.time + delay). Read off
+ * `extra` — Edict carries no delay field; the key survives verbatim there.
+ */
+export function entDelay(e: Edict): number {
+  const d = parseFloat(e.extra?.['delay'] ?? '', 0);
+  return Number.isFinite(d) && d > 0 ? d : 0;
+}
+
+/**
+ * Copy an edict for the DelayedUse think (game/g_utils.c Think_Delay): the
+ * temp object carries message/target/killtarget but NO delay — otherwise the
+ * think would defer itself forever instead of firing once.
+ */
+export function stripDelayForThink(e: Edict): Edict {
+  const extra = { ...e.extra };
+  delete extra['delay'];
+  return { ...e, extra };
+}
+
+/**
+ * C door_use_areaportals (game/g_func.c:852): open/close every
+ * func_areaportal whose targetname the door targets. G_UseTargets skips
+ * func_areaportal targets when the user is a door (the `continue` in
+ * g_utils.c), so the record here is the ONLY portal driver — call it on
+ * every portal-affecting door transition, never through the target loop.
+ */
+export function setDoorPortals(st: ServerState, door: Edict, open: boolean): void {
+  if (!door.target) return;
+  for (const e of st.entities) {
+    if (!e.freed && e.classname === 'func_areaportal' && e.targetname === door.target) {
+      st.areaPortals[e.targetname] = open;
+    }
+  }
+}
+
+/**
+ * Leg-start voice for a linear mover (game/g_func.c door_go_up /
+ * door_go_down sound_start, button_fire sound_start): doors/dr1_strt.wav
+ * for func_door, switches/butn2.wav for func_button — each suppressed when
+ * sounds == 1 (C SP_func_door / SP_func_button install no sound index then).
+ * Called on every leg start (UP and TOGGLE-close legs alike); arrivals are
+ * silent except the door's sound_end (see SV_Tick).
+ */
+export function doorLegStartSound(st: ServerState, m: Mover): void {
+  if (m.ent.sounds === 1) return;
+  if (m.ent.classname === 'func_door') {
+    st.sounds.push({
+      name: DOOR_SOUND_START,
+      pos: v3(m.ent.origin[0], m.ent.origin[1], m.ent.origin[2]),
+      born: st.time,
+    });
+  } else if (m.ent.classname === 'func_button') {
+    st.sounds.push({
+      name: BUTTON_SOUND_START,
+      pos: v3(m.ent.origin[0], m.ent.origin[1], m.ent.origin[2]),
+      born: st.time,
+    });
+  }
+}
+
+/**
+ * G_UseTargets equivalent (game/g_utils.c:173): use every entity targeted by
+ * `user`. Delay first (a delayed use schedules a DelayedUse think and does
+ * nothing synchronously — not even the message or the firedThisTick push),
+ * then the message branch (ent->message centerprints + misc/talk1.wav for a
+ * non-monster activator; this sim is SP-only so the activator is the
+ * player), then the target loop. Relay/door/button/timer recursions re-enter
+ * here, so delayed uses and messages on THOSE entities resolve at their own
+ * level — the loop never prints or schedules for a target itself.
+ */
 export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
-  if (!user.target || depth > MAX_USETARGETS_DEPTH) return;
+  if (depth > MAX_USETARGETS_DEPTH) return;
+  // C delay branch: the whole use (message included) waits for the think.
+  const delay = entDelay(user);
+  if (delay > 0) {
+    st.delayed.push({ at: st.time + delay, ent: stripDelayForThink(user), depth });
+    return;
+  }
+  // C message branch: print + talk1 (or the entity's own noise when it
+  // carries one — no base1 messaged entity does, so talk1 is the sound).
+  if (user.message) {
+    st.centerprints.push(user.message);
+    st.sounds.push({
+      name: 'misc/talk1.wav',
+      pos: v3(user.origin[0], user.origin[1], user.origin[2]),
+      born: st.time,
+    });
+  }
+  if (!user.target) return;
+  // C G_UseTargets skips func_areaportal targets when the user is a door —
+  // doors drive portals through door_use_areaportals only (setDoorPortals).
+  const userIsDoor = user.classname === 'func_door' || user.classname === 'func_door_rotating';
   for (const m of st.monsters) {
     // G_UseTargets reaches monster edicts by targetname: TRIGGER_SPAWN
     // bodies wake (monster_triggered_spawn_use), live others alert
@@ -1799,7 +1970,32 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
   let firedTrain = false;
   for (const e of st.entities) {
     if (e.freed || e.targetname !== user.target) continue;
+    // C: doors never "use" their areaportal targets (see setDoorPortals).
+    if (userIsDoor && e.classname === 'func_areaportal') continue;
+    // Delayed relays schedule instead of firing (id trigger_relay_use runs
+    // G_UseTargets on the relay itself): no firedThisTick push until the
+    // think runs. Delays on other targets are consumed by their own logic
+    // (target_explosion fuse delays ride the explosion table via
+    // firedThisTick), never deferred here.
+    if (e.classname === 'trigger_relay' && entDelay(e) > 0) {
+      st.delayed.push({ at: st.time + entDelay(e), ent: stripDelayForThink(e), depth: depth + 1 });
+      continue;
+    }
     st.firedThisTick.push(e.targetname);
+    if (e.classname === 'light') {
+      // C light_use (g_misc.c:545): flip CS_LIGHTS+style between "m" (on)
+      // and "a" (off). Only style>=32 lights install the use (SP_light
+      // gate); the record persists for the render path and every firing
+      // appends to the toggle log (strobe cadence observable).
+      const style = Number.parseInt(e.extra['style'] ?? '', 10);
+      if (Number.isFinite(style) && style >= 32) {
+        const cur = st.lightStyles[style] ?? 'm';
+        const next = cur === 'm' ? 'a' : 'm';
+        st.lightStyles[style] = next;
+        st.lightToggles.push({ style, value: next });
+      }
+      continue;
+    }
     if (e.classname === 'target_help') {
       // C Use_Target_Help (g_target.c): spawnflags & 1 selects
       // game.helpmessage1, else game.helpmessage2; every firing bumps
@@ -1813,8 +2009,10 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     }
     if (e.classname === 'target_secret') {
       // C use_target_secret: single-use (G_FreeEdict) with the secret sound
-      // (default misc/secret.wav). The loop skips freed edicts, so freeing
-      // here counts exactly once; base1 secrets chain nowhere onward.
+      // (default misc/secret.wav), then G_UseTargets on itself — which prints
+      // the secret's own message + talk1 (base1's t91/t77/t76 all carry one).
+      // The loop skips freed edicts, so freeing here counts exactly once;
+      // base1 secrets chain nowhere onward.
       e.freed = true;
       st.foundSecrets++;
       st.sounds.push({
@@ -1822,6 +2020,14 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
         pos: v3(e.origin[0], e.origin[1], e.origin[2]),
         born: st.time,
       });
+      if (e.message) {
+        st.centerprints.push(e.message);
+        st.sounds.push({
+          name: 'misc/talk1.wav',
+          pos: v3(e.origin[0], e.origin[1], e.origin[2]),
+          born: st.time,
+        });
+      }
       continue;
     }
     if (e.classname === 'target_goal') {
@@ -1847,11 +2053,31 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     }
     if (e.classname === 'target_speaker') {
       // C Use_Target_Speaker (g_target.c): the looped pair (spawnflags & 3)
-      // toggles a configstring loop sound — no one-shot-queue equivalent,
-      // so the audio lane owns it; one-shot noises play positioned here.
-      // Base1's *20 glass shatter (t78 -> world/brkglas.wav) is one-shot.
+      // toggles ent->s.sound off/on — a persistent loop-channel entry here
+      // (start = added, stop = removed, position = pos); one-shot noises play
+      // positioned. Base1's *20 glass shatter (t78 -> world/brkglas.wav) is
+      // one-shot; the 5 named looptoggles (t71/t72/t79/t80/t81) ride the
+      // toggle half, driven by the func_timer cadence.
       for (const sp of st.speakers.get(e.targetname) ?? []) {
-        if (!sp.looped && sp.noise) {
+        if (sp.looped && sp.noise) {
+          const at = st.sounds.findIndex(
+            (s) =>
+              s.loop === true &&
+              s.name === sp.noise &&
+              s.pos[0] === sp.origin[0] &&
+              s.pos[1] === sp.origin[1] &&
+              s.pos[2] === sp.origin[2],
+          );
+          if (at >= 0) st.sounds.splice(at, 1);
+          else {
+            st.sounds.push({
+              name: sp.noise,
+              pos: v3(sp.origin[0], sp.origin[1], sp.origin[2]),
+              born: st.time,
+              loop: true,
+            });
+          }
+        } else if (!sp.looped && sp.noise) {
           st.sounds.push({
             name: sp.noise,
             pos: v3(sp.origin[0], sp.origin[1], sp.origin[2]),
@@ -1893,7 +2119,8 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
       continue;
     }
     if (e.classname === 'trigger_relay') {
-      // id G_UseTargets uses the relay, which fires the relay's own target.
+      // id G_UseTargets uses the relay, which fires the relay's own target
+      // (delay pre-checked at the loop top — this recursion is immediate).
       fireTargets(st, e, depth + 1);
     } else {
       const tr = st.trains.find((tt) => tt.ent === e);
@@ -2036,11 +2263,15 @@ export function SV_TouchDoorsAt(
     if (!bodyOverlapsBounds(body.origin, body.mins, body.maxs, tmins, tmaxs)) continue;
     // C door_use → door_go_up: opens (firing the door's own target as the
     // leg starts), holds TOP open, or reverses a close — never restarts.
+    // A fresh leg plays sound_start (door_go_up/down) and opens portals.
     const res = doorTouchUse(m, st.time);
     if (res === 'opened') {
+      doorLegStartSound(st, m);
       if (m.ent.target) fireTargets(st, m.ent, 1);
+      setDoorPortals(st, m.ent, true);
       used.push(m);
     } else if (res === 'closed') {
+      doorLegStartSound(st, m);
       used.push(m);
     }
   }
@@ -2639,6 +2870,14 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
   st.firedThisTick = [];
   st.time += dt;
   const now = st.time;
+  // DelayedUse thinks (game/g_utils.c Think_Delay): due deferred uses fire
+  // through the same G_UseTargets entry (message + targets + depth guard).
+  for (let i = st.delayed.length - 1; i >= 0; i--) {
+    const d = st.delayed[i]!;
+    if (st.time < d.at) continue;
+    st.delayed.splice(i, 1);
+    fireTargets(st, d.ent, d.depth);
+  }
   const before = new Map<number, Vec3>();
   for (const m of st.movers) {
     if (m.ent.freed) continue;
@@ -2663,6 +2902,18 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
       // id button_wait fires the button's target on reaching the top.
       fireTargets(st, m.ent);
     }
+    // id door_hit_top / door_hit_bottom: arrivals play sound_end; the DOWN
+    // leg landing closes the door's areaportals (door_use_areaportals(false)).
+    if (completed && m.ent.classname === 'func_door') {
+      if (m.ent.sounds !== 1) {
+        st.sounds.push({
+          name: DOOR_SOUND_END,
+          pos: v3(m.ent.origin[0], m.ent.origin[1], m.ent.origin[2]),
+          born: now,
+        });
+      }
+      if (m.state === MOVER_BOTTOM) setDoorPortals(st, m.ent, false);
+    }
   }
   for (const tr of st.trains) {
     if (tr.ent.freed) continue;
@@ -2679,6 +2930,7 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
   }
   for (const rm of st.rotDoors) {
     if (rm.ent.freed) continue;
+    const was = rm.state;
     const sounds = rotThink(rm, now, dt);
     for (const name of sounds) {
       st.sounds.push({
@@ -2686,6 +2938,11 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
         pos: v3(rm.ent.origin[0], rm.ent.origin[1], rm.ent.origin[2]),
         born: now,
       });
+    }
+    // C door_hit_bottom (angular branch): the close leg landing shuts the
+    // door's areaportals (the open leg opened them in SV_UseRotDoor).
+    if (was === MOVER_GOING_DOWN && rm.state === MOVER_BOTTOM) {
+      setDoorPortals(st, rm.ent, false);
     }
   }
   // Ambient map timers (g_func.c func_timer_think): due timers fire their
@@ -2747,7 +3004,10 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
   // target_explosion): every firing path pushes the relay targetname into
   // firedThisTick, so the tick resolves them here — immediate or delayed
   // via the fuse list (use_target_explosion think at level.time + delay).
-  for (const t of st.firedThisTick) fireExplosionTarget(st, t);
+  // Resolved once per targetname per tick: the loop pushes once per same-
+  // named charge edict (base1's t151 is four), but C runs one G_UseTargets
+  // pass per use — one resolution arms each charge exactly once.
+  for (const t of new Set(st.firedThisTick)) fireExplosionTarget(st, t);
   // Phase 0 gameplay: monsters, bolts, fuses, debris/gibs, explosions.
   if (game) SV_GameTick(st, game, dt);
 }
@@ -2861,6 +3121,43 @@ export const SV_SPARK_GRAVITY = 40;
 /** id sv_gravity default for tossed debris/gibs (g_phys.c SV_AddGravity). */
 export const SV_TOSS_GRAVITY = 800;
 
+/**
+ * One light_use toggle event (game/g_misc.c:545): the style flipped, and the
+ * resulting switch position ("m" on / "a" off, the CS_LIGHTS payload).
+ */
+export interface ServerLightToggle {
+  style: number;
+  value: string;
+}
+
+/**
+ * One pending DelayedUse (game/g_utils.c:173 G_UseTargets delay branch):
+ * the used entity (copied at schedule time) fires through fireTargets when
+ * level.time reaches `at`. `depth` threads the cascade guard.
+ */
+export interface ServerDelayedUse {
+  at: number;
+  ent: Edict;
+  depth: number;
+}
+
+/** C button_fire voice (game/g_func.c SP_func_button: sounds != 1). */
+export const BUTTON_SOUND_START = 'switches/butn2.wav';
+
+/**
+ * id water-contents bits for hitscan splash color (game/q_shared.h BSP
+ * space, the space traceBox reports through SV_TraceFor): WATER 32 blue,
+ * SLIME 16, LAVA 8. Brown water is a surface-name property ("*brwater",
+ * g_weapon.c fire_lead) with no channel in TraceResult, so WATER maps to
+ * blue here (documented follow-up, not silent miscolor).
+ */
+export const BSP_WATER_BIT = 32;
+export const BSP_SLIME_BIT = 16;
+export const BSP_LAVA_BIT = 8;
+
+/** Hitscan-vs-water splash color (g_weapon.c fire_lead water branch). */
+export type WaterSplashKind = 'blue' | 'slime' | 'lava';
+
 /** Flying blaster bolt (g_weapon.c fire_blaster / monster_fire_blaster). */
 export interface ServerBolt {
   pos: Vec3;
@@ -2940,6 +3237,19 @@ export interface ServerSpark {
   vel: Vec3 | null;
   ttl: number;
   born: number;
+  /**
+   * Hitscan-vs-water splash color (g_weapon.c fire_lead water branch, C
+   * TE_SPLASH 8-count color per contents: blue/brown/slime/lava). Absent on
+   * dry puffs, blood and trails — the splash-vs-puff discriminator.
+   */
+  splash?: WaterSplashKind;
+  /**
+   * Flesh-hit blood marker (g_combat.c:490 T_Damage → SpawnDamage(TE_BLOOD)
+   * for monster/client flesh; the fire_lead pellet path records it here).
+   * Blaster flesh stays event-free (its takedamage branch runs T_Damage with
+   * no TE of its own — pinned by the flesh-bolt server test).
+   */
+  blood?: boolean;
 }
 
 /** One queued positional-sound request (shots, impacts). */
@@ -2947,6 +3257,14 @@ export interface ServerSound {
   name: string;
   pos: Vec3;
   born: number;
+  /**
+   * Prestarted/toggled loop channel (game/g_target.c SP_target_speaker
+   * spawnflags&1: ent->s.sound loops until toggled). Loops persist in this
+   * queue (never drained, never 5s-pruned): start = entry added, stop =
+   * entry removed, position = pos. The audio lane consumes loop-flagged
+   * entries as loop channels (Mixer.startSound loop:true).
+   */
+  loop?: boolean;
 }
 
 /** Thrown chunk (g_misc.c ThrowDebris: MOVETYPE_BOUNCE, backoff 1.5). */
@@ -4170,6 +4488,8 @@ function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
     if (st.time - e.born >= frames * 0.1) st.explosions.splice(i, 1);
   }
   // Safety prune: undrained one-shot queues never grow across frames.
+  // Loop-channel entries persist (C s.sound lives on the edict until
+  // toggled) — neither pruned here nor drained below.
   const wipe = (q: Array<{ born: number }>): void => {
     for (let i = q.length - 1; i >= 0; i--) {
       if (st.time - q[i]!.born > 5) q.splice(i, 1);
@@ -4178,7 +4498,10 @@ function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
   wipe(st.muzzles);
   wipe(st.tracers);
   wipe(st.sparks);
-  wipe(st.sounds);
+  for (let i = st.sounds.length - 1; i >= 0; i--) {
+    const s = st.sounds[i]!;
+    if (s.loop !== true && st.time - s.born > 5) st.sounds.splice(i, 1);
+  }
 }
 
 /** Drain the pending muzzle flashes (one-shot dlight pump). */
@@ -4205,11 +4528,19 @@ export function SV_DrainSparks(st: ServerState): ServerSpark[] {
   return out;
 }
 
-/** Drain the pending positional-sound requests. */
+/** Drain the pending positional-sound requests (loop channels persist). */
 export function SV_DrainSounds(st: ServerState): ServerSound[] {
   if (st.sounds.length === 0) return [];
-  const out = st.sounds.slice();
-  st.sounds.length = 0;
+  const out = st.sounds.filter((s) => s.loop !== true);
+  st.sounds = st.sounds.filter((s) => s.loop === true);
+  return out;
+}
+
+/** Drain the pending centerprint lines (G_UseTargets message branch). */
+export function SV_DrainCenterprints(st: ServerState): string[] {
+  if (st.centerprints.length === 0) return [];
+  const out = st.centerprints.slice();
+  st.centerprints.length = 0;
   return out;
 }
 
@@ -4445,6 +4776,24 @@ export function SV_PlayerFire(
       SV_DamageBarrel(st, hitBarrel, pl.damage);
     } else if (hitMonster && bestT <= corpseT) {
       SV_DamageMonster(st, hitMonster, pl.damage, opts.rand);
+      // C g_combat.c:490 T_Damage → SpawnDamage(TE_BLOOD, point, normal,
+      // take): monster/client flesh draws blood, not a gray puff. The gib
+      // path is untouched (SV_DamageMonster owns it); blaster flesh stays
+      // event-free per the lane's takedamage-branch decision (no TE there).
+      for (let i = 0; i < 8; i++) {
+        st.sparks.push({
+          pos: v3(
+            hitPos[0]! + ((opts.rand() * 8) | 0) - 4,
+            hitPos[1]! + ((opts.rand() * 8) | 0) - 4,
+            hitPos[2]! + ((opts.rand() * 8) | 0) - 4,
+          ),
+          color: 0xe8 + ((opts.rand() * 8) | 0),
+          vel: v3((opts.rand() * 2 - 1) * 60, (opts.rand() * 2 - 1) * 60, opts.rand() * 120),
+          ttl: 0.5 + opts.rand() * 0.3,
+          born: st.time,
+          blood: true,
+        });
+      }
     } else if (hitCorpse) {
       // Corpse touch (g_misc.c misc_deadsoldier_die via T_Damage): minces
       // past -80 (gibs + udeath). Impact sparks draw at the corpse hit
@@ -4468,13 +4817,39 @@ export function SV_PlayerFire(
       // blow the wall), with the impact sparks drawn either way.
       const clipBarrel = barrelOfClip(st, wall.entityNum);
       if (clipBarrel) SV_DamageBarrel(st, clipBarrel, pl.damage);
-      st.sparks.push({
-        pos: hitPos,
-        color: 200 + ((opts.rand() * 55) | 0),
-        vel: null,
-        ttl: SV_SPARK_TTL,
-        born: st.time,
-      });
+      // C g_weapon.c fire_lead water branch: a pellet stopping in water
+      // (BSP contents WATER/SLIME/LAVA, the space traceBox reports) draws
+      // TE_SPLASH — 8 particles in the contents color — instead of a dry
+      // puff. Brown is a surface-name property ("*brwater") with no channel
+      // in TraceResult, so WATER maps to blue (see BSP_*_BIT).
+      const wc = wall.contents;
+      const splashKind: WaterSplashKind | null =
+        wc & BSP_WATER_BIT ? 'blue' : wc & BSP_SLIME_BIT ? 'slime' : wc & BSP_LAVA_BIT ? 'lava' : null;
+      if (splashKind !== null) {
+        const base = splashKind === 'blue' ? 0xb0 : splashKind === 'slime' ? 0xd0 : 0xe0;
+        for (let i = 0; i < 8; i++) {
+          st.sparks.push({
+            pos: v3(
+              hitPos[0]! + ((opts.rand() * 8) | 0) - 4,
+              hitPos[1]! + ((opts.rand() * 8) | 0) - 4,
+              hitPos[2]! + ((opts.rand() * 8) | 0) - 4,
+            ),
+            color: base + ((opts.rand() * 8) | 0),
+            vel: null,
+            ttl: 0.5 + opts.rand() * 0.3,
+            born: st.time,
+            splash: splashKind,
+          });
+        }
+      } else {
+        st.sparks.push({
+          pos: hitPos,
+          color: 200 + ((opts.rand() * 55) | 0),
+          vel: null,
+          ttl: SV_SPARK_TTL,
+          born: st.time,
+        });
+      }
     }
   }
   return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: false, machinegunShots, kickOrigin, kickAngles };

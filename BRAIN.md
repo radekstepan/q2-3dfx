@@ -280,7 +280,7 @@ FAIL and a proposed, unapproved tone-normalized threshold. Reopen acceptance;
 no threshold change is authorized. Historical full verify was reported 78/80,
 and deps:check 676 passed after the sound/config fix; neither was rerun here.
 
-Priority (2026-10-31: RELEASE-7/6/9/10/11/3B done + archived; RELEASE-4 boxes 1–2 landed, box 3 blocked on map-truth prerequisite; next): R9F-1..8,
+Priority (2026-10-31: RELEASE-7/6/9/10/11/3B + R9F-1..8 done + archived; RELEASE-4 boxes 1–2 landed, box 3 blocked on map-truth prerequisite; next): R9F-9 → R9F-10 → FOLLOW-5,
 then FOLLOW-5/6/7. Independent cards can proceed with disjoint ownership.
 Claim one card; preserve software goldens and sky/lifecycle behavior. Expensive
 validation runs sequentially. Require actual production-path regressions and
@@ -300,69 +300,21 @@ done-when:
 - [x] Repair stale/incorrect collision, activation or geometry state against map/original behavior; never disable all mover collision or teleport the player to pass the test.
 - [ ] Extend real-base1 gate to walk from outside through the doorway, board, operate intended control, ride and finish. Assert no invisible obstruction and no premature departure; capture the complete route. Tests starting on the platform do not close boarding acceptance.
 
-### R9F-1 — Looped speaker ambience has no audio event
-owns: `packages/server` (`apps/web` consumes)
-depends: none
-status: ready (filed 2026-10-31 from the RELEASE-9 inventory; testkit M3 fails until done)
+### R9F-9 — Play looped speaker channels in the browser mixer
+owns: `apps/web`, `packages/sound`
+depends: R9F-1
+status: ready (filed 2026-10-31; server loop records exist, nothing consumes them audibly)
 done-when:
-- [ ] Prestarted looped speakers (57 ambient + 5 toggled: amb7/water1/drip/comp_hum/fan1/radio3/battle) register a driver-consumable loop start/stop/position event.
-- [ ] Flip testkit M3 to `it` and update the roster rows; no `any` in exported signatures.
+- [ ] Sync server loop-channel records to Mixer loop channels (start/stop/position) and through syncMixerToBrowser (looping buffers), without breaking one-shot mixing or the 0.05 master scale point.
+- [ ] Test loop start/stop/toggle with the existing headless Mixer + a browser wiring leg; no `any` in exported signatures.
 
-### R9F-2 — Relay/entity delay (DelayedUse) is ignored
-owns: `packages/server`
-depends: none
-status: ready (filed 2026-10-31 from the RELEASE-9 inventory; testkit M5 fails until done)
+### R9F-10 — Hitscan-vs-brown-water splash color
+owns: `packages/game`, `packages/server`
+depends: R9F-7
+status: ready (filed 2026-10-31; blue/slime/lava done, brown needs the surface name TraceResult does not carry)
 done-when:
-- [ ] `delay` on relay/use entities defers firing via level.time think (t2/t3/t49/t50/t51 .1s pairs, t153 .3s, t70 2s).
-- [ ] Flip testkit M5 to `it` (asserts no-sync-fire + fires-after-delay); immediate legs stay green.
-
-### R9F-3 — Targeted light toggle (t155–t159, styles 32–36) records nothing
-owns: `packages/server` (record; driver applies to lightStyles)
-depends: none
-status: ready (filed 2026-10-31 from the RELEASE-9 inventory; testkit M6 fails until done)
-done-when:
-- [ ] Firing toggles a persistent style record consumed by the render path.
-- [ ] Flip testkit M6 to `it`; strobe cadence observable over 30 unattended ticks.
-
-### R9F-4 — Linear door/button move sounds absent
-owns: `packages/server`
-depends: none
-status: ready (filed 2026-10-31 from the RELEASE-9 inventory; testkit M7 fails until done)
-done-when:
-- [ ] Door legs queue dr1_strt/mid/end, buttons queue butn2.wav (C door_go_up/down, button_fire); silent (`sounds==1`) variants stay silent.
-- [ ] Flip testkit M7 to `it`.
-
-### R9F-5 — Hitscan flesh hits emit no blood event
-owns: `packages/server`
-depends: none
-status: ready (filed 2026-10-31 from the RELEASE-9 inventory; testkit M8 fails until done)
-done-when:
-- [ ] `fire_lead` flesh branch records a blood-class impact (C TE_BLOOD); blaster-flesh stays event-free per the takedamage branch.
-- [ ] Flip testkit M8 to `it`; gib path unchanged.
-
-### R9F-6 — Trigger/entity messages never centerprint (+talk1)
-owns: `packages/server` (queue; `apps/web` displays)
-depends: none
-status: ready (filed 2026-10-31 from the RELEASE-9 inventory; testkit M10 fails until done)
-done-when:
-- [ ] Used-entity `message` surfaces a driver-readable centerprint + misc/talk1.wav (*15 ladder, *18 crouch, t76-relay line).
-- [ ] Flip testkit M10 to `it`; help/secret message behavior unchanged.
-
-### R9F-7 — Hitscan-vs-water emits no TE_SPLASH
-owns: `packages/server`
-depends: none
-status: ready (filed 2026-10-31 from the RELEASE-9 inventory; testkit M11 fails until done)
-done-when:
-- [ ] Pellet traces entering water record a splash-class event (color per blue/brown/slime/lava).
-- [ ] Flip testkit M11 to `it`; dry puffs unchanged.
-
-### R9F-8 — Door areaportal (*19→t69) never opens/closes
-owns: `packages/server` (state; PVS consumer follows)
-depends: none
-status: ready (filed 2026-10-31 from the RELEASE-9 inventory; testkit M12 fails until done)
-done-when:
-- [ ] Door travel drives a persistent areaportal record (C door_use_areaportals).
-- [ ] Flip testkit M12 to `it`; doors without portal targets unaffected.
+- [ ] Carry the hit surface name (or water color class) to the pellet-impact path and emit the brown-water splash class for *brwater hits; dry puffs unchanged.
+- [ ] Test with real base1 brown water; no contract change without the §5 major procedure.
 
 ### GPU-FOLLOW-5 — Complete fidelity and automated gate repairs
 owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`

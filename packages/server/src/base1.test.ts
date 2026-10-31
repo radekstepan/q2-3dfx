@@ -2119,7 +2119,9 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(round(delta(d32))).toEqual([0, -64, 0]);
     expect(round(delta(d33))).toEqual([0, 64, 0]);
     // touch the *19 trigger field (brush bounds +60 x/y): the up-door opens
-    // and fires its areaportal target at use time (door_go_up).
+    // and opens its areaportal target at use time (door_go_up: G_UseTargets
+    // skips func_areaportal targets for doors; door_use_areaportals drives
+    // the state instead — asserted on the record, not firedThisTick).
     const used = SV_TouchDoorsAt(st, {
       origin: v3(-1112, 1632, 24),
       mins: PLAYER_MINS,
@@ -2127,7 +2129,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     });
     expect(used.map((m) => m.ent.model)).toContain('*19');
     expect(d19.state).toBe('going_up');
-    expect(st.firedThisTick).toContain('t69');
+    expect(st.areaPortals['t69']).toBe(true);
     for (let i = 0; i < 30 && d19.state !== 'waiting' && d19.state !== 'top'; i++) SV_Tick(st);
     expect(d19.ent.origin[2]!).toBeCloseTo(120, 2); // slid +Z by travel
     // base1 has no rotating doors (only the static *29 fan): no axis-rotation

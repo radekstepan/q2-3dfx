@@ -106,6 +106,7 @@ import {
   SV_DrainTracers,
   SV_DrainSparks,
   SV_DrainSounds,
+  SV_DrainCenterprints,
   SV_ClearFinished,
   MASK_OPAQUE_C,
 } from '@q2/server';
@@ -1576,6 +1577,13 @@ export class LocalDriver implements HostDriver {
       }
     }
     if (monshot) this.events.push('monshot');
+    // Trigger/entity centerprints (R9F-6, G_UseTargets message branch):
+    // driver-readable queue → status line (kind 'status', so the RELEASE-11
+    // toggle gates these hints like other cosmetic text; death/finish never
+    // flow through here). Last line wins, like the status line it shares.
+    for (const line of SV_DrainCenterprints(this.server)) {
+      this.setMessage(line, 'status');
+    }
   }
 
   snapshot(serverTime: number): Snapshot {
@@ -2090,6 +2098,19 @@ export class LocalDriver implements HostDriver {
     } catch {
       return 0;
     }
+  }
+
+  /**
+   * Light-style brightness scale for the host RefDef (R9F-3, HostDriver
+   * contract): id `CL_SetLightstyle` maps style letters to
+   * `(c-'a')/('m'-'a')`, so 'm' is 1 and 'a' is 0; unrecorded styles read
+   * 1. The server owns the toggle records; both live view builders
+   * (host.frame + frameGpuPlay) resolve through this hook.
+   */
+  lightStyleScale(style: number): number {
+    const rec = this.server.lightStyles[style];
+    if (typeof rec !== 'string' || rec.length === 0) return 1;
+    return (rec.charCodeAt(0) - 97) / 12;
   }
 
   /**
@@ -5613,12 +5634,22 @@ export function buildAsyncView(host: Host, remainder = 0): { view: RefDef; rende
   const ducked = drvView !== null ? drvView !== 22 : (host.lastCmd ? (host.lastCmd.buttons & 8) !== 0 || host.lastCmd.upmove < 0 : false);
   let eye = calcViewOrigin(base, ducked);
   if (kick) eye = [eye[0] + kick.origin[0], eye[1] + kick.origin[1], eye[2] + kick.origin[2]];
+  // Style scales for this frame (R9F-3): resolved through the driver's
+  // lightStyleScale hook (server toggle records); absent → all 1s.
+  const gpuLightStyles = new Float32Array(256).fill(1);
+  const gpuDriver = host.driver;
+  if (gpuDriver && typeof gpuDriver.lightStyleScale === 'function') {
+    for (let i = 0; i < 256; i++) {
+      const v = gpuDriver.lightStyleScale(i);
+      if (Number.isFinite(v)) gpuLightStyles[i] = v;
+    }
+  }
   const view: RefDef = {
     origin: new Float32Array(eye) as RefDef['origin'],
     angles: new Float32Array(angles) as RefDef['angles'],
     fovX: 90,
     time: host.serverTime,
-    lightStyles: new Float32Array(256).fill(1),
+    lightStyles: gpuLightStyles,
   };
   const renderables: Entity[] = entities
     .filter((e) => e.id !== host.localPlayerId)

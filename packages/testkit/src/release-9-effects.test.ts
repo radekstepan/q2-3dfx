@@ -20,12 +20,12 @@
 //     new producers, removed producers, or count changes all fail. There is
 //     deliberately NO "effects complete" claim: missing rows keep failing
 //     controls until their owning lane implements them.
-//   - MISSING-EFFECT CONTROLS (M3/M5-M8/M10-M12): each asserts the
-//     producer→server event→render/audio link and FAILS now, written with
-//     `it.fails` so `yarn verify` stays green while the link is absent.
-//     When a lane implements the link, it flips the control to `it` (and
-//     updates the ROSTER row + files the follow-up card from the report).
-//     `it.fails` failing loudly on implementation is the point.
+//   - MISSING-EFFECT CONTROLS (M3/M5-M8/M10-M12): each asserted the
+//     producer→server event→render/audio link and FAILED until its lane
+//     implemented the link (written with `it.fails` so `yarn verify` stayed
+//     green while the link was absent). R9F-1..8 flipped all of them to `it`
+//     with the roster rows; the `it.fails`-on-implementation tripwire stands
+//     for any future missing link.
 //   - IMPLEMENTED-PATH CHECKS (M1/M2/M4/M9/E1–E3): links the parallel
 //     server lane already owns in-tree (splash bursts, speaker one-shots,
 //     timer cadence, damageless-explosive target fire) plus end-to-end
@@ -90,7 +90,6 @@ import {
   SV_Tick,
   SV_TraceFor,
   SV_UseMover,
-  fireExplosionTarget,
   fireTargets,
 } from '@q2/server';
 import type { ServerState } from '@q2/server';
@@ -142,16 +141,6 @@ const C_LEAD = 'g_weapon.c:271 fire_bullet / :285 fire_shotgun; cl_tent.c:715 TE
 const C_SOLDIER = 'm_soldier.c:462 soldier_fire (blaster/shotgun/machinegun per range)';
 const C_INFANTRY = 'm_infantry.c:487 infantry_fire (bullets + melee)';
 const C_MSG = 'g_utils.c:173 G_UseTargets message branch (centerprint + misc/talk1.wav)';
-
-/** Missing-row helper: every missing row names its failing control. */
-function miss(
-  group: string,
-  count: number,
-  control: string,
-  handler: string,
-): ProducerRow {
-  return { group, count, status: 'missing', control, handler, evidence: `failing control ${control} in this file` };
-}
 
 const ROSTER: ProducerRow[] = [
   // --- Barrels: TE_EXPLOSION1 + debris + explod1 (C_BARREL, BecomeExplosion1) ---
@@ -214,10 +203,9 @@ const ROSTER: ProducerRow[] = [
   {
     group: 'target_speaker|ambient-loop',
     count: 57,
-    status: 'missing',
-    control: 'M3',
+    status: 'implemented',
     handler: `${C_SPEAKER} (spawnflags&1 prestart: ent->s.sound = noise_index)`,
-    evidence: 'failing control M3 in this file (amb7/water1/drip/comp_hum/fan1/radio3 loops)',
+    evidence: 'server prestart loop-channel records (st.sounds loop entries: start/stop/position) + this file M3',
   },
   {
     group: 'target_speaker|ambient-inert:-1808 1936 216',
@@ -258,7 +246,13 @@ const ROSTER: ProducerRow[] = [
     }),
   ),
   ...['t71', 't72', 't79', 't80', 't81'].map(
-    (tn): ProducerRow => miss(`target_speaker|tn:${tn} looptoggle`, 1, 'M3', `${C_SPEAKER} (spawnflags&3==2 loop toggle)`),
+    (tn): ProducerRow => ({
+      group: `target_speaker|tn:${tn} looptoggle`,
+      count: 1,
+      status: 'implemented',
+      handler: `${C_SPEAKER} (spawnflags&3==2 loop toggle)`,
+      evidence: 'server Use_Target_Speaker toggle (st.sounds loop add/remove) + this file M3',
+    }),
   ),
   // --- Timers: 29 START_ON/triggered drivers (implemented: cadence think +
   // use-toggle; this file's M4 pins periodic splash/speaker events) + 1
@@ -321,13 +315,33 @@ const ROSTER: ProducerRow[] = [
     ['t157', '34'],
     ['t158', '33'],
     ['t159', '32'],
-  ].map(([tn, style]): ProducerRow => miss(`light|tn:${tn} style=${style}`, 1, 'M6', C_LIGHT)),
+  ].map(
+    ([tn, style]): ProducerRow => ({
+      group: `light|tn:${tn} style=${style}`,
+      count: 1,
+      status: 'implemented',
+      handler: C_LIGHT,
+      evidence: 'server light_use style record (lightStyles/lightToggles) + this file M6',
+    }),
+  ),
   // --- Movers: travel implemented, sounds absent ---
   ...['*19', '*31', '*32', '*33'].map(
-    (model): ProducerRow => miss(`func_door|model:${model}`, 1, 'M7', `${C_DOORSND}; cl_tent.c n/a (positional sounds)`),
+    (model): ProducerRow => ({
+      group: `func_door|model:${model}`,
+      count: 1,
+      status: 'implemented',
+      handler: `${C_DOORSND}; cl_tent.c n/a (positional sounds)`,
+      evidence: 'server door_go_up/down leg sounds (dr1_strt/end) + this file M7',
+    }),
   ),
   ...['*13', '*34'].map(
-    (model): ProducerRow => miss(`func_button|model:${model}`, 1, 'M7', C_BTNSND),
+    (model): ProducerRow => ({
+      group: `func_button|model:${model}`,
+      count: 1,
+      status: 'implemented',
+      handler: C_BTNSND,
+      evidence: 'server button_fire sound (switches/butn2.wav) + this file M7',
+    }),
   ),
   { group: 'func_train|model:*12', count: 1, status: 'implemented', handler: 'train_next/use (g_func.c); C trains are silent', evidence: "server base1.test.ts 'ships/train/flags: corner chains spawn, ships fly, train waits for *13'" },
   { group: 'func_rotating|model:*29', count: 1, status: 'deferred', handler: 'g_func.c SP_func_door_rotating', evidence: 'no firing path in base1 (no targetname, never used): the fan mesh is static scenery' },
@@ -398,11 +412,11 @@ const ROSTER: ProducerRow[] = [
  * excluded from the map-drift comparison, still pinned by controls.
  */
 const ASPECTS: ProducerRow[] = [
-  { group: 'aspect:relay/entity delay (DelayedUse)', count: 0, status: 'missing', control: 'M5', handler: C_UTILS_DELAY, evidence: 'failing control M5 in this file' },
-  { group: 'aspect:trigger/entity message centerprint + talk1', count: 0, status: 'missing', control: 'M10', handler: C_MSG, evidence: 'failing control M10 in this file (*15 ladder msg, *18 crouch msg, t76-relay msg)' },
-  { group: 'aspect:hitscan vs water TE_SPLASH', count: 0, status: 'missing', control: 'M11', handler: C_WATERSPLASH, evidence: 'failing control M11 in this file' },
-  { group: 'aspect:door areaportal open/close', count: 0, status: 'missing', control: 'M12', handler: C_AREAPORTAL, evidence: 'failing control M12 in this file (door *19 -> t69)' },
-  { group: 'aspect:blood on hitscan flesh hits', count: 0, status: 'missing', control: 'M8', handler: C_BLOOD, evidence: 'failing control M8 in this file' },
+  { group: 'aspect:relay/entity delay (DelayedUse)', count: 0, status: 'implemented', handler: C_UTILS_DELAY, evidence: 'server DelayedUse think queue + this file M5' },
+  { group: 'aspect:trigger/entity message centerprint + talk1', count: 0, status: 'implemented', handler: C_MSG, evidence: 'server G_UseTargets message branch (centerprints + talk1) + this file M10 (*15 ladder msg, *18 crouch msg, t76-relay msg)' },
+  { group: 'aspect:hitscan vs water TE_SPLASH', count: 0, status: 'implemented', handler: C_WATERSPLASH, evidence: 'server fire_lead water branch (splash-class sparks, color per contents) + this file M11' },
+  { group: 'aspect:door areaportal open/close', count: 0, status: 'implemented', handler: C_AREAPORTAL, evidence: 'server door_use_areaportals record + this file M12 (door *19 -> t69)' },
+  { group: 'aspect:blood on hitscan flesh hits', count: 0, status: 'implemented', handler: C_BLOOD, evidence: 'server fire_lead flesh branch (blood-class sparks; blaster flesh stays event-free) + this file M8' },
 ];
 
 const CONTROL_IDS = ['M1', 'M2', 'M3', 'M4', 'M5', 'M6', 'M7', 'M8', 'M9', 'M10', 'M11', 'M12'];
@@ -555,11 +569,11 @@ describe.runIf(HAS_PAK)('RELEASE-9 base1 effect inventory (real map)', () => {
       [...missing, ...extra],
       `inventory drift (update ROSTER + file follow-up cards):\n  ${[...missing, ...extra].join('\n  ')}`,
     ).toEqual([]);
-    // No blanket "effects complete" claim: the roster must still contain
-    // missing rows until their lanes land (this fails if someone marks
-    // everything implemented without the controls below flipping to `it`).
+    // The roster is complete: every enumerated producer is implemented and
+    // pinned by a passing control above (R9F-1..8 landed the last missing
+    // links). Zero open rows is the earned state, not a blanket claim.
     const openCount = ROSTER.filter((r) => r.status === 'missing').length;
-    expect(openCount, 'roster must still list missing effects (no blanket complete claim)').toBeGreaterThan(0);
+    expect(openCount, 'all enumerated producers are implemented (no missing rows remain)').toBe(0);
   });
 });
 
@@ -627,8 +641,9 @@ function mixDrainedSounds(st: ServerState, at: Vec3): ReturnType<Mixer['mix']> {
 }
 
 // ---------------------------------------------------------------------------
-// Missing-effect controls. Each FAILS now (it.fails keeps verify green);
-// implementing lanes flip them to `it` and update the ROSTER row.
+// Missing-effect controls (all implemented by R9F-1..8; formerly `it.fails`
+// until their lane landed). Each pins the producer→server event→render/audio
+// link end to end.
 // ---------------------------------------------------------------------------
 
 describe('RELEASE-9 missing-effect controls (fail until implemented)', () => {
@@ -667,7 +682,7 @@ describe('RELEASE-9 missing-effect controls (fail until implemented)', () => {
     expect(names, 't116 speaker must queue world/voice11.wav').toContain('world/voice11.wav');
   });
 
-  it.fails('M3: prestarted looped speakers register an ambient loop (s.sound)', () => {
+  it('M3: prestarted looped speakers register an ambient loop (s.sound)', () => {
     // C SP_target_speaker (spawnflags&1): ent->s.sound = noise_index at spawn;
     // the mixer loops it until toggled. 57 base1 ambients ride this path.
     const st = SV_Init();
@@ -683,7 +698,7 @@ describe('RELEASE-9 missing-effect controls (fail until implemented)', () => {
     expect(loops.length, 'looped-on speaker must register a looping ambient entry').toBeGreaterThan(0);
   });
 
-  it.fails('M5: trigger_relay delay defers firing (DelayedUse, G_UseTargets)', () => {
+  it('M5: trigger_relay delay defers firing (DelayedUse, G_UseTargets)', () => {
     // C: ent->delay spawns a DelayedUse that fires at level.time + delay.
     // The 0.1s t2/t50/t51/t3/t49 pairs + t153 (.3) + t70 (2) all ride this.
     const st = SV_Init();
@@ -701,7 +716,7 @@ describe('RELEASE-9 missing-effect controls (fail until implemented)', () => {
     expect(st.foundSecrets, 'delayed relay must fire after its delay elapses').toBe(1);
   });
 
-  it.fails('M6: firing a targeted light toggles its style (light_use CS_LIGHTS)', () => {
+  it('M6: firing a targeted light toggles its style (light_use CS_LIGHTS)', () => {
     // C light_use flips CS_LIGHTS+style between "m" (on) and "a" (off).
     // t155-t159 strobe with the splash relays every few seconds.
     const st = SV_Init();
@@ -717,7 +732,7 @@ describe('RELEASE-9 missing-effect controls (fail until implemented)', () => {
     expect(toggles.length, 'light_use must record a style-32 toggle for the driver').toBeGreaterThan(0);
   });
 
-  it.fails('M8: bullet hits on flesh emit a blood-class impact event (TE_BLOOD)', () => {
+  it('M8: bullet hits on flesh emit a blood-class impact event (TE_BLOOD)', () => {
     // C fire_lead flesh branch: TE_BLOOD at the hit. TS resolves damage but
     // records no impact event (SV_DamageMonster only pushes gib sound + gibs).
     const st = SV_Init();
@@ -756,7 +771,7 @@ describe('RELEASE-9 missing-effect controls (fail until implemented)', () => {
     expect(st.sparks.length, 'flesh hits must emit a blood-class impact event').toBeGreaterThan(0);
   });
 
-  it.fails('M10: trigger/entity messages surface a centerprint + talk1 (G_UseTargets)', () => {
+  it('M10: trigger/entity messages surface a centerprint + talk1 (G_UseTargets)', () => {
     // C prints ent->message + talk1.wav for every used entity with a message
     // (*15 ladder hint, *18 crouch hint, the t76 relay line).
     const st = SV_Init();
@@ -773,9 +788,14 @@ describe('RELEASE-9 missing-effect controls (fail until implemented)', () => {
     expect(names, 'used entity message must queue misc/talk1.wav').toContain('misc/talk1.wav');
   });
 
-  it.fails('M11: hitscan entering water emits a TE_SPLASH-class event', () => {
+  it('M11: hitscan entering water emits a TE_SPLASH-class event', () => {
     // C fire_lead water branch: TE_SPLASH (8px, blue/brown/slime/lava). TS
-    // pellet resolution never consults contents, so pool crossings are dry.
+    // pellet resolution never consulted contents, so pool crossings were dry.
+    // NOTE (R9F-7): the control as written passed contents:1 (SOLID in every
+    // contents space) and ammo:0 (an unfired shell emits nothing). The
+    // C-faithful shape keys splash on the BSP water bits traceBox reports
+    // (WATER 32; SLIME 16; LAVA 8 — q_shared.h, production-trace space), so
+    // the control now carries contents:32 (blue water) and a live shell.
     const st = SV_Init();
     const waterTrace: import('@q2/game').TraceFn = (start, _mins, _maxs, end) => ({
       fraction: 0.5,
@@ -788,14 +808,14 @@ describe('RELEASE-9 missing-effect controls (fail until implemented)', () => {
       allsolid: false,
       startsolid: false,
       entityNum: -1,
-      contents: 1,
+      contents: 32,
     });
     SV_PlayerFire(st, 'weapon_shotgun', {
       eye: v3(0, 0, 22),
       feet: v3(0, 0, 0),
       angles: v3(0, 0, 0),
       viewheight: 22,
-      ammo: 0,
+      ammo: 10,
       trace: waterTrace,
       rand: mulberry32(7),
     });
@@ -806,7 +826,7 @@ describe('RELEASE-9 missing-effect controls (fail until implemented)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Real-map missing controls (pak-gated; same it.fails contract).
+// Real-map controls (pak-gated; same implemented contract as above).
 // ---------------------------------------------------------------------------
 
 describe.runIf(HAS_PAK)('RELEASE-9 real-map missing controls (fail until implemented)', () => {
@@ -830,7 +850,7 @@ describe.runIf(HAS_PAK)('RELEASE-9 real-map missing controls (fail until impleme
     expect(gained, 'timers must drive periodic map effects within 30s').toBeGreaterThan(0);
   });
 
-  it.fails('M7: linear doors/buttons queue their move sounds', { timeout: 120000 }, () => {
+  it('M7: linear doors/buttons queue their move sounds', { timeout: 120000 }, () => {
     // C: doors/dr1_strt.wav on leg start (+middle/end), switches/butn2.wav.
     const { st } = bootBase1();
     const door = st.movers.find((m) => m.ent.model === '*32')!;
@@ -872,7 +892,7 @@ describe.runIf(HAS_PAK)('RELEASE-9 real-map missing controls (fail until impleme
     expect(names, '*20 blow must fire t78 -> world/brkglas.wav').toContain('world/brkglas.wav');
   });
 
-  it.fails('M12: door *19 use drives its areaportal (t69)', { timeout: 120000 }, () => {
+  it('M12: door *19 use drives its areaportal (t69)', { timeout: 120000 }, () => {
     // C door_use_areaportals opens/closes func_areaportal t69 with the door.
     const { st } = bootBase1();
     const door = st.movers.find((m) => m.ent.model === '*19')!;
@@ -977,9 +997,9 @@ describe.runIf(HAS_PAK)('RELEASE-9 implemented-path sequences (must pass)', () =
 
   it('E3: t70 chain -> help latch + relay cascade + delayed explosion fuses -> boom', { timeout: 120000 }, () => {
     // t70 = 2 helps + voice speaker (M2) + relay (2s delay, M5) -> t151
-    // target_explosion charges. The relay leg fires immediately in-tree
-    // (M5 pins the missing delay); the tick loop resolves explosion targets
-    // from firedThisTick, so the fuse half runs through the production
+    // target_explosion charges. M5 made the relay leg DelayedUse, so t151 is
+    // reached through the tick-think (21 ticks cover the 2s delay), not the
+    // synchronous cascade; the fuse half still runs through the production
     // SV_Tick entry point fireExplosionTarget.
     const { st, map } = bootBase1();
     const trace = SV_TraceFor(map, MASK_PLAYERSOLID_C);
@@ -988,11 +1008,6 @@ describe.runIf(HAS_PAK)('RELEASE-9 implemented-path sequences (must pass)', () =
     expect(st.helpMessage1, 't70 latches help1 (Establish communication)').toContain('Establish communication');
     expect(st.helpMessage2, 't70 latches help2 (Locate base installation)').toContain('Locate base installation');
     expect(st.helpChangedSeq, 'each help firing bumps the seq').toBe(2);
-    expect(st.firedThisTick, 'relay reaches t151 through the cascade').toContain('t151');
-    // Production tick-resolution entry for scripted explosions
-    // (SV_Tick's firedThisTick loop calls this same function).
-    fireExplosionTarget(st, 't151');
-    expect(st.fuses.length, 't151 delayed charges arm as fuses').toBe(4);
     const game = {
       player: {
         pos: v3(5000, 5000, 500),
@@ -1003,6 +1018,8 @@ describe.runIf(HAS_PAK)('RELEASE-9 implemented-path sequences (must pass)', () =
       trace,
       rand: mulberry32(0x70),
     };
+    for (let i = 0; i < 20; i++) SV_Tick(st, 0.1, game);
+    expect(st.fuses.length, 't70 delay elapses -> t151 charges arm as fuses').toBe(4);
     for (let i = 0; i < 6; i++) SV_Tick(st, 0.1, game);
     expect(st.explosions.length, 't151 fuses blow into explosion events').toBe(4);
     expect(

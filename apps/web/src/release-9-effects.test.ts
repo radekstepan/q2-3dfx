@@ -37,8 +37,9 @@ import {
   EXPLOSION_SPARK_COUNT,
   BLASTER_SPARK_COUNT,
   SPARK_COLOR_BASE,
+  spawnEdict,
 } from '@q2/game';
-import { SV_SetPlayerHealth, SV_UseMover } from '@q2/server';
+import { SV_SetPlayerHealth, SV_UseMover, SV_UseTargetname, fireTargets } from '@q2/server';
 import { setupCamera } from '@q2/sw-renderer';
 import {
   buildEntityModel,
@@ -49,6 +50,7 @@ import {
 } from '@q2/webgl-renderer';
 import {
   bootPlay,
+  buildAsyncView,
   EXPLOSION_LIGHT_WINDOW,
   explosionFrames,
   explosionStepFor,
@@ -524,7 +526,13 @@ describe.runIf(!!WEB_Q2_PAK)('release-9 barrel explosion sequence (Q2_PAK, softw
     // Prune control: after the full life nothing submits and nothing lights
     // (fails if explosions stick — the "fuller by enlarging" temptation
     // would also fail the size legs below, which pin real art scale).
-    stepDriver(driver, neutralCmd(), 20);
+    // Settle to quiescence (cap 90 ticks ≈ 9s): barrel fuse delays (C 0.2s
+    // DelayedUse) plus radius chain-detonation (E1: one hit → two booms) can
+    // legally start new lives mid-settle; a stuck explosion never drains and
+    // still fails the length assert below.
+    for (let i = 0; i < 90 && driver.drainExplosions().length > 0; i++) {
+      stepDriver(driver, neutralCmd(), 1);
+    }
     expect(driver.drainExplosions()).toHaveLength(0);
     expect(pumpExplosionLights(boot)).toBe(0);
   });
@@ -1004,5 +1012,49 @@ describe('release-9 pump wiring (no pak)', () => {
     expect(driver.pendingTracers).toBe(0);
     driver.step(neutralCmd(), 0.1);
     expect(driver.pendingTracers).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Integrator: server records consumed by the render path (R9F-3 light styles,
+// R9F-6 centerprints). Synthetic edicts on the real boot (fresh nums, no
+// SV_SpawnEntities reset); the map-wiring halves are covered by M6/M10.
+// ---------------------------------------------------------------------------
+
+describe.runIf(!!WEB_Q2_PAK)('release-9 render consumption (Q2_PAK)', () => {
+  it('light_use toggles reach RefDef.lightStyles on both view builders', { timeout: 60000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    // Synthetic relay → light(style 200, off-map so no map style moves).
+    const relay = spawnEdict({ classname: 'trigger_relay', targetname: 'r9style', target: 't959x' });
+    const lamp = spawnEdict({ classname: 'light', targetname: 't959x', style: '200' });
+    driver.server.entities.push(relay, lamp);
+    expect(driver.lightStyleScale(200)).toBe(1);
+    expect(buildAsyncView(boot.host).view.lightStyles[200]).toBe(1);
+    SV_UseTargetname(driver.server, 'r9style');
+    expect(driver.server.lightStyles[200]).toBe('a');
+    expect(driver.lightStyleScale(200)).toBeCloseTo(0, 10);
+    expect(buildAsyncView(boot.host).view.lightStyles[200]).toBeCloseTo(0, 10);
+    SV_UseTargetname(driver.server, 'r9style');
+    expect(driver.server.lightStyles[200]).toBe('m');
+    expect(driver.lightStyleScale(200)).toBeCloseTo(1, 10);
+    expect(buildAsyncView(boot.host).view.lightStyles[200]).toBeCloseTo(1, 10);
+    // Unrecorded styles stay 1 (style 201 is off-map; nothing touches it).
+    expect(driver.server.lightStyles[201]).toBeUndefined();
+    expect(driver.lightStyleScale(201)).toBe(1);
+  });
+
+  it('trigger message centerprints surface on the status line as status', { timeout: 60000 }, async () => {
+    const boot = await bootBase1();
+    const { driver } = boot;
+    const trig = spawnEdict({ classname: 'trigger_once', message: 'R9F-6 probe line' });
+    driver.server.entities.push(trig);
+    stepDriver(driver, neutralCmd(), 5);
+    expect(driver.message).not.toBe('R9F-6 probe line');
+    fireTargets(driver.server, trig);
+    stepDriver(driver, neutralCmd(), 3);
+    expect(driver.message).toBe('R9F-6 probe line');
+    expect(driver.messageKind).toBe('status');
+    expect(driver.heardSounds).toContain('misc/talk1.wav');
   });
 });
