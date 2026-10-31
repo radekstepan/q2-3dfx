@@ -5316,6 +5316,19 @@ export function drawHelpOverlay(
       /* skip bad rows */
     }
   }
+  // RELEASE-4 completion headline: once the server owns the finished state
+  // the F1 panel states it explicitly (frozen counters arrive via
+  // `helpFactsFor`; the time reads the frozen snapshot, never wall-clock).
+  // Panel-native pixels so the lines stay inside the unscaled 256x192
+  // backdrop at every resolution (`drawString` clips on tiny buffers).
+  // The yv 128/138 band sits between the help2 row (110) and the counters
+  // header (164), so live rows never shift.
+  if (boot.driver.server.finished) {
+    const headline = 'LEVEL COMPLETE';
+    const timeLine = `time ${formatLevelTime(boot.driver.server.finishTime)}`;
+    drawString(target, hx + (((256 - stringWidth(headline)) / 2) | 0), hy + 128, headline, FINISH_BLUE);
+    drawString(target, hx + (((256 - stringWidth(timeLine)) / 2) | 0), hy + 138, timeLine, 0xffffffff);
+  }
 }
 
 /**
