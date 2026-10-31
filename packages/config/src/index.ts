@@ -57,12 +57,43 @@ const DEFAULT_CVARS: ReadonlyArray<[string, CVarValue, string]> = [
   ['r_drawworld', 1, 'draw world geometry'],
   ['cl_predict', 1, 'predict local player between 10Hz snapshots'],
   ['cl_interp', 1, 'interpolate remote entities between snapshots'],
-  ['s_volume', 0.8, 'master sound volume 0..1'],
+  ['s_volume', 1, 'master sound volume 0..1 normalized (1 = quiet reference output gain 0.05; max output never exceeds 0.05)'],
   ['sensitivity', 3, 'mouse sensitivity'],
   ['m_yaw', 0.022, 'mouse yaw scale'],
   ['m_pitch', 0.022, 'mouse pitch scale'],
   ['vid_renderer', 'software', 'active refresh backend: software | voodoo | webgl2-experimental (experimental, needs WebGL2; incapable Falls back to software WITH a warning)'],
 ];
+
+// --- volume scale (RELEASE-1) ---
+//
+// `s_volume` is a normalized 0..1 control. It maps to an output gain of
+// 0..S_VOLUME_REFERENCE_GAIN (0.05): `output = clamp01(normalized) * 0.05`.
+// New default 1 therefore equals the old quiet gain 0.05, and the new
+// maximum 1 can never exceed old 0.05.
+//
+// IMPORTANT: apply the 0.05 factor exactly once, at the audio boundary
+// (`@q2/sound` mix + browser blip). Never pre-scale `s_volume` and then
+// multiply by 0.05 again. Legacy configs that stored old raw gains
+// (e.g. 0.8) are treated as normalized values and thus map to
+// 0.8*0.05 = 0.04 — quiet by construction. Non-finite/unknown values
+// map to 0 (mute, fail-safe).
+export const S_VOLUME_REFERENCE_GAIN = 0.05 as const;
+/** Normalized `s_volume` default (1 = reference quiet output 0.05). */
+export const S_VOLUME_DEFAULT = 1 as const;
+
+/** Clamp a normalized volume to 0..1; non-finite/unknown -> 0. */
+export function clampNormalizedVolume(raw: unknown): number {
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(n)) return 0;
+  if (n <= 0) return 0;
+  if (n >= 1) return 1;
+  return n;
+}
+
+/** Map a raw `s_volume` value to the actual output gain 0..0.05. Single scale point. */
+export function sVolumeToOutputGain(raw: unknown): number {
+  return clampNormalizedVolume(raw) * S_VOLUME_REFERENCE_GAIN;
+}
 
 // --- shared store (ESM/CJS unification) ---
 //

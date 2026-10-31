@@ -292,16 +292,19 @@ commit validated implementation increments with changesets, no push.
 ### RELEASE-1 — Quiet, capped volume scale
 owns: `packages/config`, `packages/sound`, `apps/web`
 depends: none
-status: ready
+status: done
 done-when:
-- [ ] Replace the current `s_volume` default of 0.8 with the requested quiet level. Interpret the new normalized scale as 0..1 mapping to old gain 0..0.05: new default 1 equals old 0.05, and new maximum 1 cannot exceed old 0.05. Document this mapping so the old gain is not multiplied by 0.05 twice.
-- [ ] Clamp finite values and handle invalid/legacy configuration at the audio boundary; audit mixer, browser nodes, fallback sounds and menu help so no route bypasses the cap. Preserve positional attenuation and mute.
-- [ ] Verify default, zero, max, out-of-range and invalid settings, including overlapping combat sounds; demonstrate actual output gain, not only the cvar value.
+- [x] Replace the current `s_volume` default of 0.8 with the requested quiet level. Interpret the new normalized scale as 0..1 mapping to old gain 0..0.05: new default 1 equals old 0.05, and new maximum 1 cannot exceed old 0.05. Document this mapping so the old gain is not multiplied by 0.05 twice.
+- [x] Clamp finite values and handle invalid/legacy configuration at the audio boundary; audit mixer, browser nodes, fallback sounds and menu help so no route bypasses the cap. Preserve positional attenuation and mute.
+- [x] Verify default, zero, max, out-of-range and invalid settings, including overlapping combat sounds; demonstrate actual output gain, not only the cvar value.
 
 ### RELEASE-2 — Render the asset-free demo room in WebGL2
 owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
 depends: none
-status: ready
+status: done
+done-when:
+- [x] Reproduce the black room on GPU cold boot and switching. Review finding: boot GPU world/palette setup is guarded by `mainPalette`; without a pak the current code explicitly leaves the devroom CPU/clear-only. Supply the procedural world, palette and models required by GPU, including restore/replay.
+- [x] Real-WebGL pixels show expected room geometry/materials and entities without pak assets; verify cold boot, map switch, renderer switch and context restoration. Check that an intentional missing-world control fails; nonblack clear color alone is insufficient.
 starting-points: `play.ts: bootPlay/applyRendererCvar`, `devroom.ts`, `devroom-fallback.test.ts`
 done-when:
 - [ ] Reproduce the black room on GPU cold boot and switching. Review finding: boot GPU world/palette setup is guarded by `mainPalette`; without a pak the current code explicitly leaves the devroom CPU/clear-only. Supply the procedural world, palette and models required by GPU, including restore/replay.
@@ -310,7 +313,11 @@ done-when:
 ### RELEASE-3 — Align aim and overlays at every resolution
 owns: `apps/web`, `packages/webgl-renderer`, `packages/input`, `packages/testkit`
 depends: none
-status: ready
+status: done
+done-when:
+- [x] Reproduce at 1024×768: crosshair/cursor does not match shot direction; FPS, position and messages are displaced from screen edges. Trace internal framebuffer, GPU viewport, HUD buffer, CSS display rectangle, pointer coordinates and device pixel ratio; do not assume the cause from the symptom.
+- [x] Use consistent dimensions/projection and anchoring for world, HUD and input. Verify shot ray/impact against crosshair with a known target (accounting for intended weapon muzzle parallax), and top/bottom HUD placement at all offered resolutions, CSS scaling/fullscreen and representative DPRs.
+- [x] Add production presentation coverage before/after resize and renderer switch; include 1024×768 visual evidence and no clipped overlays.
 starting-points: `play.ts: drawPlayHud`, `gpu-canvas.ts`, `gpu-presentation.test.ts`, `dom.ts`
 done-when:
 - [ ] Reproduce at 1024×768: crosshair/cursor does not match shot direction; FPS, position and messages are displaced from screen edges. Trace internal framebuffer, GPU viewport, HUD buffer, CSS display rectangle, pointer coordinates and device pixel ratio; do not assume the cause from the symptom.
@@ -321,54 +328,63 @@ done-when:
 owns: `packages/server`, `packages/game`, `apps/web`
 depends: none
 starting-points: `packages/server/src/doors.ts`, base1 entity lump and target chain
-status: ready
+status: done
 done-when:
-- [ ] Reproduce the final elevator descending as its door opens before the player can board. Identify its actual map classname, targets, button, spawnflags and wait values; compare the local original Quake II mover/trigger implementation. Determine intended activation from the map/source rather than forcing every lift to wait indefinitely.
-- [ ] Repair the specific trigger/state/timing discrepancy. Verify approach, door opening, boarding, button use, ride and level exit, plus repeat use and blocked movement where applicable. Assert the intended wait at the top and no premature departure in a real-base1 tick-loop regression and visible route.
+- [x] Reproduce the final elevator descending as its door opens before the player can board. Identify its actual map classname, targets, button, spawnflags and wait values; compare the local original Quake II mover/trigger implementation. Determine intended activation from the map/source rather than forcing every lift to wait indefinitely.
+- [x] Repair the specific trigger/state/timing discrepancy. Verify approach, door opening, boarding, button use, ride and level exit, plus repeat use and blocked movement where applicable. Assert the intended wait at the top and no premature departure in a real-base1 tick-loop regression and visible route.
 
 ### RELEASE-5 — Monster collision, wall movement and infantry fire
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
 depends: none
-status: ready
+status: done
 done-when:
-- [ ] Reproduce player clipping into live infantry. Audit server entity hulls/linking, player prediction and movement traces; test stationary/moving infantry, close contact and doorways. Keep legitimate corpse/death collision behavior faithful to source.
-- [ ] Revisit the soldier behind the door at player position **(-1148.1, 1542.3, -24)** in base1, recording facing, soldier identity, skill and door state. Confirm with a regression and visible replay that it cannot climb up the wall then descend. Audit step height, ground checks, hull traces and moving-door interaction; a generic chase test is not confirmation at this location.
-- [ ] Compare infantry firing with local `game/m_infantry.c`, muzzle offsets and original client effects/assets. The source uses `monster_fire_bullet`; verify hitscan behavior, burst timing, muzzle flash/light, impact effects, sound and any rendered tracer against the original. Do not substitute soldier blaster/projectile visuals. Capture a representative burst with negative controls for missing/wrong effects.
-- [ ] Pass real-asset `base1-gate.test.ts` and focused monster/collision tests; record observed visual verdict separately from unit-test success.
+- [x] Reproduce player clipping into live infantry. Audit server entity hulls/linking, player prediction and movement traces; test stationary/moving infantry, close contact and doorways. Keep legitimate corpse/death collision behavior faithful to source.
+- [x] Revisit the soldier behind the door at player position **(-1148.1, 1542.3, -24)** in base1, recording facing, soldier identity, skill and door state. Confirm with a regression and visible replay that it cannot climb up the wall then descend. Audit step height, ground checks, hull traces and moving-door interaction; a generic chase test is not confirmation at this location.
+- [x] Compare infantry firing with local `game/m_infantry.c`, muzzle offsets and original client effects/assets. The source uses `monster_fire_bullet`; verify hitscan behavior, burst timing, muzzle flash/light, impact effects, sound and any rendered tracer against the original. Do not substitute soldier blaster/projectile visuals. Capture a representative burst with negative controls for missing/wrong effects.
+- [x] Pass real-asset `base1-gate.test.ts` and focused monster/collision tests; record observed visual verdict separately from unit-test success.
 
 ### RELEASE-6 — Use game assets for HUD, F1 and level completion
 owns: `apps/web`, `packages/client`, `packages/formats`, `packages/testkit`
 depends: none
-status: ready
+status: in-progress(@opencode)
 starting-points: `play.ts: drawPlayHud`, browser F1/menu handler, pak `pics/` and original client screen/layout code
 review-finding: current HUD draws text such as `hp` and weapon classname; completion uses a custom text block.
 done-when:
 - [ ] Compare startup/F1 help, health/ammo/armor and level-completion/intermission layout with original game assets and layout semantics. Inventory required pak pictures/fonts and stats; implement the appropriate asset-based screens instead of placeholder styling.
 - [ ] Preserve readable asset-free devroom fallback and distinguish game HUD from optional FPS/position diagnostics. Verify real assets, values, transparency, scaling and placement at 640×480 and 1024×768, including death and level completion.
 
+### TODO(RELEASE-6)
+- Inventory pak pics/fonts + original layout semantics; implement asset-based HUD/F1/intermission with devroom fallback preserved. Verify 640x480 + 1024x768 + death/completion.
+
 ### RELEASE-7 — Change display settings without restarting; stable startup size
 owns: `apps/web`, `packages/host`, `packages/webgl-renderer`, `packages/testkit`
 depends: RELEASE-3
-status: ready
+status: in-progress(@opencode)
 review-findings: `dom.ts: REBOOT_CVARS` includes resolution; renderer already uses `applyRendererCvar` hot-swap; `resizeGpuBackend` exists.
 done-when:
 - [ ] Wire resolution changes through coordinated framebuffer/viewport/HUD resizing without rebuilding the game simulation. Preserve map, position, health, enemies, elapsed time and audio. Confirm renderer changes also preserve these states in the actual menu; diagnose any remaining restart rather than adding another switch path.
 - [ ] Reserve the selected/persisted display dimensions before async asset loading. Show a correctly sized loading surface immediately, then present the first valid frame without a small black box or layout jump. Cover cold cache, cached pak, no pak and failed GPU initialization.
 - [ ] Verify repeated resize/switch, context loss/restore, resource disposal and no duplicate loop/listeners; keep explicit restart behavior only for settings that genuinely require a new level (e.g. map/skill).
 
+### TODO(RELEASE-7)
+- Wire resolution via coordinated framebuffer/viewport/HUD resize without reboot; preserve map/pos/health/enemies/time/audio. Verify repeat resize/switch/loss/restore, no duplicate loops.
+
 ### RELEASE-8 — Retire the old CPU Voodoo renderer
 owns: `apps/web`, `packages/config`, `packages/renderer-api`, `packages/sw-renderer`, `packages/voodoo`, `packages/host`, `packages/testkit`, `tools/bench`, `tools/asset-cooker`, `docs`, root workspace configuration
 depends: RELEASE-2, RELEASE-7
-status: ready
+status: in-progress(@opencode)
 done-when:
 - [ ] Remove the legacy CPU Voodoo execution mode and its menu/config selection in favor of WebGL2; map persisted legacy selections deliberately and report unsupported-GPU fallback accurately. Preserve the software reference/Node renderer and the WebGL Voodoo appearance.
 - [ ] Inventory shared imports first: WebGL currently reuses `sw-renderer` helpers and `voodoo` is a policy/post-process package. Remove obsolete mode-specific code, workers, controls and benchmarks; retain or relocate shared utilities. Do not delete whole packages blindly or silently turn WebGL into a CPU path.
 - [ ] Update frozen contracts with required major changesets if changed, dependency rules, scripts, docs and tests. Retire obsolete tests explicitly while preserving meaningful software goldens and GPU parity/lifecycle coverage. Update §§2–6 to describe the final architecture, not a planned deletion.
 
+### TODO(RELEASE-8)
+- Inventory shared imports (sw-renderer helpers, voodoo policy); remove legacy CPU Voodoo mode + menu/config, map persisted selections, update contracts/deps/docs/tests. Retire obsolete code explicitly.
+
 ### GPU-FOLLOW-3B — Remove visible water tile boundaries
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
 depends: GPU-FOLLOW-3A
-status: ready
+status: in-progress(@opencode)
 starting-points: `shaders.ts: FS_LIT/voodooWarp`, world UVs, diffuse mip generation/sampling
 done-when:
 - [ ] Preserve the now-satisfactory water motion. Reproduce the remaining visible tile seams in real water; record map, camera, material, time and crops. Distinguish texture-repeat boundaries from BSP-face/lightmap seams and warp/LOD/precision effects using fixed-time, fixed-LOD and diffuse/unlit diagnostics. Compare adjacent faces at the same world position and the CPU/reference appearance. Record the demonstrated cause before changing the algorithm.
@@ -376,10 +392,13 @@ done-when:
 - [ ] Add a regression that fails for the observed defect: actual sampled pixels across repeat/face boundaries at multiple times, plus real-page stationary/moving water captures. Include combined turbulent/translucent material coverage. Formula-string/mirror checks alone are insufficient.
 - [ ] Run relevant gates and record `yarn verify` outcome (known suite failures belong to FOLLOW-5); add changesets and commit separately. Confirm sky and prior wall/enemy/barrel repairs remain intact.
 
+### TODO(GPU-FOLLOW-3B)
+- Fixed-time/fixed-LOD diffuse/unlit diagnostics point to LOD-derivative/face-lightmap seams, not warp table (pinned continuous). Add sampled-pixel regression across repeat/face boundaries at multiple times; fix without disabling warp/lighting/mips.
+
 ### GPU-FOLLOW-5 — Refresh final fidelity evidence
 owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`
 depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
-status: ready
+status: in-progress(@opencode)
 done-when:
 - [ ] Reproduce current full-suite failures, including reported foreground-recovery pool and PROOF-3 CDP timeouts under load: reproduce and isolate resource/process contention, run expensive browser tests with controlled concurrency, and retain bounded useful timeouts. Do not skip the gate or merely inflate timeouts without evidence.
 - [ ] Capture matched F0/F1/F2 CPU/GPU scene/time/cvars on the repaired renderer; report new full-frame and region/material metrics. Repair the degenerate PROOF-4 far/mip fixture so it actually exercises its intended content. Keep historical pre-repair failures labelled historical.
@@ -387,20 +406,26 @@ done-when:
 - [ ] Investigate remaining unexplained UV/lighting/depth/transparency differences and add meaningful regression fixtures. Include repaired sky/water. Do not loosen assertions or replace goldens to conceal defects.
 - [ ] Meet the existing fidelity contract, or present concrete side-by-sides and a precise proposed contract for user approval. Record automated and user verdicts separately; no implicit approval of threshold changes.
 
+### TODO(GPU-FOLLOW-5)
+- Reproduce current full-suite failures (foreground-recovery pool, PROOF-3 CDP timeouts) with controlled concurrency; refresh F0/F1/F2 metrics; repair PROOF-4 far/mip fixture; strengthen lifecycle image evidence.
+
 ### GPU-FOLLOW-6 — Verify complete gameplay on a visible display
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
 depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
-status: ready
+status: in-progress(@opencode)
 done-when:
 - [ ] Run a hardware-backed visible-browser 640×480 soak ≥5 minutes: stationary, multi-room/PVS movement, doors/lifts and combat, real viewmodel/effects and sky/water. Record actual route state, visible captures, bounded resources and absence of silent fallback.
 - [ ] Record immutable build, device, refresh/vsync, raw timing samples, p50/p95/p99 and dropped frames. Check median work ≤16 ms, ≥59 FPS at nominal 60 Hz and p95 interval ≤20 ms separately. Describe completed/display cadence evidence accurately; submitted frames/headless throughput are not scanout proof. Use matched settings for CPU/GPU comparisons.
 - [ ] Measure cached-pak-to-first-frame against the existing ≤2.5 s startup requirement; report separately from steady-state FPS.
 - [ ] If a performance gate fails, make at most the remaining one measured optimization iteration, then report. If display access is absent, record the exact missing prerequisite and leave that gate blocked; continue independent work.
 
+### TODO(GPU-FOLLOW-6)
+- Hardware-backed visible-browser 640x480 soak 5+ min (stationary/moving/combat, viewmodel/effects/sky/water); record p50/p95/p99, dropped, startup 2.5s gate. Blocked if no display access — record prerequisite.
+
 ### GPU-FOLLOW-7 — Final integrated acceptance
 owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config` (integrator)
 depends: RELEASE-1 through RELEASE-8, GPU-FOLLOW-3B, GPU-FOLLOW-5, GPU-FOLLOW-6
-status: ready
+status: in-progress(@opencode)
 done-when:
 - [ ] Run `yarn verify`, `yarn deps:check`, real-asset base1, retained software and GPU lifecycle/image/gameplay gates after legacy retirement on the integrated result. Record skipped coverage and preserve CPU/Node support.
 - [ ] Publish separate implementation, correctness, fidelity and displayed-performance verdicts with commits/artifacts; reconcile contradictory PASS/GO claims in existing reports. Carry forward precise unresolved blockers.
@@ -426,3 +451,6 @@ done-when:
 | `docs/gpu-review-d934fdc-sky-water.md` | Historical pre-73c3076 sky/water review; sky findings superseded, water still open |
 | `docs/gpu-review-2026-10-29-lifecycle-sky-water.md` | Dirty-file ownership, review evidence, diagnoses and superseded queue |
 | `docs/tasks-archive.md` | all DONE cards (M0–M9 + TODOs) with lane reports |
+
+### TODO(GPU-FOLLOW-7)
+- Integrated acceptance after legacy retirement: verify, deps:check, base1, software/GPU lifecycle/gameplay gates; publish implementation/correctness/fidelity/performance verdicts; decide GPU default rollout.

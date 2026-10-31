@@ -74,7 +74,8 @@ describe('Q2 positional sound attenuation curves', () => {
     expect(m.channelCount).toBe(2);
     const mixed = m.mix();
     expect(mixed).toHaveLength(1);
-    expect(mixed[0]!.left).toBe(1);
-    expect(mixed[0]!.right).toBe(1);
+    // RELEASE-1 quiet cap: normalized 1 -> output gain 0.05 (single scale point).
+    expect(mixed[0]!.left).toBeCloseTo(0.05, 9);
+    expect(mixed[0]!.right).toBeCloseTo(0.05, 9);
   });
 });

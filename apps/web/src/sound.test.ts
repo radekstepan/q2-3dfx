@@ -208,7 +208,8 @@ describe('syncMixerToBrowser with stub AudioContext', () => {
     expect(rec.kinds).not.toContain('osc');
     expect(nodeOf(rec, 'buffer').buffer).toBe(cached);
     // M7.2 positional behaviour intact: local player is full volume.
-    expect(nodeOf(rec, 'gain').gain.value).toBeCloseTo(1, 6);
+    // RELEASE-1 quiet cap: normalized full volume -> 0.05 output gain.
+    expect(nodeOf(rec, 'gain').gain.value).toBeCloseTo(0.05, 6);
     expect(nodeOf(rec, 'pan').pan.value).toBeCloseTo(0, 6);
     expect(sound.pending.size).toBe(0);
   });

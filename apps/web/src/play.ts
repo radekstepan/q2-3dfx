@@ -2120,6 +2120,13 @@ export class LocalDriver implements HostDriver {
     AngleVectors(this.pm.viewAngles, fwd, right, up);
     const eye = v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + this.pm.viewheight);
     this.mixer.setListener(eye, right);
+    // RELEASE-1: pull the normalized s_volume into the mixer every tick so
+    // no route bypasses the 0..0.05 cap. mix() applies the reference gain once.
+    try {
+      this.mixer.syncMasterVolFromConfig();
+    } catch {
+      /* headless/test mixer without config — keep current masterVol */
+    }
   }
 
   private emitDoorSounds(): void {
@@ -3816,7 +3823,16 @@ export function notifyGpuContextRestored(boot: PlayBoot): boolean {
   // failure (never silent), skipped entries keep their backend warning.
   // GPU-FOLLOW-3A: replay the retained map sky (per-face dims) — restoration
   // without it would silently revert to the flat fallback.
+  // RELEASE-2: devroom restores the procedural world + palette + box-critter.
+  try {
+    g.gpu.attachWorld(boot.driver.mini);
+    const pal = gpuPaletteFor(boot);
+    if (pal) g.gpu.setPalette(pal);
+  } catch {
+    /* restore best-effort */
+  }
   if (boot.models) replayPakAssetsToGpu(boot.models, g.gpu);
+  else replayDevroomAssetsToGpu(g.gpu as unknown as Parameters<typeof replayDevroomAssetsToGpu>[0]);
   syncGpuSky(boot);
   try {
     syncGpuCanvasToHud(undefined);
@@ -3880,6 +3896,56 @@ export function gpuFramesSubmitted(boot: PlayBoot): number {
     return typeof n === 'number' && Number.isFinite(n) ? n : 0;
   } catch {
     return 0;
+  }
+}
+
+/**
+ * Procedural palette for the asset-free devroom GPU path (RELEASE-2).
+ * Matches the `rampPalette` shape used across webgl-renderer/testkit suites
+ * (deterministic, never reads the pak). Without this the GPU backend stays
+ * clear-only because `uploadStatic` early-returns when palette is missing.
+ */
+export function devroomPaletteForGpu(): Uint8Array {
+  const p = new Uint8Array(768);
+  for (let i = 0; i < 256; i++) {
+    p[i * 3] = i;
+    p[i * 3 + 1] = (i * 2) & 255;
+    p[i * 3 + 2] = (i * 3) & 255;
+  }
+  return p;
+}
+
+/**
+ * Register the procedural devroom box-critter with a GPU backend (RELEASE-2):
+ * model handle 0 + skin handle mirroring the CPU `host.refresh.registerModel`
+ * path so devroom entities never stay mesh-less on GPU. Best-effort, never throws.
+ */
+function replayDevroomAssetsToGpu(
+  sink: {
+    registerModelData?: (handle: number, kind: string, data: unknown) => void;
+    registerSkinPixels?: (handle: number, pixels: Uint8Array, width: number, height: number) => void;
+  } | null | undefined,
+): void {
+  if (!sink) return;
+  try {
+    if (typeof sink.registerModelData === 'function') {
+      try {
+        sink.registerModelData(0, 'md2', getDevMesh(0));
+      } catch {
+        /* entity draws skip */
+      }
+    }
+    if (typeof sink.registerSkinPixels === 'function') {
+      try {
+        const skins = createDevroom().textures;
+        const t = skins[0];
+        if (t) sink.registerSkinPixels(0, t.texels.slice(0), t.width, t.height);
+      } catch {
+        /* white fallback stays */
+      }
+    }
+  } catch {
+    /* devroom GPU assets best-effort */
   }
 }
 
@@ -3968,6 +4034,14 @@ export function bootPlay(opts: {
     }
   } else {
     skyWarning = 'no map sky (devroom or missing palette/pak: flat sky fallback)';
+    // RELEASE-2: devroom still needs a palette for the GPU backend.
+    // Procedural ramp (never reads the pak); CPU path is unaffected.
+    mainPalette = devroomPaletteForGpu();
+    try {
+      refresh.setPalette(mainPalette);
+    } catch {
+      /* CPU devroom renders without a palette; GPU uses the ramp below */
+    }
   }
   // HUD font: real `pics/conchars.pcx` when the pak ships it, procedural
   // xorshift fallback otherwise (deterministic per boot so tests are
@@ -4029,13 +4103,19 @@ export function bootPlay(opts: {
   // GPU-PROOF-3 live-loop hookup: the backend needs the world + palette for
   // static uploads. GPU-FOLLOW-2A: the retained MD2/PCX cache replays under
   // the SAME handles right after (cold boot shares the hot-swap path).
-  // Without a pak there is nothing to attach (devroom stays CPU/clear-only).
+  // RELEASE-2: devroom boots attach the procedural world + ramp palette and
+  // the box-critter so GPU cold boot/switch/restore render real geometry
+  // without pak assets. Missing pak sky clears to the flat fallback (3A intact).
   // GPU-FOLLOW-3A: the retained map sky registers here (per-face dims, never
   // the strip's total height); missing art clears to the flat fallback.
   if (boot.gpu && mainPalette) {
     boot.gpu.gpu.attachWorld(driver.mini);
     boot.gpu.gpu.setPalette(mainPalette);
-    replayPakAssetsToGpu(models, boot.gpu.gpu);
+    if (models) {
+      replayPakAssetsToGpu(models, boot.gpu.gpu);
+    } else {
+      replayDevroomAssetsToGpu(boot.gpu.gpu as unknown as Parameters<typeof replayDevroomAssetsToGpu>[0]);
+    }
     syncGpuSky(boot);
   }
   return boot;
@@ -4060,17 +4140,18 @@ export function rebootPlay(prev: PlayBoot): PlayBoot {
 
 /**
  * Palette for a hot-swapped GPU backend (re-parsed from the pak; the boot
- * path reuses the already-parsed `mainPalette`). Null in devroom (no pak) —
- * the caller then leaves the backend clear-only. Never throws.
+ * path reuses the already-parsed `mainPalette`). Devroom (no pak) returns
+ * the procedural ramp so the backend renders real geometry instead of
+ * staying clear-only (RELEASE-2). Never throws.
  */
 function gpuPaletteFor(boot: PlayBoot): Uint8Array | null {
   try {
-    if (!boot.pak) return null;
+    if (!boot.pak) return devroomPaletteForGpu();
     const bytes = tryPakEntry(boot.pak, 'pics/colormap.pcx');
-    if (!bytes) return null;
+    if (!bytes) return devroomPaletteForGpu();
     return parsePCX(bytes).palette;
   } catch {
-    return null;
+    return devroomPaletteForGpu();
   }
 }
 
@@ -4107,11 +4188,15 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
       // World + palette for the static upload, then the retained MD2/PCX
       // cache replays under the SAME handles (GPU-FOLLOW-2A): no CPU
       // re-registration (no handle drift), no reboot, no reset of the
-      // player's game. Devroom boots carry no retained assets (models null)
-      // and stay clear-only.
+      // player's game. RELEASE-2: devroom replays the procedural box-critter.
       attached.gpu.attachWorld(boot.driver.mini);
       const pal = gpuPaletteFor(boot);
       if (pal) attached.gpu.setPalette(pal);
+      if (boot.models) {
+        replayPakAssetsToGpu(boot.models, attached.gpu);
+      } else {
+        replayDevroomAssetsToGpu(attached.gpu as unknown as Parameters<typeof replayDevroomAssetsToGpu>[0]);
+      }
       // (Retained models/skins already replayed inside attachGpuBackend
       // under the same handles — see above.)
       // GPU-FOLLOW-3A: replay the retained map sky (per-face dims) so a
@@ -5440,6 +5525,23 @@ export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus |
   } catch {
     /* a throwing status probe never submits either */
     return null;
+  }
+  // RELEASE-3: keep the GL backing/viewport in sync with the framebuffer.
+  // Reboot creates a matched backend, but a missed resize (or a mid-loop
+  // resolution latch) would otherwise offset the scene center from the
+  // HUD crosshair. Best-effort self-heal, never throws.
+  try {
+    const fbW = boot.host.fb.width;
+    const fbH = boot.host.fb.height;
+    const st = g.gpu.getStatus() as unknown as { width?: number; height?: number };
+    if (typeof st.width === 'number' && typeof st.height === 'number') {
+      if (st.width !== fbW || st.height !== fbH) resizeGpuBackend(boot, fbW, fbH);
+    } else {
+      const cv = g.canvas as unknown as { width?: number; height?: number } | undefined;
+      if (cv && (cv.width !== fbW || cv.height !== fbH)) resizeGpuBackend(boot, fbW, fbH);
+    }
+  } catch {
+    /* presentation best-effort */
   }
   const tDrain0 = performance.now();
   // GPU-side dynamic drains (mirror pumpMuzzleLight/pumpExplosionLights/

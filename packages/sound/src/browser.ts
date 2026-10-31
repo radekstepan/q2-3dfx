@@ -19,6 +19,10 @@ export function createBrowserMixer(mixer: Mixer): BrowserMixer {
     (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
   const ctx = new Ctor();
   const master = ctx.createGain();
+  // Unity: per-channel levels from `mixer.mix()` already carry the capped
+  // 0..0.05 output gain (single scale point). Keep master at 1.0 so the
+  // reference gain is never applied twice.
+  master.gain.value = 1;
   master.connect(ctx.destination);
   return {
     ctx,

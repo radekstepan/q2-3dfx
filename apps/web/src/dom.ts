@@ -503,7 +503,7 @@ export const CVAR_DESCRIPTIONS: Readonly<Record<string, string>> = {
   sw_stipplealpha: 'screen-door stipple for translucency (ref_soft sw_stipplealpha, default 0 = blend)',
   cl_predict: 'predict local player between 10Hz snapshots',
   cl_interp: 'interpolate remote entities between snapshots',
-  s_volume: 'master sound volume 0..1',
+  s_volume: 'master sound volume 0..1 normalized (1 = quiet reference output 0.05; max never exceeds 0.05)',
   sensitivity: 'mouse sensitivity',
   m_yaw: 'mouse yaw scale',
   m_pitch: 'mouse pitch scale',
@@ -1058,12 +1058,24 @@ export async function decodeAndCacheSound(
 
 function blip(ctx: AudioContext, master: GainNode, freq: number, dur: number, when = 0): void {
   try {
+    // RELEASE-1: menu/event blips obey the same quiet cap as mix().
+    // Peak equals the capped output gain 0..0.05 (max 0.05), never 0.25.
+    let peak = 0.05;
+    try {
+      const raw = getCVarNumber('s_volume');
+      const n = Number(raw);
+      const norm = !Number.isFinite(n) ? 0 : n <= 0 ? 0 : n >= 1 ? 1 : n;
+      peak = norm * 0.05;
+    } catch {
+      peak = 0.05;
+    }
+    if (!(peak > 0)) return; // mute: no blip
     const t = ctx.currentTime + when;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
     osc.frequency.value = freq;
-    gain.gain.setValueAtTime(0.25, t);
-    gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    gain.gain.setValueAtTime(peak, t);
+    gain.gain.exponentialRampToValueAtTime(Math.max(1e-4, peak * 0.004), t + dur);
     osc.connect(gain);
     gain.connect(master);
     osc.start(t);
@@ -1758,7 +1770,16 @@ export function startPlayLoop(
     // (top-right / top-left of the framebuffer itself) — no DOM overlay.
     // Per-channel positional audio: Mixer.mix() gains drive real nodes.
     // The driver already set the listener + started channels in step().
-    if (sound) syncMixerToBrowser(sound, driver.mixer);
+    // RELEASE-1: re-sync the normalized s_volume here so menu changes apply
+    // even on frames without a sim step; mix() remains the single 0.05 scale point.
+    if (sound) {
+      try {
+        driver.mixer.syncMasterVolFromConfig();
+      } catch {
+        /* keep current masterVol */
+      }
+      syncMixerToBrowser(sound, driver.mixer);
+    }
     for (const ev of driver.events.splice(0)) {
       if (!sound) continue;
       if (ev === 'kill') blip(sound.ctx, sound.master, 660, 0.12);

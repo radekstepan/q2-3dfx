@@ -73,6 +73,31 @@ export function spatialize(
 
 // --- Headless mixer -------------------------------------------------------
 
+import { S_VOLUME_REFERENCE_GAIN, clampNormalizedVolume, getCVarNumber, sVolumeToOutputGain } from '@q2/config';
+
+/** Re-exported scale (single source: `@q2/config`). Output gain cap. */
+export { S_VOLUME_REFERENCE_GAIN };
+export { clampNormalizedVolume, sVolumeToOutputGain };
+
+/**
+ * Read the live `s_volume` cvar and return the capped output gain 0..0.05.
+ * Invalid/legacy values are handled by `sVolumeToOutputGain` (non-finite -> 0).
+ * Prefer `syncMasterVolFromConfig()` on `Mixer` so `mix()` stays the single
+ * scale point (never multiply by 0.05 twice).
+ */
+export function masterOutputGainFromConfig(): number {
+  return sVolumeToOutputGain(getCVarNumber('s_volume'));
+}
+
+/**
+ * Normalize a raw `s_volume`-scale master volume to 0..1 (non-finite -> 0).
+ * `Mixer.masterVol` stores the NORMALIZED value; `mix()` applies the
+ * 0.05 reference gain exactly once at output.
+ */
+export function normalizeMasterVolume(raw: unknown): number {
+  return clampNormalizedVolume(raw);
+}
+
 export interface ChannelDesc {
   id: number;
   origin: [number, number, number];
@@ -98,6 +123,11 @@ export class Mixer {
   listenerOrigin: [number, number, number] = [0, 0, 0];
   listenerRight: [number, number, number] = [0, -1, 0];
   playerNum = 0;
+  /**
+   * Normalized master 0..1 (`s_volume` scale). Output gain is
+   * `clamp01(masterVol) * 0.05`, applied once in `mix()`. Never store a
+   * pre-scaled 0.05 value here (would double-scale).
+   */
   masterVol = 1;
   private nextId = 1;
   private channels = new Map<number, ChannelDesc>();
@@ -125,13 +155,31 @@ export class Mixer {
     return this.channels.size;
   }
 
+  /**
+   * Pull the live `s_volume` cvar into `masterVol` as a NORMALIZED 0..1
+   * value (non-finite -> 0 mute). Call once per tick/frame before `mix()`.
+   */
+  syncMasterVolFromConfig(): void {
+    this.masterVol = clampNormalizedVolume(getCVarNumber('s_volume'));
+  }
+
+  /** Capped output gain 0..0.05 actually applied by `mix()`. */
+  get effectiveOutputGain(): number {
+    return this.masterVol !== undefined
+      ? clampNormalizedVolume(this.masterVol) * S_VOLUME_REFERENCE_GAIN
+      : 0;
+  }
+
   /** Mix one tick: spatialize every channel (drops fully-silent ones). */
   mix(): MixedChannel[] {
     const out: MixedChannel[] = [];
+    // Single scale point: normalized masterVol -> output gain 0..0.05.
+    const masterGain = clampNormalizedVolume(this.masterVol) * S_VOLUME_REFERENCE_GAIN;
     for (const ch of this.channels.values()) {
+      const chNorm = clampNormalizedVolume(ch.masterVol);
       // Local player's own sounds are always full volume (Q2 rule).
       if (!ch.fixedOrigin && ch.entnum === this.playerNum + 1) {
-        const v = ch.masterVol * this.masterVol;
+        const v = chNorm * masterGain;
         out.push({ ...ch, left: v, right: v, dist: 0 });
         continue;
       }
@@ -140,7 +188,7 @@ export class Mixer {
         this.listenerRight,
         ch.origin,
         ch.attenuation,
-        ch.masterVol * this.masterVol,
+        chNorm * masterGain,
       );
       if (s.left <= 0.0001 && s.right <= 0.0001) continue;
       out.push({ ...ch, left: s.left, right: s.right, dist: s.dist });
