@@ -24,19 +24,17 @@
 import { createFramebuffer } from '@q2/renderer-api';
 import type { Entity } from '@q2/renderer-api';
 import { setCVar } from '@q2/config';
-import { SoftwareRenderer, BandWorkerPool, setRGBWorldEnabled } from '@q2/sw-renderer';
+import { SoftwareRenderer, BandWorkerPool } from '@q2/sw-renderer';
 import {
   base1RefDef, base1Views, formatABEvidence, machineJson, measureABPair,
   type ABLeg, type ABPairEvidence,
 } from '@q2/testkit';
-import { readVoodooState, resolveFrame } from '@q2/voodoo';
 import {
   combatEntities,
   fixedEntities,
   loadRgbAttrWorld,
   pinPerfCvars,
   pumpCombatLights,
-  scanoutOptsFromState,
   swRendererEsmPath,
   type RgbAttrEntities,
   type RgbAttrMode,
@@ -106,12 +104,12 @@ interface BuiltLeg {
 /** Build one leg: own renderer + own pool, same workload bytes as compare. */
 function buildLeg(fw: RgbAttrWorld, spec: ABLegSpec, tag: string): BuiltLeg {
   pinPerfCvars();
-  const rgb = spec.mode === 'rgb';
+  // RELEASE-8: software-only (the rgb/CPU-Voodoo execution legs are
+  // retired; the parser normalizes explicit `rgb` to `software`).
   const fb = createFramebuffer(spec.width, spec.height, true);
   const r = new SoftwareRenderer();
   r.init(fb);
   r.setPalette(fw.palette);
-  r.setRGBWorldEnabled(rgb);
   let pool: BandWorkerPool | null = null;
   if (spec.workers > 0) {
     setCVar('sw_workers', Math.min(8, spec.workers + 1));
@@ -133,9 +131,9 @@ function buildLeg(fw: RgbAttrWorld, spec: ABLegSpec, tag: string): BuiltLeg {
     particles: sparkParticles(origin[0]! + Math.cos((yaw * Math.PI) / 180) * 48, origin[1]! + Math.sin((yaw * Math.PI) / 180) * 48, origin[2]! - 20),
   };
   const worldArg = { name: 'base1', data };
-  const st = readVoodooState();
-  const opts = scanoutOptsFromState(st);
-  const scratch565 = new Uint16Array(spec.width * spec.height);
+  // RELEASE-8: raster-only (no scanout stage on the software path — the
+  // endFrame color plane IS the presented frame, so there is no pooled or
+  // serial resolve leg to fence here).
   const leg: ABLeg = {
     label: `${tag}(${describeLeg(spec)})`,
     renderer: r,
@@ -145,15 +143,7 @@ function buildLeg(fw: RgbAttrWorld, spec: ABLegSpec, tag: string): BuiltLeg {
     viewFor: () => ({ ...base }),
     entitiesFor: () => entities,
     pump: spec.entities === 'combat' ? () => pumpCombatLights(r, origin, yaw) : undefined,
-    scanout: rgb
-      ? {
-        pool,
-        scanoutOpts: opts,
-        resolveSerialInto: (color, display): void => {
-          resolveFrame(color, scratch565, display, spec.width, spec.height, st);
-        },
-      }
-      : null,
+    scanout: null,
   };
   return { leg, pool };
 }
@@ -195,7 +185,6 @@ export async function runInterleavedAB(pakPath: string, opts: {
   } finally {
     if (a.pool) await a.pool.dispose();
     if (b.pool) await b.pool.dispose();
-    setRGBWorldEnabled(false);
   }
 }
 

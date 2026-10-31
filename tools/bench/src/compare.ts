@@ -34,26 +34,23 @@ import { createFramebuffer } from '@q2/renderer-api';
 import type { Entity } from '@q2/renderer-api';
 import { setCVar } from '@q2/config';
 import {
-  SoftwareRenderer, BandWorkerPool, setRGBWorldEnabled,
+  SoftwareRenderer, BandWorkerPool,
 } from '@q2/sw-renderer';
 import {
   base1RefDef, base1Views, hashColorFull, machineJson,
-  collectStageCounters, formatBandRanges, frameSplit, nsToMs, nowNs,
-  readBandExecStats, readForegroundAttribution, detailTimingEnabled, summarizeLatencies, summarizeSplits,
-  summarizeWorkerImbalance, KickJournal,
+  formatBandRanges, frameSplit, nsToMs, nowNs,
+  readForegroundAttribution, detailTimingEnabled, summarizeLatencies, summarizeSplits,
   collectGeoRep, summarizeGeoReps, formatGeoSummary,
   readKickSizes, readLastKickDescs, formatKickSizes, formatLastKickDescs,
-  type FrameSplit, type WorkerExecSample, type WorkerImbalance,
+  type FrameSplit,
   type GeoRep, type KickSizeEntry, type KickSizeSummary, type LastKickDescs,
 } from '@q2/testkit';
-import { readVoodooState, resolveFrame } from '@q2/voodoo';
 import {
   combatEntities,
   loadRgbAttrWorld,
   pinPerfCvars,
   pumpCombatLights,
   runAttrConfig,
-  scanoutOptsFromState,
   swRendererEsmPath,
   type AttrRow,
   type RgbAttrWorld,
@@ -219,12 +216,13 @@ export async function runMovingConfig(
   warmup: number, reps: number, yawStepDeg: number,
 ): Promise<MovingRow> {
   pinPerfCvars();
-  const rgb = mode === 'rgb';
+  // RELEASE-8: software-only (the rgb/CPU-Voodoo execution legs are
+  // retired; an explicit `rgb` mode runs this same software leg — the
+  // label is kept so old specs and run JSONs still load).
   const fb = createFramebuffer(W, H, true);
   const r = new SoftwareRenderer();
   r.init(fb);
   r.setPalette(fw.palette);
-  setRGBWorldEnabled(rgb);
   let pool: BandWorkerPool | null = null;
   if (workers > 0) {
     setCVar('sw_workers', Math.min(8, workers + 1));
@@ -243,10 +241,6 @@ export async function runMovingConfig(
     try { return process.memoryUsage().heapUsed / 1024; } catch { return 0; }
   };
   const heapBeforeKB = heapKB();
-  const st = readVoodooState();
-  const opts = scanoutOptsFromState(st);
-  const serialDst = new Uint16Array(W * H);
-  const serialDisp = new Uint32Array(W * H);
   const viewFor = (i: number): typeof base => ({
     ...base,
     origin: new Float32Array(bv.origin),
@@ -276,7 +270,6 @@ export async function runMovingConfig(
   const splits: FrameSplit[] = [];
   const frameHashes: string[] = [];
   const displayHashes: Array<string | null> = [];
-  const journal = new KickJournal();
   let lastSuffixKick: LastKickDescs | null = null;
   let kickSummary: KickSizeSummary | null = null;
   let staged = 0, inline = 0, kicks = 0, scanoutFallbacks = 0, coverPx = 0;
@@ -288,7 +281,10 @@ export async function runMovingConfig(
     fgCombinedTris: number | null = null;
   let fgReplayedSpans: number | null = null, fgReplayedPixels: number | null = null,
     fgReplayedTris: number | null = null, fgRecoveryCount: number | null = null;
-  let scanoutKind: string | null = mode === 'software' ? null : (pool ? 'pooled' : 'serial');
+  // RELEASE-8: raster-only (no scanout stage on the software path — the
+  // endFrame color plane IS the presented frame, so there is no pooled or
+  // serial resolve leg to fence).
+  let scanoutKind: string | null = null;
   for (let i = 0; i < reps; i++) {
     pumpCombatLights(r, bv.origin, baseYaw);
     const tF = nowNs();
@@ -311,47 +307,20 @@ export async function runMovingConfig(
     t = nowNs();
     r.endFrame();
     const eM = nsToMs(nowNs() - t);
-    t = nowNs();
-    let sM = 0;
-    let disp: Uint32Array | null = null;
-    if (rgb) {
-      if (pool) {
-        const ok = pool.flushScanout(opts);
-        sM = nsToMs(nowNs() - t);
-        journal.record({
-          frame: i, seq: 0, job: 'scanout', workers, band: 'all',
-          y0: 0, y1: H, latencyMs: sM, ok, execMs: null, pixels: W * H, spans: 0,
-        });
-        if (!ok) {
-          scanoutFallbacks++;
-          const tS = nowNs();
-          resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
-          sM += nsToMs(nowNs() - tS);
-          disp = serialDisp;
-        } else {
-          disp = pool.scanoutPlanes.scanDisplay.slice(0, W * H) as Uint32Array;
-        }
-      } else {
-        resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
-        sM = nsToMs(nowNs() - t);
-        journal.record({
-          frame: i, seq: 0, job: 'scanout', workers: 0, band: 'all',
-          y0: 0, y1: H, latencyMs: sM, ok: true, execMs: sM, pixels: W * H, spans: 0,
-        });
-        disp = serialDisp;
-      }
-    }
+    // No scanout segment: the display hash rides on a serial color copy
+    // (same rep, same live frame — raster-only, never a resolve leg).
+    const sM = 0;
+    const disp: Uint32Array = r.getFramebuffer().color.slice();
     const fM = nsToMs(nowNs() - tF);
     frameMs.push(fM);
     splits.push(frameSplit(bM, rM, eM, sM, fM));
     frameHashes.push(hashColorFull(r.getFramebuffer().color));
-    displayHashes.push(disp ? hashColorFull(disp) : null);
+    displayHashes.push(hashColorFull(disp));
     if (i === reps - 1) {
-      const sc = collectStageCounters(r);
-      staged = sc.stagedBatches;
-      inline = sc.inlineBatches;
-      kicks = sc.kicks;
-      coverPx = sc.coverPixels;
+      // RELEASE-8: RGB staging counters retired with the legs — the
+      // indexed renderer publishes worker raster stats (testWorkerStats),
+      // not staged/inline/kick/cover ledgers. Zero by construction on the
+      // software path (unknown is never inferred from raster counters).
       // PERF-NEXT-5 corrected split (last rep): worker/main/combined plus
       // replay — null while the producer publishes nothing (unknown).
       try {
@@ -385,39 +354,15 @@ export async function runMovingConfig(
     }
   }
   if (pool) await pool.dispose();
-  setRGBWorldEnabled(false);
   const scan = summarizeLatencies(frameMs);
   const sp = summarizeSplits(splits);
-  // PERF-NEXT-4: per-band worker compute for the production scanout kicks
-  // (feature-detected; dispatch latencies above are the always-on fence).
+  // RELEASE-8: no scanout kicks exist on the raster-only path, so there is
+  // no per-band worker compute to attribute (null = unpublished, never
+  // zero). The caller clock split above stays the always-on fence.
   const detail: 'enabled' | 'disabled' = detailTimingEnabled() ? 'enabled' : 'disabled';
-  let workerComputeMs: number[] | null = null;
-  let workerImbalance: MovingRow['workerImbalance'] = null;
-  let fenceIdleMs: number | null = null;
-  if (detail === 'enabled' && pool && mode === 'rgb') {
-    let samples: WorkerExecSample[] | null = null;
-    try {
-      samples = readBandExecStats(pool);
-    } catch {
-      samples = null;
-    }
-    if (samples && samples.length > 0) {
-      const imb: WorkerImbalance = summarizeWorkerImbalance(samples);
-      const s = imb.straggler;
-      workerComputeMs = samples.map((x) => x.execMs);
-      workerImbalance = {
-        groups: imb.groups, bands: imb.bands, bandMed: imb.bandMed, bandMax: imb.bandMax,
-        critMax: imb.critPathMax, gapMs: imb.imbalanceMs, ratio: imb.imbalanceRatio,
-        straggler: s ? `band${s.band}(${s.job} f${s.frame}s${s.seq} ${s.execMs.toFixed(2)}ms)` : null,
-        byGroup: imb.byGroup.map((g) => ({ job: g.job, seq: g.seq, n: g.n, med: g.med, max: g.max })),
-      };
-      const kickMax = journal.summarize('scanout').max;
-      fenceIdleMs = Math.max(0, kickMax - imb.critPathMax);
-    }
-  }
-  const execPart = workerComputeMs
-    ? ` compute[${workerComputeMs.map((v) => v.toFixed(2)).join('/')}] gap=${workerImbalance!.gapMs.toFixed(2)} straggler=${workerImbalance!.straggler} groups[${workerImbalance!.byGroup.map((g) => `${g.job}s${g.seq}:${g.n}b med=${g.med.toFixed(2)} max=${g.max.toFixed(2)}`).join(' ')}] fenceIdle=${fenceIdleMs!.toFixed(2)}`
-    : detail === 'disabled' ? ' compute[detail-off]' : ' compute[unpublished:no-in-worker-timestamps]';
+  const execPart = detail === 'disabled'
+    ? ' compute[detail-off]'
+    : ' compute[unpublished:no-in-worker-timestamps]';
   const geoPart = geoDetail === 'measured'
     ? ` ${formatGeoSummary(geo)}`
     : ' geo[unavailable:no-testMeasurePhases]';
@@ -451,7 +396,7 @@ export async function runMovingConfig(
     fgReplayedSpans, fgReplayedPixels, fgReplayedTris, fgRecoveryCount,
     heapDeltaKB: heapKB() - heapBeforeKB,
     bandId: formatBandRanges(H, workers),
-    timingDetail: detail, workerComputeMs, workerImbalance, fenceIdleMs,
+    timingDetail: detail, workerComputeMs: null, workerImbalance: null, fenceIdleMs: null,
     setupMs: geoMed((r) => r.phases.setup),
     markMs: geoMed((r) => r.phases.mark),
     traverseMs: geoMed((r) => r.phases.traverse),

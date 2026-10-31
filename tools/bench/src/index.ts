@@ -19,7 +19,7 @@ export {
 } from './frame.js';
 export {
   runRgbAttr, runAttrConfig, loadRgbAttrWorld, pinPerfCvars, fixedEntities, combatEntities,
-  pumpCombatLights, scanoutOptsFromState, distFreshness, repoRoot,
+  pumpCombatLights, distFreshness, repoRoot,
   PLAYBENCH_FRESHNESS_PKGS,
   rgbBenchWorkers, rgbBenchEnts,
   RGB_ATTR_RESS, RGB_ATTR_SCENES, RGB_ATTR_ENTS,

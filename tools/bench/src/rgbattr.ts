@@ -9,57 +9,40 @@
 //   - INSTRUMENTED attribution: renderView GEO split via
 //     SoftwareRenderer.testMeasurePhases (setup / mark / traverse / cull /
 //     cache / project / emit / sort — reused, no renderer changes) + DRAW +
-//     alias phases, medians + p95 over N reps. Classic DRAW vs RGB spanfill
-//     WITHOUT touching the renderer: the phases.draw counter lumps classic
-//     + RGB (frame.ts draws classic always; RGB on top), so RGB_extra =
-//     draw(rgbOn) - draw(rgbOff) on the identical scene/camera. Same for the
-//     alias phase (RGB twins + seed live there). endFrame(rgbOn) -
-//     endFrame(rgbOff) ~= seed + composite (palette expand is the common
-//     part). These are documented estimates, not probes.
+//     alias phases, medians + p95 over N reps. (RELEASE-8: the retired
+//     classic-vs-RGB DRAW/alias/endFrame differential estimates are gone
+//     with the legs — DRAW/alias/endFrame below are the plain software
+//     indexed path, attribution only.)
 //   - UNINSTRUMENTED acceptance (the gate input, never a sum of medians):
 //     full production frames measured TOGETHER per rep —
 //       software: beginFrame+renderView+endFrame (software presents the
 //         endFrame color plane directly; there is no scanout stage).
-//       rgb serial: beginFrame+renderView+endFrame+resolveFrame (the fused
-//         pack→recon→gamma production scanout with the pinned vd_* profile).
-//       rgb pooled: beginFrame+renderView+endFrame(pooled resolve kick
-//         inside)+pool.flushScanout (Track A parallel scanout into the
-//         shared scanout buffers — the Node analogue of the browser
-//         resolveDisplayAsync path; falls back to serial resolveFrame,
-//         labeled, on kick failure).
+//     (RELEASE-8: the retired rgb serial/pooled legs measured
+//     beginFrame+renderView+endFrame+resolve and pooled flushScanout;
+//     those legs and their serial controls are gone — software rows keep
+//     the same AttrRow shape with null/zero scanout fields.)
 //     Each production rep is ALSO split into same-rep caller-clock
-//     segments (begin/render/end/scanout walls + per-rep scheduling gap =
+//     segments (begin/render/end walls + per-rep scheduling gap =
 //     frame minus that rep's segments: GC, allocator, fence slack). The
 //     split is a diagnostic decomposition of the measured total —
 //     medians over per-rep reconciled values, never median-of-medians.
-//     Scanout kicks are journaled per rep with frame/sequence + job type
-//     + stable band identity (band tiling is fixed per W×H×workers), as
-//     dispatch-to-completion latencies with med/p95/max: the max is the
-//     critical-path max for the scanout job. Per-worker execution
-//     durations are NOT reported (no renderer in-worker timestamps exist;
-//     message-arrival delays are scheduling, not compute —
-//     @q2/testkit critpath documents the timebase).
-//     Staging/skip/cache/chain-byte counters come from public renderer
-//     test hooks on the last production rep (staged vs inline batches,
-//     composite cover, elided classic work, chain bytes); per-descriptor
-//     luxel/span byte totals need renderer counters (documented gap).
+//     Per-worker execution durations are NOT reported (no renderer
+//     in-worker timestamps exist; message-arrival delays are scheduling,
+//     not compute — @q2/testkit critpath documents the timebase).
+//     Cache/translucent counters come from public renderer test hooks on
+//     the last production rep (surface-cache hits/misses/evictions,
+//     translucent spans); the retired staging/skip/chain-byte RGB ledgers
+//     stay zero/false (documented gap, not unknown).
 //     "Presented FPS" is a browser/CDP soak metric, never a Node number:
 //     frameMs here is production-frame-no-present by construction.
-//     Serial scanout stays as a LABELED control (`scanoutSerialMs` /
-//     `frameSerialMs`, interleaved back-to-back with the production kick on
-//     the same live frame so both legs share thermal state).
-//   - Legacy stage probes (resolveRGB565 pack vs applyReconstruction2x2 vs
-//     applyDisplayGamma on a COPIED buffer) are kept for attribution only
-//     and labeled non-production: they run more passes than the fused
-//     production path executes.
 //   - Hashes: index-plane FNV + legacy color-plane R+G FNV (ledger
 //     continuity; BLIND to blue-only/alpha-only corruption) + full-RGBA
-//     color/display FNV (`hashColorFull` — the PARITY authority for
-//     serial-vs-pooled raster and final display). Software planes are
-//     bit-identical with the RGB flag on or off by construction.
+//     color FNV (`hashColorFull` — the PARITY authority for serial-vs-pooled
+//     indexed raster). Rows are color-plane identical with pooled vs serial
+//     raster by construction (the serial-vs-pooled self-check below).
 // Modes: serial (workers=0) plus pooled worker configs via
-// RGB_BENCH_WORKERS (e.g. "0,1,3,7"); the Node BandWorkerPool runs real RGB
-// raster jobs on threads (PERF-2). Fixed cameras: testkit base1Views()
+// RGB_BENCH_WORKERS (e.g. "0,1,3,7"); the Node BandWorkerPool runs real
+// indexed raster jobs on threads. Fixed cameras: testkit base1Views()
 // (time 1.5, fov 90, flat styles) + DEVROOM_CAMERA. Entity sets:
 // none (empty, attribution floor), fixed (1 alias + 1 sprite + 1 tracer +
 // base1 spark particles), combat (fixed + eye-anchored depthHack viewmodel
@@ -81,27 +64,21 @@ import type { Entity } from '@q2/renderer-api';
 import {
   SoftwareRenderer, bspToMiniWorld, createDevroom, BandWorkerPool,
   type BspTexelSource, type FramePhases, type MiniWorld,
-  type DynamicLight, type ScanoutBandOptions,
+  type DynamicLight,
 } from '@q2/sw-renderer';
 import { base1RefDef, base1Views, hashColorFull, machineJson } from '@q2/testkit';
 import {
-  collectStageCounters,
   detailTimingEnabled,
   formatBandRanges,
   formatForegroundAttribution,
-  formatKickSizes,
-  formatLastKickDescs,
   formatLatency,
   formatStageCounts,
-  formatWorkerImbalance,
   frameSplit,
   nsToMs,
   nowNs,
   readBandExecStats,
   readForegroundAttribution,
   readForegroundStats,
-  readKickSizes,
-  readLastKickDescs,
   readMaterialGcMs,
   reconcileForegroundAttribution,
   summarizeLatencies,
@@ -109,18 +86,11 @@ import {
   summarizeWorkerImbalance,
   type ForegroundAttribution as ForegroundTaxonomy,
   type FrameSplit,
-  type KickSample,
   type KickSizeEntry,
-  type KickSizeSummary,
   type LastKickDescs,
   type WorkerExecSample,
   type WorkerImbalance,
 } from '@q2/testkit';
-import {
-  applyDisplayGamma, applyReconstruction2x2, readVoodooState, resolveRGB565,
-  resolveFrame,
-  type VoodooState,
-} from '@q2/voodoo';
 
 const require = createRequire(process.cwd() + '/');
 
@@ -358,26 +328,6 @@ function hashColorRG(color: Uint32Array): string {
   return (h >>> 0).toString(16).padStart(8, '0');
 }
 
-/**
- * VoodooState → Track A band scanout kick params. Same mapping as the web
- * shell's voodooStateToScanoutOpts (apps/web render-workers.ts): numbers
- * only, no per-pixel cvar reads in workers. Duplicated (not imported) so
- * the Node bench never pulls browser modules.
- */
-export function scanoutOptsFromState(st: VoodooState): ScanoutBandOptions {
-  return {
-    gamma: st.gamma,
-    dither: st.dither,
-    ditherMode: st.dithermode === '2x2' ? 1 : 0,
-    postfilter: st.postfilter,
-    reconmode: st.reconmode === 'legacy' ? 0 : st.reconmode === '4x4sub+4x1' ? 2 : 1,
-    maxR: st.rgbmaxdelta.r | 0,
-    maxG: st.rgbmaxdelta.g | 0,
-    maxB: st.rgbmaxdelta.b | 0,
-    quantise: st.quantise,
-  };
-}
-
 export interface DistFreshness {
   fresh: boolean;
   distMtimeMs: number;
@@ -488,25 +438,18 @@ export interface AttrRow {
   aliasMs: number;
   endFrameMs: number; endFrameP95: number;
   packMs: number | null; reconMs: number | null; gammaMs: number | null;
-  /** Serial fused scanout: resolveFrame on the LIVE frame (labeled control). */
+  /** Retired leg field (RELEASE-8): fused serial resolve on the live frame. */
   fusedMs: number | null;
   /**
-   * Production scanout per rep (median): pooled flushScanout when a pool is
-   * attached and the kick succeeds, else serial resolveFrame. scanoutKind
-   * records which ran ('serial' | 'pooled' | 'serial-fallback').
-   * TIMEBASE: dispatch-to-completion on the caller clock (kick → fence).
-   * For pooled kicks execMs is null BY DESIGN (work ran on workers; the
-   * caller only fenced — message arrival is scheduling, not compute).
-   * For serial kicks the work ran on the caller, so exec == latency.
-   * Per-worker execution durations need renderer in-worker timestamps
-   * (gap — see KickSample.execMs); the critical-path max below is the max
-   * DISPATCH-TO-COMPLETION across reps, not a per-band compute max.
+   * Retired leg field (RELEASE-8): production scanout per rep (pooled
+   * flushScanout or serial resolve — both gone). Software rows carry null
+   * with scanoutKind null; the shape is kept so old run JSONs still load.
    */
   scanoutMs: number | null;
   scanoutP95: number | null;
   scanoutMaxMs: number | null;
   scanoutKind: string | null;
-  /** Labeled serial-scanout control, interleaved back-to-back per rep. */
+  /** Retired leg field (RELEASE-8): labeled serial-scanout control. */
   scanoutSerialMs: number | null;
   /**
    * Main-thread segment split of the production frame, all segments timed
@@ -529,41 +472,36 @@ export interface AttrRow {
   frameMaxMs: number | null;
   /** Raw whole-production-frame samples per rep (frameMs is their median). */
   frameReps: number[];
-  /** Full frame with the serial scanout control (pooled configs only). */
+  /** Retired leg field (RELEASE-8): full frame with the serial scanout control. */
   frameSerialMs: number | null;
   frameSerialP95: number | null;
   spans: number; pixels: number; overdraw: number;
   idxHash: string; colorHash: string;
   /** Full-RGBA parity authorities (serial-vs-pooled raster + display). */
   colorFull: string;
-  /** Presented-plane hash: serial resolve display vs pooled scanout buffers. */
+  /** Retired leg fields (RELEASE-8): presented-plane hashes (no scanout stage). */
   displayHash: string | null;
   displaySerialHash: string | null;
-  /** Full-RGBA presented-plane hashes (parity authority for scanout). */
+  /** Retired leg fields (RELEASE-8): parity authority was pooled-vs-serial scanout. */
   displayFull: string | null;
   displaySerialFull: string | null;
   /**
-   * Execution proof (PERF-FINISH-C §2): RGB used + coverage this frame
-   * (testRGBStats), batches staged/inline + completed kicks since the
-   * last beginFrame (testRGBWorkerStats). A pooled RGB row MUST show
-   * staged > 0 and kicks > 0 — pool existence alone proves nothing.
+   * Retired leg fields (RELEASE-8): the RGB execution-proof ledger
+   * (testRGBStats/testRGBWorkerStats — both gone). Software rows carry
+   * false/zero; the shape is kept so old run JSONs still load.
    */
   rgbUsed: boolean;
   rgbCover: number;
   rgbStaged: number;
   rgbInline: number;
   rgbKicks: number;
-  /** Pooled scanout kicks that reported failure (serial fallback legs). */
+  /** Retired leg field (RELEASE-8): pooled scanout-kick failure count. */
   scanoutFallbacks: number;
   /**
-   * Per-frame staging ledger (LAST production rep, public hooks only):
-   * world-RGB batches staged vs inline + kicks, composite cover
-   * (inspected pixels), classic work elided by the authoritative skip,
-   * deferred-alpha spans, surface-cache hits/misses/evictions, RGB chain
-   * bytes (persistent upload cache: used/retained/orphan + evictions).
-   * GAP (integrator, needs renderer counters): per-descriptor luxel/span
-   * byte totals and RGB spans/pixels drawn — staged/admitted counts below
-   * plus cover are reported until the renderer publishes them.
+   * Retired leg fields (RELEASE-8): the RGB staging ledger (world-RGB
+   * batches, composite cover, authoritative skip, chain bytes — all gone).
+   * Software rows report surface-cache hits/misses/evictions (indexed
+   * hooks) and translucent spans; everything RGB-shaped stays zero/false.
    */
   coverPx: number;
   classicSpansSkipped: number;
@@ -580,8 +518,8 @@ export interface AttrRow {
   /**
    * Bytes admitted per frame (computed from W×H, not estimated):
    * planeBytes = color + index + depth planes the raster drains into;
-   * scanBytes = shared scanout buffers the scanout kick writes
-   * (565 + display; rgb only, pooled or serial — same bytes either way).
+   * scanBytes is a retired leg field (RELEASE-8: shared scanout buffers
+   * no longer exist) — always null; the shape is kept for old run JSONs.
    */
   planeBytes: number;
   scanBytes: number | null;
@@ -791,14 +729,11 @@ export function collectForegroundAttribution(
     fgBeamWorkerSpans: null, fgBeamMainSpans: null,
     fgEntityMs: null, materialGcMs: null,
   };
-  try {
-    const wst = r.testForegroundWorkerStats();
-    none.fgStaged = wst.staged;
-    none.fgInline = wst.inline;
-    none.fgKicks = wst.kicks;
-  } catch {
-    return none;
-  }
+  // RELEASE-8: the RGB foreground-kick hooks are retired with the legs —
+  // the indexed renderer publishes no foreground flush attribution (no
+  // staged/inline/kick counters), so fgKicks/fgStaged/fgInline stay null
+  // (unknown), never inferred from raster counters. The per-class and
+  // corrected-split reads below stay feature-detected (null when absent).
   try {
     const fg = readForegroundStats(r);
     if (fg) {
@@ -913,16 +848,18 @@ export async function runAttrConfig(
   ent: RgbAttrEntities, mode: RgbAttrMode, workers: number, warmup: number, reps: number,
 ): Promise<AttrRow> {
   pinPerfCvars();
-  const rgb = mode === 'rgb';
+  // RELEASE-8: software-only (CPU Voodoo execution retired) — an explicit
+  // `rgb` mode runs this same software leg (never a void config; old specs
+  // keep working). The label is kept so explicit configs and old run JSONs
+  // still load.
+  const rgb = false;
   const combat = ent === 'combat';
   const fb = createFramebuffer(W, H, true);
   const r = new SoftwareRenderer();
   r.init(fb);
   r.setPalette(fw.palette);
-  // The RGB switch is a shared module flag: set it explicitly EVERY config
-  // (a previous rgb config would otherwise leak into the next "software"
-  // row — caught by the idx/color cross-check below).
-  r.setRGBWorldEnabled(rgb);
+  // (The retired RGB switch was a shared module flag set explicitly every
+  // config; software-only has no cross-config leak by construction.)
   let pool: BandWorkerPool | null = null;
   if (workers > 0) {
     setCVar('sw_workers', Math.min(8, workers + 1));
@@ -1003,42 +940,14 @@ export async function runAttrConfig(
   const geo = medAcc('setup') + medAcc('mark') + medAcc('traverse') + medAcc('cull') +
     medAcc('cache') + medAcc('project') + medAcc('emit') + medAcc('sort');
 
-  // Voodoo resolve split on the produced frame (harness-level probe): the
-  // endFrame above already composited RGB565-expanded pixels into color, so
-  // resolve from that plane with the pinned vd profile (gamma 1 pack, then
-  // recon, then display gamma). NON-PRODUCTION: the shipped pipeline runs
-  // the fused resolveFrame (see fusedMs/scanoutMs/frameMs); this split runs
-  // more passes on a copied buffer and is attribution only.
-  let packMs: number | null = null, reconMs: number | null = null, gammaMs: number | null = null;
-  if (rgb) {
-    const st = readVoodooState();
-    const src = r.getFramebuffer().color.slice();
-    const dst565 = new Uint16Array(W * H);
-    const display = new Uint32Array(W * H);
-    const pk: number[] = [], rc: number[] = [], gm: number[] = [];
-    for (let i = 0; i < reps; i++) {
-      let t = process.hrtime.bigint();
-      resolveRGB565(src, dst565, W, H, { gamma: 1, dither: st.dither, ditherMode: st.dithermode, quantise: st.quantise });
-      pk.push(Number(process.hrtime.bigint() - t) / 1e6);
-      t = process.hrtime.bigint();
-      applyReconstruction2x2(dst565, display, W, H, st.rgbmaxdelta, st.dither ? '2x2' : null);
-      rc.push(Number(process.hrtime.bigint() - t) / 1e6);
-      t = process.hrtime.bigint();
-      applyDisplayGamma(display, W, H, st.gamma);
-      gm.push(Number(process.hrtime.bigint() - t) / 1e6);
-    }
-    packMs = med(pk); reconMs = med(rc); gammaMs = med(gm);
-  }
+  // RELEASE-8: the retired Voodoo resolve-split probe (pack/recon/gamma
+  // on a copied buffer) is gone with the legs — pack/recon/gamma stay null.
+  const packMs: number | null = null, reconMs: number | null = null, gammaMs: number | null = null;
 
   // Production scanout + full-frame acceptance (UNINSTRUMENTED: measured
   // together per rep, never summed medians).
   //   software: frame = begin+render+end (the color plane IS the presented
   //     frame; there is no scanout stage in the software path).
-  //   rgb serial: frame = begin+render+end+resolveFrame (fused production).
-  //   rgb pooled: frame = begin+render+end(pooled resolve kick)+flushScanout
-  //     (Track A parallel scanout — the Node analogue of the browser
-  //     resolveDisplayAsync path). The serial resolveFrame stays as a
-  //     LABELED control, interleaved back-to-back per rep.
   let fusedMs: number | null = null;
   let scanoutMs: number | null = null, scanoutP95: number | null = null,
     scanoutMaxMs: number | null = null, scanoutKind: string | null = null;
@@ -1057,7 +966,6 @@ export async function runAttrConfig(
   // the bench fences directly (the RGB kick lives inside renderView — its
   // dispatch latency is inseparable without renderer clocks, so the RGB
   // critical path is bounded by renderViewMs, not estimated here).
-  const kickJournal: KickSample[] = [];
   const scanoutKickLat: number[] = [];
   const frameSplits: FrameSplit[] = [];
   const heapKB = (): number => {
@@ -1075,7 +983,8 @@ export async function runAttrConfig(
   let frameReps: number[] = [];
   const bandId = formatBandRanges(H, workers);
   const planeBytes = W * H * (4 + 1 + 4);
-  const scanBytes = rgb ? W * H * (2 + 4) : null;
+  // RELEASE-8: no scanout buffers exist on the software-only path.
+  const scanBytes: number | null = null;
   // PERF-NEXT-4: detailed timing (per-band worker exec, imbalance,
   // material-GC ms) is env-gated and OFF for acceptance. Dispatch
   // fences + counters below are always on — they are the acceptance path.
@@ -1099,10 +1008,8 @@ export async function runAttrConfig(
     fgEntityMs: null, materialGcMs: null,
   };
   let execAttr: WorkerExecAttribution = { workerComputeMs: null, workerImbalance: null, fenceIdleMs: null };
-  // PERF-NEXT-6: kick-size histogram + FG suffix-kick descriptor drain
-  // (pooled production legs only; serial/software stay null = unknown).
-  let kickSummary: KickSizeSummary | null = null;
-  let suffixKick: LastKickDescs | null = null;
+  // RELEASE-8: no pooled production legs exist, so there is no kick-size
+  // histogram or FG suffix-kick drain to report (null = unpublished).
   if (!rgb) {
     // Software: no scanout stage (the color plane IS the presented frame).
     // Segments timed in the same rep; the gap reconciles per rep.
@@ -1123,15 +1030,20 @@ export async function runAttrConfig(
       fr.push(fM);
       frameSplits.push(frameSplit(bM, rM, eM, 0, fM));
       if (i === reps - 1) {
-        const st = collectStageCounters(r);
-        coverPx = st.coverPixels;
-        classicSpansSkipped = st.classicSpansSkipped;
-        classicFgSkipped = st.classicFgSkipped;
-        skipArmed = st.skipArmed;
-        translucentSpans = st.translucentSpans;
-        cacheHits = st.cacheHits; cacheMisses = st.cacheMisses; cacheEvictions = st.cacheEvictions;
-        chainUsedBytes = st.rgbChainUsedBytes; retainedChainBytes = st.rgbRetainedChainBytes;
-        orphanChainBytes = st.rgbOrphanChainBytes; chainEvictions = st.rgbChainEvictions;
+        // RELEASE-8: RGB staging counters retired with the legs — the
+        // indexed renderer publishes no staged/inline/kick/cover ledgers
+        // (collectStageCounters' StageCounterSource is gone). The indexed
+        // hooks that remain (surface-cache stats, translucent spans) are
+        // read directly; everything RGB-shaped stays zero/false.
+        const cache = r.testCacheStats();
+        coverPx = 0;
+        classicSpansSkipped = 0;
+        classicFgSkipped = 0;
+        skipArmed = false;
+        translucentSpans = r.testTranslucentSpans();
+        cacheHits = cache.hits; cacheMisses = cache.misses; cacheEvictions = cache.evictions;
+        chainUsedBytes = 0; retainedChainBytes = 0;
+        orphanChainBytes = 0; chainEvictions = 0;
         fgAttr = collectForegroundAttribution(r, detail);
       }
     }
@@ -1140,247 +1052,6 @@ export async function runAttrConfig(
     const sp = summarizeSplits(frameSplits);
     splitBeginMs = sp.begin; splitRenderMs = sp.render; splitEndMs = sp.end;
     splitScanoutMs = null; splitGapMs = sp.gap;
-  } else {
-    const st = readVoodooState();
-    const opts = scanoutOptsFromState(st);
-    const serialDst = new Uint16Array(W * H);
-    const serialDisp = new Uint32Array(W * H);
-    // Serial fused control (labeled, always available).
-    const fs: number[] = [];
-    for (let i = 0; i < reps; i++) {
-      const live = r.getFramebuffer().color;
-      const t = process.hrtime.bigint();
-      resolveFrame(live, serialDst, serialDisp, W, H, st);
-      fs.push(Number(process.hrtime.bigint() - t) / 1e6);
-    }
-    fusedMs = med(fs);
-    displaySerialHash = hashColorRG(serialDisp);
-    displaySerialFull = hashColorFull(serialDisp);
-    if (pool) {
-      // PRODUCTION pooled scanout, interleaved A/B with the serial control
-      // on the same live frame (shared thermal state per rep). Each kick is
-      // journaled with frame/seq + job + stable band identity; the pooled
-      // kick's execMs stays null (work ran on workers — the caller fenced),
-      // the serial control's execMs equals its latency (work ran here).
-      const bands = workers + 1;
-      const prod: number[] = [], ctrl: number[] = [];
-      let pooledOk = true;
-      let pooledDisp: Uint32Array | null = null;
-      for (let i = 0; i < reps; i++) {
-        pump();
-        r.beginFrame();
-        r.renderView(view, worldArg, entities);
-        r.endFrame();
-        const live = r.getFramebuffer().color;
-        const tP = nowNs();
-        const ok = pool.flushScanout(opts);
-        const pM = nsToMs(nowNs() - tP);
-        prod.push(pM);
-        kickJournal.push({
-          frame: i, seq: 0, job: 'scanout', workers, bands, band: 'all',
-          y0: 0, y1: H, latencyMs: pM, ok, execMs: null, pixels: W * H, spans: 0,
-        });
-        if (!ok) pooledOk = false;
-        const tC = nowNs();
-        resolveFrame(live, serialDst, serialDisp, W, H, st);
-        const cM = nsToMs(nowNs() - tC);
-        ctrl.push(cM);
-        kickJournal.push({
-          frame: i, seq: 1, job: 'scanout', workers: 0, bands: 1, band: 'all',
-          y0: 0, y1: H, latencyMs: cM, ok: true, execMs: cM, pixels: W * H, spans: 0,
-        });
-      }
-      if (pooledOk) {
-        scanoutKind = 'pooled';
-        const ps = summarizeLatencies(prod);
-        scanoutMs = ps.med; scanoutP95 = ps.p95; scanoutMaxMs = ps.max;
-        scanoutSerialMs = med(ctrl);
-        pooledDisp = pool.scanoutPlanes.scanDisplay.slice(0, W * H);
-        displayHash = hashColorRG(pooledDisp);
-        displayFull = hashColorFull(pooledDisp);
-      } else {
-        // Kick failed: production falls back to serial (identical by
-        // contract) — labeled, not silent.
-        scanoutKind = 'serial-fallback';
-        scanoutMs = med(ctrl);
-        scanoutSerialMs = med(ctrl);
-        displayHash = hashColorRG(serialDisp);
-        displayFull = hashColorFull(serialDisp);
-        scanoutFallbacks = reps;
-      }
-      // Full production frames (begin+render+end+pooled scanout together),
-      // segments timed in the same rep so the gap reconciles per rep.
-      const fr: number[] = [];
-      for (let i = 0; i < reps; i++) {
-        pump();
-        const tF = nowNs();
-        let t = nowNs();
-        r.beginFrame();
-        const bM = nsToMs(nowNs() - t);
-        t = nowNs();
-        r.renderView(view, worldArg, entities);
-        const rM = nsToMs(nowNs() - t);
-        // PERF-NEXT-6 suffix-kick drain: the newest kick right after
-        // renderView is the frame's last FG flush (endFrame's resolve kick
-        // would overwrite the slot). Lands in the per-rep gap, never a
-        // segment; microseconds, read once (last rep only).
-        if (i === reps - 1) {
-          try {
-            suffixKick = readLastKickDescs(pool);
-          } catch {
-            suffixKick = null;
-          }
-        }
-        t = nowNs();
-        r.endFrame();
-        const eM = nsToMs(nowNs() - t);
-        t = nowNs();
-        const kickOk = pool.flushScanout(opts);
-        let sM = nsToMs(nowNs() - t);
-        if (!kickOk) {
-          scanoutFallbacks++;
-          const tS = nowNs();
-          resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
-          sM += nsToMs(nowNs() - tS);
-        }
-        const fM = nsToMs(nowNs() - tF);
-        fr.push(fM);
-        frameSplits.push(frameSplit(bM, rM, eM, sM, fM));
-        scanoutKickLat.push(sM);
-        kickJournal.push({
-          frame: reps + i, seq: 0, job: 'scanout', workers, bands,
-          band: 'all', y0: 0, y1: H, latencyMs: sM, ok: kickOk,
-          execMs: null, pixels: W * H, spans: 0,
-        });
-        if (i === reps - 1) {
-          const stRGB = r.testRGBStats();
-          const wst = r.testRGBWorkerStats();
-          rgbUsed = stRGB.used; rgbCover = stRGB.coverPixels;
-          rgbStaged = wst.staged; rgbInline = wst.inline; rgbKicks = wst.kicks;
-          const sc = collectStageCounters(r);
-          coverPx = sc.coverPixels;
-          classicSpansSkipped = sc.classicSpansSkipped;
-          classicFgSkipped = sc.classicFgSkipped;
-          skipArmed = sc.skipArmed;
-          translucentSpans = sc.translucentSpans;
-          cacheHits = sc.cacheHits; cacheMisses = sc.cacheMisses; cacheEvictions = sc.cacheEvictions;
-          chainUsedBytes = sc.rgbChainUsedBytes; retainedChainBytes = sc.rgbRetainedChainBytes;
-          orphanChainBytes = sc.rgbOrphanChainBytes; chainEvictions = sc.rgbChainEvictions;
-          fgAttr = collectForegroundAttribution(r, detail);
-          // PERF-NEXT-6 kick-size histogram for the last production frame
-          // (world + FG flushes + resolve + scanout kicks, drain order).
-          try {
-            kickSummary = readKickSizes(pool);
-          } catch {
-            kickSummary = null;
-          }
-        }
-      }
-      frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
-      frameReps = fr;
-      {
-        const sp = summarizeSplits(frameSplits);
-        splitBeginMs = sp.begin; splitRenderMs = sp.render; splitEndMs = sp.end;
-        splitScanoutMs = sp.scanout; splitGapMs = sp.gap;
-      }
-      {
-        const ks = summarizeLatencies(scanoutKickLat);
-        if (scanoutMs === null) {
-          scanoutMs = ks.med; scanoutP95 = ks.p95; scanoutMaxMs = ks.max;
-        } else {
-          // Both the interleave and the production leg fenced the same
-          // kick: report the production leg (it ran inside whole frames).
-          scanoutMs = ks.med; scanoutP95 = ks.p95; scanoutMaxMs = ks.max;
-        }
-      }
-      // Per-band worker compute + imbalance for the pooled production kick
-      // (feature-detected; null while the renderer publishes no in-worker
-      // timestamps, or detail is off). Dispatch latencies above are the
-      // always-on fence; these samples are the compute side.
-      execAttr = collectWorkerExecAttribution(pool, r, scanoutKickLat, detail);
-      // Full frames with the serial control (same workload, labeled).
-      const frs: number[] = [];
-      for (let i = 0; i < reps; i++) {
-        pump();
-        const t = process.hrtime.bigint();
-        r.beginFrame();
-        r.renderView(view, worldArg, entities);
-        r.endFrame();
-        resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
-        frs.push(Number(process.hrtime.bigint() - t) / 1e6);
-      }
-      frameSerialMs = med(frs); frameSerialP95 = p95(frs);
-      // Refresh the serial display snapshot from the final live frame so
-      // pooled-vs-serial display parity compares the same workload state
-      // (untimed; all timed loops are done).
-      resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
-      displaySerialHash = hashColorRG(serialDisp);
-      displaySerialFull = hashColorFull(serialDisp);
-    } else {
-      // Serial production = the fused control itself. The serial scanout
-      // runs on the caller, so exec == latency (same clock, same thread).
-      scanoutKind = 'serial';
-      scanoutMs = med(fs);
-      scanoutSerialMs = med(fs);
-      displayHash = hashColorRG(serialDisp);
-      displayFull = displaySerialFull;
-      const fr: number[] = [];
-      for (let i = 0; i < reps; i++) {
-        pump();
-        const tF = nowNs();
-        let t = nowNs();
-        r.beginFrame();
-        const bM = nsToMs(nowNs() - t);
-        t = nowNs();
-        r.renderView(view, worldArg, entities);
-        const rM = nsToMs(nowNs() - t);
-        t = nowNs();
-        r.endFrame();
-        const eM = nsToMs(nowNs() - t);
-        t = nowNs();
-        resolveFrame(r.getFramebuffer().color, serialDst, serialDisp, W, H, st);
-        const sM = nsToMs(nowNs() - t);
-        const fM = nsToMs(nowNs() - tF);
-        fr.push(fM);
-        frameSplits.push(frameSplit(bM, rM, eM, sM, fM));
-        scanoutKickLat.push(sM);
-        kickJournal.push({
-          frame: i, seq: 0, job: 'scanout', workers: 0, bands: 1,
-          band: 'all', y0: 0, y1: H, latencyMs: sM, ok: true,
-          execMs: sM, pixels: W * H, spans: 0,
-        });
-        if (i === reps - 1) {
-          const stRGB = r.testRGBStats();
-          const wst = r.testRGBWorkerStats();
-          rgbUsed = stRGB.used; rgbCover = stRGB.coverPixels;
-          rgbStaged = wst.staged; rgbInline = wst.inline; rgbKicks = wst.kicks;
-          const sc = collectStageCounters(r);
-          coverPx = sc.coverPixels;
-          classicSpansSkipped = sc.classicSpansSkipped;
-          classicFgSkipped = sc.classicFgSkipped;
-          skipArmed = sc.skipArmed;
-          translucentSpans = sc.translucentSpans;
-          cacheHits = sc.cacheHits; cacheMisses = sc.cacheMisses; cacheEvictions = sc.cacheEvictions;
-          chainUsedBytes = sc.rgbChainUsedBytes; retainedChainBytes = sc.rgbRetainedChainBytes;
-          orphanChainBytes = sc.rgbOrphanChainBytes; chainEvictions = sc.rgbChainEvictions;
-          fgAttr = collectForegroundAttribution(r, detail);
-        }
-      }
-      frameMs = med(fr); frameP95 = p95(fr); frameMaxMs = Math.max(...fr);
-      frameReps = fr;
-      {
-        const sp = summarizeSplits(frameSplits);
-        splitBeginMs = sp.begin; splitRenderMs = sp.render; splitEndMs = sp.end;
-        splitScanoutMs = sp.scanout; splitGapMs = sp.gap;
-      }
-      {
-        const ks = summarizeLatencies(scanoutKickLat);
-        scanoutP95 = ks.p95; scanoutMaxMs = ks.max;
-      }
-      // Serial leg: the scanout ran on the caller (exec == latency, already
-      // in the journal) — per-band worker exec is a pooled concept, so the
-      // exec side stays null by construction; the split covers the caller.
-    }
   }
 
   if (pool) await pool.dispose();
@@ -1444,10 +1115,10 @@ export async function runAttrConfig(
     fgParticleWorkerSpans: fgAttr.fgParticleWorkerSpans, fgParticleMainSpans: fgAttr.fgParticleMainSpans,
     fgBeamWorkerSpans: fgAttr.fgBeamWorkerSpans, fgBeamMainSpans: fgAttr.fgBeamMainSpans,
     fgEntityMs: fgAttr.fgEntityMs, materialGcMs: fgAttr.materialGcMs,
-    kickSizes: kickSummary ? kickSummary.kicks : null,
-    emptyKicks: kickSummary ? kickSummary.emptyKicks : null,
-    emptyKickIds: kickSummary ? kickSummary.emptyKickIds : null,
-    suffixKick,
+    kickSizes: null,
+    emptyKicks: null,
+    emptyKickIds: null,
+    suffixKick: null,
     geoGapMs,
   };
   const rs = (v: number | null): string => v === null ? '—' : v.toFixed(2);
@@ -1460,8 +1131,8 @@ export async function runAttrConfig(
   // attribution (sums of medians, diagnostic only); frame() is the
   // uninstrumented production total (Node, no present — browser presented
   // FPS is a separate soak metric, never this number).
-  // Production-leg dispatch-to-completion only (the interleaved serial
-  // control kicks live in kickJournal for forensics, not in this summary).
+  // Production-leg dispatch-to-completion only (RELEASE-8: no scanout or
+  // serial-control kicks exist on the software-only path).
   // Worker compute is reported ONLY from in-worker durations (execAttr);
   // message-arrival delays are scheduling, never compute.
   const kickDist = summarizeLatencies(scanoutKickLat);
@@ -1492,8 +1163,10 @@ export async function runAttrConfig(
       `entityMs=${rs(fgAttr.fgEntityMs)} matGcMs=${rs(fgAttr.materialGcMs)}]`
     : '';
   const detailPart = ` detail=${detail}`;
-  const kickPart = kickSummary ? ` ${formatKickSizes(kickSummary)}` : '';
-  const suffixPart = suffixKick ? ` ${formatLastKickDescs(suffixKick)}` : '';
+  // RELEASE-8: no scanout or pooled production kicks exist on the
+  // software-only path, so both kick forensics stay empty (unknown).
+  const kickPart = '';
+  const suffixPart = '';
   const gapPart = ` geoGap=${geoGapMs.toFixed(2)}`;
   const stagePart = mode === 'rgb'
     ? ` ${formatStageCounts({
