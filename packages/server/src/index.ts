@@ -2131,20 +2131,20 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
       }
     }
   }
-  if (user.classname === 'func_button' && (firedTrain || user.target === 't4')) {
+  if (user.classname === 'func_button' && firedTrain) {
     // End-of-level finish (base2-not-shipped stand-in, not C: C only exits
-    // through target_changelevel). Two base1 buttons qualify, both pressable
-    // only at the completed end-complex:
-    // - the one-way (wait -1, holds TOP) lift-call button firing a train —
-    //   base1's *13 (t91) starts the *12 exit lift (and finds its secret);
-    // - the plug-platform button firing 't4' — base1's *34 leans off the DOWN
-    //   plug top only (z 120..152 vs the 88 top; unreachable from the hall,
-    //   the shaft, or the UP plug), so pressing it means standing on the
-    //   lowered end elevator with the whole map behind you.
+    // through target_changelevel). Only the one-way (wait -1, holds TOP)
+    // lift-call button qualifies — base1's *13 (t91) starts the *12 exit
+    // lift (and finds its secret). The plug-platform button (*34 -> t4) is
+    // deliberately excluded: the plug cycle is transient (it returns after
+    // its wait, so finishing on it freezes the screen mid-cycle), and *34
+    // is unreachable on foot (entombed in world rock — every press in the
+    // suite is a teleport/E-use artifact). Firing 'lift' there broke the
+    // elevator repro's Phase 4 (E-use is suppressed once finished).
     // The *27 pit exit behind the plug is sealed rock in every plug state,
-    // so these presses are the reachable end-of-game actions.
+    // so the lift call is the reachable end-of-game action.
     const btn = st.movers.find((mm) => mm.ent === user);
-    if (user.target === 't4' || (btn && btn.wait < 0)) SV_FinishLevel(st, 'lift');
+    if (btn && btn.wait < 0) SV_FinishLevel(st, 'lift');
   }
 }
 
@@ -3606,6 +3606,46 @@ export function barrelOfClip(st: ServerState, entityNum: number): ServerBarrel |
 }
 
 /**
+ * Live func_button owning a brush-clip edict num (SV_ClipTrace entityNum).
+ * Null for world hits (0) and freed brushes; health gating happens in
+ * SV_DamageButton (C installs takedamage only when health is set, so
+ * touch/use-only buttons fall through to the impact flash). Shared by the
+ * bolt touch path so a shot button resolves against the brush edict itself,
+ * like C.
+ */
+export function buttonOfClip(st: ServerState, entityNum: number): Mover | null {
+  if (entityNum <= 0) return null;
+  const m = st.movers.find(
+    (mm) => mm.ent.classname === 'func_button' && !mm.ent.freed && mm.ent.num === entityNum,
+  );
+  return m ?? null;
+}
+
+/**
+ * T_Damage on a shootable button (g_func.c button_killed): health-set
+ * buttons answer bolts (C blaster_touch takedamage branch — damage only, no
+ * TE_BLASTER flash); the lethal hit restores health and fires (button_fire —
+ * a no-op while the button is already UP/TOP, so a wait -1 hold like base1's
+ * *13 can never re-fire). Non-lethal hits accumulate across shots (C
+ * T_Damage runs no pain gate on brushes). Health-less buttons never take
+ * damage here (C installs no takedamage for them — bolts spark off).
+ *
+ * Base1 scope note: the only health-gated button (*13, wait -1) holds TOP
+ * forever after its one lethal hit, so C's takedamage=NO clear is
+ * unobservable here — repeat shots re-run the kill into the UP/TOP no-op.
+ * A wait>=0 health button (none in base1) would re-fire on a post-return
+ * shot where C stays silent; revisit with a takedamage field if one ships.
+ */
+export function SV_DamageButton(st: ServerState, m: Mover, dmg: number): boolean {
+  if (m.ent.freed || !(m.ent.health > 0)) return false;
+  m.ent.health -= dmg;
+  if (m.ent.health > 0) return true;
+  m.ent.health = m.ent.maxHealth;
+  SV_UseMover(st, m);
+  return true;
+}
+
+/**
  * T_Damage on a barrel (g_misc.c barrel_delay): the first lethal hit latches
  * the fuse (takedamage NO + think = barrel_explode at level.time + 2 frames)
  * and arms the 0.2s fuse; the fuse then runs T_RadiusDamage + BecomeExplosion.
@@ -4283,15 +4323,27 @@ function stepBoltFlight(
         // leaving func_explosives undamageable by direct fire.
         const clipBarrel = barrelOfClip(st, wall!.entityNum);
         if (clipBarrel) SV_DamageBarrel(st, clipBarrel, bolt.damage);
-        const hitPos = v3(
-          bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * tWall,
-          bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * tWall,
-          bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * tWall,
-        );
-        // Wall touch (g_weapon.c blaster_touch, non-takedamage branch):
-        // TE_BLASTER carries the plane normal (NULL plane -> zero vector).
-        SV_BlasterImpact(st, hitPos, bolt.damage, null, rand, wall!.planeNormal ?? v3(0, 0, 0));
-        dead = true;
+        // C blaster_touch takedamage branch (g_weapon.c + g_func.c
+        // button_killed): a bolt striking a health-gated func_button brush
+        // damages the button instead of flashing — the lethal hit fires it.
+        // Base1's *13 starts the exit lift this way in the original (E-use
+        // is a driver convenience; Q2 has no +use-for-buttons); the port
+        // previously sparked off it, leaving t91 unreachable by fire.
+        // Health-less buttons (e.g. *34) fall through to the flash below.
+        const hitButton = buttonOfClip(st, wall!.entityNum);
+        if (hitButton && SV_DamageButton(st, hitButton, bolt.damage)) {
+          dead = true;
+        } else {
+          const hitPos = v3(
+            bolt.pos[0]! + (next[0]! - bolt.pos[0]!) * tWall,
+            bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * tWall,
+            bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * tWall,
+          );
+          // Wall touch (g_weapon.c blaster_touch, non-takedamage branch):
+          // TE_BLASTER carries the plane normal (NULL plane -> zero vector).
+          SV_BlasterImpact(st, hitPos, bolt.damage, null, rand, wall!.planeNormal ?? v3(0, 0, 0));
+          dead = true;
+        }
       }
     }
     if (dead) st.bolts.splice(i, 1);

@@ -1906,10 +1906,13 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       const d32box = SV_MoverClipBox(st, d32)!;
       expect([...d32box.mins]).toEqual([-1688, 1376, 96]);
       expect([...d32box.maxs]).toEqual([-1680, 1472, 224]);
-      // Lower the plug through the C-intended *34 lean press (touch only).
-      // Per the fireTargets end-of-game rule this press finishes the level
-      // via the plug-platform 'lift' path (operating the end control with
-      // the map behind you) — while the train lift itself stays parked.
+      // Lower the plug through the synthetic *34 overlap press (touch only).
+      // (Setup artifact: *34 is entombed in world rock — no foot path reaches
+      // its touch box, so C touch can never press it in play; the synthetic
+      // body below starts inside rock. The press lowers the plug WITHOUT
+      // finishing: t4 is a transient door cycle, not a transition — only the
+      // one-way train call (t91) takes the 'lift' finish. The walk below then
+      // boards the lowered plug for real.)
       SV_TouchButtonsAt(
         st,
         { origin: v3(-1862, 1536, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
@@ -1984,15 +1987,15 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       expect(minX).toBeLessThan(-1825);
       expect(bot.onGround).toBe(true);
       // Waiting repair preserved: the plug holds down, the train lift never
-      // starts off the walk (it still waits for *13/t91). The *34 setup
-      // press already finished the level via the plug-platform 'lift' path;
-      // the walk adds no exit and starts no train.
+      // starts off the walk (it still waits for *13/t91). The walk boards
+      // the lowered plug (sawPlugTop) yet adds no exit and starts no train;
+      // the level stays unfinished — no transition fired on foot.
       expect(plug.state).toBe('waiting');
       expect(train.started).toBe(false);
       expect([...train.ent.origin]).toEqual([0, 0, 0]);
       expect(st.firedThisTick).not.toContain('t91');
-      expect(st.finished).toBe(true);
-      expect(st.finishReason).toBe('lift');
+      expect(st.finished).toBe(false);
+      expect(st.finishReason).toBe('');
     } finally {
       resetPmoveWorld();
     }

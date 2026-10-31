@@ -291,7 +291,8 @@ valid prior fixes or silently waive newly reported symptoms.
 ### RELEASE-4 — Walk into the final elevator and show completion help
 owns: `packages/server`, `packages/game`, `apps/web`, `packages/testkit`
 depends: none
-status: ready (diagnostic landed; boarding fix outstanding)
+status: ready (button_killed fix landed — shooting *13 now fires the lift per C; boarding fix outstanding)
+lane-note 2026-10-31: landed `SV_DamageButton`/`buttonOfClip` (C `button_killed` + `blaster_touch` damage-XOR-flash; *13 health 1 verified in lump) with box-3a walk diagnostics (hall→slot→south→walkway→bridge, silent complex) and a shoot-*13→t91→train→secret→`lift` mechanism regression explicitly labeled routing-not-boarding. Box 3 still open — precise blockers: (a) t4's only feeder *34 is touch-only/health-less/entombed (pocket sealed by world rock west + plug east; first press impossible in legit play, so the plug never lowers); (b) the *12 deck is geometrically unboardable (16-wide slot vs 32 hull, 48 climb vs 33 C jump peak, east face flush with rock at -2048); (c) tunnel/pit/t37 entry on foot is unestablished (all descents use setup teleports) and is not the elevator the user reports. Next: design decision on the intended transition, not more blind code.
 user-verdict: original game allows walking onto the elevator and then loads the next level. This project must allow boarding, then show the F1/help screen stating the level is finished. Invisible blockage persists; preserve the repaired waiting/open behavior.
 review-finding: the previous blocker analyzed the *12 train/rock slot and punted the route. That does not establish that the user’s actual exit is impossible. Prior notes identify *31 descending plug and t37 changelevel as a different candidate; re-identify from the visible approach.
 done-when:

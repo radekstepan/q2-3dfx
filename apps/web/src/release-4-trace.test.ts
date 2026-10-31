@@ -32,8 +32,10 @@
 // entry) rather than teleport past. No leg starts inside any elevator.
 import { describe, expect, it, afterEach } from 'vitest';
 import { resetCVars } from '@q2/config';
+import { BUTTON_ATTACK } from '@q2/input';
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
+import type { BspMap } from '@q2/bsp';
 import { SV_ClipTrace, SV_FinishLevel, SV_SetPlayerHealth, SV_TraceFor } from '@q2/server';
 import {
   bootPlay,
@@ -75,6 +77,84 @@ afterEach(() => {
 
 function moverNum(driver: LocalDriver, model: string): number {
   return driver.server.movers.find((m) => m.ent.model === model)!.ent.num;
+}
+
+function expectInWorld(origin: Vec3, map: BspMap): void {
+  const mins = [...map.modelsMins.slice(0, 3)];
+  const maxs = [...map.modelsMaxs.slice(0, 3)];
+  for (let i = 0; i < 3; i++) {
+    expect(origin[i]!).toBeGreaterThanOrEqual(mins[i]! - 32);
+    expect(origin[i]!).toBeLessThanOrEqual(maxs[i]! + 32);
+  }
+}
+
+interface WalkReport {
+  reached: boolean;
+  ticks: number;
+  /** ticks with <0.5u movement */
+  stuckFrames: number;
+}
+
+/** Steer the driver toward (tx,ty) with normal locomotion (yaw + forward). */
+function walkTo(
+  driver: LocalDriver,
+  tx: number,
+  ty: number,
+  cap: number,
+  note: () => void,
+  arriveRadius = 24,
+): WalkReport {
+  let stuckFrames = 0;
+  let last: [number, number] = [driver.pm.origin[0]!, driver.pm.origin[1]!];
+  let ticks = 0;
+  let reached = false;
+  while (ticks++ < cap) {
+    SV_SetPlayerHealth(driver.server, 100); // setup: hold the walker alive
+    const yaw = yawAt([driver.pm.origin[0]!, driver.pm.origin[1]!], [tx, ty]);
+    driver.step({ msec: 100, angles: [0, yaw, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+    note();
+    const px = driver.pm.origin[0]!;
+    const py = driver.pm.origin[1]!;
+    if (Math.hypot(px - last[0]!, py - last[1]!) < 0.5) stuckFrames++;
+    last = [px, py];
+    if (Math.hypot(px - tx, py - ty) < arriveRadius) {
+      reached = true;
+      break;
+    }
+  }
+  return { reached, ticks, stuckFrames };
+}
+
+/** Kill the nearest live blocker within radius (aimed blaster, bounded). */
+function killNear(driver: LocalDriver, x: number, y: number, radius: number, note: () => void, cap = 60): boolean {
+  const aimAt = (tx: number, ty: number, tz: number): [number, number, number] => {
+    const e = [driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + 22];
+    const dx = tx - e[0]!, dy = ty - e[1]!, dz = tz - e[2]!;
+    const l = Math.hypot(dx, dy) || 1;
+    return [(Math.atan2(-dz, l) * 180) / Math.PI, (Math.atan2(dy, dx) * 180) / Math.PI, 0];
+  };
+  for (let i = 0; i < cap; i++) {
+    const live = driver.server.monsters.filter(
+      (m) => !m.state.dead && !m.state.gibbed && !(m.triggered && !m.woken) &&
+        Math.hypot(m.edict.origin[0]! - x, m.edict.origin[1]! - y) < radius,
+    );
+    if (live.length === 0) return true;
+    const target = live.sort(
+      (a, b) =>
+        Math.hypot(a.edict.origin[0]! - x, a.edict.origin[1]! - y) -
+        Math.hypot(b.edict.origin[0]! - x, b.edict.origin[1]! - y),
+    )[0]!;
+    SV_SetPlayerHealth(driver.server, 100);
+    const ducked = target.state.move === 'duck';
+    const cx = target.edict.origin[0]!, cy = target.edict.origin[1]!;
+    const cz = target.edict.origin[2]! + (ducked ? -12 : 4);
+    driver.step({ msec: 100, angles: aimAt(cx, cy, cz), forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_ATTACK }, 0.1);
+    note();
+  }
+  return driver.server.monsters.every(
+    (m) => m.state.dead || m.state.gibbed || (m.triggered && !m.woken) ||
+      Math.hypot(m.edict.origin[0]! - x, m.edict.origin[1]! - y) >= radius,
+  );
 }
 
 describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
@@ -255,5 +335,339 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
     drawPlayHud(hud, boot, { fps: 0, frame: 1 });
     expect(hud.color.some((c) => c === FINISH_BLUE)).toBe(true);
     expect(moverNum(driver, '*31')).toBeGreaterThan(0);
+  });
+
+  it('box-3a gate: walk the loading platform to the bridge wall (nothing fires)', { timeout: 300000 }, async () => {
+    // Honest end-of-the-walkable-world gate (box-2 audit): hall -> doorway
+    // slot -> south loop -> walkway -> bridge, real walking only (setup
+    // teleports to the hall start alone). The bridge ends at a rock wall
+    // above the entombed deck; the plug stays frozen shut, the pit stays
+    // sealed, the *13 call button never fires, and no E-use is sent anywhere.
+    // The shot finish lives in box-3b (mechanism setup below the slab).
+    const boot = await bootBase1();
+    const { driver } = boot;
+    const map = driver.map!;
+    const fired = new Set<string>();
+    const noteFired = (): void => {
+      for (const t of driver.server.firedThisTick) fired.add(t);
+    };
+
+    // Lump truth: *13 health-gated button (target t91, wait -1); *12 train
+    // (targetname t91, target t88, speed 40); *31 plug (targetname t4,
+    // frozen shut — *34 entombed, no relay feeds t4); *34 platform button
+    // (target t4); *27 trigger_multiple (target t37, sealed pit). The deck
+    // itself is unboardable on foot (48 climb vs the 33 C jump, rock slot),
+    // so this gate walks the loading platform and pins the silent complex.
+    const train = driver.server.trains.find((t) => !t.ship)!;
+    const btn13 = driver.server.movers.find((m) => m.ent.model === '*13')!;
+    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
+    const btn34 = driver.server.movers.find((m) => m.ent.model === '*34')!;
+    expect(train.ent.model).toBe('*12');
+    expect(train.ent.targetname).toBe('t91');
+    expect(train.ent.target).toBe('t88');
+    expect(train.speed).toBe(40);
+    expect(btn13.ent.target).toBe('t91');
+    expect(btn13.ent.health).toBe(1);
+    expect(btn13.wait).toBe(-1);
+    expect(plug.ent.targetname).toBe('t4');
+    expect(btn34.ent.target).toBe('t4');
+    const off = (m: string): [number, number, number] => driver.doorRenderOffset(m)!;
+    expect([...train.ent.origin]).toEqual([0, 0, 0]);
+    expect(train.started).toBe(false);
+    const parked = (): void => {
+      expect(train.started).toBe(false);
+      expect([...train.ent.origin]).toEqual([0, 0, 0]);
+      expect(off('*12')).toEqual([0, 0, 0]);
+    };
+
+    // ---- approach: settle in the hall, walk the slot, round south ----
+    driver.pm.origin = v3(-1560, 1536, 150);
+    driver.pm.velocity = v3();
+    for (let i = 0; i < 20; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+      noteFired();
+      if (driver.pm.onGround) break;
+    }
+    expect(driver.pm.onGround).toBe(true);
+    expect(driver.pm.origin[2]!).toBeCloseTo(120, 0);
+    let doorCycle = 0;
+    let stuckTicks = 0;
+    for (let i = 0; i < 200; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      const before = driver.pm.origin[0]!;
+      driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+      noteFired();
+      doorCycle = Math.max(doorCycle, mag3(off('*32')), mag3(off('*33')));
+      if (Math.abs(driver.pm.origin[0]! - before) < 0.5) stuckTicks++;
+      else stuckTicks = 0;
+      parked();
+      if (stuckTicks >= 30) break;
+    }
+    // Non-vacuous approach (box-1 leg-1 pattern): ground covered, sliders
+    // cycled open by touch, then stuck hard at the plug east face.
+    expect(driver.pm.origin[0]!).toBeLessThan(-1640);
+    expect(doorCycle).toBeGreaterThan(30);
+    expect(stuckTicks).toBeGreaterThanOrEqual(30);
+    expect(driver.pm.origin[0]!).toBeGreaterThan(-1705);
+    expect(driver.pm.origin[0]!).toBeLessThanOrEqual(-1680);
+    expect(driver.pm.onGround).toBe(true);
+    const wps: Array<[number, number]> = [
+      [-1603, 1413],
+      [-1689, 1327],
+      [-1817, 1327],
+      [-1945, 1327],
+      [-1962, 1362],
+      [-1975, 1410],
+      [-1977, 1455],
+      [-1977, 1519],
+    ];
+    for (const [wx, wy] of wps) {
+      const rep = walkTo(driver, wx, wy, 300, noteFired);
+      expect(rep.reached).toBe(true);
+      expect(rep.stuckFrames).toBeLessThanOrEqual(15);
+      parked();
+      expectInWorld(driver.pm.origin, map);
+    }
+    expect(Math.hypot(driver.pm.origin[0]! + 1977, driver.pm.origin[1]! - 1519)).toBeLessThan(30);
+    expect(driver.pm.onGround).toBe(true);
+
+    // ---- bridge: clear the guard with fire, walk west to the rock wall ----
+    // The walkway/bridge deck runs at walkway level (origin ~120-144) over
+    // the pit and ends at world rock west of the entombed deck slot.
+    expect(killNear(driver, driver.pm.origin[0]!, driver.pm.origin[1]!, 160, noteFired)).toBe(true);
+    const bridgeWalk = walkTo(driver, -2060, 1519, 300, noteFired);
+    expect(bridgeWalk.reached).toBe(false);
+    expect(driver.pm.origin[0]!).toBeGreaterThan(-2045);
+    expect(driver.pm.origin[0]!).toBeLessThan(-2015);
+    expect(driver.pm.onGround).toBe(true);
+    expect(driver.pm.origin[2]!).toBeGreaterThan(110);
+    expect(driver.pm.origin[2]!).toBeLessThan(160);
+    parked();
+    expect(driver.server.finished).toBe(false);
+    expect(fired.has('t91')).toBe(false);
+    expect(fired.has('t4')).toBe(false);
+    expect(fired.has('t37')).toBe(false);
+    // Blocker identity on the production clip: the westward ray strikes
+    // WORLD rock (entityNum 0, +X normal) — the rock face stands ~3 east of
+    // the entombed deck face, so the hull never reaches deck clips.
+    {
+      const clip = SV_ClipTrace(driver.server, SV_TraceFor(map));
+      const o = driver.pm.origin;
+      const hit = clip(
+        v3(o[0]!, o[1]!, o[2]!),
+        v3(-16, -16, -24) as Vec3,
+        v3(16, 16, 32) as Vec3,
+        v3(o[0]! - 64, o[1]!, o[2]!),
+      );
+      expect(hit.fraction).toBeLessThan(1);
+      expect(hit.entityNum).toBe(0);
+      expect(hit.planeNormal[0]!).toBeGreaterThan(0.9);
+    }
+
+    // ---- mobility sanity: jump on the bridge, land back aboard it ----
+    // (Proves the jump itself works; the deck below stays out of reach —
+    // the boarding block numbers live in the lane report and box-3b.)
+    {
+      const floorZ = driver.pm.origin[2]!;
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 0, sidemove: 0, upmove: 127, buttons: 0 }, 0.1);
+      noteFired();
+      let peak = driver.pm.origin[2]!;
+      for (let i = 0; i < 30; i++) {
+        SV_SetPlayerHealth(driver.server, 100);
+        driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+        noteFired();
+        peak = Math.max(peak, driver.pm.origin[2]!);
+      }
+      expect(peak).toBeGreaterThan(floorZ + 10); // the jump genuinely left the deck
+      expect(driver.pm.onGround).toBe(true);
+      expect(Math.abs(driver.pm.origin[2]! - floorZ)).toBeLessThan(4);
+      expect(driver.pm.origin[0]!).toBeGreaterThan(-2070);
+      expect(driver.pm.origin[0]!).toBeLessThan(-1990);
+      parked();
+      expect(driver.server.finished).toBe(false);
+      expect(fired.has('t91')).toBe(false);
+      expect(fired.has('t4')).toBe(false);
+      expect(fired.has('t37')).toBe(false);
+    }
+
+    // ---- end of the walkable world: frozen plug, sealed pit, silent button ----
+    expect([...plug.ent.origin]).toEqual([...plug.pos1]);
+    expect(plug.state).toBe('bottom');
+    expect(off('*31')).toEqual([0, 0, 0]);
+    expect(btn13.state).toBe('bottom');
+    expect(btn34.state).toBe('bottom');
+    expect(driver.server.finished).toBe(false);
+    expect(driver.server.finishReason).toBe('');
+    expect(driver.events).not.toContain('use'); // no hidden E-use anywhere
+    expectInWorld(driver.pm.origin, map);
+  });
+
+  it('box-3b gate: shoot *13 from below (no E-use, never aboard), lift finish + F1', { timeout: 300000 }, async () => {
+    // Mechanism regression for the C button_killed fix (server lane): a
+    // live player body standing on the pit floor — OUTSIDE the *27 exit
+    // volume (volume x -1840..-1712; here x ~= -2030) — fires aimed blaster
+    // bolts up at the health-gated *13. The lethal hit fires t91 (C
+    // button_killed): the *12 train runs its leg empty, finds its secret,
+    // and the server takes the 'lift' finish with the F1 panel frozen.
+    // This claims routing, never boarding: feet stay on the world floor
+    // (groundEntity is never the train) and the deck is never entered.
+    const boot = await bootBase1();
+    const { driver } = boot;
+    const map = driver.map!;
+    const fired = new Set<string>();
+    const noteFired = (): void => {
+      for (const t of driver.server.firedThisTick) fired.add(t);
+    };
+    const train = driver.server.trains.find((t) => !t.ship)!;
+    const btn13 = driver.server.movers.find((m) => m.ent.model === '*13')!;
+    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
+    expect(btn13.ent.target).toBe('t91');
+    expect(btn13.ent.health).toBe(1);
+    expect(btn13.wait).toBe(-1);
+    const off = (m: string): [number, number, number] => driver.doorRenderOffset(m)!;
+    expect([...train.ent.origin]).toEqual([0, 0, 0]);
+    expect(train.started).toBe(false);
+
+    // Setup stance on the pit floor (mechanism setup, outside the volume):
+    // settle from above the button's brush (never an exact-plane plant, and
+    // the health-gated button owns no touch per C SP_func_button).
+    driver.pm.origin = v3(-2030, 1536, 40);
+    driver.pm.velocity = v3();
+    for (let i = 0; i < 40; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+      noteFired();
+      if (driver.pm.onGround) break;
+    }
+    expect(driver.pm.onGround).toBe(true);
+    expect(Math.abs(driver.pm.origin[2]! + 24)).toBeLessThan(2);
+    expect(driver.pm.groundEntity).not.toBe(train.ent.num);
+    // Outside the *27 volume: settling here fires no exit relay.
+    expect(driver.server.finished).toBe(false);
+    expect(fired.has('t37')).toBe(false);
+    expect(fired.has('t91')).toBe(false);
+
+    // ---- original-supported finish: SHOOT *13 (C button_killed) ----
+    // No E-use anywhere in this session (Q2 has no +use-for-buttons): the
+    // aimed blaster kills the health-gated button, t91 runs the train and
+    // finds its secret, and the server takes the 'lift' finish.
+    expect(driver.events).not.toContain('use');
+    const eye0: [number, number, number] = [driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + 22];
+    {
+      const dx = -2016 - eye0[0]!, dy = 1536 - eye0[1]!, dz = 80 - eye0[2]!;
+      const l = Math.hypot(dx, dy) || 1;
+      const aim: [number, number, number] = [
+        (Math.atan2(-dz, l) * 180) / Math.PI,
+        (Math.atan2(dy, dx) * 180) / Math.PI,
+        0,
+      ];
+      let t91at = -1;
+      for (let i = 0; i < 120 && t91at < 0; i++) {
+        SV_SetPlayerHealth(driver.server, 100);
+        driver.step({ msec: 100, angles: aim, forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_ATTACK }, 0.1);
+        noteFired();
+        if (driver.server.firedThisTick.includes('t91')) t91at = i;
+      }
+      expect(t91at).toBeGreaterThanOrEqual(0); // bolts connected: the button fired
+    }
+    expect(btn13.state).not.toBe('bottom');
+    expect(btn13.ent.health).toBe(1); // C button_killed restores health
+    expect(train.started).toBe(true);
+    expect(driver.server.foundSecrets).toBe(1); // the t91 secret, via the shot
+    expect(driver.server.totalSecrets).toBe(3);
+    expect(driver.server.finished).toBe(true);
+    expect(driver.server.finishReason).toBe('lift');
+    expect(driver.server.finishTime).toBeGreaterThan(0);
+    expect(driver.events).toContain('finished');
+    expect(driver.events).not.toContain('exit');
+    expect(driver.events).not.toContain('use');
+    expect(driver.exited).toBe(false);
+    // The plug/pit complex sat out the finish: frozen shut, no relay.
+    expect([...plug.ent.origin]).toEqual([...plug.pos1]);
+    expect(plug.state).toBe('bottom');
+    expect(off('*31')).toEqual([0, 0, 0]);
+    expect(fired.has('t4')).toBe(false);
+    expect(fired.has('t37')).toBe(false);
+
+    // ---- ride-out: the train runs its full leg and parks (nobody aboard) ----
+    {
+      let peak = 0;
+      let midLeg = false;
+      for (let i = 0; i < 120 && !train.arrived; i++) {
+        SV_SetPlayerHealth(driver.server, 100);
+        driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+        noteFired();
+        const o = train.ent.origin;
+        const moved = Math.abs(o[0]!) + Math.abs(o[1]!) + Math.abs(o[2]!);
+        peak = Math.max(peak, moved);
+        if (moved > 1 && moved < 55) midLeg = true;
+        const mesh = off('*12');
+        expect(mesh[0]!).toBeCloseTo(o[0]!, 6);
+        expect(mesh[1]!).toBeCloseTo(o[1]!, 6);
+        expect(mesh[2]!).toBeCloseTo(o[2]!, 6);
+      }
+      expect(train.started).toBe(true);
+      expect(train.arrived).toBe(true);
+      expect(peak).toBeGreaterThan(10);
+      expect(midLeg).toBe(true);
+      expect(train.ent.origin[0]!).toBeCloseTo(-16, 6);
+      expect(train.ent.origin[1]!).toBeCloseTo(0, 6);
+      expect(train.ent.origin[2]!).toBeCloseTo(40, 6);
+      // Wait -1 holds the button TOP forever (never returns to BOTTOM).
+      expect(btn13.state).toBe('top');
+      for (let i = 0; i < 50; i++) {
+        SV_SetPlayerHealth(driver.server, 100);
+        driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+        noteFired();
+      }
+      expect(btn13.state).toBe('top');
+      expect(off('*13')).toEqual([0, 0, 4]);
+      const endOff = off('*12');
+      for (let i = 0; i < 50; i++) {
+        SV_SetPlayerHealth(driver.server, 100);
+        driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+        noteFired();
+        expect(off('*12')).toEqual(endOff);
+      }
+      expect(train.arrived).toBe(true);
+      expect(fired.has('t4')).toBe(false);
+      expect(fired.has('t37')).toBe(false);
+      expect(driver.events).not.toContain('use');
+    }
+
+    // ---- F1 completion panel (box-1 wiring, reused): frozen counters ----
+    {
+      const facts = helpFactsFor(boot);
+      expect(facts.kills[0]).toBe(driver.server.finishKills);
+      expect(facts.kills[1]).toBe(driver.server.totalMonsters);
+      expect(facts.kills[0]).toBeLessThanOrEqual(facts.kills[1]);
+      expect(facts.secrets).toEqual([1, 3]);
+      expect(facts.goals).toEqual([0, 1]);
+      expect(formatLevelTime(driver.server.finishTime)).toMatch(/^\d+:\d\d$/);
+      // Post-finish play must not move the frozen rows.
+      driver.server.killedMonsters = driver.server.totalMonsters;
+      driver.server.foundSecrets = 3;
+      driver.server.foundGoals = 1;
+      const frozen = helpFactsFor(boot);
+      expect(frozen.kills[0]).toBe(facts.kills[0]);
+      expect(frozen.secrets).toEqual([1, 3]);
+      expect(frozen.goals).toEqual([0, 1]);
+      toggleHelpOverlay(boot);
+      expect(boot.showHelp).toBe(true);
+      const done = blank(320, 240);
+      drawHelpOverlay(done, boot);
+      expect(done.color.some((c) => c === FINISH_BLUE)).toBe(true);
+      expect(driver.message).toContain('LEVEL COMPLETE');
+      expect(driver.message).toContain('kills');
+      expect(driver.message).toContain('secrets');
+      expect(driver.message).toContain('goals');
+      expect(driver.message).toContain('time');
+      const hud = blank(320, 240);
+      drawPlayHud(hud, boot, { fps: 0, frame: 1 });
+      expect(hud.color.some((c) => c === FINISH_BLUE)).toBe(true);
+      expectInWorld(driver.pm.origin, map);
+    }
   });
 });
