@@ -7,12 +7,11 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-30, reviewed at `71b58bd`): preserve the
-> user-confirmed sky fixes and landed display-fit repair. Water seams, asset UI,
-> elevator, infantry collision, restart-free settings and legacy Voodoo removal
-> remain open. Investigate the newly reported blaster offset; display alignment
-> does not prove projectile accuracy. CPU optimization stays paused. §8 is the
-> only active queue; old TASK.md and historical reviews do not override it.**
+> **Current direction (2026-10-30, reviewed at `873c0d4`): fix live resize,
+> HUD/help/intermission, elevator access and water seams; audit effects and
+> renderer-specific controls. Preserve sky fixes, software support and legacy
+> Voodoo retirement. User feedback overrides archived completion claims.
+> §8 is the only active queue; CPU optimization remains paused.**
 
 ---
 
@@ -124,7 +123,7 @@ host ← {server, client} · apps/web ← host
   tolerances for documented rasterization differences.
   Software path never leaves 8-bit indexed until display (palette expand).
   WebGL2 appearance (RGB565 + 4x4 dither + 2x2 postfilter, gamma ~1.3) is applied
-  in the GPU appearance pass (`webgl-renderer/appearance.ts`). No path uses floats per channel in the inner loop.
+  in the GPU appearance pass (`webgl-renderer/appearance.ts`). The CPU reference avoids float-per-channel inner-loop work; GPU shaders use floating-point arithmetic.
 - **Naming:** keep id's names (`R_DrawSurface`, `SV_LinkEdict`, `PM_StepSlideMove`,
   `cl.frame`, `pmove_t`) so the C source stays greppable.
 - **Modules:** `export`ed symbols only; no default exports. `.ts` only, no handwritten `.d.ts`.
@@ -260,88 +259,133 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ## 8. Actionable queue
 
-### Current status and execution rules
+### Review checkpoint and rules
 
-Reviewed source/history at `71b58bd`; user feedback dated 2026-10-30 is the
-current visual verdict. This review checks the latest diff and local original
-Quake II source; browser captures, gameplay reproduction and full verify were not
-rerun. Focused test results are recorded below; do not treat them as visual acceptance.
+Source/history reviewed at `873c0d4` against current user feedback (2026-10-30).
+This is a documentation/source review: no new browser reproduction or full-suite
+run. Archived implementation/test reports remain historical evidence, not user
+acceptance. In particular, RELEASE-4/6/7 and GPU-FOLLOW-3B are reopened below.
 
-Review validation: `yarn workspace web exec vitest run src/aim-hud.test.ts`
-passed 6 tests, with 1 real-asset eye-ray test skipped because Q2_PAK was not
-set for this run. This did not fire a blaster or rerun the browser display probe.
+Landed: asset HUD/help wiring; sim-preserving resize; mover and monster changes;
+water LOD/highp changes; legacy CPU Voodoo retirement; fidelity fixtures.
+Preserve these increments where valid. Sky fixes remain user-confirmed. Volume,
+devroom, monster collision/wall/fire and blaster-parallax reports are archived;
+latest feedback does not supply a new verdict on them. Do not revive old
+implementation tasks merely because this file previously had a stale heading.
 
-- **Done: GPU-FOLLOW-3A.** Skybox black borders and sky missing through windows
-  are fixed, explicitly confirmed by the user. `73c3076` isolates sky faces and
-  removes the selected-sky-ref background gate. Details and implementation
-  evidence are in `docs/tasks-archive.md`; preserve cold boot/switch/restore and
-  opaque occlusion. The older `d934fdc` review is historical, not current status.
-- **Open:** water seams, elevator, infantry collision, asset UI,
-  restart-free settings, startup sizing and legacy retirement. The user retested
-  and still reports water/UI/elevator/collision/restart/retirement issues after
-  `71b58bd`; startup sizing remains open from earlier feedback. Wall climbing remains unconfirmed;
-  infantry fire still needs an actual source/visual audit. Water motion is satisfactory.
-- **Implemented, acceptance pending:** volume and devroom changes landed; this
-  feedback does not confirm or reject them. Preserve the work, verify outstanding
-  acceptance criteria, and do not conflate implementation with visual sign-off.
-- **Review:** `docs/review-2c4c162.md` records unsupported completion claims and
-  test limitations at the earlier commit. RELEASE-4/5 remain reopened.
-- **Latest implementation: RELEASE-3 display fit.** `71b58bd` fits both canvases
-  to the stage, preserves framebuffer aspect, adds resize cleanup and replaces
-  the earlier ineffective tests. Its archived headless-browser report covers
-  display rectangles/HUD at a 1500×1000 viewport, DPR 1. Preserve that bounded
-  repair; do not generalize it to all devices or actual projectile accuracy.
-  `aim-hud.test.ts` traces from the eye along the view axis, not a fired bolt.
-  New blaster feedback belongs to RELEASE-3B below. No new confirmation of
-  earlier startup, wall-climb or infantry-fire issues was supplied; retain them.
-- **Latest scope:** no water shader, server/game behavior, game-asset HUD,
-  resolution-reboot policy or renderer-selection removal changed in `71b58bd`.
-  The six repeated unresolved reports remain open, not regressions proved fixed
-  by this display-only commit. Elapsed effort and test counts are not acceptance evidence.
-- **Backend terminology:** the user's “new webgpu renderer” refers to the new
-  GPU path; this tree implements WebGL2 (`packages/webgl-renderer`), not WebGPU.
-- **Acceptance remains open:** the latest archived sky report records a failing
-  full verify (PROOF-4 far/mip and a foreground-recovery timeout under suite load).
-  The latest RELEASE-3 archive also reports web suite 423/427 and two
-  `sound → config` dependency violations; these are reported results, not fresh
-  passes or failures from this review. Resolve the dependency violations under
-  RELEASE-1/FOLLOW-7. Earlier reports also mention PROOF-3 CDP timeout. Reproduce current failures
-  under FOLLOW-5 rather than assuming every historical failure remains current.
+Current renderer vocabulary is `software | webgl2-experimental`; `voodoo` is
+retained shared policy, not an offered CPU renderer. GPU remains experimental.
+Fidelity acceptance is still open: FOLLOW-5 was archived DONE despite automated
+FAIL and a proposed, unapproved tone-normalized threshold. Reopen acceptance;
+no threshold change is authorized. Historical full verify was reported 78/80,
+and deps:check 676 passed after the sound/config fix; neither was rerun here.
 
-Priority: RELEASE-4/5 (gameplay), RELEASE-3B (blaster aim), GPU-FOLLOW-3B (water), RELEASE-6 (asset UI), RELEASE-7
-(settings/startup), RELEASE-8 (legacy retirement), then FOLLOW-5/6 → FOLLOW-7. Verify RELEASE-1/2 independently.
-Never tick a behavior/visual box from a constant assertion, formula mirror, stub
-call count or pre-existing unrelated test. Require a reproduction of the actual
-symptom, an effective negative control, and evidence from the repaired production
-path. Keep implementation, automated correctness and user verdict separate.
-Independent cards may proceed with disjoint package ownership; this priority
-is not an artificial dependency chain. Claim one card before implementation.
-Keep GPU experimental until integrated acceptance; preserve software/Node support.
-Expensive browser tests and benchmarks run sequentially. Intermediate targeted
-passes are not full-suite acceptance. Archive completed cards with evidence;
-commit validated implementation increments with changesets, no push.
+Priority: RELEASE-7 → RELEASE-6 → RELEASE-4 → GPU-FOLLOW-3B → RELEASE-9/10/11,
+then FOLLOW-5/6/7. Independent cards can proceed with disjoint ownership.
+Claim one card; preserve software goldens and sky/lifecycle behavior. Expensive
+validation runs sequentially. Require actual production-path regressions and
+before/after captures for visible defects, not only helper arithmetic, nonblack
+pixels or counts. Distinguish implementation, automated results and user verdict.
+Historical DONE cards in `docs/tasks-archive.md` are superseded by reopened cards
+here. A missing display blocks displayed-performance acceptance, not code repairs.
 
-### GPU-FOLLOW-6 — Verify complete gameplay on a visible display
-owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
-depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-3B, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
-status: blocked
-gate-record 2026-10-31: DISPLAY_ABSENT — X.Org :0.0 + Vega 11 DRI, headed Chromium real hardware GL, but 0 connected monitors (virtual 2560x1440, no mode/refresh/vsync); no scanout path, displayed-frame claims VOID. Headed hardware-GL route smoke (webgl2-experimental, no fallback, cells 1→3→4, +1148 submitted, uploads 1) reported as headroom-only; startup 3.05s harness-path exceeds 2.5s pending display-backed rerun. Full ≥5min soak + all boxes BLOCKED pending vsync-measurable display. See docs/gpu-follow-6-gate-record.md.
+### RELEASE-7 — Repair resize/switch distortion without resetting gameplay
+owns: `apps/web`, `packages/host`, `packages/webgl-renderer`, `packages/testkit`
+depends: none
+status: ready (reopened)
+review-finding: `dom.ts: startPlayLoop` constructs `blitFb` once from the initial framebuffer; `finishFrame` only updates its color. After `Host.resize` replaces the framebuffer, the blit wrapper retains old width/height (and index/depth references). New pixels can therefore be copied with the old row stride or overflow the cached ImageData. `resizePlay` also ignores `resizeGpuBackend`'s boolean failure result after mutating host state.
 done-when:
-- [ ] Run a hardware-backed visible-browser 640×480 soak ≥5 minutes: stationary, multi-room/PVS movement, doors/lifts and combat, real viewmodel/effects and sky/water. Record actual route state, visible captures, bounded resources and absence of silent fallback.
-- [ ] Record immutable build, device, refresh/vsync, raw timing samples, p50/p95/p99 and dropped frames. Check median work ≤16 ms, ≥59 FPS at nominal 60 Hz and p95 interval ≤20 ms separately. Describe completed/display cadence evidence accurately; submitted frames/headless throughput are not scanout proof. Use matched settings for CPU/GPU comparisons.
-- [ ] Measure cached-pak-to-first-frame against the existing ≤2.5 s startup requirement; report separately from steady-state FPS.
-- [ ] If a performance gate fails, make at most the remaining one measured optimization iteration, then report. If display access is absent, record the exact missing prerequisite and leave that gate blocked; continue independent work.
+- [ ] Reproduce skewed/zoomed views using actual menu resolution and renderer changes, including repeated and rapid cycles in both directions at all offered sizes. Record the exact sequence, renderer, viewport, DPR and screenshots.
+- [ ] Keep blit wrapper/cache, backing buffers, projection/aspect, viewport, HUD and CSS fit synchronized. Audit in-flight async rendering and stale buffer captures; handle failed GPU resize coherently instead of reporting success with mismatched state.
+- [ ] Add a real running-loop resize regression (not just direct `resizePlay` calls): assert new row stride and output dimensions, fresh rendered pixels, no RangeError, matching canvas content bounds and undistorted known geometry across switches/restores. Preserve map/player/enemy/time/audio state and correctly sized startup loading surface.
+
+### RELEASE-6 — Correct HUD, live F1 help and completion presentation
+owns: `apps/web`, `packages/client`, `packages/formats`, `packages/server`, `packages/testkit`
+depends: none
+status: ready (reopened)
+review-findings: `drawHelpOverlay` reads `finishKills/finishGoals/finishSecrets`, which are populated only by `SV_FinishLevel`; live counters are `killedMonsters/foundGoals/foundSecrets`. `statusbarStateFor` supplies a constant help icon. Completion still renders `centerPrintPlacement(driver.message)` in FINISH_BLUE, not the appropriate original intermission presentation.
+done-when:
+- [ ] Reproduce broken/misaligned icons and text outside 640×480. Audit layout coordinates, image dimensions, digit spacing, font rendering and shared UI scale; preserve original relative placement. Verify HUD/F1/death/completion at 320×240, 640×480, 800×600 and 1024×768 on Software/WebGL2, before/after resize. Real-art captures must show aligned text/icons, not merely in-bounds pixels.
+- [ ] Use live kills/goals/secrets during play, retaining frozen finish snapshots for completion. Kill an enemy/find a secret/complete a goal with F1 open and closed; verify counts update without reopening or restarting.
+- [ ] Compare startup F1/help notification with original `p_view.c` helpchanged tracking and `p_hud.c` flashing help icon; implement correct initial/change notification and acknowledgment on opening help. Test flash cadence and stop/reset conditions, not an unconditional permanent blink.
+- [ ] Replace the remaining custom blue finish summary with source/asset-faithful single-player completion/intermission behavior. Inspect original layout, camera, totals and timing; do not substitute a multiplayer scoreboard or victory asset without establishing that it belongs here. Keep asset-free devroom fallback.
+
+### RELEASE-4 — Make the waiting final elevator physically enterable
+owns: `packages/server`, `packages/game`, `apps/web`, `packages/testkit`
+depends: none
+status: ready (reopened)
+user-verdict: elevator now stays open/waits, but an invisible obstruction prevents entry. Preserve the waiting repair.
+done-when:
+- [ ] Reproduce approach and blocked boarding through normal movement, identify exact brush/entity blocking the player trace (fraction/startsolid/allsolid, model, origin, bounds, solid flags). Compare rendered door/platform pose with authoritative collision transform and target chain; inspect retained *31 plug and surrounding sliders without assuming which is responsible.
+- [ ] Repair stale/incorrect collision, activation or geometry state against map/original behavior; never disable all mover collision or teleport the player to pass the test.
+- [ ] Extend real-base1 gate to walk from outside through the doorway, board, operate intended control, ride and finish. Assert no invisible obstruction and no premature departure; capture the complete route. Tests starting on the platform do not close boarding acceptance.
+
+### GPU-FOLLOW-3B — Remove the remaining visible water tile seams
+owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
+depends: none
+status: ready (reopened)
+user-verdict: flow is good; tile seams remain after unwarped-LOD/highp repair. Prior wrap/ROI metrics did not reject the reported defect.
+done-when:
+- [ ] Locate the actual visible seam, recording map/camera/material/time and close crops. Distinguish repeat boundaries, adjacent BSP faces, lightmap borders, source art and warp/LOD behavior. Keep existing useful LOD work, but do not assert it solved every seam.
+- [ ] Add sampled-pixel and real-map regressions that fail on this current defect, across multiple tiles, times and view angles with transparent water. Include an injected seam control; animation-difference thresholds alone are not seam proof.
+- [ ] Fix demonstrated cause without disabling motion, lighting, mipmapping, transparency or intended texture scale; confirm stationary and moving views plus sky/occlusion remain correct.
+
+### RELEASE-9 — Audit explosion, blaster impact and map electrical effects
+owns: `packages/game`, `packages/server`, `apps/web`, `packages/webgl-renderer`, `packages/testkit`
+depends: none
+status: ready
+review-scope: appearance concerns require original-source/art comparison; no new claim that these effects are absent or incorrectly scaled has been established. No `target_splash` handler was found in the reviewed server source; identify the map's actual mechanism before choosing an implementation.
+done-when:
+- [ ] Compare barrel explosion fullness against original barrel/temporary-entity behavior: correct model/skin, frames/frame interpolation, lifetime, alpha, particles, debris, light, sound and occlusion. Capture frame sequences at matched distance/time; avoid simply enlarging the effect to make it fuller.
+- [ ] Compare blaster wall-impact size with original `cl_tent.c` TE_BLASTER (ex_misc, four frames), model dimensions/orientation, fade, particles and light. Measure projected size at several distances/FOVs on both renderers, including pitched hits. Fix demonstrated scaling/animation errors while keeping intended muzzle parallax separate.
+- [ ] Inspect the first blasted door's actual entity/target chain for electrical sparks, identify original event type/count/direction/cadence/sound and implement any missing producer→server event→render/audio path. Verify sparks after destruction and through relevant trigger transitions.
+- [ ] Inventory remaining base1 map effects against original spawn/temporary-entity handlers; record implemented, missing or deliberately deferred effects with locations. Add concrete follow-up cards for discovered omissions, not a blanket effects-complete claim. Use visible effect sequences and missing-effect controls.
+
+### RELEASE-10 — Disable controls unsupported by the active renderer
+owns: `apps/web`, `packages/config`, `packages/renderer-api`, `packages/webgl-renderer`
+depends: none
+status: ready
+done-when:
+- [ ] Audit every right-panel option against actual Software/WebGL2 consumers, including `sw_*`, `vd_*`, worker settings and shared controls. Build one capability mapping based on effective renderer, including fallback; do not infer support solely from name prefixes.
+- [ ] Disable irrelevant controls with a brief explanation, refresh immediately on switch/fallback/restore, retain saved values for when the renderer supports them, and keep shared settings usable. Do not silently imply unsupported options affect rendering.
+- [ ] Test real panel enablement and setting effects in each renderer and failed-GPU fallback; verify keyboard/accessibility disabled state and no stale capability labels.
+
+### RELEASE-11 — Toggle gameplay status messages
+owns: `apps/web`, `packages/config`
+depends: none
+status: ready
+done-when:
+- [ ] Add a clearly named persisted on/off option for transient gameplay status text such as “soldier minced.” Trace all relevant message producers/presentation paths; user describes these as blue, so do not filter by color alone.
+- [ ] Apply changes immediately without reboot, independently of FPS/position, F1/help, HUD and intermission. Preserve essential errors/loading/fallback warnings; hiding cosmetic text must not alter gameplay events or statistics.
+- [ ] Test toggling during an active message, subsequent events, reload persistence and both renderers/resolutions.
+
+### GPU-FOLLOW-5 — Complete fidelity and automated gate repairs
+owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`
+depends: RELEASE-4, RELEASE-6, RELEASE-7, RELEASE-9, GPU-FOLLOW-3B
+status: ready (acceptance reopened; archived implementation retained)
+done-when:
+- [ ] Repair remaining degenerate mip fixture and reproducible browser/pool contention failures with meaningful coverage; do not skip tests, loosen thresholds or label isolated passes a green integrated suite.
+- [ ] Refresh matched scene/time/cvar evidence after current visual repairs, including UI/effects/water and lifecycle negative controls. Keep automated failures explicit.
+- [ ] Meet the current contract or present precise side-by-sides and a proposed change for explicit user approval. The archived tone-normalized 0.02 proposal is unapproved; no implicit acceptance or rollout.
+
+### GPU-FOLLOW-6 — Verify gameplay on a visible display
+owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
+depends: RELEASE-4, RELEASE-6, RELEASE-7, RELEASE-9, GPU-FOLLOW-3B
+status: blocked (displayed-performance evidence only)
+blocker: archived `docs/gpu-follow-6-gate-record.md` reports hardware GL but no connected monitor/vsync/scanout. This review did not recheck display availability. Submitted-frame throughput is not displayed FPS. Historical startup 3.05s exceeds the 2.5s target.
+done-when:
+- [ ] Once a measurable display exists, run ≥5-minute 640×480 hardware-backed visible soak with rooms/PVS, boarding/ride, combat, viewmodel/effects, sky/water and settings cycles; no silent fallback or unbounded resources.
+- [ ] Record immutable build/device/refresh, raw samples, p50/p95/p99 and dropped frames; require median work ≤16ms, ≥59 FPS at nominal 60Hz and p95 interval ≤20ms separately. Measure cached-pak-to-first-frame ≤2.5s separately.
+- [ ] If a performance gate misses, permit only the remaining one measured optimization iteration, then report. Keep display blocker separate from fixable startup/content defects and continue independent work.
 
 ### GPU-FOLLOW-7 — Final integrated acceptance
-owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config` (integrator)
-depends: RELEASE-1 through RELEASE-8, RELEASE-3B, GPU-FOLLOW-3B, GPU-FOLLOW-5, GPU-FOLLOW-6
-status: blocked
-blockers-2026-10-31: FOLLOW-6 BLOCKED (DISPLAY_ABSENT, no vsync/scanout — gate record docs/gpu-follow-6-gate-record.md); FOLLOW-5 fidelity contract proposal (tone-normalized 0.02 gate) NEEDS USER APPROVAL, NOT applied — automated F1 FAIL stands loud. `sound→config` resolved (deps:check 676 ok); full verify 78/80 with 4 known load/contention failures recorded. GPU stays experimental (`software | webgl2-experimental`, persisted `voodoo`→`software` warned); no default rollout. All implementation lanes committed below; no push.
+owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config`
+depends: all active repair cards above, GPU-FOLLOW-5, GPU-FOLLOW-6
+status: blocked (repair, fidelity and display prerequisites)
 done-when:
-- [ ] Resolve the reported `sound → config` dependency-rule violations without weakening the dependency gate; run `yarn verify`, `yarn deps:check`, real-asset base1, retained software and GPU lifecycle/image/gameplay gates after legacy retirement on the integrated result. Record skipped coverage and preserve CPU/Node support.
-- [ ] Publish separate implementation, correctness, fidelity and displayed-performance verdicts with commits/artifacts; reconcile contradictory PASS/GO claims in existing reports. Carry forward precise unresolved blockers.
-- [ ] Only after all required gates pass, close GPU-EXPAND-1 and decide default rollout with accurate selection/fallback labels. Otherwise keep GPU experimental.
-- [ ] Commit validated remaining changes with required changesets, no push; move completed cards to the archive. Keep deferred CPU/hardware-oracle/demo work in the review/history docs, not silently marked complete.
+- [ ] Run full `yarn verify`, `yarn deps:check`, real-asset base1, software/Node and GPU lifecycle/image/gameplay gates after integration. Record skips, failures and exact artifacts; no claim of completion based on archived partial greens.
+- [ ] Reconcile archive claims with current user verdicts; publish separate implementation/correctness/fidelity/display-performance results. Close cards only with their required evidence.
+- [ ] Keep GPU experimental until required gates pass and default rollout is explicitly decided. Commit validated increments with changesets, no push; archive completed cards without erasing unresolved work.
 
 ---
 
