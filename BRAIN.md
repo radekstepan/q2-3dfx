@@ -50,13 +50,15 @@ Rebuild Quake II so that it:
   colormap shading, perspective-correct spans subdivided every 16 pixels, surface cache,
   edge/span rasteriser, affine alias models. Preserve this CPU-only reference/fallback;
   do not require a GPU for its Node tests or change its goldens for the new backend.
-- **Preserves the "3dfx Voodoo 3 3000" look in WebGL2.** Retire the legacy
-  CPU Voodoo mode under RELEASE-8; shared policy is not automatically obsolete. Emulation of `ref_gl`-on-Voodoo3: RGB565 + 4×4
+- **Preserves the "3dfx Voodoo 3 3000" look in WebGL2.** Emulation of `ref_gl`-on-Voodoo3: RGB565 + 4×4
   ordered dither, 2×2 "22-bit" post filter, bilinear, mip LOD with mip-dithering, 64-entry
   table fog, LOD bias, 256×256 max texture size, 16-bit depth, ~1.3 Glide gamma lift.
   Full checklist + cvars: `docs/renderers.md`. RGB mip sampling scales UVs
   into the picked level (`1/(1<<lvl)`); alias tracks the shared `vd_lodbias`
-  (`ALIAS_LOD_BIAS_DELTA = 0`, reassessed post-fix — see VOODOO-REPAIR-2 note).
+  (`ALIAS_LOD_BIAS_DELTA = 0`). Canonical appearance policy lives in
+  `packages/webgl-renderer/src/appearance.ts`; `packages/voodoo` is a pure
+  policy library (quantise, gammaLUT, Bayer/dither, mip/LOD, fog, upload);
+  no CPU frame-execution path remains.
 - **Adds a WebGL2 browser backend** for fast gameplay with a reviewed Voodoo-style
   appearance. This is an authorized independent renderer, not a replacement for
   the software reference. Cross-backend pixel identity is not assumed (see §8).
@@ -88,18 +90,17 @@ q2ts/
 Dependency flow (enforced by `yarn deps:check`):
 
 ```
-math ← formats ← bsp ← {sw-renderer, voodoo} ← renderer-api ← host
-{renderer-api, sw-renderer, bsp, math, config} ← webgl-renderer (GPU boundary impl, PROOF-2; + formats test-only)
+math ← formats ← bsp ← sw-renderer ← renderer-api ← host
+{renderer-api, sw-renderer, bsp, math, config} ← webgl-renderer (GPU boundary impl; + formats test-only)
+voodoo (pure policy: quantise/gamma/Bayer/mip/fog/upload; no frame execution, no renderer imports)
 filesystem ← formats · game ← {math, bsp, config} · server ← {game, bsp}
 client ← {renderer-api, input, sound, config, game (pmove prediction)}
 host ← {server, client} · apps/web ← host
 ```
 
 - **Nothing** imports from `apps/*`.
-- `sw-renderer` must not import `dom` types; it writes into a handed `ArrayBuffer`.
-- `voodoo` currently supplies post-process/sampling policy. RELEASE-8 retires the
-  legacy CPU Voodoo execution mode; audit shared consumers before deleting modules.
-  The map below describes the current tree, not the completed retirement.
+- `sw-renderer` must not import `dom` types; it writes into a handed `ArrayBuffer`. Indexed software renderer only (spans, surface cache, alias/sprite/particle/tracer draws, banded SAB workers, async render); no RGB/scanout execution.
+- `voodoo` is a pure policy library (see above); WebGL2 appearance is canonical in `webgl-renderer/appearance.ts`. Renderer selection vocab is `software | webgl2-experimental` (persisted `voodoo` migrates to `software` with warning); `vd_*` remain as WebGL live-uniforms.
 - Implemented (GPU-PROOF-2): `packages/webgl-renderer`, a browser GPU renderer with an
   explicit injected WebGL2 context; only this backend and browser integration may
   depend on browser graphics types. Keep sw-renderer/math/bsp/renderer-api DOM-free.
@@ -118,14 +119,12 @@ host ← {server, client} · apps/web ← host
   is a float of seconds; never use wall-clock in game logic.
 - **Texture mapping:** `u = dot(p, texinfo.s)/scale + s_off` in *texels*. Lightmap luxels are every
   **16 texels**. Keep the `LUXEL = 16` constant in `@q2/math`.
-- **Colour:** the following exact rules apply to the existing CPU reference. The new
-  GPU backend follows the explicit fidelity contract in GPU-PROOF-1, with reviewed
+- **Colour:** the following exact rules apply to the CPU reference. The
+  WebGL2 backend follows the explicit fidelity contract in GPU-PROOF-1, with reviewed
   tolerances for documented rasterization differences.
-  Software path never leaves 8-bit until resolve. Until RELEASE-8 retires it,
-  the legacy CPU Voodoo path rasters
-  authoritatively to RGB565 + window-Z (16-bit depth) planes and scanout
-  reconstructs from that target (matched `2x2sub+2x2box` by default; `vd_16bit=0`
-  is an RGB888 debug bypass). No path uses floats per channel in the inner loop.
+  Software path never leaves 8-bit indexed until display (palette expand).
+  WebGL2 appearance (RGB565 + 4x4 dither + 2x2 postfilter, gamma ~1.3) is applied
+  in the GPU appearance pass (`webgl-renderer/appearance.ts`). No path uses floats per channel in the inner loop.
 - **Naming:** keep id's names (`R_DrawSurface`, `SV_LinkEdict`, `PM_StepSlideMove`,
   `cl.frame`, `pmove_t`) so the C source stays greppable.
 - **Modules:** `export`ed symbols only; no default exports. `.ts` only, no handwritten `.d.ts`.
