@@ -13,6 +13,7 @@ import type { WebPak } from './pak.js';
 
 registerCVar('cl_showfps', 1, 'show in-canvas fps readout top-right (conchars glyphs)');
 registerCVar('cl_showpos', 1, 'show in-canvas player-position readout top-left (pos X Y Z)');
+registerCVar('cl_showmessages', 1, 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); death/finish/loading/fallback warnings unaffected (essential, never gated)');
 
 /** Cvar gate for the fps readout (`cl_showfps`, default 1). */
 
@@ -168,6 +169,13 @@ export function showPosEnabled(): boolean {
   return getCVarNumber('cl_showpos') !== 0;
 }
 
+/** Cvar gate for the transient gameplay status line (`cl_showmessages`, default 1 = ON). */
+export function showMessagesEnabled(): boolean {
+  // Absent (e.g. after a reset in tests) means the default-on state.
+  if (getCVar('cl_showmessages') === undefined) return true;
+  return getCVarNumber('cl_showmessages') !== 0;
+}
+
 /** Blit a 0xAABBGGRR framebuffer into a <canvas> via putImageData.
  *
  * Fast path: one bulk u32 copy into a cached ImageData (no per-frame
@@ -321,6 +329,9 @@ function ensureHudCvars(): void {
   if (getCVar('cl_showpos') === undefined) {
     registerCVar('cl_showpos', 1, 'show in-canvas player-position readout top-left (pos X Y Z)');
   }
+  if (getCVar('cl_showmessages') === undefined) {
+    registerCVar('cl_showmessages', 1, 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); death/finish/loading/fallback warnings unaffected (essential, never gated)');
+  }
 }
 
 /**
@@ -329,7 +340,7 @@ function ensureHudCvars(): void {
  * game input under the canvas pointer-lock discipline).
  *
  * Every 0/1 cvar the panel can list lives here: the HUD gates (`cl_showfps`,
- * `cl_showpos`), the Voodoo fidelity switches (`vd_*`, BRAIN.md §7.2), the
+ * `cl_showpos`, `cl_showmessages`), the Voodoo fidelity switches (`vd_*`, BRAIN.md §7.2), the
  * client/world toggles (`cl_predict`, `cl_interp`, `r_drawworld`), the
  * span-backend switches (`sw_wasm`, `sw_accum` — registered lazily by
  * `@q2/sw-renderer`, so they are pinned here even before first registration),
@@ -340,6 +351,7 @@ function ensureHudCvars(): void {
 export const CHECKBOX_CVARS: ReadonlySet<string> = new Set([
   'cl_showfps',
   'cl_showpos',
+  'cl_showmessages',
   'vd_16bit',
   'vd_dither',
   'vd_postfilter',
@@ -459,7 +471,7 @@ export function cvarGroup(name: string): (typeof GROUP_ORDER)[number] {
   if (name === 'vid_renderer' || name === 'vid_resolution' || name === 'r_brightness' || name === 'r_drawworld' || name === 'r_translucency') return 'VIDEO';
   if (name.startsWith('sw_')) return 'SOFTWARE SPANS';
   if (name === 'skill' || name === 'map_source' || name === 'cl_predict' || name === 'cl_interp') return 'GAME';
-  if (name === 'cl_showfps' || name === 'cl_showpos') return 'HUD';
+  if (name === 'cl_showfps' || name === 'cl_showpos' || name === 'cl_showmessages') return 'HUD';
   if (name === 's_volume' || name === 'sensitivity' || name === 'm_yaw' || name === 'm_pitch') return 'SOUND + INPUT';
   return 'OTHER';
 }
@@ -475,6 +487,7 @@ export function cvarGroup(name: string): (typeof GROUP_ORDER)[number] {
 export const CVAR_DESCRIPTIONS: Readonly<Record<string, string>> = {
   cl_showfps: 'show in-canvas fps readout top-right (conchars glyphs)',
   cl_showpos: 'show in-canvas player-position readout top-left (pos X Y Z)',
+  cl_showmessages: 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); death/finish/loading/fallback warnings unaffected (essential, never gated)',
   r_brightness: 'display-only post-resolve brightness lift 0.5..2.0',
   skill: 'difficulty 0 easy 1 medium 2 hard 3 nightmare (latched at boot)',
   map_source: 'map source: cached pak0.pak game (pak) or built-in devroom (devroom); changing it reboots the level',
@@ -535,7 +548,7 @@ export function cvarNeedsReboot(name: string): boolean {
 }
 
 /** UI cvars persisted across page reloads (localStorage, DOM-guarded). */
-const PERSISTED_CVARS = ['vid_renderer', 'skill', 'vid_resolution', 'map_source', 'r_brightness', 'sw_workers'] as const;
+const PERSISTED_CVARS = ['vid_renderer', 'skill', 'vid_resolution', 'map_source', 'r_brightness', 'sw_workers', 'cl_showmessages'] as const;
 const PERSIST_KEY = 'q2ts.cvars.v1';
 
 /** Save menu cvars to localStorage. No-op without DOM. */

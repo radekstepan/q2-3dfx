@@ -551,6 +551,12 @@ lane report (config table + webgl effectiveness + web panel + renderer-api verdi
 evidence: config 26, renderer-api 12, webgl release10-cvars 20 (full pkg 187 pass), web panel 11 + adjacent 91; combat.test.ts light-skin failure pre-existing (identical with lane files stashed). deps:check clean.
 changesets: `release-10-config-capability.md` + `release-10-webgl-cvars.md` + `release-10-renderer-api.md` (apps/web panel private, ignored). No perf-ledger row (correctness-only; CPU optimization paused).
 
+### RELEASE-11 — Toggle gameplay status messages — DONE 2026-10-31 (repaired by @opencode, 2 lanes)
+owns: `apps/web`, `packages/config` · depends: none
+lane report (config default + web tagging/gating, disjoint): central `cl_showmessages` default ON (1); driver `messageKind: status|alert` tags all 8 cosmetic producers (gib/kill/corpse/weapon/pickup/ammo/empty/clears) vs `alert` for death; draw-only gate (string/events/stats still update), per-frame cvar read (immediate toggle, no reboot); finished/loading/fallback paths untouched; checkbox + persistence, not a reboot cvar.
+evidence: config 27, web release-11 20/20 (mid-message toggle, punch-through, fps/pos/F1/HUD/intermission intact, both renderers, 320x240 + 1024x768, persistence round-trip) + panel/pos/reboot 57, base1-gate 22/23 (sole (q) failure pre-existing, identical on clean HEAD). deps:check clean.
+changesets: `release-11-config-showmessages.md` (apps/web presentation private, ignored). No perf-ledger row (correctness-only; CPU optimization paused).
+
 ### GPU-FOLLOW-5 — Refresh final fidelity evidence — DONE 2026-10-31
 owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs` · depends: 3B, R2, R3, R3B, R4, R5, R6, R7, R8 (all DONE)
 lane report (single writer, sequential controlled concurrency): full-suite failures reproduced/isolated as load/contention class (timeouts retained, nothing inflated/skipped); PROOF-4 far gate repaired via FAR_VIEW (0.9937 HOLDS, was 0/0), mip gate re-homed to valid minified MID view (still 0/0 regime miss, fails loudly, thresholds untouched); matched F0/F1/F2 CPU hashes + GPU coverage + report-only vs-CPU rows; gun-skin-withheld negative + dual-chunk determinism + follow2b evidence; F1 gap specified as tone transform with edge-uniform disagreement (no localized defect).

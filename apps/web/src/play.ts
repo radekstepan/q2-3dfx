@@ -1025,6 +1025,18 @@ export class LocalDriver implements HostDriver {
   readonly events: string[] = [];
   readonly changeTargets = new Set<string>();
   message = '';
+  /**
+   * Severity tag for the transient status line (RELEASE-11
+   * `cl_showmessages`): 'status' = cosmetic gameplay one-liners (kills,
+   * pickups, weapon swaps, dry-fire); 'alert' = the death notice. The
+   * render gate hides ONLY 'status' when the cvar is 0 — death, the
+   * finished screen and loading/fallback warnings always draw. Every
+   * cosmetic producer passes 'status' explicitly; `setMessage('')` clears
+   * reset to 'status', and `respawn()` resets to 'status' with the clear.
+   * The finished-screen mirror leaves the kind as-is (that branch never
+   * consults the gate — it keys off `server.finished`).
+   */
+  messageKind: 'status' | 'alert' = 'status';
   exited = false;
   /** Finish screen already mirrored from the server (event pushed once). */
   private finishShown = false;
@@ -1387,6 +1399,10 @@ export class LocalDriver implements HostDriver {
       this.finishShown = true;
       if (this.server.finishReason !== 'exit') this.events.push('finished');
     }
+    // Finished-screen mirror (RELEASE-11 essential path): the stats screen
+    // text updates every tick even while cosmetic messages hide — the
+    // render gate keys off `server.finished`, never `messageKind`, so the
+    // kind is deliberately left as-is here.
     if (this.server.finished) this.message = formatFinishMessage(this.server);
     this.stepSparks(dt);
     this.checkPickups();
@@ -1412,10 +1428,16 @@ export class LocalDriver implements HostDriver {
    * Status-line write (all HUD one-liners funnel here): once the server owns
    * the finished state the stats screen stays put — kills, pickups and empty
    * clicks no longer overwrite it. Death/respawn write directly (more urgent
-   * / clears the screen for the new life).
+   * / clears the screen for the new life). The kind tags the severity for
+   * the RELEASE-11 `cl_showmessages` render gate (cosmetic 'status' hides,
+   * death 'alert' never does); backward compatible — omitting it keeps the
+   * cosmetic default.
    */
-  private setMessage(s: string): void {
-    if (!this.server.finished) this.message = s;
+  private setMessage(s: string, kind: 'status' | 'alert' = 'status'): void {
+    if (!this.server.finished) {
+      this.message = s;
+      this.messageKind = kind;
+    }
   }
 
   /**
@@ -1441,7 +1463,10 @@ export class LocalDriver implements HostDriver {
     }
     if (this.ps.health <= 0 && this.deadUntil <= 0) {
       this.ps.health = 0;
+      // RELEASE-11 essential path: the death notice is 'alert' severity, so
+      // the `cl_showmessages` render gate never hides it.
       this.message = 'YOU DIED — respawning…';
+      this.messageKind = 'alert';
       this.events.push('death');
       // C player_die (p_client.c): gibbed past -40hp (udeath only), else
       // the sexed *deathN (rand()%4+1) — resolved to the male lump here.
@@ -1465,13 +1490,13 @@ export class LocalDriver implements HostDriver {
         if (!this.gibSeen.has(m.edict.num)) {
           this.gibSeen.add(m.edict.num);
           this.events.push('gib');
-          this.setMessage(`${m.state.kind} minced`);
+          this.setMessage(`${m.state.kind} minced`, 'status');
         }
       } else if (m.state.dead) {
         if (!this.deadSeen.has(m.edict.num)) {
           this.deadSeen.add(m.edict.num);
           this.events.push('kill');
-          this.setMessage(`${m.state.kind} down`);
+          this.setMessage(`${m.state.kind} down`, 'status');
         }
       } else if (m.state.health < prev) {
         this.events.push('hit');
@@ -1497,7 +1522,7 @@ export class LocalDriver implements HostDriver {
       if (Number.isFinite(hits) && hits > seen) {
         this.corpseGibSeen.set(e.num, hits);
         this.events.push('gib');
-        this.setMessage('corpse minced');
+        this.setMessage('corpse minced', 'status');
       }
     }
     // Player damage dealt by the server tick/fire → pain/death edges.
@@ -1780,7 +1805,7 @@ export class LocalDriver implements HostDriver {
 
   selectWeapon(classname: string): void {
     if (!this.ps.weapons.includes(classname)) {
-      this.setMessage('NO WEAPON');
+      this.setMessage('NO WEAPON', 'status');
       this.events.push('empty');
       return;
     }
@@ -1810,7 +1835,7 @@ export class LocalDriver implements HostDriver {
     this.raising = false;
     this.firing = false;
     this.gunframe = this.dropBounds.idle + 1; // DEACTIVATE_FIRST
-    this.setMessage(classname.replace(/_/g, ' '));
+    this.setMessage(classname.replace(/_/g, ' '), 'status');
     this.events.push('weapon');
   }
 
@@ -2320,7 +2345,10 @@ export class LocalDriver implements HostDriver {
     this.exited = false;
     this.finishShown = false;
     SV_ClearFinished(this.server);
+    // New life, clear screen: the kind resets to cosmetic 'status' with it
+    // (a stale death 'alert' must never leak into the next life's gating).
     this.message = '';
+    this.messageKind = 'status';
     this.events.push('respawn');
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
   }
@@ -2367,7 +2395,7 @@ export class LocalDriver implements HostDriver {
       }
       this.syncAmmo();
       this.events.push('pickup');
-      this.setMessage(c.replace(/_/g, ' '));
+      this.setMessage(c.replace(/_/g, ' '), 'status');
       // Real pak pickup sound (C g_items.c pickup_sound, incl. the suits).
       this.emitSound('items/pkup.wav', v3(px, py, pz));
       // New guns switch through the unified selectWeapon lower/raise (never
@@ -2833,14 +2861,14 @@ export class LocalDriver implements HostDriver {
       rand: this.rand,
     });
     if (!res.fired) {
-      this.setMessage('NO AMMO');
+      this.setMessage('NO AMMO', 'status');
       this.events.push('empty');
       this.lastShotAt = t;
       return;
     }
     if (this.weapon.ammoKind) this.setAmmo(this.weapon.ammoKind, res.ammoLeft);
     this.lastShotAt = t;
-    this.setMessage('');
+    this.setMessage('', 'status');
     this.events.push('shot');
     if (res.bolt) this.events.push('bolt');
     // Weapon_Generic-lite: firing starts at FIRE_FIRST (activate+1); the
@@ -4880,6 +4908,19 @@ export function posVisible(): boolean {
   return Number(raw) !== 0;
 }
 
+/**
+ * Cvar gate for the transient gameplay status line (`cl_showmessages`,
+ * default 1 = ON). Mirrors dom.showMessagesEnabled without importing the
+ * DOM layer (this module is headless-safe; dom.ts imports from here, never
+ * the reverse). Death ('alert' kind), the finished screen, and
+ * loading/fallback warnings never consult this gate.
+ */
+export function messagesVisible(): boolean {
+  if (getCVar('cl_showmessages') === undefined) return true;
+  const raw = getCVar('cl_showmessages');
+  return Number(raw) !== 0;
+}
+
 /** Round to 1 decimal, normalising -0 to 0 for stable reports. */
 function r1(v: number): string {
   const r = Math.round(v * 10) / 10;
@@ -5212,7 +5253,9 @@ export function toggleHelpOverlay(boot: PlayBoot): boolean {
  * The play canvas shows world + crosshair + weapon/ammo + hp + message
  * (+ the devroom hint and death bars) + the in-canvas `fps N` counter
  * top-right (gated by `cl_showfps`) + the in-canvas player-position readout
- * top-left (gated by `cl_showpos`, default ON). Both readouts use conchars
+ * top-left (gated by `cl_showpos`, default ON) + the transient gameplay
+ * status line (gated by `cl_showmessages`, default ON — cosmetic 'status'
+ * one-liners only; death/finish always draw). Both readouts use conchars
  * glyphs (`drawString`), drawn in this same pre-blit HUD pass — after the
  * `r_brightness` scene lift — so they keep their authored colours exactly
  * like the crosshair. `hud.fps` feeds the fps counter; `hud.frame` is
@@ -5281,8 +5324,15 @@ export function drawPlayHud(
       drawString(target, line.x, line.y, line.text, FINISH_BLUE);
     }
   } else if (boot.driver.message) {
-    const msg = boot.driver.message.slice(0, 48);
-    drawString(target, 8, target.height - 30, msg, 0xffffff00);
+    // RELEASE-11 `cl_showmessages`: skip ONLY the transient cosmetic status
+    // line (kind 'status') when the cvar is 0. Death ('alert') always draws;
+    // the finished screen above never consults this gate. Draw-only: the
+    // string, events and stats still update while hidden, and toggling
+    // applies immediately (cvar read per frame, no reboot).
+    if (messagesVisible() || boot.driver.messageKind !== 'status') {
+      const msg = boot.driver.message.slice(0, 48);
+      drawString(target, 8, target.height - 30, msg, 0xffffff00);
+    }
   }
   // F1 help-computer overlay (toggled by the F1 key, asset bg + layout rows).
   if (boot.showHelp) drawHelpOverlay(target, boot);

@@ -280,7 +280,7 @@ FAIL and a proposed, unapproved tone-normalized threshold. Reopen acceptance;
 no threshold change is authorized. Historical full verify was reported 78/80,
 and deps:check 676 passed after the sound/config fix; neither was rerun here.
 
-Priority (2026-10-31: RELEASE-7/RELEASE-6/RELEASE-9/3B done + archived; RELEASE-4 boxes 1–2 landed, box 3 blocked on map-truth prerequisite; next): RELEASE-10 → RELEASE-11 → R9F-1..8,
+Priority (2026-10-31: RELEASE-7/6/9/10/11/3B done + archived; RELEASE-4 boxes 1–2 landed, box 3 blocked on map-truth prerequisite; next): R9F-1..8,
 then FOLLOW-5/6/7. Independent cards can proceed with disjoint ownership.
 Claim one card; preserve software goldens and sky/lifecycle behavior. Expensive
 validation runs sequentially. Require actual production-path regressions and
@@ -299,15 +299,6 @@ done-when:
 - [x] Reproduce approach and blocked boarding through normal movement, identify exact brush/entity blocking the player trace (fraction/startsolid/allsolid, model, origin, bounds, solid flags). Compare rendered door/platform pose with authoritative collision transform and target chain; inspect retained *31 plug and surrounding sliders without assuming which is responsible.
 - [x] Repair stale/incorrect collision, activation or geometry state against map/original behavior; never disable all mover collision or teleport the player to pass the test.
 - [ ] Extend real-base1 gate to walk from outside through the doorway, board, operate intended control, ride and finish. Assert no invisible obstruction and no premature departure; capture the complete route. Tests starting on the platform do not close boarding acceptance.
-
-### RELEASE-11 — Toggle gameplay status messages
-owns: `apps/web`, `packages/config`
-depends: none
-status: ready
-done-when:
-- [ ] Add a clearly named persisted on/off option for transient gameplay status text such as “soldier minced.” Trace all relevant message producers/presentation paths; user describes these as blue, so do not filter by color alone.
-- [ ] Apply changes immediately without reboot, independently of FPS/position, F1/help, HUD and intermission. Preserve essential errors/loading/fallback warnings; hiding cosmetic text must not alter gameplay events or statistics.
-- [ ] Test toggling during an active message, subsequent events, reload persistence and both renderers/resolutions.
 
 ### R9F-1 — Looped speaker ambience has no audio event
 owns: `packages/server` (`apps/web` consumes)

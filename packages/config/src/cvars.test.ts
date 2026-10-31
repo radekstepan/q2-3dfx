@@ -72,6 +72,17 @@ describe('cvar registry', () => {
     registerCVar('x_new', 9, 'doc');
     expect(getCVarNumber('x_new')).toBe(7);
   });
+
+  it('RELEASE-11 cl_showmessages defaults ON and resets to ON', () => {
+    expect(getCVarNumber('cl_showmessages')).toBe(1);
+    expect(getCVarBool('cl_showmessages')).toBe(true);
+    setCVar('cl_showmessages', 0);
+    expect(getCVarNumber('cl_showmessages')).toBe(0);
+    resetCVars();
+    expect(getCVarNumber('cl_showmessages')).toBe(1);
+    const def = listCVars().find((c) => c.name === 'cl_showmessages')!;
+    expect(def.doc.length).toBeGreaterThan(0);
+  });
 });
 
 describe('RELEASE-1 quiet volume scale (config side)', () => {
