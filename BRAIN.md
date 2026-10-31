@@ -348,7 +348,7 @@ depends: none
 status: in-progress(@opencode)
 starting-points: `play.ts: drawPlayHud`, browser F1/menu handler, pak `pics/` and original client screen/layout code
 review-finding: current HUD draws text such as `hp` and weapon classname; completion uses a custom text block.
-lane-2026-10-30 (@opencode): formats+client lane DONE (formats 29/29, client 83/83, Q2_PAK real-art verified, no §5 change); apps/web drawPlayHud replacement + F1 wiring + testkit coverage still open for integrator.
+lane-2026-10-30 (@opencode): formats+client lane DONE + testkit lane DONE (35/35, 79-pic manifest noted vs 78 task text); apps/web drawPlayHud replacement + F1 wiring still open for integrator.
 done-when:
 - [ ] Compare startup/F1 help, health/ammo/armor and level-completion/intermission layout with original game assets and layout semantics. Inventory required pak pictures/fonts and stats; implement the appropriate asset-based screens instead of placeholder styling.
 - [ ] Preserve readable asset-free devroom fallback and distinguish game HUD from optional FPS/position diagnostics. Verify real assets, values, transparency, scaling and placement at 640×480 and 1024×768, including death and level completion.
@@ -380,7 +380,7 @@ depends: GPU-FOLLOW-3A
 status: in-progress(@opencode)
 starting-points: `shaders.ts: FS_LIT/voodooWarp`, world UVs, diffuse mip generation/sampling
 review-finding: `2c4c162` only added formula tests; no shader repair or sampled-pixel diagnostic landed. LOD/lightmap cause is unproven; the prior TODO claiming diagnostics established it is withdrawn.
-lane-2026-10-30 (@opencode): webgl-renderer lane DONE (water-seam 16/1skip, full pkg 151pass, typecheck clean; LOD-unwarped + highp fix, warp/scale/REPEAT/lighting intact); apps/web stationary/moving captures + testkit coverage still open for integrator.
+lane-2026-10-30 (@opencode): webgl-renderer lane DONE + testkit lane DONE (water-pixels real-WebGL: wrap 0.0207 < anim 4x, overlap 0.43, det 0); apps/web stationary/moving captures still open for integrator.
 done-when:
 - [ ] Preserve the now-satisfactory water motion. Reproduce the remaining visible tile seams in real water; record map, camera, material, time and crops. Distinguish texture-repeat boundaries from BSP-face/lightmap seams and warp/LOD/precision effects using fixed-time, fixed-LOD and diffuse/unlit diagnostics. Compare adjacent faces at the same world position and the CPU/reference appearance. Record the demonstrated cause before changing the algorithm.
 - [ ] Fix that cause while retaining animated turbulence, intended texture scale, repeat behavior and transparent/depth ordering. Check original versus resized texture dimensions and derivatives if implicated. Do not mask seams by disabling warp, lighting or mipmapping, or globally blurring water.
