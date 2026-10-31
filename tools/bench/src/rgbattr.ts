@@ -1,7 +1,11 @@
-// q2-bench RGB attribution (PERF-1): reproducible BEFORE/AFTER harness for
-// PERF-2 (indexed/RGB + parallel RGB) and PERF-3 (reconstruction/pack/gamma).
+// q2-bench software attribution (PERF-1): reproducible BEFORE/AFTER harness
+// for engine + pool changes. RELEASE-8 retired the legacy CPU Voodoo
+// execution legs — this matrix is software-only; the `rgb` mode below is
+// retained only so explicit configs and old run JSONs still typecheck and
+// compare (no new rgb rows are produced). Policy tables live in
+// webgl-renderer/appearance.ts (other lanes own packages/voodoo).
 //
-// What it measures, per (resolution, scene, entity-set, mode, workers):
+// What it measures, per (resolution, scene, entity-set, workers):
 //   - INSTRUMENTED attribution: renderView GEO split via
 //     SoftwareRenderer.testMeasurePhases (setup / mark / traverse / cull /
 //     cache / project / emit / sort — reused, no renderer changes) + DRAW +
@@ -142,9 +146,15 @@ export const RGB_ATTR_SCENES = ['devroom', 'spawn-north', 'trench-east'] as cons
 export type RgbAttrScene = (typeof RGB_ATTR_SCENES)[number];
 export type RgbAttrEntities = 'none' | 'fixed' | 'combat';
 export const RGB_ATTR_ENTS: RgbAttrEntities[] = ['none', 'fixed', 'combat'];
+/**
+ * Bench render mode. RELEASE-8 retired the `rgb` (CPU Voodoo execution)
+ * legs: new matrices run `software` only. `rgb` stays in the union so
+ * explicit single configs (e.g. the pak-gated moving probe) and old run
+ * JSONs still load — it must not reappear in any default matrix or gate.
+ */
 export type RgbAttrMode = 'software' | 'rgb';
 
-/** Fixed vd_* + sw_* profile for every PERF-1 run (serial, voodoo look). */
+/** Fixed vd_* + sw_* profile for every PERF-1 run (software reference). */
 export function pinPerfCvars(): void {
   resetCVars();
   setCVar('sw_workers', 0);
@@ -1559,7 +1569,9 @@ export async function runRgbAttr(pakPath: string, opts: RgbAttrOptions = {}): Pr
   for (const [W, H] of RGB_ATTR_RESS) {
     for (const scene of scenes) {
       for (const ent of ents) {
-        for (const mode of ['software', 'rgb'] as const) {
+        // RELEASE-8: software-only. The `rgb` (CPU Voodoo execution) legs
+        // are retired — no new rgb rows are produced here.
+        for (const mode of ['software'] as const) {
           for (const workers of workerSets) {
             rows.push(await runAttrConfig(fw, scene, W, H, ent, mode, workers, warmup, reps));
           }
@@ -1573,10 +1585,11 @@ export async function runRgbAttr(pakPath: string, opts: RgbAttrOptions = {}): Pr
     commit = cp.execSync('git rev-parse --short HEAD', { encoding: 'utf8' }).trim();
   } catch { /* offline */ }
   const machine = await machineJson().catch(() => ({ node: process.version }));
-  // Cross-mode self-check per (scene, res, entities, workers): the RGB
-  // composite must change at least one pixel (color differs) AND the RGB
-  // execution proof must hold (used + cover) or the row is not a real RGB
-  // run. NOTE: software-vs-RGB idx identity is NOT required — under the
+  // Cross-mode self-check per (scene, res, entities, workers): skipped for
+  // software-only runs (RELEASE-8 retired the rgb legs, so there is no rgb
+  // twin to compare against). Only applies when a caller explicitly mixes
+  // software + rgb configs in one run.
+  // NOTE: software-vs-RGB idx identity is NOT required — under the
   // default-on RGB-authoritative skip the classic index plane is
   // intentionally not drawn (stale by design); idx is reported for
   // information only. Serial-vs-pooled full-RGBA parity below is the real
@@ -1589,8 +1602,13 @@ export async function runRgbAttr(pakPath: string, opts: RgbAttrOptions = {}): Pr
     else byKey.set(k, [row]);
   }
   for (const [k, pair] of byKey) {
-    const a = pair.find((r) => r.mode === 'software')!;
-    const b = pair.find((r) => r.mode === 'rgb')!;
+    const a = pair.find((r) => r.mode === 'software');
+    const b = pair.find((r) => r.mode === 'rgb');
+    // RELEASE-8: software-only runs have no rgb twin — skip (not a failure).
+    if (!a || !b) {
+      console.log(`check ${k}: software-only (rgb legs retired RELEASE-8, no cross-mode twin)`);
+      continue;
+    }
     const idxNote = a.idxHash === b.idxHash ? 'IDENTICAL' : 'DIFFERS (expected under authoritative skip: classic idx not drawn)';
     const colorDiff = a.colorHash !== b.colorHash;
     const proofOk = b.rgbUsed && b.rgbCover > 0;

@@ -1,4 +1,6 @@
-// Committed PERF-1 bench runner: reproducible RGB attribution for PERF-2/3.
+// Committed PERF-1 bench runner: reproducible software attribution.
+// RELEASE-8 retired the CPU Voodoo (rgb) legs — this matrix is software-only
+// (the file/env names keep the RGB_* prefix for continuity).
 // Also writes the full run JSON + a durable evidence manifest (PERF-NEXT-1).
 // Run: Q2_PAK=/path/to/pak0.pak yarn bench:rgb
 // Env: RGB_BENCH_REPS (default 10), RGB_BENCH_WARMUP (default 3),

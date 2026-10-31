@@ -1,5 +1,7 @@
 // Committed item-9 budget gate: warmed, repeated, uninstrumented production
-// frames on the documented reference config (640x480 spawn-north).
+// frames on the documented reference config (640x480 spawn-north, software).
+// RELEASE-8: gate A (software fixed serial) only — the rgb gates B/C
+// retired with the CPU Voodoo legs.
 // Run: Q2_PAK=/path/to/pak0.pak yarn bench:accept
 // Env: RGB_ACCEPT_WARMUP (default 5), RGB_ACCEPT_REPS (default 10),
 //   RGB_ACCEPT_WORKERS (default "0,1,3,7").

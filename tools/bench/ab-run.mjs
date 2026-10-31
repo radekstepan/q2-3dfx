@@ -2,8 +2,8 @@
 // back-to-back interleaved on the same box, one process, shared thermals.
 // Run: Q2_PAK=/path/to/pak0.pak yarn bench:ab
 // Env: AB_A / AB_B leg specs "scene,res,entities,mode,workers"
-//   (defaults A "spawn-north,640x480,combat,rgb,7",
-//    B "spawn-north,640x480,combat,rgb,3"),
+//   (defaults A "spawn-north,640x480,combat,software,7",
+//    B "spawn-north,640x480,combat,software,3" — RELEASE-8 retired rgb),
 //   AB_WARMUP (default 3), AB_REPS (default 5),
 //   AB_OUT (default tools/bench/evidence/raw/node-ab-<commit>-<ts>.json),
 //   AB_MANIFEST_OUT (default tools/bench/evidence/node-ab-<commit>-<ts>.manifest.json).

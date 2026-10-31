@@ -7,8 +7,8 @@
 // INSTRUMENTED attribution (attributeView: testMeasurePhases medians) vs
 // UNINSTRUMENTED totals (poolCompareView: whole begin+render+end loops
 // timed together per rep — never summed medians). Software path only;
-// the RGB production frame (fused resolveFrame / pooled flushScanout)
-// lives in rgbattr.ts.
+// RELEASE-8 retired the rgb production legs (the rgbattr rgb code path is
+// retained for explicit configs and old run JSONs only).
 import { readFileSync, existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { loadBsp } from '@q2/bsp';

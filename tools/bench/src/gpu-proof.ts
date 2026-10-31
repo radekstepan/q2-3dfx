@@ -293,7 +293,9 @@ function gpuProofFind(
 
 /**
  * Node CPU baseline summary over stationary rows: acceptance-config medians
- * (640×480 software fixed serial, rgb fixed serial, rgb combat pooled-max).
+ * (640×480 software fixed serial; the rgb fixed-serial / rgb combat-pooled
+ * fields are legacy — RELEASE-8 retired the rgb legs, so new software-only
+ * runs yield nulls there while old run JSONs still summarize).
  * Logic duplicated by value from summarizeAttrRows (tools/bench/src/evidence.ts)
  * so this module keeps zero runtime imports (no import cycle risk).
  *

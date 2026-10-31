@@ -7,7 +7,8 @@ export interface BenchOptions {
   width?: number;
   height?: number;
   iterations?: number;
-  path?: 'software' | 'voodoo';
+  // RELEASE-8: software only (the legacy `voodoo` label retired with the legs).
+  path?: 'software';
   notes?: string;
 }
 

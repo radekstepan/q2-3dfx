@@ -14,10 +14,13 @@
 // verification, output parity, per-leg execution proof).
 //
 // Env: AB_A / AB_B leg specs "scene,res,entities,mode,workers"
-//   (defaults: A "spawn-north,640x480,combat,rgb,7",
-//    B "spawn-north,640x480,combat,rgb,3"),
+//   (defaults: A "spawn-north,640x480,combat,software,7",
+//    B "spawn-north,640x480,combat,software,3"),
 //   AB_WARMUP (default 3), AB_REPS (default 5),
 //   AB_OUT / AB_MANIFEST_OUT (evidence paths).
+// RELEASE-8: the `rgb` (CPU Voodoo execution) legs are retired —
+// parseABLegSpec normalizes an explicit `rgb` mode to `software` (old run
+// JSONs still load; no new rgb legs are produced).
 import { createFramebuffer } from '@q2/renderer-api';
 import type { Entity } from '@q2/renderer-api';
 import { setCVar } from '@q2/config';
@@ -63,7 +66,10 @@ export interface ABLegSpec {
 /** Parse one AB leg spec (order-preserving, clamped workers 0..8). */
 export function parseABLegSpec(raw: string | undefined, fallback: string): ABLegSpec {
   const parts = (raw ?? fallback).split(',').map((s) => s.trim());
-  const [sceneRaw = '', resRaw = '', entRaw = '', modeRaw = '', workersRaw = ''] = parts;
+  // (the 4th field, mode, is retired: RELEASE-8 runs software only —
+  // see `mode` below; the field is still consumed positionally so old
+  // "scene,res,entities,mode,workers" specs keep parsing).
+  const [sceneRaw = '', resRaw = '', entRaw = '', , workersRaw = ''] = parts;
   const scene: RgbAttrScene = (RGB_ATTR_SCENES as readonly string[]).includes(sceneRaw)
     ? (sceneRaw as RgbAttrScene) : 'spawn-north';
   const m = /^(\d+)x(\d+)$/.exec(resRaw);
@@ -71,7 +77,10 @@ export function parseABLegSpec(raw: string | undefined, fallback: string): ABLeg
   const height = m ? Number(m[2]) : 480;
   const entities: RgbAttrEntities = (RGB_ATTR_ENTS as readonly string[]).includes(entRaw)
     ? (entRaw as RgbAttrEntities) : 'combat';
-  const mode: RgbAttrMode = modeRaw === 'software' ? 'software' : 'rgb';
+  // RELEASE-8: CPU Voodoo execution retired — an explicit `rgb` mode falls
+  // back to `software` (never a void leg; old specs keep working). Kept
+  // log-free: this parser is pure (see ab.test.ts).
+  const mode: RgbAttrMode = 'software';
   const w = Math.floor(Number(workersRaw));
   const workers = Number.isFinite(w) ? Math.min(8, Math.max(0, w)) : 0;
   return { scene, width, height, entities, mode, workers };
@@ -153,8 +162,16 @@ function buildLeg(fw: RgbAttrWorld, spec: ABLegSpec, tag: string): BuiltLeg {
 export async function runInterleavedAB(pakPath: string, opts: {
   specA?: ABLegSpec; specB?: ABLegSpec; warmup?: number; reps?: number;
 } = {}): Promise<{ evidence: ABPairEvidence; specA: ABLegSpec; specB: ABLegSpec }> {
-  const specA = opts.specA ?? parseABLegSpec(process.env.AB_A, 'spawn-north,640x480,combat,rgb,7');
-  const specB = opts.specB ?? parseABLegSpec(process.env.AB_B, 'spawn-north,640x480,combat,rgb,3');
+  const specA = opts.specA ?? parseABLegSpec(process.env.AB_A, 'spawn-north,640x480,combat,software,7');
+  const specB = opts.specB ?? parseABLegSpec(process.env.AB_B, 'spawn-north,640x480,combat,software,3');
+  // RELEASE-8: the parser already normalizes env specs; this covers
+  // programmatically-passed legs (no new rgb legs from any caller).
+  for (const s of [specA, specB]) {
+    if (s.mode === 'rgb') {
+      console.log('ab-run: leg mode "rgb" retired RELEASE-8 — running the software leg instead');
+      s.mode = 'software';
+    }
+  }
   const warmup = opts.warmup ?? Number(process.env.AB_WARMUP ?? 3);
   const reps = opts.reps ?? Number(process.env.AB_REPS ?? 5);
   const commit = await gitCommit();

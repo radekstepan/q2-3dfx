@@ -4,8 +4,9 @@
 // production host render (host.renderCurrentView: predicted entities +
 // monsters + extraEntities + eye-anchored depthHack viewmodel gun — the
 // exact submit the shipped sync rAF tick renders), production scanout
-// (resolveDisplay: serial fused scanout in Node; pre-scanout HUD in strict
-// voodoo, exactly like dom.ts finishFrame), HUD/conchars blits, and the
+// (resolveDisplay: serial fused scanout in Node; the strict-voodoo
+// pre-scanout HUD path retired with the voodoo legs, RELEASE-8),
+// HUD/conchars blits, and the
 // canvas-upload copy loop estimate. Headless-safe (no DOM); run with Q2_PAK
 // like the frame bench.
 //
@@ -14,7 +15,8 @@
 // frameMs: whole production frames (step+pumps+render+endFrame+
 // resolveDisplay+HUD+blit-copy) measured TOGETHER per rep in a separate
 // loop — never a sum of stage medians. Env: PLAYBENCH_RENDERER
-// (software|voodoo, default voodoo — the scanout under test),
+// (software|webgl2-experimental — RELEASE-8 retired the voodoo default;
+// the software path is the scanout under test),
 // PLAYBENCH_W/H, PLAYBENCH_ITERS.
 import { readFileSync } from 'node:fs';
 import { getCVarString, resetCVars, setCVar, setCVarFromString } from '@q2/config';
@@ -77,7 +79,8 @@ function nowMs(): number {
 export function playBench(pakPath: string, W = 640, H = 480, iters = 10): PlayBenchRow {
   resetCVars();
   setCVar('vid_resolution', `${W}x${H}`);
-  const renderer = process.env.PLAYBENCH_RENDERER ?? 'voodoo';
+  // RELEASE-8: voodoo retired — default to the software scanout under test.
+  const renderer = process.env.PLAYBENCH_RENDERER ?? 'software';
   setCVarFromString('vid_renderer', renderer);
   const pakBytes = readFileSync(pakPath);
   const buf = pakBytes.buffer.slice(

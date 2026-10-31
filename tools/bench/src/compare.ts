@@ -21,8 +21,8 @@
 //   - moving:     spawn-north with a deterministic yaw sweep (2 deg/rep,
 //                 pure function of the rep index — identical across builds,
 //                 so per-frame hashes stay comparable) + combat entities.
-// Modes: software (no scanout stage) + rgb (fused resolveFrame serial /
-// pooled flushScanout production legs). Workers: COMPARE_WORKERS "0,1,3,7".
+// Modes: software only (RELEASE-8 retired the CPU Voodoo `rgb` legs).
+// Workers: COMPARE_WORKERS "0,1,3,7".
 //
 // Full-channel comparisons everywhere: index FNV + full-RGBA color FNV +
 // full-RGBA display FNV (legacy R+G kept for ledger continuity only).
@@ -496,9 +496,10 @@ export async function runComparisonMatrix(pakPath: string): Promise<CompareRun> 
   for (const line of describeWorkerSweep(workers, 480)) console.log(`compare-run: sweep ${line}`);
   const fw = loadRgbAttrWorld(pakPath);
   const stationary: AttrRow[] = [];
+  // RELEASE-8: software-only (rgb legs retired).
   for (const [W, H] of [[320, 240], [640, 480]] as Array<[number, number]>) {
     for (const ent of ['fixed', 'combat'] as const) {
-      for (const mode of ['software', 'rgb'] as const) {
+      for (const mode of ['software'] as const) {
         for (const w of workers) {
           stationary.push(await runAttrConfig(fw, 'spawn-north', W, H, ent, mode, w, warmup, reps));
         }
@@ -507,7 +508,7 @@ export async function runComparisonMatrix(pakPath: string): Promise<CompareRun> 
   }
   const moving: MovingRow[] = [];
   for (const [W, H] of [[320, 240], [640, 480]] as Array<[number, number]>) {
-    for (const mode of ['software', 'rgb'] as const) {
+    for (const mode of ['software'] as const) {
       for (const w of workers) {
         moving.push(await runMovingConfig(fw, W, H, mode, w, warmup, reps, yawStepDeg));
       }

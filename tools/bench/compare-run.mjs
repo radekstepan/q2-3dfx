@@ -1,5 +1,6 @@
 // Controlled-comparison run: sequential quiet-machine matrix, one JSON out
-// plus a durable evidence manifest (PERF-NEXT-1).
+// plus a durable evidence manifest (PERF-NEXT-1). RELEASE-8: software-only
+// (rgb legs retired).
 // Run: Q2_PAK=/path/to/pak0.pak yarn bench:compare-run
 // Env: COMPARE_WARMUP (default 3), COMPARE_REPS (default 5),
 //   COMPARE_WORKERS (default "0,1,3,7"), COMPARE_YAWSTEP (default 2),

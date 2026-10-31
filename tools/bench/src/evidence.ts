@@ -390,7 +390,8 @@ function findAttr(
 
 /**
  * Small committed summary over stationary rows: acceptance-config medians
- * (640x480 software fixed serial, rgb fixed serial, rgb combat pooled-max)
+ * (640x480 software fixed serial, plus legacy rgb fields for old runs —
+ * null on software-only runs since RELEASE-8 retired the rgb legs)
  * plus row count. 320x240 rows are diagnostic-only and excluded by design.
  */
 export function summarizeAttrRows(rows: ReadonlyArray<AttrLike>): Record<string, string | number | boolean | null> {
@@ -414,7 +415,8 @@ export function summarizeCompare(
 ): Record<string, string | number | boolean | null> {
   const out: Record<string, string | number | boolean | null> = summarizeAttrRows(stationary);
   for (const m of moving) {
-    if (m.res === '640x480' && m.mode === 'rgb') {
+    // RELEASE-8: software only (rgb moving legs retired).
+    if (m.res === '640x480' && m.mode === 'software') {
       out[`moving640-${m.mode}-w${m.workers}`] = med(m.frameMs);
     }
   }
@@ -429,9 +431,13 @@ export function ledgerHintFor(
   const date = new Date().toISOString().slice(0, 10);
   const fmt = (v: string | number | boolean | null): string =>
     typeof v === 'number' ? `${v.toFixed(2)}ms` : 'n/a';
+  // RELEASE-8: voodoo (rgb) legs retired — their fields read n/a on new
+  // runs. The docs lane owns docs/perf-ledger.md rows; this hint is the
+  // bench lane's retirement note (do NOT edit the ledger from here).
   return (
     `| ${date} | ${commitShort} | ${kind} | 640x480 sw-fixed-serial ${fmt(summary['swFixedSerial640'])} ` +
     `rgb-fixed-serial ${fmt(summary['rgbFixedSerial640'])} rgb-combat-pooled ${fmt(summary['rgbCombatPooled640'])} ` +
+    `(voodoo legs retired RELEASE-8; sw-only) ` +
     `| evidence: ${manifestPath} |`
   );
 }
@@ -478,7 +484,9 @@ export function validateBrowserSoak(v: unknown): { ok: boolean; errors: string[]
   if (h === null || !Number.isInteger(h) || h <= 0) errors.push('height must be a positive int');
   const res = str('resolution');
   if (w !== null && h !== null && res !== `${w}x${h}`) errors.push(`resolution must match width/height (${w}x${h})`);
-  if (str('renderer') === null) errors.push('renderer required (software|voodoo)');
+  // RELEASE-8: `voodoo` retired as a bench renderer id (kept accepted for
+  // old records); new legs are `software` (Node) or `webgl2-experimental`.
+  if (str('renderer') === null) errors.push('renderer required (software|webgl2-experimental; legacy voodoo accepted for old records)');
   const workers = r['workers'];
   if (!Array.isArray(workers) || workers.length === 0 ||
     !workers.every((x) => typeof x === 'number' && Number.isInteger(x) && x >= 0 && x <= 8)) {

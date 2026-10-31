@@ -596,7 +596,11 @@ const manifestPaths = [];
 const legReports = [];
 
 for (const renderer of LEGS) {
-  if (!['software', 'voodoo', 'webgl2-experimental'].includes(renderer)) {
+  if (renderer === 'voodoo') {
+    log(`leg ${renderer}: retired RELEASE-8 (CPU Voodoo execution removed) — skipped`);
+    continue;
+  }
+  if (!['software', 'webgl2-experimental'].includes(renderer)) {
     log(`leg ${renderer}: unknown renderer id — skipped`);
     continue;
   }

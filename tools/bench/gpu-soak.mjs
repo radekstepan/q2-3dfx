@@ -13,14 +13,15 @@
 // per-interval screenshots, GL_RENDERER capture, refresh/vsync probing.
 //
 // Legs: software (SwiftShader CPU default baseline), webgl2-experimental
-// (hardware GL gate leg), optional voodoo CPU leg (GPU_SOAK_LEGS).
+// (hardware GL gate leg). RELEASE-8: the `voodoo` CPU leg is retired —
+// requesting it is skipped with a note (old evidence still loads).
 // CPU legs import via the existing importBrowserSoak; the GPU leg is
 // validated with validateGpuProofBrowserRecord + formatGpuProofGateReport.
 // Software-emulated numbers are NEVER presented as a gate pass.
 //
 // Env:
 //   Q2_PAK (required — skip otherwise), CHROMIUM_BIN (default /usr/bin/chromium),
-//   GPU_SOAK_LEGS (default 'software,webgl2-experimental'; add ',voodoo'),
+//   GPU_SOAK_LEGS (default 'software,webgl2-experimental'; `voodoo` retired RELEASE-8),
 //   GPU_SOAK_WARMUP_S (default 20), GPU_SOAK_INTERVAL_S (default 100),
 //   GPU_SOAK_OUT (default tools/bench/evidence/raw),
 //   GPU_SOAK_VITE_PORT (default 5191), GPU_SOAK_LOG (default <out>/gpu-soak-<stamp>.log).
@@ -590,7 +591,11 @@ const manifestPaths = [];
 let gpuGateText = null;
 
 for (const renderer of LEGS) {
-  if (!['software', 'voodoo', 'webgl2-experimental'].includes(renderer)) {
+  if (renderer === 'voodoo') {
+    log(`leg ${renderer}: retired RELEASE-8 (CPU Voodoo execution removed) — skipped`);
+    continue;
+  }
+  if (!['software', 'webgl2-experimental'].includes(renderer)) {
     log(`leg ${renderer}: unknown renderer id — skipped`);
     continue;
   }

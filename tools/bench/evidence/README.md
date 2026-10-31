@@ -96,7 +96,7 @@ different records — never diffed against each other.
 To store a browser baseline, hand the importer a soak JSON:
 
 ```bash
-BROWSER_SOAK_IN=./soak-640-voodoo-w7.json yarn bench:browser-soak
+BROWSER_SOAK_IN=./soak-640-sw-w7.json yarn bench:browser-soak
 ```
 
 Soak schema (`BrowserSoakRecord`, validated — the importer exits 1 on
@@ -109,7 +109,7 @@ violation):
 | `compositorDetail` | e.g. the `GL_RENDERER` string, so the class is auditable |
 | `hardwareBacked` | `true` only for real-GPU presentation; must agree with `compositor` |
 | `resolution/width/height` | must agree with each other (640×480 for acceptance) |
-| `renderer`, `workers`, `workloads` | voodoo/software, worker sweep, intervals covered |
+| `renderer`, `workers`, `workloads` | software/webgl2-experimental (legacy voodoo accepted for old records), worker sweep, intervals covered |
 | `durationS ≥ 300`, `samples` | soak length (≥5 min) + presented-frame count |
 | `presentedFpsMedian`, `frameP50Ms/P95Ms/MaxMs` | percentiles (numbers or null) |
 | `fidelity`, `warmupS`, `pak`, `machineDetail` (optional) | FOLLOW-1 provenance: pinned vd_* + sw_* profile, warmup seconds, pak identity, host machine — absent stays null with a `limitations` entry, never a fabricated default |

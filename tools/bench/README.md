@@ -16,22 +16,26 @@ const row = await runBenchTool({ width: 640, height: 480, iterations: 60, path: 
 // | date | commit | path | res | fps | Mpixel/s | overdraw | notes |
 ```
 
-## RGB attribution bench (PERF-1)
+## Software attribution bench (PERF-1)
 
-Reproducible BEFORE/AFTER harness for PERF-2 (indexed/RGB + parallel RGB)
-and PERF-3 (reconstruction/pack/gamma). No renderer changes — attribution
+RELEASE-8 retired the CPU Voodoo (rgb) execution legs — this harness is
+software-only. File/env names keep the `RGB_*` prefix for continuity; no
+new rgb rows are produced.
+
+Reproducible BEFORE/AFTER harness for engine + pool changes. No renderer — attribution
 only, so PERF-2/3 can prove wins against it.
 
 - `src/rgbattr.ts` — `runRgbAttr(pakPath, { warmup?, reps?, scenes?,
   entities?, workers? })`. Per (320×240 + 640×480) × (devroom +
   spawn-north + trench-east) × (entities none/fixed/combat) ×
-  (software/RGB) × workers: renderView GEO split
+  software × workers: renderView GEO split
   (setup/mark/traverse/cull/cache/project/emit/sort via
   `testMeasurePhases`, reused) + DRAW + alias medians + p95, endFrame wall
-  time (hrtime), voodoo resolve split on the produced frame via live
-  `@q2/voodoo` API (`resolveRGB565` pack vs `applyReconstruction2x2` recon
-  vs `applyDisplayGamma` gamma), index-plane FNV + color-plane R+G FNV
-  hashes (same scheme as `src/frame.ts`).
+  time (hrtime), index-plane FNV + color-plane R+G FNV
+  hashes (same scheme as `src/frame.ts`) + full-RGBA `hashColorFull` parity
+  authority. The legacy Voodoo resolve split (pack vs recon vs gamma) and
+  the pooled/serial scanout legs retired with the rgb mode; `runAttrConfig`
+  keeps the code path so explicit rgb configs and old run JSONs still load.
 - INSTRUMENTED (testMeasurePhases medians, stage probes) vs UNINSTRUMENTED
   (full production frames measured TOGETHER per rep — `frameMs`, never a
   sum of medians). The production scanout is `resolveFrame` serial, or
@@ -79,7 +83,7 @@ never concurrent across agents:
   pak identity, machine/node/load, fidelity profile, warmup/reps/workers.
 - Copy the file aside, rebuild the other tree, run again, then
   `COMPARE_BASE=compare-base.json COMPARE_HEAD=compare-head.json yarn bench:compare-diff`.
-- Matrix: software + RGB (voodoo) × serial + 1/3/7 workers ×
+- Matrix (RELEASE-8: software-only, rgb legs retired): software × serial + 1/3/7 workers ×
   stationary (spawn-north fixed) + combat (fixed + viewmodel gun + pumped
   dlights) + moving (deterministic 2°/rep yaw sweep, per-frame hashes stay
   comparable) × 320×240 (diagnostic) + 640×480 (acceptance).
@@ -123,8 +127,8 @@ legs share thermal state rep-by-rep). Complements compare-run/compare-diff
 (base-vs-head across builds): this diffs two CONFIGS (workers 7 vs 3,
 pooled vs serial) of the same build.
 
-- `AB_A="spawn-north,640x480,combat,rgb,7"
-  AB_B="spawn-north,640x480,combat,rgb,3" AB_WARMUP=3 AB_REPS=5
+- `AB_A="spawn-north,640x480,combat,software,7"
+  AB_B="spawn-north,640x480,combat,software,3" AB_WARMUP=3 AB_REPS=5
   Q2_PAK=... yarn bench:ab`
   (`AB_OUT` / `AB_MANIFEST_OUT` override the evidence paths; kind
   `node-ab` in the manifest). Leg specs are
@@ -198,13 +202,14 @@ worktree-baseline recipe and the browser-soak schema live in
 Timing-sensitive budget enforcement lives OUTSIDE vitest (correctness-only
 tests are NOT gates): `src/acceptance.ts` + `bench-accept.mjs`.
 
-- Reference config: 640×480 spawn-north, `fixed` + `combat` entity sets,
-  software + RGB, worker sweep `0,1,3,7` (`RGB_ACCEPT_WORKERS`,
+- Reference config: 640×480 spawn-north, `fixed` entity set,
+  software only, worker sweep `0,1,3,7` (`RGB_ACCEPT_WORKERS`,
   `RGB_ACCEPT_WARMUP=5`, `RGB_ACCEPT_REPS=10`).
-- Gates A/B/C: software-fixed-serial, rgb-fixed-serial, and
-  rgb-combat-pooled(max workers) production frames each ≤ 16ms.
-- Gate D (correctness, exit 1): serial/pooled idx+color+display parity on
-  every swept config, odd-dimensions smoke (639×479), dead-pool fallback.
+- Gate A: software-fixed-serial production frame ≤ 16ms. (Gates B/C —
+  rgb-fixed-serial and rgb-combat-pooled — retired RELEASE-8 with the
+  CPU Voodoo legs.)
+- Gate D (correctness, exit 1): serial/pooled idx+color parity on
+  every swept config, software odd-dimensions smoke (639×479).
 - Exit codes: 0 pass, 1 hard failure (stale dist / parity / fallback),
   2 budget miss with the gap printed.
 - Run: `Q2_PAK=... yarn bench:accept` (sequentially, quiet machine).
@@ -231,5 +236,5 @@ byte-identity hashes. Committed here so any agent can re-run it.
 
 ## Constraints
 
-- Dependency direction: `tools/*` are leaves — nothing depends on them. May depend on engine packages for measurement only (`@q2/sw-renderer`, `@q2/bsp`, `@q2/formats`, `@q2/renderer-api`, `@q2/config`, `@q2/testkit`, `@q2/voodoo`).
+- Dependency direction: `tools/*` are leaves — nothing depends on them. May depend on engine packages for measurement only (`@q2/sw-renderer`, `@q2/bsp`, `@q2/formats`, `@q2/renderer-api`, `@q2/config`, `@q2/testkit`, `@q2/voodoo` — voodoo import retained for explicit-rgb/old-row compat; no new rgb legs, RELEASE-8).
 - Platform: Node-only (`process.argv`, `child_process.execSync` for the commit hash, `process.version` fallback in `machineJson`).
