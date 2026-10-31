@@ -10,7 +10,7 @@ import { createRequire } from 'node:module';
 import { existsSync } from 'fs';
 import { NullRefresh, createFramebuffer, devroomWorld } from '@q2/renderer-api';
 import { resetCVars, setCVar } from '@q2/config';
-import { SoftwareRenderer, setRGBWorldEnabled, type BandWorkerPool } from '@q2/sw-renderer';
+import { SoftwareRenderer, type BandWorkerPool } from '@q2/sw-renderer';
 import {
   BENCH_ACCEPT_HEIGHT,
   BENCH_ACCEPT_WIDTH,
@@ -331,21 +331,8 @@ describe.runIf(!!Q2_PAK)('matched 640x480 workloads (Q2_PAK)', () => {
     const bw = loadBenchWorld(buf);
     expect(bw.world.surfaces.length).toBeGreaterThan(0);
 
-    let voodoo: {
-      readVoodooState(): unknown;
-      resolveFrame(color: Uint32Array, dst565: Uint16Array, disp: Uint32Array, w: number, h: number, st: unknown): void;
-    } | null = null;
-    try {
-      const mod = await import('@q2/voodoo');
-      voodoo = {
-        readVoodooState: (mod as { readVoodooState(): unknown }).readVoodooState,
-        resolveFrame: (mod as {
-          resolveFrame(c: Uint32Array, d: Uint16Array, s: Uint32Array, w: number, h: number, st: unknown): void;
-        }).resolveFrame,
-      };
-    } catch {
-      voodoo = null;
-    }
+    // RELEASE-8: raster-only legs (software path has no voodoo scanout
+    // stage). The legacy CPU Voodoo resolve leg is retired.
 
     const W = BENCH_ACCEPT_WIDTH, H = BENCH_ACCEPT_HEIGHT;
     const origin = benchSpawnOrigin();
@@ -357,7 +344,6 @@ describe.runIf(!!Q2_PAK)('matched 640x480 workloads (Q2_PAK)', () => {
       const r = new SoftwareRenderer();
       r.init(fb);
       r.setPalette(bw.palette);
-      setRGBWorldEnabled(true);
       try {
         const yawRad = (yaw * Math.PI) / 180;
         const world = {
@@ -369,34 +355,28 @@ describe.runIf(!!Q2_PAK)('matched 640x480 workloads (Q2_PAK)', () => {
         };
         const fixed = fixedBenchEntities(r, bw, origin, yaw);
         const combat = combatBenchEntities(r, bw, origin, yaw);
-        const stVoodoo = voodoo ? voodoo.readVoodooState() : null;
-        const serialDisp = new Uint32Array(W * H);
-        const serial565 = new Uint16Array(W * H);
-        const scanout = voodoo ? {
-          resolveSerialInto: (color: Uint32Array, display: Uint32Array): void => {
-            voodoo!.resolveFrame(color, serial565, serialDisp, W, H, stVoodoo);
-            display.set(serialDisp);
-          },
-        } : null;
         const stat = measureProductionFrames({
           renderer: r, world, width: W, height: H,
           viewFor: (rep) => benchViewFor('stationary', rep),
           entitiesFor: () => fixed,
-          warmup: 1, reps: 2, scanout,
+          warmup: 1, reps: 2, scanout: null,
         });
         const comb = measureProductionFrames({
           renderer: r, world, width: W, height: H,
           viewFor: (rep) => benchViewFor('combat', rep),
           entitiesFor: (rep) => { pumpBenchLights(r, origin, yaw); return combat; },
-          warmup: 1, reps: 2, scanout,
+          warmup: 1, reps: 2, scanout: null,
         });
         const mov = measureProductionFrames({
           renderer: r, world, width: W, height: H,
           viewFor: (rep) => benchViewFor('moving', rep),
           entitiesFor: (rep) => { pumpBenchLights(r, origin, yaw); return combatBenchEntities(r, bw, origin, yaw); },
-          warmup: 1, reps: 3, scanout,
+          warmup: 1, reps: 3, scanout: null,
         });
-        const cover = comb.stage ? comb.stage.coverPixels : -1;
+        // Indexed renderer: the palette-expanded color plane of the last
+        // (moving-combat) frame carries real texel variety — the
+        // no-empty-scene signal (stage counters retired with the RGB path).
+        const cover = new Set(r.getFramebuffer().color).size;
         console.log(formatProductionEvidence('stationary', stat));
         console.log(formatProductionEvidence('combat', comb));
         console.log(formatProductionEvidence('moving', mov));
@@ -407,7 +387,6 @@ describe.runIf(!!Q2_PAK)('matched 640x480 workloads (Q2_PAK)', () => {
           cover,
         };
       } finally {
-        setRGBWorldEnabled(false);
         resetCVars();
       }
     };
@@ -422,8 +401,8 @@ describe.runIf(!!Q2_PAK)('matched 640x480 workloads (Q2_PAK)', () => {
     expect(a.comb).not.toBe(a.stat);
     // Moving sweep changes the frame across reps.
     expect(new Set(a.mov).size).toBeGreaterThan(1);
-    // Combat uses the RGB path with real coverage (no empty-scene numbers).
-    expect(a.cover).toBeGreaterThan(0);
+    // Combat renders real geometry (no empty-scene numbers).
+    expect(a.cover).toBeGreaterThan(20);
   });
 
   it('serial vs 1-worker pooled: full-RGBA parity + execution proof', { timeout: 300000 }, async () => {
@@ -456,7 +435,6 @@ describe.runIf(!!Q2_PAK)('matched 640x480 workloads (Q2_PAK)', () => {
         if (!pool) throw new Error('pool unavailable (need worker_threads + SAB + Atomics.wait)');
         r.attachWorkerPool(pool);
       }
-      setRGBWorldEnabled(true);
       try {
         const world = { name: 'base1', data: bw.world };
         const combat = combatBenchEntities(r, bw, origin, yaw);
@@ -469,12 +447,14 @@ describe.runIf(!!Q2_PAK)('matched 640x480 workloads (Q2_PAK)', () => {
         const last = e.frames[e.frames.length - 1]!;
         return {
           color: last.colorFull,
-          cover: e.stage ? e.stage.coverPixels : -1,
+          // Indexed renderer: texel variety of the last frame read from the
+          // LIVE framebuffer (pooled mode renders into adopted pool planes,
+          // not the host fb). Parity stays exact.
+          cover: new Set(r.getFramebuffer().color).size,
           exec: e.execProven,
           fb: e.scanoutFallbacks,
         };
       } finally {
-        setRGBWorldEnabled(false);
         if (pool) await pool.dispose();
         resetCVars();
       }

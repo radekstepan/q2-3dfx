@@ -1,18 +1,23 @@
 // @q2/testkit — PROOF-4 boxes 3-4: Node-side CPU reference render for the
 // GPU-vs-CPU fixed-scene comparison.
 //
-// Renders the F1 combat frame through the CPU path (SoftwareRenderer serial
-// + voodoo resolve, pinned cvars) and packs/visualizes captures. Reuses the
-// committed fixtures (bench-workloads entity/light/particle placement,
+// Renders the F1 combat frame through the CPU path (SoftwareRenderer serial,
+// pinned cvars) and packs/visualizes captures. Reuses the committed
+// fixtures (bench-workloads entity/light/particle placement,
 // gpu-proof route/view/pump, GPU_PROOF_TOLERANCES gate). The render path
 // mirrors gpu-proof.test.ts renderGpuProofFrame for the combat frame —
 // duplicated here (not imported from the .test.ts file) so importing this
 // module never re-registers that file's suites. The injected-writer pattern
 // is not used here: fs writes happen in the calling test file.
+//
+// RELEASE-8: the legacy CPU Voodoo resolve leg is retired. The display
+// plane is the raw-color software plane (a copy of the raster color
+// plane); there is no voodoo-resolve oracle. GPU_PROOF_TOLERANCES are
+// unchanged (no silent loosening).
 
 import { createFramebuffer } from '@q2/renderer-api';
 import { resetCVars } from '@q2/config';
-import { SoftwareRenderer, setRGBWorldEnabled } from '@q2/sw-renderer';
+import { SoftwareRenderer } from '@q2/sw-renderer';
 import {
   loadBenchWorld,
   pinBenchCvars,
@@ -37,10 +42,10 @@ import { fnvColorFull } from './frame-evidence.js';
 export interface GpuProofCpuRender {
   /** Raster color plane (0xAABBGGRR). */
   color: Uint32Array;
-  /** Display plane after the voodoo resolve (0xAABBGGRR). */
+  /** Display plane: raw-color software copy of the raster plane (0xAABBGGRR). */
   display: Uint32Array;
-  /** Which leg produced the display plane. */
-  displayKind: 'voodoo-resolve' | 'raw-color';
+  /** Which leg produced the display plane (RELEASE-8: raw-color only). */
+  displayKind: 'raw-color';
   colorHash: string;
   displayHash: string;
 }
@@ -52,7 +57,7 @@ export function loadCpuProofWorld(pakBytes: ArrayBuffer): BenchWorld {
 
 /**
  * Render the F1 combat frame serially under the pinned profile (fresh
- * renderer, combat particles, pumped dlights, voodoo-resolve display leg).
+ * renderer, combat particles, pumped dlights; raw-color display leg).
  * Resets cvars + RGB-world mode afterwards (no leakage into sibling tests).
  */
 export async function renderCpuProofF1(bw: BenchWorld): Promise<GpuProofCpuRender> {
@@ -63,7 +68,6 @@ export async function renderCpuProofF1(bw: BenchWorld): Promise<GpuProofCpuRende
   try {
     r.init(fb);
     r.setPalette(bw.palette);
-    setRGBWorldEnabled(true);
     const frame = gpuProofRoute()[1]!;
     const origin: [number, number, number] = [128, -320, 54];
     const yawRad = (frame.yawDeg * Math.PI) / 180;
@@ -82,28 +86,10 @@ export async function renderCpuProofF1(bw: BenchWorld): Promise<GpuProofCpuRende
     r.renderView(gpuProofViewFor(frame), world, entities);
     r.endFrame();
     const color = fb.color.slice();
-    let display = color.slice();
-    let displayKind: 'voodoo-resolve' | 'raw-color' = 'raw-color';
-    try {
-      const mod = (await import('@q2/voodoo')) as {
-        readVoodooState(): unknown;
-        resolveFrame(
-          c: Uint32Array,
-          d: Uint16Array,
-          s: Uint32Array,
-          w: number,
-          h: number,
-          st: unknown,
-        ): void;
-      };
-      const st = mod.readVoodooState();
-      const scratch = new Uint32Array(W * H);
-      mod.resolveFrame(color, new Uint16Array(W * H), scratch, W, H, st);
-      display = scratch;
-      displayKind = 'voodoo-resolve';
-    } catch {
-      display = color.slice();
-    }
+    // RELEASE-8: raw-color software plane only — the legacy CPU Voodoo
+    // resolve leg is retired, never attempted here.
+    const display = color.slice();
+    const displayKind: 'raw-color' = 'raw-color';
     return {
       color,
       display,
@@ -112,7 +98,6 @@ export async function renderCpuProofF1(bw: BenchWorld): Promise<GpuProofCpuRende
       displayHash: fnvColorFull(display),
     };
   } finally {
-    setRGBWorldEnabled(false);
     resetCVars();
   }
 }

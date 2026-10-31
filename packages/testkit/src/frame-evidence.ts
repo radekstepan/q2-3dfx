@@ -12,8 +12,8 @@
 // Worker sweep: the pool is structural (EvidenceScanoutPool), so serial,
 // 1/3/7-worker and disposed-pool configs all flow through one helper with
 // no hard-coded worker counts. The display resolve is injected
-// (resolveSerialInto) because @q2/voodoo is not a testkit dependency — the
-// bench passes its production resolveFrame; tests pass a probe.
+// (resolveSerialInto); testkit has no voodoo dependency — callers pass a
+// raw-color copy probe, never a production voodoo resolve.
 //
 // Hash note: fnvIndex/fnvColorFull duplicate index.ts hashFrame/hashColorFull
 // by value (same FNV-1a, byte-wise so endianness can never hide a channel)
@@ -86,9 +86,10 @@ export interface EvidenceScanoutPool {
 }
 
 /**
- * Display-resolve leg. `resolveSerialInto` runs the production fused
- * serial resolve (bench: voodoo resolveFrame) from the live color plane
- * into scratch; `scanoutOpts` is passed untouched to pool.flushScanout.
+ * Display-resolve leg. `resolveSerialInto` runs the serial resolve from
+ * the live color plane into scratch (RELEASE-8: a raw-color copy — the
+ * legacy voodoo resolveFrame leg is retired); `scanoutOpts` is passed
+ * untouched to pool.flushScanout.
  */
 export interface EvidenceScanout {
   pool?: EvidenceScanoutPool | null;

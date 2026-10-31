@@ -12,7 +12,7 @@ import { join } from 'path';
 import { createFramebuffer } from '@q2/renderer-api';
 import type { FrameStats } from '@q2/renderer-api';
 import { resetCVars } from '@q2/config';
-import { SoftwareRenderer, setRGBWorldEnabled } from '@q2/sw-renderer';
+import { SoftwareRenderer } from '@q2/sw-renderer';
 import {
   BENCH_FIDELITY_CVARS,
   benchSpawnYaw,
@@ -43,7 +43,6 @@ import {
   type GpuProofFrame,
 } from './gpu-proof.js';
 import { fnvColorFull } from './frame-evidence.js';
-import { collectStageCounters } from './critpath.js';
 import { readForegroundStats, type ForegroundStats } from './renderer-hooks.js';
 
 // --- Route determinism (asset-free) ------------------------------------------
@@ -236,7 +235,7 @@ interface GpuProofRender {
   frame: GpuProofFrame;
   color: Uint32Array;
   display: Uint32Array;
-  displayKind: 'voodoo-resolve' | 'raw-color';
+  displayKind: 'raw-color';
   colorHash: string;
   displayHash: string;
   stats: FrameStats;
@@ -255,7 +254,6 @@ async function renderGpuProofFrame(bw: BenchWorld, frame: GpuProofFrame): Promis
   try {
     r.init(fb);
     r.setPalette(bw.palette);
-    setRGBWorldEnabled(true);
     const origin: [number, number, number] = [128, -320, 54];
     const yawRad = (frame.yawDeg * Math.PI) / 180;
     const world = frame.workload === 'stationary'
@@ -275,39 +273,24 @@ async function renderGpuProofFrame(bw: BenchWorld, frame: GpuProofFrame): Promis
     r.beginFrame();
     const stats = r.renderView(view, world, entities);
     r.endFrame();
-    const stage = collectStageCounters(r as unknown as Parameters<typeof collectStageCounters>[0]);
     const fg = readForegroundStats(r);
     const fidelity = fidelityCvarSnapshot();
     const color = fb.color.slice();
-    // Display leg: production voodoo resolve when the package resolves,
-    // else the raw raster plane (recorded in the slot sidecar).
-    let display = color.slice();
-    let displayKind: 'voodoo-resolve' | 'raw-color' = 'raw-color';
-    try {
-      const mod = (await import('@q2/voodoo')) as {
-        readVoodooState(): unknown;
-        resolveFrame(c: Uint32Array, d: Uint16Array, s: Uint32Array, w: number, h: number, st: unknown): void;
-      };
-      const st = mod.readVoodooState();
-      const scratch = new Uint32Array(W * H);
-      mod.resolveFrame(color, new Uint16Array(W * H), scratch, W, H, st);
-      display = scratch;
-      displayKind = 'voodoo-resolve';
-    } catch {
-      display = color.slice();
-    }
+    // RELEASE-8: raw-color software plane only — the indexed renderer
+    // palette-expands into color at endFrame; no voodoo resolve leg.
+    const display = color.slice();
+    const displayKind: 'raw-color' = 'raw-color';
     return {
       frame, color, display, displayKind,
       colorHash: fnvColorFull(color),
       displayHash: fnvColorFull(display),
       stats,
-      coverPixels: stage.coverPixels,
-      translucentSpans: stage.translucentSpans,
+      coverPixels: stats.pixels,
+      translucentSpans: r.testTranslucentSpans(),
       fg,
       fidelity,
     };
   } finally {
-    setRGBWorldEnabled(false);
     resetCVars();
   }
 }
@@ -320,9 +303,8 @@ describe.runIf(!!Q2_PAK)('gpu proof CPU reference (Q2_PAK)', () => {
     const r1 = await renderGpuProofFrame(bw, f1!);
     const r2 = await renderGpuProofFrame(bw, f2!);
     for (const r of [r0, r1, r2]) {
-      // Under the RGB-authoritative path the classic span counters stay
-      // zero by design (skipped duplicate work); the composite coverage
-      // and real-texel variety are the non-triviality signals.
+      // Indexed renderer: FrameStats.pixels counts written pixels and the
+      // palette-expanded color plane carries real texel variety.
       expect(r.coverPixels).toBeGreaterThan(GPU_PROOF_WIDTH * GPU_PROOF_HEIGHT * 0.15);
       expect(new Set(r.color).size).toBeGreaterThan(20);
       expect(r.fidelity).toEqual(GPU_PROOF_FIDELITY_CVARS);

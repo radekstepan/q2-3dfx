@@ -298,8 +298,8 @@ export interface GpuProofReferenceMeta {
   workload: GpuProofWorkload;
   rep: number;
   yawDeg: number;
-  /** Which leg produced the stored display plane. */
-  display: 'voodoo-resolve' | 'raw-color';
+  /** Which leg produced the stored display plane (RELEASE-8: raw-color only). */
+  display: 'raw-color';
   /** Pinned fidelity profile snapshot (must equal GPU_PROOF_FIDELITY_CVARS). */
   fidelity: Record<string, string>;
 }

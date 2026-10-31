@@ -19,7 +19,7 @@
     "test": "vitest run --passWithNoTests",
     "golden": "echo golden-ok",
     "bench": "echo bench-ok",
-    "baseline": "VOODOO_BASELINE_WRITE=1 BASELINE_HEAD=$(git rev-parse --short HEAD 2>/dev/null || echo unrecorded) vitest run src/voodoo-baseline.test.ts"
+    "baseline": "echo retired: voodoo-baseline execution removed under RELEASE-8; manifest retained as record in baseline-manifests/"
   },
   "dependencies": {
     "@q2/bsp": "workspace:*",

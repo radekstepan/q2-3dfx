@@ -706,7 +706,9 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         }
       }
 
-      // --- (d) CPU reference render in-Node (serial, pinned, voodoo-resolve) ---
+      // --- (d) CPU reference render in-Node (serial, pinned, raw-color/software) ---
+      // RELEASE-8: the oracle is the raw-color software plane (cpu.color),
+      // not the retired CPU Voodoo resolve. Tolerances unchanged.
       const pakBytes = readFileSync(pak);
       const buf = new ArrayBuffer(pakBytes.length);
       new Uint8Array(buf).set(pakBytes);
@@ -715,7 +717,7 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
       console.log(
         `[gpu-proof-4] CPU F1: color=${cpu.colorHash} display=${cpu.displayHash}(${cpu.displayKind})`,
       );
-      expect(cpu.displayKind).toBe('voodoo-resolve');
+      expect(cpu.displayKind).toBe('raw-color');
 
       // Page readPixels rows are bottom-first (GL); CPU planes are
       // top-first: flip vertically before packing to 0xAABBGGRR.
@@ -726,7 +728,7 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         gpuTopFirst.set(src.subarray(y * W * 4, (y + 1) * W * 4), (H - 1 - y) * W * 4);
       }
       const gpuPacked = packRgbaBytesToAbgr(gpuTopFirst);
-      const diff = compareGpuProofFrames(gpuPacked, cpu.display, GPU_PROOF_TOLERANCES, W);
+      const diff = compareGpuProofFrames(gpuPacked, cpu.color, GPU_PROOF_TOLERANCES, W);
       const gateLine = formatGpuProofReport('f1-gpu-vs-cpu', diff, GPU_PROOF_TOLERANCES);
       console.log(`[gpu-proof-4] F1 GATE: ${gateLine} (gate fraction<=${GPU_PROOF_TOLERANCES.maxFractionDiff})`);
 
@@ -751,7 +753,7 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         const yGl = H - 1 - y;
         const o = i * 4;
         const gr = gpuTopFirst[o]!, gg = gpuTopFirst[o + 1]!, gbb = gpuTopFirst[o + 2]!;
-        const c = cpu.display[i]!;
+        const c = cpu.color[i]!;
         const cr = c & 255, cg = (c >> 8) & 255, cb = (c >> 16) & 255;
         const isDiff =
           Math.abs(gr - cr) > lsb || Math.abs(gg - cg) > lsb || Math.abs(gbb - cb) > lsb;
@@ -791,10 +793,10 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
       const base = join(outDir, `gpu-proof4-${stamp}`);
       writeFileSync(`${base}-gpu.rgba`, gpuTopFirst);
-      writeFileSync(`${base}-cpu.rgba`, new Uint8Array(cpu.display.buffer, cpu.display.byteOffset, cpu.display.byteLength));
+      writeFileSync(`${base}-cpu.rgba`, new Uint8Array(cpu.color.buffer, cpu.color.byteOffset, cpu.color.byteLength));
       writeFileSync(`${base}-gpu.ppm`, encodePpm(W, H, rgbaToRgb(gpuTopFirst)));
-      writeFileSync(`${base}-cpu.ppm`, encodePpm(W, H, abgrToRgb(cpu.display)));
-      writeFileSync(`${base}-diff.ppm`, encodePpm(W, H, buildDiffRgb(gpuTopFirst, cpu.display, W, H)));
+      writeFileSync(`${base}-cpu.ppm`, encodePpm(W, H, abgrToRgb(cpu.color)));
+      writeFileSync(`${base}-diff.ppm`, encodePpm(W, H, buildDiffRgb(gpuTopFirst, cpu.color, W, H)));
       if (shot) writeFileSync(`${base}-browser.png`, shot);
       const verdict =
         'human sign-off: STILL NEEDED (pending) — differences below are documented ' +
