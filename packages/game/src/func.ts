@@ -116,7 +116,9 @@ export function spawnPlat(ent: Edict, height: number): Mover {
   return m;
 }
 
-/** Spawn a func_button: moves `lip` units along its angle, fires targets, resets. */
+/** Spawn a func_button: moves `lip` units along its angle, fires targets, resets.
+ * C default wait is 3 (SP_func_button: `if (!ent->wait) ent->wait = 3`) —
+ * the TOP hold before button_return, not 1. */
 export function spawnButton(ent: Edict, angleDeg: number): Mover {
   const dir = moveDirForAngle(angleDeg);
   const lip = ent.lip || 4;
@@ -127,7 +129,7 @@ export function spawnButton(ent: Edict, angleDeg: number): Mover {
     pos1,
     pos2,
     speed: ent.speed || 40,
-    wait: ent.wait === 0 ? 1 : ent.wait,
+    wait: ent.wait === 0 ? 3 : ent.wait,
     lip,
     state: MOVER_BOTTOM,
     legEnd: 0,

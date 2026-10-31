@@ -1780,6 +1780,14 @@ export function SV_TouchTriggersAt(
  * Pass toucherClass 'monster' for monster bodies so the NOMONSTER gate
  * applies.
  *
+ * C spawn rule (SP_func_door / SP_func_door_rotating): a door carrying
+ * health or a targetname gets NO touch trigger at all (think =
+ * Think_CalcMoveSpeed, not Think_SpawnDoorTrigger) — it answers use (a
+ * button relay like base1's *34 -> t4, or damage) but never proximity.
+ * Base1's *31 plug (targetname t4) is such a door: the entry-hall camper
+ * overlapping its expanded rest bounds must NOT lower it; only the *34
+ * press may. Skipping those movers here is that rule.
+ *
  * Returns the doors that started moving (sliders and rotators).
  */
 export function SV_TouchDoorsAt(
@@ -1790,6 +1798,8 @@ export function SV_TouchDoorsAt(
   const used: Array<Mover | RotMover> = [];
   for (const m of st.movers) {
     if (m.ent.classname !== 'func_door') continue;
+    // id SP_func_door: health/targetname doors spawn no trigger (see above).
+    if (m.ent.targetname || m.ent.health > 0) continue;
     // id Touch_DoorTrigger: NOMONSTER doors ignore monster touches.
     if (toucherClass === 'monster' && m.ent.spawnflags & DOOR_NOMONSTER) continue;
     const b = st.moverBounds.get(m.ent.num);
@@ -1810,6 +1820,8 @@ export function SV_TouchDoorsAt(
     }
   }
   for (const rm of st.rotDoors) {
+    // id SP_func_door_rotating: same no-trigger rule as linear doors.
+    if (rm.ent.targetname || rm.ent.health > 0) continue;
     if (toucherClass === 'monster' && rm.ent.spawnflags & DOOR_NOMONSTER) continue;
     const b = st.moverBounds.get(rm.ent.num);
     if (!b) continue;

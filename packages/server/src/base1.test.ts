@@ -59,11 +59,14 @@ import {
   SV_RemoveBrushClip,
   SV_SetPmoveWorldFromBsp,
   SV_SetSkill,
+  SV_TouchButtonsAt,
   SV_TouchDoorsAt,
   SV_TraceFor,
+  SV_UseButton,
   dmOnlyInSP,
   droptofloor,
   inhibitedBySkill,
+  trainBlocked,
 } from './index.js';
 
 const Q2_PAK = process.env.Q2_PAK;
@@ -235,10 +238,12 @@ interface BotReport {
   stuckWaypoint: number;
   finalPos: [number, number, number];
   onGround: boolean;
-  /** total pusher displacement ridden while standing on the *31 plug */
-  rideCarried: number;
   /** closest the bot ever got to the exit volume center (XY) */
   slotClosest: number;
+  /** plug origin (must never leave pos1: the C no-trigger rule) */
+  plugOrigin: [number, number, number];
+  /** train started flag at end of run (must stay false: needs t91) */
+  trainStarted: boolean;
 }
 
 describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
@@ -338,6 +343,8 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       return modelBounds(map, n);
     });
     try {
+      const plugRest = st.movers.find((m) => m.ent.model === '*31')!;
+      const rest: [number, number, number] = [plugRest.pos1[0]!, plugRest.pos1[1]!, plugRest.pos1[2]!];
       const report = driveBot(st, map);
       console.log(
         `WIRE traversal ticks=${report.ticks} time=${report.time.toFixed(1)}s ` +
@@ -345,24 +352,25 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
           `opened=[${report.doorsOpened}] crossed=[${report.doorsCrossed}] ` +
           `exit=${report.exitFired} stuck=${JSON.stringify(report.stuckAt)}@${report.stuckWaypoint} ` +
           `final=[${report.finalPos}] onGround=${report.onGround} ` +
-          `ride=${report.rideCarried.toFixed(0)} slotClosest=${report.slotClosest.toFixed(0)}`,
+          `plug=[${report.plugOrigin}] train=${report.trainStarted} slotClosest=${report.slotClosest.toFixed(0)}`,
       );
       // minimum proof: a door opened on its trigger volume and the bot passed it
       expect(report.doorsOpened.length).toBeGreaterThan(0);
       expect(report.doorsCrossed.length).toBeGreaterThan(0);
-      // WIRE-EXIT: the bot touches the *31 plug (like the real game), boards
-      // it and rides the pusher displacement (SV_Push semantics via
-      // SV_CarryRiders). The pit itself is sealed in every plug state (see
-      // TODO(WIRE-EXIT)), so the honest proof is the ride — displacement
-      // carried while standing on the plug — plus reaching the slot.
-      // NOTE (M7.4 audit): the *27 volume (pit floor, feet -80) is reachable
-      // only through the slot column, which the plug fills in every state
-      // (closed [80,244], open [-76,88], and at every transit step — verified
-      // by exhaustive sweeps). No rider configuration overlaps *27, so the
-      // bot reports its slot-edge hold honestly instead of faking the touch.
-      expect(report.doorsOpened).toContain('*31');
-      expect(report.rideCarried).toBeGreaterThan(100);
-      expect(report.slotClosest).toBeLessThan(80);
+      // WIRE-EXIT (C-parity RELEASE-4): the bot leans on the plug face at
+      // the slot mouth, cycling the *32/*33 sliders around itself. The
+      // targetname'd plug owns no touch trigger, so it sits at pos1 the
+      // whole run — and the named lift never starts without its button's
+      // t91. Boarding + riding the operable lift is proven by the scripted
+      // pmove-rider test, not by this bot.
+      expect(report.doorsOpened).toContain('*32');
+      expect(report.doorsOpened).not.toContain('*31');
+      expect(report.plugOrigin).toEqual(rest);
+      expect(report.trainStarted).toBe(false);
+      // lean point (-1688,1488) sits ~104 XY from the exit volume center
+      // (through the *32 doorway): the bot reaches the complex, never the
+      // sealed volume itself.
+      expect(report.slotClosest).toBeLessThan(120);
       // route proof: the bot walks the whole low road and reaches the exit
       // shaft complex (within 150 XY of the exit volume).
       const [fx, fy, fz] = report.finalPos;
@@ -606,24 +614,29 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
 
 // --- traversal driver (10Hz scripted bot) ---------------------------------
 //
-// WIRE-EXIT status (M7.4): the exit pit is sealed rock except for the top
-// slot, and the *31 plug fills that slot in every state (closed [80,244],
-// open [-76,88], and at every 1/8 transit step — audited by exhaustive
-// wall sweeps at z -60..150 plus an exhaustive rider-vs-*27 overlap probe:
-// no top-rider or deck/ledge configuration overlaps *27). The only overlap
-// in the map is the pit floor itself (feet -80, head grazing the volume
-// bottom — proven by the mechanism test below). So the bot cannot enter the
-// volume, and the honest end-to-end proof is: touch *31 like the real game,
-// board the plug, ride the SV_Push displacement (SV_CarryRiders), and hold
-// at the slot. The driver asserts the ride (carried displacement + slot
-// proximity), never a faked touch.
+// WIRE-EXIT status (M7.4, C-parity RELEASE-4): the exit pit's top slot is
+// capped by the *31 plug in every state (closed [80,244], open [-76,88],
+// and at every transit step — audited by exhaustive wall sweeps at z
+// -60..150 plus an exhaustive rider-vs-*27 overlap probe: no top-rider or
+// deck/ledge configuration overlaps *27). The only overlap in the map is
+// the pit floor itself (feet -80, head grazing the volume bottom — proven
+// by the mechanism test below). So this bot cannot enter the volume, and
+// its honest end-to-end proof is: walk the full low road to the exit
+// complex, open the *32/*33 sliders by touch, lean on the plug face at the
+// slot mouth — and prove the targetname'd plug (per id SP_func_door, owner
+// of NO touch trigger) plus the named lift sit out the whole run while the
+// sliders cycle. Boarding + riding the operable lift (the *12 train) is
+// proven by the scripted pmove-rider test, never by this bot.
+// RELEASE-4 probe note: a low tunnel east of the plug (x -1700 -> -1776 at
+// feet -80) sweeps clear at player hull, so the pit floor is not
+// rock-sealed on that side — the M7.4 "sealed" verdict covers the
+// slot/rider configurations only. Tracing the tunnel back to the low road
+// is route work (web lane); the bot below keeps the upper slot delivery.
 //
-// Presence pin (real Q2 behaviour, reproduced here): a body standing in the
-// plug's Touch_DoorTrigger volume re-fires moverUse every tick, so the wait
-// never expires while boarded and the plug never rises with the rider. The
-// ride the bot completes is therefore the down-ride (board during descent
-// or drop onto the open plug); the absolute carried displacement across
-// touch cycles is what the test asserts.
+// Presence pin (real Q2 behaviour, reproduced here): with no touch trigger
+// on the plug, nothing re-holds any wait — the plug sits at pos1 no matter
+// how long the lean lasts. Pre-fix the same lean lowered it (the reported
+// "elevator descends as its door opens").
 
 function driveBot(st: ServerState, map: BspMap): BotReport {
   // The scripted traversal driver keeps the legacy mask-1 world hookup it
@@ -658,7 +671,6 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
     const b = modelBounds(map, n);
     brushTriggers.push({ trigger: t, mins: b.mins, maxs: b.maxs });
   }
-  const buttons = st.movers.filter((m) => m.ent.classname === 'func_button');
 
   const combined: TraceFn = (start, mins, maxs, end) => {
     let best = worldTrace(start, mins, maxs, end);
@@ -703,8 +715,15 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
   // routes a fake plunge through the shaft mouth. All other doors are
   // passable: the bot opens *19/*32/*33 by touch en route, and the plan is
   // made before tick 0 when every mover sits at pos1.)
+  // C-parity RELEASE-4: the BFS goal is the slot mouth east of the plug.
+  // The targetname'd plug owns no touch trigger, so the lean there opens
+  // only the *32/*33 sliders (the plug staying shut the whole run is the
+  // full-scale no-premature-departure proof). Boarding + riding the
+  // operable final elevator (the *12 train) is proven separately with a
+  // scripted pmove rider below — no BFS jump choreography.
   const spawn = v3(128, -320, 32); // info_player_start origin, feet 8 up
   const exitCenter: [number, number] = [-1776, 1544];
+  const slotMouth: [number, number] = [-1664, 1456];
   const plug31 = doors.find((d) => d.model === 31);
   const planTrace: PlanTrace = (sx, sy, sz, ex, ey, ez) => {
     const w = worldTrace(v3(sx, sy, sz), PLAYER_MINS, PLAYER_MAXS, v3(ex, ey, ez));
@@ -730,7 +749,7 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
       endpos: [w.endpos[0]!, w.endpos[1]!, w.endpos[2]!],
     };
   };
-  const waypoints = planPath(map, spawn, exitCenter, trains, planTrace);
+  const waypoints = planPath(map, spawn, slotMouth, trains, planTrace);
   console.log(`WIRE plan: ${waypoints.length} waypoints from spawn to exit`);
   console.log(`WIRE waypoints: ${waypoints.map((w) => `[${w[0]},${w[1]}]`).join(' ')}`);
 
@@ -746,21 +765,11 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
   let lastProgress = Infinity;
   let stuckTicks = 0;
   let jumpTicks = 0;
-  // WIRE-EXIT ride state (M7.4): the bot touches *31 like the real game,
-  // boards the plug and holds still while SV_CarryRiders applies the
-  // pusher displacement (SV_Push semantics). At the top of the ride it
-  // steps off east and holds; the trail-stall detector then ends the run.
-  const plug = doors.find((d) => d.model === 31)!;
-  const plugNum = plug.mover.ent.num;
-  let boarded = false;
-  let rideCompleted = false;
-  let rideCarried = 0;
+  // WIRE-EXIT state (RELEASE-4): the plug never moves (C: no trigger),
+  // so there is no boarding here — the lean below only cycles the
+  // sliders. Boarding + riding the operable lift (the *12 train) is proven
+  // by the scripted pmove-rider test, not by this bot.
   let slotClosest = Infinity;
-  // descend behavior: high above the goal volume (e.g. on the z=120 deck over
-  // base1's exit room), gradient-descend the floor — probe a ring around the
-  // bot for the lowest landing and walk toward it, repeating until the bot
-  // walks off the edge/hole and falls in. No hardcoded targets: if no nearby
-  // sample lands meaningfully lower, normal waypoint steering resumes.
   // displacement-based stall detection (jump-proof): samples every 30 ticks
   const trail: Array<[number, number, number]> = [];
   let stuckAt: [number, number, number] | null = null;
@@ -774,7 +783,9 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
     SV_Tick(st, 0.1);
     // Pusher carrying (SV_Push rider pass): bodies standing on a mover
     // that displaced this tick ride along. Must run after SV_Tick (reads
-    // moverDeltas) and before the bot's own move for the tick.
+    // moverDeltas) and before the bot's own move for the tick. No rider
+    // is expected on this route (the plug never moves); the call stays so
+    // the loop mirrors the production tick order.
     const body: RiderBody = {
       origin: bot.origin,
       mins: bot.mins,
@@ -783,126 +794,37 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
       onGround: bot.onGround,
     };
     SV_CarryRiders(st, [body]);
-    const plugDelta = st.moverDeltas.get(plugNum);
-    const onPlug = bot.onGround && bot.groundEntity === plugNum;
-    if (onPlug && plugDelta) {
-      rideCarried += Math.sqrt(
-        plugDelta[0]! * plugDelta[0]! + plugDelta[1]! * plugDelta[1]! + plugDelta[2]! * plugDelta[2]!,
-      );
-      boarded = true;
-    }
     slotClosest = Math.min(slotClosest, Math.hypot(bot.origin[0]! - exitCenter[0], bot.origin[1]! - exitCenter[1]));
-    // final approach: once the planned route is consumed, steer to the
-    // slot-edge touch point (NOT the exit volume: the sealed pit is
-    // impassable, so the honest play is to lean on the plug face until
-    // the auto-touch lowers it, then board via the descend logic below).
-    // The slotTouch sits 16 inside the plug face: the bot stops face-touching
-    // (combined trace), which overlaps the Touch_DoorTrigger volume.
+    // ENDGAME (C-parity RELEASE-4): once the planned route is consumed,
+    // lean on the plug's east face at the slot mouth. The targetname'd plug
+    // owns no touch trigger, so the lean cycles only the *32/*33 sliders —
+    // the plug (and the lift) sitting out the whole run is the full-scale
+    // no-premature-departure proof. The sealed pit (driver header) means
+    // delivery ends at the slot edge.
     const slotTouch: [number, number] = [-1688, 1456];
     let target = waypoints[Math.min(wpIndex, waypoints.length - 1)]!;
     if (wpIndex >= waypoints.length - 1) target = slotTouch;
-    // RIDE OVERRIDE: hold still while riding (let the pusher do the work),
-    // step off east once the ride returns to the top, then hold for good.
-    // The sealed pit (driver header) means delivery ends at the slot edge.
-    let hold = rideCompleted;
-    let stepOff = false;
-    if (!rideCompleted && onPlug) {
-      const atTop =
-        Math.abs(plug.mover.ent.origin[2]! - plug.mover.pos1[2]!) < 2;
-      if (boarded && atTop && rideCarried > 50) {
-        stepOff = true;
-      } else {
-        hold = true;
-      }
-    }
-    if (rideCompleted) target = [bot.origin[0]!, bot.origin[1]!];
     // Door-transit hold: never walk into a slab that is still travelling.
     // The bot outruns opening doors and the rising slab head-grazes it
     // (movers integrate blindly), then step-ups park it mid-slab forever.
     // Real players wait for the door; so does the bot. Holding also
     // suppresses the stall-hop, which would mount thresholds and graze.
-    if (!hold && !stepOff) {
-      for (const d of doors) {
-        const ds = d.mover.state;
-        if (ds !== 'going_up' && ds !== 'going_down') continue;
-        const ox = d.mover.ent.origin[0]! - d.mover.pos1[0]!;
-        const oy = d.mover.ent.origin[1]! - d.mover.pos1[1]!;
-        const oz = d.mover.ent.origin[2]! - d.mover.pos1[2]!;
-        const emins = new Float32Array([d.baseMin[0]! + ox - 24, d.baseMin[1]! + oy - 24, d.baseMin[2]! + oz]);
-        const emaxs = new Float32Array([d.baseMax[0]! + ox + 24, d.baseMax[1]! + oy + 24, d.baseMax[2]! + oz]);
-        if (boxOverlap(bot.origin, PLAYER_MINS, PLAYER_MAXS, emins, emaxs)) {
-          hold = true;
-          break;
-        }
+    let hold = false;
+    for (const d of doors) {
+      const ds = d.mover.state;
+      if (ds !== 'going_up' && ds !== 'going_down') continue;
+      const ox = d.mover.ent.origin[0]! - d.mover.pos1[0]!;
+      const oy = d.mover.ent.origin[1]! - d.mover.pos1[1]!;
+      const oz = d.mover.ent.origin[2]! - d.mover.pos1[2]!;
+      const emins = new Float32Array([d.baseMin[0]! + ox - 24, d.baseMin[1]! + oy - 24, d.baseMin[2]! + oz]);
+      const emaxs = new Float32Array([d.baseMax[0]! + ox + 24, d.baseMax[1]! + oy + 24, d.baseMax[2]! + oz]);
+      if (boxOverlap(bot.origin, PLAYER_MINS, PLAYER_MAXS, emins, emaxs)) {
+        hold = true;
+        break;
       }
     }
-    // descend override (LAST MILE: route consumed, or stalled while high
-    // near the goal): gradient-descend the floor toward the lowest nearby
-    // landing over expanding rings (finds the drop into the exit room
-    // instead of wandering the deck above it). Gated so mid-route steering
-    // never skips door trigger volumes.
-    const routeDone = wpIndex >= waypoints.length - 1;
-    // M7.4: the descend probe only runs once the bot is committed to the
-    // slot mouth (west of the touch line). Anywhere else it drags the bot
-    // off-route (e.g. up the north stairs) instead of letting it walk to
-    // the plug face and touch. Mid-route stalls are handled by hop/trail.
-    const nearGoal =
-      !hold && !stepOff && routeDone &&
-      bot.origin[0]! < -1650 &&
-      bot.origin[0]! >= exitMin[0]! - 128 && bot.origin[0]! <= exitMax[0]! + 128 &&
-      bot.origin[1]! >= exitMin[1]! - 128 && bot.origin[1]! <= exitMax[1]! + 128;
-    if (nearGoal && !boxOverlap(bot.origin, PLAYER_MINS, PLAYER_MAXS, exitMin, exitMax)) {
-      // (no z>48 deck gate: the plunge also starts from the low road at
-      // origin ~-8, 48 above the pit floor — the ring probe handles both.)
-      // DIRECTION GATE: only descend toward the exit volume, never away —
-      // an unconstrained lowest-landing search once dragged the bot east
-      // into a drainage dip it couldn't climb out of.
-      const botGoalDist = Math.hypot(bot.origin[0]! - exitCenter[0], bot.origin[1]! - exitCenter[1]);
-      // nearest reachable way down: sample expanding rings, keep the lowest
-      // landing that is also walkable-to at deck height (a sheer shaft walled
-      // on this side is not an entrance — that cost us a run against the
-      // south parapet of the exit shaft).
-      let bestZ = bot.origin[2]!;
-      let best: [number, number] | null = null;
-      for (const r of [28, 64, 96]) {
-        for (let a = 0; a < 8; a++) {
-          const ang = (a / 8) * Math.PI * 2;
-          const px = bot.origin[0]! + Math.cos(ang) * r;
-          const py = bot.origin[1]! + Math.sin(ang) * r;
-          const walk = traceBox(
-            map, v3(bot.origin[0]!, bot.origin[1]!, bot.origin[2]! + 18),
-            v3(px, py, bot.origin[2]! + 18), PLAYER_MINS, PLAYER_MAXS, 1,
-          );
-          if (walk.fraction < 0.95 || walk.startsolid) continue;
-          const dt = worldTrace(
-            v3(px, py, bot.origin[2]! + 18), PLAYER_MINS, PLAYER_MAXS,
-            v3(px, py, bot.origin[2]! - 400),
-          );
-          if (dt.startsolid || dt.allsolid) continue;
-          const lz = dt.endpos[2]!;
-          if (lz >= bestZ - 4) continue;
-          const gd = Math.hypot(px - exitCenter[0], py - exitCenter[1]);
-          if (gd > botGoalDist - 8) continue; // must approach the exit
-          bestZ = lz; best = [px, py];
-        }
-        if (best) break; // nearest ring that finds a way down wins
-      }
-      if (best) {
-        if (tick % 100 === 0) {
-          console.log(
-            `WIRE descend: seeking down at [${bot.origin[0]!.toFixed(0)},${bot.origin[1]!.toFixed(0)},${bot.origin[2]!.toFixed(0)}] -> [${best[0].toFixed(0)},${best[1].toFixed(0)}@${bestZ.toFixed(0)}]`,
-          );
-        }
-        target = best;
-        // hop while pushing at the hole so shaft rims don't pin the bot
-        // (real pmove physics, no teleport)
-        if (bot.origin[2]! - bestZ > 48) jumpTicks = Math.max(jumpTicks, 2);
-      } else if (tick % 200 === 0) {
-        console.log(
-          `WIRE descend: no way down from [${bot.origin[0]!.toFixed(0)},${bot.origin[1]!.toFixed(0)},${bot.origin[2]!.toFixed(0)}]`,
-        );
-      }
-    }
+    // scripted C-parity endgame (see above): lean on the slot mouth; the
+    // sealed pit ends delivery there.
     if (tick % 100 === 0) {
       const d19 = doors.find((d) => d.model === 19);
       const d31 = doors.find((d) => d.model === 31);
@@ -913,7 +835,7 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
           `ground=${bot.onGround} ge=${bot.groundEntity} ` +
           `door19=${d19?.mover.state}@[${[...(d19?.mover.ent.origin ?? [])].map((v) => Math.round(v as number))}] ` +
           `door31=${d31?.mover.state}@[${[...(d31?.mover.ent.origin ?? [])].map((v) => Math.round(v as number))}] ` +
-          `hold=${hold} stepOff=${stepOff} ride=${rideCarried.toFixed(0)} onPlug=${onPlug} ` +
+          `hold=${hold} ` +
           `tgt=[${target[0].toFixed(0)},${target[1].toFixed(0)}] ` +
           `opened=[${doors.filter((d) => d.opened).map((d) => `*${d.model}`)}]`,
       );
@@ -925,9 +847,8 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
       wpIndex++;
       continue;
     }
-    // hold/step-off override the heading: hold = neutral (stand and ride),
-    // stepOff = due east off the plug top.
-    const yaw = hold ? bot.viewAngles[1]! : stepOff ? 0 : (Math.atan2(dy, dx) * 180) / Math.PI;
+    // hold override the heading: hold = neutral (stand and lean).
+    const yaw = hold ? bot.viewAngles[1]! : (Math.atan2(dy, dx) * 180) / Math.PI;
     const fwd = hold ? 0 : 300;
     // stuck detection: waypoint distance must shrink over time (hop on stalls)
     if (hold) {
@@ -971,24 +892,22 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
       upmove,
       buttons: 0,
     });
-    // ride completion: stepped off the plug top heading east (off the
-    // pusher, east of the slot) — hold here for the honest report.
-    if (stepOff && !(bot.onGround && bot.groundEntity === plugNum) && bot.origin[0]! > -1704) {
-      rideCompleted = true;
-    }
-    // door trigger volumes (Touch_DoorTrigger: expanded 60 in x/y, id
-    // g_func.c). *31 included like the real game: walking the slot-edge
-    // deck auto-touches the plug and lowers it.
+    // lean-and-hold at the slot mouth: the sliders cycle around the bot
+    // while the plug and the lift sit out the whole run (see assertions).
+    // C Touch_DoorTrigger (id g_func.c Think_SpawnDoorTrigger): REST
+    // volumes that never follow the door, and NO trigger at all for
+    // health/targetname doors (the *31 plug answers the *34 button only).
+    // One server call keeps the harness at C-parity by construction.
+    SV_TouchDoorsAt(
+      st,
+      { origin: bot.origin, mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+      'player',
+    );
     for (const d of doors) {
+      d.opened = d.opened || d.mover.state !== 'bottom';
       const ox = d.mover.ent.origin[0]! - d.mover.pos1[0]!;
       const oy = d.mover.ent.origin[1]! - d.mover.pos1[1]!;
       const oz = d.mover.ent.origin[2]! - d.mover.pos1[2]!;
-      const tmins = new Float32Array([d.baseMin[0]! + ox - 60, d.baseMin[1]! + oy - 60, d.baseMin[2]! + oz]);
-      const tmaxs = new Float32Array([d.baseMax[0]! + ox + 60, d.baseMax[1]! + oy + 60, d.baseMax[2]! + oz]);
-      if (boxOverlap(bot.origin, PLAYER_MINS, PLAYER_MAXS, tmins, tmaxs)) {
-        if (d.mover.state === 'bottom' || d.mover.state === 'waiting') moverUse(d.mover, st.time);
-        d.opened = d.opened || d.mover.state !== 'bottom';
-      }
       // crossed: strict slab overlap, or a slab plane crossing while open
       // (up-doors are passed UNDER, never through the raised slab volume)
       const cmins = new Float32Array([d.baseMin[0]! + ox, d.baseMin[1]! + oy, d.baseMin[2]! + oz]);
@@ -998,18 +917,15 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
         if (crossedSlab(prevBot, bot.origin, PLAYER_MINS, PLAYER_MAXS, cmins, cmaxs)) d.crossed = true;
       }
     }
-    // buttons fire on touch (id button_touch); touch = tight overlap
-    for (const b of buttons) {
-      const n = modelNum(b.ent);
-      if (n === null) continue;
-      const bb = modelBounds(map, n);
-      if (boxOverlap(bot.origin, PLAYER_MINS, PLAYER_MAXS, bb.mins, bb.maxs)) {
-        if (b.state === 'bottom') {
-          moverUse(b, st.time);
-          fireTargets(st, b.ent);
-        }
-      }
-    }
+    // C button_touch (id g_func.c): touchable buttons (no targetname, no
+    // health — base1's *34) press on brush overlap; the target fires on TOP
+    // arrival in SV_Tick (id button_wait), never instantly here. *13
+    // (health 1) answers use only, never touch.
+    SV_TouchButtonsAt(
+      st,
+      { origin: bot.origin, mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+      'player',
+    );
     // brush triggers: real volume overlap
     for (const bt of brushTriggers) {
       if (!boxOverlap(bot.origin, PLAYER_MINS, PLAYER_MAXS, bt.mins, bt.maxs)) continue;
@@ -1026,6 +942,8 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
 
   const doorsOpened = doors.filter((d) => d.opened).map((d) => `*${d.model}`);
   const doorsCrossed = doors.filter((d) => d.crossed).map((d) => `*${d.model}`);
+  const plug31end = doors.find((d) => d.model === 31)!;
+  const lift = st.trains.find((t) => !t.ship)!;
   return {
     ticks: tick,
     time: st.time,
@@ -1038,8 +956,9 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
     stuckWaypoint,
     finalPos: [bot.origin[0]!, bot.origin[1]!, bot.origin[2]!],
     onGround: bot.onGround,
-    rideCarried,
     slotClosest,
+    plugOrigin: [plug31end.mover.ent.origin[0]!, plug31end.mover.ent.origin[1]!, plug31end.mover.ent.origin[2]!],
+    trainStarted: lift.started,
   };
 }
 
@@ -1090,22 +1009,13 @@ function planPath(
     }
     return false;
   };
-  // exit trigger *27 volume (base1): the goal test is volume-aware, not
-  // XY-only, so the low dead-end across the wall can never satisfy it. The
-  // final approach steers into the volume (falling in counts: triggers fire
-  // every tick on AABB overlap). z is capped at the volume top (+8 margin):
-  // the z=120 deck directly above the exit room must NOT satisfy the goal —
-  // the bot has to find a real descent into the room, never stop on the lid.
-  const EXIT_MIN_X = -1840, EXIT_MAX_X = -1712;
-  const EXIT_MIN_Y = 1448, EXIT_MAX_Y = 1640;
-  // M7.4: the pit floor (origin -56) is sealed under the *31 plug in every
-  // state (see the driver header), so the BFS goal is the slot-edge deck
-  // the real player crosses to reach the plug: XY near the slot mouth at
-  // deck height. From there the final-approach/descend logic takes over —
-  // touch *31, board the plug, ride (SV_CarryRiders).
+  // Exit-complex goal (C-parity RELEASE-4): XY near the passed goal at
+  // deck height (z 96..144 — the hall level). The caller passes the slot
+  // mouth east of the plug; the lean there cycles the sliders while the
+  // plug sits out the run (the full-scale no-premature-departure proof).
   const inGoal = (x: number, y: number, z: number): boolean => {
     if (z < 96 || z > 144) return false;
-    return Math.hypot(x - -1664, y - 1456) <= 48;
+    return Math.hypot(x - goal[0], y - goal[1]) <= 48;
   };
   const sx = Math.round(spawn[0]! / CELL) * CELL;
   const sy = Math.round(spawn[1]! / CELL) * CELL;
@@ -1624,14 +1534,20 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(opened).toBe(true); // the plug genuinely travelled (non-vacuous)
     expect(train.started).toBe(false);
     expect([train.ent.origin[0]!, train.ent.origin[1]!, train.ent.origin[2]!]).toEqual(parked);
-    // Touch-open (Touch_DoorTrigger volume at the plug mouth) is equally
-    // clean: camp the volume, the door cycles at the top, the lift sits.
+    // C SP_func_door negative control: the targetname'd plug spawns NO
+    // trigger (think = Think_CalcMoveSpeed), so camping its mouth — the
+    // touch that opens the *32/*33 sliders — leaves it shut and the lift
+    // parked. Pre-fix this touch lowered the plug (the reported "elevator
+    // descends as its door opens").
     SV_TouchDoorsAt(
       st,
       { origin: v3(-1774, 1536, 104), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) },
       'player',
     );
+    expect(door31.state).toBe('bottom');
+    expect([...door31.ent.origin]).toEqual([...door31.pos1]);
     for (let i = 0; i < 30; i++) SV_Tick(st, 0.1);
+    expect(door31.state).toBe('bottom');
     expect(train.started).toBe(false);
     expect([train.ent.origin[0]!, train.ent.origin[1]!, train.ent.origin[2]!]).toEqual(parked);
     // And the lift itself still runs when its button's target fires.
@@ -1641,6 +1557,297 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(train.ent.origin[0]!).toBeCloseTo(-16, 3);
     expect(train.ent.origin[2]!).toBeCloseTo(40, 3);
     expect(train.arrived).toBe(true);
+  });
+
+  it('RELEASE-4: end-lift trigger/state/timing on real base1 (plug *31, train *12)', { timeout: 300000 }, () => {
+    // GROUND TRUTH (pak entities lump + game/g_func.c, g_trigger.c):
+    // - *12 func_train, targetname t91, target t88, speed 40, no wait/flags;
+    //   corners t88 (-2064,1472,-48) -> t89 (-2080,1472,-48, wait .5) ->
+    //   t90 (-2080,1472,-8), one-way (no TOGGLE).
+    // - *31 func_door, angle -2 (down 156), targetname t4, no wait/health/
+    //   target of its own. Per id SP_func_door it spawns NO touch trigger.
+    // - *32/*33 func_door team sliders (angle 270/90, lip 32, speed 50),
+    //   no targetname/health -> touchable; both carry NOMONSTER (2056).
+    // - *13 func_button, target t91, wait -1, health 1 (no touch; use/shoot
+    //   only), speed 200. *34 func_button, target t4, C-default wait 3,
+    //   touchable. The reported bug: the plug dropped as the entry doors
+    //   opened (shared slop-volume overlap tripped a trigger that must not
+    //   exist), before the player could board or press *34.
+    const { map } = loadBase1();
+    const dicts = parseEntities(map.entities);
+    const byModel = (ds: typeof dicts, n: number): Record<string, string> =>
+      ds.find((d) => d['model'] === `*${n}`)!;
+    expect(byModel(dicts, 12)).toMatchObject({
+      classname: 'func_train', targetname: 't91', target: 't88', speed: '40',
+    });
+    expect(byModel(dicts, 31)).toMatchObject({ classname: 'func_door', angle: '-2', targetname: 't4' });
+    expect(byModel(dicts, 31)['wait']).toBeUndefined();
+    expect(byModel(dicts, 31)['health']).toBeUndefined();
+    expect(byModel(dicts, 31)['target']).toBeUndefined();
+    expect(byModel(dicts, 32)['team']).toBe('1');
+    expect(byModel(dicts, 13)).toMatchObject({
+      classname: 'func_button', target: 't91', wait: '-1', health: '1',
+    });
+    expect(byModel(dicts, 34)).toMatchObject({ classname: 'func_button', target: 't4' });
+    expect(byModel(dicts, 34)['wait']).toBeUndefined(); // C default 3 applies
+    const corner = (name: string): Record<string, string> =>
+      dicts.find((d) => d.classname === 'path_corner' && d['targetname'] === name)!;
+    expect(corner('t88')).toMatchObject({ target: 't89' });
+    expect(corner('t89')).toMatchObject({ target: 't90', wait: '.5' });
+    expect(corner('t90')['target']).toBeUndefined(); // chain ends: parks
+
+    // PART A — approach: camp the hall the way the game does.
+    resetEdictNums();
+    const st = SV_Init();
+    spawnWith(st, map, 1, true);
+    const train = st.trains.find((t) => !t.ship)!;
+    expect(train.ent.model).toBe('*12');
+    const d31 = st.movers.find((m) => m.ent.model === '*31')!;
+    const d32 = st.movers.find((m) => m.ent.model === '*32')!;
+    const d33 = st.movers.find((m) => m.ent.model === '*33')!;
+    const b13 = st.movers.find((m) => m.ent.model === '*13')!;
+    const b34 = st.movers.find((m) => m.ent.model === '*34')!;
+    expect(b13.wait).toBe(-1); // one-way hold at the top
+    expect(b13.ent.health).toBe(1); // use-only: no touch
+    expect(b34.wait).toBe(3); // C SP_func_button default (not 1)
+    const off = (m: { ent: { origin: Vec3 }; pos1: Vec3 }): [number, number, number] => [
+      m.ent.origin[0]! - m.pos1[0]!,
+      m.ent.origin[1]! - m.pos1[1]!,
+      m.ent.origin[2]! - m.pos1[2]!,
+    ];
+    const camper = { origin: v3(-1669, 1514, 120), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) };
+    const park32: Array<[number, number, number]> = [];
+    const park33: Array<[number, number, number]> = [];
+    for (let i = 0; i < 400; i++) {
+      SV_Tick(st, 0.1);
+      SV_TouchDoorsAt(st, camper, 'player');
+      // no premature departure: the lift never starts while doors cycle.
+      expect(train.started).toBe(false);
+      expect([train.ent.origin[0]!, train.ent.origin[1]!, train.ent.origin[2]!]).toEqual([0, 0, 0]);
+      // and the plug never fires either (no t4 cascade from proximity).
+      expect(st.firedThisTick).not.toContain('t4');
+      expect(st.firedThisTick).not.toContain('t91');
+      if (i >= 60) {
+        park32.push(off(d32));
+        park33.push(off(d33));
+      }
+    }
+    // non-vacuous: the sliders genuinely travelled open (64 sideways) and
+    // parked — TOP wait resets while camped, rendered offsets frozen.
+    expect(Math.hypot(...off(d32))).toBeGreaterThan(30);
+    expect(Math.hypot(...off(d33))).toBeGreaterThan(30);
+    for (const o of park32) expect(o).toEqual(park32[0]);
+    for (const o of park33) expect(o).toEqual(park33[0]);
+    // ...while the targetname'd plug stayed shut the whole time.
+    expect(d31.state).toBe('bottom');
+    expect([...d31.ent.origin]).toEqual([...d31.pos1]);
+
+    // PART B — C-intended activation: lean into *34 (touchable) from the
+    // west walkway; t4 fires on TOP arrival (id button_wait), never on touch.
+    const lean = { origin: v3(-1862, 1536, 120), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) };
+    expect(SV_TouchButtonsAt(st, lean, 'player').map((m) => m.ent.model)).toContain('*34');
+    expect(b34.state).toBe('going_up');
+    expect(st.firedThisTick).not.toContain('t4'); // not yet: fires at the top
+    SV_Tick(st, 0.1);
+    expect(st.firedThisTick).toContain('t4');
+    let guard = 0;
+    while (d31.state !== 'waiting' && d31.state !== 'top' && guard++ < 100) SV_Tick(st, 0.1);
+    expect(d31.ent.origin[2]!).toBeCloseTo(d31.pos2[2]!, 3); // down 156
+    expect(train.started).toBe(false); // the plug cycle never starts the lift
+    // intended wait at the top: the C-default 3s hold, then the return.
+    let holdTicks = 0;
+    guard = 0;
+    while (d31.state !== 'bottom' && guard++ < 400) {
+      SV_Tick(st, 0.1);
+      if (d31.state === 'waiting' || d31.state === 'top') holdTicks++;
+    }
+    expect(holdTicks).toBeGreaterThanOrEqual(28);
+    expect(holdTicks).toBeLessThanOrEqual(32);
+    expect(d31.state).toBe('bottom');
+    // repeat use: the button cycled back on its own 3s, so a second lean
+    // re-fires and the plug drops again.
+    expect(b34.state).toBe('bottom');
+    SV_TouchButtonsAt(st, lean, 'player');
+    guard = 0;
+    while (d31.state === 'bottom' && guard++ < 20) SV_Tick(st, 0.1);
+    expect(d31.state).toBe('going_up');
+
+    // PART C — fresh state: E-use the *13 call button from the train top;
+    // the lift runs its full one-way leg (honouring the t89 .5s corner
+    // wait), parks, and ignores re-use. Blocked rules pinned on the real
+    // train (C train_blocked).
+    resetEdictNums();
+    const st2 = SV_Init();
+    spawnWith(st2, map, 1, true);
+    const train2 = st2.trains.find((t) => !t.ship)!;
+    const btn13 = st2.movers.find((m) => m.ent.model === '*13')!;
+    expect(train2.started).toBe(false);
+    // health buttons answer use, never touch (C: no touch field installed).
+    const onTop = { origin: v3(-2056, 1500, 24), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) };
+    expect(SV_TouchButtonsAt(st2, onTop, 'player').map((m) => m.ent.model)).not.toContain('*13');
+    expect(btn13.state).toBe('bottom');
+    // E-use: aimed within reach, facing, line of sight (the driver path).
+    const eye = v3(-2056, 1500, 46);
+    const ctr = v3(-2016, 1536, 80);
+    const dx = ctr[0]! - eye[0]!;
+    const dy = ctr[1]! - eye[1]!;
+    const dz = ctr[2]! - eye[2]!;
+    const len = Math.hypot(dx, dy, dz);
+    expect(len).toBeLessThan(96);
+    const pressed = SV_UseButton(st2, eye, v3(dx / len, dy / len, dz / len), {
+      trace: SV_ClipTrace(st2, SV_TraceFor(map)),
+    });
+    expect(pressed?.ent.model).toBe('*13');
+    expect(btn13.state).toBe('going_up');
+    let saw91 = false;
+    guard = 0;
+    while (!train2.started && guard++ < 10) {
+      SV_Tick(st2, 0.1);
+      if (st2.firedThisTick.includes('t91')) saw91 = true;
+    }
+    expect(train2.started).toBe(true);
+    expect(saw91).toBe(true); // the button fired its target on TOP arrival
+    expect(btn13.state).toBe('top'); // wait -1: holds, never returns
+    // full leg with the corner wait: t88 -> t89 (16 west), .5s hold, then
+    // t89 -> t90 (40 up). Arrival parks one-way (no TOGGLE, no return).
+    let at89For = 0;
+    let movedAfter89 = false;
+    guard = 0;
+    while (!train2.arrived && guard++ < 60) {
+      SV_Tick(st2, 0.1);
+      const at89 =
+        Math.abs(train2.ent.origin[0]! + 16) < 1 && Math.abs(train2.ent.origin[2]!) < 1;
+      if (at89 && !movedAfter89) at89For++;
+      if (at89For > 0 && Math.abs(train2.ent.origin[2]!) > 1) movedAfter89 = true;
+    }
+    expect(train2.arrived).toBe(true);
+    expect(at89For).toBeGreaterThanOrEqual(3); // the .5s t89 hold happened
+    expect(train2.ent.origin[0]!).toBeCloseTo(-16, 6);
+    expect(train2.ent.origin[2]!).toBeCloseTo(40, 6);
+    // the button holds TOP throughout the ride and after (wait -1: no
+    // return think ever runs).
+    expect(btn13.state).toBe('top');
+    for (let i = 0; i < 50; i++) SV_Tick(st2, 0.1);
+    expect(btn13.state).toBe('top');
+    const endPos: [number, number, number] = [train2.ent.origin[0]!, train2.ent.origin[1]!, train2.ent.origin[2]!];
+    for (let i = 0; i < 50; i++) SV_Tick(st2, 0.1);
+    expect([train2.ent.origin[0]!, train2.ent.origin[1]!, train2.ent.origin[2]!]).toEqual(endPos);
+    // re-use after arrival is ignored (C train_use: START_ON without TOGGLE
+    // returns early; ours additionally latches arrived).
+    SV_UseTargetname(st2, 't91');
+    for (let i = 0; i < 10; i++) SV_Tick(st2, 0.1);
+    expect(train2.arrived).toBe(true);
+    expect([train2.ent.origin[0]!, train2.ent.origin[1]!, train2.ent.origin[2]!]).toEqual(endPos);
+    // C train_blocked on the real lift: 100 dmg debounced at 0.5s, debris
+    // crushed (BLOCK_STOPS not set -> default damage stands).
+    expect(train2.dmg).toBe(100);
+    expect(trainBlocked(train2, 'player', 1.0)).toEqual({ dmg: 100, crush: false });
+    expect(trainBlocked(train2, 'player', 1.2)).toBeNull();
+    expect(trainBlocked(train2, 'other', 1.7)).toEqual({ dmg: 100000, crush: true });
+  });
+
+  it('RELEASE-4: board and ride the exit train with a pmove rider', { timeout: 180000 }, () => {
+    // The operable final elevator (*12 func_train, parked top z=0): a live
+    // pmove body settles onto the top, E-calls the lift through *13 (the
+    // sim's use entry with C button_use semantics — the lump health 1 keeps
+    // touch off, exactly like C), rides the full leg with feet glued to the
+    // pusher top, arrives at t90, and parks with the rider aboard. Every
+    // verdict below is sim state after real ticks (settle/carry/pmove),
+    // never a scripted origin.
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st = SV_Init();
+    spawnWith(st, map, 1, true);
+    const train = st.trains.find((t) => !t.ship)!;
+    const btn13 = st.movers.find((m) => m.ent.model === '*13')!;
+    expect([...train.ent.origin]).toEqual([0, 0, 0]);
+    expect(train.started).toBe(false);
+    try {
+      setPmoveWorld(SV_ClipTrace(st, SV_TraceFor(map)), bspContentsFor(map));
+      const rider = makePmoveState();
+      // Setup teleport only (the web (u) footprint pattern): settle from
+      // above onto the parked top — the C +1/32 contact rest, never an
+      // exact-plane plant that reads allsolid in C too.
+      rider.origin = v3(-2056, 1500, 24.03);
+      rider.velocity = v3();
+      const carry = (): void => {
+        SV_CarryRiders(st, [{
+          origin: rider.origin,
+          mins: rider.mins,
+          maxs: rider.maxs,
+          groundEntity: rider.groundEntity,
+          onGround: rider.onGround,
+        }]);
+      };
+      for (let i = 0; i < 10; i++) {
+        SV_Tick(st, 0.1);
+        carry();
+        pmoveFull(rider, { msec: 100, angles: v3(0, 0, 0), forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 });
+      }
+      expect(rider.onGround).toBe(true);
+      expect(rider.groundEntity).toBe(train.ent.num);
+      expect(rider.origin[2]! - 24).toBeCloseTo(0, 1);
+      expect(train.started).toBe(false);
+      // E-call: aim at the *13 center (reach + facing + wall trace — the
+      // driver pressUseButton path). The button fires t91 on TOP arrival.
+      const eye = v3(rider.origin[0]!, rider.origin[1]!, rider.origin[2]! + 22);
+      const ctr = v3(-2016, 1536, 80);
+      const dx = ctr[0]! - eye[0]!;
+      const dy = ctr[1]! - eye[1]!;
+      const dz = ctr[2]! - eye[2]!;
+      const len = Math.hypot(dx, dy, dz);
+      expect(len).toBeLessThan(96);
+      const pressed = SV_UseButton(st, eye, v3(dx / len, dy / len, dz / len), {
+        trace: SV_ClipTrace(st, SV_TraceFor(map)),
+      });
+      expect(pressed?.ent.model).toBe('*13');
+      let guard = 0;
+      while (!train.started && guard++ < 10) {
+        SV_Tick(st, 0.1);
+        carry();
+        pmoveFull(rider, { msec: 100, angles: v3(0, 0, 0), forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 });
+      }
+      expect(train.started).toBe(true);
+      // Full leg: grounded on the pusher every tick, feet glued to the top
+      // (the pre-fix fall-through read airborne here), body displacement
+      // matching the pusher displacement (SV_Push semantics).
+      guard = 0;
+      while (!train.arrived && guard++ < 60) {
+        const tx = train.ent.origin[0]!;
+        const ty = train.ent.origin[1]!;
+        const tz = train.ent.origin[2]!;
+        const px = rider.origin[0]!;
+        const py = rider.origin[1]!;
+        const pz = rider.origin[2]!;
+        SV_Tick(st, 0.1);
+        carry();
+        pmoveFull(rider, { msec: 100, angles: v3(0, 0, 0), forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 });
+        expect(rider.onGround).toBe(true);
+        expect(rider.groundEntity).toBe(train.ent.num);
+        expect(rider.origin[2]! - 24).toBeCloseTo(train.ent.origin[2]!, 0);
+        // SV_Push semantics: the rider moves WITH the pusher displacement.
+        expect(rider.origin[0]! - px).toBeCloseTo(train.ent.origin[0]! - tx, 1);
+        expect(rider.origin[1]! - py).toBeCloseTo(train.ent.origin[1]! - ty, 1);
+        expect(rider.origin[2]! - pz).toBeCloseTo(train.ent.origin[2]! - tz, 1);
+      }
+      expect(train.arrived).toBe(true);
+      expect(train.ent.origin[0]!).toBeCloseTo(-16, 6);
+      expect(train.ent.origin[2]!).toBeCloseTo(40, 6);
+      expect(rider.origin[2]! - 24).toBeCloseTo(40, 0);
+      // Parks with the rider aboard: 50 ticks, grounded, zero motion.
+      for (let i = 0; i < 50; i++) {
+        SV_Tick(st, 0.1);
+        carry();
+        pmoveFull(rider, { msec: 100, angles: v3(0, 0, 0), forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 });
+        expect(rider.onGround).toBe(true);
+        expect(rider.groundEntity).toBe(train.ent.num);
+      }
+      expect(train.arrived).toBe(true);
+      expect(train.ent.origin[0]!).toBeCloseTo(-16, 6);
+      expect(train.ent.origin[2]!).toBeCloseTo(40, 6);
+    } finally {
+      resetPmoveWorld();
+    }
   });
 
   it('no door/relay/button use in the lump can start the exit lift except t91', { timeout: 300000 }, () => {
@@ -1781,13 +1988,22 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(findByClassname(st.entities, 'func_rotating')).toHaveLength(1);
   });
 
-  it('doors: all four start closed at pos1; touch opens; clear + wait returns to pos1', { timeout: 120000 }, () => {
+  it('doors: touch opens untargeted doors; targetname doors ignore touch, answer use', { timeout: 120000 }, () => {
     // M5.2 pin for the "doors render open at spawn" report: the server must
     // spawn every mover at pos1/STATE_BOTTOM (base1 sets no START_OPEN bit —
-    // verified from the lump below), SV_TouchDoorsAt must open each door,
-    // and with the area clear the C wait cycle (door_hit_top -> door_go_down
-    // after `wait` -> door_hit_bottom) must latch back at pos1/bottom.
-    // A stuck-open door here would implicate spawn state, not the renderer.
+    // verified from the lump below), SV_TouchDoorsAt must open each
+    // TRIGGERED door, and with the area clear the C wait cycle
+    // (door_hit_top -> door_go_down after `wait` -> door_hit_bottom) must
+    // latch back at pos1/bottom. A stuck-open door here would implicate
+    // spawn state, not the renderer.
+    // C SP_func_door (g_func.c): a door carrying a targetname (or health)
+    // spawns NO touch trigger — think = Think_CalcMoveSpeed, not
+    // Think_SpawnDoorTrigger. Base1's *31 plug (targetname t4) therefore
+    // ignores the camper that opens the *32/*33 sliders; only the *34
+    // button (t4, C button_touch — touchable: no targetname, no health)
+    // lowers it. The old build touch-opened *31 (the reported "elevator
+    // descends as its door opens"), so the *31 leg below is a negative
+    // control plus the C-intended button cycle.
     const { map } = loadBase1();
     const dicts = parseEntities(map.entities);
     const doorDicts = dicts.filter((d) => d.classname === 'func_door');
@@ -1803,16 +2019,16 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       expect(m.state).toBe('bottom');
       expect([...m.ent.origin]).toEqual([...m.pos1]);
     }
-    // door *19 (up), *31 (down), *32 (-y slider), *33 (+y slider).
+    // door *19 (up), *32 (-y slider), *33 (+y slider): touch opens.
     const touchAt: Record<number, [number, number, number]> = {
       19: [-1112, 1632, -24],
-      31: [-1774, 1536, 104],
       32: [-1684, 1488, 120],
       33: [-1684, 1584, 120],
     };
     for (const m of st.movers) {
       if (m.ent.classname !== 'func_door') continue;
       const n = Number.parseInt(m.ent.model.slice(1), 10);
+      if (n === 31) continue; // C: no trigger — covered below, not here.
       const tp = touchAt[n]!;
       expect(tp).toBeDefined();
       const used = SV_TouchDoorsAt(
@@ -1837,11 +2053,72 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
         expect(m.ent.origin[i]!).toBeCloseTo(m.pos1[i]!, 3);
       }
     }
+    // *31 (targetname t4): touch is a no-op — the plug stays shut through
+    // the camper that opens the sliders, and a monster leaning on it is
+    // equally ignored.
+    const d31 = st.movers.find((m) => m.ent.model === '*31')!;
+    expect(d31.ent.targetname).toBe('t4');
+    for (const spot of [[-1774, 1536, 104], [-1684, 1488, 120]] as const) {
+      const used = SV_TouchDoorsAt(
+        st,
+        { origin: v3(spot[0], spot[1], spot[2]), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+        'player',
+      );
+      expect(used.map((u) => u.ent.model)).not.toContain('*31');
+    }
+    expect(
+      SV_TouchDoorsAt(
+        st,
+        { origin: v3(-1774, 1536, 104), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+        'monster',
+      ).map((u) => u.ent.model),
+    ).not.toContain('*31');
+    for (let i = 0; i < 30; i++) SV_Tick(st, 0.1);
+    expect(d31.state).toBe('bottom');
+    expect([...d31.ent.origin]).toEqual([...d31.pos1]);
+    // C-intended opener: lean into the *34 platform button (touchable —
+    // no targetname, no health). The button fires t4 on reaching the TOP
+    // (id button_wait), the plug drops the full 156, holds the C-default
+    // 3s wait at the top, returns, and answers a second press (repeat use).
+    const b34 = st.movers.find((m) => m.ent.model === '*34')!;
+    expect(b34.ent.target).toBe('t4');
+    expect(b34.wait).toBe(3); // C SP_func_button default, not 1
+    const lean = SV_TouchButtonsAt(
+      st,
+      { origin: v3(-1862, 1536, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+      'player',
+    );
+    expect(lean.map((m) => m.ent.model)).toContain('*34');
+    let guard = 0;
+    while (d31.state === 'bottom' && guard++ < 20) SV_Tick(st, 0.1);
+    expect(d31.state).toBe('going_up');
+    expect(st.firedThisTick).toContain('t4');
+    guard = 0;
+    while (d31.state !== 'waiting' && d31.state !== 'top' && guard++ < 100) SV_Tick(st);
+    expect(d31.ent.origin[2]!).toBeCloseTo(d31.pos2[2]!, 3); // down 156
+    guard = 0;
+    while (d31.state !== 'bottom' && guard++ < 400) SV_Tick(st);
+    expect(d31.state).toBe('bottom');
+    expect(d31.ent.origin[2]!).toBeCloseTo(d31.pos1[2]!, 3);
+    // repeat use: the button returned to BOTTOM on its own 3s cycle, so a
+    // second lean re-fires and the plug drops again.
+    expect(b34.state).toBe('bottom');
+    SV_TouchButtonsAt(
+      st,
+      { origin: v3(-1862, 1536, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+      'player',
+    );
+    guard = 0;
+    while (d31.state === 'bottom' && guard++ < 20) SV_Tick(st, 0.1);
+    expect(d31.state).toBe('going_up');
   });
 
   it('doors: NOMONSTER sliders ignore monsters, plain doors do not', { timeout: 120000 }, () => {
     // id Touch_DoorTrigger: (spawnflags & DOOR_NOMONSTER) && monster -> return.
     // Base1: *32/*33 carry 2056 = NOT_DM|NOMONSTER; *19/*31 carry no flags.
+    // C SP_func_door: *31 (targetname t4) spawns no trigger at all, so the
+    // monster leaning on the entry sliders trips nothing — neither the
+    // NOMONSTER sliders nor the untriggered plug.
     const { map } = loadBase1();
     resetEdictNums();
     const st = SV_Init();
@@ -1856,13 +2133,14 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       mins: v3(-16, -16, -24),
       maxs: v3(16, 16, 32),
     });
-    // sliders: monster touch is a no-op (the shared trigger volume still
-    // opens *31, which carries no NOMONSTER bit), player touch opens *32.
+    // sliders: monster touch is a no-op (NOMONSTER), and the targetname'd
+    // *31 has no trigger to trip either. Player touch still opens *32.
     const mUsed = SV_TouchDoorsAt(st, monsterBody(-1684, 1488, 120), 'monster').map((m) => m.ent.model);
-    expect(mUsed).toContain('*31');
+    expect(mUsed).not.toContain('*31');
     expect(mUsed).not.toContain('*32');
     expect(mUsed).not.toContain('*33');
     expect(byModel(32).state).toBe('bottom');
+    expect(byModel(31).state).toBe('bottom');
     expect(SV_TouchDoorsAt(st, monsterBody(-1684, 1488, 120), 'player').map((m) => m.ent.model)).toContain('*32');
     // plain doors: monsters open them (authentic — the NOMONSTER bit is absent).
     expect(SV_TouchDoorsAt(st, monsterBody(-1112, 1632, -24), 'monster').map((m) => m.ent.model)).toContain('*19');

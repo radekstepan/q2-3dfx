@@ -335,7 +335,8 @@ done-when:
 owns: `packages/server`, `packages/game`, `apps/web`
 depends: none
 starting-points: `packages/server/src/doors.ts`, base1 entity lump and target chain
-status: ready
+status: in-progress(@opencode)
+lane-2026-10-30 (@opencode): server+game lane DONE (server 184/184, game 209/209, C-parity no-trigger + button wait 3, real-base1 regressions); apps/web base1-gate legs (c,r,t,u,v,w) still encode the old touch-plug bug and need rerouting to *34/*13 + low-tunnel path.
 done-when:
 - [ ] Reproduce the final elevator descending as its door opens before the player can board. Identify its actual map classname, targets, button, spawnflags and wait values; compare the local original Quake II mover/trigger implementation. Determine intended activation from the map/source rather than forcing every lift to wait indefinitely.
 - [ ] Repair the specific trigger/state/timing discrepancy. Verify approach, door opening, boarding, button use, ride and level exit, plus repeat use and blocked movement where applicable. Assert the intended wait at the top and no premature departure in a real-base1 tick-loop regression and visible route.
