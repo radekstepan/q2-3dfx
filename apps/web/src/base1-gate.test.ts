@@ -44,11 +44,11 @@
 //   (q) a dying soldier fires its last-ditch shot (death1 frames 21/24):
 //       the foe bolt renders in flight out of the corpse's muzzle, aimed
 //       back at the player, plus the muzzle-flash drain.
-//   (r) exit-door-open leaves the lift parked: opening the *31 plug (touch
-//       volume, then the real walk-in through the *32/*33 doors) never
-//       starts the *12 func_train and never moves its brush mesh — the
-//       sim origin stays (0,0,0) and the rendered offset stays 0 while the
-//       doors cycle around it (no t91 cascade, no graft coupling).
+//   (r) exit-door-open leaves the lift parked: camping the hall opens and
+//       parks the *32/*33 sliders while the targetname'd *31 plug (C: no
+//       touch trigger) stays at pos1 and the *12 func_train never starts —
+//       the sim origin stays (0,0,0) and the rendered offset stays 0 while
+//       the entry doors cycle around the walker (no t91/t4 cascade).
 //   (s) walk-out from the debris spot (-384.4,33.8,-16): the body settles
 //       from above onto the func_wall *9 slab top and walks N/S/E standing,
 //       N crouched, and W to the world rock face at x=-412 (the stop is the
@@ -245,20 +245,22 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
   it('(c) a touched door renders open, then re-closes when clear', { timeout: 180000 }, async () => {
     const boot = await bootBase1();
     const { driver } = boot;
-    // *31 plug (down-door, wait 0): no monster camps its volume, so the
+    // *32 entry slider (touchable: no targetname/health, so C SP_func_door
+    // spawns its rest-bounds trigger — the targetname'd *31 plug owns none
+    // and can no longer cover this leg). No monster camps its volume, so the
     // cycle completes once the player leaves.
-    const off0 = driver.doorRenderOffset('*31');
+    const off0 = driver.doorRenderOffset('*32');
     expect(off0).not.toBeNull();
     expect(mag3(off0!)).toBeLessThan(0.01); // renders CLOSED at spawn
-    // Walk into the *31 trigger field: the server Touch_DoorTrigger opens it.
-    driver.pm.origin = v3(-1774, 1536, 104);
+    // Walk into the *32 rest volume: the server Touch_DoorTrigger opens it.
+    driver.pm.origin = v3(-1684, 1488, 120);
     driver.pm.velocity = v3();
     let open = 0;
-    for (let i = 0; i < 120 && open < 100; i++) {
+    for (let i = 0; i < 120 && open < 30; i++) {
       driver.step(neutralCmd(), 0.1);
-      open = mag3(driver.doorRenderOffset('*31')!);
+      open = mag3(driver.doorRenderOffset('*32')!);
     }
-    expect(open).toBeGreaterThanOrEqual(100); // plug travels 156u; rendered
+    expect(open).toBeGreaterThanOrEqual(30); // slider travels 64u; rendered
     // Leave the volume and wait out the hold + return leg: the rendered slab
     // rides back to the closed pose.
     driver.pm.origin = v3(128, -320, 32);
@@ -267,7 +269,7 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     let n = 0;
     while (shut >= 0.5 && n++ < 400) {
       driver.step(neutralCmd(), 0.1);
-      shut = mag3(driver.doorRenderOffset('*31')!);
+      shut = mag3(driver.doorRenderOffset('*32')!);
     }
     expect(shut).toBeLessThan(0.5);
   });
@@ -1022,56 +1024,81 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect([...train.ent.origin]).toEqual([0, 0, 0]);
     expect(train.started).toBe(false);
     expect(driver.doorRenderOffset('*12')).toEqual([0, 0, 0]);
-    // Watch every tick for a t91 cascade (the server unit pin only fired
+    // Watch every tick for a relay cascade (the server unit pin fired
     // targetnames headlessly; here the full driver loop runs — triggers,
     // pickups, monster door touches, fuses — exactly like the game).
-    let saw91 = false;
-    // Phase 1: open the exit door the way the game does — walk the body
-    // into the plug-mouth touch volume so SV_TouchDoorsAt fires through
-    // the real driver tick (gate (c) teleports here; same volume).
-    driver.pm.origin = v3(-1774, 1536, 104);
+    const fired = new Set<string>();
+    // Phase 1: camp the hall the way the game does — the body overlaps the
+    // *32/*33 rest volumes so the sliders open and park, while the
+    // targetname'd *31 plug (C SP_func_door: no touch trigger) sits out the
+    // whole camp and the named lift never starts.
+    driver.pm.origin = v3(-1669, 1514, 120);
     driver.pm.velocity = v3();
-    let doorTravel = 0;
+    let sliderTravel = 0;
+    let plugTravel = 0;
     for (let i = 0; i < 120; i++) {
       driver.step(neutralCmd(), 0.1);
-      if (driver.server.firedThisTick.includes('t91')) saw91 = true;
-      doorTravel = Math.max(doorTravel, mag3(driver.doorRenderOffset('*31')!));
+      for (const t of driver.server.firedThisTick) fired.add(t);
+      sliderTravel = Math.max(
+        sliderTravel,
+        mag3(driver.doorRenderOffset('*32')!),
+        mag3(driver.doorRenderOffset('*33')!),
+      );
+      plugTravel = Math.max(plugTravel, mag3(driver.doorRenderOffset('*31')!));
+      expect(train.started).toBe(false);
+      expect([...train.ent.origin]).toEqual([0, 0, 0]);
     }
-    // Non-vacuous: the plug genuinely travelled its 156u down leg.
-    expect(doorTravel).toBeGreaterThan(100);
+    // Non-vacuous: the sliders genuinely travelled (64u sideways each) ...
+    expect(sliderTravel).toBeGreaterThan(30);
+    // ... while the plug never moved a unit, nobody fired its relay, and
+    // the lift never started.
+    expect(plugTravel).toBeLessThan(0.01);
+    const plug31 = driver.server.movers.find((m) => m.ent.model === '*31')!;
+    expect([...plug31.ent.origin]).toEqual([...plug31.pos1]);
+    expect(fired.has('t91')).toBe(false);
+    expect(fired.has('t4')).toBe(false);
     // Phase 2: the real walk-in through the *32/*33 entry doors.
     driver.pm.origin = v3(-1560, 1536, 150);
     driver.pm.velocity = v3();
     let doorCycle = 0;
     for (let i = 0; i < 200 && driver.playerHealth > 0; i++) {
       driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
-      if (driver.server.firedThisTick.includes('t91')) saw91 = true;
+      for (const t of driver.server.firedThisTick) fired.add(t);
       doorCycle = Math.max(doorCycle, mag3(driver.doorRenderOffset('*32')!));
     }
     // Non-vacuous: the entry doors cycled as the bot walked through.
     expect(doorCycle).toBeGreaterThan(30);
-    // RENDERED + SIM verdict: the lift never started and never moved —
-    // the brush mesh sits at the parked pose while the doors cycled.
-    expect(saw91).toBe(false);
+    // RENDERED + SIM verdict: the lift never started and never moved — the
+    // brush mesh sits at the parked pose while the doors cycled, and the
+    // plug stayed shut throughout (no t91/t4 cascade, no graft coupling).
+    expect(fired.has('t91')).toBe(false);
+    expect(fired.has('t4')).toBe(false);
     expect(train.started).toBe(false);
     expect([...train.ent.origin]).toEqual([0, 0, 0]);
     expect(driver.doorRenderOffset('*12')).toEqual([0, 0, 0]);
+    expect(mag3(driver.doorRenderOffset('*31')!)).toBeLessThan(0.01);
+    expect([...plug31.ent.origin]).toEqual([...plug31.pos1]);
   });
 
-  it('(t) the exit lift waits for the player: doors park while camped, the train runs once and parks', { timeout: 180000 }, async () => {
+  it('(t) the exit lift waits for the player: doors park while camped, the plug cycles on *34, the train runs once and parks', { timeout: 180000 }, async () => {
     const boot = await bootBase1();
     const { driver } = boot;
-    // The exit lift complex: the *31 plug (drops 156), the *32/*33 entry
-    // sliders (64 sideways each), and the *12 func_train (t91 → t88 → t89
-    // (wait .5) → t90, one-way). Lump geometry: the reported spot sits just
-    // east of the *32 door, inside the *31/*32/*33 rest trigger volumes.
+    // The exit lift complex: the *31 plug (drops 156 on t4, C-default hold),
+    // the *32/*33 entry sliders (64 sideways each), and the *12 func_train
+    // (t91 → t88 → t89 (wait .5) → t90, one-way). Lump geometry: the reported
+    // spot sits just east of the *32 door, inside the *32/*33 rest volumes
+    // but overlapping NO trigger of the targetname'd plug.
     const train = driver.server.trains.find((t) => t.ent.model === '*12')!;
     expect(train).toBeDefined();
+    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
+    const btn34 = driver.server.movers.find((m) => m.ent.model === '*34')!;
+    expect(btn34.wait).toBe(3); // C SP_func_button default (not 1)
     // Phase 1: camp the reported spot — nearby, aboard nothing — 400 ticks.
-    // C Touch_DoorTrigger volumes are baked from the rest bounds, so the
-    // doors open once and the TOP wait keeps resetting while camped: they
-    // park open instead of cycling closed/open (the old follower volume let
-    // *33 slide out from under the camper and it cycled 7× in 400 ticks).
+    // C rest-baked Touch_DoorTrigger volumes open the sliders once and the
+    // TOP wait keeps resetting while camped: they park open instead of
+    // cycling. The targetname'd plug owns no trigger (C SP_func_door), so
+    // it sits at pos1 no matter how long the lean lasts — pre-fix this same
+    // lean lowered it (the reported "elevator descends as its door opens").
     driver.pm.origin = v3(-1669, 1514, 120);
     driver.pm.velocity = v3();
     stepDriver(driver, neutralCmd(), 5);
@@ -1084,10 +1111,12 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     const park31: Array<[number, number, number]> = [];
     const park32: Array<[number, number, number]> = [];
     const park33: Array<[number, number, number]> = [];
+    const fired = new Set<string>();
     for (let i = 0; i < 400; i++) {
       SV_SetPlayerHealth(driver.server, 100); // setup: hold the camper alive
       driver.step(neutralCmd(), 0.1);
-      // The lift never starts while the doors cycle: no t91 cascade.
+      for (const t of driver.server.firedThisTick) fired.add(t);
+      // The lift never starts while the doors park: no t91/t4 cascade.
       expect(train.started).toBe(false);
       expect([...train.ent.origin]).toEqual([0, 0, 0]);
       expect(off('*12')).toEqual([0, 0, 0]);
@@ -1097,22 +1126,102 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
         park33.push(off('*33'));
       }
     }
-    // Non-vacuous: every slab genuinely travelled open (plug 156 down,
-    // sliders 64 sideways) and then parked — rendered offsets frozen.
-    expect(mag3(off('*31'))).toBeGreaterThan(100);
+    // Non-vacuous: the sliders genuinely travelled open (64 sideways) and
+    // parked — rendered offsets frozen.
     expect(mag3(off('*32'))).toBeGreaterThan(30);
     expect(mag3(off('*33'))).toBeGreaterThan(30);
-    for (const [nm, trace] of [['*31', park31], ['*32', park32], ['*33', park33]] as const) {
+    for (const [nm, trace] of [['*32', park32], ['*33', park33]] as const) {
       for (const o of trace) expect(o).toEqual(trace[0]);
       void nm;
     }
-    // Phase 2: board the lift and press its call button. The driver has no
-    // button-touch path, so the press runs the button's own use entry — the
-    // same call its touch would make — and every verdict below is rendered
-    // or sim-travel state. (Movers are not solid to the driver trace, so
-    // boarding parks the origin on the lift footprint; the lift's travel
-    // and park are what this pins.)
-    driver.pm.origin = v3(-2056, 1536, 20);
+    // ... while the plug never moved and no relay fired the whole camp.
+    for (const o of park31) expect(o).toEqual([0, 0, 0]);
+    expect([...plug.ent.origin]).toEqual([...plug.pos1]);
+    expect(fired.has('t91')).toBe(false);
+    expect(fired.has('t4')).toBe(false);
+    // Phase 2: the C-intended opener — press the *34 platform button. It
+    // sits in a rock alcove east of the walkway dead-end, so the press is
+    // delivered as an overlap (the server-lane lean pattern): the driver
+    // loop fires t4 on the button's TOP arrival, never on touch.
+    driver.pm.origin = v3(-1860, 1536, 150);
+    driver.pm.velocity = v3();
+    let t4first = -1;
+    let tick = 0;
+    for (let i = 0; i < 10 && t4first < 0; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+      tick++;
+      if (driver.server.firedThisTick.includes('t4')) t4first = tick;
+    }
+    expect(t4first).toBeGreaterThanOrEqual(0); // the alcove press fired t4
+    expect(btn34.state).not.toBe('bottom');
+    // Leave the overlap at once: a body parked in the touch volume would
+    // re-fire t4 every button cycle and stretch the door's TOP hold, so the
+    // pure C cycle below is measured without a rider in the button.
+    driver.pm.origin = v3(-1669, 1514, 120);
+    driver.pm.velocity = v3();
+    // The plug drops the full 156 (pos1 z 0 → pos2 z -156), rendered and
+    // simulated identically — while the lift sits out the cycle. (Movers
+    // step in whole ticks, so poll to the clamped pos2, not past it.)
+    let guard = 0;
+    while (plug.ent.origin[2]! > -155 && guard++ < 100) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+      tick++;
+      expect(driver.server.firedThisTick.includes('t4')).toBe(false);
+    }
+    expect(plug.ent.origin[2]!).toBeCloseTo(-156, 0);
+    expect(mag3(off('*31'))).toBeGreaterThan(100);
+    expect(train.started).toBe(false);
+    expect([...train.ent.origin]).toEqual([0, 0, 0]);
+    // Intended wait at the top: the C-default hold (~3s), then the return.
+    // (No t4 anywhere in here: the rider left the button, so the hold is
+    // the pure door wait — a re-press would stretch it, which is exactly
+    // what the old touch-plug bug did every camp tick.)
+    let holdTicks = 0;
+    guard = 0;
+    while (plug.state !== 'bottom' && guard++ < 400) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+      tick++;
+      expect(driver.server.firedThisTick.includes('t4')).toBe(false);
+      if (plug.state === 'waiting' || plug.state === 'top') holdTicks++;
+      expect(train.started).toBe(false);
+    }
+    expect(holdTicks).toBeGreaterThanOrEqual(28);
+    expect(holdTicks).toBeLessThanOrEqual(32);
+    expect([...plug.ent.origin]).toEqual([...plug.pos1]);
+    expect(off('*31')).toEqual([0, 0, 0]);
+    // Repeat use: the button cycled back to BOTTOM on its own 3s, so a
+    // second alcove press re-fires t4 and the plug drops again.
+    expect(btn34.state).toBe('bottom');
+    driver.pm.origin = v3(-1860, 1536, 150);
+    driver.pm.velocity = v3();
+    let t4second = -1;
+    for (let i = 0; i < 10 && t4second < 0; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+      tick++;
+      if (driver.server.firedThisTick.includes('t4')) t4second = tick;
+    }
+    expect(t4second).toBeGreaterThan(t4first + 25); // a separate later cycle
+    guard = 0;
+    while (plug.ent.origin[2]! > -155 && guard++ < 120) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+      tick++;
+    }
+    expect(plug.ent.origin[2]!).toBeCloseTo(-156, 0);
+    expect(train.started).toBe(false);
+    expect(driver.playerHealth).toBeGreaterThan(0);
+    expectInWorld(driver.pm.origin, driver.map!);
+    // Phase 3: press the lift's call button. The driver has no
+    // button-touch path for the health-gated *13, so the press runs the
+    // button's own use entry — the same call its E-use/shot would make —
+    // and every verdict below is rendered or sim-travel state. Park the body
+    // back at the safe hall camp first (movers are not solid to the driver
+    // trace, so the lift's travel and park are what this pins).
+    driver.pm.origin = v3(-1669, 1514, 120);
     driver.pm.velocity = v3();
     stepDriver(driver, neutralCmd(), 10);
     expectInWorld(driver.pm.origin, driver.map!);
@@ -1263,52 +1372,18 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
   it('(u) board the parked lift and ride it: feet on top, grounded, no fall-through', { timeout: 180000 }, async () => {
     const boot = await bootBase1();
     const { driver } = boot;
-    // The exit lift (*12 func_train, t91): parked with its top at z=0 under
-    // a sealed rock shaft mouth (world rock fills x<-2048 z 0..96 over the
-    // whole platform — verified by point-hull rays hitting the east face at
-    // x=-2048 and the ceiling flush at z=0, and by an exhaustive placement
-    // sweep: no 32-wide hull rests on the top without embedding). So the
-    // boarding below is placement setup exactly like gate (t)'s footprint
-    // parking — and every verdict (feet, ground, carry, render) is a real
-    // driver-loop outcome that fails without the mover clip + carry wiring.
+    // The exit lift (*12 func_train, t91): parked with its top at z=0. The
+    // shaft walls wedge a rider the moment it settles (zero walking room —
+    // verified by stepping all four directions), so the boarding below is
+    // placement setup exactly like the server-lane pmove-rider footprint —
+    // and every verdict (feet, ground, carry, render) is a real driver-loop
+    // outcome that fails without the mover clip + carry wiring.
     const train = driver.server.trains.find((t) => t.ent.model === '*12')!;
     expect(train.started).toBe(false);
     expect([...train.ent.origin]).toEqual([0, 0, 0]);
-    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
-    // Part 1 — walk-boarding on the complex's walkable parked platform (the
-    // DOWN plug top: camp the hall first so touch parks it down, reached by
-    // falling in from the deck the way the engine does so the rest is the
-    // C +1/32 contact, never an exact teleport): feet rest on the top,
-    // grounded, linked to the plug, no fall-through walking its length.
-    driver.pm.origin = v3(-1669, 1514, 120);
-    driver.pm.velocity = v3();
-    for (let i = 0; i < 120; i++) {
-      SV_SetPlayerHealth(driver.server, 100);
-      driver.step(neutralCmd(), 0.1);
-    }
-    expect(driver.server.movers.find((m) => m.ent.model === '*31')!.ent.origin[2]!).toBeCloseTo(-156, 0);
-    driver.pm.origin = v3(-1800, 1536, 120);
-    driver.pm.velocity = v3();
-    stepDriver(driver, neutralCmd(), 10);
-    const plugTop = 88;
-    expect(driver.pm.onGround).toBe(true);
-    expect(driver.pm.origin[2]! - 24).toBeCloseTo(plugTop, 0);
-    expect(driver.pm.groundEntity).toBe(plug.ent.num);
-    const walkFrom = driver.pm.origin[0]!;
-    // Walk east along the plug top (away from the *34 button): every tick
-    // the feet rest on the top, grounded, linked to the plug — the
-    // fall-through the user reported is gone. (3 ticks stay well clear of
-    // the plug's east edge step-up.)
-    for (let i = 0; i < 3; i++) {
-      driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
-      expect(driver.pm.origin[2]! - 24).toBeGreaterThan(plugTop - 1);
-      expect(driver.pm.onGround).toBe(true);
-      expect(driver.pm.groundEntity).toBe(plug.ent.num);
-    }
-    expect(driver.pm.origin[0]! - walkFrom).toBeGreaterThan(20);
-    // Part 2 — the train ride: place the rider on the parked top (feet
-    // +1/32 above it), settle, E-call the lift, ride the full leg. The
-    // carry keeps feet==top every tick; the render tracks the sim exactly.
+    // The train ride: place the rider on the parked top (feet +1/32 above
+    // it), settle, E-call the lift, ride the full leg. The carry keeps
+    // feet==top every tick; the render tracks the sim exactly.
     driver.pm.origin = v3(-2056, 1500, 24.03);
     driver.pm.velocity = v3();
     stepDriver(driver, neutralCmd(), 10);
@@ -1444,37 +1519,22 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     }
     expect(btn13.state).toBe('top');
     expect(driver.doorRenderOffset('*13')).toEqual([0, 0, 4]);
-    // Camp the exit hall so the plug parks DOWN (touch opens it, TOP wait
-    // holds it while camped): the *34 touch walk needs the plug top down.
-    // (The camper leans inside the *32 slab but its feet sit at the slab's
-    // base, not its top, so the feet-on-top carry gate leaves it parked —
-    // and the touch walk teleports in fresh afterwards.)
+    // Touch path: the *34 platform button sits in a rock alcove east of the
+    // walkway dead-end (hull stop x -1904, 40u short of the button's west
+    // face), so the press is delivered as an overlap (the server-lane lean
+    // pattern): the driver loop fires t4 on the button's TOP arrival, never
+    // on touch. The health-gated *13 answers use only — it never fires here.
     // Ambient ship relays are not collected here (see the audit note above).
     window = null;
-    driver.pm.origin = v3(-1669, 1514, 120);
+    driver.pm.origin = v3(-1860, 1536, 150);
     driver.pm.velocity = v3();
-    for (let i = 0; i < 120; i++) {
-      SV_SetPlayerHealth(driver.server, 100);
-      driver.step(neutralCmd(), 0.1);
-    }
-    expect(driver.server.movers.find((m) => m.ent.model === '*31')!.ent.origin[2]!).toBeCloseTo(-156, 0);
-    // Touch path: walk into *34 on the plug top (the lean presses it — C
-    // button_touch via the blocking clip, 1u slop over the 1/32 rest) and
-    // it fires t4 (and NOT t91 — only the touched button fires), cycles,
-    // and returns to BOTTOM (wait default semantics).
-    driver.pm.origin = v3(-1800, 1536, 120);
-    driver.pm.velocity = v3();
-    stepDriver(driver, neutralCmd(), 10);
-    const plugNum = plug.ent.num;
-    expect(driver.pm.groundEntity).toBe(plugNum);
-    // Lean west into *34: the contact press fires t4 and the button starts
-    // its cycle (C wait/return semantics: UP, 1s hold, DOWN, BOTTOM).
     window = new Set<string>();
     const w34 = window;
     let saw34 = false;
     let sawOffset = false;
-    for (let i = 0; i < 60 && !saw34; i++) {
-      driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+    for (let i = 0; i < 10 && !saw34; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
       collectTargets();
       if (driver.server.firedThisTick.includes('t4')) saw34 = true;
       const off = driver.doorRenderOffset('*34')!;
@@ -1483,14 +1543,30 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect(saw34).toBe(true);
     expect(sawOffset).toBe(true);
     expect(btn34.state).not.toBe('bottom');
-    // Clear the lean due east (out of touch + slop range), then the button
-    // finishes its wait and returns to BOTTOM on its own — offset back to 0.
-    for (let i = 0; i < 5; i++) {
-      driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+    // Leave the overlap at once (gate (t) pattern): a parked rider would
+    // re-fire t4 every button cycle and the button would never observably
+    // rest at BOTTOM. The plug's cycle runs on without the presser.
+    driver.pm.origin = v3(-1669, 1514, 120);
+    driver.pm.velocity = v3();
+    // The plug drops the full 156 on the press — while the arrived train
+    // parks through the cycle (a plug firing never drives the lift).
+    const plugZ0 = plug.ent.origin[2]!;
+    let guard34 = 0;
+    while (plug.ent.origin[2]! > plugZ0 - 155 && guard34++ < 100) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
       collectTargets();
+      expect(driver.server.firedThisTick.includes('t4')).toBe(false);
     }
+    expect(plug.ent.origin[2]!).toBeCloseTo(plugZ0 - 156, 0);
+    expect(train.arrived).toBe(true);
+    expect(train.ent.origin[0]!).toBeCloseTo(-16, 6);
+    expect(train.ent.origin[2]!).toBeCloseTo(40, 6);
+    // The button finishes its C-default 3s hold and returns to BOTTOM on
+    // its own — offset back to 0.
     let back = false;
-    for (let i = 0; i < 40 && !back; i++) {
+    for (let i = 0; i < 60 && !back; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
       driver.step(neutralCmd(), 0.1);
       collectTargets();
       back = btn34.state === 'bottom';
@@ -1511,17 +1587,15 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expectInWorld(driver.pm.origin, driver.map!);
   });
 
-  it('(w) the end-elevator button finishes the level: blue stats screen, sane counters', { timeout: 180000 }, async () => {
-    // User repro near (-1823,1540,112): standing on the DOWN plug top (plug
-    // *31 rest z 80..244, DOWN offset -156 -> top 88, origin 112) and leaning
-    // into the *34 platform button (box x -1848..-1839 — the hull touches its
-    // east face a few units west of the reported spot; the button is
-    // unreachable from anywhere else). Lump geometry: *34 fires t4 (the
-    // fires t91 (the *12 lift + its secret); the *27 pit behind the plug is
-    // sealed rock in every plug state, so these presses ARE the reachable
-    // end of the game (base2 is not shipped). The server owns the finished
-    // state; the HUD renders it centered in blue with HelpComputer-lite
-    // stats (kills / secrets / goals over totals + level time, C p_hud.c).
+  it('(w) the low tunnel reaches the *27 exit volume: blue stats screen, sane counters', { timeout: 180000 }, async () => {
+    // C-intended exit path (base2 is not shipped): a low tunnel east of the
+    // plug (x -1700 → -1776 at feet -80) sweeps clear at player hull all the
+    // way to the *27 trigger volume (x -1840..-1712, y 1448..1640, z -24..32
+    // — a body with feet at -80 grazes its floor). The plug/train complex is
+    // optional side content (t91 fires its target_secret); the tunnel is the
+    // way out. The server owns the finished state; the HUD renders it
+    // centered in blue with HelpComputer-lite stats (kills / secrets / goals
+    // over totals + level time, C p_hud.c).
     const boot = await bootBase1();
     const { driver } = boot;
     // Pure time formatter pins (M:SS from level.time, never wall-clock).
@@ -1535,41 +1609,49 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect(driver.server.totalSecrets).toBe(3);
     expect(driver.server.totalGoals).toBe(1);
     expect(driver.server.finished).toBe(false);
-    // Camp the hall so the plug parks DOWN (touch opens it, TOP wait holds
-    // while camped — gate (t) pattern), then footprint the DOWN plug top and
-    // settle from above (the C +1/32 contact rest, never an exact teleport).
-    driver.pm.origin = v3(-1669, 1514, 120);
+    // Route documentation (sim truth, C player mask): the tunnel sweeps
+    // clear at player hull from x -1700 to x -1776 at feet -80, on the
+    // center line and 24u to either side — the full width that reaches *27.
+    // (Same clip-trace construction as the driver's own world trace.)
+    const clip = SV_ClipTrace(driver.server, SV_TraceFor(driver.map!));
+    const sweep = (sx: number, y: number): number =>
+      clip(
+        v3(sx, y, -56), v3(-16, -16, -24), v3(16, 16, 32), v3(-1776, y, -56),
+      ).fraction;
+    for (const y of [1520, 1544, 1568]) expect(sweep(-1700, y)).toBe(1);
+    // Descend into the tunnel east of the plug: teleport below the plug
+    // bottom (80 — body top 72 clears it) and settle from above the way the
+    // engine does (never an exact-plane plant). The real fall ends on the
+    // pit floor at feet -80, inside the *27 volume.
+    driver.pm.origin = v3(-1750, 1544, 40);
     driver.pm.velocity = v3();
-    for (let i = 0; i < 120; i++) {
-      SV_SetPlayerHealth(driver.server, 100); // setup: hold the camper alive
-      driver.step(neutralCmd(), 0.1);
-    }
-    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
-    expect(plug.ent.origin[2]!).toBeCloseTo(-156, 0);
-    // Stage just east of the *34 face (button box x -1848..-1839, 1u touch
-    // slop): close enough to lean in, far enough that settle fires nothing.
-    driver.pm.origin = v3(-1815, 1540, 120);
-    driver.pm.velocity = v3();
-    stepDriver(driver, neutralCmd(), 10);
-    expect(driver.server.finished).toBe(false);
-    expect(driver.pm.onGround).toBe(true);
-    expect(driver.pm.groundEntity).toBe(plug.ent.num);
-    // The user spot: feet on the 88 top (origin 112), on the plug.
-    expect(driver.pm.origin[0]!).toBeCloseTo(-1815, 1);
-    expect(driver.pm.origin[1]!).toBeCloseTo(1540, 1);
-    expect(driver.pm.origin[2]!).toBeCloseTo(112, 0);
-    // Lean west into *34: the contact press fires t4 (the plug cycles — the
-    // sim keeps running, riders included) and the server marks the finish.
-    // (Per-tick collection: firedThisTick resets every SV_Tick.)
+    // NB: the loop runs unconditionally — t37 fires on the first overlap
+    // (body top 72 already grazes the volume floor) while the engine is
+    // still falling; cutting the loop at finished would plant the verdict
+    // mid-air instead of on the pit floor.
     const fired = new Set<string>();
-    for (let i = 0; i < 30 && !driver.server.finished; i++) {
-      driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+    for (let i = 0; i < 40; i++) {
+      driver.step(neutralCmd(), 0.1);
       for (const t of driver.server.firedThisTick) fired.add(t);
     }
-    expect(fired.has('t4')).toBe(true);
+    // The body genuinely fell (not a teleport plant) and rests on the floor.
+    expect(driver.pm.origin[2]!).toBeCloseTo(-56, 0);
     expect(driver.server.finished).toBe(true);
-    expect(driver.server.finishReason).toBe('lift');
+    expect(driver.pm.onGround).toBe(true);
+    expectInWorld(driver.pm.origin, driver.map!);
+    // The *27 brush trigger fired t37 → target_changelevel during the real
+    // descent, and the server marked the finish via the exit path.
+    expect(fired.has('t37')).toBe(true);
+    expect(driver.server.finished).toBe(true);
+    expect(driver.server.finishReason).toBe('exit');
     expect(driver.server.finishTime).toBeGreaterThan(0);
+    // The plug/train complex sat out the exit: optional side content,
+    // never touched.
+    const train = driver.server.trains.find((t) => !t.ship)!;
+    expect(train.started).toBe(false);
+    expect([...train.ent.origin]).toEqual([0, 0, 0]);
+    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
+    expect([...plug.ent.origin]).toEqual([...plug.pos1]);
     // RENDERED verdict: the finished message carries the headline + the
     // stats lines, with every counter sane (kills/secrets/goals <= totals).
     const msg = driver.message;
@@ -1592,11 +1674,11 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect(Number(kills![2])).toBeGreaterThan(0);
     expect(Number(secrets![2])).toBe(3);
     expect(Number(goals![2])).toBe(1);
-    // The level never exits from the press (no base2 to go to): no 'exit'
-    // event, no invincibility — but the finished screen announced itself.
-    expect(driver.events).toContain('finished');
-    expect(driver.events).not.toContain('exit');
-    expect(driver.exited).toBe(false);
+    // The changelevel path: 'exit' fires (and the driver goes invincible —
+    // the old lift path's 'finished' event does not apply here).
+    expect(driver.events).toContain('exit');
+    expect(driver.events).not.toContain('finished');
+    expect(driver.exited).toBe(true);
     // The screen persists: firing afterwards never overwrites it.
     driver.step(attackCmd([0, 0, 0]), 0.1);
     expect(driver.message).toBe(msg);

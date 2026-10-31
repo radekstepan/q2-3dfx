@@ -331,16 +331,6 @@ done-when:
 - [ ] Verify the landed procedural palette/world/model replay on GPU cold boot, switching and restoration without a pak. The former palette guard was addressed in `2c4c162`; do not repeat the obsolete diagnosis or rebuild the implementation. Diagnose any remaining failure from rendered evidence.
 - [ ] Real-WebGL pixels show expected room geometry/materials and entities without pak assets; verify cold boot, map switch, renderer switch and context restoration. Check that an intentional missing-world control fails; nonblack clear color alone is insufficient.
 
-### RELEASE-4 — Correct final elevator activation and waiting
-owns: `packages/server`, `packages/game`, `apps/web`
-depends: none
-starting-points: `packages/server/src/doors.ts`, base1 entity lump and target chain
-status: in-progress(@opencode)
-lane-2026-10-30 (@opencode): server+game lane DONE (server 184/184, game 209/209, C-parity no-trigger + button wait 3, real-base1 regressions); apps/web base1-gate legs (c,r,t,u,v,w) still encode the old touch-plug bug and need rerouting to *34/*13 + low-tunnel path.
-done-when:
-- [ ] Reproduce the final elevator descending as its door opens before the player can board. Identify its actual map classname, targets, button, spawnflags and wait values; compare the local original Quake II mover/trigger implementation. Determine intended activation from the map/source rather than forcing every lift to wait indefinitely.
-- [ ] Repair the specific trigger/state/timing discrepancy. Verify approach, door opening, boarding, button use, ride and level exit, plus repeat use and blocked movement where applicable. Assert the intended wait at the top and no premature departure in a real-base1 tick-loop regression and visible route.
-
 ### RELEASE-5 — Monster collision, wall movement and infantry fire
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
 depends: none

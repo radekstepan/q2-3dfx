@@ -477,3 +477,9 @@ lane report (single writer, web-only test addition, no production edits to prese
 par finding: production `SV_PlayerFire` matches C `Blaster_Fire`/`G_ProjectSource` exactly (24 fwd + 8 right + viewheight-8, dir = forward). `apps/web/src/blaster-aim.test.ts` 6/6 (incl. real-base1 Q2_PAK leg): near 200u ~13px right/down, mid 800u ~3px, far 1500u ~2px at 640x480 FOV90; CPU/GPU agree <1px at 640x480/800x600/1024x768 level+pitched; wall impact preserves 8u lateral (parallel); kick `-2*fwd`/`[-1,0,0]` is one-tick camera transient per `SV_CalcViewOffset`. Zero-muzzle and convergent-aim negative controls pinned as not-shipped.
 neighbors: web typecheck clean, blaster-aim 6/6, aim-hud 7/7, resolution-fit 7/7; play M7.2 damage + `sound→config` ×2 pre-existing (FOLLOW-5/RELEASE-1 territory, reproduced on clean tree).
 changesets: `release-3b-blaster-parallax.md` (web ignored; no versioned package touched). No perf-ledger row: test-only, no raster/frame-time change.
+
+### RELEASE-4 — Correct final elevator activation and waiting — DONE 2026-10-30
+owns: `packages/server`, `packages/game`, `apps/web` · depends: none
+lane report (server+game + web reroute, disjoint): C-parity no-trigger for targetname/health doors + button wait 3; base1 *31 plug waits for *34 (t4), sliders touchable, *13 runs *12 train one-way with t89 hold.
+evidence: server 184/184 + game 209/209 (real-base1 tick-loop: lump identity, 400-tick camp no-departure, *34 156-down/3s-hold/return/repeat, *13 ride with pmove rider, blocked rules); web base1-gate 23/23 rerouted (sliders park/*31 shut/train parked, *34 cycle, *13 ride, low-tunnel *27 exit with stats).
+changesets: `release-4-elevator-trigger.md` (`@q2/server`+`@q2/game` patch) + `release-4-web-gate.md` (web ignored). No perf-ledger row: trigger/timing logic only.
