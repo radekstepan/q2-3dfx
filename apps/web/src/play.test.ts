@@ -1238,6 +1238,9 @@ describe.runIf(!!WEB_Q2_PAK)('sweep gameplay: emitted channel names resolve to d
     // secrets + goals (C g_target.c use_target_secret/use_target_goal
     // default noise — counted server-side, single-use)
     'misc/secret.wav',
+    // help-change beep (C p_view.c G_SetClientSound: misc/pc_up.wav while
+    // pers.helpchanged is 1..3, every 64th frame — RELEASE-6 driver mirror)
+    'misc/pc_up.wav',
     // monster fire (C m_soldier.c/m_gunner.c/m_infantry.c sound_* names)
     'soldier/solatck1.wav',
     'soldier/solatck2.wav',

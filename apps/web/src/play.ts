@@ -99,7 +99,6 @@ import {
   SV_ClipTrace,
   SV_PlayerFire,
   SV_UseButton,
-  SV_UseTargetname,
   SV_DamagePlayer,
   SV_SetPlayerHealth,
   SV_SetPlayerSuit,
@@ -109,10 +108,12 @@ import {
   SV_DrainSounds,
   SV_DrainCenterprints,
   SV_ClearFinished,
+  fireTargets,
+  helpBeepDue,
   MASK_OPAQUE_C,
 } from '@q2/server';
 import type { ServerState, ServerMonster, ServerBarrel, ServerBolt, ServerExplosion, ServerDebris, ServerGib, ServerSound } from '@q2/server';
-import { ATTN_NORM, Mixer } from '@q2/sound';
+import { ATTN_NORM, ATTN_STATIC, Mixer } from '@q2/sound';
 import { parseMD2, parseWAL, parsePCX } from '@q2/formats';
 import type { Pcx } from '@q2/formats';
 
@@ -1073,6 +1074,23 @@ export class LocalDriver implements HostDriver {
    */
   centerText = '';
   centerAt = -10;
+  /**
+   * Per-client help-notification state (RELEASE-6, id `client_persistant_t`
+   * `game_helpchanged` / `helpchanged`, game/p_view.c `G_SetClientSound` +
+   * game/p_hud.c `G_SetStats` / `Cmd_Help_f`): the server owns the published
+   * sequence (`server.helpChangedSeq`, bumped by every `target_help`
+   * firing); THIS driver owns the acknowledgment. `helpGameSeen` latches the
+   * last published seq observed (a mismatch re-arms `helpChanged = 1`, so a
+   * NEW change re-notifies even after an ack); `helpChanged` (0 acked ..
+   * 4 beeped-out) drives the `i_help` flash (`(serverframe & 8)`) and the
+   * `misc/pc_up.wav` beep (≤3, `(framenum & 63) == 0`). F1-open zeroes
+   * `helpChanged` (`toggleHelpOverlay`). Both persist across respawn (C
+   * `pers` survives SP respawn) and are mirrored nowhere else — the
+   * `PlayBoot.helpChangedSeq/helpSeenSeq` pair is the UI-side view of the
+   * same latch, synced on toggle.
+   */
+  helpGameSeen = 0;
+  helpChanged = 0;
   exited = false;
   /** Finish screen already mirrored from the server (event pushed once). */
   private finishShown = false;
@@ -1422,6 +1440,16 @@ export class LocalDriver implements HostDriver {
       mins: v3(this.pm.mins[0], this.pm.mins[1], this.pm.mins[2]),
       maxs: v3(this.pm.maxs[0], this.pm.maxs[1], this.pm.maxs[2]),
     }, 'player');
+    // Help-change latch + beep (RELEASE-6, id `G_SetClientSound`,
+    // game/p_view.c): a newly published server seq re-arms the pending
+    // notification (`helpChanged = 1`, so the `i_help` slot flashes and the
+    // beep cadence restarts even after an earlier ack); while pending, beep
+    // `misc/pc_up.wav` at most 3 times on the 64-frame cadence
+    // (`helpBeepDue`, the production rule — the counter walks 1→4, then the
+    // icon flashes silently until F1 acks). Runs after every firing path
+    // above so a same-tick `target_help` notifies immediately. C-attention:
+    // `ATTN_STATIC`, at the player origin.
+    this.syncHelpSound();
 
     this.syncDoors();
     this.hideFreedBrushes();
@@ -1513,6 +1541,32 @@ export class LocalDriver implements HostDriver {
   /** True once the centered channel has outlived CENTER_TTL. */
   centerExpired(): boolean {
     return this.server.time - this.centerAt > CENTER_TTL;
+  }
+
+  /**
+   * Per-tick `G_SetClientSound` help half (game/p_view.c, RELEASE-6): latch
+   * newly published server help (`helpGameSeen` follows
+   * `server.helpChangedSeq`, re-arming `helpChanged = 1`), then beep while
+   * the production `helpBeepDue` rule holds (counter 1..3, every 64th 10Hz
+   * frame). The beep increments the counter, so at most three `pc_up`
+   * sounds play per change; the icon keeps flashing (via `helpChanged`)
+   * until `toggleHelpOverlay` acks. Frame convention matches the statusbar
+   * (`Math.floor(serverTime * 10)`, the 10Hz tick).
+   */
+  private syncHelpSound(): void {
+    if (this.helpGameSeen !== this.server.helpChangedSeq) {
+      this.helpGameSeen = this.server.helpChangedSeq;
+      this.helpChanged = 1;
+    }
+    const framenum = Math.floor(this.server.time * 10);
+    if (helpBeepDue(this.helpChanged, framenum)) {
+      this.helpChanged++;
+      this.emitSound(
+        'misc/pc_up.wav',
+        v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]!),
+        ATTN_STATIC,
+      );
+    }
   }
 
   /**
@@ -2543,11 +2597,15 @@ export class LocalDriver implements HostDriver {
       healed = true;
       // id Touch_Item: a successful grab fires the item's target once
       // (G_UseTargets, ITEM_TARGETS_USED) — base1's shotgun fires t55 and
-      // wakes the two TRIGGER_SPAWN soldiers. Once-ever per edict (the
-      // server tracks the same bit on its path via SV_ConsumePickup).
+      // wakes the two TRIGGER_SPAWN soldiers; the silencer fires t76 and
+      // finds its secret. Once-ever per edict (the extra flag mirrors the
+      // server's ITEM_TARGETS_USED bit in SV_ConsumePickup). The FULL target
+      // cascade (fireTargets) is required here, not the narrow
+      // SV_UseTargetname helper (movers/relays/timers only): C uses every
+      // edict carrying the targetname, including target_secret itself.
       if (e.target && e.extra['targetsUsed'] === undefined) {
         e.extra['targetsUsed'] = '1';
-        SV_UseTargetname(this.server, e.target);
+        fireTargets(this.server, e);
       }
       this.syncAmmo();
       this.events.push('pickup');
@@ -3522,14 +3580,14 @@ export interface PlayBoot {
   /**
    * RELEASE-6 help-change tracking (id `game.helpchanged` vs
    * `pers.game_helpchanged`, `p_view.c` / `p_hud.c: Cmd_Help_f`):
-   * `helpChangedSeq` counts help-content changes published for this boot,
-   * `helpSeenSeq` the seq acked by opening F1 (`pers.helpchanged = 0`).
-   * The server lane carries no `target_help` producer yet, so the counter
-   * stays 0 and the statusbar slot never blinks on its own — `helpIconFor`
-   * flashes `i_help` only while the seqs differ, at `(serverframe & 8)`.
-   * TODO(RELEASE-6): advance `helpChangedSeq` from the server lane when a
-   * `target_help` equivalent lands (plus the `misc/pc_up.wav` ≤3 beep path
-   * from `G_SetClientSound`, which has no clean driver-sound route yet).
+   * `helpChangedSeq` is the published seq the UI layer has observed,
+   * `helpSeenSeq` the seq acked by opening F1 (`pers.helpchanged = 0`) —
+   * both synced in `toggleHelpOverlay`. The per-tick latch itself lives on
+   * the driver (`helpGameSeen`/`helpChanged`, `G_SetClientSound` parity in
+   * `step()` + `misc/pc_up.wav` ≤3 beeps, base1's entry trigger `*16 → t70`
+   * fires on the first tick so a cold boot notifies immediately);
+   * `helpIconFor` flashes `i_help` while a change is pending, at
+   * `(serverframe & 8)`.
    */
   helpChangedSeq: number;
   helpSeenSeq: number;
@@ -5229,11 +5287,12 @@ export function buildHudPicCache(pak: WebPak): HudPicCache {
  *
  * The help slot (stat 11, `if 11 xv 148 pic 11`) follows id `G_SetStats`
  * via the shared `helpIconFor` pure helper (`@q2/client`): `i_help` flashes
- * only while an unacked help change exists (`helpChangedSeq !== helpSeenSeq`,
- * the web stand-in for `pers.helpchanged`) at `(serverframe & 8)` — never an
- * unconditional blink. Frame convention is `Math.floor(serverTime * 10)`,
- * the 10Hz server tick (`HelpIconArgs.frame`). Hand/fov pass the id
- * defaults (right-handed, fov 90, so the slot hides when nothing is pending);
+ * only while the driver's unacked help counter (`driver.helpChanged`, the
+ * `pers.helpchanged` latch armed by `syncHelpSound` on every `target_help`
+ * firing) is nonzero, at `(serverframe & 8)` — never an unconditional
+ * blink. Frame convention is `Math.floor(serverTime * 10)`, the 10Hz
+ * server tick (`HelpIconArgs.frame`). Hand/fov pass the id defaults
+ * (right-handed, fov 90, so the slot hides when nothing is pending);
  * TODO(RELEASE-6): forward real hand/fov state if those settings ever land.
  */
 export function statusbarStateFor(boot: PlayBoot): StatusbarState {
@@ -5246,7 +5305,7 @@ export function statusbarStateFor(boot: PlayBoot): StatusbarState {
   const weaponIcon = weaponIconFor(d.weapon.classname);
   const serverframe = Math.floor(boot.host.serverTime * 10);
   const helpPic = helpIconFor({
-    helpChanged: boot.helpChangedSeq !== boot.helpSeenSeq ? 1 : 0,
+    helpChanged: d.helpChanged,
     frame: serverframe,
     centerHanded: false,
     fov: 90,
@@ -5274,6 +5333,29 @@ export function statusbarStateFor(boot: PlayBoot): StatusbarState {
     serverframe,
     clientInfo: () => null,
   };
+}
+
+/**
+ * `DrawHUDString` parity (client/cl_scrn.c, RELEASE-6): `cstring`/`cstring2`
+ * text may carry embedded `\n` (base1's latched help lines do — the lump
+ * `\n` escapes become real newlines at parse). Split into rows, center EACH
+ * row in `centerWidth`, step 8px per row. Single-line text renders exactly
+ * as the old inline math did.
+ */
+export function drawHudText(
+  target: { width: number; height: number; color: Uint32Array },
+  x: number,
+  y: number,
+  text: string,
+  centerWidth: number,
+  rgba: number,
+): void {
+  const rows = text.split('\n');
+  for (let i = 0; i < rows.length; i++) {
+    const line = rows[i]!;
+    const lx = centerWidth > 0 ? x + Math.max(0, ((centerWidth - stringWidth(line)) / 2) | 0) : x;
+    drawString(target, lx, y + i * 8, line, rgba);
+  }
 }
 
 /**
@@ -5305,8 +5387,7 @@ export function drawStatusbarCmds(
       } else if (c.kind === 'field') {
         drawField(target, c.x, c.y, c.style, c.width, c.value, cache.digits, palette);
       } else if (c.kind === 'text') {
-        const x = c.centerWidth > 0 ? c.x + Math.max(0, ((c.centerWidth - stringWidth(c.text)) / 2) | 0) : c.x;
-        drawString(target, x, c.y, c.text, c.alt ? 0xff33ff33 : 0xffffffff);
+        drawHudText(target, c.x, c.y, c.text, c.centerWidth, c.alt ? 0xff33ff33 : 0xffffffff);
       }
     } catch {
       /* one bad cmd never blanks the HUD */
@@ -5320,16 +5401,22 @@ export function drawStatusbarCmds(
  * totals — the `finish*` snapshot (frozen at `SV_FinishLevel`, zero during
  * play) is only for the completion screen. While the level runs this reads
  * the live counters; once finished it reads the frozen snapshot so the
- * totals stay put under post-finish play.
+ * totals stay put under post-finish play. Help text and map name are the
+ * CURRENT server values (`game.helpmessage1/2` latched by `target_help`,
+ * `level.level_name` from worldspawn): base1 shows its two latched lines
+ * (each two rows — the lump messages carry `\n`, split at draw time per
+ * `DrawHUDString`) once `*16 → t70` fires; before any firing (and in the
+ * asset-free devroom, which has no `target_help`) the readable fallback
+ * lines stand in so the panel is never blank.
  */
 export function helpFactsFor(boot: PlayBoot): HelpFacts {
   const s = boot.driver.server;
   const frozen = s.finished;
   return {
     skill: getSkill(),
-    levelName: boot.source === 'pak' ? 'Outer Base' : 'devroom',
-    help1: 'Find the exit.',
-    help2: 'Watch for soldiers.',
+    levelName: s.levelName || (boot.source === 'pak' ? 'Outer Base' : 'devroom'),
+    help1: s.helpMessage1 || 'Find the exit.',
+    help2: s.helpMessage2 || 'Watch for soldiers.',
     kills: [frozen ? s.finishKills : s.killedMonsters, s.totalMonsters],
     goals: [frozen ? s.finishGoals : s.foundGoals, s.totalGoals],
     secrets: [frozen ? s.finishSecrets : s.foundSecrets, s.totalSecrets],
@@ -5374,8 +5461,7 @@ export function drawHelpOverlay(
         const pic = cache?.icons.get(c.name) ?? (c.name === 'help' ? (cache?.help ?? null) : null);
         if (pic && palette) drawPic(target, c.x, c.y, pic, palette);
       } else if (c.kind === 'text') {
-        const x = c.centerWidth > 0 ? c.x + Math.max(0, ((c.centerWidth - stringWidth(c.text)) / 2) | 0) : c.x;
-        drawString(target, x, c.y, c.text, c.alt ? 0xff33ff33 : 0xffffffff);
+        drawHudText(target, c.x, c.y, c.text, c.centerWidth, c.alt ? 0xff33ff33 : 0xffffffff);
       }
     } catch {
       /* skip bad rows */
@@ -5399,22 +5485,24 @@ export function drawHelpOverlay(
 /**
  * Toggle the F1 help-computer overlay (id `Cmd_Help_f`, `game/p_hud.c`):
  * if open AND no help change arrived since it was opened → close; otherwise
- * open + ack (`pers.helpchanged = 0`, i.e. `helpSeenSeq = helpChangedSeq`)
- * + resend the layout (the draw path re-executes `buildHelpLayout` every
- * frame while open, so the resent rows are live on the next present).
- * TODO(RELEASE-6): help-change beep (`misc/pc_up.wav`, ≤3 times at
- * `(framenum & 63) == 0` per `G_SetClientSound`) — no clean driver-sound
- * route exists from this free function (`emitSound` is driver-private, the
- * server sound queue is tick-drained); do not invent audio plumbing until
- * the server lane carries the beep event.
+ * open + ack (`pers.helpchanged = 0`, i.e. `driver.helpChanged = 0`) + the
+ * UI-side seqs follow the published server seq (the draw path re-executes
+ * `buildHelpLayout` every frame while open, so the resent rows are live on
+ * the next present). The help-change beep (`misc/pc_up.wav`, ≤3 times at
+ * `(framenum & 63) == 0` per `G_SetClientSound`) runs in the driver's
+ * per-tick `syncHelpSound`, which also re-arms the flash when a NEW change
+ * lands after an ack.
  */
 export function toggleHelpOverlay(boot: PlayBoot): boolean {
-  if (boot.showHelp && boot.helpSeenSeq >= boot.helpChangedSeq) {
+  const d = boot.driver;
+  if (boot.showHelp && d.helpGameSeen >= d.server.helpChangedSeq) {
     boot.showHelp = false;
     return boot.showHelp;
   }
   boot.showHelp = true;
-  boot.helpSeenSeq = boot.helpChangedSeq;
+  d.helpChanged = 0; // ack: C Cmd_Help_f pers.helpchanged = 0
+  boot.helpChangedSeq = d.server.helpChangedSeq;
+  boot.helpSeenSeq = d.server.helpChangedSeq;
   return boot.showHelp;
 }
 

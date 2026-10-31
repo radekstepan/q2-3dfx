@@ -22,9 +22,11 @@ import {
   bootPlay,
   buildHudPicCache,
   drawHelpOverlay,
+  drawHudText,
   drawPlayHud,
   drawStatusbarCmds,
   helpFactsFor,
+  resizePlay,
   RETAIL_SINGLE_STATUSBAR,
   statusbarStateFor,
   toggleHelpOverlay,
@@ -34,6 +36,10 @@ import {
 } from './play.js';
 import type { PlayBoot } from './play.js';
 import type { UserCmdT } from '@q2/input';
+import { BUTTON_ATTACK, BUTTON_DUCK } from '@q2/input';
+import { v3 } from '@q2/math';
+import { spawnEdict } from '@q2/game';
+import { SV_LinkEdict, SV_SetPlayerHealth, fireTargets } from '@q2/server';
 import {
   buildHelpLayout,
   centerPrintPlacement,
@@ -310,8 +316,14 @@ describe('RELEASE-6 web lane (live counters / help ack / completion)', () => {
   });
 
   it('help icon flashes only while a change is unacked, at (serverframe & 8)', () => {
+    // Real tick path (devroom, no pak): a synthetic target_help fires
+    // through fireTargets + driver.step — never hand-set counters (the old
+    // revision assigned boot.helpChangedSeq directly, which the production
+    // mirror never reads).
     const boot = bootPlay({ width: 320, height: 240 });
-    // Startup: seqs equal → slot hidden at every flash phase (no
+    const { driver } = boot;
+    const idle: UserCmdT = { msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
+    // Cold: nothing pending → slot hidden at every flash phase (no
     // unconditional permanent blink).
     for (const t of [0, 0.8, 1.6, 8.0]) {
       boot.host.serverTime = t;
@@ -319,8 +331,15 @@ describe('RELEASE-6 web lane (live counters / help ack / completion)', () => {
       expect(st.stats[11]).toBe(0);
       expect(st.images[11]).toBe('');
     }
+    expect(driver.helpChanged).toBe(0);
+    // Fire a help change the C way (G_UseTargets on a target_help).
+    SV_LinkEdict(driver.server, spawnEdict({ classname: 'target_help', targetname: 'h1', message: 'Hi.' }));
+    fireTargets(driver.server, spawnEdict({ classname: 'trigger_once', target: 'h1' }));
+    expect(driver.server.helpChangedSeq).toBe(1);
+    driver.step(idle, 0.1);
+    expect(driver.helpGameSeen).toBe(1);
+    expect(driver.helpChanged).toBe(1);
     // A published change: i_help exactly when (frame & 8), hidden otherwise.
-    boot.helpChangedSeq = 1;
     boot.host.serverTime = 0; // frame 0
     expect(statusbarStateFor(boot).stats[11]).toBe(0);
     boot.host.serverTime = 0.8; // frame 8
@@ -331,16 +350,59 @@ describe('RELEASE-6 web lane (live counters / help ack / completion)', () => {
     expect(statusbarStateFor(boot).stats[11]).toBe(0);
     // Opening F1 acks (pers.helpchanged = 0) → slot hides on flash frames.
     expect(toggleHelpOverlay(boot)).toBe(true);
+    expect(driver.helpChanged).toBe(0);
     expect(boot.helpSeenSeq).toBe(1);
     expect(statusbarStateFor(boot).stats[11]).toBe(0);
     // Open + no new change → F1 closes (id Cmd_Help_f).
     expect(toggleHelpOverlay(boot)).toBe(false);
-    // Open with a new change pending → stays open + acks.
-    boot.helpChangedSeq = 2;
+    // A new change re-notifies → F1 stays open + acks again.
+    SV_LinkEdict(driver.server, spawnEdict({ classname: 'target_help', targetname: 'h2', message: 'Yo.' }));
+    fireTargets(driver.server, spawnEdict({ classname: 'trigger_once', target: 'h2' }));
+    driver.step(idle, 0.1);
+    expect(driver.helpChanged).toBe(1);
     expect(toggleHelpOverlay(boot)).toBe(true);
     expect(boot.showHelp).toBe(true);
+    expect(driver.helpChanged).toBe(0);
     expect(boot.helpSeenSeq).toBe(2);
     expect(statusbarStateFor(boot).stats[11]).toBe(0);
+  });
+
+  it('help ack survives respawn and resize; multiline text centers per row', () => {
+    const boot = bootPlay({ width: 320, height: 240 });
+    const { driver } = boot;
+    const idle: UserCmdT = { msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
+    // Publish + latch through the real tick.
+    SV_LinkEdict(driver.server, spawnEdict({ classname: 'target_help', targetname: 'h1', message: 'Hi.' }));
+    fireTargets(driver.server, spawnEdict({ classname: 'trigger_once', target: 'h1' }));
+    driver.step(idle, 0.1);
+    expect(driver.helpChanged).toBe(1);
+    expect(driver.helpGameSeen).toBe(1);
+    // Death → respawn keeps the pending notification (C pers survives SP
+    // respawn — the new life must still flash until F1).
+    driver.damagePlayer(1000);
+    expect(driver.playerDead).toBe(true);
+    for (let i = 0; i < 30; i++) driver.step(idle, 0.1);
+    expect(driver.playerDead).toBe(false);
+    expect(driver.helpChanged).toBe(1);
+    expect(driver.helpGameSeen).toBe(1);
+    // F1 still acks after the new life.
+    expect(toggleHelpOverlay(boot)).toBe(true);
+    expect(driver.helpChanged).toBe(0);
+    toggleHelpOverlay(boot);
+    // Resize preserves UI + driver help state and keeps rendering.
+    expect(resizePlay(boot, 640, 480)).toBe(true);
+    expect(driver.helpGameSeen).toBe(1);
+    expect(driver.helpChanged).toBe(0);
+    toggleHelpOverlay(boot);
+    const target = blank(640, 480);
+    expect(() => drawPlayHud(target, boot, { fps: 0, frame: 1 })).not.toThrow();
+    expect(paintedIn(target, 192, 144, 192 + 256, 144 + 192)).toBeGreaterThan(200);
+    // DrawHUDString parity: embedded newlines split into per-row centered
+    // lines (base1's latched help text relies on this).
+    const lines = blank(320, 32);
+    drawHudText(lines, 0, 0, 'A\nLONGER LINE', 320, 0xffffffff);
+    expect(paintedIn(lines, 100, 0, 220, 8)).toBeGreaterThan(0);
+    expect(paintedIn(lines, 100, 8, 220, 16)).toBeGreaterThan(0);
   });
 
   it('completion freezes interaction and drops the gun (intermission-lite)', () => {
@@ -419,5 +481,178 @@ describe('RELEASE-6 web lane (live counters / help ack / completion)', () => {
     }
     setCVar('cl_showfps', 1);
     setCVar('cl_showpos', 1);
+  });
+});
+
+describe.runIf(!!WEB_Q2_PAK)('RELEASE-6 cold boot + secret trace (real base1, real ticks)', () => {
+  function neutralCmd(): UserCmdT {
+    return { msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
+  }
+
+  function beeps(driver: PlayBoot['driver']): number {
+    return driver.heardSounds.filter((s) => s === 'misc/pc_up.wav').length;
+  }
+
+  it('cold boot notifies on tick 1 (*16→t70): flash until F1 ack, ≤3 beeps, re-notify', { timeout: 300000 }, async () => {
+    const boot = await bootPak(96, 72);
+    const { driver } = boot;
+    // Cold boot: nothing published, nothing pending, secrets 0/3, the
+    // worldspawn map name captured server-side.
+    expect(driver.server.helpChangedSeq).toBe(0);
+    expect(driver.helpChanged).toBe(0);
+    expect(driver.helpGameSeen).toBe(0);
+    expect(boot.helpChangedSeq).toBe(0);
+    expect(boot.helpSeenSeq).toBe(0);
+    expect(driver.server.totalSecrets).toBe(3);
+    expect(driver.server.totalGoals).toBe(1);
+    expect(driver.server.foundSecrets).toBe(0);
+    expect(driver.server.levelName).toBe('Outer Base');
+    for (const t of [0, 0.8, 1.6]) {
+      boot.host.serverTime = t;
+      expect(statusbarStateFor(boot).images[11]).toBe('');
+    }
+    // Fallback help text before any firing (no target_help latched yet).
+    expect(helpFactsFor(boot).help1).toBe('Find the exit.');
+    expect(helpFactsFor(boot).help2).toBe('Watch for soldiers.');
+    expect(helpFactsFor(boot).levelName).toBe('Outer Base');
+    // Tick 1: the spawn volume overlaps *16 → t70 latches both messages
+    // (the C startup notification — the player spawns inside the trigger).
+    driver.step(neutralCmd(), 0.1);
+    expect(driver.server.helpChangedSeq).toBe(2);
+    expect(driver.server.helpMessage1).toBe('Establish communication\nlink to command ship.');
+    expect(driver.server.helpMessage2).toBe('Locate base installation\nelevator.');
+    expect(driver.helpGameSeen).toBe(2);
+    expect(driver.helpChanged).toBe(1);
+    // Current text/map name flow into F1.
+    const facts = helpFactsFor(boot);
+    expect(facts.levelName).toBe('Outer Base');
+    expect(facts.help1).toBe('Establish communication\nlink to command ship.');
+    expect(facts.help2).toBe('Locate base installation\nelevator.');
+    // Flash cadence through the production statusbar.
+    boot.host.serverTime = 0.8; // frame 8
+    const flashing = statusbarStateFor(boot);
+    expect(flashing.stats[11]).toBe(11);
+    expect(flashing.images[11]).toBe('i_help');
+    boot.host.serverTime = 1.6; // frame 16
+    expect(statusbarStateFor(boot).stats[11]).toBe(0);
+    // Multiline help renders as two rows (DrawHUDString parity): help1 sits
+    // on the yv-54 cstring2 row with its second line 8px below. Drawn
+    // directly (no toggle — opening F1 would ack before the beep leg).
+    const panel = blank(320, 240);
+    drawHelpOverlay(panel, boot);
+    expect(paintedIn(panel, 0, 50, 320, 62)).toBeGreaterThan(0);
+    expect(paintedIn(panel, 0, 62, 320, 72)).toBeGreaterThan(0);
+    // Beep: exactly 3 pc_up sounds, then the counter parks at 4 (silent
+    // flash until F1). The loop runs until the terminal counter rather
+    // than a fixed frame so float tick accumulation cannot flake it.
+    let guard = 0;
+    while (driver.helpChanged !== 4 && guard++ < 400) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+    }
+    expect(driver.helpChanged).toBe(4);
+    expect(beeps(driver)).toBe(3);
+    // F1 ack stops the flash; the slot stays dark on lit-phase frames.
+    expect(toggleHelpOverlay(boot)).toBe(true);
+    expect(driver.helpChanged).toBe(0);
+    expect(boot.helpSeenSeq).toBe(2);
+    boot.host.serverTime = 0.8;
+    expect(statusbarStateFor(boot).stats[11]).toBe(0);
+    expect(toggleHelpOverlay(boot)).toBe(false);
+    // A NEW change re-notifies: counter re-arms and the beep restarts.
+    SV_LinkEdict(driver.server, spawnEdict({ classname: 'target_help', targetname: 'h9', message: 'More.' }));
+    fireTargets(driver.server, spawnEdict({ classname: 'trigger_once', target: 'h9' }));
+    expect(driver.server.helpChangedSeq).toBe(3);
+    driver.step(neutralCmd(), 0.1);
+    expect(driver.helpGameSeen).toBe(3);
+    expect(driver.helpChanged).toBe(1);
+    boot.host.serverTime = 0.8;
+    expect(statusbarStateFor(boot).images[11]).toBe('i_help');
+    guard = 0;
+    while (driver.helpChanged !== 2 && guard++ < 120) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+    }
+    expect(driver.helpChanged).toBe(2);
+    expect(beeps(driver)).toBe(4);
+    console.log('[release-6] cold-boot trace: tick-1 *16→t70 notify, 3+1 beeps, ack + re-notify PASS');
+  });
+
+  it('secret chain t77 → t76 → t91: immediate, single-use, live F1, frozen finish', { timeout: 300000 }, async () => {
+    const boot = await bootPak(96, 72);
+    const { driver } = boot;
+    expect(driver.server.totalSecrets).toBe(3);
+    // One setup tick (fires *16 helps; secrets untouched).
+    driver.step(neutralCmd(), 0.1);
+    expect(driver.server.foundSecrets).toBe(0);
+    // t77: walk into the *14 brush volume — counts on the SAME tick.
+    driver.pm.origin = v3(1088, 837, -200);
+    driver.pm.velocity = v3();
+    SV_SetPlayerHealth(driver.server, 100);
+    driver.step(neutralCmd(), 0.1);
+    expect(driver.server.foundSecrets).toBe(1);
+    // Live F1 with help closed AND open (no reopen needed).
+    expect(helpFactsFor(boot).secrets).toEqual([1, 3]);
+    toggleHelpOverlay(boot);
+    expect(helpFactsFor(boot).secrets).toEqual([1, 3]);
+    // Single-use: camping the volume never double-counts.
+    for (let i = 0; i < 5; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+    }
+    expect(driver.server.foundSecrets).toBe(1);
+    // t76: silencer duck-crawl pickup (pickups.test.ts recipe) — the
+    // item-target cascade that SV_UseTargetname used to drop.
+    driver.pm.origin = v3(-408, 620, -96);
+    driver.pm.velocity = v3();
+    const duck: UserCmdT = { msec: 100, angles: [0, 90, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_DUCK };
+    let n = 0;
+    const pickupsBefore = driver.events.filter((e) => e === 'pickup').length;
+    while (driver.events.filter((e) => e === 'pickup').length < pickupsBefore + 1 && n++ < 60) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step({ ...duck, forwardmove: 100 }, 0.1);
+    }
+    expect(driver.events.filter((e) => e === 'pickup').length).toBe(pickupsBefore + 1);
+    expect(driver.server.foundSecrets).toBe(2);
+    // The already-open overlay re-renders the new count (no reopen).
+    expect(boot.showHelp).toBe(true);
+    expect(helpFactsFor(boot).secrets).toEqual([2, 3]);
+    // t91: shoot *13 from the pit floor (release-4-trace recipe, C
+    // button_killed) — counts the secret and takes the lift finish.
+    driver.pm.origin = v3(-2030, 1536, 40);
+    driver.pm.velocity = v3();
+    for (let i = 0; i < 40 && !driver.pm.onGround; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+    }
+    const aimDx = -2016 - driver.pm.origin[0]!;
+    const aimDy = 1536 - driver.pm.origin[1]!;
+    const aimDz = 80 - (driver.pm.origin[2]! + 22);
+    const aimL = Math.hypot(aimDx, aimDy) || 1;
+    const aim: [number, number, number] = [
+      (Math.atan2(-aimDz, aimL) * 180) / Math.PI,
+      (Math.atan2(aimDy, aimDx) * 180) / Math.PI,
+      0,
+    ];
+    const attack: UserCmdT = { msec: 100, angles: aim, forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_ATTACK };
+    let t91at = -1;
+    for (let i = 0; i < 120 && t91at < 0; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(attack, 0.1);
+      if (driver.server.firedThisTick.includes('t91')) t91at = i;
+    }
+    expect(t91at).toBeGreaterThanOrEqual(0);
+    expect(driver.server.foundSecrets).toBe(3);
+    expect(driver.server.finished).toBe(true);
+    expect(driver.server.finishReason).toBe('lift');
+    expect(driver.server.finishSecrets).toBe(3);
+    // Frozen once finished: post-finish ticks never move the F1 rows.
+    expect(helpFactsFor(boot).secrets).toEqual([3, 3]);
+    for (let i = 0; i < 10; i++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      driver.step(neutralCmd(), 0.1);
+    }
+    expect(helpFactsFor(boot).secrets).toEqual([3, 3]);
+    console.log('[release-6] secret trace: t77 touch + t76 pickup + t91 shot, single-use, live→frozen PASS');
   });
 });

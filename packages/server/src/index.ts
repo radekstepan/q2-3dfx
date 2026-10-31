@@ -376,6 +376,12 @@ export interface ServerState {
   /** C game.helpmessage2 (Use_Target_Help, spawnflags & 1 clear). */
   helpMessage2: string;
   /**
+   * C level.level_name (worldspawn `message` key, g_spawn.c SpawnEntities):
+   * the map title the F1 help computer centers (`HelpComputer`, p_hud.c).
+   * Empty when the spawn text carries no worldspawn message (devroom).
+   */
+  levelName: string;
+  /**
    * Server-owned finished state. Set once: 'exit' when a target_changelevel
    * fires (C BeginIntermission-lite for SP — no map change, base2 is not
    * shipped), 'lift' when the one-way end-lift button fires its train (the
@@ -396,7 +402,7 @@ export interface ServerState {
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0 };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0 };
 }
 
 /**
@@ -1272,6 +1278,7 @@ export function SV_SpawnEntities(
   // spawn (always active in SP; deathmatch never inits — our sim is SP-only).
   st.trail = trailInit(true);
   st.combatPoints = [];
+  st.levelName = '';
   dicts.forEach((dict, index) => {
     const spawnflags = parseFloat(dict['spawnflags'], 0);
     // Skill inhibit (g_spawn.c); worldspawn (first block) is exempt.
@@ -1287,6 +1294,10 @@ export function SV_SpawnEntities(
     );
     SV_LinkEdict(st, e);
     out.push(e);
+    // C level.level_name: the worldspawn `message` is the map title the F1
+    // help computer shows (base1: "Outer Base"). First block only in C
+    // (worldspawn is dicts[0]); later blocks never carry the classname.
+    if (e.classname === 'worldspawn' && index === 0) st.levelName = dict['message'] ?? '';
     const angle = parseFloat(dict['angle'], 0);
     switch (e.classname) {
       case 'func_door': {

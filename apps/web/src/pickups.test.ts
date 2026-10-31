@@ -84,12 +84,13 @@ describe.runIf(!!WEB_Q2_PAK)('base1 pickup wiring (Q2_PAK)', () => {
     expect(driver.events).toContain('pickup');
     expect(sil.freed).toBe(true);
     expect(driver.ps.silencerShots).toBe(30);
-    // NOTE (server-lane follow-up, out of this lock): the lump chains the
-    // grab to t76 (trigger_relay + target_secret "You have found a secret").
-    // SV_UseTargetname relays the use but never reaches target_secret
-    // directly (C G_UseTargets uses every edict with the targetname,
-    // including the secret itself), so foundSecrets does not increment on
-    // this path yet. Pinned here as the driver-observable grants only.
+    // The lump chains the grab to t76 (target_secret "You have found a
+    // secret."): the driver fires the FULL item-target cascade
+    // (fireTargets — C Touch_Item G_UseTargets uses every edict carrying
+    // the targetname, including the secret itself), so foundSecrets
+    // increments on this path, exactly once (single-use G_FreeEdict: the
+    // secret-trace leg in release-6-hud-web.test.ts pins the count).
+    expect(driver.server.foundSecrets).toBe(1);
     expect(driver.livePickupCount()).toBe(liveBefore - 1);
     expect(driver.message).toContain('silencer');
     expect(driver.heardSounds).toContain('items/pkup.wav');

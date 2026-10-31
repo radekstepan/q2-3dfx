@@ -279,8 +279,8 @@ Sky fixes remain preserved. FOLLOW-5 tone/structural acceptance is recorded in
 experimental pending FOLLOW-6/7. No runtime tests were rerun in this review.
 
 Priority: RELEASE-4 (boarding, box 3 open with recorded blockers) →
-RELEASE-6 (help) → RELEASE-13 (dying collision/patrols) →
-RELEASE-10/14/15 (RELEASE-11 message and RELEASE-12 movement repairs landed this session). Independent bounded fixes can proceed without waiting for
+RELEASE-13 (dying collision/patrols) →
+RELEASE-10/14/15 (RELEASE-11 message, RELEASE-12 movement and RELEASE-6 help repairs landed this session). Independent bounded fixes can proceed without waiting for
 the elevator investigation; do not leave the rest untouched after one diagnostic.
 Use disjoint ownership for independent work. Claim one card, run expensive tests
 sequentially, and keep implementation/test/user verdicts separate. Real-map
@@ -315,12 +315,12 @@ done-when:
 ### RELEASE-6 — F1 startup flash and live secret progression
 owns: `apps/web`, `packages/client`, `packages/server`, `packages/testkit`
 depends: none
-status: ready (reopened)
+status: done (repaired 2026-10-31; see docs/tasks-archive.md RELEASE-6 repair entry)
 review-findings: HUD uses `boot.helpChangedSeq/helpSeenSeq`; boot initializes both to zero and no advancing assignment was found. Server now has a target_help producer and independent helpChangedSeq, but the boot comment still says that producer is absent. Live F1 already reads `foundSecrets`; therefore the repeated secret-count symptom needs trigger/counter/presentation tracing, not another blind replacement of finish counters.
 done-when:
-- [ ] Show the startup F1/help notification flashing until the first F1 acknowledgment, as requested. Reconcile server help-change state with HUD acknowledgment, initial map help, actual icon visibility and the original `p_view.c`/`p_hud.c` cadence; new help changes should notify again. Verify a real cold boot rather than manually altering counters in tests.
-- [ ] Follow a real secret discovery from trigger/target chain through single-use `foundSecrets` increment to F1 rendering. With help open and closed, verify multiple discoveries update immediately and never double-count. Preserve final frozen counters once finished.
-- [ ] Use current help text/map name, remove stale producer comments, and verify icon/panel across resolutions, resize/switch and respawn. Coordinate the final help screen with RELEASE-4.
+- [x] Show the startup F1/help notification flashing until the first F1 acknowledgment, as requested. Reconcile server help-change state with HUD acknowledgment, initial map help, actual icon visibility and the original `p_view.c`/`p_hud.c` cadence; new help changes should notify again. Verify a real cold boot rather than manually altering counters in tests.
+- [x] Follow a real secret discovery from trigger/target chain through single-use `foundSecrets` increment to F1 rendering. With help open and closed, verify multiple discoveries update immediately and never double-count. Preserve final frozen counters once finished.
+- [x] Use current help text/map name, remove stale producer comments, and verify icon/panel across resolutions, resize/switch and respawn. Coordinate the final help screen with RELEASE-4.
 
 ### RELEASE-11 — Fix message flicker, centered hints and status toggle
 owns: `apps/web`, `packages/client`, `packages/config`, `packages/server`
