@@ -14,10 +14,10 @@ describe('statusbar string parsing (configstrings)', () => {
   });
 
   it('parses positions, pics and nums', () => {
-    const ops = parseStatusbar('xv 32 yv 144 pic 0 client 0 num 3 10');
-    expect(ops).toContainEqual({ op: 'pos', x: 32, y: 144 });
+    const ops = parseStatusbar('xv 32 yv 144 pic 0 client 0 0 1 10 20 30 num 3 10');
+    expect(ops).toContainEqual({ op: 'pos', x: 32, y: 144, xMode: 'xv', yMode: 'yv' });
     expect(ops).toContainEqual({ op: 'pic', index: 0 });
-    expect(ops).toContainEqual({ op: 'client', index: 0 });
+    expect(ops).toContainEqual({ op: 'client', x: 0, y: 0, slot: 1, score: 10, ping: 20, time: 30 });
     expect(ops).toContainEqual({ op: 'num', width: 3, index: 10 });
   });
 

@@ -265,3 +265,111 @@ export function fillRect(
     for (let px = x0; px < x1; px++) s.color[row + px] = rgba;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Asset-based HUD blitting (RELEASE-6): 8-bit `pics/*.pcx` art expanded
+// through the game palette. `drawPic` is the `re.DrawPic` equivalent for
+// statusbar icons, digit pics and backgrounds; `drawField` is
+// `SCR_DrawField` (digit-pic numbers, 16px `CHAR_WIDTH` cells, `field_3`
+// flash background drawn separately by the layout executor).
+// ---------------------------------------------------------------------------
+
+/** Palette index id never paints (`TRANSPARENT_COLOR`). */
+export const PIC_TRANSPARENT = 255;
+
+/** Width of one statusbar digit cell (`CHAR_WIDTH` in `cl_scrn.c`). */
+export const FIELD_DIGIT_W = 16;
+/** Height of statusbar digit/icon art. */
+export const FIELD_DIGIT_H = 24;
+/** Width/height of statusbar icon art (`ICON_WIDTH`/`ICON_HEIGHT`). */
+export const ICON_SIZE = 24;
+/** Max digits `SCR_DrawField` renders (wider values left-truncate). */
+export const FIELD_MAX_WIDTH = 5;
+
+/** Decoded 8-bit pic (structurally matches `Pcx` from `@q2/formats`). */
+export interface IndexedPic {
+  readonly width: number;
+  readonly height: number;
+  /** Row-major palette indices, `width * height` entries. */
+  readonly pixels: Uint8Array;
+}
+
+/** One digit-pic set (`num_*` normal, `anum_*` alert). */
+export interface DigitPics {
+  /** Pics for '0'-'9'. */
+  readonly digits: readonly IndexedPic[];
+  readonly minus: IndexedPic;
+}
+
+/**
+ * Blit 8-bit pic art through a 768-byte RGB palette (0xAABBGGRR output),
+ * skipping the transparent index. Out-of-bounds pixels are clipped.
+ */
+export function drawPic(
+  fb: Framebuffer | BlitSurface,
+  x: number,
+  y: number,
+  pic: IndexedPic,
+  palette: Uint8Array,
+  transparent: number = PIC_TRANSPARENT,
+): void {
+  if (palette.length < 768) Com_Error('fatal', `drawPic: need 768-byte palette, got ${palette.length}`);
+  if (pic.pixels.length < pic.width * pic.height) {
+    Com_Error('fatal', `drawPic: only ${pic.pixels.length} pixels for ${pic.width}x${pic.height}`);
+  }
+  const s = toSurface(fb);
+  for (let gy = 0; gy < pic.height; gy++) {
+    const py = y + gy;
+    if (py < 0 || py >= s.height) continue;
+    const srcRow = gy * pic.width;
+    const dstRow = py * s.width;
+    for (let gx = 0; gx < pic.width; gx++) {
+      const px = x + gx;
+      if (px < 0 || px >= s.width) continue;
+      const idx = pic.pixels[srcRow + gx]!;
+      if (idx === transparent) continue;
+      const r = palette[idx * 3]!;
+      const g = palette[idx * 3 + 1]!;
+      const b = palette[idx * 3 + 2]!;
+      s.color[dstRow + px] = 0xff000000 | (b << 16) | (g << 8) | r;
+    }
+  }
+}
+
+/**
+ * Characters `SCR_DrawField` renders for a value: `%i` text left-truncated to
+ * `width` (max 5), so over-wide values keep their leading digits like id.
+ */
+export function formatField(value: number, width: number): string {
+  const w = Math.min(FIELD_MAX_WIDTH, width);
+  if (w < 1) return '';
+  return `${Math.trunc(value)}`.slice(0, w);
+}
+
+/**
+ * Draw a statusbar number from digit pics (`SCR_DrawField`): the field is
+ * right-aligned in `width` 16px cells with a 2px left inset, `-` uses the
+ * minus pic, and each digit advances `FIELD_DIGIT_W`. The `field_3` flash
+ * background (health/ammo/armor pickup flash) is a separate `drawPic` call
+ * at the same origin, emitted by `executeStatusbar`.
+ */
+export function drawField(
+  fb: Framebuffer | BlitSurface,
+  x: number,
+  y: number,
+  style: 'num' | 'anum',
+  width: number,
+  value: number,
+  pics: { readonly num: DigitPics; readonly anum: DigitPics },
+  palette: Uint8Array,
+): void {
+  const set = style === 'num' ? pics.num : pics.anum;
+  if (set.digits.length !== 10) Com_Error('fatal', `drawField: need 10 digit pics, got ${set.digits.length}`);
+  const text = formatField(value, width);
+  let cx = x + 2 + FIELD_DIGIT_W * (Math.min(FIELD_MAX_WIDTH, Math.max(0, width | 0)) - text.length);
+  for (const ch of text) {
+    const pic = ch === '-' ? set.minus : set.digits[ch.charCodeAt(0) - 48];
+    if (pic) drawPic(fb, cx, y, pic, palette);
+    cx += FIELD_DIGIT_W;
+  }
+}

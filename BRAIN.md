@@ -353,9 +353,10 @@ done-when:
 ### RELEASE-6 — Use game assets for HUD, F1 and level completion
 owns: `apps/web`, `packages/client`, `packages/formats`, `packages/testkit`
 depends: none
-status: ready
+status: in-progress(@opencode)
 starting-points: `play.ts: drawPlayHud`, browser F1/menu handler, pak `pics/` and original client screen/layout code
 review-finding: current HUD draws text such as `hp` and weapon classname; completion uses a custom text block.
+lane-2026-10-30 (@opencode): formats+client lane DONE (formats 29/29, client 83/83, Q2_PAK real-art verified, no §5 change); apps/web drawPlayHud replacement + F1 wiring + testkit coverage still open for integrator.
 done-when:
 - [ ] Compare startup/F1 help, health/ammo/armor and level-completion/intermission layout with original game assets and layout semantics. Inventory required pak pictures/fonts and stats; implement the appropriate asset-based screens instead of placeholder styling.
 - [ ] Preserve readable asset-free devroom fallback and distinguish game HUD from optional FPS/position diagnostics. Verify real assets, values, transparency, scaling and placement at 640×480 and 1024×768, including death and level completion.

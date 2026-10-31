@@ -512,3 +512,148 @@ export function parseWavHeader(buf: ArrayBuffer): WavInfo {
   }
   return { rate, width, channels, samples, loopstart, dataOffset };
 }
+
+// ---------------------------------------------------------------------------
+// HUD / F1 help / level-completion asset inventory (RELEASE-6).
+//
+// Ground truth: `pics/` in pak0.pak plus `client/cl_scrn.c` (`sb_nums`,
+// `SCR_ExecuteLayoutString`), `game/g_spawn.c` (`single_statusbar`,
+// `dm_statusbar`), `game/p_hud.c` (`HelpComputer`, `DeathmatchScoreboardMessage`)
+// and `client/cl_inv.c` (`CL_DrawInventory`). Dimensions below were read off
+// the real lumps; `hud-assets.test.ts` re-checks every entry against Q2_PAK.
+
+/** Palette index id never paints (`TRANSPARENT_COLOR`, `Draw_Char`). */
+export const PIC_TRANSPARENT = 255;
+
+/** Art role of a HUD pic (drives transparency expectations). */
+export type HudPicKind =
+  | 'digit'
+  | 'anum'
+  | 'icon'
+  | 'field'
+  | 'font'
+  | 'background'
+  | 'crosshair'
+  | 'overlay'
+  | 'screen';
+
+export interface HudPicSpec {
+  /** Pak path, e.g. `pics/num_0.pcx`. */
+  readonly name: string;
+  readonly width: number;
+  readonly height: number;
+  readonly kind: HudPicKind;
+}
+
+const digits = (prefix: 'num' | 'anum', kind: HudPicKind): HudPicSpec[] => {
+  const out: HudPicSpec[] = [];
+  for (let d = 0; d <= 9; d++) {
+    out.push({ name: `pics/${prefix}_${d}.pcx`, width: 16, height: 24, kind });
+  }
+  out.push({ name: `pics/${prefix}_minus.pcx`, width: 16, height: 24, kind });
+  return out;
+};
+
+/** 24x24 statusbar icons (`pic N` ops resolve through `CS_IMAGES`). */
+const ICON_24: readonly string[] = [
+  'i_airstrike', 'i_bodyarmor', 'i_combatarmor', 'i_fixme', 'i_health',
+  'i_help', 'i_jacketarmor', 'i_pack', 'i_powerscreen', 'i_powershield',
+  'w_bfg', 'w_blaster', 'w_chaingun', 'w_glauncher', 'w_hgrenade',
+  'w_hyperblaster', 'w_machinegun', 'w_railgun', 'w_rlauncher',
+  'w_shotgun', 'w_sshotgun',
+  'a_blaster', 'a_bullets', 'a_cells', 'a_grenades', 'a_rockets',
+  'a_shells', 'a_slugs',
+  'k_bluekey', 'k_comhead', 'k_datacd', 'k_dataspin', 'k_powercube',
+  'k_pyramid', 'k_redkey', 'k_security',
+  'p_adrenaline', 'p_bandolier', 'p_envirosuit', 'p_invulnerability',
+  'p_megahealth', 'p_quad', 'p_rebreather', 'p_silencer',
+];
+
+/**
+ * Every pak picture the asset-based HUD, F1 help, inventory, scoreboard and
+ * completion screens need. Status digits (`num_*` white, `anum_*` alert red),
+ * the `field_3` damage-flash field, 24x24 icons, the F1/inventory 256x192
+ * backgrounds, crosshairs, scoreboard dogtags, plaques and victory screen.
+ */
+export const HUD_PICS: readonly HudPicSpec[] = [
+  ...digits('num', 'digit'),
+  ...digits('anum', 'anum'),
+  { name: 'pics/field_3.pcx', width: 48, height: 24, kind: 'field' },
+  ...ICON_24.map((n): HudPicSpec => ({ name: `pics/${n}.pcx`, width: 24, height: 24, kind: 'icon' })),
+  { name: 'pics/conchars.pcx', width: 128, height: 128, kind: 'font' },
+  { name: 'pics/help.pcx', width: 256, height: 192, kind: 'background' },
+  { name: 'pics/inventory.pcx', width: 256, height: 192, kind: 'background' },
+  { name: 'pics/ch1.pcx', width: 8, height: 8, kind: 'crosshair' },
+  { name: 'pics/ch2.pcx', width: 8, height: 8, kind: 'crosshair' },
+  { name: 'pics/ch3.pcx', width: 8, height: 8, kind: 'crosshair' },
+  { name: 'pics/tag1.pcx', width: 128, height: 32, kind: 'overlay' },
+  { name: 'pics/tag2.pcx', width: 128, height: 32, kind: 'overlay' },
+  { name: 'pics/net.pcx', width: 32, height: 32, kind: 'overlay' },
+  { name: 'pics/pause.pcx', width: 101, height: 25, kind: 'overlay' },
+  { name: 'pics/loading.pcx', width: 111, height: 25, kind: 'overlay' },
+  { name: 'pics/victory.pcx', width: 320, height: 240, kind: 'screen' },
+];
+
+/** Look up a manifest entry by pak path (undefined when not a HUD pic). */
+export function hudPicByName(name: string): HudPicSpec | undefined {
+  return HUD_PICS.find((p) => p.name === name);
+}
+
+/**
+ * Whether art of this kind is cut out of a transparent page (digits,
+ * crosshairs, overlays) rather than an opaque block (icons, fields, screens).
+ */
+export function hudPicTransparentExpected(kind: HudPicKind): boolean {
+  return kind === 'digit' || kind === 'anum' || kind === 'crosshair' || kind === 'overlay';
+}
+
+/** Decoded-pic shape accepted by `checkHudPic` (matches `Pcx` structurally). */
+export interface HudPicPixels {
+  readonly width: number;
+  readonly height: number;
+  readonly pixels: Uint8Array;
+}
+
+/**
+ * Validate a decoded HUD pic against its manifest entry. Returns a list of
+ * problems (empty = usable). Checks dimensions, pixel coverage and, for cutout
+ * art, the presence of both ink and transparent pixels.
+ */
+export function checkHudPic(spec: HudPicSpec, pic: HudPicPixels): string[] {
+  const problems: string[] = [];
+  if (pic.width !== spec.width || pic.height !== spec.height) {
+    problems.push(`dimensions ${pic.width}x${pic.height}, expected ${spec.width}x${spec.height}`);
+  }
+  if (pic.pixels.length < spec.width * spec.height) {
+    problems.push(`only ${pic.pixels.length} pixels for ${spec.width}x${spec.height}`);
+    return problems;
+  }
+  let distinct = 0;
+  const seen = new Uint8Array(256);
+  let transparent = 0;
+  for (let i = 0; i < spec.width * spec.height; i++) {
+    const v = pic.pixels[i]!;
+    if (seen[v] === 0) {
+      seen[v] = 1;
+      distinct++;
+    }
+    if (v === PIC_TRANSPARENT) transparent++;
+  }
+  if (distinct < 2) problems.push('flat art (single palette index)');
+  if (hudPicTransparentExpected(spec.kind)) {
+    if (transparent === 0) problems.push('cutout art has no transparent pixels');
+    if (transparent === spec.width * spec.height) problems.push('fully transparent');
+  }
+  return problems;
+}
+
+/**
+ * Pak path of one statusbar digit pic (`num_*` normal, `anum_*` alert).
+ * `digit` is 0-9, or -1 for the minus sign (`num_minus` / `anum_minus`).
+ */
+export function digitPicName(style: 'num' | 'anum', digit: number): string {
+  if (!Number.isInteger(digit) || digit < -1 || digit > 9) {
+    Com_Error('fatal', `digitPicName: digit out of range ${digit}`);
+  }
+  return digit === -1 ? `pics/${style}_minus.pcx` : `pics/${style}_${digit}.pcx`;
+}
