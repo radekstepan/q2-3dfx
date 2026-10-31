@@ -184,6 +184,11 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     // the monster) so foe bolts miss and the facing gate keeps it running.
     driver.pm.origin = v3(-904, 1326, -24);
     driver.pm.velocity = v3();
+    // Face the beat cop at the player: #341 walks the t16/t15 patrol and
+    // starts facing south — C FindTarget needs facing at near range, so an
+    // un-turned staging would wait for the beat to turn (RELEASE-13). The
+    // chase/run/return-fire verdicts below are the same either way.
+    A.state.yaw = 90;
     driver.step(neutralCmd(), 0.1);
     const gap2 = (): number =>
       Math.hypot(A.edict.origin[0]! - driver.pm.origin[0]!, A.edict.origin[1]! - driver.pm.origin[1]!);
@@ -476,18 +481,25 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     runner.edict.origin = v3(lowA[0], lowA[1], lowA[2]);
     runner.state.move = 'run';
     runner.state.frame = 0;
-    const PB2 = seat(360, -430);
+    // Stage the player inside the runner's facing cone: the seated body is
+    // the start-room ambusher (mapper yaw 315, southeast), and C FindTarget
+    // needs facing at near range — a stage behind its back correctly stays
+    // silent (RELEASE-13 gating), which would wedge the pursuit below. The
+    // probed spot (+60,-40: dist ~73 NEAR, yaw -34 dead in the cone) keeps
+    // eye-to-eye LOS from the stairs.
+    const PB2 = seat(lowA[0] + 60, lowA[1] - 40);
     driver.pm.origin = v3(PB2[0], PB2[1], PB2[2]);
     driver.pm.velocity = v3();
+    // Pre-chase geometry for the validity pair below (the runner closes
+    // during the acquire ticks, so post-move origins would skew it).
+    const M: [number, number, number] = [lowA[0], lowA[1], lowA[2]];
+    const L: [number, number, number] = [PB2[0], PB2[1], PB2[2]];
+    expect(los(M, L)).toBe(true);
     for (let i = 0; i < 5; i++) driver.step(neutralCmd(), 0.1);
     expect(runner.seen).toBe(true);
-    // Last sighting: the high-end spot the monster saw the player at.
-    const L: [number, number, number] = [driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]!];
-    const M: [number, number, number] = [runner.edict.origin[0]!, runner.edict.origin[1]!, runner.edict.origin[2]!];
-    expect(los(M, L)).toBe(true);
     // Hidden spot off the M->L axis (a beeliner stalls at the corner wall
     // far from L instead of rounding to it — the validity pair below).
-    const H = seat(246, -662);
+    const H = seat(350, -700);
     expect(los(M, H as [number, number, number])).toBe(false);
     const beeline = SV_TraceFor(driver.map!, MASK_PLAYERSOLID_C)(
       v3(M[0], M[1], M[2]), v3(-16, -16, -24), v3(16, 16, 32), v3(H[0], H[1], H[2]),
@@ -543,6 +555,10 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
       expect(A.edict.extra['skinnum']).toBe('0');
       driver.pm.origin = v3(-904, 1326, -24);
       driver.pm.velocity = v3();
+      // Same facing staging as (b): #341 starts its beat facing away, and C
+      // sight needs facing — without this the latch waits for the patrol
+      // turn instead of the first tick.
+      A.state.yaw = 90;
       driver.step(neutralCmd(), 0.1);
       expect(A.seen).toBe(true);
       let strafe = 1;
@@ -981,11 +997,18 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     }
     expect(killedAt).toBeGreaterThanOrEqual(0);
     expect(driver.playerHealth).toBeGreaterThan(0);
+    // Soldier death is a rand()%5 roll (C soldier_die): only death1 is
+    // armed (frames 21/24). Other rolls render their own unarmed C falls —
+    // the watch below branches on the rolled move instead of assuming
+    // death1, and the deterministic death1 render pin lives in (q2).
+    const deathMove = A.state.move;
+    expect(['death1', 'death2', 'death4', 'death5', 'death6'].includes(deathMove)).toBe(true);
     const corpse: [number, number] = [A.edict.origin[0]!, A.edict.origin[1]!];
     const monshotsBefore = driver.events.filter((e) => e === 'monshot').length;
-    // Watch the 36-frame death move: the C armed frames (21/24, ~2.1s/2.4s
-    // after death) must submit a foe bolt in flight out of the corpse's
-    // muzzle, aimed back at the player — plus the muzzle flash drain.
+    // Watch the death move: a bearing-passing foe bolt counts only when the
+    // corpse's own frame is on an armed frame (21/24) — cross-traffic from
+    // the alerted courtyard fails the frame correlation, which is what made
+    // the old wall-clock window (boltSeenAt >= 16) flake.
     let boltSeenAt = -1;
     let monshotTick = -1;
     let s2 = 1;
@@ -993,6 +1016,7 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
       if (k % 40 === 0) s2 = -s2 as 1 | -1;
       const yaw = yawAt([driver.pm.origin[0]!, driver.pm.origin[1]!], [corpse[0], corpse[1]]);
       driver.step({ msec: 100, angles: [0, yaw, 0], forwardmove: 0, sidemove: 400 * s2, upmove: 0, buttons: 0 }, 0.1);
+      const armed = A.state.move === 'death1' && A.state.frame >= 20 && A.state.frame <= 26;
       const wantYaw = yawAt(corpse, [driver.pm.origin[0]!, driver.pm.origin[1]!]);
       for (const x of driver.extraEntities() ?? []) {
         if (x.model !== boot.models!.bolt) continue;
@@ -1004,14 +1028,74 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
         if (Math.hypot(x.origin![0]! - corpse[0]!, x.origin![1]! - corpse[1]!) > 400) continue;
         let dy = Math.abs(x.angles![1]! - wantYaw) % 360;
         if (dy > 180) dy = 360 - dy;
-        if (dy < 20 && boltSeenAt < 0) boltSeenAt = k;
+        if (dy < 20 && boltSeenAt < 0 && armed) boltSeenAt = k;
       }
-      if (driver.events.filter((e) => e === 'monshot').length > monshotsBefore && monshotTick < 0) monshotTick = k;
+      if (driver.events.filter((e) => e === 'monshot').length > monshotsBefore && monshotTick < 0 && armed) monshotTick = k;
     }
-    expect(boltSeenAt).toBeGreaterThanOrEqual(16);
-    expect(boltSeenAt).toBeLessThanOrEqual(36);
-    expect(monshotTick).toBeGreaterThanOrEqual(16);
-    expect(monshotTick).toBeLessThanOrEqual(36);
+    if (deathMove === 'death1') {
+      // The C armed frames (21/24, ~2.1s/2.4s after death) submit a foe
+      // bolt in flight out of the corpse's muzzle, aimed back at the
+      // player — plus the muzzle flash drain (monshot sound same tick).
+      expect(boltSeenAt).toBeGreaterThanOrEqual(16);
+      expect(boltSeenAt).toBeLessThanOrEqual(36);
+      expect(monshotTick).toBeGreaterThanOrEqual(16);
+      expect(monshotTick).toBeLessThanOrEqual(36);
+    } else {
+      // Unarmed C falls never fire: the corpse settles on its last frame
+      // and persists hittable in the snapshot (no frame-correlated bolt).
+      expect(boltSeenAt).toBe(-1);
+      expect(A.state.deadDone).toBe(true);
+      expect(driver.entityFrame(A.edict.num)).toBeGreaterThan(0);
+    }
+  });
+
+  it('(q2) seeded death1 last-ditch shot renders: foe bolt + muzzle (Q2_PAK)', { timeout: 180000 }, async () => {
+    // Deterministic death1 render pin for (q): a synthetic courtyard
+    // soldier minced through the PRODUCTION damage path with controlled RNG
+    // (soldier_die rand()%5 roll 0 → armed death1), then stepped through the
+    // real driver loop — damage→server→snapshot→renderer with no wall clock.
+    const boot = await bootBase1();
+    const { driver } = boot;
+    const { SV_SpawnMonster, SV_DamageMonster } = await import('@q2/server');
+    // #341's own overlook cell: proven open with a working bolt lane (gate
+    // (b) trades shots here). Corridor/corner synthetics plant the muzzle
+    // inside rock and the bolt dies on its first step (monshot with no
+    // render — debugged, not assumed). Skin 0 (light → blaster): death1's
+    // last-ditch fires real foe bolts; a skin-2 body shotguns instead (C
+    // soldier_fire skin gun — verified by a 2hp pellet hit mid-debug).
+    const m = SV_SpawnMonster(driver.server, 'monster_soldier_light', v3(-904, 976, -24));
+    m.state.yaw = 90; // face the staged player
+    driver.pm.origin = v3(-904, 1326, -24);
+    driver.pm.velocity = v3();
+    expect(SV_DamageMonster(driver.server, m, 25, () => 0.05)).toBe('dead');
+    expect(m.state.move).toBe('death1');
+    const corpse: [number, number] = [m.edict.origin[0]!, m.edict.origin[1]!];
+    const monshotsBefore = driver.events.filter((e) => e === 'monshot').length;
+    let boltSeenAt = -1;
+    let monshotTick = -1;
+    for (let k = 1; k <= 40 && driver.playerHealth > 0; k++) {
+      SV_SetPlayerHealth(driver.server, 100);
+      const yaw = yawAt([driver.pm.origin[0]!, driver.pm.origin[1]!], [corpse[0], corpse[1]]);
+      driver.step({ msec: 100, angles: [0, yaw, 0], forwardmove: 0, sidemove: 400, upmove: 0, buttons: 0 }, 0.1);
+      const armed = m.state.frame >= 20 && m.state.frame <= 26;
+      const wantYaw = yawAt([m.edict.origin[0]!, m.edict.origin[1]!], [driver.pm.origin[0]!, driver.pm.origin[1]!]);
+      for (const x of driver.extraEntities() ?? []) {
+        if (x.model !== boot.models!.bolt) continue;
+        if (Math.hypot(x.origin![0]! - corpse[0]!, x.origin![1]! - corpse[1]!) > 400) continue;
+        let dy = Math.abs(x.angles![1]! - wantYaw) % 360;
+        if (dy > 180) dy = 360 - dy;
+        if (dy < 20 && boltSeenAt < 0 && armed) boltSeenAt = k;
+      }
+      if (driver.events.filter((e) => e === 'monshot').length > monshotsBefore && monshotTick < 0 && armed) monshotTick = k;
+    }
+    // Armed frames 21/24 render the foe bolt + muzzle inside the window.
+    expect(boltSeenAt).toBeGreaterThanOrEqual(19);
+    expect(boltSeenAt).toBeLessThanOrEqual(30);
+    expect(monshotTick).toBeGreaterThanOrEqual(19);
+    expect(monshotTick).toBeLessThanOrEqual(30);
+    // The fall settles on its last frame and stays submitted.
+    expect(m.state.deadDone).toBe(true);
+    expect(driver.entityFrame(m.edict.num)).toBeGreaterThan(0);
   });
 
   it('(r) exit-door-open leaves the lift parked (mesh + sim)', { timeout: 180000 }, async () => {
@@ -1352,6 +1436,10 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     driver.pm.origin = v3(-384.4, 100, 60);
     driver.pm.velocity = v3();
     A.edict.origin = v3(-384.4, -60, 60);
+    // Face the chaser at the player: #341 walks a patrol beat and C sight
+    // needs facing — teleported sideways to its beat it would walk off
+    // instead of acquiring (RELEASE-13 gating).
+    A.state.yaw = 90;
     let minAy = Infinity;
     let maxAy = -Infinity;
     let minGap = Infinity;

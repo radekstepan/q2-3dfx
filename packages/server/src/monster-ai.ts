@@ -20,14 +20,14 @@
 // - trail steering runs the C ai_run sidestep probe on freshly adopted legs
 //   and the SV_NewChaseDir-lite heading sweep in locomotion (opt-in); long
 //   wall faces are followed around their ends instead of pressed forever.
-// - unseen non-ambush monsters keep the legacy beeline (C would stand until
-//   FindTarget; we have no sound-alert path yet, and standing the whole map
-//   down would read as dead).
+// - PHS hearing is approximated by range (the sim has no PHS set); light
+//   levels are omitted from sight (no light_level per client).
 
 import {
   MONSTER_HULL_MAXS,
   MONSTER_HULL_MAXS_DUCKED,
   MONSTER_HULL_MINS,
+  MELEE_DISTANCE,
   burstRefire,
   checkDodgeGate,
   infantryCockBurstFrames,
@@ -86,6 +86,36 @@ export function monsterHullMaxs(m: ServerMonster): Vec3 {
 /** C infront(self, other): other lies within ~72.5° of self's facing. */
 export function monsterSeesPoint(m: ServerMonster, point: Vec3): boolean {
   return Math.abs(yawDiff(monsterYawTo(m.edict.origin, point), m.state.yaw)) <= 72.5;
+}
+
+// --- FoundTarget sight gating (g_ai.c) --------------------------------------
+//
+// C FindTarget only acquires through visible() + range/infront rules —
+// never omnidirectionally, never past 1000u:
+// - RANGE_FAR (>= 1000): never seen (only damage/noise acquire).
+// - RANGE_MELEE (< 80): visible → seen even with the back turned.
+// - RANGE_NEAR (< 500): visible + (infront OR the player recently hostile —
+//   client->show_hostile, set for 1s on weapon fire).
+// - RANGE_MID (< 1000): visible + infront.
+// (Light level is omitted: the sim has no light_level per client.)
+// `visibleLOS` is the caller's eye-to-eye visible() result; `dist` the 3D
+// monster-player distance; `recentlyHostile` mirrors show_hostile
+// (level.time < lastShot + 1).
+
+/** True when a sight check acquires the enemy (C FindTarget vision half). */
+export function acquireSight(
+  m: ServerMonster,
+  playerPos: Vec3,
+  dist: number,
+  visibleLOS: boolean,
+  recentlyHostile: boolean,
+): boolean {
+  if (!visibleLOS) return false;
+  if (dist >= 1000) return false;
+  if (dist < MELEE_DISTANCE) return true;
+  if (monsterSeesPoint(m, playerPos)) return true;
+  if (dist < 500 && recentlyHostile) return true;
+  return false;
 }
 
 // --- player-trail upkeep (p_client.c) ---------------------------------------
@@ -174,6 +204,74 @@ export function arriveCombatPoint(st: ServerState, m: ServerMonster): string | n
   if (arrived && arrived.pathtarget) fire = arrived.pathtarget;
   m.combatGoal = null;
   return fire;
+}
+
+// --- patrol beats (g_monster.c monster_start_go + g_misc.c path_corner) -----
+//
+// A monster whose `target` names a path_corner walks the chain (C
+// monster_start_go: goalentity/movetarget + walk move, facing the first
+// corner) until FindTarget acquires an enemy — the base1 beat cops. Ambush
+// does NOT hold back patrol walking (ai_walk runs FindTarget every frame;
+// spawnflags & 1 only gates hearing wake-up). Monsters with no target stand
+// with pausetime 1e8 (stand until seen); a target naming anything but a
+// path_corner (or nothing at all) also stands — e.g. the t39 infantry whose
+// target t40 is the packmate's targetname.
+//
+// Corners advance on touch (C path_corner_touch): the corner's own `target`
+// names the next corner (re-resolved by targetname each arrival, so t5<->t6
+// ping-pongs loop forever); an empty/dangling link ends the beat (stand).
+// `wait` corners hold the stand pose until level.time + wait. TELEPORT
+// corners (spawnflags & 1) and pathtarget firing are omitted: no base1
+// monster-route corner carries either (teleports exist only on the
+// misc_strogg_ship loops t130/t131/t137/t141/t143/t147).
+
+/** One resolved patrol corner (g_misc.c SP_path_corner fields we honor). */
+export interface PatrolCorner {
+  /** targetname of this corner (the link other corners resolve by). */
+  name: string;
+  pos: Vec3;
+  /** target link handed off on arrival ('' = beat ends). */
+  target: string;
+  /** wait seconds the monster stands on arrival (0 = keep walking). */
+  wait: number;
+}
+
+/** Collect the map's patrol corners from the spawned edict roster. */
+export function patrolCornersOf(st: ServerState): PatrolCorner[] {
+  const out: PatrolCorner[] = [];
+  for (const e of st.entities) {
+    if (e.freed || e.classname !== 'path_corner' || !e.targetname) continue;
+    out.push({ name: e.targetname, pos: v3(e.origin[0], e.origin[1], e.origin[2]), target: e.target, wait: e.wait > 0 ? e.wait : 0 });
+  }
+  return out;
+}
+
+/**
+ * Resolve the first patrol leg for a monster `target` (C monster_start_go
+ * movetarget branch). Null unless the target names a path_corner — the
+ * caller then stands (point_combat targets are handled by the combattarget
+ * fixup instead).
+ */
+export function patrolStart(corners: PatrolCorner[], target: string): PatrolCorner | null {
+  if (!target) return null;
+  return corners.find((c) => c.name === target) ?? null;
+}
+
+/**
+ * Advance the beat on arrival at `arrivedName` (C path_corner_touch
+ * chaining): the arrived corner's own target link names the next corner.
+ * Null when the beat ends there (empty/dangling link → stand, C pausetime
+ * 1e8). The caller honors `wait` by standing until now + wait.
+ */
+export function patrolAdvance(corners: PatrolCorner[], arrivedName: string): PatrolCorner | null {
+  const arrived = corners.find((c) => c.name === arrivedName);
+  if (!arrived || !arrived.target) return null;
+  return corners.find((c) => c.name === arrived.target) ?? null;
+}
+
+/** Walk move per kind for the patrol beat (C monsterinfo.walk). */
+export function patrolWalkMove(kind: ServerMonster['kind']): string {
+  return kind === 'soldier' ? 'walk1' : 'walk';
 }
 
 // --- ai_run lost-sight pursuit (g_ai.c) ---------------------------------------

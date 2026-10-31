@@ -9,6 +9,8 @@ import { describe, expect, it } from 'vitest';
 import {
   MONSTER_HULL_MAXS,
   MONSTER_HULL_MINS,
+  SOLID_BBOX,
+  SOLID_NOT,
   mulberry32,
   resetEdictNums,
 } from '@q2/game';
@@ -161,17 +163,51 @@ describe('RELEASE-5 live bodies block movement', () => {
   });
 });
 
-describe('RELEASE-5 corpses never block (C SVF_DEADMONSTER skip)', () => {
-  it('fresh corpses, gibbed bodies and dormant TRIGGER_SPAWN pass sweeps', () => {
+describe('RELEASE-13 dying blocks, settled corpses never block (C SVF_DEADMONSTER endfunc timing)', () => {
+  it('a fresh kill still blocks; the hull drops only when the fall completes', () => {
     resetEdictNums();
     const st = SV_Init();
-    const dead = SV_SpawnMonster(st, 'monster_infantry', v3(0, 0, 24));
-    expect(SV_DamageMonster(st, dead, 120, mulberry32(3))).toBe('dead');
+    const dying = SV_SpawnMonster(st, 'monster_infantry', v3(0, 0, 24));
+    expect(SV_DamageMonster(st, dying, 120, mulberry32(3))).toBe('dead');
+    expect(dying.state.dead).toBe(true);
+    expect(dying.state.deadDone).toBe(false);
+    expect(dying.edict.solid).toBe(SOLID_BBOX); // SOLID_BBOX held through the fall
+    const trace = SV_ClipTrace(st, openTrace(), -1, true);
+    const mins = v3(-16, -16, -24);
+    const maxs = v3(16, 16, 32);
+    // Dying: the sweep stops on the falling hull (id deadflag DEAD_DEAD but
+    // no SVF_DEADMONSTER yet — the fall blocks like the living).
+    const blocked = trace(v3(200, 0, 24), mins, maxs, v3(-200, 0, 24));
+    expect(blocked.fraction).toBeLessThan(1);
+    expect(blocked.entityNum).toBe(dying.edict.num);
+    // Run the death move to its last frame (the C endfunc): the hull drops
+    // and sweeps pass through the settled corpse from then on.
+    for (let t = 0; t < 40 && !dying.state.deadDone; t++) {
+      st.time += 0.1;
+      SV_MonsterTick(st, v3(9000, 0, 24), openTrace(), null, mulberry32(t));
+    }
+    expect(dying.state.deadDone).toBe(true);
+    expect(dying.edict.solid).toBe(SOLID_NOT); // SOLID_NOT: the C SVF_DEADMONSTER skip
+    const free = trace(v3(200, 0, 24), mins, maxs, v3(-200, 0, 24));
+    expect(free.fraction).toBe(1);
+  });
+
+  it('gibbed bodies and dormant TRIGGER_SPAWN pass sweeps immediately', () => {
+    resetEdictNums();
+    const st = SV_Init();
     const gibbed = SV_SpawnMonster(st, 'monster_soldier', v3(300, 0, 24));
     expect(SV_DamageMonster(st, gibbed, 500, mulberry32(4))).toBe('gib');
     const dormant = SV_SpawnMonster(st, 'monster_infantry', v3(600, 0, 24));
     dormant.triggered = true;
     dormant.woken = false;
+    // A settled corpse (death move completed) passes too.
+    const settled = SV_SpawnMonster(st, 'monster_infantry', v3(0, 0, 24));
+    expect(SV_DamageMonster(st, settled, 120, mulberry32(5))).toBe('dead');
+    for (let t = 0; t < 40 && !settled.state.deadDone; t++) {
+      st.time += 0.1;
+      SV_MonsterTick(st, v3(9000, 0, 24), openTrace(), null, mulberry32(100 + t));
+    }
+    expect(settled.state.deadDone).toBe(true);
     const trace = SV_ClipTrace(st, openTrace(), -1, true);
     const mins = v3(-16, -16, -24);
     const maxs = v3(16, 16, 32);

@@ -603,9 +603,39 @@ describe('infantry spin/cock combat loop (m_infantry.c cock_gun + fire + death2)
     m.state.move = 'death2';
     m.state.frame = 0;
     const before = st.playerHealth;
+    // Floor under the fall: the fully-open stub has no ground, and the dead
+    // branch now runs gravity (id ai_move + M_walkmove ground handling) —
+    // without a floor the body would probe-fall 50u/tick and take the spray
+    // with it. Rest z at the 24 spawn height like the other floor suites.
+    const floor: TraceFn = (start, mins, maxs, end) => {
+      if (end[2]! < 24) {
+        return {
+          fraction: 0,
+          endpos: v3(end[0], end[1], 24),
+          planeNormal: v3(0, 0, 1),
+          allsolid: false,
+          startsolid: false,
+          entityNum: -1,
+          contents: 0,
+          surfaceFlags: 0,
+        };
+      }
+      return openTrace()(start, mins, maxs, end);
+    };
+    // Muzzle basis per spray round: the dying body slides its death2 dists
+    // (id ai_move runs inside every death frame), so each round leaves the
+    // gun where the body stands that tick — not the kill spot. The dead
+    // branch steps dist[pre] then advances to pre+1 (the event frame), so
+    // rounds (event frames 10-21) ride the post-step origin of pre 9-20.
+    const muzzleBases: Vec3[] = [];
     for (let t = 0; t < 30; t++) {
-      SV_Tick(st, 0.1, { player: playerAt(0), trace: openTrace(), rand: () => 0 });
+      const f = m.state.frame;
+      SV_Tick(st, 0.1, { player: playerAt(0), trace: floor, rand: () => 0 });
+      if (f >= 9 && f <= 20) muzzleBases.push(v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]));
     }
+    expect(muzzleBases).toHaveLength(12);
+    // The fall travels (death2 opens 0,1,5,-1,...): the spray walks with it.
+    expect(muzzleBases[0]![0]).not.toBeCloseTo(200, 9);
     // Unconditional like C (no LOS gate): all 12 rounds leave the gun.
     expect(st.muzzles.filter((z) => z.foe)).toHaveLength(12);
     expect(st.tracers).toHaveLength(12);
@@ -622,7 +652,7 @@ describe('infantry spin/cock combat loop (m_infantry.c cock_gun + fire + death2)
     expect(m.state.yaw).toBe(0); // corpses never turn: the yaw basis is fixed
     const foes = st.muzzles.filter((z) => z.foe);
     for (let i = 0; i < 12; i++) {
-      const want = projectSource(v3(200, 0, 24), monsterFlashOffset(MZ2_INFANTRY_MACHINEGUN_2 + i), fwd, right);
+      const want = projectSource(muzzleBases[i]!, monsterFlashOffset(MZ2_INFANTRY_MACHINEGUN_2 + i), fwd, right);
       expect(foes[i]!.pos[0]!).toBeCloseTo(want[0]!, 9);
       expect(foes[i]!.pos[1]!).toBeCloseTo(want[1]!, 9);
       expect(foes[i]!.pos[2]!).toBeCloseTo(want[2]!, 9);

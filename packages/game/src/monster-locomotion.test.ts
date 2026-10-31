@@ -77,13 +77,28 @@ describe('monsterLocomotion (pure, headless)', () => {
     expect([...origin]).toEqual([10, 20, 0]);
   });
 
-  it('corpses never move', () => {
+  it('settled corpses never move; dying bodies slide their death frame', () => {
+    // Settled (deadDone: C SVF_DEADMONSTER endfunc landed) — frozen.
     const ms = spawnMonster('soldier');
     ms.dead = true;
+    ms.deadDone = true;
     ms.move = 'run';
     const origin = v3(0, 0, 50);
     monsterLocomotion(ms, origin, v3(100, 0, 0), openTrace);
     expect([...origin]).toEqual([0, 0, 50]);
+    // Dying (dead, death move still playing): id ai_move keeps stepping the
+    // frame dist along the facing until the endfunc — run frame 0 dist 10
+    // slides +10x with no re-yaw.
+    const dying = spawnMonster('soldier');
+    dying.dead = true;
+    dying.move = 'run';
+    dying.frame = 0;
+    const dorg = v3(0, 0, 50);
+    const res = monsterLocomotion(dying, dorg, v3(0, 100, 0), openTrace);
+    expect(dying.yaw).toBe(0); // no re-yaw while dying
+    expect(dorg[0]).toBeCloseTo(10, 6);
+    expect(dorg[1]).toBeCloseTo(0, 6);
+    expect(res).toEqual({ slide: 0, blocked: false });
   });
 
   it('walls clamp the step via trace (no pass-through)', () => {
@@ -238,6 +253,7 @@ describe('monsterLocomotion SV_NewChaseDir-lite sweep (opt-in)', () => {
     expect([...so]).toEqual([10, 20, 0]);
     const dead = spawnMonster('soldier');
     dead.dead = true;
+    dead.deadDone = true; // settled corpse: frozen, keep-commitment
     dead.move = 'run';
     const do_ = v3(0, 0, 50);
     expect(monsterLocomotion(dead, do_, v3(100, 0, 0), openTrace)).toEqual({
@@ -274,14 +290,16 @@ describe('M_ChangeYaw clamp (id m_move.c, yaw_speed 20°/tick)', () => {
 describe('corpse persistence (id holds the last death frame)', () => {
   it('dead think advances the death move to the last frame, then holds', () => {
     const ms = spawnMonster('soldier');
-    monsterPain(ms, 1000, () => 0);
+    expect(monsterPain(ms, 30, () => 0)).toBe('dead'); // lethal, not gib
     expect(ms.dead).toBe(true);
+    expect(ms.deadDone).toBe(false); // lethal hit is not the endfunc
     expect(ms.move).toBe('death1');
     expect(ms.frame).toBe(0);
     for (let i = 0; i < 100; i++) monsterThink(ms);
     const mv = monsterMoveOf(ms); // still a valid move (never 'dead')
     expect(ms.move).toBe('death1');
     expect(ms.frame).toBe(mv.frames.length - 1);
+    expect(ms.deadDone).toBe(true); // endfunc timing: SVF_DEADMONSTER
     expect(monsterThink(ms)).toBe(mv.frames[mv.frames.length - 1]!.action);
     expect(ms.frame).toBe(mv.frames.length - 1);
   });
@@ -321,9 +339,10 @@ describe('monster facing (Q2 yaw: 0 = +X, 90 = +Y/left)', () => {
     expect(origin[1]).toBeCloseTo(10, 6);
   });
 
-  it('corpses keep their last yaw and never move', () => {
+  it('settled corpses keep their last yaw and never move', () => {
     const ms = spawnMonster('soldier');
     ms.dead = true;
+    ms.deadDone = true;
     ms.yaw = 135;
     const origin = v3(0, 0, 50);
     monsterLocomotion(ms, origin, v3(100, 0, 0), openTrace);

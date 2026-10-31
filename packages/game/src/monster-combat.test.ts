@@ -233,8 +233,7 @@ describe('shooting dead: corpses hittable, overkill gibs (M7.2 batch #4)', () =>
   });
 });
 
-describe('Phase 2 C HP/damage tables (m_soldier.c, m_infantry.c)', () => {
-  it('soldier spawn HP is skin-determined: 20 / 30 / 40 (gib -30 throughout)', () => {
+describe('Phase 2 C HP/damage tables (m_soldier.c, m_infantry.c)', () => {  it('soldier spawn HP is skin-determined: 20 / 30 / 40 (gib -30 throughout)', () => {
     // m_soldier.c SP_ funcs: light (skin 0) 20hp, normal (skin 2) 30hp,
     // super-shot (skin 4) 40hp; every skin gibs at -30.
     expect(soldierHealthForSkin(0)).toBe(20);
@@ -261,8 +260,7 @@ describe('Phase 2 C HP/damage tables (m_soldier.c, m_infantry.c)', () => {
     expect(SOLDIER_HP.machinegun).toBe(40);
   });
 
-  it('infantry C numbers back the lite def (m_infantry.c, now simulated)', () => {
-    // SP_monster_infantry: 100hp, gib -40, mass 200. InfantryMachineGun ->
+  it('infantry C numbers back the lite def (m_infantry.c, now simulated)', () => {    // SP_monster_infantry: 100hp, gib -40, mass 200. InfantryMachineGun ->
     // monster_fire_bullet dmg 3 kick 4 spread 300/500; infantry_smack ->
     // fire_hit dmg 5+(rand%5) kick 50.
     expect(INFANTRY_C.health).toBe(100);
@@ -275,5 +273,79 @@ describe('Phase 2 C HP/damage tables (m_soldier.c, m_infantry.c)', () => {
     expect(INFANTRY_C.meleeDamageMin).toBe(5);
     expect(INFANTRY_C.meleeDamageMax).toBe(9);
     expect(INFANTRY_C.meleeKick).toBe(50);
+  });
+});
+
+describe('RELEASE-13 death variety (m_soldier.c soldier_die, m_infantry.c infantry_die)', () => {
+  function killSoldier(randVal: number, pointZ?: number): ReturnType<typeof spawnMonster> {
+    const s = spawnMonster('soldier'); // 30hp normal
+    expect(monsterPain(s, 30, () => randVal, pointZ)).toBe('dead');
+    return s;
+  }
+  it('soldier rand()%5 covers death1/2/4/5/6 (C frame bases + lengths)', () => {
+    // m_soldier.h FRAME_* bases with the C frame counts (death101=272x36,
+    // death201=308x35, death401=388x53, death501=441x24, death601=465x10).
+    const cases: Array<[number, string, number, number]> = [
+      [0.0, 'death1', 272, 36],
+      [0.2, 'death2', 308, 35],
+      [0.4, 'death4', 388, 53],
+      [0.6, 'death5', 441, 24],
+      [0.8, 'death6', 465, 10],
+    ];
+    for (const [r, move, first, len] of cases) {
+      const s = killSoldier(r);
+      expect(s.move).toBe(move);
+      const mv = monsterMoveOf(s);
+      expect(mv.first).toBe(first);
+      expect(mv.frames.length).toBe(len);
+      expect(mv.last).toBe(first + len - 1);
+    }
+  });
+  it('soldier head shot (impact within 4u of origin+25) plays death3', () => {
+    // C: |origin.z + viewheight - point.z| <= 4 → death3 (343-387, 45f),
+    // regardless of the random roll.
+    for (const z of [21, 25, 29]) {
+      const s = killSoldier(0.0, z);
+      expect(s.move).toBe('death3');
+      expect(monsterMoveOf(s).first).toBe(343);
+      expect(monsterMoveOf(s).frames.length).toBe(45);
+    }
+    // just outside the window the roll applies again
+    expect(killSoldier(0.0, 20).move).toBe('death1');
+    expect(killSoldier(0.0, 30).move).toBe('death1');
+    expect(killSoldier(0.0).move).toBe('death1'); // no point: roll
+  });
+  it('only soldier death1 is armed (fire at indices 21/24); the rest are NULL', () => {
+    for (const move of ['death2', 'death3', 'death4', 'death5', 'death6'] as const) {
+      const s = spawnMonster('soldier');
+      s.move = move;
+      expect(monsterMoveOf(s).frames.every((f) => f.action === 'move')).toBe(true);
+    }
+    const s = spawnMonster('soldier');
+    s.move = 'death1';
+    const tagged = monsterMoveOf(s).frames.map((f, i) => (f.action === 'fire' ? i : -1)).filter((i) => i >= 0);
+    expect(tagged).toEqual([21, 24]);
+  });
+  it('infantry rand()%3 covers death1/2/3 (C frame bases + lengths)', () => {
+    // m_infantry.h: death101=125x20, death201=145x25 (fire 10-21),
+    // death301=170x9.
+    const cases: Array<[number, string, number, number]> = [
+      [0.0, 'death1', 125, 20],
+      [0.34, 'death2', 145, 25],
+      [0.67, 'death3', 170, 9],
+    ];
+    for (const [r, move, first, len] of cases) {
+      const s = spawnMonster('infantry');
+      expect(monsterPain(s, 100, () => r)).toBe('dead');
+      expect(s.move).toBe(move);
+      const mv = monsterMoveOf(s);
+      expect(mv.first).toBe(first);
+      expect(mv.frames.length).toBe(len);
+    }
+    // death2 spray tags: exactly frames 10-21 fire (death211-222)
+    const d2 = spawnMonster('infantry');
+    d2.move = 'death2';
+    expect(monsterMoveOf(d2).frames.map((f, i) => (f.action === 'fire' ? i : -1)).filter((i) => i >= 0))
+      .toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
   });
 });

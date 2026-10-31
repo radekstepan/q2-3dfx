@@ -13,6 +13,7 @@ import type { TraceFn, TraceResult } from '@q2/game';
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
 import {
+  SV_DamageMonster,
   SV_Init,
   SV_MonsterTick,
   SV_PlayerFire,
@@ -377,8 +378,11 @@ describe('soldier last-ditch death fire (m_soldier.c death1)', () => {
     const st = SV_Init();
     const trace = floorTrace();
     const m = SV_SpawnMonster(st, 'monster_soldier_light', v3(200, 0, 24)); // skin 0: blaster
-    expect(monsterPain(m.state, 25, () => 0.5)).toBe('dead'); // 20hp - 25: dead, past gib (-30)
+    // Production path (damage→server): seeded RNG forces the armed death1
+    // (soldier_die rand()%5 roll 0); other rolls play unarmed death2/4/5/6.
+    expect(SV_DamageMonster(st, m, 25, () => 0.05)).toBe('dead'); // 20hp - 25: dead, past gib (-30)
     expect(m.state.dead).toBe(true);
+    expect(m.state.deadDone).toBe(false); // lethal hit is not the endfunc
     expect(m.state.gibbed).toBe(false);
     expect(m.state.move).toBe('death1');
     const playerPos = v3(0, 0, 24);
@@ -426,7 +430,7 @@ describe('soldier last-ditch death fire (m_soldier.c death1)', () => {
     const st = SV_Init();
     const trace = floorTrace();
     const m = SV_SpawnMonster(st, 'monster_soldier_light', v3(200, 0, 24));
-    expect(monsterPain(m.state, 25, () => 0.5)).toBe('dead');
+    expect(SV_DamageMonster(st, m, 25, () => 0.05)).toBe('dead'); // seeded: armed death1
     const player = {
       pos: v3(0, 0, 24),
       mins: v3(-16, -16, -24),

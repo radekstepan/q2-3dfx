@@ -1,14 +1,17 @@
 // Monster collision wiring pins (driver-level bot: real lump, real tick loop).
 //
 // Prior lane landed the server half (monsters SOLID_BBOX, SOLID_NOT while
-// dormant, SOLID_NOT once dead, SV_MonsterClipBox + the opt-in includeMonsters
-// pass defaulting off so the shared monster-tick trace never self-freezes).
+// dormant, SOLID_BBOX held through the death fall and SOLID_NOT only when the
+// last death frame lands — C soldier_dead/infantry_dead endfunc timing for
+// SVF_DEADMONSTER — SV_MonsterClipBox + the opt-in includeMonsters pass
+// defaulting off so the shared monster-tick trace never self-freezes).
 // This file pins the DRIVER half: pmove runs on a split trace that SEES live
-// monsters (worldTrace stays monster-free for the monster tick, bolts and
-// explosions), so:
+// AND DYING monsters (worldTrace stays monster-free for the monster tick,
+// bolts and explosions), so:
 // - walking into a live infantry hull is blocked (contact, never penetration);
+// - walking into a DYING infantry hull is blocked until its fall completes;
 // - dormant TRIGGER_SPAWN bodies pass through until the wake, then block;
-// - corpses (misc_deadsoldier, C SVF_DEADMONSTER skip) never block;
+// - settled corpses (misc_deadsoldier, C SVF_DEADMONSTER skip) never block;
 // - movers still move (the split never starves the mover trace).
 import { describe, expect, it, afterEach } from 'vitest';
 import { resetCVars } from '@q2/config';
@@ -112,9 +115,39 @@ describe.runIf(!!WEB_Q2_PAK)('base1 monster collision (Q2_PAK)', () => {
       driver.step({ msec: 100, angles: aim, forwardmove: 0, sidemove: 0, upmove: 0, buttons: 1 }, 0.1);
     }
     expect(inf.state.dead).toBe(true);
-    // Same walk past the corpse: near-free advance straight through the
-    // 32-wide box — far beyond the live reach, so the leg-1 stall was the
-    // live hull, not a wall.
+    // Dying leg: the fall still blocks (C deadflag DEAD_DEAD without
+    // SVF_DEADMONSTER yet). Four westward ticks — inside even the shortest
+    // fall (death3, 9 frames) — must stall at the hull like the live leg.
+    {
+      const dying = v3(inf.edict.origin[0]!, inf.edict.origin[1]!, inf.edict.origin[2]!);
+      driver.pm.origin = v3(dying[0]! + 80, dying[1]!, dying[2]!);
+      driver.pm.velocity = v3();
+      stepDriver(driver, neutralCmd(), 1);
+      const x0 = driver.pm.origin[0]!;
+      let dyingGap = Infinity;
+      for (let i = 0; i < 4; i++) {
+        SV_SetPlayerHealth(driver.server, 100);
+        driver.step({ msec: 100, angles: [0, 180, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+        dyingGap = Math.min(dyingGap, gap2D(driver.pm.origin, inf.edict.origin));
+      }
+      const dyingReach = x0 - driver.pm.origin[0]!;
+      expect(dyingReach).toBeLessThan(liveReach + 40);
+      expect(dyingGap).toBeGreaterThanOrEqual(28); // hull contact, no penetration
+      expect(driver.pm.onGround).toBe(true);
+    }
+    // Let the fall complete (the C endfunc drops the hull at the last death
+    // frame — up to 25 ticks for death2, plus margin).
+    {
+      let n = 0;
+      while (!inf.state.deadDone && n++ < 60) {
+        SV_SetPlayerHealth(driver.server, 100);
+        driver.step(neutralCmd(), 0.1);
+      }
+      expect(inf.state.deadDone).toBe(true);
+    }
+    // Same walk past the settled corpse: near-free advance straight through
+    // the 32-wide box — far beyond the live reach, so the leg-1 stall was
+    // the live hull, not a wall.
     const corpse = v3(inf.edict.origin[0]!, inf.edict.origin[1]!, inf.edict.origin[2]!);
     driver.pm.origin = v3(corpse[0]! + 80, corpse[1]!, corpse[2]!);
     driver.pm.velocity = v3();

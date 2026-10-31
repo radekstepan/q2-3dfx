@@ -36,6 +36,8 @@ import {
   monsterMoveOf,
   monsterPain,
   monsterThink,
+  monsterYawTo,
+  mulberry32,
   moverThink,
   moverUse,
   muzzleRadius,
@@ -129,7 +131,12 @@ import {
   duckHoldFrozen,
   duckShootEvent,
   maybeBurstRefire,
+  acquireSight,
   monsterHullMaxs,
+  patrolAdvance,
+  patrolCornersOf,
+  patrolStart,
+  patrolWalkMove,
   pursueGoal,
   reactionAt,
   resolveCombatPoint,
@@ -301,6 +308,13 @@ export interface ServerState {
   speakers: Map<string, Array<{ origin: Vec3; noise: string; looped: boolean }>>;
   /** Ambient map timers (func_timer, g_func.c func_timer_think). */
   timers: ServerTimer[];
+  /**
+   * Dedicated ambient-timer jitter stream (C func_timer_think reschedules on
+   * wait + crandom spread). Seeded at init — never the global Math.random —
+   * so map ambience stays deterministic and no gameplay RNG consumption can
+   * shift timer phase (which wedged timer-cadence assertions).
+   */
+  timerRand: () => number;
   /** Authoritative player health (the driver mirrors it into HUD state). */
   playerHealth: number;
   playerMaxHealth: number;
@@ -399,10 +413,17 @@ export interface ServerState {
   finishKills: number;
   finishSecrets: number;
   finishGoals: number;
+  /**
+   * Level.time of the last player weapon fire (C client->show_hostile =
+   * level.time + 1, g_weapon.c: a recently-hostile player is seen at
+   * RANGE_NEAR even from behind, and non-ambush monsters hear the shot).
+   * -10 at spawn (nobody hostile yet).
+   */
+  lastPlayerShotAt: number;
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0 };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], timerRand: mulberry32(0x71E4), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0, lastPlayerShotAt: -10 };
 }
 
 /**
@@ -793,17 +814,19 @@ export function SV_TrainClipBox(
  * Current world-space clip box of a live monster: the C SOLID_BBOX hull
  * (MONSTER_HULL_MINS + duck-aware maxs) at the edict origin. Null for every
  * body movement must pass through: dormant TRIGGER_SPAWN (SOLID_NOT until
- * monster_triggered_spawn), gibbed (G_FreeEdict-gone in C), and the dead
- * (C Killed sets SVF_DEADMONSTER, which SV_ClipMoveToEntities skips unless
- * the mask carries CONTENTS_DEADMONSTER — corpses never block the living).
- * Corpses stay hittable through the state-based bolt/pellet sweeps, which
- * key off state.dead instead of solid.
+ * monster_triggered_spawn), gibbed (G_FreeEdict-gone in C), and settled
+ * corpses (C Killed→die→death-move endfunc sets SVF_DEADMONSTER, which
+ * SV_ClipMoveToEntities skips unless the mask carries CONTENTS_DEADMONSTER
+ * — corpses never block the living). Dying bodies (dead, death move still
+ * playing, C deadflag DEAD_DEAD but no SVF_DEADMONSTER yet) DO clip: the
+ * fall blocks until the endfunc lands. Corpses stay hittable through the
+ * state-based bolt/pellet sweeps, which key off state.dead instead of solid.
  */
 export function SV_MonsterClipBox(
   m: ServerMonster,
 ): { mins: Float32Array; maxs: Float32Array } | null {
   if (m.edict.freed || m.edict.solid !== SOLID_BBOX) return null;
-  if (m.kind === null || m.state.dead || m.state.gibbed) return null;
+  if (m.kind === null || m.state.deadDone || m.state.gibbed) return null;
   if (m.triggered && !m.woken) return null;
   const maxs = monsterHullMaxs(m);
   return {
@@ -997,6 +1020,18 @@ export interface ServerMonster {
    * keeps its hand instead of dithering back.
    */
   slideDir: number;
+  /**
+   * Patrol beat (g_monster.c movetarget / g_misc.c path_corner): targetname
+   * of the corner currently being walked to ('' = no beat — stand until
+   * seen). Set at spawn for target→path_corner monsters (and at wake for
+   * triggered ones); walked while unseen, abandoned on acquire (seen hunts
+   * from then on). Chained by targetname on arrival so loops run forever.
+   */
+  patrolCorner: string;
+  /** World position of patrolCorner (re-resolved on every advance). */
+  patrolGoal: Vec3 | null;
+  /** Corner-wait hold: stand until this level.time (C pausetime on wait). */
+  patrolWaitUntil: number;
 }
 
 /**
@@ -1707,6 +1742,9 @@ export function SV_SpawnEntities(
         combatHold: false,
         combatDone: false,
         slideDir: 0,
+        patrolCorner: '',
+        patrolGoal: null,
+        patrolWaitUntil: 0,
       };
       st.monsters.push(monster);
       // C spawn HP per skin (m_soldier.c SP_ funcs): light 20, normal 30,
@@ -1739,6 +1777,15 @@ export function SV_SpawnEntities(
       trainNext(tr, 0);
     }
   }
+  // Second pass: monster target links (g_monster.c monster_start_go runs
+  // after all spawns too). A target naming a point_combat becomes the
+  // combattarget (base1's t67 soldier); a target naming a path_corner starts
+  // the patrol beat, facing the first corner (base1's ten beat cops).
+  // Triggered bodies resolve on wake instead (monster_triggered_spawn) —
+  // see resolveMonsterTarget, shared with SV_UseMonster.
+  for (const m of st.monsters) {
+    if (!m.triggered) resolveMonsterTarget(st, m);
+  }
   // SP_trigger_always: fire at spawn (starts base1's ships; the exit train's
   // own trigger_always is skill-inhibited in SP, so the train waits for *13).
   // Explosion targets fire for real too (none in base1, but the path is the
@@ -1765,6 +1812,38 @@ export function SV_SpawnEntities(
 }
 
 /**
+ * Monster spawn target resolution (g_monster.c monster_start_go, runs after
+ * all spawns — and late for triggered bodies at wake). A target naming a
+ * point_combat becomes the combattarget (FoundTarget heads there on
+ * acquire); a target naming a path_corner starts the patrol beat, facing
+ * the first corner with the walk move (base1's beat cops); anything else
+ * (a packmate targetname like t40, a dangling link) stands until seen.
+ * The edict target is kept for monster_death_use (C clears it for the
+ * combattarget fixup, but the t39→t40 death chain needs it; firing a
+ * point_combat targetname on death is a no-op in fireTargets).
+ */
+export function resolveMonsterTarget(st: ServerState, m: ServerMonster): void {
+  const target = m.edict.target;
+  if (!target || m.kind === null) return;
+  const named = st.entities.filter((e) => !e.freed && e.targetname === target);
+  if (named.some((e) => e.classname === 'point_combat')) {
+    m.edict.extra['combattarget'] = target;
+    return;
+  }
+  const corners = patrolCornersOf(st);
+  const first = patrolStart(corners, target);
+  if (!first) return;
+  m.patrolCorner = first.name;
+  m.patrolGoal = v3(first.pos[0], first.pos[1], first.pos[2]);
+  // C faces the first corner outright (ideal_yaw = angles[YAW] = vectoyaw).
+  m.state.yaw = monsterYawTo(m.edict.origin, m.patrolGoal);
+  if (!m.state.dead && !m.state.gibbed) {
+    m.state.move = patrolWalkMove(m.kind);
+    m.state.frame = 0;
+  }
+}
+
+/**
  * id G_UseTargets on a monster edict (g_monster.c): TRIGGER_SPAWN bodies
  * wake via monster_triggered_spawn_use (solid + visible + thinking next
  * frame; the activator becomes the enemy unless ambush holds it), while a
@@ -1773,7 +1852,7 @@ export function SV_SpawnEntities(
  * bodies ignore uses. `byPlayer` marks a client activator (pickup/death
  * chains in this sim are always player-caused; doors/buttons pass false).
  */
-export function SV_UseMonster(m: ServerMonster, byPlayer: boolean): void {
+export function SV_UseMonster(m: ServerMonster, byPlayer: boolean, st?: ServerState): void {
   if (m.state.gibbed || m.state.dead) return;
   if (m.triggered && !m.woken) {
     // monster_triggered_start -> monster_triggered_spawn_use: one frame
@@ -1791,6 +1870,9 @@ export function SV_UseMonster(m: ServerMonster, byPlayer: boolean): void {
     // The use carries no clock; stamp the sight-delay on the next tick
     // (reactionAt -1 = pending, resolved against level.time there).
     if (m.seen) m.reactionAt = -1;
+    // monster_triggered_spawn runs the spawn target resolution late
+    // (walkmonster_start_go): patrol beats start on wake, not on lump spawn.
+    if (st) resolveMonsterTarget(st, m);
     return;
   }
   if (!m.triggered && byPlayer && !m.seen) {
@@ -1815,7 +1897,7 @@ export function SV_UseTargetname(st: ServerState, targetname: string): void {
     if (tr.ent.targetname === targetname) startTrain(tr, st.time);
   }
   for (const m of st.monsters) {
-    if (!m.edict.freed && m.edict.targetname === targetname) SV_UseMonster(m, true);
+    if (!m.edict.freed && m.edict.targetname === targetname) SV_UseMonster(m, true, st);
   }
   for (const e of st.entities) {
     if (e.targetname === targetname && e.classname === 'trigger_relay') {
@@ -1981,7 +2063,7 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     // G_UseTargets reaches monster edicts by targetname: TRIGGER_SPAWN
     // bodies wake (monster_triggered_spawn_use), live others alert
     // (monster_use). Movers/trains/relays keep their branches below.
-    if (!m.edict.freed && m.edict.targetname === user.target) SV_UseMonster(m, true);
+    if (!m.edict.freed && m.edict.targetname === user.target) SV_UseMonster(m, true, st);
   }
   let firedTrain = false;
   for (const e of st.entities) {
@@ -2526,11 +2608,20 @@ function attackOfMove(kind: MonsterKind, move: string): AttackChoice {
  * equivalent used by tests and headless sims):
  * - triggered (spawnflags & 2) and unmapped (no lite def) monsters stay
  *   dormant;
- * - ambush (spawnflags & 1) monsters hold their stand pose until line of
+ * - ambush (spawnflags & 1) monsters hold their stand pose until gated
  *   sight latches `seen` — the base1 opener: the start-room soldier waits
  *   until the player rounds the corner, then runs at them. Sight is C
  *   visible(): eye to eye (monster +25, player +22 standing) against an
- *   opaque-mask trace;
+ *   opaque-mask trace, gated by the C FindTarget range/infront rules (melee
+ *   sees behind, near needs facing or a shot in the last second, mid needs
+ *   facing, far never). Damage and gunfire noise acquire separately;
+ * - target→path_corner monsters walk their patrol beat (ai_walk on
+ *   movetarget, chained by targetname) while unseen instead of beelining;
+ * - first sight latches seen plus the skill-scaled sight delay
+ *   (HuntTarget AttackFinished): no attack may start before reactionAt;
+ * - dying bodies slide through their death move and keep blocking until the
+ *   last frame latches deadDone (C SVF_DEADMONSTER endfunc timing); settled
+ *   corpses never block but stay hittable; gibbed bodies are gone;
  * - first sight latches seen plus the skill-scaled sight delay
  *   (HuntTarget AttackFinished): no attack may start before reactionAt;
  * - a monster carrying combattarget heads for its point_combat instead
@@ -2586,9 +2677,10 @@ export function SV_MonsterTick(
   // SV_ClipMoveToEntities): the world/clip trace PLUS every OTHER live
   // monster hull (self skipped via ignoreNum — a mover always starts inside
   // its own hull) PLUS the player box, so walkers stop on bodies instead
-  // of entering them. Corpses never block (C SVF_DEADMONSTER skip without
-  // CONTENTS_DEADMONSTER — SV_MonsterClipBox drops them the same way),
-  // gibbed/dormant bodies are already skipped there. The player box always
+  // of entering them. Settled corpses never block (C SVF_DEADMONSTER skip
+  // without CONTENTS_DEADMONSTER — SV_MonsterClipBox drops them the same
+  // way); dying bodies still clip until deadDone latches. Gibbed/dormant
+  // bodies are already skipped there. The player box always
   // clips while provided (C keeps the client edict SOLID_BBOX after death;
   // SP restarts on death anyway). Sight still runs on sightTrace.
   let playerMins: Float32Array | null = null;
@@ -2650,11 +2742,27 @@ export function SV_MonsterTick(
     const ms: MonsterState = m.state;
     if (ms.gibbed) continue;
     if (ms.dead) {
-      // Corpses hold their last death frame — except the soldier's
-      // last-ditch shot (monster-ai deathFireEvent: death1 'fire' frames
-      // 21/24 emit a skin-gun event through the live resolver, exactly
-      // like duck-and-shoot). Unconditional like C (no LOS gate).
+      // Dying bodies keep sliding through their death move (id ai_move runs
+      // inside every death frame until the endfunc) and keep blocking
+      // movement until deadDone latches (SVF_DEADMONSTER timing) — only
+      // then does the hull drop (soldier_dead / infantry_dead linkentity).
+      // Last-ditch shots (soldier death1 fire frames, infantry death2
+      // spray) emit skin-gun events through the live resolver, exactly like
+      // duck-and-shoot. Unconditional like C (no LOS gate).
+      if (!ms.deadDone) {
+        const moveTrace = moveTraceFor(m);
+        monsterLocomotion(ms, m.edict.origin, playerPos, (s, e) => {
+          const h = stepHullTrace(moveTrace, s, e, monsterHullMaxs(m));
+          return { fraction: h.fraction, endpos: h.endpos };
+        });
+      } else if (m.edict.solid !== SOLID_NOT) {
+        m.edict.solid = SOLID_NOT;
+      }
       const deadAction = monsterThink(ms);
+      // The endfunc lands inside monsterThink (deadDone latches on the last
+      // frame): drop the hull the same tick, so a corpse never blocks for
+      // an extra quantum after its fall completes.
+      if (ms.deadDone && m.edict.solid !== SOLID_NOT) m.edict.solid = SOLID_NOT;
       const lastDitch = deathFireEvent(m, deadAction, skillMultiplier(st.skill));
       if (lastDitch) events.push(lastDitch);
       continue;
@@ -2672,15 +2780,26 @@ export function SV_MonsterTick(
     const dy = playerPos[1]! - pos[1]!;
     const dz = playerPos[2]! - pos[2]!;
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    const canSee = losClear(sightTrace, pos, playerPos, playerView);
+    const los = losClear(sightTrace, pos, playerPos, playerView);
+    // C FindTarget vision gating (g_ai.c): visible() alone never acquires —
+    // melee range (< 80) sees even behind, near (< 500) needs facing unless
+    // the player fired in the last second (show_hostile), mid (< 1000)
+    // needs facing, far never acquires. Damage and noise acquire separately.
+    const hostile = now - st.lastPlayerShotAt < 1;
+    const spotted = !m.seen && acquireSight(m, playerPos, dist, los, hostile);
     // FoundTarget (g_ai.c): first sight acquires the enemy plus the
     // sight-delay hold (HuntTarget AttackFinished) before any attack.
-    if (!m.seen && canSee) {
+    if (spotted) {
       m.seen = true;
       m.reactionAt = reactionAt(st.skill, now);
     }
-    if (m.ambush && !m.seen) {
-      if (!canSee) {
+    if (m.ambush && !m.seen && !m.patrolCorner) {
+      // Ambush stand (ai_stand without movetarget): hold the pose until
+      // gated sight acquires. Beat cops skip this: C ai_walk steps the
+      // movetarget FIRST and checks FindTarget after, so patrolling
+      // ambushers keep walking while unseen (the patrol branch below runs
+      // the same gated acquisition before stepping).
+      if (!los || !acquireSight(m, playerPos, dist, true, hostile)) {
         const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
         if (ms.move !== stand) {
           ms.move = stand;
@@ -2692,12 +2811,79 @@ export function SV_MonsterTick(
       m.seen = true;
       m.reactionAt = reactionAt(st.skill, now);
     }
+    // Patrol beat (ai_walk on movetarget): unseen beat cops walk their
+    // corners — facing and stepping along the route — instead of beelining
+    // the player. Acquisition above already latched seen (hunt from here);
+    // arrival advances the targetname chain (loops run forever), an ended
+    // chain stands, and wait corners hold the stand pose. Corner waits and
+    // arrivals below run on the same gated sight (ai_walk checks FindTarget
+    // every frame, which already ran).
+    if (!m.seen && m.patrolCorner && m.patrolGoal) {
+      if (now < m.patrolWaitUntil) {
+        const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
+        if (ms.move !== stand) {
+          ms.move = stand;
+          ms.frame = 0;
+        }
+        monsterThink(ms);
+        continue;
+      }
+      const gx = m.patrolGoal[0]! - pos[0]!;
+      const gy = m.patrolGoal[1]! - pos[1]!;
+      if (Math.hypot(gx, gy) <= 24) {
+        const corners = patrolCornersOf(st);
+        const arrivedName = m.patrolCorner;
+        const next = patrolAdvance(corners, arrivedName);
+        if (!next) {
+          m.patrolCorner = '';
+          m.patrolGoal = null;
+          const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
+          ms.move = stand;
+          ms.frame = 0;
+          monsterThink(ms);
+          continue;
+        }
+        m.patrolCorner = next.name;
+        m.patrolGoal = v3(next.pos[0], next.pos[1], next.pos[2]);
+        if (next.wait > 0) {
+          m.patrolWaitUntil = now + next.wait;
+          const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
+          ms.move = stand;
+          ms.frame = 0;
+          monsterThink(ms);
+          continue;
+        }
+      }
+      const walk = patrolWalkMove(m.kind);
+      if (ms.move !== walk) {
+        ms.move = walk;
+        ms.frame = 0;
+      }
+      const goal = m.patrolGoal;
+      monsterLocomotion(ms, pos, playerPos, (s, e) => {
+        const h = stepHullTrace(moveTrace, s, e, monsterHullMaxs(m));
+        return { fraction: h.fraction, endpos: h.endpos };
+      }, goal, { newChaseDir: true, slideSign: m.slideDir });
+      monsterThink(ms);
+      continue;
+    }
     // Combat-point hookup (one-shot): a carried combattarget installs the
     // point_combat goal instead of hunting the enemy directly.
     if (m.seen) resolveCombatPoint(st, m);
     // Steering goal: combat points run blind (M_MoveToGoal, no attack);
-    // seen monsters pursue via the trail when sight breaks; unseen
-    // non-ambush bodies keep the legacy beeline (no sound-alert path yet).
+    // seen monsters pursue via the trail when sight breaks; unseen beat-less
+    // non-ambush bodies stand (C ai_stand with pausetime 1e8 — no target, no
+    // movetarget) instead of beelining: with patrol beats and the noise path
+    // in place the legacy beeline would walk standers into the player.
+    if (!m.seen && !m.combatGoal && !m.combatHold) {
+      const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
+      if (ms.move !== stand) {
+        ms.move = stand;
+        ms.frame = 0;
+      }
+      monsterThink(ms);
+      continue;
+    }
     let standGround = false;
     let goal: Vec3;
     if (m.combatGoal) {
@@ -2709,14 +2895,14 @@ export function SV_MonsterTick(
         goal = m.combatGoal;
       } else if (m.combatHold) {
         standGround = true;
-        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), moveTrace) : playerPos;
+        goal = m.seen ? pursueGoal(st, m, playerPos, los, sightTrace, frameDistOf(ms), moveTrace) : playerPos;
       } else {
-        goal = m.seen ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), moveTrace) : playerPos;
+        goal = m.seen ? pursueGoal(st, m, playerPos, los, sightTrace, frameDistOf(ms), moveTrace) : playerPos;
       }
     } else {
       if (m.combatHold) standGround = true;
       goal = m.seen
-        ? pursueGoal(st, m, playerPos, canSee, sightTrace, frameDistOf(ms), moveTrace)
+        ? pursueGoal(st, m, playerPos, los, sightTrace, frameDistOf(ms), moveTrace)
         : playerPos;
       goal = separationOffset(st, m, goal);
     }
@@ -2735,7 +2921,7 @@ export function SV_MonsterTick(
     // Sight delay (HuntTarget AttackFinished): attacks stay holstered until
     // reactionAt, but the body still closes — folded into the sight bit so
     // monsterChaseMove's M_CheckAttack path never sees an early attack.
-    const gated = canSee && now >= m.reactionAt;
+    const gated = los && now >= m.reactionAt;
     // A playing duck is never interrupted (C runs the current move's
     // frames): chase decisions would re-roll it into run/attack, so the
     // duck steers with the goal but takes no chase decisions until it
@@ -2801,9 +2987,9 @@ export function SV_MonsterTick(
     // Skill-3 burst refire (attack1/attack2 nextframe): re-enter
     // the finished attack move immediately, bypassing the cooldown.
     // (attack4 has no nextframe in C — the hold IS the burst.)
-    maybeBurstRefire(m, prevMove, canSee, st.skill, rand);
+    maybeBurstRefire(m, prevMove, los, st.skill, rand);
     // Duck-and-shoot (attack3): one skin-gun event on the duck fire frame.
-    const duckEv = duckShootEvent(m, canSee, skillMultiplier(st.skill));
+    const duckEv = duckShootEvent(m, los, skillMultiplier(st.skill));
     if (duckEv) events.push(duckEv);
     // Infantry chaingun spin (m_infantry.c infantry_cock_gun, attak104):
     // the cock frame plays infatck3 and arms the 1.0-2.5s burst pausetime
@@ -2825,7 +3011,7 @@ export function SV_MonsterTick(
         born: st.time,
       });
     }
-    if ((action === 'fire' || action === 'melee') && canSee) {
+    if ((action === 'fire' || action === 'melee') && los) {
       // Fresh arrival on the ss fire frame (a live hold's frozen replay
       // never reaches think; the expiry replay carries wasHeld): arm the C
       // pausetime (m_soldier.c soldier_fire sets it when AI_HOLD_FRAME is
@@ -2963,14 +3149,14 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
   }
   // Ambient map timers (g_func.c func_timer_think): due timers fire their
   // target through the same cascade, then reschedule on wait + crandom
-  // spread (Math.random only when random > 0 — most base1 timers carry
-  // one, so exact cadence is C-like but not seeded; the map loop stays
-  // deterministic only for random-0 timers). Runs without the game phase:
+  // spread from the state's dedicated timer stream (deterministic; never
+  // the global Math.random, so gameplay consumption cannot shift ambience
+  // phase). Runs without the game phase:
   // splash/speaker cadence needs no player, like C thinks.
   for (const t of st.timers) {
     if (t.ent.freed || t.nextAt < 0 || now < t.nextAt) continue;
     fireTargets(st, t.ent);
-    t.nextAt = now + t.wait + (t.random > 0 ? (Math.random() * 2 - 1) * t.random : 0);
+    t.nextAt = now + t.wait + (t.random > 0 ? (st.timerRand() * 2 - 1) * t.random : 0);
   }
   st.moverDeltas.clear();
   for (const m of st.movers) {
@@ -3440,6 +3626,9 @@ export function SV_SpawnMonster(
     combatHold: false,
     combatDone: false,
     slideDir: 0,
+    patrolCorner: '',
+    patrolGoal: null,
+    patrolWaitUntil: 0,
   };
   if (kind === 'soldier') {
     const skin = Number.parseInt((e.extra['skinnum'] as string) ?? '2', 10);
@@ -3511,24 +3700,36 @@ export function SV_SetPlayerSuit(st: ServerState, breatherUntil: number, enviroU
  * T_Damage on a monster (g_combat.c gib-first ordering via monsterPain).
  * Gibbing spawns meat/chest/head extras + the udeath sound and marks
  * DEAD_DEAD (unhittable from then on). Returns the pain result.
+ * `pointZ` is the impact height relative to the monster origin for the
+ * soldier head-shot death branch (omitted for radius/melee kills).
  */
 export function SV_DamageMonster(
   st: ServerState,
   m: ServerMonster,
   damage: number,
   rand: () => number,
+  pointZ?: number,
 ): 'gib' | 'dead' | 'pain' | 'none' {
   const wasAlive = !m.state.dead && !m.state.gibbed;
-  const res = monsterPain(m.state, damage, rand);
+  const res = monsterPain(m.state, damage, rand, pointZ);
+  if (wasAlive && !m.seen) {
+    // C M_ReactToDamage: a client hurting a monster acquires it (FoundTarget
+    // on the enemy change — no visibility requirement). Only on the unseen→
+    // seen edge (re-hits never re-arm the hold, like C's early return when
+    // the attacker is already the enemy).
+    m.seen = true;
+    m.reactionAt = -1;
+  }
   if ((res === 'dead' || res === 'gib') && wasAlive) {
     // C Killed(): every fresh SVF_MONSTER death counts (this sim has no
     // AI_GOOD_GUY bodies; deadsoldier minces run a separate counter).
     st.killedMonsters++;
-    // C Killed sets SVF_DEADMONSTER: SV_ClipMoveToEntities skips the corpse
-    // unless the mask carries CONTENTS_DEADMONSTER, so the dead never block
-    // the living. SOLID_NOT is that skip here (SV_MonsterClipBox drops them
-    // the same way). Corpses stay hittable via the state-based sweeps.
-    m.edict.solid = SOLID_NOT;
+    // The hull drops only when the death move completes (C soldier_dead /
+    // infantry_dead endfunc sets SVF_DEADMONSTER): the tick flips solid to
+    // SOLID_NOT as deadDone latches. Dying bodies keep blocking until then.
+    // Gibbed bodies are gone (SOLID_NOT now — SV_MonsterClipBox gates gibbed
+    // either way). Corpses stay hittable via the state-based sweeps.
+    if (res === 'gib' && wasAlive) m.edict.solid = SOLID_NOT;
   }
   if ((res === 'dead' || res === 'gib') && wasAlive && m.edict.target) {
     // id monster_death_use: a dying monster fires its target (with the
@@ -3859,7 +4060,7 @@ export function SV_BlasterImpact(
   }
   SV_SpawnExplosion(st, pos, 0, { kind: 'blaster', rand, dir: d });
   st.sounds.push({ name: 'weapons/lashit.wav', pos: v3(pos[0], pos[1], pos[2]), born: st.time });
-  if (hitMonster) SV_DamageMonster(st, hitMonster, damage, rand);
+  if (hitMonster) SV_DamageMonster(st, hitMonster, damage, rand, pos[2]! - hitMonster.edict.origin[2]!);
 }
 
 /** Fire one target_explosion: immediate, or delayed via the fuse list. */
@@ -3937,7 +4138,7 @@ export function useTimer(st: ServerState, t: ServerTimer, depth = 0): void {
     return;
   }
   fireTargets(st, t.ent, depth);
-  t.nextAt = st.time + t.wait + (t.random > 0 ? (Math.random() * 2 - 1) * t.random : 0);
+  t.nextAt = st.time + t.wait + (t.random > 0 ? (st.timerRand() * 2 - 1) * t.random : 0);
 }
 
 /**
@@ -4314,7 +4515,8 @@ function stepBoltFlight(
         dead = true;
       } else if (hitMonster !== null && tMonster !== null && tMonster < tWall - eps && (tBarrel === null || tMonster <= tBarrel) && (tCorpse === null || tMonster <= tCorpse)) {
         // Player bolt vs monster flesh: T_Damage only, no TE_BLASTER (C).
-        SV_DamageMonster(st, hitMonster, bolt.damage, rand);
+        // Impact height rides along for the soldier head-shot death branch.
+        SV_DamageMonster(st, hitMonster, bolt.damage, rand, bolt.pos[2]! - hitMonster.edict.origin[2]!);
         dead = true;
       } else if (hb !== null && tBarrel !== null && tBarrel < tWall - eps && (tCorpse === null || tBarrel <= tCorpse)) {
         // Bolt vs shootable barrel (takedamage YES until fused): the fuse
@@ -4666,6 +4868,37 @@ export interface SVFireResult {
 }
 
 /**
+ * Weapon-noise wake-up (g_ai.c FindTarget heardit half + PlayerNoise).
+ * Called once per player shot; see the SV_PlayerFire call site for the
+ * C mapping. `opts.trace` doubles as the ambush visibility check.
+ */
+export function playerNoiseWake(st: ServerState, opts: SVFireOpts): void {
+  for (const m of st.monsters) {
+    if (m.kind === null || m.state.dead || m.state.gibbed) continue;
+    if (m.triggered && !m.woken) continue;
+    if (m.seen) continue;
+    const dx = opts.feet[0]! - m.edict.origin[0]!;
+    const dy = opts.feet[1]! - m.edict.origin[1]!;
+    const dz = opts.feet[2]! - m.edict.origin[2]!;
+    if (Math.sqrt(dx * dx + dy * dy + dz * dz) > 1000) continue;
+    if (m.ambush) {
+      // Spawnflags & 1 hears only what it can see (C heardit ambush gate).
+      const a = v3(m.edict.origin[0], m.edict.origin[1], m.edict.origin[2]! + MONSTER_VIEWHEIGHT);
+      const t = opts.trace(a, ZERO_HULL, ZERO_HULL, opts.eye);
+      if (t.fraction !== 1 || t.startsolid) continue;
+    }
+    m.seen = true;
+    m.reactionAt = -1;
+    // Hunt the noise position (C acquires the sound entity): steer the
+    // trail pursuit at the firing feet until sight takes over.
+    m.state.lastSighting[0] = opts.feet[0]!;
+    m.state.lastSighting[1] = opts.feet[1]!;
+    m.state.lastSighting[2] = opts.feet[2]!;
+    m.state.trailTime = st.time;
+  }
+}
+
+/**
  * Per-trigger fire sound (client/cl_fx.c CL_ParseMuzzleFlash MZ_* cases —
  * the client plays these on the muzzle flash, which is the sound slot
  * SV_PlayerFire feeds). Machinegun/chaingun rotate machgf1-5b
@@ -4731,6 +4964,14 @@ export function SV_PlayerFire(
     pos: v3(opts.eye[0], opts.eye[1], opts.eye[2]),
     born: st.time,
   });
+  // Weapon noise (g_ai.c FindTarget heardit half): firing stamps
+  // show_hostile (near-range rear sight for 1s) and wakes listeners — every
+  // non-ambush body within 1000u (C gi.inPHS approximated by range; the sim
+  // has no PHS set), ambush bodies only when the muzzle is visible to them.
+  // Woken bodies hunt the noise position via the trail (lastSighting), like
+  // C acquiring the sound entity.
+  st.lastPlayerShotAt = st.time;
+  playerNoiseWake(st, opts);
   // Muzzle flash: HUD glow + a real dlight (id CL_MuzzleFlash: origin =
   // feet + fwd*18 + right*16, radius 200+(rand&31), pure yellow).
   st.muzzles.push({
@@ -4856,7 +5097,7 @@ export function SV_PlayerFire(
     if (hitBarrel && !hitBarrel.edict.freed && barrelT <= corpseT) {
       SV_DamageBarrel(st, hitBarrel, pl.damage);
     } else if (hitMonster && bestT <= corpseT) {
-      SV_DamageMonster(st, hitMonster, pl.damage, opts.rand);
+      SV_DamageMonster(st, hitMonster, pl.damage, opts.rand, hitPos[2]! - hitMonster.edict.origin[2]!);
       // C g_combat.c:490 T_Damage → SpawnDamage(TE_BLOOD, point, normal,
       // take): monster/client flesh draws blood, not a gray puff. The gib
       // path is untouched (SV_DamageMonster owns it); blaster flesh stays

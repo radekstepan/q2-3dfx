@@ -154,10 +154,25 @@ export const SOLDIER: MonsterDef = {
     duck: mv('duck', 45, [5, -1, 1, 0, 5], 'run'),
     // Last-ditch shot (see the fire-tags note above): death1 indices 21/24
     // are 'fire' exactly like the C soldier_fire6/soldier_fire7 frames.
-    // (C picks death1-6 at random with only death1 armed; the lite soldier
-    // holds death1, so every lite death plays the armed move — the trace
-    // agrees with the animation it actually renders.)
+    // (C picks death1/2/4/5/6 at random — rand()%5 — plus death3 on a head
+    // shot; only death1 is armed, so the other moves render unarmed falls.)
     death1: taggedMove('death1', 272, [0, -10, -10, -10, -5, ...new Array(31).fill(0)], 'dead', { 21: 'fire', 24: 'fire' }),
+    // C soldier_move_death2 (FRAME_death201-235 = 308-342): all 35 frames
+    // ai_move/NULL, opening backstep -5 x3.
+    death2: mv('death2', 308, [-5, -5, -5, ...new Array(32).fill(0)], 'dead'),
+    // C soldier_move_death3 (FRAME_death301-345 = 343-387): the head-shot
+    // fall (45 frames, opening backstep -5 x3). Picked by impact height,
+    // never by the random roll.
+    death3: mv('death3', 343, [-5, -5, -5, ...new Array(42).fill(0)], 'dead'),
+    // C soldier_move_death4 (FRAME_death401-453 = 388-440): 53 zero-dist
+    // frames (crumple in place).
+    death4: mv('death4', 388, new Array(53).fill(0), 'dead'),
+    // C soldier_move_death5 (FRAME_death501-524 = 441-464): 24 frames,
+    // opening backstep -5 x3.
+    death5: mv('death5', 441, [-5, -5, -5, ...new Array(21).fill(0)], 'dead'),
+    // C soldier_move_death6 (FRAME_death601-610 = 465-474): 10 zero-dist
+    // frames (drop in place).
+    death6: mv('death6', 465, new Array(10).fill(0), 'dead'),
   },
 };
 
@@ -211,6 +226,16 @@ export interface MonsterState {
   frame: number; // absolute frame number within current move
   dead: boolean;
   /**
+   * Death animation finished (id SVF_DEADMONSTER, set by the death move's
+   * endfunc — soldier_dead / infantry_dead — AFTER the fall plays, never at
+   * the lethal hit: soldier_die / infantry_die set deadflag DEAD_DEAD
+   * immediately but the body stays SOLID_BBOX and keeps clipping movement
+   * until the endfunc shrinks the hull and tosses it). Dying bodies
+   * (dead, !deadDone) still block; settled corpses (deadDone) never block
+   * but stay hittable; gibbed bodies are gone.
+   */
+  deadDone: boolean;
+  /**
    * Gibbed (id DEAD_DEAD after ThrowGib: soldier_die/gunner_die gib branch).
    * Gibbed bodies are gone — unhittable, skipped by snapshots. Plain corpses
    * (dead, !gibbed) stay hittable (takedamage YES) so re-hitting them can
@@ -253,6 +278,7 @@ export function spawnMonster(kind: MonsterKind): MonsterState {
     move: kind === 'soldier' ? 'stand1' : 'stand',
     frame: 0,
     dead: false,
+    deadDone: false,
     gibbed: false,
     yaw: 0,
     attackState: 'straight',
@@ -569,8 +595,15 @@ export function monsterThink(ms: MonsterState): string {
     // rendering via the snapshot instead of being freed). Advance the death
     // move to its last frame, then hold it — never wrap, never transition
     // (the 'dead' end name has no move table and must never be entered).
+    // Reaching the last frame latches deadDone: the C death-move endfunc
+    // (soldier_dead / infantry_dead) that sets SVF_DEADMONSTER runs when the
+    // last frame is current, releasing movement blocking while the corpse
+    // stays hittable.
     const mv = monsterMoveOf(ms);
-    if (ms.frame < mv.frames.length - 1) ms.frame++;
+    if (ms.frame >= mv.frames.length - 1) {
+      ms.frame = mv.frames.length - 1;
+      ms.deadDone = true;
+    } else ms.frame++;
     return mv.frames[ms.frame]?.action ?? 'move';
   }
   const mv = monsterMoveOf(ms);
@@ -655,9 +688,13 @@ export interface LocomotionResult {
  * monster hull (MONSTER_HULL_MINS/MAXS) and traces the origin as a point
  * segment; only `fraction`/`endpos` are used. Mutates `origin` in place and
  * `state.yaw` (facing only), and touches nothing else (no I/O, no globals),
- * so it is headless-testable with a stub trace. Corpses (`state.dead`)
- * never move and keep their last yaw. Returns what the horizontal step did
- * so the caller can commit wall-following chirality (see LocomotionResult).
+ * so it is headless-testable with a stub trace. Settled corpses
+ * (`state.deadDone`) never move and keep their last yaw. Dying bodies (dead
+ * but the death move still playing) slide along their facing by the death
+ * frame's dist — id ai_move keeps stepping through M_walkmove until the
+ * endfunc lands — but never re-yaw (ai_move sets no ideal_yaw). Returns what
+ * the horizontal step did so the caller can commit wall-following chirality
+ * (see LocomotionResult).
  *
  * Reads `state.frame` without advancing it: call BEFORE monsterThink each
  * tick so the move plays the frame think is about to advance (id ai_move
@@ -671,7 +708,34 @@ export function monsterLocomotion(
   moveTarget?: Vec3,
   opts?: LocomotionOpts,
 ): LocomotionResult {
-  if (state.dead) return { slide: 0, blocked: true };
+  if (state.deadDone || state.gibbed) return { slide: 0, blocked: true };
+  if (state.dead) {
+    // Dying slide (see above): step the death frame's dist along the facing,
+    // collision-clamped, then gravity. No yaw change, no chase steering.
+    const mv = monsterMoveOf(state);
+    const fr = mv.frames[state.frame] ?? { dist: 0, action: 'move' };
+    if (fr.dist !== 0) {
+      const a = (state.yaw * Math.PI) / 180;
+      const end = v3(
+        origin[0]! + Math.cos(a) * fr.dist,
+        origin[1]! + Math.sin(a) * fr.dist,
+        origin[2]!,
+      );
+      const step = trace(v3(origin[0], origin[1], origin[2]), end);
+      origin[0] = step.endpos[0]!;
+      origin[1] = step.endpos[1]!;
+      origin[2] = step.endpos[2]!;
+    }
+    const gstart = v3(origin[0], origin[1], origin[2]! + 1);
+    const gend = v3(origin[0], origin[1], origin[2]! - MONSTER_FALL_PROBE);
+    const g = trace(gstart, gend);
+    if (g.fraction < 1) {
+      origin[2] = g.endpos[2]!;
+    } else {
+      origin[2] = gend[2]!;
+    }
+    return { slide: 0, blocked: false };
+  }
   const mv = monsterMoveOf(state);
   const fr = mv.frames[state.frame] ?? { dist: 0, action: 'move' };
   const goal = moveTarget ?? playerPos;
@@ -771,8 +835,19 @@ export function monsterLocomotion(
  * - 'dead': killed (or a corpse re-hit short of gibbing — stays a corpse).
  * - 'pain': survived, maybe entered a pain move.
  * - 'none': already gibbed (unhittable — no further damage).
+ *
+ * `pointZ` is the lethal impact height relative to the monster origin
+ * (id soldier_die head-shot test: |origin.z + viewheight - point.z| <= 4
+ * picks death3 instead of the rand()%5 roll; infantry has no head-shot
+ * branch). Omitted (radius damage, melee) → the random roll, like C's
+ * non-located kills.
  */
-export function monsterPain(ms: MonsterState, damage: number, rand: () => number): 'gib' | 'dead' | 'pain' | 'none' {
+export function monsterPain(
+  ms: MonsterState,
+  damage: number,
+  rand: () => number,
+  pointZ?: number,
+): 'gib' | 'dead' | 'pain' | 'none' {
   if (ms.gibbed) return 'none';
   ms.health -= damage;
   if (ms.health <= monsterDef(ms.kind).gibHealth) {
@@ -785,13 +860,23 @@ export function monsterPain(ms: MonsterState, damage: number, rand: () => number
   if (ms.dead) return 'dead';
   if (ms.health <= 0) {
     ms.dead = true;
-    // id infantry_die: n = rand() % 3 across the three death moves;
-    // soldier/gunner lite sims hold one death move each.
+    ms.deadDone = false;
+    // id infantry_die: n = rand() % 3 across the three death moves.
     if (ms.kind === 'infantry') {
       const pick = Math.floor(rand() * 3) % 3;
       ms.move = pick === 0 ? 'death1' : pick === 1 ? 'death2' : 'death3';
+    } else if (ms.kind === 'soldier') {
+      // id soldier_die: a head shot (impact within 4u of origin + viewheight
+      // 25) plays death3; otherwise n = rand() % 5 across death1/2/4/5/6.
+      // Only death1 is armed (soldier_fire6/7); the rest render unarmed.
+      if (pointZ !== undefined && Math.abs(pointZ - 25) <= 4) {
+        ms.move = 'death3';
+      } else {
+        const n = Math.floor(rand() * 5) % 5;
+        ms.move = n === 0 ? 'death1' : n === 1 ? 'death2' : n === 2 ? 'death4' : n === 3 ? 'death5' : 'death6';
+      }
     } else {
-      ms.move = ms.kind === 'soldier' ? 'death1' : 'death';
+      ms.move = 'death';
     }
     ms.frame = 0;
     return 'dead';

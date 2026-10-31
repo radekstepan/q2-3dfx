@@ -1126,12 +1126,14 @@ export class LocalDriver implements HostDriver {
   /**
    * Pmove body trace: worldTrace PLUS the live-monster hull pass
    * (SV_MonsterClipBox, C SV_ClipMoveToEntities SOLID_BBOX bodies), so the
-   * player cannot walk through live enemies. Corpses never block (C Killed
-   * sets SVF_DEADMONSTER — SV_MonsterClipBox drops dead/gibbed), dormant
-   * TRIGGER_SPAWN bodies pass through until monster_triggered_spawn wakes
-   * them (SOLID_NOT → SOLID_BBOX). Installed via setPmoveWorld; the monster
-   * tick keeps the monster-free worldTrace above (split traces: pmove sees
-   * monsters, monster locomotion never sees self).
+   * player cannot walk through live enemies — or through DYING ones (the
+   * fall blocks until the last death frame latches deadDone, C
+   * soldier_dead/infantry_dead endfunc timing for SVF_DEADMONSTER).
+   * Settled corpses never block (SV_MonsterClipBox drops deadDone/gibbed),
+   * dormant TRIGGER_SPAWN bodies pass through until monster_triggered_spawn
+   * wakes them (SOLID_NOT → SOLID_BBOX). Installed via setPmoveWorld; the
+   * monster tick keeps the monster-free worldTrace above (split traces:
+   * pmove sees monsters, monster locomotion never sees self).
    */
   private pmoveTrace: (start: Vec3, mins: Vec3, maxs: Vec3, end: Vec3) => TraceResult;
   /**

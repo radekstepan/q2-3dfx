@@ -2370,14 +2370,20 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
         const m = st.monsters.find((mm) => mm.edict === e)!;
         expect(m.kind).toBe('infantry');
         expect(m.state.health).toBe(100);
-        expect(m.state.move).toBe('stand');
+        // Beat cops walk their path_corner chain from spawn (C
+        // monster_start_go movetarget branch: t21 at all skills, t20 at 2+);
+        // the rest stand until seen.
+        if (m.patrolCorner !== '') expect(m.state.move).toBe('walk');
+        else expect(m.state.move).toBe('stand');
       }
     }
     // Think wiring: an always-spawn ambusher (t40) acquires on LOS and
     // closes with the same chase/locomotion as the soldier runner. A
     // permissive stub trace keeps the assertion geometry-free (shared
     // SV_MonsterTick path — no kind-specific branches besides stand/death
-    // names and fire sounds).
+    // names and fire sounds). The player stages where t40 faces (mapper yaw
+    // 270, south): C FindTarget needs facing at near range — an east stage
+    // is behind its back and correctly stays silent (RELEASE-13 gating).
     resetEdictNums();
     const st = SV_Init();
     spawnWith(st, map, 1, true);
@@ -2393,11 +2399,13 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       entityNum: -1,
       contents: 0,
     });
-    const near = v3(t40.edict.origin[0]! + 300, t40.edict.origin[1], t40.edict.origin[2]);
+    const near = v3(t40.edict.origin[0]!, t40.edict.origin[1]! - 300, t40.edict.origin[2]);
+    const before = Math.hypot(near[0]! - t40.edict.origin[0]!, near[1]! - t40.edict.origin[1]!);
     SV_MonsterTick(st, near, stub, null, mulberry32(1234));
     expect(t40.seen).toBe(true);
     expect(t40.state.move).not.toBe('stand');
-    expect(t40.edict.origin[0]!).toBeGreaterThan(-1768);
+    const after = Math.hypot(near[0]! - t40.edict.origin[0]!, near[1]! - t40.edict.origin[1]!);
+    expect(after).toBeLessThan(before); // closed on the player
   });
   it('DM-only items stay out of SP: every 1792-flagged lump edict absent at skills 0-3', { timeout: 120000 }, () => {
     // g_spawn.c: 1792 = NOT_EASY|NOT_MEDIUM|NOT_HARD inhibits at every SP

@@ -279,8 +279,7 @@ Sky fixes remain preserved. FOLLOW-5 tone/structural acceptance is recorded in
 experimental pending FOLLOW-6/7. No runtime tests were rerun in this review.
 
 Priority: RELEASE-4 (boarding, box 3 open with recorded blockers) →
-RELEASE-13 (dying collision/patrols) →
-RELEASE-10/14/15 (RELEASE-11 message, RELEASE-12 movement and RELEASE-6 help repairs landed this session). Independent bounded fixes can proceed without waiting for
+RELEASE-10/14/15 (RELEASE-11 message, RELEASE-12 movement, RELEASE-6 help and RELEASE-13 patrol repairs landed this session). Independent bounded fixes can proceed without waiting for
 the elevator investigation; do not leave the rest untouched after one diagnostic.
 Use disjoint ownership for independent work. Claim one card, run expensive tests
 sequentially, and keep implementation/test/user verdicts separate. Real-map
@@ -346,13 +345,13 @@ done-when:
 ### RELEASE-13 — Dying-enemy collision, death variety and soldier patrols
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
 depends: none
-status: ready
+status: done (repaired 2026-10-31; see docs/tasks-archive.md RELEASE-13 entry)
 review-findings: `monsterClipBox` returns null on `state.dead`, while monster damage sets that flag immediately at health <= 0, before death animation completes. Audit the source dying→dead transition and collision masks; do not equate lethal damage with finished corpse state. Infantry already defines death1/death2/death3 and chooses via `floor(rand()*3)` in monster damage; soldier lite currently pins death1. The user’s infantry observation may concern RNG delivery, frame submission or identity rather than missing tables.
 done-when:
-- [ ] Keep enemies blocking the player while downed/dying but not yet fully dead, as requested. Separate lethal-hit, active death animation/last-shot, final corpse and gib states; audit source `Killed`, species dead callbacks and SVF_DEADMONSTER timing. Preserve appropriate final-corpse behavior and shootability. Test walking into each state, including infantry death2 firing, on real server/prediction paths; never make all corpses permanently solid.
-- [ ] Exercise all three non-gib infantry deaths through the production damage→server→snapshot→renderer path with controlled RNG, then sample normal play. Compare original frames, timing, movement, death2 firing and final corpse bounds; distinguish soldiers from infantry and gib deaths. Fix actual selection/rendering omissions.
-- [ ] Reproduce the missing patrol behavior the user sees in the original; audit base1 soldier spawn targets/path_corner chains, idle/walk patrol, facing, ambush flags, sight/hearing and wake-up against original `g_monster.c`/`g_ai.c` and map entities. Identify which soldiers should patrol and be approachable from behind; do not make every idle soldier patrol or detect players omnidirectionally.
-- [ ] Record real-map routes and visible death sequences; add regressions for patrol→detection/combat and rear approach with appropriate source sight/noise behavior.
+- [x] Keep enemies blocking the player while downed/dying but not yet fully dead, as requested. Separate lethal-hit, active death animation/last-shot, final corpse and gib states; audit source `Killed`, species dead callbacks and SVF_DEADMONSTER timing. Preserve appropriate final-corpse behavior and shootability. Test walking into each state, including infantry death2 firing, on real server/prediction paths; never make all corpses permanently solid.
+- [x] Exercise all three non-gib infantry deaths through the production damage→server→snapshot→renderer path with controlled RNG, then sample normal play. Compare original frames, timing, movement, death2 firing and final corpse bounds; distinguish soldiers from infantry and gib deaths. Fix actual selection/rendering omissions.
+- [x] Reproduce the missing patrol behavior the user sees in the original; audit base1 soldier spawn targets/path_corner chains, idle/walk patrol, facing, ambush flags, sight/hearing and wake-up against original `g_monster.c`/`g_ai.c` and map entities. Identify which soldiers should patrol and be approachable from behind; do not make every idle soldier patrol or detect players omnidirectionally.
+- [x] Record real-map routes and visible death sequences; add regressions for patrol→detection/combat and rear approach with appropriate source sight/noise behavior.
 
 ### RELEASE-14 — Source-faithful damage feedback and strafe view roll
 owns: `packages/game`, `packages/server`, `packages/client`, `apps/web`, `packages/webgl-renderer`, `packages/renderer-api`
