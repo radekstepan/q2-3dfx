@@ -40,6 +40,7 @@ import {
   makeWorldEffectsState,
   parseEntities,
   parseFloat,
+  parseVec3,
   projectSource,
   radiusDamageAttackerPoints,
   radiusDamagePoints,
@@ -242,8 +243,28 @@ export interface ServerState {
   gibs: ServerGib[];
   /** Pending 0.2s barrel fuses / target_explosion delays (server time). */
   fuses: ServerFuse[];
-  /** Scripted explosion targets (target_explosion) by targetname. */
-  explosionTargets: Map<string, { origin: Vec3; dmg: number; delay: number }>;
+  /**
+   * Scripted explosion targets (target_explosion, g_target.c
+   * use_target_explosion) by targetname. C G_UseTargets fires EVERY edict
+   * carrying the name, and base1 stacks up to 4 charges per name (t151:
+   * four positions/delays), so this is a list per name, not one record.
+   */
+  explosionTargets: Map<string, Array<{ origin: Vec3; dmg: number; delay: number }>>;
+  /**
+   * Ambient spark showers (target_splash, g_target.c use_target_splash) by
+   * targetname: TE_SPLASH count/dir/sounds (+dmg radius). Base1 stacks 2 per
+   * name (t1), fired on func_timer cadence. No base1 splash carries dmg.
+   */
+  splashes: Map<string, Array<{ origin: Vec3; count: number; sounds: number; dmg: number; dir: Vec3 }>>;
+  /**
+   * Positional speakers (target_speaker, g_target.c Use_Target_Speaker) by
+   * targetname. One-shot (no loop spawnflags) pushes the noise; looped
+   * (spawnflags & 3) toggles a configstring loop sound the one-shot sound
+   * queue cannot carry — deferred to the audio lane.
+   */
+  speakers: Map<string, Array<{ origin: Vec3; noise: string; looped: boolean }>>;
+  /** Ambient map timers (func_timer, g_func.c func_timer_think). */
+  timers: ServerTimer[];
   /** Authoritative player health (the driver mirrors it into HUD state). */
   playerHealth: number;
   playerMaxHealth: number;
@@ -339,7 +360,7 @@ export interface ServerState {
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0 };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0 };
 }
 
 /**
@@ -854,6 +875,29 @@ export function droptofloor(origin: Vec3, mins: Vec3, maxs: Vec3, trace: TraceFn
   const t = trace(start, mins, maxs, end);
   if (t.fraction === 1 || t.allsolid) return v3(origin[0], origin[1], origin[2]);
   return v3(t.endpos[0], t.endpos[1], t.endpos[2]);
+}
+
+/**
+ * id G_SetMovedir (g_utils.c) for target_splash: the scalar `angle` key maps
+ * to yaw (pitch 0), except -1 (VEC_UP (0,-1,0)) and -2 (VEC_DOWN (0,-2,0))
+ * which spray straight up/down; the vector `angles` key is used verbatim
+ * with the same two special cases. Base1 splashes all use scalar angles
+ * (-2 down, 90, 180).
+ */
+export function splashMovedir(dict: Record<string, string>): Vec3 {
+  let angles: Vec3;
+  if (dict['angles'] !== undefined) {
+    angles = parseVec3(dict['angles'], v3());
+  } else {
+    angles = v3(0, parseFloat(dict['angle'] ?? '', 0), 0);
+  }
+  if (angles[0] === 0 && angles[1] === -1 && angles[2] === 0) return v3(0, 0, 1);
+  if (angles[0] === 0 && angles[1] === -2 && angles[2] === 0) return v3(0, 0, -1);
+  const fwd = v3();
+  const right = v3();
+  const up = v3();
+  AngleVectors(angles, fwd, right, up);
+  return fwd;
 }
 
 // --- monsters (game/g_monster.c walkmonster_start) ---------------------------
@@ -1463,16 +1507,71 @@ export function SV_SpawnEntities(
     // Scripted explosion targets (target_explosion, g_target.c
     // use_target_explosion): recorded by targetname so SV_Tick can fire
     // them when the relay chain reaches them (Phase 0 single sim — the
-    // driver used to own this table).
+    // driver used to own this table). Every same-named charge is kept:
+    // base1's t151 is four edicts (four positions/delays, one name).
     if (e.classname === 'target_explosion' && e.targetname) {
       const ex = spawnExplosive(dict);
       if (ex) {
-        st.explosionTargets.set(e.targetname, {
+        const list = st.explosionTargets.get(e.targetname) ?? [];
+        list.push({
           origin: v3(ex.origin[0], ex.origin[1], ex.origin[2]),
           dmg: ex.dmg,
           delay: ex.delay,
         });
+        st.explosionTargets.set(e.targetname, list);
       }
+    }
+    // Ambient spark shower (target_splash, g_target.c use_target_splash):
+    // TE_SPLASH count/dir/sounds. C defaults count to 32 and derives the
+    // spray direction with G_SetMovedir (angle -1 = up, -2 = down, else
+    // yaw). Base1's 12 splashes are all sounds 1 (sparks), none carry dmg.
+    if (e.classname === 'target_splash' && e.targetname) {
+      const list = st.splashes.get(e.targetname) ?? [];
+      list.push({
+        origin: v3(e.origin[0], e.origin[1], e.origin[2]),
+        count: e.count > 0 ? e.count : 32,
+        sounds: e.sounds,
+        dmg: e.dmg,
+        dir: splashMovedir(dict),
+      });
+      st.splashes.set(e.targetname, list);
+    }
+    // Positional speaker (target_speaker, g_target.c Use_Target_Speaker).
+    // C appends .wav when the noise lacks it and drops noiseless edicts
+    // (no use func ever runs for them). Volume/attenuation default 1.
+    if (e.classname === 'target_speaker' && e.targetname) {
+      let noise = dict['noise'] ?? '';
+      if (noise && !noise.includes('.wav')) noise += '.wav';
+      if (noise) {
+        const list = st.speakers.get(e.targetname) ?? [];
+        list.push({
+          origin: v3(e.origin[0], e.origin[1], e.origin[2]),
+          noise,
+          looped: (e.spawnflags & 3) !== 0,
+        });
+        st.speakers.set(e.targetname, list);
+      }
+    }
+    // Ambient timer (func_timer, g_func.c SP_func_timer): wait defaults to
+    // 1.0, random clamps to wait - 0.1, START_ON (spawnflags & 1) fires
+    // from spawn at 1 + delay + wait (C adds the spawn pausetime fraction
+    // and one crandom spread the reschedules keep carrying).
+    if (e.classname === 'func_timer') {
+      const wait = e.wait > 0 ? e.wait : 1;
+      const randomRaw = parseFloat(dict['random'] ?? '', 0);
+      const random = Number.isFinite(randomRaw) && randomRaw > 0
+        ? Math.min(randomRaw, wait - SERVER_DT)
+        : 0;
+      const delayRaw = parseFloat(dict['delay'] ?? '', 0);
+      const delay = Number.isFinite(delayRaw) && delayRaw > 0 ? delayRaw : 0;
+      st.timers.push({
+        ent: e,
+        target: e.target,
+        wait,
+        random,
+        delay,
+        nextAt: (e.spawnflags & 1) !== 0 ? 1 + delay + wait : -1,
+      });
     }
     if (e.classname.startsWith('monster_')) {      // id skin assignment (m_soldier.c SP_monster_soldier_*): light troops
       // wear skin 0 (blaster), normals skin 2 (shotgun), supershots skin 4
@@ -1635,6 +1734,11 @@ export function SV_UseTargetname(st: ServerState, targetname: string): void {
       fireTargets(st, e);
     }
   }
+  for (const t of st.timers) {
+    // C G_UseTargets reaches func_timer edicts by targetname (func_timer_use
+    // toggles the loop): base1's t120/t121 timers start on trigger_once.
+    if (!t.ent.freed && t.ent.targetname === targetname) useTimer(st, t);
+  }
 }
 
 /**
@@ -1730,6 +1834,39 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
         pos: v3(e.origin[0], e.origin[1], e.origin[2]),
         born: st.time,
       });
+      continue;
+    }
+    if (e.classname === 'target_splash') {
+      // C use_target_splash (g_target.c): TE_SPLASH burst (count particles
+      // along movedir, sounds-indexed color) + spark sound. Base1's 12
+      // splashes are all sounds 1 (no dmg); a dmg splash would also run
+      // T_RadiusDamage (MOD_SPLASH) — the use path carries no player/trace,
+      // so that half is deferred (no base1 instance needs it).
+      fireSplashTarget(st, e.targetname);
+      continue;
+    }
+    if (e.classname === 'target_speaker') {
+      // C Use_Target_Speaker (g_target.c): the looped pair (spawnflags & 3)
+      // toggles a configstring loop sound — no one-shot-queue equivalent,
+      // so the audio lane owns it; one-shot noises play positioned here.
+      // Base1's *20 glass shatter (t78 -> world/brkglas.wav) is one-shot.
+      for (const sp of st.speakers.get(e.targetname) ?? []) {
+        if (!sp.looped && sp.noise) {
+          st.sounds.push({
+            name: sp.noise,
+            pos: v3(sp.origin[0], sp.origin[1], sp.origin[2]),
+            born: st.time,
+          });
+        }
+      }
+      continue;
+    }
+    if (e.classname === 'func_timer') {
+      // C func_timer_use (g_func.c): toggles the cadence loop. Firing the
+      // timer's own target runs through the same cascade (depth-guarded).
+      for (const t of st.timers) {
+        if (!t.ent.freed && t.ent === e) useTimer(st, t, depth + 1);
+      }
       continue;
     }
     if (e.classname === 'target_changelevel') {
@@ -2551,6 +2688,17 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
       });
     }
   }
+  // Ambient map timers (g_func.c func_timer_think): due timers fire their
+  // target through the same cascade, then reschedule on wait + crandom
+  // spread (Math.random only when random > 0 — most base1 timers carry
+  // one, so exact cadence is C-like but not seeded; the map loop stays
+  // deterministic only for random-0 timers). Runs without the game phase:
+  // splash/speaker cadence needs no player, like C thinks.
+  for (const t of st.timers) {
+    if (t.ent.freed || t.nextAt < 0 || now < t.nextAt) continue;
+    fireTargets(st, t.ent);
+    t.nextAt = now + t.wait + (t.random > 0 ? (Math.random() * 2 - 1) * t.random : 0);
+  }
   st.moverDeltas.clear();
   for (const m of st.movers) {
     if (m.ent.freed) continue;
@@ -2759,6 +2907,12 @@ export interface ServerExplosion {
   kind: ServerExplosionKind;
   baseframe: number;
   yaw: number;
+  /**
+   * Impact normal for TE_BLASTER (cl_tent.c transmits dir: the ex_misc
+   * model orients by it and CL_BlasterParticles sprays along it; NULL
+   * plane in C sends the zero vector). Big booms send no dir.
+   */
+  dir?: Vec3;
 }
 
 /** One-shot muzzle-flash dlight request (id CL_MuzzleFlash). */
@@ -2823,6 +2977,25 @@ export interface ServerFuse {
   dmg: number;
   at: number;
   barrel?: { edict: Edict; origin: Vec3; size: Vec3; mass: number; dmg: number; isFunc: boolean };
+}
+
+/** Ambient map timer (func_timer, g_func.c SP_func_timer/func_timer_think). */
+export interface ServerTimer {
+  ent: Edict;
+  /** Target fired on every cadence tick (G_UseTargets). */
+  target: string;
+  /** Base interval seconds (default 1.0). */
+  wait: number;
+  /** Random spread seconds (clamped to wait - 0.1, may be 0). */
+  random: number;
+  /** One-shot arming delay for use-started timers. */
+  delay: number;
+  /**
+   * Next server-time firing, or -1 when toggled off (func_timer_use).
+   * C runs thinks on exact level.time; the 10Hz tick fires up to one
+   * quantum late.
+   */
+  nextAt: number;
 }
 
 /** Live player body for the gameplay phase (touch, LOS, bolt flesh). */
@@ -3152,16 +3325,18 @@ export function SV_DamageBarrel(
 /**
  * Explosion visual + sound + radius damage (TE_EXPLOSION1/2 barrel/func/
  * target, TE_BLASTER touch flash). Big booms emit the 256-count ballistic
- * burst (CL_ExplosionParticles) and the explod1 fallback sound; the blaster
- * flash keeps its 40-spark burst (added by SV_BlasterImpact, not here).
- * Grounded booms render as explosion2 (BecomeExplosion2), airborne as
- * explosion1 (BecomeExplosion1). No scorch (Q2 has none).
+ * burst (CL_ExplosionParticles) plus the client's TE sound — rocklx1a for
+ * TE_EXPLOSION1, grenlx1a for TE_EXPLOSION2 (cl_tent.c registrations; the
+ * old explod1.wav name appears nowhere in C). The blaster flash keeps its
+ * 40-spark burst (added by SV_BlasterImpact, not here) and its lashit from
+ * the touch path. Grounded booms render as explosion2 (BecomeExplosion2),
+ * airborne as explosion1 (BecomeExplosion1). No scorch (Q2 has none).
  */
 export function SV_SpawnExplosion(
   st: ServerState,
   pos: Vec3,
   dmg: number,
-  opts?: { kind?: ServerExplosionKind; trace?: TraceFn; rand?: () => number },
+  opts?: { kind?: ServerExplosionKind; trace?: TraceFn; rand?: () => number; dir?: Vec3 },
 ): void {
   const rand = opts?.rand ?? Math.random;
   let kind = opts?.kind ?? 'explosion1';
@@ -3189,6 +3364,7 @@ export function SV_SpawnExplosion(
     kind,
     baseframe,
     yaw: (rand() * 360) | 0,
+    ...(opts?.dir ? { dir: v3(opts.dir[0], opts.dir[1], opts.dir[2]) } : {}),
   });
   if (kind === 'blaster') return;
   for (let i = 0; i < 256; i++) {
@@ -3200,7 +3376,7 @@ export function SV_SpawnExplosion(
       born: st.time,
     });
   }
-  st.sounds.push({ name: 'world/explod1.wav', pos: v3(pos[0], pos[1], pos[2]), born: st.time });
+  st.sounds.push({ name: kind === 'explosion2' ? 'weapons/grenlx1a.wav' : 'weapons/rocklx1a.wav', pos: v3(pos[0], pos[1], pos[2]), born: st.time });
   void dmg;
 }
 
@@ -3268,37 +3444,123 @@ export function SV_RadiusDamage(
   }
 }
 
-/** TE_BLASTER impact: sparks + explosion flash + lashit + flesh damage. */
+/**
+ * TE_BLASTER wall impact (g_weapon.c blaster_touch, non-takedamage branch):
+ * 40 dir-biased sparks (cl_fx.c CL_BlasterParticles: origin jitter
+ * ((rand&7)-4) plus d*dir with d = rand&15, velocity dir*30 + crand*40,
+ * gravity falloff, life 0.5+frand*0.3), the 4-frame ex_misc flash carrying
+ * the impact normal (cl_tent.c orients by it), and lashit. Flesh hits
+ * (takedamage) run T_Damage with NO temp entity in C — callers resolve
+ * those as damage only and never come here.
+ */
 export function SV_BlasterImpact(
   st: ServerState,
   pos: Vec3,
   damage: number,
   hitMonster: ServerMonster | null,
   rand: () => number,
+  dir?: Vec3,
 ): void {
+  const d = dir ?? v3(0, 0, 0);
   for (let i = 0; i < 40; i++) {
+    const spread = (rand() * 16) | 0;
     st.sparks.push({
-      pos: v3(pos[0]! + ((rand() * 16 - 8) | 0), pos[1]! + ((rand() * 16 - 8) | 0), pos[2]! + ((rand() * 16 - 8) | 0)),
+      pos: v3(
+        pos[0]! + (((rand() * 8) | 0) - 4) + spread * d[0]!,
+        pos[1]! + (((rand() * 8) | 0) - 4) + spread * d[1]!,
+        pos[2]! + (((rand() * 8) | 0) - 4) + spread * d[2]!,
+      ),
       color: 0xe0 + ((rand() * 8) | 0),
-      vel: null,
-      ttl: SV_SPARK_TTL,
+      vel: v3(
+        d[0]! * 30 + (rand() * 2 - 1) * 40,
+        d[1]! * 30 + (rand() * 2 - 1) * 40,
+        d[2]! * 30 + (rand() * 2 - 1) * 40,
+      ),
+      ttl: 0.5 + rand() * 0.3,
       born: st.time,
     });
   }
-  SV_SpawnExplosion(st, pos, 0, { kind: 'blaster', rand });
+  SV_SpawnExplosion(st, pos, 0, { kind: 'blaster', rand, dir: d });
   st.sounds.push({ name: 'weapons/lashit.wav', pos: v3(pos[0], pos[1], pos[2]), born: st.time });
   if (hitMonster) SV_DamageMonster(st, hitMonster, damage, rand);
 }
 
 /** Fire one target_explosion: immediate, or delayed via the fuse list. */
 export function fireExplosionTarget(st: ServerState, targetname: string): void {
-  const ex = st.explosionTargets.get(targetname);
-  if (!ex) return;
-  if (ex.delay > 0) {
-    st.fuses.push({ pos: v3(ex.origin[0], ex.origin[1], ex.origin[2]), dmg: ex.dmg, at: targetExplosionFuseAt(st.time, ex.delay) });
+  // C G_UseTargets fires every same-named charge (base1's t151 is four):
+  // each keeps its own origin/delay.
+  for (const ex of st.explosionTargets.get(targetname) ?? []) {
+    if (ex.delay > 0) {
+      st.fuses.push({ pos: v3(ex.origin[0], ex.origin[1], ex.origin[2]), dmg: ex.dmg, at: targetExplosionFuseAt(st.time, ex.delay) });
+      continue;
+    }
+    SV_SpawnExplosion(st, ex.origin, 0);
+  }
+}
+
+/**
+ * id splash_color table (cl_tent.c): TE_SPLASH color by `sounds` key —
+ * 0 unknown, 1 sparks, 2 blue water, 3 brown water, 4 slime, 5 lava,
+ * 6 blood. sounds > 6 renders color 0x00. Only sounds 1 plays a sound
+ * (spark5/6/7 pick).
+ */
+export const SPLASH_COLORS: readonly number[] = [0x00, 0xe0, 0xb0, 0x50, 0xd0, 0xe0, 0xe8];
+
+/**
+ * Fire one target_splash (g_target.c use_target_splash): TE_SPLASH burst —
+ * `count` particles (cl_fx.c CL_ParticleEffect: origin jitter ((rand&7)-4)
+ * plus d*dir with d = rand&31, velocity crand*20, gravity falloff, life
+ * 0.5+frand*0.3, color base + (rand&7)) plus the sounds-1 spark sound (C
+ * picks spark5/6/7 by rand&3: 0 -> 5, 1 -> 6, else 7).
+ */
+export function fireSplashTarget(
+  st: ServerState,
+  targetname: string,
+  rand: () => number = Math.random,
+): void {
+  for (const sp of st.splashes.get(targetname) ?? []) {
+    const base = sp.sounds >= 0 && sp.sounds < SPLASH_COLORS.length ? SPLASH_COLORS[sp.sounds]! : 0x00;
+    for (let i = 0; i < sp.count; i++) {
+      const d = (rand() * 32) | 0;
+      st.sparks.push({
+        pos: v3(
+          sp.origin[0]! + (((rand() * 8) | 0) - 4) + d * sp.dir[0]!,
+          sp.origin[1]! + (((rand() * 8) | 0) - 4) + d * sp.dir[1]!,
+          sp.origin[2]! + (((rand() * 8) | 0) - 4) + d * sp.dir[2]!,
+        ),
+        color: base + ((rand() * 8) | 0),
+        vel: v3((rand() * 2 - 1) * 20, (rand() * 2 - 1) * 20, (rand() * 2 - 1) * 20),
+        ttl: 0.5 + rand() * 0.3,
+        born: st.time,
+      });
+    }
+    if (sp.sounds === 1) {
+      const r = (rand() * 4) | 0;
+      st.sounds.push({
+        name: r === 0 ? 'world/spark5.wav' : r === 1 ? 'world/spark6.wav' : 'world/spark7.wav',
+        pos: v3(sp.origin[0], sp.origin[1], sp.origin[2]),
+        born: st.time,
+      });
+    }
+  }
+}
+
+/**
+ * Use a func_timer the id way (g_func.c func_timer_use): a running timer
+ * stops; a stopped one fires immediately (or arms `delay`) and resumes the
+ * wait cadence. `depth` threads the fireTargets cascade guard.
+ */
+export function useTimer(st: ServerState, t: ServerTimer, depth = 0): void {
+  if (t.nextAt >= 0) {
+    t.nextAt = -1;
     return;
   }
-  SV_SpawnExplosion(st, ex.origin, 0);
+  if (t.delay > 0) {
+    t.nextAt = st.time + t.delay;
+    return;
+  }
+  fireTargets(st, t.ent, depth);
+  t.nextAt = st.time + t.wait + (t.random > 0 ? (Math.random() * 2 - 1) * t.random : 0);
 }
 
 /**
@@ -3669,42 +3931,25 @@ function stepBoltFlight(
       const { tPlayer, tMonster, hitMonster, tBarrel, hb, tCorpse, hitCorpse } = sweep;
       const eps = TOUCH_EPS;
       if (tPlayer !== null && tPlayer < tWall - eps && (tMonster === null || tPlayer <= tMonster) && (tBarrel === null || tPlayer <= tBarrel)) {
-        const hitPos = v3(bolt.pos[0]! + seg[0]! * tPlayer, bolt.pos[1]! + seg[1]! * tPlayer, bolt.pos[2]! + seg[2]! * tPlayer);
-        SV_BlasterImpact(st, hitPos, bolt.damage, null, rand);
-        if (st.playerHealth > 0) {
-          SV_DamagePlayer(st, bolt.damage);
-          st.sparks.push({
-            pos: v3(player.pos[0], player.pos[1], player.pos[2]! + player.view),
-            color: 200 + ((rand() * 55) | 0),
-            vel: null,
-            ttl: SV_SPARK_TTL,
-            born: st.time,
-          });
-        }
+        // Foe bolt vs player (g_weapon.c blaster_touch takedamage branch):
+        // T_Damage only, no temp entity — C sends no TE_BLASTER here.
+        if (st.playerHealth > 0) SV_DamagePlayer(st, bolt.damage);
         dead = true;
       } else if (hitMonster !== null && tMonster !== null && tMonster < tWall - eps && (tBarrel === null || tMonster <= tBarrel) && (tCorpse === null || tMonster <= tCorpse)) {
-        const hitPos = v3(
-          bolt.pos[0]! + seg[0]! * tMonster,
-          bolt.pos[1]! + seg[1]! * tMonster,
-          bolt.pos[2]! + seg[2]! * tMonster,
-        );
-        SV_BlasterImpact(st, hitPos, bolt.damage, hitMonster, rand);
+        // Player bolt vs monster flesh: T_Damage only, no TE_BLASTER (C).
+        SV_DamageMonster(st, hitMonster, bolt.damage, rand);
         dead = true;
       } else if (hb !== null && tBarrel !== null && tBarrel < tWall - eps && (tCorpse === null || tBarrel <= tCorpse)) {
+        // Bolt vs shootable barrel (takedamage YES until fused): the fuse
+        // latches, no impact flash in C (barrel_delay branch, no TE).
         SV_DamageBarrel(st, hb, bolt.damage);
-        SV_BlasterImpact(st, v3(hb.origin[0], hb.origin[1], hb.origin[2]), bolt.damage, null, rand);
         dead = true;
       } else if (hitCorpse !== null && tCorpse !== null && tCorpse < tWall - eps) {
         // Corpse touch (g_misc.c misc_deadsoldier_die via T_Damage): the
         // bolt minces past -80 (gibs + udeath) and dies either way — live
         // edicts win ties above, so scenery never shields a firefight.
-        const hitPos = v3(
-          bolt.pos[0]! + seg[0]! * tCorpse,
-          bolt.pos[1]! + seg[1]! * tCorpse,
-          bolt.pos[2]! + seg[2]! * tCorpse,
-        );
+        // No TE_BLASTER on takedamage (C blaster_touch): damage only.
         SV_DamageDeadsoldier(st, hitCorpse, bolt.damage, rand);
-        SV_BlasterImpact(st, hitPos, bolt.damage, null, rand);
         dead = true;
       } else if (tWall < 1) {
         // Wall touch (g_weapon.c blaster_touch): everything non-sky
@@ -3722,7 +3967,9 @@ function stepBoltFlight(
           bolt.pos[1]! + (next[1]! - bolt.pos[1]!) * tWall,
           bolt.pos[2]! + (next[2]! - bolt.pos[2]!) * tWall,
         );
-        SV_BlasterImpact(st, hitPos, bolt.damage, null, rand);
+        // Wall touch (g_weapon.c blaster_touch, non-takedamage branch):
+        // TE_BLASTER carries the plane normal (NULL plane -> zero vector).
+        SV_BlasterImpact(st, hitPos, bolt.damage, null, rand, wall!.planeNormal ?? v3(0, 0, 0));
         dead = true;
       }
     }
@@ -3888,6 +4135,10 @@ function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
     st.fuses.splice(i, 1);
     if (f.barrel) {
       spawnBarrelDebris(st, f.barrel, rand);
+      // C func_explosive_explode fires the brush target (G_UseTargets)
+      // between the radius damage and the free: base1's *20 glass shatter
+      // plays t78 (world/brkglas.wav) from here. Fire before freeing, as C.
+      if (f.barrel.edict.target) fireTargets(st, f.barrel.edict);
       // C BecomeExplosion1/G_FreeEdict: the brush frees the same tick its
       // clip drops, so the vanished mesh and the opened hole stay atomic —
       // no freed-but-solid window for bodies to collide with.
@@ -3895,6 +4146,15 @@ function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
       // The brush is gone (func_explosive_explode / BecomeExplosion free the
       // edict either way): open the clip so the hole stays open.
       if (f.barrel.isFunc) SV_RemoveBrushClip(st, f.barrel.edict);
+      // C guards BOTH the T_RadiusDamage and the BecomeExplosion1 behind
+      // `if (self->dmg)`: a damageless brush (*20 glass, dmg 0) throws
+      // debris, fires its target and frees — no flash, no sound, no radius.
+      // (misc_explobox always carries its 150 default, so it always booms.)
+      if (f.barrel.dmg > 0) {
+        SV_SpawnExplosion(st, f.pos, f.dmg, { trace: game.trace, rand });
+        SV_RadiusDamage(st, f.pos, f.dmg, game.player, game.trace, rand);
+      }
+      continue;
     }
     SV_SpawnExplosion(st, f.pos, f.dmg, { trace: game.trace, rand });
     SV_RadiusDamage(st, f.pos, f.dmg, game.player, game.trace, rand);
@@ -4096,7 +4356,9 @@ export function SV_PlayerFire(
     checkDodges(st, opts.eye, dir, st.skill, opts.trace, opts.rand, BOLT_SPEED);
     const spawn = resolveBoltSpawn(opts.trace, dir, start);
     if (spawn.embedded) {
-      SV_BlasterImpact(st, start, res.bolt.damage, null, opts.rand);
+      // C fire_blaster pullback: touch with a NULL plane (no trace plane
+      // reaches this path) -> TE_BLASTER carries the zero vector.
+      SV_BlasterImpact(st, start, res.bolt.damage, null, opts.rand, v3(0, 0, 0));
       return { fired: true, reason: 'ok', ammoLeft: res.ammoLeft, bolt: false, machinegunShots };
     }
     st.bolts.push({

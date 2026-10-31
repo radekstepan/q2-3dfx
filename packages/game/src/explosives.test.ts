@@ -2,13 +2,26 @@
 // Fixture lump models base1's opening-room barrels (misc_explobox with no
 // explicit health/dmg keys, as shipped in base1.bsp).
 import { describe, expect, it } from 'vitest';
+import { v3 } from '@q2/math';
 import {
   BARREL_DEBRIS_BIG,
   BARREL_DEBRIS_CORNER,
   BARREL_DEBRIS_SMALL,
   BARREL_DEBRIS_TOTAL,
   BARREL_FUSE_DELAY,
+  BIG_BOOM_MODEL,
+  BIG_BOOM_MODEL_BIG,
+  BIG_BOOM_MODEL_FRAMES,
+  BIG_BOOM_MODEL_SKINS,
+  BLASTER_IMPACT_MODEL,
+  BLASTER_IMPACT_MODEL_FRAMES,
   BLASTER_SPARK_COUNT,
+  BLASTER_SPARK_DIR_SPEED,
+  BLASTER_SPARK_FORWARD_MAX,
+  BLASTER_SPARK_JITTER,
+  BLASTER_SPARK_SPREAD,
+  BLASTER_SPARK_TTL_MAX,
+  BLASTER_SPARK_TTL_MIN,
   DEBRIS_BOUNCE_BACKOFF,
   DEBRIS_LIFE_MIN,
   DEBRIS_LIFE_SPAN,
@@ -24,6 +37,7 @@ import {
   EXPLOSION_LIGHT_COLOR,
   EXPLOSION_SPARK_COUNT,
   EXPLOSION_SPARK_SPEED,
+  EXPLOSION_SPARK_SPREAD,
   EXPLOSION_SPARK_TTL_MAX,
   EXPLOSION_SPARK_TTL_MIN,
   FUNC_EXPLOSIVE_DEFAULT_DMG,
@@ -34,15 +48,31 @@ import {
   GIB_LIFE_SPAN,
   GIB_SOUND,
   GIB_TOSS_BACKOFF,
+  MULTICAST_PHS,
+  MULTICAST_PVS,
+  PARTICLE_GRAVITY,
   SPARK_COLOR_BASE,
   SPARK_COLOR_JITTER,
   TARGET_EXPLOSION_DEFAULT_DELAY,
   TARGET_EXPLOSION_DEFAULT_DMG,
+  TEMP_ENTITY_CULLING,
+  TEMP_ENTITY_INVENTORY,
+  TE_BLASTER_SOUND,
+  TE_EXPLOSION1_SOUND,
+  TE_EXPLOSION2_SOUND,
+  TE_EXPLOSION_WATER_SOUND,
   barrelDebrisSpeeds,
+  barrelExplosionKind,
   barrelFuseAt,
+  blasterImpactAngles,
   explosionAlpha,
   explosionBaseframe,
   explosionFrames,
+  explosionLerp,
+  explosionLifetime,
+  explosionSkin,
+  explosionSound,
+  funcExplosiveBlast,
   funcExplosiveDebris,
   gibModelsFor,
   isExplosiveClassname,
@@ -53,6 +83,7 @@ import {
   radiusDamageRadius,
   spawnExplosive,
   targetExplosionFuseAt,
+  tempEntityInfo,
 } from './index.js';
 
 const START_ROOM_LUMP = `
@@ -272,5 +303,140 @@ describe('explosion timing/visuals (M7.2 batch #4 regressions)', () => {
     expect(leavesScorch('explosion1')).toBe(false);
     expect(leavesScorch('explosion2')).toBe(false);
     expect(leavesScorch('blaster')).toBe(false);
+  });
+});
+
+describe('TE client-presentation tables (RELEASE-9 boxes 1-2, C-exact pins)', () => {
+  it('impact/boom model lumps match CL_RegisterTEntModels (pak frame counts)', () => {
+    expect(BLASTER_IMPACT_MODEL).toBe('models/objects/explode/tris.md2');
+    expect(BIG_BOOM_MODEL).toBe('models/objects/r_explode/tris.md2');
+    expect(BIG_BOOM_MODEL_BIG).toBe('models/objects/r_explode2/tris.md2');
+    // parseMD2 of pak0.pak: explode ships 5 frames, the TE plays 4
+    expect(BLASTER_IMPACT_MODEL_FRAMES).toBe(5);
+    expect(EXPLOSION_FRAMES['blaster']).toBe(4);
+    // r_explode ships 49f/7skins: covers base-30+19f (max frame 44) and skins 0..6
+    expect(BIG_BOOM_MODEL_FRAMES).toBe(49);
+    expect(BIG_BOOM_MODEL_SKINS).toBe(7);
+  });
+
+  it('TE sounds match CL_RegisterTEntSounds + the ParseTEnt case blocks', () => {
+    expect(TE_BLASTER_SOUND).toBe('weapons/lashit.wav');
+    expect(TE_EXPLOSION1_SOUND).toBe('weapons/rocklx1a.wav');
+    expect(TE_EXPLOSION2_SOUND).toBe('weapons/grenlx1a.wav');
+    expect(TE_EXPLOSION_WATER_SOUND).toBe('weapons/xpld_wat.wav');
+    // blaster always lashit (no water variant); booms pick water vs family
+    expect(explosionSound('blaster', false)).toBe('weapons/lashit.wav');
+    expect(explosionSound('blaster', true)).toBe('weapons/lashit.wav');
+    expect(explosionSound('explosion1', false)).toBe('weapons/rocklx1a.wav');
+    expect(explosionSound('explosion2', false)).toBe('weapons/grenlx1a.wav');
+    expect(explosionSound('explosion1', true)).toBe('weapons/xpld_wat.wav');
+    expect(explosionSound('explosion2', true)).toBe('weapons/xpld_wat.wav');
+  });
+
+  it('barrel TE choice follows groundedness (barrel_explode BecomeExplosion*)', () => {
+    expect(barrelExplosionKind(true)).toBe('explosion2');
+    expect(barrelExplosionKind(false)).toBe('explosion1');
+    // func_explosive only blasts when it deals damage, always TE_EXPLOSION1
+    expect(funcExplosiveBlast(150)).toBe('explosion1');
+    expect(funcExplosiveBlast(0)).toBe(null);
+  });
+
+  it('visual life is (frames-1)*100ms (freed when f >= frames-1)', () => {
+    expect(explosionLifetime('blaster')).toBeCloseTo(0.3, 9);
+    expect(explosionLifetime('explosion1')).toBeCloseTo(1.4, 9);
+    expect(explosionLifetime('explosion2')).toBeCloseTo(1.8, 9);
+  });
+
+  it('framelerp follows ent->frame = base+f+1, oldframe = base+f, backlerp = 1-lerpfrac', () => {
+    // grounded boom mid-life at render fraction 0.25
+    expect(explosionLerp(30, 5, 0.25)).toEqual({ frame: 36, oldframe: 35, backlerp: 0.75 });
+    // first tick at full lerp: frame base+1 over base+0
+    expect(explosionLerp(0, 0, 0)).toEqual({ frame: 1, oldframe: 0, backlerp: 1 });
+    // backlerp clamps per the renderer-api Entity contract
+    expect(explosionLerp(15, 3, 1).backlerp).toBe(0);
+    expect(explosionLerp(15, 3, 2).backlerp).toBe(0);
+    expect(explosionLerp(15, 3, -1).backlerp).toBe(1);
+  });
+
+  it('ex_poly skin stepping picks up TRANSLUCENT at frame 10', () => {
+    expect(explosionSkin('explosion1', 0)).toEqual({ skinnum: 0, translucent: false });
+    expect(explosionSkin('explosion1', 8)).toEqual({ skinnum: 4, translucent: false });
+    expect(explosionSkin('explosion1', 10)).toEqual({ skinnum: 5, translucent: true });
+    expect(explosionSkin('explosion1', 12)).toEqual({ skinnum: 5, translucent: true });
+    expect(explosionSkin('explosion1', 13)).toEqual({ skinnum: 6, translucent: true });
+    // blaster flash is translucent from frame 0 with no skin stepping
+    expect(explosionSkin('blaster', 0)).toEqual({ skinnum: 0, translucent: true });
+    expect(explosionSkin('blaster', 3)).toEqual({ skinnum: 0, translucent: true });
+  });
+
+  it('blaster alpha is continuous in frac (cl_tent.c:1627), ex_poly floored', () => {
+    // C ex_misc: 1.0 - frac/(frames-1) — half-frame is not 1.0
+    expect(explosionAlpha('blaster', 0.5)).toBeCloseTo(1 - 0.5 / 3, 9);
+    expect(explosionAlpha('blaster', 1.5)).toBeCloseTo(0.5, 9);
+    expect(explosionAlpha('blaster', 0)).toBeCloseTo(1, 9);
+    expect(explosionAlpha('blaster', 3)).toBe(0);
+    // C ex_poly: (16-f)/16 on the floored index — fractions match the floor
+    expect(explosionAlpha('explosion1', 8.5)).toBe(explosionAlpha('explosion1', 8));
+  });
+
+  it('blaster impact angles face along the impact normal (cl_tent.c:807-818)', () => {
+    const v = (x: number, y: number, z: number) => v3(x, y, z);
+    // floor hit (normal +Z): flat, yaw 0
+    expect(blasterImpactAngles(v(0, 0, 1))).toEqual({ pitch: 0, yaw: 0 });
+    // ceiling hit: pitched 180
+    const ceil = blasterImpactAngles(v(0, 0, -1));
+    expect(ceil.pitch).toBeCloseTo(180, 9);
+    // wall hits: pitched 90, yaw follows atan2 (incl. the dir[0]==0 fallbacks)
+    expect(blasterImpactAngles(v(1, 0, 0))).toEqual({ pitch: 90, yaw: 0 });
+    expect(blasterImpactAngles(v(0, 1, 0))).toEqual({ pitch: 90, yaw: 90 });
+    expect(blasterImpactAngles(v(0, -1, 0))).toEqual({ pitch: 90, yaw: 270 });
+    expect(blasterImpactAngles(v(-1, 0, 0)).yaw).toBeCloseTo(180, 9);
+    // pitched hit: 45-degree normal yields a 45-degree pitch
+    const inv = Math.SQRT1_2;
+    const pitched = blasterImpactAngles(v(0, inv, inv));
+    expect(pitched.pitch).toBeCloseTo(45, 5); // Float32 normal, not exact
+    expect(pitched.yaw).toBeCloseTo(90, 5);
+  });
+
+  it('blaster spark recipe matches CL_BlasterParticles (count/vel/ttl/gravity)', () => {
+    expect(BLASTER_SPARK_COUNT).toBe(40);
+    expect(BLASTER_SPARK_DIR_SPEED).toBe(30); // vel = dir*30 + crand*40
+    expect(BLASTER_SPARK_JITTER).toBe(40);
+    expect(BLASTER_SPARK_SPREAD).toBe(4); // org += (rand&7)-4 + d*dir
+    expect(BLASTER_SPARK_FORWARD_MAX).toBe(15); // d = rand&15
+    // ttl = -1/alphavel = 0.5 + frand*0.3
+    expect(BLASTER_SPARK_TTL_MIN).toBeCloseTo(0.5, 9);
+    expect(BLASTER_SPARK_TTL_MAX).toBeCloseTo(0.8, 9);
+    expect(PARTICLE_GRAVITY).toBe(40);
+    expect(EXPLOSION_SPARK_SPREAD).toBe(16); // (rand%32)-16
+  });
+
+  it('occlusion rule: barrel/func blasts PVS, target_explosion PHS', () => {
+    expect(MULTICAST_PHS).toBe(1);
+    expect(MULTICAST_PVS).toBe(2);
+    expect(TEMP_ENTITY_CULLING['barrel']).toBe(MULTICAST_PVS);
+    expect(TEMP_ENTITY_CULLING['func_explosive']).toBe(MULTICAST_PVS);
+    expect(TEMP_ENTITY_CULLING['target_explosion']).toBe(MULTICAST_PHS);
+  });
+
+  it('TE inventory covers every q_shared.h id with cl_tent.c line refs', () => {
+    // q_shared.h temp_event_t: TE_GUNSHOT = 0 .. TE_FLECHETTE = 55
+    expect(TEMP_ENTITY_INVENTORY.length).toBe(56);
+    expect(TEMP_ENTITY_INVENTORY[0]).toMatchObject({ id: 0, name: 'TE_GUNSHOT' });
+    expect(TEMP_ENTITY_INVENTORY[55]).toMatchObject({ id: 55, name: 'TE_FLECHETTE' });
+    expect(tempEntityInfo(2)).toMatchObject({ name: 'TE_BLASTER', clTent: 798, status: 'tabled' });
+    expect(tempEntityInfo(5)).toMatchObject({ name: 'TE_EXPLOSION1', clTent: 880, status: 'tabled' });
+    expect(tempEntityInfo(6)).toMatchObject({ name: 'TE_EXPLOSION2', clTent: 834, status: 'tabled' });
+    expect(tempEntityInfo(46)).toMatchObject({ name: 'TE_ELECTRIC_SPARKS', clTent: 1158, status: 'missing' });
+    expect(tempEntityInfo(999)).toBe(null);
+    // ids are dense 0..55 and every cased TE carries its case line
+    const ids = TEMP_ENTITY_INVENTORY.map((row) => row.id);
+    expect(ids).toEqual([...Array(56).keys()]);
+    for (const row of TEMP_ENTITY_INVENTORY) {
+      if (row.clTent !== -1) expect(row.clTent).toBeGreaterThan(0);
+    }
+    // only the box 1-2 audit scope is tabled; the rest is explicit
+    const tabled = TEMP_ENTITY_INVENTORY.filter((row) => row.status === 'tabled').map((row) => row.id);
+    expect(tabled).toEqual([2, 5, 6]);
   });
 });

@@ -298,7 +298,9 @@ describe('gpu-follow3 inventory + wiring policy (no pak)', () => {
     expect(explosionFrames(e1)).toBe(15);
     expect(explosionFrames(e2)).toBe(19);
     expect(SPARK_TTL).toBe(0.4);
-    expect(EXPLOSION_LIGHT_WINDOW).toBe(0.1);
+    // ex_misc frees at f>=frames-1=3 (cl_tent.c CL_AddExplosions): the
+    // 150-intensity yellow touch flash burns 3 steps, not one 100ms tick.
+    expect(EXPLOSION_LIGHT_WINDOW).toBe(0.3);
     expect(TRACER_TTL_FRAMES).toBe(6);
   });
 

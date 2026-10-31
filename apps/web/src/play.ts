@@ -823,6 +823,62 @@ export function explosionFrames(kind: ExplosionKind): number {
 }
 
 /**
+ * One sampled explosion step (C cl_tent.c CL_AddExplosions, ex_misc/ex_poly).
+ *
+ * C mapping, replicated exactly:
+ * - visible while `0 <= age < (frames-1)*0.1` (ex_misc frees at f>=3,
+ *   ex_poly at f>=frames-1 — one 100ms step SHORTER than the nominal frame
+ *   count, so a 15f boom shows f=0..13 as frame/oldframe pairs 1/0..14/13).
+ * - `frame = baseframe + f + 1`, `oldframe = baseframe + f` (the visible
+ *   pair, never a bare baseframe hold).
+ * - blend `backlerp = frac` (0 at the step start = fully oldframe, 1 at the
+ *   step end = fully frame). C's wire `backlerp = 1 - cl.lerpfrac` reads
+ *   inverted, but BOTH renderers in this repo consume the slot as a
+ *   front-lerp (`sw-renderer/frame.ts` RF_FRAMELERP block,
+ *   `webgl-renderer/alias.ts` resolveAliasLerp: out = A + (B-A)*t), so the
+ *   value emitted here is what renders C-identical on the actual backends.
+ *   TODO(renderer-lanes): reconcile the frozen §5 doc ("1 = fully
+ *   oldframe") with the front-lerp consumption both backends implement.
+ * - alpha: ex_misc `1 - frac/(frames-1)` (linear 1→0 over the 3 live steps);
+ *   ex_poly `(16-f)/16` (never fully 0 while visible).
+ * - skinnum (ex_poly only, the r_explode skin1..7 cycle): f<10 → f>>1,
+ *   f<13 → 5, else 6 (the f>=10 TRANSLUCENT flag rides Entity.alpha here).
+ */
+export interface ExplosionStep {
+  frame: number;
+  oldframe: number;
+  backlerp: number;
+  alpha: number;
+  visible: boolean;
+  /** ex_poly skin cycle 0..6 (skin1..7); 0 for the single-skin blaster flash. */
+  skinnum: number;
+}
+
+export function explosionStepFor(kind: ExplosionKind, baseframe: number, age: number): ExplosionStep {
+  const frames = explosionFrames(kind);
+  const step = age / 0.1;
+  const f = Math.floor(step);
+  const frac = step - f;
+  const visible = age >= 0 && step < frames - 1 - 1e-6;
+  if (!visible) {
+    return { frame: baseframe + 1, oldframe: baseframe, backlerp: 0, alpha: 0, visible: false, skinnum: 0 };
+  }
+  const alpha =
+    kind === 'blaster'
+      ? Math.max(0, Math.min(1, 1 - step / (frames - 1)))
+      : Math.max(0, Math.min(1, (16 - f) / 16));
+  const skinnum = kind === 'blaster' ? 0 : f < 10 ? f >> 1 : f < 13 ? 5 : 6;
+  return {
+    frame: baseframe + f + 1,
+    oldframe: baseframe + f,
+    backlerp: Math.max(0, Math.min(1, frac)),
+    alpha,
+    visible: true,
+    skinnum,
+  };
+}
+
+/**
  * Trail/impact spark lifetime in server seconds. id's CL_BlasterParticles
  * fade in a fraction of a second; world-seeded particles (devroom torch
  * flame, born +Infinity) never expire.
@@ -830,11 +886,79 @@ export function explosionFrames(kind: ExplosionKind): number {
 export const SPARK_TTL = 0.4;
 
 /**
- * Impact-flash dlight window in server seconds. TE_BLASTER / TE_EXPLOSION1
- * are brief flashes (id adds a short yellow light on touch). The renderer's
- * own light ttl still bounds each add to ~2 renders.
+ * C target_splash color table (client/cl_tent.c splash_color[7], indexed by
+ * the lump `sounds` byte). Base1 uses 1 (SPARKS, yellow 0xe0) everywhere.
  */
-export const EXPLOSION_LIGHT_WINDOW = 0.1;
+export const SPLASH_COLORS = [0x00, 0xe0, 0xb0, 0x50, 0xd0, 0xe0, 0xe8] as const;
+
+/** Lump `sounds` value selecting the SPARKS (electrical) splash (q_shared.h). */
+export const SPLASH_SPARKS = 1;
+
+/** Spark burst sounds (cl_tent.c TE_SPLASH: spark5/6/7 at ATTN_STATIC). */
+export const SPLASH_SPARK_SOUNDS = ['world/spark5.wav', 'world/spark6.wav', 'world/spark7.wav'] as const;
+
+/**
+ * G_SetMovedir (game/g_utils.c) by value: lump `angle` -1 aims up, -2 aims
+ * down, anything else is the forward vector of (pitch 0, yaw angle, roll 0).
+ * TODO(server): canonical home is a server-side use_target_splash/func_timer
+ * producer; this helper only orients the web-lane ambient replication.
+ */
+export function splashMovedir(angleDeg: number): Vec3 {
+  if (angleDeg === -1) return v3(0, 0, 1);
+  if (angleDeg === -2) return v3(0, 0, -1);
+  const fwd = v3();
+  const right = v3();
+  const up = v3();
+  AngleVectors(v3(0, angleDeg, 0), fwd, right, up);
+  return v3(fwd[0], fwd[1], fwd[2]);
+}
+
+/** One ambient splash spark (CL_ParticleEffect distribution, by value). */
+export interface SplashSpark {
+  pos: Vec3;
+  vel: Vec3;
+  color: number;
+  ttl: number;
+}
+
+/**
+ * CL_ParticleEffect (client/cl_fx.c) by value: `count` sparks around `pos`,
+ * each offset ((rand&7)-4) + d*dir with d=(rand&31), velocity crand*20 per
+ * axis (gravity-stepped by the driver's ballistic path), color
+ * `colorBase+(rand&7)`, life 0.5+frand*0.3 (alphavel -1/(0.5+frand*0.3)).
+ * TODO(server): consume the server lane's target_splash producer once it
+ * lands; until then the driver replicates the distribution here.
+ */
+export function splashBurst(
+  rand: () => number,
+  pos: Vec3,
+  dir: Vec3,
+  count: number,
+  colorBase: number,
+): SplashSpark[] {
+  const out: SplashSpark[] = [];
+  for (let i = 0; i < count; i++) {
+    const d = (rand() * 32) | 0;
+    out.push({
+      pos: v3(
+        pos[0]! + (((rand() * 8) | 0) - 4) + d * dir[0]!,
+        pos[1]! + (((rand() * 8) | 0) - 4) + d * dir[1]!,
+        pos[2]! + (((rand() * 8) | 0) - 4) + d * dir[2]!,
+      ),
+      vel: v3((rand() * 2 - 1) * 20, (rand() * 2 - 1) * 20, (rand() * 2 - 1) * 20),
+      color: colorBase + ((rand() * 8) | 0),
+      ttl: 0.5 + rand() * 0.3,
+    });
+  }
+  return out;
+}
+
+/**
+ * Impact-flash dlight window in server seconds. TE_BLASTER's ex_misc lives
+ * f<3 (cl_tent.c frees at f>=frames-1=3): 0.3s of 150*alpha yellow, not a
+ * single 100ms tick — the boom window below matches the same rule.
+ */
+export const EXPLOSION_LIGHT_WINDOW = 0.3;
 
 /** Pak lump for shootable barrels (g_misc.c SP_misc_explobox, origin at the box bottom). */
 export const BARREL_MODEL = 'models/objects/barrels/tris.md2';
@@ -966,6 +1090,16 @@ export class LocalDriver implements HostDriver {
   private tracerQueue: TracerBeam[] = [];
   /** Enemy muzzle flashes (200+(rand&31) yellow, drained via the dlight pump). */
   private enemyFlashes: Array<{ pos: Vec3; intensity: number }> = [];
+  /**
+   * Ambient electrical sparks (RELEASE-9 box 3): base1's 12 target_splash
+   * emitters fire on server-side func_timer cadence (START_ON timers target
+   * t1/t2/t3/t41/t48..t54), independent of doors — the *19 door and *20
+   * glass chains carry no splash (t69 areaportal / t78 glass speaker).
+   * Single-sim rule: the SERVER owns the producers (SV_Tick timer think +
+   * fireSplashTarget → st.sparks/st.sounds, drained below); the driver only
+   * renders. The pure splashBurst/splashMovedir helpers below remain as
+   * tested distribution mirrors, never ticked here.
+   */
   /** Last-tick monster health by edict num (drives kill/gib/hit synthesis). */
   private monHealth = new Map<number, number>();
   /** Monster edicts already reported gibbed/dead (id DEAD_DEAD is terminal). */
@@ -1264,6 +1398,8 @@ export class LocalDriver implements HostDriver {
     if ((cmd.buttons & BUTTON_USE) !== 0) this.pressUseButton();
     // Single drain point: server event queues from the tick AND the fire
     // above (muzzles, tracers, sparks, sounds) become driver cosmetics here.
+    // Ambient func_timer → target_splash sparks/sounds arrive through the
+    // same server drains (single-sim: no driver-side replication).
     this.drainServerEvents();
     this.expireSounds();
     this.updateMixerListener();
@@ -1386,10 +1522,17 @@ export class LocalDriver implements HostDriver {
         t.length,
       );
     }
-    // Sparks: impact/trail/boom bursts into the particle pool.
-    for (const s of SV_DrainSparks(this.server)) {
-      if (s.vel) this.pushBallisticSpark(v3(s.pos[0], s.pos[1], s.pos[2]), v3(s.vel[0], s.vel[1], s.vel[2]), s.color, s.ttl);
-      else this.pushColoredSpark(v3(s.pos[0], s.pos[1], s.pos[2]), s.color, s.ttl);
+    // Sparks: impact/trail/boom bursts into the particle pool. A non-empty
+    // server spark drain also raises the 'splash' event (ambient timer
+    // showers surface here; single-sim: the server owns the producers).
+    {
+      let n = 0;
+      for (const s of SV_DrainSparks(this.server)) {
+        if (s.vel) this.pushBallisticSpark(v3(s.pos[0], s.pos[1], s.pos[2]), v3(s.vel[0], s.vel[1], s.vel[2]), s.color, s.ttl);
+        else this.pushColoredSpark(v3(s.pos[0], s.pos[1], s.pos[2]), s.color, s.ttl);
+        n++;
+      }
+      if (n > 0) this.events.push('splash');
     }
     // Sounds: positional shots, impacts, gibs, booms.
     let monshot = false;
@@ -1485,33 +1628,28 @@ export class LocalDriver implements HostDriver {
     }
     if (this.models) {
       // Server-owned explosion visuals (pruned server-side by frame life).
-      // RF_FRAMELERP smoothing: oldframe = previous frame, backlerp =
-      // 1 - frac (cl_tent.c frac stepping), so frames interpolate instead
-      // of popping; alpha fades over the life (ex_poly 16-frame alpha,
-      // ex_misc linear) so the alias backend screen-doors to translucent.
-      // Freed-sky bolts never reach this list (the server frees them
-      // silently with no explosion record), so no remnant renders here.
+      // C cl_tent.c CL_AddExplosions via explosionStepFor: frame/oldframe =
+      // baseframe+f+1/baseframe+f (never a bare baseframe hold), renderer
+      // front-lerp backlerp = frac, ex_poly alpha (16-f)/16, ex_misc linear
+      // 1→0 over its 3 live steps, r_explode skinnum cycle. Freed-sky bolts
+      // never reach this list (the server frees them silently with no
+      // explosion record), so no remnant renders here.
       for (const e of this.server.explosions) {
         const age = this.server.time - e.born;
-        const frames = explosionFrames(e.kind);
-        if (age < 0 || age >= frames * 0.1) continue;
-        const f = Math.floor(age / 0.1);
-        const frac = age / 0.1 - f;
+        const step = explosionStepFor(e.kind, e.baseframe, age);
+        if (!step.visible) continue;
         // TE_EXPLOSION1/2 render the r_explode MD2 (cl_mod_explo4, 15f/19f);
         // TE_BLASTER's 4f ex_misc renders the explode MD2 (cl_mod_explode).
         const isBlast = e.kind === 'blaster';
-        const alpha = isBlast
-          ? 1 - age / EXPLOSION_LIGHT_WINDOW
-          : (16 - f) / 16;
         out.push({
           origin: [e.pos[0]!, e.pos[1]!, e.pos[2]!],
           angles: [0, e.yaw, 0],
           model: isBlast ? this.models.blast : this.models.explode,
-          skin: isBlast ? this.models.blastSkin : this.models.explodeSkin,
-          frame: e.baseframe + f,
-          oldframe: e.baseframe + Math.max(0, f - 1),
-          backlerp: Math.max(0, Math.min(1, 1 - frac)),
-          alpha: Math.max(0, Math.min(1, alpha)),
+          skin: isBlast ? this.models.blastSkin : this.explosionSkinFor(step.skinnum),
+          frame: step.frame,
+          oldframe: step.oldframe,
+          backlerp: step.backlerp,
+          alpha: step.alpha,
         });
       }
       // Server-owned debris/gibs (SV_Physics_Toss-lite, stepped in SV_Tick).
@@ -2729,25 +2867,32 @@ export class LocalDriver implements HostDriver {
   }
 
   /**
-   * Drain live explosion flashes for the dlight pump. Blaster flashes are
-   * brief (EXPLOSION_LIGHT_WINDOW); big booms burn over their frame life
-   * with alpha fade (ex_poly 16-frame alpha, ex_misc linear). Returns pos +
+   * Drain live explosion flashes for the dlight pump. Both kinds burn for
+   * their full C life ((frames-1)*0.1: 0.3s blaster, 1.4/1.8s booms) with
+   * the C alpha fade (ex_poly (16-f)/16, ex_misc linear). Returns pos +
    * kind + alpha so the pump can pick the authentic light per kind. Backed
    * by the server explosion list (pruned server-side by frame life).
    */
   drainExplosions(): Array<{ pos: Vec3; kind: ExplosionKind; alpha: number }> {
     const out: Array<{ pos: Vec3; kind: ExplosionKind; alpha: number }> = [];
     for (const e of this.server.explosions) {
-      const age = this.server.time - e.born;
-      const frames = explosionFrames(e.kind);
-      if (age < 0 || age >= frames * 0.1) continue;
-      const lit = e.kind === 'blaster' ? age < EXPLOSION_LIGHT_WINDOW : age < (frames - 1) * 0.1;
-      if (!lit) continue;
-      const f = Math.floor(age / 0.1);
-      const alpha = e.kind === 'blaster' ? 1 - age / EXPLOSION_LIGHT_WINDOW : (16 - f) / 16;
-      out.push({ pos: e.pos, kind: e.kind, alpha: Math.max(0, Math.min(1, alpha)) });
+      const step = explosionStepFor(e.kind, e.baseframe, this.server.time - e.born);
+      if (!step.visible) continue;
+      out.push({ pos: e.pos, kind: e.kind, alpha: step.alpha });
     }
     return out;
+  }
+
+  /**
+   * r_explode skin for a C ex_poly skinnum (0..6 → skin1..skin7). Degrades to
+   * the registered skin1 when the cycle registration is short (fallback
+   * pak) or the stub predates explodeSkins (older test fixtures).
+   */
+  explosionSkinFor(skinnum: number): number {
+    if (!this.models) return 0;
+    if (skinnum <= 0) return this.models.explodeSkin;
+    const cycled = this.models.explodeSkins?.[skinnum - 1];
+    return cycled ?? this.models.explodeSkin;
   }
 
   private pushColoredSpark(pos: Vec3, color: number, ttl: number = SPARK_TTL, born?: number): void {
@@ -2815,6 +2960,25 @@ export class LocalDriver implements HostDriver {
         this.particleTtl.splice(i, 1);
       }
     }
+  }
+
+  /**
+   * Test hook: live ambient splash emitters (target_splash count, off the
+   * server roster — single-sim: the server owns the producers).
+   */
+  ambientSplashSources(): number {
+    let n = 0;
+    for (const list of this.server.splashes.values()) n += list.length;
+    return n;
+  }
+
+  /** Test hook: live ambient splash timers (START_ON func_timer count). */
+  ambientSplashTimers(): number {
+    let n = 0;
+    for (const t of this.server.timers) {
+      if (!t.ent.freed && (t.ent.spawnflags & 1) !== 0 && t.target) n++;
+    }
+    return n;
   }
 }
 
@@ -3398,6 +3562,13 @@ export interface PakModelHandles {
   explode: number;
   /** r_explode skin (skin1.pcx; the MD2 cycles skin1-7 by frame in C). */
   explodeSkin: number;
+  /**
+   * r_explode skins skin2..skin7 (the C ex_poly skinnum cycle: f<10 → f>>1,
+   * f<13 → 5, else 6). Appended after every pre-existing handle so no
+   * numeric handle shifts; may be shorter than 6 on fallback (the lookup
+   * degrades to explodeSkin).
+   */
+  explodeSkins: number[];
   /** explode MD2 for the TE_BLASTER 4f ex_misc flash (cl_mod_explode). */
   blast: number;
   /** PCX skin for the blaster-flash MD2. */
@@ -3644,9 +3815,16 @@ export function registerPakModels(refresh: SoftwareRenderer, pak: WebPak, gpuSin
   // every earlier handle stays stable; missing lump → box-critter fallback).
   const corpseSkin = loadSkin(CORPSE_SKIN);
   const corpse = loadModel(CORPSE_MODEL);
+  // r_explode skin cycle (cl_tent.c ex_poly skinnum): registered LAST so
+  // every handle above stays put; the explosion lookup degrades to
+  // explodeSkin for any missing/unparseable entry.
+  const explodeSkins: number[] = [];
+  for (let s = 2; s <= 7; s++) {
+    explodeSkins.push(loadSkin(`models/objects/r_explode/skin${s}.pcx`));
+  }
   return {
     monster, monsterSkin, soldierLightSkin, soldierSsSkin, gunner, gunnerSkin, infantry, infantrySkin, weapons, weaponSkins, bolt, boltSkin, barrel, barrelSkin,
-    explode, explodeSkin, blast, blastSkin,
+    explode, explodeSkin, explodeSkins, blast, blastSkin,
     debris1, debris1Skin, debris2, debris2Skin, debris3, debris3Skin,
     gibMeat, gibMeatSkin, gibChest, gibChestSkin, gibBone, gibBoneSkin, gibHead, gibHeadSkin,
     items, ship, shipSkin, banner, bannerSkin, corpse, corpseSkin,

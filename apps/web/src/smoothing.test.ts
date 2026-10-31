@@ -34,30 +34,35 @@ describe('explosion smoothing (oldframe/backlerp/alpha)', () => {
       monster: 0, monsterSkin: 0, soldierLightSkin: 0, soldierSsSkin: 0,
       gunner: 0, gunnerSkin: 0, weapons: {}, weaponSkins: {},
       bolt: 0, boltSkin: 0, barrel: 0, barrelSkin: 0,
-      explode: 7, explodeSkin: 8, blast: 9, blastSkin: 10,
+      explode: 7, explodeSkin: 8, explodeSkins: [11, 12, 13, 14, 15, 16], blast: 9, blastSkin: 10,
       debris1: 0, debris1Skin: 0, debris2: 0, debris2Skin: 0, debris3: 0, debris3Skin: 0,
       gibMeat: 0, gibMeatSkin: 0, gibChest: 0, gibChestSkin: 0,
       gibBone: 0, gibBoneSkin: 0, gibHead: 0, gibHeadSkin: 0,
       items: {}, ship: -1, shipSkin: 0, banner: -1, bannerSkin: 0, skins: [],
     };
-    // Seed one big-boom explosion at t=0 and read it mid-first-frame.
+    // Seed one big-boom explosion at t=0 and read it at the step start.
+    // C CL_AddExplosions: frame = base+f+1, oldframe = base+f, front-lerp =
+    // frac (0 at the step start = fully oldframe), ex_poly alpha (16-f)/16.
     driver.server.explosions.push({
       pos: v3(10, 20, 30), born: driver.server.time, kind: 'explosion1', baseframe: 0, yaw: 0,
     });
     const extras = driver.extraEntities()!;
     const boom = extras.find((x) => x.model === 7)!;
     expect(boom).toBeDefined();
-    expect(boom.frame).toBe(0);
+    expect(boom.frame).toBe(1);
     expect(boom.oldframe).toBe(0);
-    expect(boom.backlerp).toBeCloseTo(1, 5);
+    expect(boom.backlerp).toBeCloseTo(0, 5);
     expect(boom.alpha).toBeCloseTo(1, 5);
-    // Mid-life: frame advanced, blend partway, alpha faded.
+    expect(boom.skin).toBe(8);
+    // Mid-life: frame advanced, blend partway, alpha faded, skin cycled
+    // (f=2 → skinnum 1 → second r_explode skin).
     driver.server.time += 0.25;
     const mid = driver.extraEntities()!.find((x) => x.model === 7)!;
-    expect(mid.frame).toBe(2);
-    expect(mid.oldframe).toBe(1);
+    expect(mid.frame).toBe(3);
+    expect(mid.oldframe).toBe(2);
     expect(mid.backlerp).toBeCloseTo(0.5, 5);
     expect(mid.alpha).toBeCloseTo((16 - 2) / 16, 5);
+    expect(mid.skin).toBe(11);
     // Aged out: no remnant submitted.
     driver.server.time += 10;
     const gone = (driver.extraEntities() ?? []).filter((x) => x.model === 7);
