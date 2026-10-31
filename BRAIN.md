@@ -340,18 +340,6 @@ done-when:
 - [ ] Verify the landed procedural palette/world/model replay on GPU cold boot, switching and restoration without a pak. The former palette guard was addressed in `2c4c162`; do not repeat the obsolete diagnosis or rebuild the implementation. Diagnose any remaining failure from rendered evidence.
 - [ ] Real-WebGL pixels show expected room geometry/materials and entities without pak assets; verify cold boot, map switch, renderer switch and context restoration. Check that an intentional missing-world control fails; nonblack clear color alone is insufficient.
 
-### RELEASE-3B — Verify and repair blaster offset from the crosshair
-owns: `packages/game`, `packages/server`, `apps/web`, `packages/webgl-renderer`, `packages/testkit`
-depends: RELEASE-3 (display-fit implementation archived)
-status: ready
-user-report: the blaster beam/bolt appears slightly below and right of the crosshair.
-starting-points: `packages/game/src/weapons.ts: blasterSpawn`, server bolt spawn/tick/trace, `play.ts` bolt submission, original `game/p_weapon.c: Blaster_Fire`
-review-finding: both local implementations use a muzzle offset of 24 forward, 8 right and viewheight−8, with original C firing along forward. Some visual offset can be intended muzzle parallax; neither source inspection nor an eye-ray test establishes whether the reported appearance/impact is correct.
-done-when:
-- [ ] Capture actual fired bolts and impact points at near/mid/far known targets, level and pitched views, on Software and WebGL2 at 640×480, 800×600 and 1024×768. Record camera, FOV, resolution, viewmodel/recoil state and projected eye/muzzle/bolt positions.
-- [ ] Distinguish intended source muzzle offset from incorrect direction, camera/recoil timing, projectile transform, interpolation or presentation. Compare actual trajectory and effects with original behavior. Do not move the crosshair or zero the muzzle offset merely to hide the symptom; if original parity explains it, document the comparison and get a user verdict rather than silently closing it.
-- [ ] Fix any demonstrated discrepancy and add a production fire/tick/collision/render regression with an intentionally wrong offset/direction control. Eye-ray projection and matched canvas rectangles alone cannot pass this card. Preserve the display-fit and sky repairs.
-
 ### RELEASE-4 — Correct final elevator activation and waiting
 owns: `packages/server`, `packages/game`, `apps/web`
 depends: none

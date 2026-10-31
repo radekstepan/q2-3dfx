@@ -464,3 +464,10 @@ pixel/rect evidence (real headless Chromium 1500x1000 @dpr1, production page, `a
 neighbors green: testkit `gpu-presentation` 9/10 (1 env-skip; small-viewport leg triples 140 → 6163 with the fit), web typecheck 17/17 + build green, full web suite 423/427 with the 4 failures (browser-lane ×1, play M7.2 ×1, pool-diag ×2) reproduced IDENTICALLY on the clean tree (pre-existing suite-load flakes, FOLLOW-5 territory); `deps:check` sound→config ×2 violations pre-existing (untouched, RELEASE-1 review).
 changesets: `release-3-aim-hud.md` rewritten for the fit repair (web ignored; no versioned package touched). No perf-ledger row: display-CSS only, no raster/frame-time change.
 follow-ups left visible (not RELEASE-3 blockers): RELEASE-1/2 acceptance review, RELEASE-4/5 gameplay, FOLLOW-3B water, RELEASE-6/7/8, FOLLOW-5/6/7.
+
+### RELEASE-3B — Verify blaster offset is intended muzzle parallax — DONE 2026-10-30
+owns: `apps/web`, `packages/game`, `packages/server`, `packages/webgl-renderer`, `packages/testkit` · depends: RELEASE-3 (archived)
+lane report (single writer, web-only test addition, no production edits to preserve display-fit/sky): all 3 done-when boxes evidenced with actual production bolts, not eye-ray stubs.
+par finding: production `SV_PlayerFire` matches C `Blaster_Fire`/`G_ProjectSource` exactly (24 fwd + 8 right + viewheight-8, dir = forward). `apps/web/src/blaster-aim.test.ts` 6/6 (incl. real-base1 Q2_PAK leg): near 200u ~13px right/down, mid 800u ~3px, far 1500u ~2px at 640x480 FOV90; CPU/GPU agree <1px at 640x480/800x600/1024x768 level+pitched; wall impact preserves 8u lateral (parallel); kick `-2*fwd`/`[-1,0,0]` is one-tick camera transient per `SV_CalcViewOffset`. Zero-muzzle and convergent-aim negative controls pinned as not-shipped.
+neighbors: web typecheck clean, blaster-aim 6/6, aim-hud 7/7, resolution-fit 7/7; play M7.2 damage + `sound→config` ×2 pre-existing (FOLLOW-5/RELEASE-1 territory, reproduced on clean tree).
+changesets: `release-3b-blaster-parallax.md` (web ignored; no versioned package touched). No perf-ledger row: test-only, no raster/frame-time change.
