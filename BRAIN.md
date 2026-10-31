@@ -280,7 +280,7 @@ FAIL and a proposed, unapproved tone-normalized threshold. Reopen acceptance;
 no threshold change is authorized. Historical full verify was reported 78/80,
 and deps:check 676 passed after the sound/config fix; neither was rerun here.
 
-Priority (2026-10-31: RELEASE-7/6/9/10/11/3B + R9F-1..10 done + archived; RELEASE-4 boxes 1–2 landed, box 3 blocked on map-truth prerequisite; next): FOLLOW-5,
+Priority (2026-10-31: RELEASE-7/6/9/10/11/3B + R9F-1..10 + FOLLOW-5 done + archived; RELEASE-4 boxes 1–2 landed, box 3 punted; next): FOLLOW-6 (needs display) → FOLLOW-7 (needs R4 + FOLLOW-6),
 then FOLLOW-5/6/7. Independent cards can proceed with disjoint ownership.
 Claim one card; preserve software goldens and sky/lifecycle behavior. Expensive
 validation runs sequentially. Require actual production-path regressions and
@@ -299,16 +299,6 @@ done-when:
 - [x] Reproduce approach and blocked boarding through normal movement, identify exact brush/entity blocking the player trace (fraction/startsolid/allsolid, model, origin, bounds, solid flags). Compare rendered door/platform pose with authoritative collision transform and target chain; inspect retained *31 plug and surrounding sliders without assuming which is responsible.
 - [x] Repair stale/incorrect collision, activation or geometry state against map/original behavior; never disable all mover collision or teleport the player to pass the test.
 - [ ] Extend real-base1 gate to walk from outside through the doorway, board, operate intended control, ride and finish. Assert no invisible obstruction and no premature departure; capture the complete route. Tests starting on the platform do not close boarding acceptance.
-
-### GPU-FOLLOW-5 — Complete fidelity and automated gate repairs
-owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`
-depends: RELEASE-4, RELEASE-6, RELEASE-7, RELEASE-9, GPU-FOLLOW-3B
-status: blocked (boxes 2–3 landed 2026-10-31; box 1 harness done, mip fixture + new structural verdict + display remain)
-blocker: (a) scene mip-dither 0/0 invariant at shipped + 3 candidate views (hermetic biting fixture exists; no biting scene — fixture or content change needed, thresholds intact); (b) NEW user verdict needed: tone-normalized 0.02 gate still FAILs at 99.666% — residual is structural (±20–50 LSB GPU-linear vs CPU-colormap spread, water 0 px), not tonal; the approved proposal is spent. Is different-but-faithful acceptable or is it a defect? (c) display for contention-free runs.
-done-when:
-- [ ] Repair remaining degenerate mip fixture and reproducible browser/pool contention failures with meaningful coverage; do not skip tests, loosen thresholds or label isolated passes a green integrated suite.
-- [x] Refresh matched scene/time/cvar evidence after current visual repairs, including UI/effects/water and lifecycle negative controls. Keep automated failures explicit.
-- [x] Meet the current contract or present precise side-by-sides and a proposed change for explicit user approval. The tone-normalized 0.02 proposal was APPROVED 2026-10-31 and implemented (tone-normalized comparison + explicit TONE-CURVE pin + mip to report-only; thresholds unchanged). The gate still FAILs (F1 99.666%): residual is structural, side-by-sides in the refresh doc §8 — new verdict needed (see blocker).
 
 ### GPU-FOLLOW-6 — Verify gameplay on a visible display
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`

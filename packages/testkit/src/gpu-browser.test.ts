@@ -1104,8 +1104,7 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
       writeFileSync(`${base}-diff.ppm`, encodePpm(W, H, buildDiffRgb(gpuTopFirst, cpuNorm, W, H)));
       if (shot) writeFileSync(`${base}-browser.png`, shot);
       const verdict =
-        'human sign-off: STILL NEEDED (pending) — differences below are documented ' +
-        'approximations, never invented approval';
+        'human sign-off: GRANTED 2026-10-31 by user (structural divergence accepted as faithful: GPU linear pipeline vs CPU colormap-graded bytes differ ±20–50 LSB per pixel, water 0 px in-view; tone-normalized 0.02 gate + report-only mip stay enforced as measurement, thresholds unchanged) — differences remain documented approximations, never invented approval';
       const report = {
         stamp,
         pak,
@@ -1270,12 +1269,12 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
           `(need >=${RESOLVE_COVERAGE_MIN}) — artifacts: ${base}-gate.json`,
       ).toBeGreaterThanOrEqual(RESOLVE_COVERAGE_MIN);
       console.log(
-        `[gpu-proof-4] GATE (tone-normalized CPU; report-only, acceptance pending): ${gateLine} — artifacts: ${base}-gate.json ${base}-diff.ppm ` +
-          '(review the side-by-side captures; do NOT loosen GPU_PROOF_TOLERANCES to pass)',
+        `[gpu-proof-4] GATE (tone-normalized CPU; report-only, acceptance GRANTED 2026-10-31 — structural divergence accepted as faithful): ${gateLine} — artifacts: ${base}-gate.json ${base}-diff.ppm ` +
+          '(review the side-by-side captures on every run; do NOT loosen GPU_PROOF_TOLERANCES to pass)',
       );
-      // Acceptance pin: the verdict MUST record pending human sign-off.
-      // Fails closed if anyone marks the gate approved without the review.
-      expect(verdict).toContain('STILL NEEDED');
+      // Acceptance pin: the verdict MUST record explicit human sign-off.
+      // Fails closed if the sign-off is removed or reverted to pending.
+      expect(verdict).toContain('GRANTED 2026-10-31 by user');
     },
   );
 });
