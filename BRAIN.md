@@ -325,7 +325,8 @@ commit validated implementation increments with changesets, no push.
 ### RELEASE-8 — Retire the old CPU Voodoo renderer
 owns: `apps/web`, `packages/config`, `packages/renderer-api`, `packages/sw-renderer`, `packages/voodoo`, `packages/host`, `packages/testkit`, `tools/bench`, `tools/asset-cooker`, `docs`, root workspace configuration
 depends: RELEASE-2, RELEASE-7
-status: ready
+status: in-progress(@opencode)
+lane-2026-10-30 (@opencode): step 1 DONE (config 17/17 + renderer-api 7/7 majors, vocab software|webgl2-experimental, persisted-voodoo→software warned); sw-renderer/bench/docs lanes running.
 inventory-2026-10-30 (@opencode, read-only): static `@q2/voodoo` importers are `apps/web/play.ts` (resolve/scanout), `render-workers.ts` (SAB/scanout), `tools/bench` rgb legs, dynamic `testkit` resolve reference — all retire-execution; policy tables already duplicated in `webgl-renderer/appearance.ts` (keep/relocate, not blind delete). `webgl-renderer→sw-renderer` imports are all KEEP (MiniWorld/camera/alias front-end). `vid_renderer` vocab `software|voodoo|webgl2-experimental` → `software|webgl2-experimental` with persisted-`voodoo`→`software` warned fallback; `vd_*` stay (WebGL uniforms). Workers/bench/tests RGB legs retire, software+GPU goldens preserved; frozen majors required for `config`+`renderer-api` (+`sw-renderer`/`voodoo`/`webgl-renderer` if APIs change). Ordered plan: selection vocab → web CPU-resolve removal → sw-renderer RGB strip → bench legs → voodoo package decision → obsolete tests → contracts/docs/gates.
 done-when:
 - [ ] Remove the legacy CPU Voodoo execution mode and its menu/config selection in favor of WebGL2; map persisted legacy selections deliberately and report unsupported-GPU fallback accurately. Preserve the software reference/Node renderer and the WebGL Voodoo appearance.

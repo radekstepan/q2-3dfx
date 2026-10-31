@@ -1,9 +1,12 @@
-// @q2/renderer-api — GPU scene/backend boundary (GPU-PROOF-2).
+// @q2/renderer-api — GPU scene/backend boundary (GPU-PROOF-2, RELEASE-8 vocab retirement).
 //
-// Additive only: the §5 frozen contracts (Refresh/Framebuffer/RefDef/Entity)
-// are untouched. A GPU backend implements GpuRenderer, never Refresh: it
-// must NOT populate a CPU framebuffer or read pixels back every frame just
-// to satisfy Refresh.
+// RELEASE-8 is a BREAKING change to the selection vocabulary: `voodoo` is
+// removed from `ResolvedBackend` (now `software | webgl2-experimental`); a
+// persisted `voodoo` request migrates one-time to `software` with an explicit
+// warning, never auto-promoted to webgl2. The §5 frozen contracts
+// (Refresh/Framebuffer/RefDef/Entity) are untouched: a GPU backend implements
+// GpuRenderer, never Refresh — it must NOT populate a CPU framebuffer or read
+// pixels back every frame just to satisfy Refresh.
 //
 // DOM-free by construction: the GL context is an opaque generic parameter
 // (`GpuRenderer<WebGL2RenderingContext>` binds it in @q2/webgl-renderer —
@@ -16,7 +19,7 @@ import type { Vec3 } from '@q2/math';
 export type GpuBackendId = 'webgl2-experimental';
 
 /** Every renderer selection the shell can resolve to. */
-export type ResolvedBackend = 'software' | 'voodoo' | GpuBackendId;
+export type ResolvedBackend = 'software' | GpuBackendId;
 
 /**
  * Capability/failure report for the experimental GPU backend. Explicit, never
@@ -38,14 +41,22 @@ export interface ResolvedSelection {
 }
 
 /**
- * Pure selection resolver: exact `software`/`voodoo`/`webgl2-experimental`
- * strings map directly (GPU only when capable); anything else — including a
- * GPU request without capability — resolves to `software` with an explicit
- * warning. No silent CPU fallback, no exceptions, no IO.
+ * Pure selection resolver: exact `software`/`webgl2-experimental` strings map
+ * directly (GPU only when capable); the retired `voodoo` id migrates one-time
+ * to `software` with an explicit warning (never auto-promoted to webgl2);
+ * anything else — including a GPU request without capability — resolves to
+ * `software` with an explicit warning. No silent CPU fallback, no exceptions,
+ * no IO.
  */
 export function resolveRendererSelection(requested: string, gpu: GpuCapability): ResolvedSelection {
   if (requested === 'software') return { active: 'software', warning: null };
-  if (requested === 'voodoo') return { active: 'voodoo', warning: null };
+  if (requested === 'voodoo') {
+    return {
+      active: 'software',
+      warning:
+        'vid_renderer "voodoo" was retired (RELEASE-8); migrated to software (never auto-promoted to webgl2-experimental)',
+    };
+  }
   if (requested === 'webgl2-experimental') {
     if (gpu.available) return { active: 'webgl2-experimental', warning: null };
     return {

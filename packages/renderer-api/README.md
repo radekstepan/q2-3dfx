@@ -3,7 +3,11 @@
 Frozen `Refresh` / `Framebuffer` / `RefDef` contracts both renderers implement (BRAIN.md §6).
 No engine internals, no renderer code — just the interface plus a headless null backend.
 
-Entry point: `src/index.ts` (single-file package, `src/index.ts:1`).
+Entry point: `src/index.ts` (frozen `Refresh` side); `src/gpu.ts` holds the
+GPU scene/backend boundary (`GpuRenderer`, `GpuSceneInput`, `resolveRendererSelection`).
+RELEASE-8 removed `voodoo` from `ResolvedBackend` (now
+`software | webgl2-experimental`); persisted `voodoo` requests migrate
+one-time to `software` with an explicit warning, never auto-promoted to webgl2.
 
 ## Public API
 
@@ -30,9 +34,9 @@ r.endFrame();
 
 ## Testing
 
-- `yarn workspace @q2/renderer-api test` — vitest with `--passWithNoTests`; no test files in-package (covered indirectly via testkit/sw-renderer suites).
+- `yarn workspace @q2/renderer-api test` — vitest: `src/contract.test.ts` (Entity evolution) and `src/gpu.test.ts` (selection resolver incl. legacy-`voodoo`→`software` migration).
 
 ## Constraints
 
-- Dependency direction (BRAIN.md §4): leaf contract above `{sw-renderer, voodoo}`, below `host`/`client`; depends only on `@q2/config`, `@q2/math`. Never import `apps/*`.
+- Dependency direction (BRAIN.md §4): leaf contract above `sw-renderer`, below `host`/`client`; depends only on `@q2/config`, `@q2/math`. Never import `apps/*`.
 - Platform: DOM-free, runtime-free types + plain typed arrays; `NullRefresh` runs in browsers, workers, and Node.

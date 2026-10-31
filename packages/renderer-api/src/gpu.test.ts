@@ -18,9 +18,19 @@ const INCAPABLE: GpuCapability = {
 };
 
 describe('gpu selection resolver', () => {
-  it('honors exact software/voodoo requests without warnings', () => {
+  it('honors exact software requests without warnings', () => {
     expect(resolveRendererSelection('software', INCAPABLE)).toEqual({ active: 'software', warning: null });
-    expect(resolveRendererSelection('voodoo', INCAPABLE)).toEqual({ active: 'voodoo', warning: null });
+    expect(resolveRendererSelection('software', CAPABLE)).toEqual({ active: 'software', warning: null });
+  });
+
+  it('migrates legacy voodoo requests one-time to software WITH an explicit warning (never webgl2)', () => {
+    for (const gpu of [INCAPABLE, CAPABLE]) {
+      const sel = resolveRendererSelection('voodoo', gpu);
+      expect(sel.active).toBe('software');
+      expect(sel.warning).toContain('"voodoo" was retired');
+      expect(sel.warning).toContain('migrated to software');
+      expect(sel.warning).toContain('never auto-promoted to webgl2-experimental');
+    }
   });
 
   it('honors a capable webgl2-experimental request', () => {

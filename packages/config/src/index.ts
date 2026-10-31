@@ -61,7 +61,7 @@ const DEFAULT_CVARS: ReadonlyArray<[string, CVarValue, string]> = [
   ['sensitivity', 3, 'mouse sensitivity'],
   ['m_yaw', 0.022, 'mouse yaw scale'],
   ['m_pitch', 0.022, 'mouse pitch scale'],
-  ['vid_renderer', 'software', 'active refresh backend: software | voodoo | webgl2-experimental (experimental, needs WebGL2; incapable Falls back to software WITH a warning)'],
+  ['vid_renderer', 'software', 'active refresh backend: software | webgl2-experimental (experimental, needs WebGL2; incapable falls back to software WITH a warning). Legacy "voodoo" ids migrate to software with an explicit warning (RELEASE-8 retirement; never auto-promoted to webgl2)'],
 ];
 
 // --- volume scale (RELEASE-1) ---
@@ -123,7 +123,7 @@ export function sVolumeToOutputGain(raw: unknown): number {
 interface Q2ConfigSharedState {
   values: Map<string, CVarValue>;
   docs: Map<string, string>;
-  features: { workers: boolean; wasmSpans: boolean; voodoo: boolean };
+  features: { workers: boolean; wasmSpans: boolean };
 }
 
 declare global {
@@ -138,7 +138,7 @@ function sharedState(): Q2ConfigSharedState {
     state = {
       values: new Map<string, CVarValue>(),
       docs: new Map<string, string>(),
-      features: { workers: false, wasmSpans: false, voodoo: true },
+      features: { workers: false, wasmSpans: false },
     };
     for (const [name, value, doc] of DEFAULT_CVARS) {
       state.values.set(name, value);
@@ -215,16 +215,20 @@ export function listCVars(): CVarDef[] {
 
 // --- vid_renderer selection states + unsupported-device fallback labels ---
 //
-// GPU-FOLLOW-4, additive/label-only: the default stays 'software' and the GPU
-// backend stays experimental until final evidence (GPU-FOLLOW-7) decides
-// otherwise. Canonical selection *resolution* lives in `@q2/renderer-api`
-// (`resolveRendererSelection`); the declarations below are the config-side
-// cvar vocabulary + human labels for that same contract, mirrored BY VALUE
-// so this leaf package never imports `@q2/renderer-api` (dependency rule:
-// config is imported by renderer consumers, never the reverse).
+// RELEASE-8: the legacy CPU Voodoo execution mode is retired. The `vid_renderer`
+// vocabulary is `software | webgl2-experimental` (the `webgl2` rename is deferred
+// per plan). Persisted legacy `voodoo` ids migrate one-time to `software` WITH
+// an explicit warning — never silently, never auto-promoted to webgl2.
+// The default stays 'software' and the GPU backend stays experimental until
+// final evidence (GPU-FOLLOW-7) decides otherwise. Canonical selection
+// *resolution* lives in `@q2/renderer-api` (`resolveRendererSelection`); the
+// declarations below are the config-side cvar vocabulary + human labels for
+// that same contract, mirrored BY VALUE so this leaf package never imports
+// `@q2/renderer-api` (dependency rule: config is imported by renderer
+// consumers, never the reverse).
 
 /** Every renderer id the `vid_renderer` cvar accepts (cvar vocabulary). */
-export type VidRendererId = 'software' | 'voodoo' | 'webgl2-experimental';
+export type VidRendererId = 'software' | 'webgl2-experimental';
 
 /** Compiled-in `vid_renderer` default: software. Never promoted by this module. */
 export const VID_RENDERER_DEFAULT: VidRendererId = 'software';
@@ -239,12 +243,12 @@ export const GPU_EXPERIMENTAL_BACKEND: VidRendererId = 'webgl2-experimental';
  */
 export const GPU_EXPERIMENTAL = true as const;
 
-/** True for an exact known `vid_renderer` value (no coercion, no aliases). */
+/** True for an exact known `vid_renderer` value (no coercion, no aliases, no legacy ids). */
 export function isKnownRendererId(name: string): name is VidRendererId {
-  return name === 'software' || name === 'voodoo' || name === 'webgl2-experimental';
+  return name === 'software' || name === 'webgl2-experimental';
 }
 
-/** True only for the experimental GPU backend id (never for software/voodoo). */
+/** True only for the experimental GPU backend id (never for software). */
 export function isExperimentalRenderer(name: string): boolean {
   return name === GPU_EXPERIMENTAL_BACKEND;
 }
@@ -272,14 +276,25 @@ export interface VidRendererSelection {
  * Describe a `vid_renderer` request against GPU capability. Capability false
  * always carries the blocking reason into the warning. GPU honored only when
  * capable; everything unhonorable stays on software with a warning.
+ * The retired `voodoo` id migrates one-time to software WITH an explicit
+ * warning — never silently, never auto-promoted to webgl2-experimental.
  */
 export function describeRendererSelection(
   requested: string,
   gpuAvailable: boolean,
   gpuReason = 'no WebGL2 context',
 ): VidRendererSelection {
-  if (requested === 'software' || requested === 'voodoo') {
+  if (requested === 'software') {
     return { requested, active: requested, fallback: false, experimental: false, warning: null };
+  }
+  if (requested === 'voodoo') {
+    return {
+      requested,
+      active: 'software',
+      fallback: true,
+      experimental: false,
+      warning: 'vid_renderer "voodoo" was retired (RELEASE-8); migrated to software (never auto-promoted to webgl2-experimental)',
+    };
   }
   if (requested === GPU_EXPERIMENTAL_BACKEND) {
     if (gpuAvailable) {
@@ -326,7 +341,6 @@ export function rendererSelectionLabel(sel: VidRendererSelection): string {
 export const features: {
   readonly workers: boolean;
   readonly wasmSpans: boolean;
-  readonly voodoo: boolean;
 } = shared.features;
 export type FeatureName = keyof typeof features;
 export function featureEnabled(name: FeatureName): boolean {
