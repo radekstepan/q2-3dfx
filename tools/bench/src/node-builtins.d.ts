@@ -43,3 +43,7 @@ declare module 'node:module' {
     resolve(id: string): string;
   };
 }
+
+declare module 'node:url' {
+  export function fileURLToPath(url: string): string;
+}

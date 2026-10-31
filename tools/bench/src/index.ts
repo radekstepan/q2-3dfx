@@ -82,6 +82,10 @@ export {
   type GpuFidelityMeasurement, type GpuCoverageEvidence, type GpuDisplayedClaim,
   type GpuAcceptanceVerdict, type GpuAcceptanceInput,
 } from './gpu-acceptance.js';
+export {
+  auditProofFixtureWiring, formatProofFixtureAudit,
+  type ProofFixtureGateWiring, type ProofFixtureAudit,
+} from './gpu-fixture-audit.js';
 
 export async function runBenchTool(opts: BenchOptions = {}): Promise<string> {
   const width = opts.width ?? 640;
