@@ -50,7 +50,7 @@ const DEFAULT_CVARS: ReadonlyArray<[string, CVarValue, string]> = [
   ['vd_zbits', 16, 'depth precision at test/write (16 = hw profile); frame helper is banding-only approx'],
   ['vd_palettetex', 1, 'texture storage/upload policy (paletted vs expanded); does not gate filtering'],
   ['vd_overbright', 1, 'compat policy: lightmap modulate x2 + clamp (blanket boost; gl_image audit pending)'],
-  ['vd_dithermode', '4x4', 'profile data (read-path only): ordered-dither matrix 2x2|4x4; current approx is 4x4'],
+  ['vd_dithermode', '4x4', 'ordered-dither write matrix 2x2|4x4, honored live on WebGL (uDitherMode); software has no dither stage'],
   ['vd_reconmode', '2x2sub+2x2box', 'matched scanout: subtract 2x2 dither pattern then 2x2 box with edge rejection; legacy = unconditional box (no subtract)'],
   ['vd_rgbmaxdelta', '8,8,8', 'per-component recon rejection thresholds r,g,b; smooth gradients pass, hard edges stay sharp'],
   ['sw_gamma', 1.0, 'software gamma'],
@@ -336,6 +336,169 @@ export function rendererSelectionLabel(sel: VidRendererSelection): string {
   );
 }
 
+// --- renderer capability mapping (RELEASE-10) ---
+//
+// Single table mapping every panel cvar to the renderers that honor it.
+// The panel (`apps/web` settings) disables irrelevant controls with the
+// `reason` as the tooltip/disabled label, refreshes on switch/fallback/
+// restore, and retains saved values for when the renderer supports them.
+//
+// "Effective renderer" is `software | webgl2-experimental` AFTER fallback
+// resolution: a failed-GPU request (`webgl2-experimental` on an incapable
+// device) runs the software path, so it counts as `software` here. Use
+// `resolveEffectiveRenderer` (thin wrapper over `describeRendererSelection`)
+// or pass `describeRendererSelection(...).active` directly.
+//
+// Audit truth (verified by grepping consumers, 2026-10-31 — corrections to
+// the RELEASE-10 card's draft claims are marked CORRECTION):
+// - `vd_*` (except `vd_palettetex`): live consumers are ONLY
+//   `packages/webgl-renderer/src/appearance.ts` (live uniforms, upload-time
+//   `vd_maxtexsize`, target-creation `vd_zbits`) plus `packages/voodoo`
+//   policy/test snapshots (pure policy, never live rendering). The software
+//   path reads NO `vd_*` cvar (only comments citing the `vd_maxtexsize`
+//   value next to fixed `TEX_CAP` constants) → software-unsupported.
+// - `vd_dithermode`/`vd_reconmode`/`vd_zbits`/`vd_rgbmaxdelta` are NOT
+//   decorative on WebGL: they drive live uniforms (`uDitherMode`,
+//   `uReconMode`, `uRgbMaxDelta`) / depth-target creation. The config
+//   "read-path/profile/banding-approx" docs describe the CPU `packages/voodoo`
+//   helpers, not the GPU path → webgl-supported, software-unsupported.
+// - CORRECTION `vd_palettetex`: decorative on BOTH. `appearance.ts` kind is
+//   `policy-note`: WebGL always uploads expanded RGB and filtering is
+//   identical either way (never gates filtering); software is always indexed.
+//   Toggling it changes no pixels on either renderer.
+// - `sw_workers`/`sw_wasm`/`sw_accum`: consumed ONLY by `packages/sw-renderer`
+//   (`bands.ts`, `wasmSpans.ts`, `frame.ts`) + `apps/web` pool glue. The GPU
+//   path never rasterises on the CPU → webgl-unsupported.
+// - CORRECTION `sw_gamma`: read NOWHERE. `appearance.ts` lists it as NOT READ
+//   (the GPU uses `vd_gamma` for the same role) and `packages/sw-renderer`
+//   has zero gamma code (no `getCVar` gamma read anywhere in the package).
+//   Decorative on both renderers — retained so saved values survive.
+// - CORRECTION `sw_stipplealpha` / `r_translucency`: NOT read on both sides.
+//   `packages/sw-renderer/src/spans.ts` `translucencyModeFromCvars` reads both
+//   (mode 0 = opaque fallback, 1 = alphamap blend, 2 = screen-door stipple) and
+//   `frame.ts` takes pixel effect from it → software-supported. `appearance.ts`
+//   lists both as UNSUPPORTED `policy-note`s (the GPU always true-blends; the
+//   CPU stipple path has no GPU equivalent) → webgl-unsupported.
+// - CORRECTION `r_drawworld`: read NOWHERE live. `appearance.ts` lists it as
+//   an UNSUPPORTED `policy-note` (the GPU always draws the submitted world)
+//   and `packages/sw-renderer` never reads it. Decorative on both renderers.
+// - CORRECTION `r_brightness`: NOT shared. Only `resolveDisplay` in
+//   `apps/web/src/play.ts` applies it (`getBrightness` → post-resolve lift);
+//   `frameGpuPlay` never calls it and `packages/webgl-renderer` has no
+//   brightness code → software-supported, webgl-unsupported.
+// - `cl_showfps`/`cl_showpos`: HUD conchars overlays painted post-resolve on
+//   both paths (`drawPlayHud` / `paintHudOverlay`) → shared.
+// - `skill`/`map_source`/`vid_resolution`/`vid_renderer`: boot/resize/backend
+//   selection, renderer-independent → shared.
+// - `cl_predict`: `packages/client/src/prediction.ts` (+ host/play) consume it
+//   → shared. CORRECTION `cl_interp`: NO consumer outside config + the dom
+//   panel (repo-wide grep) → decorative on both (cvar retained, not removed).
+// - `s_volume`/`sensitivity`/`m_yaw`/`m_pitch`: audio/input, no renderer
+//   gating → shared.
+
+/** Renderer that actually runs a frame (post-fallback). Failed-GPU fallback counts as software. */
+export type EffectiveRenderer = 'software' | 'webgl2-experimental';
+
+/** A cvar name in the capability table (open string: unknown names stay shared, never brick the panel). */
+export type CVarName = string;
+
+/** Per-renderer support for one cvar + the short human reason for tooltips/disabled labels. */
+export interface CVarRendererSupport {
+  software: boolean;
+  webgl2: boolean;
+  reason: string;
+}
+
+export const RENDERER_CVAR_SUPPORT: Record<CVarName, CVarRendererSupport> = Object.freeze({
+  // --- WebGL-only Voodoo effects (software reads no vd_*) ---
+  vd_16bit: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: RGB565 quantise at the GPU resolve; the indexed software path never quantises.' },
+  vd_dither: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: ordered dither at GPU target writes; software has no dither stage.' },
+  vd_postfilter: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: scanout reconstruction filter; software presents the palette expand directly.' },
+  vd_bilinear: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: GPU sampler filtering switch; software span sampling ignores it.' },
+  vd_mipdither: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: single-TMU trilinear pick; software has no mip-dither stage.' },
+  vd_fog: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: 64-entry table-fog gate; software never reads it.' },
+  vd_gamma: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: display-stage transfer LUT; software has no gamma stage.' },
+  vd_lodbias: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: mip LOD bias uniform; software mip selection never reads it.' },
+  vd_overbright: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: lightmap x2 modulate + clamp; software lighting ignores it.' },
+  vd_maxtexsize: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: upload cap enforced at GPU upload; software uses fixed caps and ignores it.' },
+  vd_zbits: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: depth-target precision (16/24-bit); software depth is not cvar-gated.' },
+  vd_dithermode: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: write-matrix profile (4x4/2x2 live uniform); software has no dither stage.' },
+  vd_reconmode: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: scanout reconstruction profile (live uniform); software has no reconstruction stage.' },
+  vd_rgbmaxdelta: { software: false, webgl2: true, reason: 'WebGL-only Voodoo effect: reconstruction edge-gate thresholds (live uniform); software has no reconstruction stage.' },
+  // --- Software-only span/display controls (GPU path never touches the CPU rasteriser) ---
+  sw_workers: { software: true, webgl2: false, reason: 'Software-only span control: banded SAB raster threads; the GPU path never rasterises on the CPU.' },
+  sw_wasm: { software: true, webgl2: false, reason: 'Software-only span control: WASM spanfill backend; the GPU path has no CPU spanfill.' },
+  sw_accum: { software: true, webgl2: false, reason: 'Software-only span control: coalesced pool span-batch kick; the GPU path has no pool kicks.' },
+  r_translucency: { software: true, webgl2: false, reason: 'Software-only world control: opaque-fallback vs alphamap blend; the GPU always blends.' },
+  sw_stipplealpha: { software: true, webgl2: false, reason: 'Software-only world control: screen-door stipple; the GPU always true-blends.' },
+  r_brightness: { software: true, webgl2: false, reason: 'Software-only display lift: applied post-resolve on the software path; the GPU path never applies it.' },
+  // --- Decorative on both (retained cvars, no pixel effect anywhere) ---
+  sw_gamma: { software: false, webgl2: false, reason: 'No effect on either renderer: nothing reads it (software has no gamma stage; the GPU uses vd_gamma).' },
+  r_drawworld: { software: false, webgl2: false, reason: 'No effect on either renderer: neither backend gates world submission on it.' },
+  vd_palettetex: { software: false, webgl2: false, reason: 'No effect on either renderer: storage policy only (GPU always expanded RGB, software always indexed; filtering identical).' },
+  cl_interp: { software: false, webgl2: false, reason: 'No effect on either renderer: no consumer reads it (entity interpolation never consults it).' },
+  // --- Shared (no renderer gating) ---
+  vid_renderer: { software: true, webgl2: true, reason: 'Shared backend selector: picks which renderer runs.' },
+  vid_resolution: { software: true, webgl2: true, reason: 'Shared setting: framebuffer size resizes in place on both renderers.' },
+  skill: { software: true, webgl2: true, reason: 'Shared setting: difficulty latched at boot, renderer-independent.' },
+  map_source: { software: true, webgl2: true, reason: 'Shared setting: level source (reboots the level on both renderers).' },
+  cl_showfps: { software: true, webgl2: true, reason: 'Shared HUD overlay: fps readout painted on both renderers.' },
+  cl_showpos: { software: true, webgl2: true, reason: 'Shared HUD overlay: position readout painted on both renderers.' },
+  cl_predict: { software: true, webgl2: true, reason: 'Shared client setting: local-player prediction between snapshots, renderer-independent.' },
+  s_volume: { software: true, webgl2: true, reason: 'Shared audio setting: master volume, renderer-independent.' },
+  sensitivity: { software: true, webgl2: true, reason: 'Shared input setting: mouse sensitivity, renderer-independent.' },
+  m_yaw: { software: true, webgl2: true, reason: 'Shared input setting: mouse yaw scale, renderer-independent.' },
+  m_pitch: { software: true, webgl2: true, reason: 'Shared input setting: mouse pitch scale, renderer-independent.' },
+});
+
+/** Generic reason for cvars absent from the table (new cvars stay shared — never brick the panel). */
+export const UNKNOWN_CVAR_SUPPORT_REASON =
+  'Shared setting: applies to every renderer.' as const;
+
+/**
+ * Resolve the renderer that actually runs a frame. Failed-GPU fallback
+ * (incapable device, unknown id, retired `voodoo`) runs the software path,
+ * so it counts as `software` — capability checks must use this, never the
+ * raw `vid_renderer` request. Never throws (unknown input falls back to
+ * software via `describeRendererSelection`).
+ */
+export function resolveEffectiveRenderer(requested: string, gpuAvailable: boolean): EffectiveRenderer {
+  try {
+    return describeRendererSelection(requested, gpuAvailable).active;
+  } catch {
+    return 'software';
+  }
+}
+
+/**
+ * True when changing `name` can affect pixels on `effectiveRenderer`.
+ * Unknown cvars default to supported/shared (never brick the panel on new
+ * cvars). Never throws.
+ */
+export function isCVarSupportedBy(name: string, effectiveRenderer: EffectiveRenderer): boolean {
+  try {
+    const entry = RENDERER_CVAR_SUPPORT[name];
+    if (entry === undefined) return true;
+    return effectiveRenderer === 'software' ? entry.software : entry.webgl2;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Short human explanation for the panel tooltip/disabled label.
+ * Unknown cvars get a generic shared reason. Never throws, never empty.
+ */
+export function supportReason(name: string, effectiveRenderer: EffectiveRenderer): string {
+  try {
+    const entry = RENDERER_CVAR_SUPPORT[name];
+    if (entry === undefined) return UNKNOWN_CVAR_SUPPORT_REASON;
+    void effectiveRenderer;
+    return entry.reason.length > 0 ? entry.reason : UNKNOWN_CVAR_SUPPORT_REASON;
+  } catch {
+    return UNKNOWN_CVAR_SUPPORT_REASON;
+  }
+}
 // --- feature flags (prime directive: land risky work behind a flag) ---
 // Shared identity across ESM/CJS copies via the globalThis store (see above).
 export const features: {

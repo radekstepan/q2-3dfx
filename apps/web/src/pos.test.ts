@@ -5,9 +5,9 @@
 // pixels are asserted on headless framebuffers (same pattern as the fps
 // lane): no DOM overlay owns the readout anymore.
 import { afterEach, describe, expect, it } from 'vitest';
-import { getCVarNumber, getCVarString, resetCVars, setCVar } from '@q2/config';
+import { getCVarNumber, getCVarString, isCVarSupportedBy, resetCVars, setCVar } from '@q2/config';
 import { bootPlay, drawPlayHud, formatPlayerPos, playerPosText, posHudAnchor, posVisible, POS_GREY } from './play.js';
-import { CHECKBOX_CVARS, cvarControlKind, cvarDescription, cvarIsCheckbox, renderCvarPanel, showPosEnabled } from './dom.js';
+import { CHECKBOX_CVARS, cvarControlKind, cvarDescription, cvarIsCheckbox, effectivePanelRenderer, renderCvarPanel, showPosEnabled } from './dom.js';
 
 afterEach(() => {
   resetCVars();
@@ -228,12 +228,26 @@ describe('player position readout (in-canvas conchars, top-left, cl_showpos)', (
       const container = new FakeContainer();
       const seen: Array<[string, string]> = [];
       const names = renderCvarPanel(container, '', (n, v) => seen.push([n, v]));
+      // RELEASE-10: the panel keys on the effective renderer (headless =
+      // software). Unsupported controls are disabled, not operable: a change
+      // dispatch is a no-op and the saved value is retained.
+      const effective = effectivePanelRenderer();
       for (const name of CHECKBOX_CVARS) {
         if (!names.includes(name)) continue; // lazily registered: pinned statically above
         const row = container.children.find((r) => r.children[0]?.textContent === name);
         expect(row).toBeDefined();
         const box = row!.children[1]!;
         expect(box.type).toBe('checkbox');
+        if (!isCVarSupportedBy(name, effective)) {
+          expect((box as unknown as { disabled?: boolean }).disabled).toBe(true);
+          const retained = getCVarString(name);
+          box.checked = !(getCVarNumber(name) !== 0);
+          box.dispatch('change');
+          expect(getCVarString(name)).toBe(retained);
+          expect(seen.some(([n]) => n === name)).toBe(false);
+          box.checked = retained !== '0';
+          continue;
+        }
         const initial = getCVarString(name);
         const flipped = initial === '1' ? '0' : '1';
         box.checked = flipped === '1';

@@ -13,6 +13,7 @@ import {
   getResolution,
   measureFrameStages,
   resizePlay,
+  setPanelRefreshHook,
 } from './play.js';
 import type { AsyncLoopState, PlayBoot, RendererKind, StageReport } from './play.js';
 import { blitToCanvas } from './dom.js';
@@ -29,8 +30,10 @@ export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
 export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';export { blitToCanvas, blitCopyRGBA, blitIsLittleEndian, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, showFpsEnabled, showPosEnabled, cvarIsCheckbox, CHECKBOX_CVARS, cvarOptions, cvarControlKind, cvarOptionLabels, cvarDescription, CVAR_DESCRIPTIONS, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, MAP_SOURCE_LABELS, VID_RENDERER_LABELS, setMapSourceHasPak, getMapSourceHasPak, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS, pushConsoleLog, clearConsoleLog, resetConsoleLog, getConsoleLines, renderConsoleLines, attachConsoleClear, setModeReadout, MAX_CONSOLE_LINES } from './dom.js';
 export type { PlayLoop, ConsoleKind, ConsoleLine } from './dom.js';
+export { effectivePanelRenderer } from './dom.js';
 export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpExplosionLights, pumpBoltLights, pumpTracers, registerPakModels, replayPakAssetsToGpu, retainedSkyFromPak, syncGpuSky, loadSkyStrip, skyNameForMap, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, posHudAnchor, formatFpsText, fpsVisible, posVisible, formatPlayerPos, playerPosText, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, resizePlay, reservedDisplaySize, applyReservedSizeToCanvas, applyRendererCvar, buildHudPicCache, statusbarStateFor, drawStatusbarCmds, drawHelpOverlay, toggleHelpOverlay, RETAIL_SINGLE_STATUSBAR, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, POS_GREY, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, detectGpuCapability, getGpuStatus, resolveBootRenderer, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
 export type { PakModelHandles, RetainedModelAsset, RetainedPakAssets, RetainedSkinAsset, TracerBeam, RetainedSky, HudPicCache } from './play.js';
+export { setPanelRefreshHook } from './play.js';
 export {
   attachBrowserPool,
   buildAsyncView,
@@ -340,6 +343,9 @@ if (typeof document !== 'undefined') {
       dom.savePersistedCVars();
       if (cvarName === 'vid_renderer') {
         if (currentBoot) applyRendererCvar(currentBoot);
+        // RELEASE-10: the effective renderer (incl. failed-GPU fallback) may
+        // have changed — re-render the menu so capability labels stay live.
+        renderCvars();
         dom.pushConsoleLog(`vid_ref "${cvarName}" hot-swapped in place`, 'cmd');
         return;
       }
@@ -362,6 +368,8 @@ if (typeof document !== 'undefined') {
             } catch {
               /* CSS fit best-effort */
             }
+            // RELEASE-10: keep the menu capability mapping fresh after resize.
+            renderCvars();
             dom.pushConsoleLog(`vid_resolution ${res.width}x${res.height} resized in place (sim preserved)`, 'ok');
             return;
           }
@@ -378,8 +386,14 @@ if (typeof document !== 'undefined') {
       startWithPak(lastPak, lastName);
     };
     const renderCvars = (): void => {
-      if (cvars) dom.renderCvarPanel(cvars, '', onCvar);
+      // RELEASE-10: key the capability mapping on the EFFECTIVE renderer
+      // (the boot's recorded post-fallback value, never the raw request).
+      if (cvars) dom.renderCvarPanel(cvars, '', onCvar, currentBoot?.renderer ?? undefined);
     };
+    // RELEASE-10: single panel-refresh slot for the play-layer hook
+    // (switch/fallback/restore paths re-render the menu; no listener leak —
+    // one replaceable callback, installed once here).
+    setPanelRefreshHook(() => renderCvars());
     // Cached-first boot: a previous drop persists in IndexedDB, so one
     // drop survives reloads. Empty/corrupt cache → devroom, no error spam.
     const bootFromCache = async (): Promise<void> => {

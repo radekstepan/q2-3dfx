@@ -859,4 +859,7 @@ export const GPU_CVAR_GAPS: ReadonlyArray<CvarInterpretation> = Object.freeze([
   { cvar: 'sw_stipplealpha', kind: 'policy-note', note: 'UNSUPPORTED (screen-door stipple ignored): the GPU always true-blends; the CPU stipple path (mode 2) has no GPU equivalent. Documented deviation (true blending vs Voodoo screen-door).' },
   { cvar: 'r_drawworld', kind: 'policy-note', note: 'UNSUPPORTED (=0 world-hide ignored): the GPU always draws the submitted world selection. The play layer never sets it on the GPU path; hiding the world requires not submitting it.' },
   { cvar: 'sw_gamma', kind: 'policy-note', note: 'NOT READ (by design): the software 8-bit gamma path does not apply here; the GPU uses vd_gamma (display-stage RAMDAC placement) for the same role.' },
+  { cvar: 'sw_workers', kind: 'policy-note', note: 'UNSUPPORTED (CPU execution knob ignored): the GPU backend issues one GL submission per frame; software banded-SAB worker count has no GPU equivalent.' },
+  { cvar: 'sw_wasm', kind: 'policy-note', note: 'UNSUPPORTED (CPU execution knob ignored): selects the software TS/WASM span backend; the GPU backend never runs span fills.' },
+  { cvar: 'sw_accum', kind: 'policy-note', note: 'UNSUPPORTED (CPU execution knob ignored): software frame-accumulation batching; the GPU backend has no frame accumulator.' },
 ]);

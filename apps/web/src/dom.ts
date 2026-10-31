@@ -3,8 +3,10 @@
 // Browser-only. All functions no-op / return null without a DOM so Node
 // tests can import this module safely. Canvas code is isolated here —
 // `index.ts` and `devroom.ts` never touch `document`.
-import { getCVar, getCVarNumber, getCVarString, listCVars, registerCVar, setCVarFromString, sVolumeToOutputGain } from '@q2/config';
+import { getCVar, getCVarNumber, getCVarString, isCVarSupportedBy, listCVars, registerCVar, setCVarFromString, supportReason, sVolumeToOutputGain } from '@q2/config';
+import type { EffectiveRenderer } from '@q2/config';
 import { availableMapSources } from './play.js';
+import { resolveBootRenderer } from './gpu-select.js';
 import type { Framebuffer } from '@q2/renderer-api';
 import { ingestPak } from './pak.js';
 import type { WebPak } from './pak.js';
@@ -655,12 +657,14 @@ function defineQ2Elements(): void {
     private boxEl: HTMLInputElement | null = null;
     private pendingChecked = false;
     private pendingTitle: string | null = null;
+    private pendingDisabled = false;
     private ensureBox(): HTMLInputElement {
       let box = this.boxEl;
       if (!box) {
         box = document.createElement('input');
         box.type = 'checkbox';
         box.checked = this.pendingChecked;
+        box.disabled = this.pendingDisabled;
         if (this.pendingTitle !== null) box.title = this.pendingTitle;
         this.boxEl = box;
         this.appendChild(box);
@@ -685,6 +689,30 @@ function defineQ2Elements(): void {
       if (box) box.checked = v;
       else this.pendingChecked = v;
     }
+    /** RELEASE-10: disabled state mirrors to the inner native control (real
+     * `disabled` attribute on the wrapper + non-operable inner input). */
+    get disabled(): boolean {
+      const box = this.boxEl;
+      return box ? box.disabled : this.pendingDisabled;
+    }
+    set disabled(v: boolean) {
+      const on = v === true;
+      this.pendingDisabled = on;
+      try {
+        if (on) this.setAttribute('disabled', '');
+        else this.removeAttribute('disabled');
+      } catch {
+        /* headless/unsupported: the expando below still carries it */
+      }
+      const box = this.boxEl;
+      if (box) {
+        try {
+          box.disabled = on;
+        } catch {
+          /* headless stub */
+        }
+      }
+    }
     bindControlId(id: string): void {
       this.ensureBox().id = id;
     }
@@ -698,11 +726,13 @@ function defineQ2Elements(): void {
     private selEl: HTMLSelectElement | null = null;
     private pendingValue: string | null = null;
     private pendingTitle: string | null = null;
+    private pendingDisabled = false;
     private ensureSel(): HTMLSelectElement {
       let sel = this.selEl;
       if (!sel) {
         sel = document.createElement('select');
         if (this.pendingValue !== null) sel.value = this.pendingValue;
+        sel.disabled = this.pendingDisabled;
         if (this.pendingTitle !== null) sel.title = this.pendingTitle;
         this.selEl = sel;
         this.appendChild(sel);
@@ -727,6 +757,29 @@ function defineQ2Elements(): void {
       if (sel) sel.value = v;
       else this.pendingValue = v;
     }
+    /** RELEASE-10: disabled state mirrors to the inner native select. */
+    get disabled(): boolean {
+      const sel = this.selEl;
+      return sel ? sel.disabled : this.pendingDisabled;
+    }
+    set disabled(v: boolean) {
+      const on = v === true;
+      this.pendingDisabled = on;
+      try {
+        if (on) this.setAttribute('disabled', '');
+        else this.removeAttribute('disabled');
+      } catch {
+        /* headless/unsupported: the expando below still carries it */
+      }
+      const sel = this.selEl;
+      if (sel) {
+        try {
+          sel.disabled = on;
+        } catch {
+          /* headless stub */
+        }
+      }
+    }
     addOption(opt: HTMLOptionElement): void {
       this.ensureSel().appendChild(opt);
     }
@@ -744,12 +797,14 @@ function defineQ2Elements(): void {
     private inputEl: HTMLInputElement | null = null;
     private pendingValue = '';
     private pendingTitle: string | null = null;
+    private pendingDisabled = false;
     private ensureInput(): HTMLInputElement {
       let input = this.inputEl;
       if (!input) {
         input = document.createElement('input');
         input.type = 'text';
         input.value = this.pendingValue;
+        input.disabled = this.pendingDisabled;
         if (this.pendingTitle !== null) input.title = this.pendingTitle;
         this.inputEl = input;
         this.appendChild(input);
@@ -774,6 +829,29 @@ function defineQ2Elements(): void {
       if (input) input.value = v;
       else this.pendingValue = v;
     }
+    /** RELEASE-10: disabled state mirrors to the inner native input. */
+    get disabled(): boolean {
+      const input = this.inputEl;
+      return input ? input.disabled : this.pendingDisabled;
+    }
+    set disabled(v: boolean) {
+      const on = v === true;
+      this.pendingDisabled = on;
+      try {
+        if (on) this.setAttribute('disabled', '');
+        else this.removeAttribute('disabled');
+      } catch {
+        /* headless/unsupported: the expando below still carries it */
+      }
+      const input = this.inputEl;
+      if (input) {
+        try {
+          input.disabled = on;
+        } catch {
+          /* headless stub */
+        }
+      }
+    }
     bindControlId(id: string): void {
       this.ensureInput().id = id;
     }
@@ -792,17 +870,89 @@ function defineQ2Elements(): void {
 
 defineQ2Elements();
 
+/* --- RELEASE-10 renderer-gated panel (apps/web lane, boxes 2–3) ------------
+ *
+ * Capability source of truth is `@q2/config` (`RENDERER_CVAR_SUPPORT` +
+ * `isCVarSupportedBy`/`supportReason`, audited against real consumers box 1):
+ * every control the EFFECTIVE renderer cannot honor renders DISABLED (never
+ * hidden) with the support reason as its visible + screen-reader explanation.
+ * Keyed on the effective renderer INCLUDING fallback (failed-GPU requests run
+ * the software path, so they use the software mapping — never stale GPU
+ * labels). Saved values are retained: disabling never resets a cvar, so the
+ * value is live again when its renderer returns. Shared cvars (HUD, boot,
+ * audio/input, prediction) stay usable on both renderers.
+ */
+
+/**
+ * Effective renderer the panel keys its capability mapping on
+ * (post-fallback). An explicit `active` (the boot's recorded renderer —
+ * `PlayBoot.renderer`, already fallback-resolved) wins; otherwise resolve
+ * live from the `vid_renderer` cvar + GPU capability probe, so a failed-GPU
+ * request counts as software. Never throws (falls back to software).
+ */
+export function effectivePanelRenderer(active?: string | null): EffectiveRenderer {
+  try {
+    if (active === 'software' || active === 'webgl2-experimental') return active;
+    return resolveBootRenderer().kind;
+  } catch {
+    return 'software';
+  }
+}
+
+/**
+ * Disable one panel control with its capability reason: a real `disabled`
+ * attribute (focusable-read, not operable) + `aria-label` carrying the
+ * reason for screen readers + extended tooltip. Returns the full tooltip
+ * text (also applied to the row/label by the caller). Headless-safe: fake
+ * nodes get the expando + a recorded attribute. Never throws.
+ */
+function disablePanelControl(
+  control: unknown,
+  name: string,
+  effective: EffectiveRenderer,
+  reason: string,
+): string {
+  const tip = cvarDescription(name);
+  const full = tip
+    ? `${tip} (disabled on ${effective}: ${reason})`
+    : `disabled on ${effective}: ${reason}`;
+  const label = `${name}: disabled on ${effective} — ${reason}`;
+  try {
+    const el = control as {
+      disabled?: boolean;
+      title?: string;
+      setAttribute?: (k: string, v: string) => void;
+    };
+    el.disabled = true;
+    try {
+      el.setAttribute?.('disabled', '');
+    } catch { /* fake node without setAttribute: expando above covers it */ }
+    try {
+      el.setAttribute?.('aria-label', label);
+    } catch { /* fake node: expando below covers it */ }
+    (control as Record<string, unknown>)['ariaLabel'] = label;
+    el.title = full;
+  } catch {
+    /* non-object stub: row/label tooltips still carry the reason */
+  }
+  return full;
+}
+
 /** Render a cvar editor panel into a container. Returns bound cvar names. */
 export function renderCvarPanel(
   container: unknown,
   filter = '',
   onChange: (name: string, value: string) => void = () => undefined,
+  active?: string | null,
 ): string[] {
   ensureHudCvars();
   const all = listCVars()
     .map((c) => c.name)
     .filter((n) => !filter || n.includes(filter));
   if (typeof document === 'undefined' || !container) return all;
+  // Capability mapping keys on the EFFECTIVE renderer (explicit boot record
+  // wins; otherwise live cvar + capability probe incl. failed-GPU fallback).
+  const effective = effectivePanelRenderer(active ?? undefined);
   const node = container as HTMLElement;
   node.innerHTML = '';
   const names: string[] = [];
@@ -821,7 +971,7 @@ export function renderCvarPanel(
     head.textContent = group;
     node.appendChild(head);
     for (const name of grouped) {
-      renderCvarRow(node, name, onChange);
+      renderCvarRow(node, name, onChange, effective);
       names.push(name);
     }
   }
@@ -833,22 +983,46 @@ function renderCvarRow(
   node: HTMLElement,
   name: string,
   onChange: (n: string, v: string) => void,
+  effective: EffectiveRenderer,
 ): void {
   const row = document.createElement('q2-cvar-row');
   row.className = 'q2-cvar-row';
+  // Capability gate: unsupported controls are DISABLED (never hidden, never
+  // reset) with the support reason as the visible + screen-reader note.
+  const supported = isCVarSupportedBy(name, effective);
+  const reason = supported ? null : supportReason(name, effective);
   // On-hover description for the row (tooltip source: the cvar registry
   // doc, static fallback in CVAR_DESCRIPTIONS — see cvarDescription).
   const tip = cvarDescription(name);
-  if (tip) row.title = tip;
+  const fullTip = reason !== null
+    ? (tip ? `${tip} (disabled on ${effective}: ${reason})` : `disabled on ${effective}: ${reason}`)
+    : tip;
+  if (fullTip) row.title = fullTip;
   const label = document.createElement('label');
   label.textContent = name;
-  if (tip) label.title = tip;
+  if (fullTip) label.title = fullTip;
   // Keyboard access: label linked to the inner native control (real DOM
   // forwards via bindControlId; fakes keep the expando harmlessly).
   const controlId = `q2c-${name}`;
   (label as unknown as { htmlFor?: string }).htmlFor = controlId;
   const options = cvarOptions(name);
   const current = getCVarString(name);
+  // Disabled rows keep their saved value on the control (retained for when
+  // the renderer supports them again) and gain a visible reason note.
+  const noteDisabled = (control: unknown): void => {
+    if (reason === null) return;
+    disablePanelControl(control, name, effective, reason);
+    const why = document.createElement('span');
+    why.className = 'q2-cvar-why';
+    why.textContent = `Disabled on ${effective}: ${reason}`;
+    row.appendChild(why);
+  };
+  // A disabled control is not operable: real DOM never fires `change` on it;
+  // the guard below makes headless dispatches match (no-ops, never clobber).
+  const gated = (apply: () => void): void => {
+    if (!isCVarSupportedBy(name, effective)) return;
+    apply();
+  };
   if (cvarIsCheckbox(name)) {
     // Boolean checkbox: element-local `change` only, no document-level
     // mouse wiring, so toggling never produces game input (canvas
@@ -859,16 +1033,19 @@ function renderCvarRow(
     if (tip) box.title = tip;
     bindControlId(box, controlId);
     box.addEventListener('change', () => {
-      try {
-        const next = box.checked ? '1' : '0';
-        setCVarFromString(name, next);
-        onChange(name, next);
-      } catch {
-        box.checked = getCVarNumber(name) !== 0;
-      }
+      gated(() => {
+        try {
+          const next = box.checked ? '1' : '0';
+          setCVarFromString(name, next);
+          onChange(name, next);
+        } catch {
+          box.checked = getCVarNumber(name) !== 0;
+        }
+      });
     });
     row.appendChild(label);
     row.appendChild(box as unknown as HTMLElement);
+    noteDisabled(box);
   } else if (options !== null) {
     const select = document.createElement('q2-select') as unknown as Q2ValueNode;
     if (tip) select.title = tip;
@@ -888,30 +1065,36 @@ function renderCvarRow(
     }
     select.value = current;
     select.addEventListener('change', () => {
-      try {
-        setCVarFromString(name, select.value);
-        onChange(name, select.value);
-      } catch {
-        select.value = getCVarString(name);
-      }
+      gated(() => {
+        try {
+          setCVarFromString(name, select.value);
+          onChange(name, select.value);
+        } catch {
+          select.value = getCVarString(name);
+        }
+      });
     });
     row.appendChild(label);
     row.appendChild(select as unknown as HTMLElement);
+    noteDisabled(select);
   } else {
     const input = document.createElement('q2-text') as unknown as Q2ValueNode;
     input.value = current;
     if (tip) input.title = tip;
     bindControlId(input, controlId);
     input.addEventListener('change', () => {
-      try {
-        setCVarFromString(name, input.value);
-        onChange(name, input.value);
-      } catch {
-        input.value = getCVarString(name);
-      }
+      gated(() => {
+        try {
+          setCVarFromString(name, input.value);
+          onChange(name, input.value);
+        } catch {
+          input.value = getCVarString(name);
+        }
+      });
     });
     row.appendChild(label);
     row.appendChild(input as unknown as HTMLElement);
+    noteDisabled(input);
   }
   node.appendChild(row);
 }

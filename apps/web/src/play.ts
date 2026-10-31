@@ -4016,6 +4016,8 @@ export function notifyGpuContextLost(boot: PlayBoot): boolean {
   } catch {
     /* the backend records loss per contract; the shell flag still gates */
   }
+  // RELEASE-10: refresh the menu mapping (submission is gated while lost).
+  refreshPanelAfterRendererChange();
   return true;
 }
 
@@ -4060,6 +4062,8 @@ export function notifyGpuContextRestored(boot: PlayBoot): boolean {
   }
   g.contextLost = false;
   g.restoreCount++;
+  // RELEASE-10: the backend is live again — refresh the menu mapping.
+  refreshPanelAfterRendererChange();
   return true;
 }
 
@@ -4359,6 +4363,9 @@ export function rebootPlay(prev: PlayBoot): PlayBoot {
   // (see applyRendererCvar) without rebuilding Host/LocalDriver/server
   // state. Skill/map reboot through this path; resolution resizes in place.
   const next = bootPlay({ pak, width: prev.host.fb.width, height: prev.host.fb.height });
+  // RELEASE-10: a reboot re-resolves the boot (renderer included) — refresh
+  // the menu mapping with it.
+  refreshPanelAfterRendererChange();
   return next;
 }
 
@@ -4448,6 +4455,9 @@ export function resizePlay(boot: PlayBoot, width: number, height: number): boole
     ) {
       return false;
     }
+    // RELEASE-10: keep the menu mapping fresh (renderer unchanged here, but
+    // the refresh path is the same single re-render — no extra listeners).
+    refreshPanelAfterRendererChange();
     return true;
   } catch {
     return false;
@@ -4497,6 +4507,33 @@ function gpuPaletteFor(boot: PlayBoot): Uint8Array | null {
     return parsePCX(bytes).palette;
   } catch {
     return devroomPaletteForGpu();
+  }
+}
+
+/* --- RELEASE-10 panel refresh hook (apps/web only) ----------------------
+ *
+ * Single replaceable callback (never a listener list: no accumulation across
+ * boot/switch cycles). The browser boot layer owns the settings panel and
+ * installs `() => <re-render the menu>` once; every path that can change the
+ * effective renderer — `applyRendererCvar` (switch + failed-GPU fallback),
+ * `rebootPlay`, `resizePlay`, `notifyGpuContextLost/Restored` — invokes it
+ * best-effort so the panel re-renders with the live capability mapping (no
+ * stale labels). Headless/tests: null by default. Never throws.
+ */
+let panelRefreshHook: (() => void) | null = null;
+
+/** Install (or clear) the panel re-render callback. Single slot, replaceable. */
+export function setPanelRefreshHook(fn: (() => void) | null): void {
+  panelRefreshHook = fn;
+}
+
+/** Invoke the panel hook best-effort: refresh failures never break sim/present. */
+function refreshPanelAfterRendererChange(): void {
+  if (panelRefreshHook === null) return;
+  try {
+    panelRefreshHook();
+  } catch {
+    /* panel refresh is best-effort */
   }
 }
 
@@ -4585,6 +4622,9 @@ export function applyRendererCvar(boot: PlayBoot): RendererKind {
   // Shell-owned scratch: zero so the next frame can never show
   // previous-mode pixels (engine planes are repainted by the next render).
   boot.display.fill(0);
+  // RELEASE-10: the effective renderer may have changed (or fallen back) —
+  // re-render the menu so capability labels cannot go stale.
+  refreshPanelAfterRendererChange();
   return boot.renderer;
 }
 

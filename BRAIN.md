@@ -300,15 +300,6 @@ done-when:
 - [x] Repair stale/incorrect collision, activation or geometry state against map/original behavior; never disable all mover collision or teleport the player to pass the test.
 - [ ] Extend real-base1 gate to walk from outside through the doorway, board, operate intended control, ride and finish. Assert no invisible obstruction and no premature departure; capture the complete route. Tests starting on the platform do not close boarding acceptance.
 
-### RELEASE-10 — Disable controls unsupported by the active renderer
-owns: `apps/web`, `packages/config`, `packages/renderer-api`, `packages/webgl-renderer`
-depends: none
-status: ready
-done-when:
-- [ ] Audit every right-panel option against actual Software/WebGL2 consumers, including `sw_*`, `vd_*`, worker settings and shared controls. Build one capability mapping based on effective renderer, including fallback; do not infer support solely from name prefixes.
-- [ ] Disable irrelevant controls with a brief explanation, refresh immediately on switch/fallback/restore, retain saved values for when the renderer supports them, and keep shared settings usable. Do not silently imply unsupported options affect rendering.
-- [ ] Test real panel enablement and setting effects in each renderer and failed-GPU fallback; verify keyboard/accessibility disabled state and no stale capability labels.
-
 ### RELEASE-11 — Toggle gameplay status messages
 owns: `apps/web`, `packages/config`
 depends: none
