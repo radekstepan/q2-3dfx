@@ -335,7 +335,8 @@ done-when:
 ### GPU-FOLLOW-7 — Final integrated acceptance
 owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config` (integrator)
 depends: RELEASE-1 through RELEASE-8, RELEASE-3B, GPU-FOLLOW-3B, GPU-FOLLOW-5, GPU-FOLLOW-6
-status: ready
+status: blocked
+blockers-2026-10-31: FOLLOW-6 BLOCKED (DISPLAY_ABSENT, no vsync/scanout — gate record docs/gpu-follow-6-gate-record.md); FOLLOW-5 fidelity contract proposal (tone-normalized 0.02 gate) NEEDS USER APPROVAL, NOT applied — automated F1 FAIL stands loud. `sound→config` resolved (deps:check 676 ok); full verify 78/80 with 4 known load/contention failures recorded. GPU stays experimental (`software | webgl2-experimental`, persisted `voodoo`→`software` warned); no default rollout. All implementation lanes committed below; no push.
 done-when:
 - [ ] Resolve the reported `sound → config` dependency-rule violations without weakening the dependency gate; run `yarn verify`, `yarn deps:check`, real-asset base1, retained software and GPU lifecycle/image/gameplay gates after legacy retirement on the integrated result. Record skipped coverage and preserve CPU/Node support.
 - [ ] Publish separate implementation, correctness, fidelity and displayed-performance verdicts with commits/artifacts; reconcile contradictory PASS/GO claims in existing reports. Carry forward precise unresolved blockers.
