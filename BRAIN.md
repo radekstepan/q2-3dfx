@@ -7,9 +7,10 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-30, reviewed at `2c4c162`): sky borders and
-> sky through windows are fixed and user-confirmed. Repair water seams,
-> presentation, audio and gameplay issues below; retire the legacy CPU Voodoo
+> **Current direction (2026-10-30, RELEASE-3 done): sky borders and
+> sky through windows are fixed and user-confirmed; aim/HUD alignment at all
+> resolutions is repaired and browser-verified. Repair water seams,
+> audio and gameplay issues below; retire the legacy CPU Voodoo
 > renderer in favor of WebGL2. CPU optimization stays paused. §8 is the only
 > active queue; old TASK.md and historical reviews do not override it.**
 
@@ -271,7 +272,7 @@ benchmarks or tests. Do not describe its diagnoses as reproduced fixes.
   removes the selected-sky-ref background gate. Details and implementation
   evidence are in `docs/tasks-archive.md`; preserve cold boot/switch/restore and
   opaque occlusion. The older `d934fdc` review is historical, not current status.
-- **Open:** water seams, aim/presentation, elevator, infantry collision, asset UI,
+- **Open:** water seams, elevator, infantry collision, asset UI,
   restart-free settings, startup sizing and legacy retirement. The user retested
   and still sees these defects after `2c4c162`. Wall climbing remains unconfirmed;
   infantry fire still needs an actual source/visual audit. Water motion is satisfactory.
@@ -279,8 +280,9 @@ benchmarks or tests. Do not describe its diagnoses as reproduced fixes.
   feedback does not confirm or reject them. Preserve the work, verify outstanding
   acceptance criteria, and do not conflate implementation with visual sign-off.
 - **Review:** `docs/review-2c4c162.md` records unsupported completion claims and
-  test limitations. RELEASE-3/4/5 are reopened. Elapsed effort and test counts
-  are not acceptance evidence.
+  test limitations. RELEASE-4/5 remain reopened; RELEASE-3 is re-closed by the
+  fitted-presentation repair (archived with browser evidence). Elapsed effort and
+  test counts are not acceptance evidence.
 - **Backend terminology:** the user's “new webgpu renderer” refers to the new
   GPU path; this tree implements WebGL2 (`packages/webgl-renderer`), not WebGPU.
 - **Acceptance remains open:** the latest archived sky report records a failing
@@ -288,8 +290,7 @@ benchmarks or tests. Do not describe its diagnoses as reproduced fixes.
   Earlier reports also mention PROOF-3 CDP timeout. Reproduce current failures
   under FOLLOW-5 rather than assuming every historical failure remains current.
 
-Priority: RELEASE-3 (aim/HUD),
-RELEASE-4/5 (gameplay), GPU-FOLLOW-3B (water), RELEASE-6 (asset UI), RELEASE-7
+Priority: RELEASE-4/5 (gameplay), GPU-FOLLOW-3B (water), RELEASE-6 (asset UI), RELEASE-7
 (settings/startup), RELEASE-8 (legacy retirement), then FOLLOW-5/6 → FOLLOW-7. Verify RELEASE-1/2 independently.
 Never tick a behavior/visual box from a constant assertion, formula mirror, stub
 call count or pre-existing unrelated test. Require a reproduction of the actual
@@ -319,17 +320,6 @@ starting-points: `play.ts: bootPlay/applyRendererCvar`, `devroom.ts`, `devroom-f
 done-when:
 - [ ] Reproduce the black room on GPU cold boot and switching. Review finding: boot GPU world/palette setup is guarded by `mainPalette`; without a pak the current code explicitly leaves the devroom CPU/clear-only. Supply the procedural world, palette and models required by GPU, including restore/replay.
 - [ ] Real-WebGL pixels show expected room geometry/materials and entities without pak assets; verify cold boot, map switch, renderer switch and context restoration. Check that an intentional missing-world control fails; nonblack clear color alone is insufficient.
-
-### RELEASE-3 — Align aim and overlays at every resolution
-owns: `apps/web`, `packages/webgl-renderer`, `packages/input`, `packages/testkit`
-depends: none
-status: ready
-starting-points: `play.ts: drawPlayHud/frameGpuPlay`, `gpu-canvas.ts`, `gpu-presentation.test.ts`, `dom.ts: startPlayLoop`, `apps/web/index.html`
-review-finding: viewport self-heal did not fix the user’s presentation issue. `startPlayLoop` still requests framebuffer×2 CSS size; HUD is in flex flow while GL is absolute, with max-size/object-fit constraints. Inspect actual browser rectangles/content bounds; matching backing sizes is insufficient.
-done-when:
-- [ ] Reproduce the user’s actual browser failures: at **800×600 and above on WebGL2**, crosshair/cursor does not match shot direction; weapon, FPS, position and other overlays drift or disappear. At **800×600 WebGL2** the weapon and FPS/position need to appear higher; at **1024×768 Software** the entire rendered canvas shifts down. Trace internal framebuffer, GPU viewport, HUD buffer, CSS display rectangle, pointer coordinates and device pixel ratio; do not assume the cause from the symptom.
-- [ ] Use consistent dimensions/projection and anchoring for world, HUD and input. Verify shot ray/impact against crosshair with a known target (accounting for intended weapon muzzle parallax), and top/bottom HUD placement at all offered resolutions, CSS scaling/fullscreen and representative DPRs.
-- [ ] Replace arithmetic/tautological aim tests with real-browser checks of canvas/content rectangles, rendered crosshair versus a shot at a known target, and visible HUD/viewmodel bounds. Cover 640×480, 800×600 and 1024×768 on Software and WebGL2 before/after settings changes. Include viewport size, DPR, scroll/fullscreen and screenshots; do not fix this with a resolution-specific vertical offset.
 
 ### RELEASE-4 — Correct final elevator activation and waiting
 owns: `packages/server`, `packages/game`, `apps/web`

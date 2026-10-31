@@ -668,7 +668,8 @@ async function runBrowserRoute(outDir: string): Promise<BrowserRouteEvidence> {
         await page.evaluate<void>(SHOT_STATS_INSTALL, 30000);
         // Canvas-box clip: capture exactly the composed game page (the GL
         // scene + HUD overlay), never the surrounding config UI. The soak
-        // loop displays the 640x480 framebuffer at 2x CSS (1280x960).
+        // loop fits the 640x480 framebuffer to the stage at its aspect
+        // (RELEASE-3: uniform scale, no letterbox bands).
         const box = await page.evaluate<{ x: number; y: number; width: number; height: number } | null>(
           '(() => { const c = document.querySelector("#q2"); if (!c) return null; const r = c.getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; })()',
           30000,

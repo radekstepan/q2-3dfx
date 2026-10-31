@@ -1629,7 +1629,106 @@ export function publishQ2Stats(boot: PlayBoot, fps: number, frame: number): Q2St
 /**
  * Drive a booted game on a canvas: pointer-lock input, rAF frames,
  * voodoo resolve, HUD, blit, and gesture-unlocked sound. No-op without DOM.
+ *
+ * Display geometry (RELEASE-3): the CSS display box is FITTED to the stage
+ * at the framebuffer aspect (see `fitPlayCanvas`), never framebuffer-x2
+ * blindly — x2 overflows the bezel at 800x600+ and the max-width/height +
+ * object-fit caps then letterbox the content (drifting centers, HUD below
+ * the fold). Both canvases share the identical fitted box, so the scene
+ * center and the HUD crosshair coincide at every offered resolution.
  */
+export interface CanvasFit {
+  cssW: number;
+  cssH: number;
+  /** Uniform display scale (cssW/fbW == cssH/fbH up to 1px floor rounding). */
+  scale: number;
+  /** True when the sizes were applied to live DOM nodes. */
+  applied: boolean;
+}
+
+/**
+ * Pure fit: largest integer CSS box with the framebuffer aspect that fits
+ * availW x availH. Floors (never exceeds the available space); degenerate
+ * inputs degrade to a 1x box instead of NaN/zero CSS sizes. Headless-safe.
+ */
+export function fitScaleForStage(
+  fbW: number,
+  fbH: number,
+  availW: number,
+  availH: number,
+): { cssW: number; cssH: number; scale: number } {
+  const fw = Number.isFinite(fbW) && fbW > 0 ? fbW : 1;
+  const fh = Number.isFinite(fbH) && fbH > 0 ? fbH : 1;
+  const aw = Number.isFinite(availW) && availW > 0 ? availW : fw * 2;
+  const ah = Number.isFinite(availH) && availH > 0 ? availH : fh * 2;
+  const raw = Math.min(aw / fw, ah / fh);
+  const s = Number.isFinite(raw) && raw > 0 ? raw : 1;
+  return { cssW: Math.max(1, Math.floor(fw * s)), cssH: Math.max(1, Math.floor(fh * s)), scale: s };
+}
+
+/**
+ * Fit a play canvas to the stage at the framebuffer aspect and mirror the
+ * box onto the GL overlay (see `syncGpuCanvasToHud`), so scene pixels and
+ * HUD pixels scale together with one shared center. Available space is the
+ * `#q2-stage` client box minus its padding and the bezel border; when the
+ * stage is not measurable (stub DOMs, pre-layout boots) it falls back to
+ * the viewport minus the sidebar/console chrome, then to the legacy
+ * framebuffer-x2 box. The framebuffer — and the sim behind it — is never
+ * touched, only the CSS display box. Headless-safe: returns applied:false
+ * without a DOM and never throws.
+ */
+export function fitPlayCanvas(canvas: unknown, fbW: number, fbH: number): CanvasFit {
+  const fallback = fitScaleForStage(fbW, fbH, fbW * 2, fbH * 2);
+  if (typeof document === 'undefined' || typeof window === 'undefined' || !canvas) {
+    return { ...fallback, applied: false };
+  }
+  try {
+    const el = canvas as HTMLCanvasElement;
+    let availW = 0;
+    let availH = 0;
+    try {
+      const stage = document.querySelector('#q2-stage') as {
+        clientWidth?: unknown;
+        clientHeight?: unknown;
+      } | null;
+      const sw = typeof stage?.clientWidth === 'number' ? stage.clientWidth : 0;
+      const sh = typeof stage?.clientHeight === 'number' ? stage.clientHeight : 0;
+      if (sw > 0 && sh > 0) {
+        // Stage padding is 12px vertical / 16px horizontal (see index.html)
+        // plus the 1px bezel border each side.
+        availW = Math.max(1, sw - 34);
+        availH = Math.max(1, sh - 26);
+      }
+    } catch {
+      /* viewport fallback below */
+    }
+    if (!(availW > 0) || !(availH > 0)) {
+      try {
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        if (vw > 0 && vh > 0) {
+          availW = Math.max(1, vw - 400);
+          availH = Math.max(1, vh - 220);
+        }
+      } catch {
+        /* legacy fallback below */
+      }
+    }
+    const fit = fitScaleForStage(fbW, fbH, availW, availH);
+    el.style.imageRendering = 'pixelated';
+    el.style.width = `${fit.cssW}px`;
+    el.style.height = `${fit.cssH}px`;
+    try {
+      syncGpuCanvasToHud(undefined, el);
+    } catch {
+      /* HUD still presents at its fitted size */
+    }
+    return { ...fit, applied: true };
+  } catch {
+    return { ...fallback, applied: false };
+  }
+}
+
 export function startPlayLoop(
   canvas: unknown,
   boot: PlayBoot,
@@ -1640,18 +1739,25 @@ export function startPlayLoop(
   if (typeof document === 'undefined' || typeof window === 'undefined' || !canvas) return noop;
   const el = canvas as HTMLCanvasElement;
   const bindings = attachToCanvas(el, host.input);
-  el.style.imageRendering = 'pixelated';
-  el.style.width = `${host.fb.width * 2}px`;
-  el.style.height = `${host.fb.height * 2}px`;
-  // GPU presentation (GPU-FOLLOW-0): the GL canvas mirrors the HUD CSS size
-  // (fb*2 above). Sync on loop start so boot/hot-swap/reboot alignment holds
-  // even when the HUD size was set before the GL canvas existed.
-  if (boot.gpu) {
+  // RELEASE-3: fit the display box to the stage at the framebuffer aspect
+  // (never framebuffer-x2 blindly — that overflows the bezel at 800x600+ and
+  // letterboxes the canvas, drifting the center and pushing HUD below the
+  // fold). The GL overlay mirrors the same box inside fitPlayCanvas.
+  fitPlayCanvas(el, host.fb.width, host.fb.height);
+  // Re-fit on viewport changes (resize/fullscreen/sidebar): the framebuffer
+  // and the sim are untouched, only the CSS display box moves. Removed on
+  // stop so rebooted loops never stack listeners.
+  const onResize = (): void => {
     try {
-      syncGpuCanvasToHud(undefined, el);
+      fitPlayCanvas(el, host.fb.width, host.fb.height);
     } catch {
-      /* GL overlay stays at its acquired size; HUD still presents */
+      /* sticky best-effort */
     }
+  };
+  try {
+    window.addEventListener('resize', onResize);
+  } catch {
+    /* static layout stays */
   }
 
   let sound: BrowserSound | null = null;
@@ -1895,6 +2001,11 @@ export function startPlayLoop(
       stopped = true;
       cancelAnimationFrame(raf);
       bindings.dispose();
+      try {
+        window.removeEventListener('resize', onResize);
+      } catch {
+        /* loop ran headless; nothing to unwire */
+      }
       document.removeEventListener('pointerdown', unlock);
       document.removeEventListener('keydown', unlock);
       document.removeEventListener('keydown', onWeaponKeys);
