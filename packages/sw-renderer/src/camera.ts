@@ -14,7 +14,7 @@ export interface Camera {
   focalX: number;
   focalY: number;
   near: number;
-  /** Far plane for the RGB window-Z mapping (depth01 = 1 at far). */
+  /** Far plane (depth test limit). */
   far: number;
   /** 4 side planes + near, each {normal: Float32Array(3), dist} inward-facing */
   frustum: { normal: Float32Array; dist: number }[];

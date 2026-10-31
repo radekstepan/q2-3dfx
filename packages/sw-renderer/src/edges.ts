@@ -239,7 +239,7 @@ export function emitSpansForPoly(
   // least-squares plane fit of (u, v) over screen (x, y), computed once
   // per polygon (not per span/row). Solves the 2x2 normal equations for
   // [du/dx, du/dy] and [dv/dx, dv/dy]; only the vertical pair is stored
-  // (the horizontal pair is re-derived per span in drawSpansRGB from the
+  // (the horizontal pair is re-derived per span from the
   // iz/uz/vz steps, bit-identical to the fit). Degenerate (collinear)
   // polys fall back to 0 (no vertical contribution — same rho as the old
   // horizontal-only footprint). Zero allocation: pure scalar arithmetic.

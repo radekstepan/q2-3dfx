@@ -14,7 +14,6 @@ import { BandWorkerPool } from './bandPool.js';
 import {
   buildColormap, defaultPalette,
   packFrameSpans, splitBands,
-  R_FLAG_REPEAT, R_FLAG_DEPTHWRITE, R_FLAG_LIGHT, R_FLAG_OPAQUE,
   type Span, type Texture, type LightBlock,
 } from './index.js';
 import { SPAN_OPAQUE, createSpan } from './spans.js';

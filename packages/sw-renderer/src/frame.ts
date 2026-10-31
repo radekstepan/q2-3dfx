@@ -7,8 +7,8 @@ import type {
   Entity, Framebuffer, FrameStats, Model, ModelHandle, RefDef, Refresh, TextureHandle, WorldModel,
 } from '@q2/renderer-api';
 import { Com_Error, getCVarNumber, registerCVar } from '@q2/config';
-import type { MiniLightmap } from './worldNodes.js';import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, buildRGBLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
-import { SurfaceCache, hashLightStyles, RGBLightCache, type RGBCachedBlock, type SurfaceBlock } from './surfaceCache.js';
+import type { MiniLightmap } from './worldNodes.js';import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
+import { SurfaceCache, hashLightStyles, type SurfaceBlock } from './surfaceCache.js';
 import { setupCamera, setupCameraInto, culledByFlatFrustum, type Camera } from './camera.js';
 import {
   collectVisibleSurfaces, findLeaf, isMiniWorld,
@@ -25,153 +25,28 @@ import {
 import {
   SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SPAN_TRANS33, SPAN_TRANS66, buildTurbTable, createSpan,
   drawSpansTranslucent, drawSpansTurbulent, SoftwareBackend, translucencyModeFromCvars,
-  buildRGBChain, buildRGBMaterial, RGBWorldBackend,
-  type LightBlock, type RasterBackend, type RGBBlend, type RGBMaterial, type RGBMipLevel, type Span, type SpanList, type Texture,
+  type LightBlock, type RasterBackend, type Span, type SpanList, type Texture,
 } from './spans.js';
 import { WasmSpanBackend, wasmRequestedByCvar } from './wasmSpans.js';
 import {
   BandedSoftwareBackend, createBandBuffers, sabAvailable, workersRequestedByCvar,
   accumRequestedByCvar,
-  R_FLAG_BILINEAR, R_FLAG_BLEND_ALPHA, R_FLAG_ADDITIVE, R_FLAG_DEPTHWRITE, R_FLAG_FLAT, R_FLAG_LIGHT,
-  R_FLAG_MIPDITHER, R_FLAG_OPAQUE, R_FLAG_OVERBRIGHT, R_FLAG_REPEAT, R_FLAG_WARP, R_FLAG_TRI,
   type BandDispatcher,
 } from './bands.js';
 import {
-  buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, createSoldierMesh, createSoldierSkin, md2ToAliasMesh, DEPTHHACK_SCALE, drawAliasInstanceRGB, emitAliasTris, type AliasMesh, type AliasInstance,
+  buildANorms, buildShadeDots, createBoxMesh, createGunMesh, createGunSkin, createSoldierMesh, createSoldierSkin, md2ToAliasMesh, DEPTHHACK_SCALE, type AliasMesh, type AliasInstance,
 } from './alias.js';
 import { drawAliasInstance } from './alias.js';
-import { drawTracerBeam, drawTracerBeamRGB, projectTracerBeam, emitTracerSpans, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE, TRACER_CORE_COLOR } from './tracer.js';
+import { drawTracerBeam, projectTracerBeam, TRACER_DEFAULT_COLOR, TRACER_DEFAULT_LENGTH, TRACER_POOL_SIZE, TRACER_CORE_COLOR } from './tracer.js';
 import { isValidSkySize, SKY_BOX_CORNERS, SKY_BOX_HALF, skyUvOnFace } from './sky.js';
 import { AngleVectors } from '@q2/math';
-import { drawSprite, drawSpriteRGB, emitSpriteSpans } from './sprites.js';
-import { drawParticles, drawParticlesRGB, emitParticleSpans, projectParticles, type ScreenParticle } from './particles.js';
+import { drawSprite, emitSpriteSpans } from './sprites.js';
+import { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
 import { buildColormap, buildAlphamapPair, defaultPalette, extractAlphamap33, extractAlphamap66, COLORMAP_PCX_PIXELS } from './colormap.js';
 import { createDevroom, getDevMesh } from './devroom.js';
 
 export const MAX_SPANS = 16384;
 const MAX_ROW = 4096;
-
-/**
- * Serial RGB (voodoo-policy) pass selector (astra V2a/V2c + step 3).
- * Default OFF: software output is bit-identical whether the RGB code exists
- * or not (the classic path pays one flag check per surface when off, and
- * nothing else). ON routes the serial classic backend through BOTH the
- * indexed path (always drawn, so `index` + the software depth plane stay
- * bit-identical) and the RGB overlay (opaque world, turbulent water,
- * sky/skybox, translucent glass/water, alias/MD2 incl. the depth-hack
- * viewmodel, sprites, particles, tracer beams) into a packed RGB565 plane
- * + window-Z Uint16 depth plane + coverage mask, composited (565 expanded
- * to 8:8:8) in endFrame. The RGB path owns SEPARATE planes: sharing the
- * software zb would perturb indexed draws after it, and sharing an 888
- * color plane would hide the hardware 565 quantise (blends must read the
- * quantized destination). Pooled (banded) backends route the same RGB
- * spans per band (inline, absolute screen coords) and merge them in the
- * single global endFrame composite; the wasm backend has no RGB pass and
- * errors explicitly when the flag is on (never silent software output).
- */
-let rgbWorldEnabled = false;
-
-/**
- * Select the serial RGB world pass. For the apps/web agent: prefer the
- * `SoftwareRenderer.setRGBWorldEnabled` instance method (it also drops the
- * renderer's RGB caches + coverage so no stale frame survives a switch);
- * this module-level flag exists so headless tests and backend probes can
- * arm the pass without a renderer instance. No stale color survives a
- * switch: the coverage mask is cleared every enabled frame and the
- * composite is skipped entirely while disabled.
- */
-export function setRGBWorldEnabled(on: boolean): void {
-  rgbWorldEnabled = on === true;
-}
-
-/** Observability hook for the RGB world flag (default false). */
-export function isRGBWorldEnabled(): boolean {
-  return rgbWorldEnabled;
-}
-
-/**
- * Cvar gating the PERF-FINISH-A authoritative RGB skip (default 1 = on):
- * world-surface batches that draw an RGB overlay skip the redundant classic
- * indexed drawSpans call (sky-flat, opaque / turbulent world batches,
- * skybox faces), and the entity foreground skips its redundant classic
- * draws (alias, sprites, particles, tracer beams, deferred alpha) wherever
- * the RGB twin drew. The RGB planes (packed 565 + window-Z + coverage) are
- * the production authority in Voodoo mode; the classic planes then carry
- * only what the RGB path did not cover, for the uncovered-pixel composite
- * in endFrame.
- *
- * Why this is sound (no translucency/stipple/depth carve-outs needed):
- * - Every skipped classic write lands on a pixel the RGB overlay covered,
- *   and endFrame resolves covered pixels from the RGB planes — the classic
- *   value there is never displayed.
- * - Every classic *read* of the skipped planes (foreground depth tests,
- *   translucent blend background, stipple source) is skipped together with
- *   the write: the foreground RGB twins depth-test against the RGB
- *   window-Z plane and blend against the seeded RGB background, so no
- *   skipped classic value is ever consumed.
- * - The residual vs the classic oracle (cvar 0): float-1/z vs quantised
- *   window-Z can disagree on depth-tie pixels, so a pixel the RGB path
- *   rejects but classic would accept composites background instead of the
- *   classic foreground texel. Measured tiny on real base1 views (see
- *   PERF-FINISH-A report); the cvar-0 oracle path is kept for comparison.
- * With RGB disabled (software mode) the skip never arms — software output
- * is bit-identical with the flag on or off.
- */
-export const SW_RGB_SKIP_CLASSIC_CVAR = 'sw_rgb_skip_classic';
-
-/** True unless the operator explicitly restored the classic oracle (cvar 0). */
-export function skipClassicRequested(): boolean {
-  try {
-    registerCVar(SW_RGB_SKIP_CLASSIC_CVAR, 1, 'skip redundant classic spanfill where the RGB overlay drew (PERF-FINISH-A authoritative default 1 = on, 0 = classic oracle)');
-    return getCVarNumber(SW_RGB_SKIP_CLASSIC_CVAR) !== 0;
-  } catch {
-    return true;
-  }
-}
-
-/**
- * Per-frame Voodoo fidelity snapshot for the RGB world pass (M4.1 resolve
- * chain). Read from the `vd_*` cvars (see docs/renderers.md + the @q2/config
- * defaults) once per renderView — never per pixel. A @q2/voodoo import is
- * deliberately NOT used here: the enforced dependency rules
- * (math<-formats<-bsp<-{sw-renderer,voodoo}) forbid sw-renderer depending on
- * voodoo, so the snapshot reads the same cvar names directly. Unset cvars
- * fall back to the compiled-in Voodoo3 profile (the values the hardcoded
- * RGB path always used); vd_zbits falls back to 0 (off) when unset or out
- * of range so direct unit-test renders without cvar setup stay legacy.
- */
-export interface RGBFidelity {
-  /** vd_overbright: lightmap modulate x2 + clamp. */
-  overbright: boolean;
-  /** vd_lodbias: added to log2(rho). */
-  lodBias: number;
-  /** vd_mipdither: per-pixel Bayer n/n+1 pick. */
-  mipDither: boolean;
-  /** vd_bilinear: bilinear taps (false = nearest point sample). */
-  bilinear: boolean;
-  /** vd_zbits: depth precision 1..23, 0 = off (legacy raw-1/z test). */
-  zbits: number;
-}
-
-/** Read the current fidelity snapshot (pure, no allocation, sanitised). */
-export function readRGBFidelity(): RGBFidelity {
-  const lodRaw = getCVarNumber('vd_lodbias');
-  const zRaw = getCVarNumber('vd_zbits');
-  return {
-    overbright: getCVarNumber('vd_overbright') !== 0,
-    lodBias: Number.isFinite(lodRaw) ? lodRaw : -0.35,
-    mipDither: getCVarNumber('vd_mipdither') !== 0,
-    bilinear: getCVarNumber('vd_bilinear') !== 0,
-    zbits: Number.isInteger(zRaw) && zRaw >= 1 && zRaw <= 23 ? zRaw : 0,
-  };
-}
-
-/** True when two fidelity snapshots select identical RGB behaviour. */
-export function sameRGBFidelity(a: RGBFidelity, b: RGBFidelity): boolean {
-  return a.overbright === b.overbright && a.lodBias === b.lodBias &&
-    a.mipDither === b.mipDither && a.bilinear === b.bilinear &&
-    a.zbits === b.zbits;
-}
 
 function isAliasMesh(data: unknown): data is AliasMesh {
   if (!data || typeof data !== 'object') return false;
@@ -417,36 +292,6 @@ export function countValidStyles(
   return nValid;
 }
 
-/**
- * VRAM-like budget for the shared per-texture RGB mip chains (upload-time
- * expansion, retained across frames). Base1's chain working set is ~7-15MB;
- * LRU eviction only bites on texture churn (cvar/palette flips clear it).
- */
-export const RGB_TEXCHAIN_BUDGET = 16 * 1024 * 1024;
-
-/**
- * Extra LOD bias for alias (MD2) RGB materials, added to the `vd_lodbias`
- * fidelity value. Deliberately ZERO since the mip-UV-scale fix (P1):
- * fillPerspTriRGB and the world span loops used to sample the picked mip
- * with full-resolution UVs, so any coarse pick wrapped deep into the black
- * gutter around thin MD2 skin islands (barrel 37%, soldier 47% index-127
- * black) and the shadow side rendered flat black (soldier yaw90 @120u 29.4%
- * pure-black pre-resolve, blaster bolt @40u 64.5%). The -3.3 content bias
- * hid that sampling bug by pinning alias to L0. Re-measured post-fix on
- * real skins with production sampling (clamp, dither, bilinear): soldier
- * @120u 1.7% black, @300u 2.5%, v_blast @40u 4.4%, synthetic thin island
- * 91% of L0 with 0% black — all flat across the bias sweep (-0.35..-3.65),
- * i.e. no bias-sensitive gutter collapse remains. A nonzero delta would
- * pin alias to L0 (no minification filtering, distant shimmer, diverging
- * from the real-Voodoo behavior the RGB path emulates) for zero measured
- * benefit, so alias now tracks the shared bias exactly like world
- * textures. Close-range viewmodels (rho < 1, L0 either way) are unaffected
- * in kind. Kept as a named hook (instead of inlining 0) so a future
- * real-Voodoo3 capture review (M4.1) can re-tune content bias against
- * hardware with one knob.
- */
-export const ALIAS_LOD_BIAS_DELTA = 0;
-
 export class SoftwareRenderer implements Refresh {
   private fbW = 0;
   private fbH = 0;
@@ -501,205 +346,14 @@ export class SoftwareRenderer implements Refresh {
    */
   private lastDropWorld: MiniWorld | null = null;
   private lastDropSig: number[] = [];
-  /**
-   * Serial RGB world pass state (astra V2a/V2c + true-565 window-Z). Planes
-   * are sized in init() and re-attached every enabled frame so backend
-   * switches (wasm/banded) can never leave a stale depth view behind. All
-   * no-ops while the module flag is off.
-   */
-  private readonly rgbBackend = new RGBWorldBackend();
-  /**
-   * Packed RGB565 authority plane (5:6:5, the ONLY RGB color target). Every
-   * opaque write quantises 8:8:8 -> 565 on write; translucent/alpha/additive
-   * expand the stored quantum, blend in 8-bit, and re-quantise.
-   */
-  private rgb565: Uint16Array = new Uint16Array(0);
-  private rgbCover: Uint8Array = new Uint8Array(0);
-  /**
-   * RGB-owned window-Z depth plane (Voodoo3 hardware model): normalized
-   * depth01 quanta, integer LESS wins, ties keep stored (first wins),
-   * cleared to 0xFFFF (far) every enabled frame. The always-drawn classic
-   * path keeps bit-identical depth decisions whether the flag is on or off
-   * (it never reads this plane).
-   */
-  private rgbDepth16: Uint16Array = new Uint16Array(0);
-  /**
-   * Renderer-owned RGB plane backups (init-sized): attachWorkerPool
-   * repoints the live fields at pool SAB views; detach/disable restores
-   * these so the serial clear never writes a dead pool's buffer.
-   */
-  private rgbOwned565: Uint16Array = new Uint16Array(0);
-  private rgbOwnedCover: Uint8Array = new Uint8Array(0);
-  private rgbOwnedDepth: Uint16Array = new Uint16Array(0);
-  /**
-   * Retained-frame RGB watermark (TASK item 1): the pool retains staged
-   * descriptors across flushes within a frame and kicks only the
-   * unapplied suffix — so no inline write ever needs to pin the rest of
-   * the frame inline (the old rgbInlineRest latch is gone: recovery
-   * replays advance the pool watermark instead of latching). Reset per
-   * frame in beginFrame (pooled path).
-   */
-  private rgbStagedBatches = 0;
-  private rgbInlineBatches = 0;
-  private rgbKicks = 0;
-  /**
-   * Foreground worker observability (renderer lane task 1): span-based
-   * foreground batches (deferred alpha, world sprites) staged into the
-   * RGB worker kick vs drawn inline, and foreground kicks completed.
-   * Per-pixel/triangle foreground (alias, particles, tracers, entities)
-   * is instrumented separately below (item 3 breakdown) — span batches
-   * and direct draws use different units and must not be summed.
-   */
-  private fgStagedBatches = 0;
-  private fgInlineBatches = 0;
-  private fgKicks = 0;
-  /**
-   * Foreground primitive-class breakdown (TASK item 3): truthful
-   * per-class, per-unit attribution. Span batches (staged/inline) and
-   * direct draws (alias/particles/tracers) use different units — reported
-   * separately, never summed. `worker*Completed` counts pool-completed
-   * suffix-kick work (calling-thread band split out when the pool reports
-   * it); `replayed*` counts complete-frame recovery replays; `recovery*`
-   * counts recovery invocations by class. `fgEntityMs` times the expensive
-   * entity-foreground pass (alias incl. viewmodel, entity sprites,
-   * tracers, pooled tracers) with the monotonic clock — always on, two
-   * clock reads per frame, zero allocation. Reset per frame in beginFrame.
-   */
-  private fgAlphaSpansStaged = 0;
-  private fgAlphaSpansInline = 0;
-  private fgSpriteSpansStaged = 0;
-  /** Spans drawn inline for the sprite class (pooled staging-refusal path, spans). */
-  private fgSpriteSpansInline = 0;
-  private fgSpriteDrawsInline = 0;
-  /** Alias instances successfully staged (draws/instances offered to the kick). */
-  private fgAliasDrawsStaged = 0;
-  private fgAliasDrawsInline = 0;
-  private fgAliasTrisInline = 0;
-  private fgParticleDrawsInline = 0;
-  private fgParticlesInline = 0;
-  /** Spans drawn inline for the particle class (pooled staging-refusal path, spans). */
-  private fgParticleSpansInline = 0;
-  private fgBeamDrawsInline = 0;
-  /** Spans drawn inline for the beam class (pooled staging-refusal path, spans). */
-  private fgBeamSpansInline = 0;
-  private fgWorkerSpansCompleted = 0;
-  private fgWorkerPixelsCompleted = 0;
-  private fgMainSpansCompleted = 0;
-  private fgMainPixelsCompleted = 0;
-  private fgReplayedSpans = 0;
-  private fgReplayedPixels = 0;
-  private fgRecoveryCount = 0;
-  private fgEntityMs = 0;
-  /**
-   * Triangle/point/line staging breakdown (TASK items 2+3, native units):
-   * screen tris staged for the worker kick (`trisStaged`), pool-completed
-   * tris (`trisCompleted`, worker + calling-thread band — the pool reports
-   * per-band shares where available), 1px particle/beam spans staged.
-   * Inline alias draws keep the draw/tris counters above (mesh tris per
-   * drawn instance); staged counts are screen tris. Reset per frame.
-   */
-  private fgTrisStaged = 0;
-  private fgTrisCompleted = 0;
-  private fgTrisMainCompleted = 0;
-  private fgReplayedTris = 0;
-  private fgParticleSpansStaged = 0;
-  private fgBeamSpansStaged = 0;
-  /**
-   * Direct (non-staged) inline RGB plane writes happened this frame
-   * (TASK item 1): alias/entities/sprites/particles/tracers drawn straight
-   * into the planes, or a staging-refusal inline fallback. Such writes are
-   * NOT retained in any descriptor, so a later clear-and-replay recovery
-   * could never restore them. While set, blend-carrying foreground batches
-   * are refused staging (they draw inline in order instead) — the replay
-   * clear then only ever runs over purely staged state. Set by
-   * drawRGBSpans and every direct RGB draw site; the background seed is
-   * NOT a write for this purpose (it is a pure function of the final
-   * indexed plane and re-runs identically). Reset per frame in beginFrame.
-   */
-  private rgbDirectInlineWrites = false;
-  /**
-   * Classic work avoided by the RGB-first probe (renderer lane task 3):
-   * scalar surface-block builds skipped on RGB cache hits while the
-   * authoritative skip is armed, and the estimated texel+luxel bytes those
-   * builds would have allocated/copied. Reset per frame in beginFrame.
-   */
-  private classicAvoidedBuilds = 0;
-  private classicAvoidedBytes = 0;
+
   /**
    * Worker span entries actually inspected this frame (renderer lane task
-   * 2): summed from every pool kick tally (indexed + world RGB +
-   * foreground RGB), main band included. Compare against staged spans to
-   * prove subranges skip non-owned rows.
+   * 2): summed from every pool kick tally, main band included. Compare
+   * against staged spans to prove subranges skip non-owned rows.
    */
   private rangeScanned = 0;
-  /**
-   * EndFrame resolve scratch only (expanded from rgb565 where covered).
-   * Nothing blends against it mid-frame.
-   */
-  private rgbColor: Uint32Array = new Uint32Array(0);
-  /** Projection window for this frame's window-Z mapping (from the Camera). */
-  private rgbWin: { near: number; far: number } = { near: 4, far: 32768 };
-  /**
-   * Fidelity snapshot for this frame's RGB materials (M4.1 resolve chain):
-   * refreshed from the vd_* cvars once per renderView; any change drops the
-   * RGB cache + palette-baked skin/sky memos so toggling a cvar rebuilds
-   * instead of serving stale materials.
-   */
-  private rgbFidelity: RGBFidelity = readRGBFidelity();
-  private rgbCache = new RGBLightCache();
-  /**
-   * Per-texture shared RGB mip chains (upload-time expansion, like GL
-   * texture upload to VRAM): texId -> expanded chain, shared by every
-   * surface using that texture. buildRGBEntry used to expand a FULL chain
-   * per (surface, serial) entry, so the real-map working set (hundreds of
-   * surfaces x full chains) permanently thrashed the 4MB RGBLightCache
-   * (0% hits, full rebuild + megabytes of garbage per frame). Chains depend
-   * only on (world, texels, palette) — never on lighting, styles, mip or
-   * the vd_* fidelity snapshot — so they survive dlight serial bumps,
-   * style changes and cvar toggles; only the small per-surface luxel block
-   * rebuilds (same cost profile as the scalar cache). Budgeted VRAM-like
-   * (RGB_TEXCHAIN_BUDGET) with frame-stamp LRU; guarded by world identity
-   * (a new world clears chains AND the surface caches, whose ids are
-   * world-relative). Cleared on setPalette / setRGBWorldEnabled /
-   * invalidateCaches (palette is baked in), NOT on fidelity changes.
-   */
-  private rgbTexChains = new Map<number, { chain: RGBMipLevel[]; bytes: number; used: number }>();
-  private rgbTexUsed = 0;
-  private rgbTexWorld: MiniWorld | null = null;
-  private rgbTexHits = 0;
-  private rgbTexMisses = 0;
-  private rgbTexEvictions = 0;
-  private rgbUsedThisFrame = false;
-  /**
-   * Skin/sky/flat RGB materials (step 3, serial RGB only): palette-baked
-   * mip chains, so every entry is dropped on setPalette (and sky entries
-   * on setSkyTexture). Keyed by the Texture object identity for skins
-   * (renderer-owned stable refs), single-slot for sky/flat.
-   */
-  private rgbSkinMats = new Map<Texture, RGBMaterial>();
-  /**
-   * Opaque RGB materials for alias (MD2) models, keyed by Texture identity
-   * like rgbSkinMats but built with opaqueMask (index 255 draws opaque).
-   * ref_soft's alias path (r_polyse/D_DrawPoly) has no TRANSPARENT_COLOR
-   * check and ref_gl draws meshes opaque (blend only under RF_TRANSLUCENT,
-   * which rides Entity.alpha instead) — only sprites/HUD pics honor 255
-   * (r_spr8.asm, r_draw.c). A separate map because the SAME Texture object
-   * can back both an alias skin and a sprite, and the mask is baked into
-   * the mip chain at upload. Cleared everywhere rgbSkinMats is.
-   */
-  private rgbAliasMats = new Map<Texture, RGBMaterial>();
-  private rgbSkyMat: { tex: { width: number; height: number; texels: Uint8Array }; mat: RGBMaterial } | null = null;
-  private rgbFlatSky: { index: number; mat: RGBMaterial } | null = null;
-  /**
-   * Palette-chain materials for point/line foreground (TASK item 2):
-   * a 256x1 palette-expanded chain so 1px particle/tracer spans sample
-   * exact quanta with point filtering. Opaque (particles) + additive
-   * (tracer beams, depth-writing like splatRGB) variants share the level
-   * chain. Palette-baked: rebuilt on setPalette like the skin mats.
-   */
-  private rgbPaletteTexels = new Uint8Array(256);
-  private rgbPaletteOpaque: RGBMaterial | null = null;
-  private rgbPaletteAdditive: RGBMaterial | null = null;
+
   private models: RegisteredModel[] = [];
   /**
    * Parallel model-space bounds (perf remediation item 1): modelBounds[h]
@@ -727,15 +381,6 @@ export class SoftwareRenderer implements Refresh {
   private pool: Span[] = [];
   private spanList: SpanList = { spans: [], count: 0 };
   private spriteScratch: SpanList = { spans: [], count: 0 };
-  /**
-   * Span scratch for staged point/line foreground (TASK item 2):
-   * particles (1px opaque points) and tracer beams (1px additive DDA
-   * steps) emit here, then stage into the RGB kick in exact serial
-   * order. Dedicated lists so entity-loop emission never clobbers the
-   * sprite scratch mid-batch.
-   */
-  private particleScratch: SpanList = { spans: [], count: 0 };
-  private beamScratch: SpanList = { spans: [], count: 0 };
   private tmpSort: Span[] = [];
   private rowBase = new Int32Array(MAX_ROW + 1);
   private visSurfs: number[] = [];
@@ -828,12 +473,11 @@ export class SoftwareRenderer implements Refresh {
   private tracerRight = new Float32Array(3);
   private tracerUp = new Float32Array(3);
   private lightBlockScratch: Uint8Array = new Uint8Array(0);
-  /** Reusable RGB luxel block for the RGB miss path (grown on demand). */
-  private rgbLightScratch: Uint8Array = new Uint8Array(0);
+
   /** Reusable per-luxel world-pos grid for dlight falloff (grown on demand). */
   private dluxScratch: Float32Array = new Float32Array(0);
   private styleScratch = new Float32Array(8);
-  /** Reusable style-scale array for the scalar/RGB miss paths (task 6:
+  /** Reusable style-scale array for the scalar miss paths (task 6:
    * the per-miss `scalesCopy`/`scales` allocations showed up as steady
    * garbage on dlight-churn frames; the builders consume the scales
    * synchronously and never retain them, so one shared scratch is exact).
@@ -859,24 +503,6 @@ export class SoftwareRenderer implements Refresh {
    * non-reentrant by contract).
    */
   private skipForeground = false;
-  /**
-   * Stashed authoritative-skip decision for the async path (PERF-FINISH-A
-   * item A): phase-1 renderView records it with the other foreground
-   * inputs; phase-2 drawForeground applies the same foreground classic
-   * skips so both halves agree.
-   */
-  private fgSkipClassic = false;
-  /**
-   * PERF-FINISH-A item A observability: classic work eliminated by the
-   * authoritative skip this frame. `classicSpansSkipped` counts world /
-   * sky / skybox / deferred-alpha spans whose classic draw was elided
-   * where the RGB overlay drew; `classicFgSkipped` counts entity
-   * foreground classic draws elided (alias / sprite / particle / tracer
-   * calls). Reset in beginFrame, read via testClassicSkipStats. Software
-   * mode (RGB off) leaves both at zero — the skip never arms there.
-   */
-  private classicSpansSkipped = 0;
-  private classicFgSkipped = 0;
   private fgCam: Camera | null = null;  private fgWorld: MiniWorld | null = null;
   private fgDyn: DynamicLight[] | null = null;
   private fgTMode = 0;
@@ -911,14 +537,6 @@ export class SoftwareRenderer implements Refresh {
     this.idx = fb.index;
     this.zb = fb.depth;
     this.color = fb.color;
-    this.rgb565 = new Uint16Array(fb.width * fb.height);
-    this.rgbCover = new Uint8Array(fb.width * fb.height);
-    this.rgbDepth16 = new Uint16Array(fb.width * fb.height);
-    this.rgbColor = new Uint32Array(fb.width * fb.height);
-    this.rgbOwned565 = this.rgb565;
-    this.rgbOwnedCover = this.rgbCover;
-    this.rgbOwnedDepth = this.rgbDepth16;
-    this.rgbBackend.attach(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
     this.pickSkyIndex();
     for (let i = 0; i < MAX_SPANS; i++) this.pool.push(createSpan());
     for (let i = 0; i < MAX_SPANS; i++) this.tmpSort.push(this.pool[i]!);
@@ -952,12 +570,6 @@ export class SoftwareRenderer implements Refresh {
    */
   setWasmEnabled(on: boolean): boolean {
     if (on) {
-      // No silent software fallback: the wasm kernel only implements the
-      // indexed opaque-span loop, so an armed RGB flag is an explicit error
-      // (a full WASM RGB port is out of scope — see spans.ts PORT-DIFF).
-      if (rgbWorldEnabled) {
-        Com_Error('error', 'sw-renderer: WASM backend has no RGB world pass (call setRGBWorldEnabled(false) first) — refusing to render silent software output');
-      }
       if (!this.wasmBackend && !this.initWasm()) return false;
       const wb = this.wasmBackend!;
       wb.attach(wb.idx, wb.zb, this.fbW, this.fbH, this.colormap);
@@ -1026,14 +638,10 @@ export class SoftwareRenderer implements Refresh {
    * the renderer adopts the pool's shared planes (zero copy); the pool must
    * have been created for this W×H or the attach is ignored. Unsuitable
    * batches still run inline, so output stays bit-identical either way.
-   * RGB planes are adopted alongside the indexed planes when the pool
-   * exposes them (PERF-2 RGB workers); the serial beginFrame clear then
-   * owns them exactly like the renderer-owned buffers.
    */
   attachWorkerPool(pool: BandDispatcher | null): void {
     this.bandBackend.dispatcher = pool;
     if (!pool) {
-      this.restoreOwnedRGBPlanes();
       return;
     }
     if (pool.planes && this.isWorkersActive()) {
@@ -1045,15 +653,6 @@ export class SoftwareRenderer implements Refresh {
         this.zb = p.zb;
         this.color = p.color;
         this.bandBackend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
-        const rp = pool.rgbPlanes;
-        if (rp && rp.rgb565.length === this.fbW * this.fbH &&
-          rp.cover.length === this.fbW * this.fbH &&
-          rp.rgbDepth.length === this.fbW * this.fbH &&
-          rp.rgb565.buffer === rp.cover.buffer) {
-          this.rgb565 = rp.rgb565;
-          this.rgbCover = rp.cover;
-          this.rgbDepth16 = rp.rgbDepth;
-        }
       }
     }
   }
@@ -1070,154 +669,12 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
-   * Observability for RGB worker execution (PERF-2): batches staged for
-   * the worker kick vs batches drawn inline, and worker kicks completed,
-   * since the last beginFrame. `staged` counts batches routed to the pool;
-   * `inline` counts world batches drawn inline (unpooled or fallback);
-   * `kicks` counts completed RGB kicks (sync or async). A pooled Voodoo
-   * frame shows staged > 0 and kicks > 0; serial shows staged = kicks = 0.
-   * Read-only, zero behavior change.
-   */
-  testRGBWorkerStats(): { staged: number; inline: number; kicks: number } {
-    return {
-      staged: this.rgbStagedBatches,
-      inline: this.rgbInlineBatches,
-      kicks: this.rgbKicks,
-    };
-  }
-
-  /**
-   * Foreground worker observability (renderer lane task 1, truthful per
-   * item 3): span-based foreground batches (deferred alpha, world sprites)
-   * staged for the worker kick vs drawn inline, and foreground kicks
-   * actually completed by workers, since the last beginFrame. `inline`
-   * counts span batches AND direct inline draws (alias instances incl. the
-   * viewmodel, entity/world sprites, particle batches, tracer beams — one
-   * per draw call), so it is nonzero whenever serial foreground ran; see
-   * testForegroundStats() for the per-class breakdown in native units.
-   * Staged-but-failed work is never counted in `kicks` (only pool
-   * completions increment it); recovery replays land in
-   * `replayedSpans/recoveryCount` instead.
-   */
-  testForegroundWorkerStats(): { staged: number; inline: number; kicks: number } {
-    return {
-      staged: this.fgStagedBatches,
-      inline: this.fgInlineBatches,
-      kicks: this.fgKicks,
-    };
-  }
-
-  /**
-   * Foreground primitive-class breakdown (TASK item 3, PERF-NEXT-5): prepared/staged
-   * vs worker-completed vs calling-thread vs deliberately inline vs
-   * fallback/replayed work, in native units (spans, draws, triangles,
-   * particles, pixels, kicks, ms — never mixed in one field). `worker*Completed`
-   * counts pool-completed suffix-kick work only (actual completion, not
-   * staging): the WORKER bands' share; `main*Completed` is the calling-thread
-   * band's share from the same kicks (combined kick totals = worker + main,
-   * exactly, per kick). A kick result WITHOUT the split (legacy pool shape:
-   * neither worker* nor main* present) is UNKNOWN attribution and maps to
-   * the calling-thread band (main = combined, worker = 0) — absent fields
-   * imply the calling-thread band ran inline and are NEVER reported as
-   * worker-completed. Per-class worker/main completion is UNKNOWN by
-   * construction (one kick mixes alpha + sprite + particle + beam spans and
-   * alias tris; the pool reports only the global split) — per-class
-   * attribution stops at staged/inline. `trisStaged` counts screen tris
-   * offered to the kick (post-clip); `trisCompleted` counts per-band tri
-   * executions (worker + main: a tri straddling a band boundary fills disjoint
-   * rows in both bands and counts once per band, so completed can slightly
-   * exceed staged; spans behave the same way only across descriptor rows and
-   * reconcile exactly). `aliasTrisInline` counts pre-clip mesh tris per
-   * inline instance (different unit from staged screen tris — documented, never
-   * summed). `aliasDrawsStaged` counts alias instances (incl. the depthHack
-   * viewmodel gun) successfully staged; the viewmodel rides the exact alias
-   * path (depthScale = DEPTHHACK_SCALE) and is attributed identically.
-   * `replayedSpans/Pixels/Tris` + `recoveryCount` count complete-frame recovery
-   * replays (staging refusals + kick failures), never worker completions:
-   * staged-but-failed work is reported as zero worker-completed with the work
-   * in replayed/inline counters. `entityMs` times the expensive
-   * entity-foreground pass (alias incl. viewmodel). `directInlineWrites`
-   * reports whether un-retained inline writes happened (blend staging
-   * refuses after that point). Read-only, zero behavior change.
-   */
-  testForegroundStats(): {
-    stagedBatches: number; inlineBatches: number; kicks: number;
-    alphaSpansStaged: number; alphaSpansInline: number;
-    spriteSpansStaged: number; spriteSpansInline: number; spriteDrawsInline: number;
-    aliasDrawsStaged: number; aliasDrawsInline: number; aliasTrisInline: number;
-    particleDrawsInline: number; particlesInline: number; particleSpansInline: number;
-    beamDrawsInline: number; beamSpansInline: number;
-    workerSpansCompleted: number; workerPixelsCompleted: number;
-    mainSpansCompleted: number; mainPixelsCompleted: number;
-    trisStaged: number; trisCompleted: number; trisMainCompleted: number;
-    trisReplayed: number;
-    particleSpansStaged: number; beamSpansStaged: number;
-    replayedSpans: number; replayedPixels: number; recoveryCount: number;
-    entityMs: number; directInlineWrites: boolean;
-  } {
-    return {
-      stagedBatches: this.fgStagedBatches,
-      inlineBatches: this.fgInlineBatches,
-      kicks: this.fgKicks,
-      alphaSpansStaged: this.fgAlphaSpansStaged,
-      alphaSpansInline: this.fgAlphaSpansInline,
-      spriteSpansStaged: this.fgSpriteSpansStaged,
-      spriteSpansInline: this.fgSpriteSpansInline,
-      spriteDrawsInline: this.fgSpriteDrawsInline,
-      aliasDrawsStaged: this.fgAliasDrawsStaged,
-      aliasDrawsInline: this.fgAliasDrawsInline,
-      aliasTrisInline: this.fgAliasTrisInline,
-      particleDrawsInline: this.fgParticleDrawsInline,
-      particlesInline: this.fgParticlesInline,
-      particleSpansInline: this.fgParticleSpansInline,
-      beamDrawsInline: this.fgBeamDrawsInline,
-      beamSpansInline: this.fgBeamSpansInline,
-      workerSpansCompleted: this.fgWorkerSpansCompleted,
-      workerPixelsCompleted: this.fgWorkerPixelsCompleted,
-      mainSpansCompleted: this.fgMainSpansCompleted,
-      mainPixelsCompleted: this.fgMainPixelsCompleted,
-      trisStaged: this.fgTrisStaged,
-      trisCompleted: this.fgTrisCompleted,
-      trisMainCompleted: this.fgTrisMainCompleted,
-      trisReplayed: this.fgReplayedTris,
-      particleSpansStaged: this.fgParticleSpansStaged,
-      beamSpansStaged: this.fgBeamSpansStaged,
-      replayedSpans: this.fgReplayedSpans,
-      replayedPixels: this.fgReplayedPixels,
-      recoveryCount: this.fgRecoveryCount,
-      entityMs: this.fgEntityMs,
-      directInlineWrites: this.rgbDirectInlineWrites,
-    };
-  }
-
-  /**
-   * Classic work avoided by the RGB-first probe (renderer lane task 3):
-   * scalar surface-block builds skipped on RGB cache hits while the
-   * authoritative skip was armed, and the estimated texel+luxel bytes
-   * those builds would have copied, since the last beginFrame. Zero in
-   * software mode and under the classic oracle (cvar 0).
-   */
-  testClassicAvoidStats(): { builds: number; bytes: number } {
-    return {
-      builds: this.classicAvoidedBuilds,
-      bytes: this.classicAvoidedBytes,
-    };
-  }
-
-  /**
    * Worker span-entry proof (renderer lane task 2): entries actually
-   * inspected by pool kicks (indexed + world RGB + foreground RGB, main
-   * band included) since the last beginFrame. Compare against staged
-   * spans to prove subranges skip non-owned rows.
+   * inspected by pool kicks (main band included) since the last beginFrame.
+   * Compare against staged spans to prove subranges skip non-owned rows.
    */
   testWorkerRangeStats(): { scanned: number } {
     return { scanned: this.rangeScanned };
-  }
-
-  /** Pending staged RGB batches (observability for the browser soak). */
-  testRGBPending(): number {
-    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    return pool ? pool.rgbPending() : 0;
   }
 
   private enableBanded(n: number): void {
@@ -1242,22 +699,6 @@ export class SoftwareRenderer implements Refresh {
         this.color = this.hostFb.color;
         this.backend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
       }
-      this.restoreOwnedRGBPlanes();
-    }
-  }
-
-  /**
-   * Restore the renderer-owned RGB planes after a pool detach (adoption in
-   * attachWorkerPool repoints the live fields at SAB views; the owned
-   * buffers stay allocated and are simply re-adopted here).
-   */
-  private restoreOwnedRGBPlanes(): void {
-    if (this.rgbOwned565.length === this.fbW * this.fbH &&
-      this.rgbOwnedCover.length === this.fbW * this.fbH &&
-      this.rgbOwnedDepth.length === this.fbW * this.fbH) {
-      this.rgb565 = this.rgbOwned565;
-      this.rgbCover = this.rgbOwnedCover;
-      this.rgbDepth16 = this.rgbOwnedDepth;
     }
   }
 
@@ -1278,20 +719,9 @@ export class SoftwareRenderer implements Refresh {
     this.bandBackend.colormap = this.colormap;
     // Blend tables follow the palette (lazily rebuilt on the next
     // translucent frame; a real colormap.pcx install is dropped too).
-    // The RGB world pass bakes palette colors into its mip chain at upload,
-    // so a palette change drops the whole RGB cache (serial-keyed entries
-    // would otherwise serve stale color).
     this.alphaReady = false;
     this.alpha33 = new Uint8Array(0);
     this.alpha66 = new Uint8Array(0);
-    this.rgbCache.invalidateAll();
-    this.rgbSkinMats.clear();
-    this.rgbPaletteOpaque = null;
-    this.rgbPaletteAdditive = null;
-    this.rgbAliasMats.clear();
-    this.clearRGBTextureChains();
-    this.rgbSkyMat = null;
-    this.rgbFlatSky = null;
   }
 
   /**
@@ -1532,65 +962,19 @@ export class SoftwareRenderer implements Refresh {
     if (!tex || !isValidSkySize(tex.width, tex.height) ||
       tex.texels.length !== tex.width * tex.height) {
       this.skyTex = null;
-      this.rgbSkyMat = null;
       return;
     }
     this.skyTex = { width: tex.width, height: tex.height, texels: tex.texels.slice() };
-    this.rgbSkyMat = null;
   }
 
   /**
-   * True when this frame may take the RGB overlay path: the module flag is
-   * on AND the active backend is the serial classic or the banded one (the
-   * banded backend routes RGB spans per band; see drawRGBSpans). The wasm
-   * backend has no RGB pass and refuses to enable while the flag is on.
-   */
-  /**
-   * Select the serial RGB world pass for THIS renderer (what
-   * `apps/web/src/play.ts` probes as `setRGBWorldEnabled` on the instance):
-   * sets the shared module flag AND drops this renderer's RGB state
-   * (coverage, both depth planes, RGB cache, palette-baked skin/sky memos)
-   * so no stale frame survives the switch in either direction. Disabling
-   * additionally marks the frame unused so endFrame skips the composite.
-   */
-  setRGBWorldEnabled(on: boolean): void {
-    rgbWorldEnabled = on === true;
-    this.rgbUsedThisFrame = false;
-    if (this.rgbCover.length > 0) this.rgbCover.fill(0);
-    // Window-Z clear value is all-ones (far) under the LESS-wins convention.
-    if (this.rgbDepth16.length > 0) this.rgbDepth16.fill(0xffff);
-    this.rgbCache.invalidateAll();
-    this.rgbSkinMats.clear();
-    this.rgbPaletteOpaque = null;
-    this.rgbPaletteAdditive = null;
-    this.rgbAliasMats.clear();
-    this.clearRGBTextureChains();
-    this.rgbSkyMat = null;
-    this.rgbFlatSky = null;
-  }
-
-  /** Instance view of the shared RGB world flag (default false). */
-  isRGBWorldEnabled(): boolean {
-    return rgbWorldEnabled;
-  }
-
-  /**
-   * Drop every cached raster (scalar surface cache, RGB light cache, and
-   * the palette-baked skin/sky material memos). Palette changes and cvar
-   * toggles funnel here; the next renderView rebuilds from source. Frame
-   * planes are untouched (beginFrame clears those).
+   * Drop every cached raster (the scalar surface cache). Palette changes
+   * funnel here; the next renderView rebuilds from source. Frame planes
+   * are untouched (beginFrame clears those).
    */
   invalidateCaches(): void {
     this.cache.invalidateAll();
     this.lastTouched.length = 0;
-    this.rgbCache.invalidateAll();
-    this.rgbSkinMats.clear();
-    this.rgbPaletteOpaque = null;
-    this.rgbPaletteAdditive = null;
-    this.rgbAliasMats.clear();
-    this.clearRGBTextureChains();
-    this.rgbSkyMat = null;
-    this.rgbFlatSky = null;
   }
 
   /**
@@ -1617,7 +1001,6 @@ export class SoftwareRenderer implements Refresh {
     while (j < prev.length) scratch.push(prev[j++]!);
     if (scratch.length > 0) {
       this.cache.invalidateSurfaces(scratch);
-      this.rgbCache.invalidateSurfaces(scratch);
     }
     prev.length = 0;
     for (let k = 0; k < affected.length; k++) prev.push(affected[k]!);
@@ -1680,755 +1063,6 @@ export class SoftwareRenderer implements Refresh {
       const l = dyn[i]!;
       s.push(l.origin[0]!, l.origin[1]!, l.origin[2]!, l.intensity, l.color[0]!, l.color[1]!, l.color[2]!);
     }
-  }
-
-  /**
-   * Refresh the per-frame fidelity snapshot (M4.1): read the vd_* cvars
-   * once per renderView; on any change drop the RGB cache + memos so the
-   * new policy rebuilds instead of serving stale materials. The shared
-   * texture chains SURVIVE (they depend only on texels+palette, never on
-   * the fidelity snapshot), so a cvar toggle re-links luxels without
-   * re-expanding every texture. Also re-clears
-   * the 16-bit plane when the zbits selection changed mid-stream (beginFrame
-   * already cleared for the frame-start snapshot).
-   */
-  private syncRGBFidelity(): void {
-    const snap = readRGBFidelity();
-    if (sameRGBFidelity(snap, this.rgbFidelity)) return;
-    const zChanged = snap.zbits !== this.rgbFidelity.zbits;
-    this.rgbFidelity = snap;
-    this.rgbCache.invalidateAll();
-    this.rgbSkinMats.clear();
-    this.rgbPaletteOpaque = null;
-    this.rgbPaletteAdditive = null;
-    this.rgbAliasMats.clear();
-    this.rgbSkyMat = null;
-    this.rgbFlatSky = null;
-    if (zChanged && rgbWorldEnabled && this.rgbDepth16.length > 0) {
-      this.rgbDepth16.fill(0xffff);
-    }
-  }
-
-  private rgbOverlayActive(): boolean {
-    return rgbWorldEnabled && (this.backend === this.tsBackend || this.backend === this.bandBackend);
-  }
-
-  /**
-   * Route one RGB span batch (perf-2 lane): the serial classic backend draws
-   * through the renderer's RGB backend, the banded backend partitions the
-   * same spans per row band (absolute coords, bit-identical dither phase).
-   * The caller runs inside rgbOverlayActive(); marks the frame used so
-   * endFrame runs the single global composite.
-   */
-  private drawRGBSpans(list: SpanList, mat: RGBMaterial): void {
-    if (this.backend === this.bandBackend) this.bandBackend.drawSpansRGB(list, mat, this.rgbWin);
-    else this.rgbBackend.drawSpansRGB(list, mat, this.rgbWin);
-    this.rgbUsedThisFrame = true;
-    // Any direct plane write marks the frame: blend staging after this
-    // point must go inline (see stageForegroundRGBSpans), so a later
-    // clear-and-replay recovery can never discard un-retained work.
-    this.rgbDirectInlineWrites = true;
-  }
-
-  /**
-   * Stage one world RGB batch for the worker kick (PERF-2 RGB workers).
-   * Only opaque, depth-writing world materials stage (the world + sky
-   * materials: repeat or uniform-clamp addressing, always with a mip
-   * chain); everything else (including any future translucent world use)
-   * runs inline. Returns true when staged; false means the caller must
-   * draw inline (no pool, staging miss, unsupported material). On a miss
-   * with retained batches pending, the retained work replays inline first
-   * so global batch order is preserved, then this batch draws inline; the
-   * pool watermark advances, so later batches can stage again (no latch).
-   * All writes stay depth-guarded: identical output either way. Never
-   * throws.
-   */
-  private stageRGBSpans(list: SpanList, mat: RGBMaterial): boolean {
-    this.rgbUsedThisFrame = true;
-    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    if (!pool) {
-      this.drawRGBSpans(list, mat);
-      return false;
-    }
-    if (mat.blend !== 'opaque' || !mat.depthWrite) {
-      this.drawInlineRGBRest(list, mat);
-      return false;
-    }
-    const repeatS = mat.addressS === 'repeat';
-    const repeatT = mat.addressT === 'repeat';
-    if (repeatS !== repeatT) {
-      this.drawInlineRGBRest(list, mat);
-      return false;
-    }
-    let flags = 0;
-    if (mat.warp) flags |= R_FLAG_WARP;
-    if (mat.bilinear !== false) flags |= R_FLAG_BILINEAR;
-    if (mat.mipDither) flags |= R_FLAG_MIPDITHER;
-    if (mat.overbright) flags |= R_FLAG_OVERBRIGHT;
-    // Upload-time opacity proof (perf remediation item 4): the worker core
-    // skips the mask tap + hole branch for these batches.
-    if (mat.opaqueMask) flags |= R_FLAG_OPAQUE;
-    flags |= R_FLAG_DEPTHWRITE;
-    if (repeatS) flags |= R_FLAG_REPEAT;
-    let luxels: Uint8Array | null = null;
-    let luxW = 0, luxH = 0;
-    if (mat.light) {
-      luxels = mat.light.samples;
-      luxW = mat.light.luxW;
-      luxH = mat.light.luxH;
-      if (!(luxW > 0 && luxH > 0) || luxels.length < luxW * luxH * 3) {
-        this.drawInlineRGBRest(list, mat);
-        return false;
-      }
-      flags |= R_FLAG_LIGHT;
-    }
-    let flatRGB = 0;
-    if (mat.flatColor) {
-      if (mat.flatColor.length < 3) {
-        this.drawInlineRGBRest(list, mat);
-        return false;
-      }
-      flags |= R_FLAG_FLAT;
-      flatRGB = ((mat.flatColor[0]! & 255) << 16) | ((mat.flatColor[1]! & 255) << 8) | (mat.flatColor[2]! & 255);
-    }
-    const count = list.count < list.spans.length ? list.count : list.spans.length;
-    const ok = pool.stageRGB(
-      list, 0, count, mat.levels, luxels, luxW, luxH,
-      flags, mat.zbits, mat.turbPhase, flatRGB,
-    );
-    if (!ok) {
-      this.drawInlineRGBRest(list, mat);
-      return false;
-    }
-    this.rgbStagedBatches++;
-    return true;
-  }
-
-  /**
-   * Inline fallback for an RGB batch that could not stage (retained-frame
-   * protocol, TASK item 1): replay the retained pending work inline first
-   * (ordering — the current batch must land after it), then draw this
-   * batch inline. Staging refusal happens BEFORE dispatch (class a), so
-   * nothing pending ran — but the replay still goes through the full
-   * recover path (selective: opaque suffix replays in place, blend suffix
-   * clears + replays with a seed). It converges to the identical planes
-   * either way and advances the pool watermark, so no inline-rest latch
-   * is needed and later batches can stage again. The seed repaints
-   * uncovered destinations from the indexed plane (partial during world
-   * staging — repaired by the phase-2 foreground seed before any blend
-   * reads it; final during foreground staging). `fg` selects the
-   * foreground span counters instead of the world ones. Never throws.
-   */
-  private drawInlineRGBRest(list: SpanList, mat: RGBMaterial, fg = false): void {
-    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    if (pool) {
-      const flushed = pool.rgbFlushed?.() ?? 0;
-      if (pool.rgbPending() > flushed) {
-        this.recoverRetainedRGB(pool, 'staging-refusal');
-      }
-    }
-    if (fg) this.fgInlineBatches++;
-    else this.rgbInlineBatches++;
-    this.drawRGBSpans(list, mat);
-  }
-
-  /**
-   * Inline fallback for an alias instance that could not stage (TASK item
-   * 2): replay retained work first (ordering), draw the instance inline
-   * via the exact direct path, and mark direct writes (later blend staging
-   * refuses, so a later clear-and-replay can never discard this work).
-   * Identical output via depth-guarded convergence. Never throws.
-   */
-  private drawInlineTriRest(
-    inst: AliasInstance,
-    mesh: AliasMesh,
-    mat: RGBMaterial,
-    cam: Camera,
-    dyn: DynamicLight[] | null,
-    alphaQ: number,
-    blend: RGBBlend,
-    depthWrite: boolean,
-  ): void {
-    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    if (pool) {
-      const flushed = pool.rgbFlushed?.() ?? 0;
-      if (pool.rgbPending() > flushed) {
-        this.recoverRetainedRGB(pool, 'tri-staging-refusal');
-      }
-    }
-    this.fgAliasDrawsInline++;
-    this.fgAliasTrisInline += mesh.numTris;
-    this.rgbDirectInlineWrites = true;
-    this.rgbBackend.pixelsDrawn += drawAliasInstanceRGB(
-      this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
-      inst, mat, cam, this.anorms, this.shadeDots, dyn, this.rgbWin);
-    this.rgbUsedThisFrame = true;
-  }
-
-  /**
-   * Stage one alias instance's screen tris for the worker kick (TASK item
-   * 2). Prepares transforms/clipping/lighting once, emits screen-space
-   * tris into the pool's tri region, and records one R_FLAG_TRI batch
-   * (chain slot, per-batch alphaQ) in entity order. Falls back to the
-   * exact inline path (drawInlineTriRest) when unpooled, unsupported, or
-   * refused — order-preserving either way. Translucent instances after
-   * direct inline writes draw inline (blend-after-inline refusal, see
-   * rgbDirectInlineWrites). Returns true when staged.
-   */
-  private stageAliasTris(
-    inst: AliasInstance,
-    mesh: AliasMesh,
-    mat: RGBMaterial,
-    cam: Camera,
-    dyn: DynamicLight[] | null,
-    alphaQ: number,
-    blend: RGBBlend,
-    depthWrite: boolean,
-  ): boolean {
-    this.rgbUsedThisFrame = true;
-    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    const direct = (): boolean => {
-      this.drawInlineTriRest(inst, mesh, mat, cam, dyn, alphaQ, blend, depthWrite);
-      return false;
-    };
-    if (!pool || !pool.triCursor || !pool.stageTriBatch) return direct();
-    if (blend === 'alpha' && this.rgbDirectInlineWrites) return direct();
-    const cursor = pool.triCursor();
-    if (!cursor) return direct();
-    const n = emitAliasTris(inst, cam, this.anorms, this.shadeDots, dyn, cursor.F, cursor.I, cursor.base, cursor.base + cursor.cap);
-    if (n < 0) return direct();
-    const triCount = n - cursor.base;
-    if (triCount <= 0) return true; // fully clipped: nothing to stage, order preserved trivially
-    let flags = R_FLAG_TRI;
-    if (mat.bilinear !== false) flags |= R_FLAG_BILINEAR;
-    if (mat.mipDither) flags |= R_FLAG_MIPDITHER;
-    if (mat.overbright) flags |= R_FLAG_OVERBRIGHT;
-    if (mat.opaqueMask) flags |= R_FLAG_OPAQUE;
-    if (depthWrite) flags |= R_FLAG_DEPTHWRITE;
-    if (blend === 'alpha') flags |= R_FLAG_BLEND_ALPHA;
-    const ok = pool.stageTriBatch(
-      cursor.base, triCount, mat.levels, flags, mat.zbits, alphaQ,
-    );
-    if (!ok) return direct();
-    this.fgStagedBatches++;
-    this.fgAliasDrawsStaged++;
-    this.fgTrisStaged += triCount;
-    return true;
-  }
-
-  /**
-   * Complete-frame recovery replay driver (TASK item 1, classes a-d):
-   * retained descriptors replay in exact serial order with exactly-once
-   * blends. The replay shape is selective (see the pool): an opaque-only
-   * suffix replays in place (no clear — preserves non-retained inline
-   * writes); a blend-carrying suffix clears, replays the world prefix,
-   * re-seeds, then replays the suffix. Pools with the retained-frame
-   * protocol run recoverInlineRGBAll; legacy pools (browser, until
-   * mirrored) fall back to drawInlineRGBAll, which replays the pending
-   * set — correct for clean failures, but a partial foreground failure
-   * there still loses already-flushed world work (the documented gap the
-   * mirror closes). Tallies land in the RGB backend counters + the
-   * replayed breakdown (never in the worker-completed counters:
-   * staged-but-failed work is not reported as worker-rendered).
-   */
-  private recoverRetainedRGB(pool: NonNullable<BandDispatcher>, reason: string): void {
-    void reason;
-    // PERF-NEXT-2 fence: a timeout quarantine isolates the pool onto a
-    // replacement SAB (epoch bump) — re-adopt the pool's CURRENT planes
-    // first, so the seed, the recovery replay and every later inline draw
-    // target the live buffer, never the abandoned one a live worker may
-    // still be scribbling. No-op when the pool kept its buffer.
-    this.readoptQuarantinedPlanes(pool);
-    const near = this.rgbWin.near, far = this.rgbWin.far, lodBias = this.rgbFidelity.lodBias;
-    if (typeof pool.recoverInlineRGBAll === 'function') {
-      const q = pool.recoverInlineRGBAll(() => this.seedRGBBackground(), near, far, lodBias);
-      this.rgbBackend.spansDrawn += q.spans;
-      this.rgbBackend.pixelsDrawn += q.pixels;
-      this.rangeScanned += q.scanned ?? 0;
-      this.fgReplayedSpans += q.spans;
-      this.fgReplayedPixels += q.pixels;
-      this.fgReplayedTris += q.tris ?? 0;
-      this.fgRecoveryCount++;
-      return;
-    }
-    const q = pool.drawInlineRGBAll(near, far, lodBias);
-    this.rgbBackend.spansDrawn += q.spans;
-    this.rgbBackend.pixelsDrawn += q.pixels;
-    this.rangeScanned += q.scanned ?? 0;
-    this.fgReplayedSpans += q.spans;
-    this.fgReplayedPixels += q.pixels;
-    this.fgReplayedTris += q.tris ?? 0;
-    this.fgRecoveryCount++;
-  }
-
-  /**
-   * Re-adopt the pool's current shared planes after a quarantine (PERF-NEXT-2
-   * fence): the pool may have isolated onto a fresh SAB, in which case the
-   * renderer's adopted views (and both backends' attachments) still point
-   * at the abandoned buffer. Mirrors the attachWorkerPool guards; no-op
-   * when the pool kept its buffer or exposes no planes. Never throws.
-   */
-  private readoptQuarantinedPlanes(pool: BandDispatcher): void {
-    try {
-      const p = pool.planes;
-      if (p && p.idx.length === this.fbW * this.fbH && p.zb.length === this.fbW * this.fbH &&
-        p.color.length === this.fbW * this.fbH &&
-        p.idx.buffer === p.zb.buffer && p.idx.buffer === p.color.buffer) {
-        this.idx = p.idx;
-        this.zb = p.zb;
-        this.color = p.color;
-        this.bandBackend.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
-      }
-      const rp = pool.rgbPlanes;
-      if (rp && rp.rgb565.length === this.fbW * this.fbH &&
-        rp.cover.length === this.fbW * this.fbH &&
-        rp.rgbDepth.length === this.fbW * this.fbH &&
-        rp.rgb565.buffer === rp.cover.buffer) {
-        this.rgb565 = rp.rgb565;
-        this.rgbCover = rp.cover;
-        this.rgbDepth16 = rp.rgbDepth;
-        this.rgbBackend.attach(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
-        if (this.backend === this.bandBackend) {
-          this.bandBackend.attachRGB(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
-        }
-      }
-    } catch {
-      /* best effort; the pool-view replay below still targets live planes */
-    }
-  }
-
-  /**
-   * Attribute one pool-completed suffix kick to the foreground breakdown
-   * (actual completion, not staging): worker-band spans/pixels/tris vs the
-   * calling-thread band share. PERF-NEXT-5: the pool reports worker* and
-   * main* separately from the combined totals (worker bands only vs the
-   * calling-thread band's drain — never mixed). A result WITHOUT the split
-   * (legacy shape: neither worker* nor main* present) means UNKNOWN, and is
-   * attributed to the calling-thread band (main = combined totals, worker =
-   * 0) — absent fields imply the calling-thread band ran inline and must
-   * NEVER be reported as worker-completed. When only one side of the split
-   * is present, the other is derived (combined - reported). Staged-but-failed
-   * work never reaches here (kicks return null and replay via the retained
-   * recovery, counted in replayed* — never in worker*).
-   */
-  private noteForegroundCompleted(r: { pixels: number; spans: number; workerSpans?: number; workerPixels?: number; tris?: number; workerTris?: number; mainSpans?: number; mainPixels?: number; mainTris?: number }): void {
-    const hasWorker = typeof r.workerSpans === 'number' || typeof r.workerPixels === 'number' || typeof r.workerTris === 'number';
-    const hasMain = typeof r.mainSpans === 'number' || typeof r.mainPixels === 'number' || typeof r.mainTris === 'number';
-    let wSpans: number; let wPixels: number; let wTris: number;
-    let mSpans: number; let mPixels: number; let mTris: number;
-    const tris = typeof r.tris === 'number' ? r.tris : 0;
-    if (!hasWorker && !hasMain) {
-      // Legacy shape without the split: UNKNOWN attribution, mapped to the
-      // calling-thread band per PERF-NEXT-5 (never worker-completed).
-      wSpans = 0; wPixels = 0; wTris = 0;
-      mSpans = r.spans; mPixels = r.pixels; mTris = tris;
-    } else {
-      wSpans = typeof r.workerSpans === 'number' ? r.workerSpans : r.spans - (typeof r.mainSpans === 'number' ? r.mainSpans : 0);
-      wPixels = typeof r.workerPixels === 'number' ? r.workerPixels : r.pixels - (typeof r.mainPixels === 'number' ? r.mainPixels : 0);
-      wTris = typeof r.workerTris === 'number' ? r.workerTris : tris - (typeof r.mainTris === 'number' ? r.mainTris : 0);
-      mSpans = typeof r.mainSpans === 'number' ? r.mainSpans : r.spans - wSpans;
-      mPixels = typeof r.mainPixels === 'number' ? r.mainPixels : r.pixels - wPixels;
-      mTris = typeof r.mainTris === 'number' ? r.mainTris : tris - wTris;
-    }
-    this.fgWorkerSpansCompleted += wSpans;
-    this.fgWorkerPixelsCompleted += wPixels;
-    this.fgMainSpansCompleted += mSpans;
-    this.fgMainPixelsCompleted += mPixels;
-    this.fgTrisCompleted += wTris + mTris;
-    this.fgTrisMainCompleted += mTris;
-  }
-
-  /**
-   * Complete the staged RGB frame (blocking): one worker kick over the
-   * unapplied suffix, tallied into the RGB backend counters for
-   * observability. Kick failure replays via the retained-frame recovery
-   * (identical planes, exactly-once blends — never counted as a worker
-   * kick). No-op without unapplied work. Frame stats intentionally track
-   * the classic path only, so counters here are observability-only.
-   */
-  private flushRGB(): void {
-    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    if (!pool) return;
-    if (pool.rgbPending() <= (pool.rgbFlushed?.() ?? 0)) return;
-    const r = pool.flushRGBFrame(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
-    if (r) {
-      this.rgbBackend.spansDrawn += r.spans;
-      this.rgbBackend.pixelsDrawn += r.pixels;
-      this.rangeScanned += r.scanned ?? 0;
-      this.rgbKicks++;
-      return;
-    }
-    this.recoverRetainedRGB(pool, 'world-flush-failure');
-  }
-
-  /**
-   * Same as flushRGB but message-driven (browser async completion: no
-   * Atomics.wait on the calling thread). Falls back to retained recovery.
-   */
-  private async flushRGBAsync(): Promise<void> {
-    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    if (!pool) return;
-    if (pool.rgbPending() <= (pool.rgbFlushed?.() ?? 0)) return;
-    const r = await pool.flushRGBFrameAsync(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
-    if (r) {
-      this.rgbBackend.spansDrawn += r.spans;
-      this.rgbBackend.pixelsDrawn += r.pixels;
-      this.rangeScanned += r.scanned ?? 0;
-      this.rgbKicks++;
-      return;
-    }
-    this.recoverRetainedRGB(pool, 'world-flush-failure-async');
-  }
-
-  /**
-   * World RGB batch route (PERF-2 RGB workers): stage for the worker kick
-   * when pooled, draw inline otherwise. Foreground RGB always uses
-   * drawRGBSpans directly (inline after the kick completes).
-   */
-  private drawWorldRGBSpans(list: SpanList, mat: RGBMaterial): void {
-    const pooled = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    if (pooled) {
-      this.stageRGBSpans(list, mat);
-      return;
-    }
-    this.rgbInlineBatches++;
-    this.drawRGBSpans(list, mat);
-  }
-
-  /**
-   * Stage one foreground RGB batch for the worker kick (renderer lane task
-   * 1, extended by task 2). Accepts exactly the serial foreground span
-   * draws: opaque depth-writing batches (world/entity sprites, 1px
-   * particle points), alpha-blended non-depth-writing batches (deferred
-   * TRANS33/66 glass), and additive depth-writing batches (tracer beams).
-   * Addressing must be uniform (repeat or clamp on both axes — the staged
-   * protocol carries one bit); FLAT fills run inline. World-before-
-   * foreground order is preserved by descriptor order per band: the world
-   * kick always drains before any foreground stage, and each foreground
-   * group flushes before the next inline direct write (see
-   * drawForeground). Alias triangles stage separately (stageAliasTris)
-   * into the same kick. Every write stays depth-guarded: identical output
-   * either way. Never throws. Returns true when staged.
-   */
-  private stageForegroundRGBSpans(list: SpanList, mat: RGBMaterial, cls: 'alpha' | 'sprite' | 'particle' | 'beam'): boolean {
-    this.rgbUsedThisFrame = true;
-    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    const count = list.count < list.spans.length ? list.count : list.spans.length;
-    // PERF-NEXT-5: every inline span batch counts in its class's inline
-    // spans (spans unit, matching the staged spans) AND, for the draw-based
-    // classes, one inline draw (the refused batch executes as one inline
-    // draw). Staged work is never counted here — only actually-inline work.
-    const noteInline = (): void => {
-      if (cls === 'alpha') this.fgAlphaSpansInline += count;
-      else if (cls === 'sprite') { this.fgSpriteSpansInline += count; this.fgSpriteDrawsInline++; }
-      else if (cls === 'particle') { this.fgParticleSpansInline += count; this.fgParticleDrawsInline++; }
-      else { this.fgBeamSpansInline += count; this.fgBeamDrawsInline++; }
-    };
-    const noteStaged = (): void => {
-      if (cls === 'alpha') this.fgAlphaSpansStaged += count;
-      else if (cls === 'sprite') this.fgSpriteSpansStaged += count;
-      else if (cls === 'particle') this.fgParticleSpansStaged += count;
-      else this.fgBeamSpansStaged += count;
-    };
-    if (!pool) {
-      this.fgInlineBatches++;
-      noteInline();
-      this.drawRGBSpans(list, mat);
-      return false;
-    }
-    const blendAlpha = mat.blend === 'alpha';
-    const opaqueOk = mat.blend === 'opaque' && mat.depthWrite;
-    const alphaOk = blendAlpha && !mat.depthWrite;
-    const addOk = mat.blend === 'additive';
-    if (!opaqueOk && !alphaOk && !addOk) {
-      this.drawInlineRGBRest(list, mat, true);
-      noteInline();
-      return false;
-    }
-    // Blends and additives staged after direct inline writes would need a
-    // clear-and-replay recovery that could never restore the un-retained
-    // inline writes — so they draw inline in order instead (pending work is
-    // opaque-only at this point and replays without a clear inside
-    // drawInlineRGBRest, preserving everything). Pre-inline blends and
-    // additives (the deferred alpha pass) stage as usual.
-    if ((blendAlpha || addOk) && this.rgbDirectInlineWrites) {
-      this.drawInlineRGBRest(list, mat, true);
-      noteInline();
-      return false;
-    }
-    const repeatS = mat.addressS === 'repeat';
-    const repeatT = mat.addressT === 'repeat';
-    if (repeatS !== repeatT) {
-      this.drawInlineRGBRest(list, mat, true);
-      noteInline();
-      return false;
-    }
-    let flags = 0;
-    if (mat.warp) flags |= R_FLAG_WARP;
-    if (mat.bilinear !== false) flags |= R_FLAG_BILINEAR;
-    if (mat.mipDither) flags |= R_FLAG_MIPDITHER;
-    if (mat.overbright) flags |= R_FLAG_OVERBRIGHT;
-    if (mat.opaqueMask) flags |= R_FLAG_OPAQUE;
-    if (mat.depthWrite) flags |= R_FLAG_DEPTHWRITE;
-    if (repeatS) flags |= R_FLAG_REPEAT;
-    if (blendAlpha) flags |= R_FLAG_BLEND_ALPHA;
-    if (mat.blend === 'additive') flags |= R_FLAG_ADDITIVE;
-    let luxels: Uint8Array | null = null;
-    let luxW = 0, luxH = 0;
-    if (mat.light) {
-      luxels = mat.light.samples;
-      luxW = mat.light.luxW;
-      luxH = mat.light.luxH;
-      if (!(luxW > 0 && luxH > 0) || luxels.length < luxW * luxH * 3) {
-        this.drawInlineRGBRest(list, mat, true);
-        noteInline();
-        return false;
-      }
-      flags |= R_FLAG_LIGHT;
-    }
-    if (mat.flatColor) {
-      this.drawInlineRGBRest(list, mat, true);
-      noteInline();
-      return false;
-    }
-    const ok = pool.stageRGB(
-      list, 0, count, mat.levels, luxels, luxW, luxH,
-      flags, mat.zbits, mat.turbPhase, 0,
-    );
-    if (!ok) {
-      this.drawInlineRGBRest(list, mat, true);
-      noteInline();
-      return false;
-    }
-    this.fgStagedBatches++;
-    noteStaged();
-    return true;
-  }
-
-  /**
-   * Foreground RGB batch route: stage span-based foreground (deferred
-   * alpha, world/entity sprites, particles, tracer beams) for the worker
-   * kick when pooled, draw inline otherwise. Alias triangles stage
-   * through stageAliasTris (same kick, entity order).
-   */
-  private drawForegroundRGBSpans(list: SpanList, mat: RGBMaterial, cls: 'alpha' | 'sprite' | 'particle' | 'beam'): void {
-    const pooled = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    if (pooled) {
-      this.stageForegroundRGBSpans(list, mat, cls);
-      return;
-    }
-    this.fgInlineBatches++;
-    if (cls === 'alpha') this.fgAlphaSpansInline += list.count < list.spans.length ? list.count : list.spans.length;
-    this.drawRGBSpans(list, mat);
-  }
-
-  /**
-   * Complete staged foreground RGB work (blocking): one worker kick over
-   * the batches staged since the last flush, tallied into the RGB backend
-   * counters AND the foreground completed breakdown (actual completion).
-   * PERF-NEXT-6 lane A (fused drain): this is the ONLY foreground kick per
-   * frame — the alpha/placed/entity passes all stage into the same ordered
-   * suffix, which executes in pack (serial) order inside this kick.
-   * Staged-before-inline order without intermediate kicks is enforced by
-   * the refusal paths (drawInlineRGBRest/drawInlineTriRest replay the
-   * pending suffix via recoverRetainedRGB before any direct write). Kick
-   * failure replays via the retained-frame recovery (world + foreground,
-   * exactly-once). No-op without unapplied work.
-   */
-  private flushForegroundRGB(): void {
-    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    if (!pool) return;
-    if (pool.rgbPending() <= (pool.rgbFlushed?.() ?? 0)) return;
-    const r = pool.flushRGBFrame(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
-    if (r) {
-      this.rgbBackend.spansDrawn += r.spans;
-      this.rgbBackend.pixelsDrawn += r.pixels;
-      this.rangeScanned += r.scanned ?? 0;
-      this.noteForegroundCompleted(r);
-      this.fgKicks++;
-      return;
-    }
-    this.recoverRetainedRGB(pool, 'foreground-flush-failure');
-  }
-
-  /**
-   * Same as flushForegroundRGB but message-driven (browser async
-   * completion: no Atomics.wait on the calling thread), used for the
-   * single fused drain by drawForegroundAsync. The browser pool's sync flush
-   * always declines (null) and its async flush runs the staged batches on
-   * workers; the Node pool serves both. Async decline/timeout/failure
-   * replays via the retained-frame recovery. No-op without unapplied work.
-   */
-  private async flushForegroundRGBAsync(): Promise<void> {
-    const pool = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-    if (!pool) return;
-    if (pool.rgbPending() <= (pool.rgbFlushed?.() ?? 0)) return;
-    try {
-      const r = await pool.flushRGBFrameAsync(this.rgbWin.near, this.rgbWin.far, this.rgbFidelity.lodBias);
-      if (r) {
-        this.rgbBackend.spansDrawn += r.spans;
-        this.rgbBackend.pixelsDrawn += r.pixels;
-        this.rangeScanned += r.scanned ?? 0;
-        this.noteForegroundCompleted(r);
-        this.fgKicks++;
-        return;
-      }
-    } catch {
-      /* fall through to the retained recovery below */
-    }
-    // Sync-pool decline (browser sync flush always declines): a direct
-    // blocking flush would serialize the browser main thread, so only
-    // legacy pools without the retained protocol take this path — and
-    // only to preserve today's behaviour until the mirror lands.
-    if (typeof pool.recoverInlineRGBAll !== 'function') {
-      this.flushForegroundRGB();
-      return;
-    }
-    this.recoverRetainedRGB(pool, 'foreground-flush-failure-async');
-  }
-
-  /**
-   * Seed the packed RGB565 plane from the indexed framebuffer (palette
-   * expand + 8:8:8 -> 565 quantise) before any RGB foreground/alpha draws.
-   * Alpha/additive RGB composites read the STORED 565 quantum as their
-   * destination, so the seed gives them the exact software background
-   * (opaque world already drawn classically); opaque RGB writes overwrite
-   * it. Pixels the world RGB pass already covered are spared (their
-   * filtered color survives); uncovered pixels composite from the identical
-   * indexed expand in endFrame either way. Called once at the top of
-   * drawForeground (covers world + foreground).
-   */
-  private seedRGBBackground(): void {
-    const pal = this.palette;
-    const src = this.idx;
-    const dst = this.rgb565;
-    const cover = this.rgbCover;
-    const n = this.fbW * this.fbH;
-    for (let i = 0; i < n; i++) {
-      if (cover[i] !== 0) continue;
-      const c = src[i]! * 3;
-      const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
-      const rr = r < 0 ? 0 : r > 255 ? 255 : r | 0;
-      const gg = g < 0 ? 0 : g > 255 ? 255 : g | 0;
-      const bb = b < 0 ? 0 : b > 255 ? 255 : b | 0;
-      dst[i] = (((rr >> 3) << 11) | ((gg >> 2) << 5) | (bb >> 3)) & 0xffff;
-    }
-  }
-
-  /**
-   * Palette-baked RGB material for an entity/placed skin (unlit: alias and
-   * sprite lighting rides vertex colors / fullbright, not a lightmap).
-   * Cached by Texture identity; cleared on setPalette, cvar toggles and
-   * renderer enable/disable. Sampling policy comes from the per-frame
-   * fidelity snapshot (overbright is inert here — no lightmap to modulate).
-   * Sprites keep the 255-hole mask (masked); alias models are opaque.
-   */
-  private rgbMaterialForSkin(skin: Texture): RGBMaterial {
-    const fid = this.rgbFidelity;
-    let mat = this.rgbSkinMats.get(skin);
-    if (!mat) {
-      mat = buildRGBMaterial(skin.texels, skin.width, skin.height, this.palette, null, {
-        addressS: 'clamp', addressT: 'clamp',
-        overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
-        bilinear: fid.bilinear, zbits: fid.zbits,
-      });
-      this.rgbSkinMats.set(skin, mat);
-    }
-    return mat;
-  }
-
-  /**
-   * Opaque palette-baked RGB material for alias (MD2) models: identical to
-   * rgbMaterialForSkin except opaqueMask (index 255 draws opaque, never a
-   * hole — see the rgbAliasMats field doc for the id-source audit) plus the
-   * ALIAS_LOD_BIAS_DELTA hook (currently 0: the mip-UV-scale fix removed
-   * the gutter collapse that motivated the old -3.3 content bias — see its
-   * doc comment). Separate cache because the mask is baked into the mip
-   * chain at upload.
-   */
-  private rgbMaterialForAlias(skin: Texture): RGBMaterial {
-    const fid = this.rgbFidelity;
-    let mat = this.rgbAliasMats.get(skin);
-    if (!mat) {
-      mat = buildRGBMaterial(skin.texels, skin.width, skin.height, this.palette, null, {
-        addressS: 'clamp', addressT: 'clamp',
-        overbright: fid.overbright, lodBias: fid.lodBias + ALIAS_LOD_BIAS_DELTA, mipDither: fid.mipDither,
-        bilinear: fid.bilinear, zbits: fid.zbits, opaqueMask: true,
-      });
-      this.rgbAliasMats.set(skin, mat);
-    }
-    return mat;
-  }
-
-  /**
-   * Palette-chain materials for point/line foreground (TASK item 2):
-   * 1px particle/tracer spans sample the palette index as a texel, so the
-   * chain is the 256-entry palette itself (256x1, point-sampled, unlit).
-   * The additive beam twin shares the chain and adds like splatRGB.
-   * Palette-baked (rebuilt when the palette changes); zbits is hardcoded
-   * 16 to match the direct drawParticlesRGB/drawTracerBeamRGB defaults
-   * (not the vd_zbits fidelity — those paths never took it either).
-   */
-  private rgbPaletteMaterials(): { opaque: RGBMaterial; additive: RGBMaterial } {
-    let opaque = this.rgbPaletteOpaque;
-    let additive = this.rgbPaletteAdditive;
-    if (!opaque || !additive) {
-      for (let i = 0; i < 256; i++) this.rgbPaletteTexels[i] = i;
-      opaque = buildRGBMaterial(this.rgbPaletteTexels, 256, 1, this.palette, null, {
-        addressS: 'clamp', addressT: 'clamp',
-        overbright: false, lodBias: 0, mipDither: false,
-        bilinear: false, zbits: 16, blend: 'opaque',
-        depthWrite: true, opaqueMask: true,
-      });
-      additive = buildRGBMaterial(this.rgbPaletteTexels, 256, 1, this.palette, null, {
-        addressS: 'clamp', addressT: 'clamp',
-        overbright: false, lodBias: 0, mipDither: false,
-        bilinear: false, zbits: 16, blend: 'additive',
-        depthWrite: true, opaqueMask: true,
-      });
-      // Share the one uploaded chain (same bytes): the additive twin only
-      // differs in blend, never in sampling.
-      additive.levels = opaque.levels;
-      this.rgbPaletteOpaque = opaque;
-      this.rgbPaletteAdditive = additive;
-    }
-    return { opaque, additive };
-  }
-
-  /** Palette-baked RGB material for the packed skybox strip (clamp, unlit). */
-  private rgbMaterialForSky(): RGBMaterial | null {
-    const sky = this.skyTex;
-    if (!sky) return null;
-    const cached = this.rgbSkyMat;
-    if (cached && cached.tex.width === sky.width && cached.tex.height === sky.height &&
-      cached.tex.texels.length === sky.texels.length) {
-      return cached.mat;
-    }    const fid = this.rgbFidelity;
-    const mat = buildRGBMaterial(sky.texels, sky.width, sky.height, this.palette, null, {
-      addressS: 'clamp', addressT: 'clamp',
-      overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
-      bilinear: fid.bilinear, zbits: fid.zbits, opaqueMask: true,
-    });
-    this.rgbSkyMat = { tex: { width: sky.width, height: sky.height, texels: sky.texels }, mat };
-    return mat;
-  }
-
-  /** Palette-baked flat RGB material for untextured sky (solid sky color). */
-  private rgbMaterialForFlatSky(): RGBMaterial {
-    const cached = this.rgbFlatSky;
-    if (cached && cached.index === this.skyIndex) return cached.mat;
-    const c = this.skyIndex * 3;
-    const flat = new Uint8Array([
-      this.palette[c] ?? 0, this.palette[c + 1] ?? 0, this.palette[c + 2] ?? 0,
-    ]);
-    const fid = this.rgbFidelity;
-    const mat = buildRGBMaterial(new Uint8Array([0]), 1, 1, this.palette, null, {
-      flatColor: flat, opaqueMask: true,
-      overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
-      bilinear: fid.bilinear, zbits: fid.zbits,
-    });
-    this.rgbFlatSky = { index: this.skyIndex, mat };
-    return mat;
   }
 
   /**
@@ -2506,72 +1140,11 @@ export class SoftwareRenderer implements Refresh {
     this.backend.pixelsDrawn = 0;
     this.backend.time = 0;
     this.transSpans = 0;
-    // RGB plane binding follows the live depth plane (backend switches swap
-    // this.zb; re-attaching here keeps the RGB backend on the active one).
-    // Cover clears only while enabled — disabled frames skip the composite
-    // so the extra fill costs nothing and output is untouched.
-    this.rgbBackend.spansDrawn = 0;
-    this.rgbBackend.pixelsDrawn = 0;
-    this.rgbUsedThisFrame = false;
-    this.rgbStagedBatches = 0;
-    this.rgbInlineBatches = 0;
-    this.rgbKicks = 0;
-    this.fgStagedBatches = 0;
-    this.fgInlineBatches = 0;
-    this.fgKicks = 0;
-    this.fgAlphaSpansStaged = 0;
-    this.fgAlphaSpansInline = 0;
-    this.fgSpriteSpansStaged = 0;
-    this.fgSpriteSpansInline = 0;
-    this.fgSpriteDrawsInline = 0;
-    this.fgAliasDrawsStaged = 0;
-    this.fgAliasDrawsInline = 0;
-    this.fgAliasTrisInline = 0;
-    this.fgParticleDrawsInline = 0;
-    this.fgParticlesInline = 0;
-    this.fgParticleSpansInline = 0;
-    this.fgBeamDrawsInline = 0;
-    this.fgBeamSpansInline = 0;
-    this.fgWorkerSpansCompleted = 0;
-    this.fgWorkerPixelsCompleted = 0;
-    this.fgMainSpansCompleted = 0;
-    this.fgMainPixelsCompleted = 0;
-    this.fgReplayedSpans = 0;
-    this.fgReplayedPixels = 0;
-    this.fgRecoveryCount = 0;
-    this.fgEntityMs = 0;
-    this.fgTrisStaged = 0;
-    this.fgTrisCompleted = 0;
-    this.fgTrisMainCompleted = 0;
-    this.fgReplayedTris = 0;
-    this.fgParticleSpansStaged = 0;
-    this.fgBeamSpansStaged = 0;
-    this.rgbDirectInlineWrites = false;
-    this.classicAvoidedBuilds = 0;
-    this.classicAvoidedBytes = 0;
     this.rangeScanned = 0;
-    this.classicSpansSkipped = 0;
-    this.classicFgSkipped = 0;
-    if (rgbWorldEnabled) {
-      this.rgbBackend.attach(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
-      this.rgbCover.fill(0);
-      // Window-Z clear value is all-ones (far) under the LESS-wins
-      // convention (see the field doc).
-      this.rgbDepth16.fill(0xffff);
-      // The banded backend partitions RGB spans per row band over the same
-      // planes (workers never touch them); binding follows the live planes
-      // like the serial backend above.
-      if (this.backend === this.bandBackend) {
-        this.bandBackend.attachRGB(this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, this.rgbColor);
-      }
-    }
-    this.rgbCache.nextFrame();
   }
 
   renderView(view: RefDef, world: WorldModel, entities: Entity[]): FrameStats {
     const t0 = Date.now();
-    // M4.1: fidelity snapshot once per view (cvar toggles invalidate below).
-    this.syncRGBFidelity();
     // Perf remediation item 1: per-frame entity cull counters (drawForeground
     // accumulates; the async path's phase-1 renderView resets before the
     // phase-2 drawForeground counts).
@@ -2585,10 +1158,6 @@ export class SoftwareRenderer implements Refresh {
     const cam = this.camMemo
       ? setupCameraInto(this.camMemo, view.origin, view.angles, view.fovX, this.fbW, this.fbH)
       : (this.camMemo = setupCamera(view.origin, view.angles, view.fovX, this.fbW, this.fbH));
-    // Thread the projection window (near/far) into every RGB draw this
-    // frame: the window-Z mapping derives normalized depth from it.
-    this.rgbWin = { near: cam.near, far: cam.far };
-    this.rgbBackend.setWindow(cam.near, cam.far);
     this.backend.time = view.time;
     // Renderer-owned dynamic lights (muzzle flashes) age out on their own:
     // expire before the serial check so a stale flash invalidates the cache
@@ -2716,20 +1285,6 @@ export class SoftwareRenderer implements Refresh {
     // r_translucency = 0 collapses to one loop with translucent surfaces
     // drawn opaque (pre-port behaviour).
     const tMode = translucencyModeFromCvars();
-    // PERF-FINISH-A item A (authoritative RGB skip, default on): elide the
-    // redundant classic world spanfill wherever the RGB overlay drew. The
-    // gate is the overlay itself, not the translucency mode: every skipped
-    // classic write lands on an RGB-covered pixel (resolved from the RGB
-    // planes in endFrame), and every classic *read* of the skipped planes
-    // is skipped together with it (the foreground RGB twins test against
-    // the RGB window-Z plane and blend against the seeded RGB background;
-    // covered in detail on SW_RGB_SKIP_CLASSIC_CVAR). Per-batch: classic
-    // still runs wherever no RGB material drew (unusable lightmap), so
-    // uncovered pixels keep exact classic values. Software mode (overlay
-    // off) never skips. Frame stats intentionally still track the classic
-    // path, so they undercount while the skip is armed.
-    const skipClassicWorld = skipClassicRequested() && this.rgbOverlayActive();
-    this.fgSkipClassic = skipClassicWorld;
     if (this.alphaDeferredSi.length < nvis) {
       this.alphaDeferredSi = new Int32Array(Math.max(16, nvis));
       this.alphaDeferredOrd = new Int32Array(Math.max(16, nvis));
@@ -2814,9 +1369,8 @@ export class SoftwareRenderer implements Refresh {
         if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
         if (nproj < 3) { if (d) d.clipRejected++; continue; }
         const start = this.spanList.count;
-        // Task 3: skip the unused classic flat-span packing when the
-        // classic fill below is elided (RGB stager packs from the objects).
-        const flat = skipClassicWorld ? undefined : this.flatForEmit(SPAN_FLAT, order, this.skyIndex, 0, null);
+        // Fused flat-span packing: spans carry the flat color (s.light).
+        const flat = this.flatForEmit(SPAN_FLAT, order, this.skyIndex, 0, null);
         const endCount = emitSpansForPoly(
           this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
           flat,
@@ -2841,17 +1395,7 @@ export class SoftwareRenderer implements Refresh {
         // non-emitter batches (deferred alpha loop, manual spans).
         if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = endCount;
-        // Authoritative skip (item A): elide the redundant classic fill
-        // where the RGB overlay drew (always does here — flat sky always
-        // builds its material); count the eliminated spans.
-        if (skipClassicWorld) {
-          this.classicSpansSkipped += endCount - start;
-        } else {
-          this.backend.drawSpans(this.spanList, texView, lightView);
-        }
-        if (this.rgbOverlayActive()) {
-          this.drawWorldRGBSpans(this.spanList, this.rgbMaterialForFlatSky());
-        }
+        this.backend.drawSpans(this.spanList, texView, lightView);
         if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
         this.spanList.count = 0;
         spansEmitted += endCount - start;
@@ -2894,97 +1438,26 @@ export class SoftwareRenderer implements Refresh {
         this.styleHashStyles = view.lightStyles;
       }
       if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
-      // Task 3 (block-free RGB): while the authoritative skip is armed the
-      // scalar block has no consumer (classic is elided wherever the RGB
-      // material draws), so RGB hits skip it untouched and RGB misses build
-      // the material without it (validation from the source dims; the entry
-      // stores the shared empty scalar sentinel — never rasterised). The
-      // scalar block builds only when RGB fails (classic fallback) or
-      // under the oracle. One scalar lookup per surface either way, so the
-      // cache stats below are not double-counted. Cache keys + invalidation
-      // are unchanged (both caches drop together in dropTouchedSurfaces),
-      // so a later oracle frame simply rebuilds scalar entries the RGB
-      // frames skipped.
-      let block: SurfaceBlock | null = null;
-      let rgbMat: RGBMaterial | null = null;
-      let scalarFetched = false;
-      if (skipClassicWorld && !surf.sky) {
-        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 0);
-        if (rgbHit) {
-          rgbMat = rgbHit.material;
-          // Warp phase is frame state, not cached state (see below).
-          if (rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-        } else {
-          block = this.cache.get(surf.id, stylesHash, mip);
-          scalarFetched = true;
-          if (block === null) {
-            rgbMat = this.buildRGBEntry(
-              worldData, surf, null, stylesHash, mip,
-              view.lightStyles, dyn, dlightFrameBits(surf.id),
-              { variant: 0 },
-            );
-            if (rgbMat) {
-              if (rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-              this.classicAvoidedBuilds++;
-              const srcT = worldData.textures[surf.texId % worldData.textures.length]!;
-              const shift = mip > 3 ? 3 : mip;
-              this.classicAvoidedBytes += Math.max(1, srcT.width >> shift) *
-                Math.max(1, srcT.height >> shift) + lm.luxW * lm.luxH;
-            }
-          } else {
-            rgbMat = this.buildRGBEntry(
-              worldData, surf, block, stylesHash, mip,
-              view.lightStyles, dyn, dlightFrameBits(surf.id),
-              { variant: 0 },
-            );
-            if (rgbMat && rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-          }
-        }
+      let block: SurfaceBlock | null = this.cache.get(surf.id, stylesHash, mip);
+      if (!block) {
+        // copy the style scales out of scratch (build is a miss-only path;
+        // the shared scratch is exact: buildSurfaceBlock consumes the
+        // scales synchronously and never retains them).
+        if (nValid < 0) nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
+        const scalesCopy = this.scalesScratch;
+        scalesCopy.length = 0;
+        for (let k = 0; k < nValid; k++) scalesCopy.push(this.styleScratch[k]!);
+        if (scalesCopy.length === 0) scalesCopy.push(1);
+        block = this.buildSurfaceBlock(worldData, surf, mip, scalesCopy, dyn, dlightFrameBits(surf.id));
+        this.cache.put(surf.id, stylesHash, mip, block);
       }
-      if (!rgbMat) {
-        if (!scalarFetched) block = this.cache.get(surf.id, stylesHash, mip);
-        if (!block) {
-          // copy the style scales out of scratch (build is a miss-only path;
-          // the shared scratch is exact: buildSurfaceBlock consumes the
-          // scales synchronously and never retains them).
-          if (nValid < 0) nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
-          const scalesCopy = this.scalesScratch;
-          scalesCopy.length = 0;
-          for (let k = 0; k < nValid; k++) scalesCopy.push(this.styleScratch[k]!);
-          if (scalesCopy.length === 0) scalesCopy.push(1);
-          block = this.buildSurfaceBlock(worldData, surf, mip, scalesCopy, dyn, dlightFrameBits(surf.id));
-          this.cache.put(surf.id, stylesHash, mip, block);
-        }
-        texView.width = block.bw;
-        texView.height = block.bh;
-        texView.texels = block.texels;
-        lightView.width = block.luxW;
-        lightView.height = block.luxH;
-        lightView.values = block.light;
-      }
+      texView.width = block.bw;
+      texView.height = block.bh;
+      texView.texels = block.texels;
+      lightView.width = block.luxW;
+      lightView.height = block.luxH;
+      lightView.values = block.light;
       if (ph) { ph.cache += phaseNow() - pt; pt = phaseNow(); }
-      // RGB (voodoo-policy) binding for the world pass (oracle order: the
-      // skip-armed path above already resolved or fell back to scalar).
-      // Null (unusable lightmap, pooled/wasm backend, flag off) falls back
-      // to the scalar backend alone.
-      if (!rgbMat && this.rgbOverlayActive() && !surf.sky && block && !skipClassicWorld) {
-        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 0);
-        rgbMat = rgbHit
-          ? rgbHit.material
-          : this.buildRGBEntry(
-            worldData, surf, block, stylesHash, mip,
-            view.lightStyles, dyn, dlightFrameBits(surf.id),
-            { variant: 0 },
-          );
-        // Warp phase is frame state, not cached state: refresh the shared
-        // material every frame so turbulent water scrolls instead of
-        // freezing on its build frame.
-        if (rgbMat && rgbMat.warp) rgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-      }
-      // emit (skip the fused classic flat-span packing when the classic
-      // draw below is elided — the RGB stager packs from the span objects,
-      // so the SAB flat copy would be unused staging writes).
-      const willSkipClassic = skipClassicWorld && rgbMat !== null;
       this.polyInput.verts = surf.verts;
       this.polyInput.uvs = surf.uvs;
       this.polyInput.lux = surf.lux;
@@ -2993,7 +1466,7 @@ export class SoftwareRenderer implements Refresh {
       if (ph) { ph.project += phaseNow() - pt; pt = phaseNow(); }
       if (nproj < 3) { if (d) d.clipRejected++; continue; }
       const start = this.spanList.count;
-      const flat = willSkipClassic ? undefined : this.flatForEmit(
+      const flat = this.flatForEmit(
         surf.turbulent ? SPAN_TURBULENT : SPAN_OPAQUE, order, null, null, null,
       );
       const endCount = emitSpansForPoly(
@@ -3014,18 +1487,7 @@ export class SoftwareRenderer implements Refresh {
       // validation scan, no sort (see the sky-fill site above).
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
-      // Authoritative skip (item A): elide the classic draw only where an
-      // RGB material drew (unusable lightmaps fall back to classic, so
-      // uncovered pixels keep exact values); count eliminated spans.
-      // Frame stats intentionally track the classic path only.
-      if (skipClassicWorld && rgbMat) {
-        this.classicSpansSkipped += endCount - start;
-      } else {
-        this.backend.drawSpans(this.spanList, texView, lightView);
-      }
-      if (rgbMat) {
-        this.drawWorldRGBSpans(this.spanList, rgbMat);
-      }
+      this.backend.drawSpans(this.spanList, texView, lightView);
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
       spansEmitted += endCount - start;
@@ -3046,23 +1508,6 @@ export class SoftwareRenderer implements Refresh {
       this.bandBackend.accumEnabled && !this.bandBackend.flushDeferred) {
       if (ph) pt = phaseNow();
       this.rangeScanned += this.bandBackend.flushAccum();
-      if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
-    }
-    // RGB worker kick (PERF-2): drain staged world RGB batches before any
-    // direct RGB plane write. The foreground seed reads the indexed planes
-    // (finished above) and writes rgb565 for uncovered pixels; foreground
-    // RGB draws inline after it. Unpooled / nothing staged / inline-rest:
-    // no-op, batches already drew inline. Deferred in the async path (the
-    // async driver awaits flushRGBAsync after the indexed kick instead —
-    // a blocking kick here would serialize the browser main thread).
-    // No zb backfill: under the authoritative skip (item A) no classic
-    // read of the skipped planes survives — the foreground RGB twins test
-    // against the RGB window-Z plane — so the lossy quantised->float
-    // reconstruction is gone, not just unused.
-    if (this.rgbUsedThisFrame &&
-      !(this.backend === this.bandBackend && this.bandBackend.flushDeferred)) {
-      if (ph) pt = phaseNow();
-      this.flushRGB();
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
     }
     candidatePixels = this.backend.pixelsDrawn - pixelsBase;
@@ -3091,7 +1536,7 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
-   * Foreground segment 1: RGB background seed + deferred translucent alpha
+   * Foreground segment 1: deferred translucent alpha
    * (R_DrawAlphaSurfaces) pass. Split from drawForeground for async
    * orchestration (see drawForeground): the body is unchanged, ends
    * immediately before the alpha flush point. Returns the alpha spans
@@ -3111,18 +1556,6 @@ export class SoftwareRenderer implements Refresh {
     // exact (buckets were counted at deferral time; only maxBatchSpans is
     // updated here). Tables build lazily on the first translucent frame, so
     // translucent-free worlds never pay for them.
-    // RGB background seed (step 3): alpha/additive RGB foreground draws
-    // composite against the current plane pixel, so seed the plane with the
-    // exact software background (opaque world, classically drawn above)
-    // before any RGB foreground write. Opaque RGB writes overwrite it.
-    const rgbActive = this.rgbOverlayActive();
-    if (rgbActive) this.seedRGBBackground();
-    // Authoritative skip (item A): the foreground RGB twins below are the
-    // displayed values in Voodoo mode, so the redundant classic draws are
-    // elided and counted. The RGB depth tests run against the RGB
-    // window-Z plane and blends against the seeded background — no skipped
-    // classic value is ever read.
-    const fgSkip = this.fgSkipClassic && rgbActive;
     for (let a = this.fgAlphaCount - 1; a >= 0; a--) {
       const si = this.alphaDeferredSi[a]!;
       const order = this.alphaDeferredOrd[a]!;
@@ -3152,49 +1585,8 @@ export class SoftwareRenderer implements Refresh {
         this.styleHashStyles = view.lightStyles;
       }
       if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
-      // Task 3 (block-free RGB, alpha variant): same contract as the world
-      // pass above — RGB hits skip the scalar block untouched, RGB misses
-      // build the alpha material without it, and the scalar block builds
-      // only when RGB fails (classic fallback) or under the oracle.
-      let block: SurfaceBlock | null = null;
-      let alphaRgbMat: RGBMaterial | null = null;
-      let alphaScalarFetched = false;
-      if (fgSkip) {
-        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 1);
-        if (rgbHit) {
-          alphaRgbMat = rgbHit.material;
-          if (alphaRgbMat.warp) alphaRgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-        } else {
-          const got = this.cache.get(surf.id, stylesHash, mip);
-          alphaScalarFetched = true;
-          if (got === null) {
-            alphaRgbMat = this.buildRGBEntry(
-              worldData, surf, null, stylesHash, mip,
-              view.lightStyles, dyn, this.alphaDeferredBits[a]!,
-              { blend: 'alpha', depthWrite: false, variant: 1 },
-            );
-            if (alphaRgbMat) {
-              if (alphaRgbMat.warp) alphaRgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-              this.classicAvoidedBuilds++;
-              const srcT = worldData.textures[surf.texId % worldData.textures.length]!;
-              const shift = mip > 3 ? 3 : mip;
-              this.classicAvoidedBytes += Math.max(1, srcT.width >> shift) *
-                Math.max(1, srcT.height >> shift) + lm.luxW * lm.luxH;
-            }
-          } else {
-            block = got;
-            alphaRgbMat = this.buildRGBEntry(
-              worldData, surf, block, stylesHash, mip,
-              view.lightStyles, dyn, this.alphaDeferredBits[a]!,
-              { blend: 'alpha', depthWrite: false, variant: 1 },
-            );
-            if (alphaRgbMat && alphaRgbMat.warp) alphaRgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-          }
-        }
-      }
-      if (!alphaRgbMat) {
-        if (!alphaScalarFetched) block = this.cache.get(surf.id, stylesHash, mip);
-        if (!block) {
+      let block: SurfaceBlock | null = this.cache.get(surf.id, stylesHash, mip);
+      if (!block) {
           // Shared scratch (task 6, same contract as the world miss path).
           if (nValid < 0) nValid = countValidStyles(lm, view.lightStyles, this.styleScratch);
           const scalesCopy = this.scalesScratch;
@@ -3210,7 +1602,6 @@ export class SoftwareRenderer implements Refresh {
         lightView.width = block.luxW;
         lightView.height = block.luxH;
         lightView.values = block.light;
-      }
       if (ph) { ph.cache += phaseNow() - pt; pt = phaseNow(); }
       this.polyInput.verts = surf.verts;
       this.polyInput.uvs = surf.uvs;
@@ -3234,51 +1625,19 @@ export class SoftwareRenderer implements Refresh {
       sortBatchByRow(this.pool, start, endCount - start, this.fbH, this.rowBase, this.tmpSort);
       if (ph) { ph.sort += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = endCount;
-      // RGB overlay (oracle order: the skip-armed path above already
-      // resolved or fell back to scalar): same spans, true alpha blend
-      // (never the screen-door stipple — the RGB path has no stipple),
-      // warped when the surface is turbulent, never depth-writing. Reverse
-      // traversal order is preserved (back-to-front over-blend). Resolved
-      // first so the authoritative skip below can test coverage. Staged
-      // into the RGB worker kick when pooled (task 1), drawn inline
-      // otherwise.
-      if (!alphaRgbMat && this.rgbOverlayActive() && block && !fgSkip) {
-        const rgbHit = this.rgbCache.get(surf.id, stylesHash, mip, 1);
-        alphaRgbMat = rgbHit
-          ? rgbHit.material
-          : this.buildRGBEntry(
-            worldData, surf, block, stylesHash, mip,
-            view.lightStyles, dyn, this.alphaDeferredBits[a]!,
-            { blend: 'alpha', depthWrite: false, variant: 1 },
-          );
-        if (alphaRgbMat) {
-          if (alphaRgbMat.warp) alphaRgbMat.turbPhase = (((this.backend.time * 64) | 0) & 1023);
-          this.drawForegroundRGBSpans(this.spanList, alphaRgbMat, 'alpha');
-        }
-      } else if (alphaRgbMat) {
-          this.drawForegroundRGBSpans(this.spanList, alphaRgbMat, 'alpha');
-      }
-      // Authoritative skip (item A): elide the redundant classic blend
-      // where the RGB overlay drew (its blend is the displayed value);
-      // count the eliminated spans. Falls back to classic when no RGB
-      // material exists (degenerate lightmap), so output shape is kept.
-      if (this.fgSkipClassic && alphaRgbMat) {
-        this.classicSpansSkipped += endCount - start;
+      this.ensureAlphamap();
+      const tb = this.tsBackend;
+      if (this.backend !== tb) tb.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
+      const t = drawSpansTranslucent(this.idx, this.zb, this.fbW, this.fbH, this.spanList,
+        texView, lightView, this.colormap, this.alpha33, this.alpha66,
+        surf.turbulent ? tb.turbTable : null, view.time, this.fgTMode === 2);
+      this.transSpans += t.spans;
+      if (this.backend === tb) {
+        tb.spansDrawn += t.spans;
+        tb.pixelsDrawn += t.pixels;
       } else {
-        this.ensureAlphamap();
-        const tb = this.tsBackend;
-        if (this.backend !== tb) tb.attach(this.idx, this.zb, this.fbW, this.fbH, this.colormap);
-        const t = drawSpansTranslucent(this.idx, this.zb, this.fbW, this.fbH, this.spanList,
-          texView, lightView, this.colormap, this.alpha33, this.alpha66,
-          surf.turbulent ? tb.turbTable : null, view.time, this.fgTMode === 2);
-        this.transSpans += t.spans;
-        if (this.backend === tb) {
-          tb.spansDrawn += t.spans;
-          tb.pixelsDrawn += t.pixels;
-        } else {
-          this.backend.spansDrawn += t.spans;
-          this.backend.pixelsDrawn += t.pixels;
-        }
+        this.backend.spansDrawn += t.spans;
+        this.backend.pixelsDrawn += t.pixels;
       }
       if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
       this.spanList.count = 0;
@@ -3301,8 +1660,6 @@ export class SoftwareRenderer implements Refresh {
   private drawForegroundPlacedPass(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[]): void {
     const ph = this.phaseArmed ? this.phaseAcc : null;
     let pt = ph ? phaseNow() : 0;
-    const rgbActive = this.rgbOverlayActive();
-    const fgSkip = this.fgSkipClassic && rgbActive;
     // world-placed alias / sprites / particles (M3.4 in the devroom)
     // Pooled path with zero span batches (degenerate frame): planes were
     // never cleared lazily, so fill once before direct plane writes.
@@ -3325,27 +1682,11 @@ export class SoftwareRenderer implements Refresh {
         continue;
       }
       this.fgDrawn++;
-      if (fgSkip) {
-        this.classicFgSkipped++;
-      } else {
-        drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
-          mesh, origin: pa.origin, angles: pa.angles,
-          frameA: pa.frameA, frameB: pa.frameB, lerp: pa.lerp,
-          lightAngle: ((pa.angles[1]! * 256) / 360) & 255,
-        }, skin, cam, this.anorms, this.shadeDots, this.colormap);
-      }
-      if (rgbActive) {
-        // TASK item 2: stage the instance's screen tris into the RGB
-        // worker kick (entity order = staged order) instead of filling
-        // inline — identical setup, identical filler, identical order.
-        // World-placed alias is always opaque (no Entity.alpha).
-        const mat = this.rgbMaterialForAlias(skin);
-        this.stageAliasTris({
-          mesh, origin: pa.origin, angles: pa.angles,
-          frameA: pa.frameA, frameB: pa.frameB, lerp: pa.lerp,
-          lightAngle: ((pa.angles[1]! * 256) / 360) & 255,
-        }, mesh, mat, cam, dyn, 256, 'opaque', mat.depthWrite);
-      }
+      drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
+        mesh, origin: pa.origin, angles: pa.angles,
+        frameA: pa.frameA, frameB: pa.frameB, lerp: pa.lerp,
+        lightAngle: ((pa.angles[1]! * 256) / 360) & 255,
+      }, skin, cam, this.anorms, this.shadeDots, this.colormap);
     }
     for (const ps of worldData.sprites) {
       const tex = worldData.textures[ps.skinId % worldData.textures.length]!;
@@ -3359,44 +1700,10 @@ export class SoftwareRenderer implements Refresh {
         continue;
       }
       this.fgDrawn++;
-      if (fgSkip) {
-        this.classicFgSkipped++;
-      } else {
-        drawSprite(this.idx, this.zb, this.fbW, this.fbH,
-          { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
-          [{ width: tex.width, height: tex.height, texels: tex.texels }],
-          emptyLight, this.colormap, cam, this.spriteScratch, 1024);
-      }
-      if (rgbActive) {
-        const pooledFg = this.backend === this.bandBackend
-          ? this.bandBackend.dispatcher
-          : null;
-        if (pooledFg) {
-          // Task 1: stage the emitted billboard spans into the foreground
-          // RGB kick (ascending-y emission, ordered) instead of drawing
-          // them inline — identical spans, material and order; the flush
-          // after this loop lands them before the particle writes below.
-          const n = emitSpriteSpans(
-            { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
-            [tex], cam, this.fbW, this.fbH, this.spriteScratch, 1024);
-          if (n > 0) {
-            this.spriteScratch.count = n;
-            const fgMat = this.rgbMaterialForSkin(tex);
-            this.stageForegroundRGBSpans(this.spriteScratch, fgMat, 'sprite');
-            this.spriteScratch.count = 0;
-            this.rgbUsedThisFrame = true;
-          }
-        } else {
-          this.fgInlineBatches++;
-          this.fgSpriteDrawsInline++;
-          this.rgbDirectInlineWrites = true;
-          this.rgbBackend.pixelsDrawn += drawSpriteRGB(
-            this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
-            { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
-            [tex], this.rgbMaterialForSkin(tex), cam, this.spriteScratch, 1024, undefined, this.rgbWin);
-          this.rgbUsedThisFrame = true;
-        }
-      }
+      drawSprite(this.idx, this.zb, this.fbW, this.fbH,
+        { origin: ps.origin, width: ps.size, height: ps.size, texId: 0, grade: 60 },
+        [{ width: tex.width, height: tex.height, texels: tex.texels }],
+        emptyLight, this.colormap, cam, this.spriteScratch, 1024);
     }
     if (ph) { ph.alias += phaseNow() - pt; pt = phaseNow(); }
   }
@@ -3412,8 +1719,6 @@ export class SoftwareRenderer implements Refresh {
   private drawForegroundEntityPass(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[], entities: Entity[]): void {
     const ph = this.phaseArmed ? this.phaseAcc : null;
     let pt = ph ? phaseNow() : 0;
-    const rgbActive = this.rgbOverlayActive();
-    const fgSkip = this.fgSkipClassic && rgbActive;
     if (worldData.particles.length > 0) {
       const n = Math.min(worldData.particles.length, 256);
       for (let i = 0; i < n; i++) {
@@ -3429,57 +1734,7 @@ export class SoftwareRenderer implements Refresh {
         cam.xCenter, cam.yCenter, cam.focalX, cam.focalY, cam.near,
         this.partPool,
       );
-      // PERF-NEXT-5: inline particle work counts ONLY when an inline draw
-      // actually executes (serial path, overflow, staging refusal, or the
-      // RGB-off classic path). Staged work counts in particleSpansStaged —
-      // never both (the old unconditional increment double-counted staged
-      // batches as inline).
-      const noteParticlesInline = (): void => {
-        this.fgParticleDrawsInline++;
-        this.fgParticlesInline += np;
-      };
-      if (fgSkip) {
-        this.classicFgSkipped++;
-      } else {
-        drawParticles(this.idx, this.zb, this.fbW, this.fbH, this.partPool, 0, np);
-      }
-      if (rgbActive) {
-        // TASK item 2: stage the projected points as 1px opaque spans
-        // (palette chain, point-sampled) into the entity-ordered kick
-        // instead of drawing inline — identical pixels, identical order.
-        const pooledPts = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-        if (pooledPts) {
-          const pn = emitParticleSpans(this.partPool, 0, np, this.fbW, this.fbH, this.particleScratch, 4096);
-          if (pn < 0) {
-            // Overflow (pathological particle count): draw inline.
-            noteParticlesInline();
-            this.rgbDirectInlineWrites = true;
-            this.rgbBackend.pixelsDrawn += drawParticlesRGB(
-              this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
-              this.partPool, 0, np, this.palette, this.rgbWin);
-            this.rgbUsedThisFrame = true;
-          } else if (pn > 0) {
-            const pmat = this.rgbPaletteMaterials().opaque;
-            const staged = this.stageForegroundRGBSpans(this.particleScratch, pmat, 'particle');
-            this.particleScratch.count = 0;
-            // Staging refusal draws the batch inline (noteInline already
-            // counted the spans + draw); the offered particle count lands
-            // here so particlesInline counts actually-inline particles only.
-            if (!staged) this.fgParticlesInline += np;
-            this.rgbUsedThisFrame = true;
-          }
-          // pn == 0: fully clipped — nothing staged, nothing drawn inline.
-        } else {
-          noteParticlesInline();
-          this.rgbDirectInlineWrites = true;
-          this.rgbBackend.pixelsDrawn += drawParticlesRGB(
-            this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
-            this.partPool, 0, np, this.palette, this.rgbWin);
-          this.rgbUsedThisFrame = true;
-        }
-      } else {
-        noteParticlesInline();
-      }
+      drawParticles(this.idx, this.zb, this.fbW, this.fbH, this.partPool, 0, np);
     }
 
     // entities (game-driven; model kind selects the M3.4 path)
@@ -3521,36 +1776,15 @@ export class SoftwareRenderer implements Refresh {
           continue;
         }
         this.fgDrawn++;
-        if (fgSkip) {
-          this.classicFgSkipped++;
-        } else {
-          drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
-            mesh: m.data, origin: e.origin, angles: e.angles,
-            frameA: frA, frameB: fr, lerp,
-            lightAngle: ((e.angles[1]! * 256) / 360) & 255,
-            // First-person viewmodel (Entity.depthHack = RF_DEPTHHACK):
-            // bias stored 1/z so the eye-anchored gun wins vs nearby walls.
-            depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
-            alpha: alpha >= 1 ? undefined : alpha,
-          }, skin, cam, this.anorms, this.shadeDots, this.colormap);
-        }
-        // RGB overlay (TASK item 2): the instance's screen tris stage
-        // into the entity-ordered worker kick (exact setup + filler +
-        // order) instead of filling inline. Translucency rides the
-        // per-batch alphaQ; RF_DEPTHHACK rides the staged iz.
-        if (rgbActive) {
-          const mat = this.rgbMaterialForAlias(skin);
-          const translucent = alpha < 1;
-          const alphaQ = translucent ? Math.round(alpha * 256) : 256;
-          this.stageAliasTris({
-            mesh: m.data, origin: e.origin, angles: e.angles,
-            frameA: frA, frameB: fr, lerp,
-            lightAngle: ((e.angles[1]! * 256) / 360) & 255,
-            depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
-            alpha: alpha >= 1 ? undefined : alpha,
-          }, m.data, mat, cam, dyn, alphaQ, translucent ? 'alpha' : 'opaque',
-          translucent ? false : mat.depthWrite);
-        }
+        drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
+          mesh: m.data, origin: e.origin, angles: e.angles,
+          frameA: frA, frameB: fr, lerp,
+          lightAngle: ((e.angles[1]! * 256) / 360) & 255,
+          // First-person viewmodel (Entity.depthHack = RF_DEPTHHACK):
+          // bias stored 1/z so the eye-anchored gun wins vs nearby walls.
+          depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,
+          alpha: alpha >= 1 ? undefined : alpha,
+        }, skin, cam, this.anorms, this.shadeDots, this.colormap);
       } else if (m.kind === 'sp2') {
         const skin = this.skins[e.skin] ?? devSkin0(worldData);
         // Item 1: sprite-entity billboard cull (48px quad, same rule as
@@ -3563,37 +1797,9 @@ export class SoftwareRenderer implements Refresh {
           continue;
         }
         this.fgDrawn++;
-        if (fgSkip) {
-          this.classicFgSkipped++;
-        } else {
-          drawSprite(this.idx, this.zb, this.fbW, this.fbH,
-            { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
-            [skin], emptyLight, this.colormap, cam, this.spriteScratch, 1024);
-        }
-        if (rgbActive) {
-          // TASK item 2: stage the billboard spans (entity order) instead
-          // of drawing inline — identical spans, material and order.
-          const pooledEs = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-          if (pooledEs) {
-            const n = emitSpriteSpans(
-              { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
-              [skin], cam, this.fbW, this.fbH, this.spriteScratch, 1024);
-            if (n > 0) {
-              this.spriteScratch.count = n;
-              this.stageForegroundRGBSpans(this.spriteScratch, this.rgbMaterialForSkin(skin), 'sprite');
-              this.spriteScratch.count = 0;
-              this.rgbUsedThisFrame = true;
-            }
-          } else {
-            this.fgSpriteDrawsInline++;
-            this.rgbDirectInlineWrites = true;
-            this.rgbBackend.pixelsDrawn += drawSpriteRGB(
-              this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH,
-              { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
-              [skin], this.rgbMaterialForSkin(skin), cam, this.spriteScratch, 1024, undefined, this.rgbWin);
-            this.rgbUsedThisFrame = true;
-          }
-        }
+        drawSprite(this.idx, this.zb, this.fbW, this.fbH,
+          { origin: e.origin, width: 48, height: 48, texId: 0, grade: 60 },
+          [skin], emptyLight, this.colormap, cam, this.spriteScratch, 1024);
       } else if (m.kind === 'tracer') {
         // Contract-free beam convention (renderer-internal): origin is the
         // beam start, angles its direction, frame the length in world units
@@ -3619,60 +1825,12 @@ export class SoftwareRenderer implements Refresh {
           }
           this.fgDrawn++;
         }
-        if (fgSkip) {
-          this.classicFgSkipped++;
-        } else {
-          drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
-            e.origin[0]!, e.origin[1]!, e.origin[2]!,
-            e.origin[0]! + this.tracerFwd[0]! * len,
-            e.origin[1]! + this.tracerFwd[1]! * len,
-            e.origin[2]! + this.tracerFwd[2]! * len,
-            col);
-        }
-        if (rgbActive) {
-          // TASK item 2: stage the beam as 1px additive spans (palette
-          // chain, entity order) instead of drawing inline — identical
-          // splats, identical order.
-          const pooledEb = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-          if (pooledEb) {
-            const proj = projectTracerBeam(cam,
-              e.origin[0]!, e.origin[1]!, e.origin[2]!,
-              e.origin[0]! + this.tracerFwd[0]! * len,
-              e.origin[1]! + this.tracerFwd[1]! * len,
-              e.origin[2]! + this.tracerFwd[2]! * len,
-              col, TRACER_CORE_COLOR);
-            const bn = proj ? emitTracerSpans(proj, this.fbW, this.fbH, this.beamScratch, 8192) : 0;
-            if (bn < 0) {
-              // Overflow (pathological beam): draw inline.
-              this.fgBeamDrawsInline++;
-              this.rgbDirectInlineWrites = true;
-              this.rgbBackend.pixelsDrawn += drawTracerBeamRGB(
-                this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, cam,
-                e.origin[0]!, e.origin[1]!, e.origin[2]!,
-                e.origin[0]! + this.tracerFwd[0]! * len,
-                e.origin[1]! + this.tracerFwd[1]! * len,
-                e.origin[2]! + this.tracerFwd[2]! * len,
-                col, this.palette, TRACER_CORE_COLOR, this.rgbWin);
-              this.rgbUsedThisFrame = true;
-            } else if (bn > 0) {
-              const bmat = this.rgbPaletteMaterials().additive;
-              this.stageForegroundRGBSpans(this.beamScratch, bmat, 'beam');
-              this.beamScratch.count = 0;
-              this.rgbUsedThisFrame = true;
-            }
-          } else {
-            this.fgBeamDrawsInline++;
-            this.rgbDirectInlineWrites = true;
-            this.rgbBackend.pixelsDrawn += drawTracerBeamRGB(
-              this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, cam,
-              e.origin[0]!, e.origin[1]!, e.origin[2]!,
-              e.origin[0]! + this.tracerFwd[0]! * len,
-              e.origin[1]! + this.tracerFwd[1]! * len,
-              e.origin[2]! + this.tracerFwd[2]! * len,
-              col, this.palette, TRACER_CORE_COLOR, this.rgbWin);
-            this.rgbUsedThisFrame = true;
-          }
-        }
+        drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
+          e.origin[0]!, e.origin[1]!, e.origin[2]!,
+          e.origin[0]! + this.tracerFwd[0]! * len,
+          e.origin[1]! + this.tracerFwd[1]! * len,
+          e.origin[2]! + this.tracerFwd[2]! * len,
+          col);
       }
     }
 
@@ -3697,51 +1855,10 @@ export class SoftwareRenderer implements Refresh {
         }
         this.fgDrawn++;
       }
-      if (fgSkip) {
-        this.classicFgSkipped++;
-      } else {
-        drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
-          this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
-          this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
-          this.tracerColors[ti]!, this.tracerCores[ti]!);
-      }
-      if (rgbActive) {
-        // TASK item 2: stage pooled beams as additive spans (serial order,
-        // after entities) instead of drawing inline — identical splats.
-        const pooledTb = this.backend === this.bandBackend ? this.bandBackend.dispatcher : null;
-        if (pooledTb) {
-          const proj = projectTracerBeam(cam,
-            this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
-            this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
-            this.tracerColors[ti]!, this.tracerCores[ti]!);
-          const bn = proj ? emitTracerSpans(proj, this.fbW, this.fbH, this.beamScratch, 8192) : 0;
-          if (bn < 0) {
-            // Overflow (pathological beam): draw inline.
-            this.fgBeamDrawsInline++;
-            this.rgbDirectInlineWrites = true;
-            this.rgbBackend.pixelsDrawn += drawTracerBeamRGB(
-              this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, cam,
-              this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
-              this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
-              this.tracerColors[ti]!, this.palette, this.tracerCores[ti]!, this.rgbWin);
-            this.rgbUsedThisFrame = true;
-          } else if (bn > 0) {
-            const bmat = this.rgbPaletteMaterials().additive;
-            this.stageForegroundRGBSpans(this.beamScratch, bmat, 'beam');
-            this.beamScratch.count = 0;
-            this.rgbUsedThisFrame = true;
-          }
-        } else {
-          this.fgBeamDrawsInline++;
-          this.rgbDirectInlineWrites = true;
-          this.rgbBackend.pixelsDrawn += drawTracerBeamRGB(
-            this.rgb565, this.rgbCover, this.rgbDepth16, this.fbW, this.fbH, cam,
-            this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
-            this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
-            this.tracerColors[ti]!, this.palette, this.tracerCores[ti]!, this.rgbWin);
-          this.rgbUsedThisFrame = true;
-        }
-      }
+      drawTracerBeam(this.idx, this.zb, this.fbW, this.fbH, cam,
+        this.tracerSegs[o]!, this.tracerSegs[o + 1]!, this.tracerSegs[o + 2]!,
+        this.tracerSegs[o + 3]!, this.tracerSegs[o + 4]!, this.tracerSegs[o + 5]!,
+        this.tracerColors[ti]!, this.tracerCores[ti]!);
       this.tracerTtl[ti]--;
     }
     if (ph) { ph.alias += phaseNow() - pt; pt = phaseNow(); }
@@ -3754,65 +1871,26 @@ export class SoftwareRenderer implements Refresh {
 
   /**
    * Entity foreground orchestrator (sync path): alpha pass, placed pass,
-   * entity pass — each stages its foreground work (alpha spans; alias
-   * tris + sprites; alias tris + sprites + particles + tracer beams, all
-   * in exact serial order) and flushes one worker kick, so the serial
-   * order holds exactly across mixed staged/inline work. Bit-identical
-   * either way: world-first, foreground-second, all writes depth-guarded.
-   * The three flush points preserve the exact serial order; kick failures
-   * replay via the retained-frame recovery (selective clear, exactly-once
-   * blends, inline writes preserved). Zero allocation (phase timing uses
-   * the armed scratch). Returns the alpha spans emitted (feeds the stats
-   * stash).
+   * entity pass. All writes are depth-guarded indexed draws, so output is
+   * identical either way. Zero allocation (phase timing uses the armed
+   * scratch). Returns the alpha spans emitted (feeds the stats stash).
    */
   private drawForeground(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[], entities: Entity[]): number {
-    const ph = this.phaseArmed ? this.phaseAcc : null;
     const alphaSpans = this.drawForegroundAlphaPass(cam, worldData, view, dyn);
-    // PERF-NEXT-6 lane A (fused foreground drain): the alpha and placed
-    // passes stage into the same ordered descriptor suffix as the entity
-    // pass below — no intermediate kicks. Staged-before-inline order is
-    // enforced by the refusal paths (drawInlineRGBRest/drawInlineTriRest
-    // replay the pending suffix via recoverRetainedRGB before any direct
-    // write), and the single drain below preserves serial order exactly,
-    // so the eager intermediate kicks were pure dispatch overhead.
     this.drawForegroundPlacedPass(cam, worldData, view, dyn);
-    // Item 3: wall-clock time of the expensive entity-foreground pass
-    // (alias incl. viewmodel, entity sprites, tracers, pooled beams).
-    // Always on (two clock reads per frame); output-identical.
-    const tEntity = phaseNow();
     this.drawForegroundEntityPass(cam, worldData, view, dyn, entities);
-    this.fgEntityMs += phaseNow() - tEntity;
-    // TASK item 2: the entity pass stages alias tris + sprites + particles
-    // + tracers in exact serial order into one kick — flush it here so the
-    // staged work lands before endFrame (no inline draws follow, so a
-    // failure recovery here can never discard un-retained work). This is
-    // the only foreground kick (fused: the alpha + placed passes above
-    // staged into the same suffix).
-    let pt = ph ? phaseNow() : 0;
-    this.flushForegroundRGB();
-    if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
     return alphaSpans;
   }
 
   /**
    * Entity foreground orchestrator (async path): the same three segments
-   * in the same order with a single fused drain (see drawForeground), but
-   * the drain is message-driven (no Atomics.wait on the calling thread),
-   * so staged foreground batches execute on workers in the browser instead
-   * of replaying inline. Bit-identical to drawForeground: world-first,
-   * foreground-second, all writes depth-guarded, serial + failure
-   * fallbacks intact (see flushForegroundRGBAsync).
+   * in the same order. Bit-identical to drawForeground: world-first,
+   * foreground-second, all writes depth-guarded.
    */
   private async drawForegroundAsync(cam: Camera, worldData: MiniWorld, view: RefDef, dyn: DynamicLight[], entities: Entity[]): Promise<number> {
-    const ph = this.phaseArmed ? this.phaseAcc : null;
     const alphaSpans = this.drawForegroundAlphaPass(cam, worldData, view, dyn);
     this.drawForegroundPlacedPass(cam, worldData, view, dyn);
-    const tEntity = phaseNow();
     this.drawForegroundEntityPass(cam, worldData, view, dyn, entities);
-    this.fgEntityMs += phaseNow() - tEntity;
-    let pt = ph ? phaseNow() : 0;
-    await this.flushForegroundRGBAsync();
-    if (ph) { ph.draw += phaseNow() - pt; pt = phaseNow(); }
     return alphaSpans;
   }
 
@@ -3867,13 +1945,6 @@ export class SoftwareRenderer implements Refresh {
     if (banded && banded.dispatcher && banded.accumEnabled) {
       this.rangeScanned += await banded.flushAccumAsync();
     }
-    // RGB worker kick (message-driven): staged world RGB batches drain
-    // before the foreground seed + inline foreground RGB draws below.
-    // No zb backfill (item A): the foreground classic reads are skipped
-    // with the writes, so nothing consumes the skipped planes.
-    if (this.rgbUsedThisFrame) {
-      await this.flushRGBAsync();
-    }
     // World kick complete (planes valid) — now the direct plane writes.
     const fgCam = this.fgCam;
     const fgWorld = this.fgWorld;
@@ -3888,20 +1959,12 @@ export class SoftwareRenderer implements Refresh {
   }
 
   endFrame(): void {
-    // Retained-frame protocol (TASK item 1): the frame's staged RGB
-    // descriptors (world + foreground) are retained across flushes for
-    // complete-frame recovery; no more kicks run after this point, so
-    // drop the retention now. beginFrame() also resets, so a missed
-    // commit can never leak descriptors into the next frame.
-    if (this.backend === this.bandBackend) this.bandBackend.dispatcher?.commitRGB?.();
     if (this.backend === this.bandBackend && this.bandBackend.dispatcher) {
-      // Pooled path: fused palette-expand + RGB composite via one resolve
-      // kick (workers + the main band drain the color plane in parallel;
-      // bit-identical to the serial fused loop below). Timeout/dead pool
-      // falls back to the serial fused expand inside resolveAccum. The
-      // zero-batch guard keeps the resolve input defined (mirrors the
-      // pre-alias guard in renderView). No second compositeRGB pass: the
-      // kick already composited (PERF-5 pooled end-frame fusion).
+      // Pooled path: parallel palette-expand via one resolve kick (workers
+      // + the main band drain the color plane in parallel; bit-identical
+      // to the serial loop below). Timeout/dead pool falls back to the
+      // serial expand inside resolveAccum. The zero-batch guard keeps the
+      // resolve input defined (mirrors the pre-alias guard in renderView).
       if (this.bandBackend.batchesDrawn === 0) {
         this.idx.fill(0);
         this.zb.fill(0);
@@ -3909,65 +1972,15 @@ export class SoftwareRenderer implements Refresh {
       this.bandBackend.resolveAccum(this.palette, this.color);
     } else {
       // Palette expand to 0xAABBGGRR (classic / wasm / banded-inline paths).
-      // PERF-2 C fused single pass: pixels the RGB overlay covered expand
-      // from the packed RGB565 authority plane (top-bit replication into
-      // the resolve scratch, exactly like compositeRGB below), everything
-      // else from the indexed plane. Disjoint pixel sets, no cross-pixel
-      // dependencies: bit-identical to expand-then-composite, minus one
-      // full-frame idx+color read/write pass. Skipped cover branch while
-      // disabled, so classic output is untouched.
       const pal = this.palette;
       const n = this.fbW * this.fbH;
-      if (!this.rgbUsedThisFrame) {
-        for (let i = 0; i < n; i++) {
-          const c = this.idx[i]! * 3;
-          const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
-          this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
-        }
-      } else {
-        const q = this.rgb565, cover = this.rgbCover, rgb = this.rgbColor;
-        for (let i = 0; i < n; i++) {
-          if (cover[i]) {
-            const v = q[i]!;
-            const r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
-            rgb[i] = (0xff000000 |
-              ((((b5 << 3) | (b5 >> 2)) << 16) |
-                (((g6 << 2) | (g6 >> 4)) << 8) |
-                ((r5 << 3) | (r5 >> 2)))) >>> 0;
-            this.color[i] = rgb[i]!;
-          } else {
-            const c = this.idx[i]! * 3;
-            const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
-            this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
-          }
-        }
+      for (let i = 0; i < n; i++) {
+        const c = this.idx[i]! * 3;
+        const r = pal[c]!, g = pal[c + 1]!, b = pal[c + 2]!;
+        this.color[i] = (0xff << 24) | (b << 16) | (g << 8) | r;
       }
     }
     this.mirrorIndexPlane();
-  }
-
-  /**
-   * Merge the RGB overlay over the resolved color plane wherever the
-   * coverage mask is set (the single global reconstruct for the pooled
-   * backend; the serial/banded-inline paths fuse the identical math into
-   * the endFrame expand pass in one scan — see there). The source is the
-   * packed RGB565 authority plane, expanded to 8:8:8 into the resolve
-   * scratch (5/6-bit upscale replicates the top bits into the low bits).
-   */
-  private compositeRGB(): void {
-    const q = this.rgb565, cover = this.rgbCover, rgb = this.rgbColor;
-    const n = this.fbW * this.fbH;
-    for (let i = 0; i < n; i++) {
-      if (cover[i]) {
-        const v = q[i]!;
-        const r5 = (v >> 11) & 31, g6 = (v >> 5) & 63, b5 = v & 31;
-        rgb[i] = (0xff000000 |
-          ((((b5 << 3) | (b5 >> 2)) << 16) |
-            (((g6 << 2) | (g6 >> 4)) << 8) |
-            ((r5 << 3) | (r5 >> 2)))) >>> 0;
-        this.color[i] = rgb[i]!;
-      }
-    }
   }
 
   /**
@@ -3976,7 +1989,6 @@ export class SoftwareRenderer implements Refresh {
    * the identical serial expand. Bit-identical to endFrame.
    */
   async endFrameAsync(): Promise<void> {
-    if (this.backend === this.bandBackend) this.bandBackend.dispatcher?.commitRGB?.();
     if (this.backend === this.bandBackend && this.bandBackend.dispatcher) {
       if (this.bandBackend.batchesDrawn === 0) {
         this.idx.fill(0);
@@ -4040,124 +2052,6 @@ export class SoftwareRenderer implements Refresh {
    * view sees no TRANS33/66 glass; observability for the glass golden). */
   testTranslucentSpans(): number {
     return this.transSpans;
-  }
-
-  /**
-   * PERF-FINISH-A item A observability: classic work eliminated by the
-   * authoritative skip in the last renderView. `classicSpansSkipped`
-   * counts world / sky / skybox / deferred-alpha spans whose classic draw
-   * was elided where the RGB overlay drew; `classicFgSkipped` counts
-   * elided entity-foreground classic draws (alias / sprite / particle /
-   * tracer calls). Both are zero with the cvar-0 oracle or in software
-   * mode (RGB off) — the skip never arms there. `skipArmed` reports the
-   * phase-1 decision for the last frame.
-   */
-  testClassicSkipStats(): {
-    classicSpansSkipped: number; classicFgSkipped: number; skipArmed: boolean;
-  } {
-    return {
-      classicSpansSkipped: this.classicSpansSkipped,
-      classicFgSkipped: this.classicFgSkipped,
-      skipArmed: this.fgSkipClassic,
-    };
-  }
-
-  /**
-   * Observability for the RGB pass (astra V2a/V2c + step-3 test hook):
-   * whether the module flag is on, whether any draw took the RGB backend
-   * this frame, RGB cache hit/miss/size, and how many framebuffer pixels
-   * the coverage mask marks for the RGB888 composite. Zero unless the
-   * flag was enabled for the last renderView.
-   */
-  testRGBStats(): {
-    enabled: boolean; used: boolean;
-    hits: number; misses: number; size: number; coverPixels: number;
-  } {
-    let coverPixels = 0;
-    if (this.rgbUsedThisFrame) {
-      const c = this.rgbCover;
-      for (let i = 0; i < c.length; i++) coverPixels += c[i]!;
-    }
-    const cc = this.rgbCache;
-    return {
-      enabled: rgbWorldEnabled,
-      used: this.rgbUsedThisFrame,
-      hits: cc.hits,
-      misses: cc.misses,
-      size: cc.size,
-      coverPixels,
-    };
-  }
-
-  /** Live RGB cache hit rate (bench/ledger observability). */
-  testRGBCacheStats(): {
-    hits: number; misses: number; size: number; hitRate: number;
-    evictions: number;
-    chainHits: number; chainMisses: number; chainSize: number;
-    chainUsed: number; chainEvictions: number;
-  } {
-    const c = this.rgbCache;
-    return {
-      hits: c.hits, misses: c.misses, size: c.size, hitRate: c.hitRate(),
-      evictions: c.evictions,
-      chainHits: this.rgbTexHits, chainMisses: this.rgbTexMisses,
-      chainSize: this.rgbTexChains.size, chainUsed: this.rgbTexUsed,
-      chainEvictions: this.rgbTexEvictions,
-    };
-  }
-
-  /**
-   * Eviction-accounting probe (P2 pin): real chain retention vs the
-   * budgeted `chainUsed`. `retainedChainBytes` walks the chain map plus
-   * every DISTINCT chain still referenced by RGBLightCache materials;
-   * `orphanChainBytes` is the unbudgeted part (chains evicted from the map
-   * but pinned alive by surviving materials). Coordinated eviction keeps
-   * orphans at zero, so `retainedChainBytes === chainUsed <= BUDGET`.
-   * Byte formula matches rgbChainFor (64 + data + mask per level).
-   */
-  testRGBChainAccounting(): {
-    chainUsed: number; chainMapBytes: number; orphanChainBytes: number;
-    retainedChainBytes: number; rgbEntries: number; budget: number;
-  } {
-    let mapBytes = 0;
-    const live = new Set<RGBMipLevel[]>();
-    for (const e of this.rgbTexChains.values()) {
-      mapBytes += e.bytes;
-      live.add(e.chain);
-    }
-    let orphan = 0;
-    for (const ch of this.rgbCache.referencedChains()) {
-      if (live.has(ch)) continue;
-      let b = 64;
-      for (const lvl of ch) b += lvl.data.length + lvl.mask.length;
-      orphan += b;
-    }
-    return {
-      chainUsed: this.rgbTexUsed,
-      chainMapBytes: mapBytes,
-      orphanChainBytes: orphan,
-      retainedChainBytes: mapBytes + orphan,
-      rgbEntries: this.rgbCache.size,
-      budget: RGB_TEXCHAIN_BUDGET,
-    };
-  }
-
-  /**
-   * RGB cover count inside a screen rect (step-3 test hook: dense-cover
-   * asserts for filtered explosions — stipple would leave holes). Clamped
-   * to the framebuffer. Zero unless the flag was enabled for the last
-   * renderView.
-   */
-  testRGBBoxCover(x0: number, y0: number, x1: number, y1: number): number {
-    let n = 0;
-    const xa = Math.max(0, Math.floor(x0)), xb = Math.min(this.fbW - 1, Math.ceil(x1));
-    const ya = Math.max(0, Math.floor(y0)), yb = Math.min(this.fbH - 1, Math.ceil(y1));
-    for (let y = ya; y <= yb; y++) {
-      for (let x = xa; x <= xb; x++) {
-        if (this.rgbCover[y * this.fbW + x] !== 0) n++;
-      }
-    }
-    return n;
   }
 
   /** WASM backend batch stats (M9.1): null unless initWasm() succeeded. */
@@ -4277,17 +2171,9 @@ export class SoftwareRenderer implements Refresh {
   private emitSkyBox(cam: Camera, order: number, acc: { spans: number; max: number }): void {
     const sky = this.skyTex!;
     const tileH = sky.height / 6;
-    // Authoritative skip (item A): same unified gate as the world pass
-    // (fgSkipClassic is set by renderView before any skybox emission; the
-    // world tMode gate is gone, so sky and world share one policy).
-    const skipClassicSky = this.fgSkipClassic;
     texView.width = sky.width;
     texView.height = sky.height;
     texView.texels = sky.texels;
-    // Task 3: resolve once per frame (not per face) and skip the unused
-    // classic flat-span packing when the classic face fill is elided.
-    const skyMatAll = this.rgbOverlayActive() ? this.rgbMaterialForSky() : null;
-    const skipSkyFlat = skipClassicSky && skyMatAll !== null;
     const ox = cam.origin[0]!, oy = cam.origin[1]!, oz = cam.origin[2]!;
     const tmp = this.skyTmp;
     acc.spans = 0;
@@ -4311,7 +2197,7 @@ export class SoftwareRenderer implements Refresh {
       const nproj = projectClippedPoly(this.polyInput, cam, this.fbW, this.fbH, this.scratch);
       if (nproj < 3) continue;
       const start = this.spanList.count;
-      const flat = skipSkyFlat ? undefined : this.flatForEmit(SPAN_OPAQUE, order, 63, 0, -1);
+      const flat = this.flatForEmit(SPAN_OPAQUE, order, 63, 0, -1);
       const endCount = emitSpansForPoly(
         this.scratch.poly, nproj, order, this.pool, start, MAX_SPANS, 63, 0, this.fbH,
         flat,
@@ -4331,16 +2217,7 @@ export class SoftwareRenderer implements Refresh {
       // emitSpansForPoly batch (one span per row, ascending) — no scan,
       // no sort (see the sky-fill site in renderView).
       this.spanList.count = endCount;
-      // Authoritative skip (item A): elide the classic face fill where the
-      // RGB sky material drew; count the eliminated spans.
-      if (skipClassicSky && skyMatAll) {
-        this.classicSpansSkipped += endCount - start;
-      } else {
-        this.backend.drawSpans(this.spanList, texView, lightView);
-      }
-      if (skyMatAll) {
-        this.drawWorldRGBSpans(this.spanList, skyMatAll);
-      }
+      this.backend.drawSpans(this.spanList, texView, lightView);
       this.spanList.count = 0;
       const batch = endCount - start;
       acc.spans += batch;
@@ -4384,198 +2261,7 @@ export class SoftwareRenderer implements Refresh {
       luxW: lm.luxW, luxH: lm.luxH,
     };
   }
-
-  /**
-   * Drop the shared per-texture RGB chains (palette/world change).
-   * Coordinated ownership (P2): chains are shared by reference with
-   * RGBLightCache materials, so the drop also invalidates the light
-   * cache — otherwise evicted/cleared chains stay alive through
-   * `material.levels` with no accounting trace. All callers already
-   * invalidate the light cache too; the second clear is a harmless no-op
-   * that keeps the pairing enforceable in one place. Also drops the pool's
-   * persistent SAB upload cache (PERF-5), so stale chain bytes can never
-   * serve after a palette/world change.
-   */
-  private clearRGBTextureChains(): void {
-    this.rgbCache.invalidateAll();
-    this.rgbTexChains.clear();
-    this.rgbTexUsed = 0;
-    try {
-      this.bandBackend.dispatcher?.clearRGBChains();
-    } catch {
-      /* pool gone: next attach re-uploads */
-    }
-  }
-
-  /**
-   * Get-or-build the shared expanded mip chain for one world texture
-   * (upload-time cost, amortised across every surface using it). Frame-stamp
-   * LRU inside RGB_TEXCHAIN_BUDGET; a world-identity change drops chains
-   * AND the surface caches (surface ids are world-relative). Returns null
-   * only for unusable texture data (caller falls back to the scalar block).
-   */
-  private rgbChainFor(texId: number, src: Texture, worldData: MiniWorld): RGBMipLevel[] | null {
-    if (this.rgbTexWorld !== worldData) {
-      this.clearRGBTextureChains();
-      this.rgbTexWorld = worldData;
-      this.lastTouched.length = 0;
-      this.rgbCache.invalidateAll();
-    }
-    const hit = this.rgbTexChains.get(texId);
-    if (hit) {
-      hit.used = this.frame;
-      this.rgbTexHits++;
-      return hit.chain;
-    }
-    this.rgbTexMisses++;
-    if (!(src.width >= 1 && src.height >= 1) || src.texels.length < src.width * src.height) return null;
-    const chain = buildRGBChain(src.texels, src.width, src.height, this.palette, false);
-    let bytes = 64;
-    for (const lvl of chain) bytes += lvl.data.length + lvl.mask.length;
-    while (this.rgbTexUsed + bytes > RGB_TEXCHAIN_BUDGET && this.rgbTexChains.size > 0) {
-      let victim: number | undefined;
-      let victimAge = -1;
-      for (const [k, e] of this.rgbTexChains) {
-        const age = (this.frame - e.used) >>> 0;
-        if (age > victimAge) {
-          victimAge = age;
-          victim = k;
-          if (age > 0) break;
-        }
-      }
-      if (victim === undefined) break;
-      const e = this.rgbTexChains.get(victim)!;
-      this.rgbTexChains.delete(victim);
-      this.rgbTexUsed -= e.bytes;
-      this.rgbTexEvictions++;
-      // Coordinated ownership (P2): entries whose material shares this
-      // chain would otherwise pin the evicted bytes alive (retention above
-      // budget, plus a duplicate chain on the next miss for the texture).
-      // Drop only that texture's dependents; the next access rebuilds both
-      // the chain and the small luxel blocks.
-      this.rgbCache.invalidateChain(e.chain);
-    }
-    this.rgbTexChains.set(texId, { chain, bytes, used: this.frame });
-    this.rgbTexUsed += bytes;
-    return chain;
-  }
-
-  /**
-   * RGB miss path: build the cached binding for one surface from the
-   * SHARED per-texture mip chain (see rgbChainFor: expanded once per
-   * texture, reused by every surface) plus a fresh per-channel luxel block
-   * (buildRGBLightMap). Returns null when the lightmap or texture is
-   * unusable; the caller then draws the scalar block/backend alone, so
-   * output shape never changes. The entry shares the chain with every
-   * other surface on the same texture and owns only the RGB luxels, so the
-   * RGBLightCache budget covers thousands of surfaces (scalar-style
-   * discipline); only lighting/serial changes rebuild luxels. Turbulent
-   * surfaces get a warp material; `extra` lets the deferred alpha loop
-   * request the blended, non-depth-writing variant for TRANS33/66 (the main
-   * loop always draws opaque). Sampling policy comes from the per-frame
-   * fidelity snapshot; a cvar change invalidates the per-surface luxels in
-   * syncRGBFidelity but keeps the shared chains (fidelity-independent), so
-   * the next frame re-links without re-expanding textures.
-   *
-   * `block` may be null (task 3): while the authoritative skip is armed
-   * the scalar block has no consumer (classic is elided, and the cached
-   * entry's scalar copy is never rasterised — it only feeds budget
-   * accounting, which the luxels below already cover), so the miss path
-   * validates against the source dims and stores a shared empty scalar
-   * sentinel. A null RGB result (unusable lightmap/texture) still falls
-   * back to the scalar path, which builds the block on demand.
-   */
-  private buildRGBEntry(
-    world: MiniWorld, surf: MiniSurf, block: SurfaceBlock | null,
-    stylesHash: number, mip: number,
-    lightStyles: Float32Array, dyn: DynamicLight[], dlightBits: number,
-    extra?: { blend?: 'opaque' | 'alpha' | 'additive'; depthWrite?: boolean; variant?: number },
-  ): RGBMaterial | null {
-    const lm = world.lightmaps[surf.lightId % world.lightmaps.length]!;
-    if (!lm || lm.luxW < 1 || lm.luxH < 1) return null;
-    if (lm.samples.length < lm.luxW * lm.luxH * 3) return null;
-    if (block) {
-      if (block.texels.length < block.bw * block.bh || block.bw < 1 || block.bh < 1) return null;
-    }
-    // Full-res mip source (see doc above): the cache key keeps `mip`, so
-    // entries filed under different scalar mips share the identical chain.
-    const src = world.textures[surf.texId % world.textures.length]!;
-    if (!src || src.width < 1 || src.height < 1) return null;
-    if (src.texels.length < src.width * src.height) return null;
-    const n = lm.luxW * lm.luxH;
-    const need = n * 3;
-    if (this.rgbLightScratch.length < need) this.rgbLightScratch = new Uint8Array(need);
-    // Per-luxel dlight falloff (same grid fit as the scalar miss path).
-    let luxelPos: Float32Array | null = null;
-    if (dyn.length > 0 && dlightBits !== 0) {
-      const need3 = n * 3;
-      if (this.dluxScratch.length < need3) this.dluxScratch = new Float32Array(need3);
-      luxelWorldPositions(surf.verts, surf.lux, surf.n, lm.luxW, lm.luxH, surf.center, this.dluxScratch);
-      luxelPos = this.dluxScratch;
-    }
-    const nValid = countValidStyles(lm, lightStyles, this.styleScratch);
-    // Shared scratch (task 6): buildRGBLightMap consumes the scales
-    // synchronously and never retains them (the entry owns the luxels).
-    const scales = this.scalesScratch;
-    scales.length = 0;
-    for (let k = 0; k < nValid; k++) scales.push(this.styleScratch[k]!);
-    if (scales.length === 0) scales.push(1);
-    buildRGBLightMap(
-      this.rgbLightScratch, lm.samples, lm.luxW, lm.luxH,
-      scales, dyn, surf.center, dlightBits, LIGHT_OVERBRIGHT, luxelPos,
-    );
-    const rgb = this.rgbLightScratch.slice(0, need);
-    // Shared chain (one expansion per texture, reused by every surface on
-    // it) + per-surface luxels. The material shell is small and cached with
-    // the luxels; the chain lives in the texture cache (own budget).
-    const texId = surf.texId % world.textures.length;
-    const chain = this.rgbChainFor(texId, src, world);
-    if (!chain) return null;
-    const fid = this.rgbFidelity;
-    const material: RGBMaterial = {
-      levels: chain,
-      addressS: 'repeat', addressT: 'repeat',
-      light: { samples: rgb, luxW: lm.luxW, luxH: lm.luxH },
-      overbright: fid.overbright, lodBias: fid.lodBias, mipDither: fid.mipDither,
-      bilinear: fid.bilinear, zbits: fid.zbits,
-      blend: extra?.blend ?? 'opaque',
-      alphaTest: null,
-      depthWrite: extra?.depthWrite ?? true,
-      alpha: 1,
-      // World chains are NOT opacity-proven (WAL texels may carry index
-      // 255 in test palettes), so the mask tap stays — alias/sky materials
-      // set this via buildRGBMaterial's opaqueMask option instead.
-      opaqueMask: false,
-      warp: surf.turbulent,
-      turbPhase: surf.turbulent ? (((this.backend.time * 64) | 0) & 1023) : 0,
-      flatColor: null,
-    };
-    const entry: RGBCachedBlock = {
-      block: block
-        ? {
-          texels: block.texels, bw: block.bw, bh: block.bh,
-          light: block.light, luxW: block.luxW, luxH: block.luxH, rgb,
-        }
-        : {
-          // Task 3 scalar-free entry: no consumer reads the scalar copy
-          // (classic is elided while the skip is armed), so store the
-          // shared empty sentinel. Budget accounting is unchanged: it
-          // counts the owned luxels (`rgb`) plus the entry overhead, like
-          // the scalar-carrying entry above.
-          texels: RGB_EMPTY_BLOCK.texels, bw: 0, bh: 0,
-          light: RGB_EMPTY_BLOCK.light, luxW: lm.luxW, luxH: lm.luxH, rgb,
-        },
-      material,
-    };
-    this.rgbCache.put(surf.id, stylesHash, mip, entry, extra?.variant ?? 0);
-    return material;
-  }
 }
-
-/** Shared empty scalar copy for scalar-free RGB entries (task 3). */
-const RGB_EMPTY_BLOCK: { texels: Uint8Array; light: Uint8Array } = {
-  texels: new Uint8Array(0), light: new Uint8Array(0),
-};
 
 function getDevMeshSafe(id: number, fallback: AliasMesh): AliasMesh {
   try {

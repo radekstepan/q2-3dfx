@@ -4,7 +4,7 @@
 
 export {
   SUBDIV,
-  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SPAN_TRANS33, SPAN_TRANS66, SPAN_ADD,
+  SPAN_OPAQUE, SPAN_TURBULENT, SPAN_FLAT, SPAN_TRANS33, SPAN_TRANS66,
   TRANSLUCENCY_CVAR, STIPPLE_ALPHA_CVAR, translucencyModeFromCvars,
   createSpan,
   runSubdiv16, runSubdivTurbulent, runSpanFlat,
@@ -14,18 +14,7 @@ export {
   drawSpansSoftware, drawSpansTurbulent, drawSpansFlat, drawSpansTranslucent,
   drawSpans16, SoftwareBackend,
   buildTurbTable, spanListView,
-  rgbMipLevel, rgbPickMipLevel, rgbSampleTexture, rgbSampleLightmap,
-  rgbModulate, expandPaletteRGB, buildRGBMaterial, buildRGBChain,
-  quantiseIz, quantiseIzInt,
-  packRGB565, expandRGB565, rgbBlendPixel565,
-  windowDepth01, windowDepthQ16, windowDepthQ16FromIz, testResetWinMemo,
-  DEFAULT_RGB_NEAR, DEFAULT_RGB_FAR, DEFAULT_RGB_WINDOW,
-  rgbWrapCoord, rgbBlendPixel,
-  runSubdivRGBRepeat, runSubdivRGBClamp, runSubdivRGBGeneric, runSpanFlatRGB,
-  drawSpansRGB, RGBWorldBackend,
   type Span, type SpanList, type Texture, type LightBlock, type RasterBackend,
-  type RGBAddressMode, type RGBBlend, type RGBMipLevel, type RGBLightmap, type RGBMaterial,
-  type RGBWindow,
 } from './spans.js';
 
 export {
@@ -40,35 +29,24 @@ export {
   F_PER_SPAN, I_PER_SPAN,
   CTL_SEQ, CTL_COUNT, CTL_TEXW, CTL_TEXH, CTL_LIGHTW, CTL_LIGHTH,
   CTL_WSHIFT, CTL_WMASK, CTL_HMASK, CTL_TURBPHASE, CTL_FBW, CTL_FBH,
-  CTL_DONE, CTL_EXEC, CTL_PIXELS, CTL_SPANS, CTL_READY, CTL_FCOUNT, CTL_JOB, CTL_FRAME, CTL_RGBCOUNT, CTL_RGBBASE, CTL_SCAN, CTL_TRIS, CTL_LEN,
-  JOB_RASTER, JOB_RESOLVE, JOB_RGB, JOB_SCANOUT,
+  CTL_DONE, CTL_EXEC, CTL_PIXELS, CTL_SPANS, CTL_READY, CTL_FCOUNT, CTL_JOB, CTL_FRAME, CTL_SCAN, CTL_LEN,
+  JOB_RASTER, JOB_RESOLVE,
   workersRequestedByCvar, accumRequestedByCvar, sabAvailable, syncWaitAllowed,
   splitBands, bandLayout, bandTotal, attachBandShared, createBandBuffers,
   packBandSpans, packFrameSpans, readBandJob, writeBandJob,
-  processBandJob, rasterizePackedRange, rasterizePackedRGBRange, processFrameJob, processRGBFrameJob,
+  processBandJob, rasterizePackedRange, processFrameJob,
   lowerBoundRow,
-  processScanoutBand,
-  resolveBand, resolveBandFused, bandWorkerLoop,
+  resolveBand, bandWorkerLoop,
   defaultBandWorkerNow, bandJobName,
   MAX_FRAME_SPANS, FRAME_TEX_CAP, FRAME_LIGHT_CAP, MAX_FRAME_BATCHES, PALETTE_BYTES,
   D_SPAN_BASE, D_SPAN_COUNT, D_TEX_OFF, D_TEX_W, D_TEX_H,
   D_LIGHT_OFF, D_LIGHT_W, D_LIGHT_H, D_WSHIFT, D_WMASK, D_HMASK,
   D_TURBPHASE, D_YMIN, D_YMAX, D_ORDERED, D_PER_BATCH,
   frameAccumLayout, frameAccumTotal, attachFrameAccum,
-  RGB_CHAIN_CAP, RGB_LUX_CAP, MAX_RGB_BATCHES, MAX_RGB_SPANS, RGB_MAX_CHAINS, RGB_MAX_LEVELS,
-  C_LEVEL_BASE, C_LEVEL_COUNT, C_PER_CHAIN,
-  L_DATA_OFF, L_MASK_OFF, L_W, L_H, L_PER_LEVEL,
-  R_SPAN_BASE, R_SPAN_COUNT, R_CHAIN, R_LUX_OFF, R_LUX_W, R_LUX_H,
-  R_FLAGS, R_ZBITS, R_TURBPHASE, R_FLATRGB, R_YMIN, R_YMAX, R_ORDERED, R_ALPHAQ, R_PER_BATCH,
-  R_FLAG_WARP, R_FLAG_BILINEAR, R_FLAG_MIPDITHER, R_FLAG_OVERBRIGHT,
-  R_FLAG_DEPTHWRITE, R_FLAG_REPEAT, R_FLAG_LIGHT, R_FLAG_FLAT, R_FLAG_OPAQUE, R_FLAG_BLEND_ALPHA, R_FLAG_ADDITIVE, R_FLAG_TRI,
-  rgbAccumLayout, rgbAccumTotal, attachRGBAccum,
-  workerMaterialToRGB, SCAN_KICK_LEN,
   BandedSoftwareBackend,
   type Band, type BandLayout, type BandViews, type BandJob, type BandPort,
   type BandDispatcher, type BandExecSample, type BandJobLabel, type BandWorkerOptions,
-  type FrameAccumLayout, type FrameAccumViews, type RGBAccumLayout, type RGBAccumViews,
-  type RGBWorkerMaterial, type ScanoutBandOptions,
+  type FrameAccumLayout, type FrameAccumViews,
 } from './bands.js';
 
 export { BandWorkerPool, type PoolOptions } from './bandPool.js';
@@ -83,12 +61,11 @@ export {
 export {
   SURFACE_CACHE_BUDGET,
   SurfaceCache, surfaceCacheKey, hashLightStyles,
-  RGBLightCache, rgbCacheKey,
-  type SurfaceBlock, type RGBCachedBlock,
+  type SurfaceBlock,
 } from './surfaceCache.js';
 
 export {
-  buildLightMap, buildRGBLightMap, combineStyleScales, bboxDistance, luxelWorldPositions,
+  buildLightMap, combineStyleScales, bboxDistance, luxelWorldPositions,
   LIGHT_STYLE_UNUSED, LIGHT_OVERBRIGHT, DEFAULT_DLIGHT_TTL_FRAMES,
   DLightState,
   type DynamicLight, type SurfaceBounds,
@@ -116,21 +93,20 @@ export {
   createSoldierMesh, createSoldierSkin,
   isMd2Data, md2ToAliasMesh,
   MD2_CONVERT_MAX_TRIS, MD2_CONVERT_MAX_VERTS, MD2_CONVERT_MAX_FRAMES,
-  drawAliasInstance, fillAffineTri, DEPTHHACK_SCALE, TRI_F_PER_TRI, TRI_I_PER_TRI, TRI_MAX_TRIS,
-  drawAliasInstanceRGB, fillPerspTriRGB,
+  drawAliasInstance, fillAffineTri, DEPTHHACK_SCALE,
   clampBacklerp, aliasAlphaKeeps,
   testAliasShareStats, testResetAliasShareStats,
   type AliasMesh, type AliasInstance, type AliasSkin, type Md2Like,
 } from './alias.js';
 
-export { drawSprite, drawSpriteRGB, emitSpriteSpans, type SpriteDef, type Scissor } from './sprites.js';
+export { drawSprite, emitSpriteSpans, type SpriteDef, type Scissor } from './sprites.js';
 
 export {
-  drawTracerBeam, drawTracerBeamRGB,
+  drawTracerBeam,
   TRACER_DEFAULT_LENGTH, TRACER_DEFAULT_COLOR, TRACER_CORE_COLOR, TRACER_MAX_STEPS, TRACER_POOL_SIZE,
 } from './tracer.js';
 
-export { drawParticles, drawParticlesRGB, projectParticles, type ScreenParticle } from './particles.js';
+export { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
 
 export { createDevroom, createDevSkins, getDevMesh, DEVROOM_CAMERA } from './devroom.js';
 
@@ -145,11 +121,7 @@ export {
 export {
   SoftwareRenderer, sortBatchByRow, spansBatchIsRowOrdered, nextPot, MAX_SPANS,
   aliasModelBounds, sphereCulledByFlatFrustum,
-  setRGBWorldEnabled, isRGBWorldEnabled,
-  SW_RGB_SKIP_CLASSIC_CVAR, skipClassicRequested,
-  readRGBFidelity, sameRGBFidelity,
-  ALIAS_LOD_BIAS_DELTA,
-  type RGBFidelity, type ModelBounds,
+  type ModelBounds,
 } from './frame.js';
 export {
   createFramePhases, phaseNow,

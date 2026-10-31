@@ -7,8 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { createFramebuffer, type Entity } from '@q2/renderer-api';
 import { resetCVars, setCVar } from '@q2/config';
 import {
-  SoftwareRenderer, setRGBWorldEnabled,
-  SW_RGB_SKIP_CLASSIC_CVAR, skipClassicRequested,
+  SoftwareRenderer,
   spansBatchIsRowOrdered, sortBatchByRow,
   sphereCulledByFlatFrustum,
 } from './frame.js';
@@ -20,13 +19,10 @@ import {
   D_TEX_OFF, D_TEX_W, D_TEX_H, D_LIGHT_OFF, D_LIGHT_W, D_LIGHT_H,
   D_WSHIFT, D_WMASK, D_HMASK, D_TURBPHASE, D_YMIN, D_YMAX,
   processFrameJob, F_PER_SPAN, I_PER_SPAN,
-  R_FLAG_OPAQUE,
   type FrameAccumViews,
 } from './bands.js';
 import {
-  SPAN_OPAQUE, TRANSLUCENCY_CVAR,
-  buildRGBMaterial, buildRGBChain,
-  windowDepthQ16,
+  SPAN_OPAQUE,
 } from './spans.js';
 import {
   DLightState, bboxDistance, type SurfaceBounds,
@@ -42,7 +38,6 @@ import {
 import { setupCamera } from './camera.js';
 
 afterEach(() => {
-  setRGBWorldEnabled(false);
   resetCVars();
   testResetMarkCacheStats();
 });
@@ -398,50 +393,6 @@ describe('item 3: emitter-order sort bypass', () => {
   });
 });
 
-describe('item 4: specialised RGB pixel paths', () => {
-  const pal = testPalette();
-
-  it('opaqueMask materials carry all-opaque masks at every mip', () => {
-    const texels = new Uint8Array(16 * 16).fill(7);
-    texels[3] = 255; // a hole in the source art
-    const open = buildRGBChain(texels, 16, 16, pal, false);
-    const shut = buildRGBChain(texels, 16, 16, pal, true);
-    expect(open.some((l) => l.mask.some((m) => m === 0))).toBe(true);
-    for (const l of shut) expect(l.mask.every((m) => m === 1)).toBe(true);
-  });
-
-  it('mask skip is a proven no-op on all-opaque chains', () => {
-    const texels = new Uint8Array(16 * 16).fill(7);
-    const matOpen = buildRGBMaterial(texels, 16, 16, pal, null, {
-      addressS: 'repeat', addressT: 'repeat', zbits: 16, opaqueMask: false,
-    });
-    const matShut = buildRGBMaterial(texels, 16, 16, pal, null, {
-      addressS: 'repeat', addressT: 'repeat', zbits: 16, opaqueMask: true,
-    });
-    expect(matShut.opaqueMask).toBe(true);
-    expect(matOpen.opaqueMask).toBe(false);
-    // Same chain bytes (no 255 in the art), only the proof flag differs.
-    expect(matShut.levels[0]!.data).toEqual(matOpen.levels[0]!.data);
-  });
-
-  it('16-bit fast path matches windowDepthQ16 bit-for-bit on loop inputs', () => {
-    // The loops sanitise d01 first (clamp + NaN -> far), so the fast path
-    // only ever sees [0,1] finite inputs — mirror that derivation here.
-    for (const raw of [0, 1e-9, 0.001, 0.25, 0.5, 0.999, 1, NaN, -0.5, 1.5]) {
-      const d = raw < 0 ? 0 : raw > 1 ? 1 : (raw === raw ? raw : 1);
-      expect(Math.round(d * 65535) & 0xffff).toBe(windowDepthQ16(d, 16));
-      expect(Math.round(d * 65535) & 0xffff).toBe(windowDepthQ16(d, 23));
-    }
-    // Sub-16-bit policies still quantise (the kept fallback path).
-    expect(windowDepthQ16(0.5, 1)).toBe(0xffff);
-    expect(windowDepthQ16(0.5, 8)).toBe(Math.round((Math.round(0.5 * 255) * 65535) / 255) & 0xffff);
-  });
-
-  it('R_FLAG_OPAQUE round-trips through the worker material adapter', () => {
-    expect(R_FLAG_OPAQUE).toBe(256);
-  });
-});
-
 describe('item 5: cached PVS marking', () => {
   function twoLeafWorld(): MiniWorld {
     const big = new Float32Array([-1000, -1000, -1000]);
@@ -563,11 +514,10 @@ describe('item 6: dynamic-light marking without the quadratic scan', () => {
 
 describe('item 7: foreground/model setup sharing', () => {
   it('shared setup is deterministic across cameras (memo hit + miss agree)', () => {
-    // The world-alias loop draws every critter classically then (with RGB
-    // on) in RGB — the second call reuses the shared view verts. Three
-    // consecutive frames (A, B, A) prove the memoised frame equals a fresh
-    // computation: A1 === A2 while B differs.
-    setRGBWorldEnabled(true);
+    // The world-alias loop draws every critter through the shared setup:
+    // repeated instances reuse the shared view verts. Three consecutive
+    // frames (A, B, A) prove the memoised frame equals a fresh computation:
+    // A1 === A2 while B differs.
     testResetAliasShareStats();
     const render = (ox: number, yaw: number) => {
       const fb = createFramebuffer(160, 120, true);
@@ -594,126 +544,10 @@ describe('item 7: foreground/model setup sharing', () => {
     const a2 = render(DEVROOM_CAMERA.origin[0]!, yawA);
     expect(a2).toBe(a1);
     expect(b).not.toBe(a1);
-    // The classic+RGB twin per instance shares one setup: every render
-    // draws critters twice (miss then hit), so both counters are live.
+    // Instances after the first share one setup (miss then hits), so both
+    // counters are live.
     const share = testAliasShareStats();
     expect(share.misses).toBeGreaterThan(0);
     expect(share.hits).toBeGreaterThan(0);
-  });
-});
-
-describe('item 8: RGB-authoritative production path', () => {
-  function renderRGB(W: number, H: number, skip: boolean, entities: Entity[] = []) {
-    const fb = createFramebuffer(W, H, true);
-    const r = new SoftwareRenderer();
-    r.init(fb);
-    r.setPalette(testPalette());
-    setCVar(SW_RGB_SKIP_CLASSIC_CVAR, skip ? 1 : 0);
-    expect(skipClassicRequested()).toBe(skip);
-    setRGBWorldEnabled(true);
-    r.beginFrame();
-    r.renderView(devView(), { name: 'devroom', data: createDevroom() }, entities);
-    r.endFrame();
-    const live = r.getFramebuffer();
-    const color = fnvU8(new Uint8Array(live.color.buffer, live.color.byteOffset, live.color.byteLength));
-    const idx = fnvU8(live.index!);
-    const st = r.testRGBStats();
-    setRGBWorldEnabled(false);
-    return { color, idx, cover: st.coverPixels, used: st.used };
-  }
-
-  function idxDiff(a: Uint8Array, b: Uint8Array): number {
-    let n = 0;
-    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) n++;
-    return n;
-  }
-
-  it('all-opaque frames: skip-on composite equals skip-off composite', () => {
-    setCVar(TRANSLUCENCY_CVAR, 0); // tMode 0: the authoritative gate arms
-    const off = renderRGB(160, 120, false);
-    const on = renderRGB(160, 120, true);
-    expect(on.used).toBe(true);
-    expect(on.cover).toBe(off.cover);
-    // The production resolve (what scanout consumes) is identical: the
-    // duplicate classic fill is proven waste on this scene.
-    expect(on.color).toBe(off.color);
-  });
-
-  it('foreground depth survives the skip (entity in front of a wall)', () => {
-    setCVar(TRANSLUCENCY_CVAR, 0);
-    const mk = (skip: boolean) => {
-      const fb = createFramebuffer(160, 120, true);
-      const r = new SoftwareRenderer();
-      r.init(fb);
-      r.setPalette(testPalette());
-      const box = r.registerModel({ kind: 'md2', name: 'box', data: createBoxMesh() });
-      const skin = r.registerSkin('fg');
-      setCVar(SW_RGB_SKIP_CLASSIC_CVAR, skip ? 1 : 0);
-      setRGBWorldEnabled(true);
-      r.beginFrame();
-      r.renderView(
-        devView(),
-        { name: 'devroom', data: createDevroom() },
-        [{ model: box, skin, frame: 0,
-           origin: new Float32Array([DEVROOM_CAMERA.origin[0]! + 60, DEVROOM_CAMERA.origin[1]!, DEVROOM_CAMERA.origin[2]!]),
-           angles: new Float32Array([0, 0, 0]) }],
-      );
-      r.endFrame();
-      const live = r.getFramebuffer();
-      const out = {
-        color: fnvU8(new Uint8Array(live.color.buffer, live.color.byteOffset, live.color.byteLength)),
-        idx: live.index!.slice(),
-      };
-      setRGBWorldEnabled(false);
-      return out;
-    };
-    const off = mk(false);
-    const on = mk(true);
-    // RGB composite identical: the entity won the same depth test both ways
-    // (foreground depth reads the backfilled classic plane under the skip).
-    expect(on.color).toBe(off.color);
-    // The classic index plane stops being meaningful under the skip BY
-    // DESIGN (batches the RGB overlay drew never run their classic fill):
-    // most world pixels differ. That IS the eliminated duplicate work.
-    // Software mode (flag off) is untouched; the composite is the
-    // production authority. Integrator: docs/tests invariant update.
-    const d = idxDiff(on.idx, off.idx);
-    expect(d).toBeGreaterThan(1000);
-  });
-
-  it('translucent frames keep the classic path in software mode (skip never arms with RGB off)', () => {
-    setCVar(TRANSLUCENCY_CVAR, 1); // tMode 1: alpha loop live
-    const plain = (() => {
-      const fb = createFramebuffer(160, 120, true);
-      const r = new SoftwareRenderer();
-      r.init(fb);
-      r.setPalette(testPalette());
-      r.beginFrame();
-      r.renderView(devView(), { name: 'devroom', data: createDevroom() }, []);
-      r.endFrame();
-      return fnvU8(r.getFramebuffer().index!);
-    })();
-    setCVar(SW_RGB_SKIP_CLASSIC_CVAR, 1);
-    const fb = createFramebuffer(160, 120, true);
-    const r = new SoftwareRenderer();
-    r.init(fb);
-    r.setPalette(testPalette());
-    r.beginFrame();
-    r.renderView(devView(), { name: 'devroom', data: createDevroom() }, []);
-    r.endFrame();
-    // Software mode unchanged: flag on + RGB off never skips.
-    expect(fnvU8(r.getFramebuffer().index!)).toBe(plain);
-  });
-
-  it('translucent frames disarm the skip with RGB enabled (no silent translucency loss)', () => {
-    setCVar(TRANSLUCENCY_CVAR, 1); // tMode 1: alpha loop live
-    const off = renderRGB(160, 120, false);
-    const on = renderRGB(160, 120, true);
-    expect(on.used).toBe(true);
-    // The production composite is identical with the skip on or off: no
-    // translucent contribution is lost where the overlay drew, and the
-    // alpha loop still runs its classic draws (skip only elides classic
-    // writes landing on RGB-covered pixels).
-    expect(on.color).toBe(off.color);
   });
 });
