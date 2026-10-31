@@ -477,7 +477,7 @@ export const CVAR_DESCRIPTIONS: Readonly<Record<string, string>> = {
   r_brightness: 'display-only post-resolve brightness lift 0.5..2.0',
   skill: 'difficulty 0 easy 1 medium 2 hard 3 nightmare (latched at boot)',
   map_source: 'map source: cached pak0.pak game (pak) or built-in devroom (devroom); changing it reboots the level',
-  vid_resolution: 'internal framebuffer WxH (latched: changing it reboots the level)',
+  vid_resolution: 'internal framebuffer WxH (resizes in place, no reboot)',
   vid_renderer: 'active refresh backend: software | voodoo | webgl2-experimental (experimental, needs WebGL2; incapable Falls back to software WITH a warning)',
   vd_16bit: 'quantise 8:8:8 to RGB565 at resolve',
   vd_dither: '4x4 ordered dither before quantise',
@@ -519,13 +519,14 @@ export function cvarDescription(name: string): string {
 
 /**
  * Cvars that reboot the level when changed (latched in id, immediate here):
- * skill re-calls the boot path with SV_SetSkill applied before spawning,
- * vid_resolution reboots at the new framebuffer size. vid_renderer is NOT
- * here: it hot-swaps in place (applyRendererCvar) without rebuilding
- * Host/LocalDriver/server state. The browser boot listens via
- * renderCvarPanel's onChange and calls rebootPlay.
+ * skill re-calls the boot path with SV_SetSkill applied before spawning.
+ * vid_resolution is NOT here: it resizes in place via resizePlay
+ * (RELEASE-7, no sim rebuild) without touching Host/LocalDriver/server
+ * state. vid_renderer is NOT here either: it hot-swaps in place
+ * (applyRendererCvar). The browser boot listens via
+ * renderCvarPanel's onChange and calls rebootPlay / resizePlay.
  */
-export const REBOOT_CVARS: ReadonlySet<string> = new Set(['skill', 'vid_resolution', 'map_source']);
+export const REBOOT_CVARS: ReadonlySet<string> = new Set(['skill', 'map_source']);
 
 /** True when changing this cvar reboots the level (skill, vid_resolution). */
 export function cvarNeedsReboot(name: string): boolean {
@@ -946,6 +947,7 @@ import {
   pumpMuzzleLight,
   pumpTracers,
   resolveDisplay,
+  toggleHelpOverlay,
 } from './play.js';
 import type { AsyncLoopState } from './play.js';
 import { syncGpuCanvasToHud } from './gpu-canvas.js';
@@ -1796,9 +1798,25 @@ export function startPlayLoop(
     if (e.code === 'Digit3') driver.selectWeapon('weapon_machinegun');
   };
 
+  // RELEASE-6 F1 help computer: toggles the asset-based help overlay
+  // (buildHelpLayout + help background) painted by drawPlayHud. preventDefault
+  // keeps the browser from opening its own help; element-local keydown only
+  // (never document-level mouse wiring, so UI keys never produce game input).
+  const onHelpKey = (e: KeyboardEvent): void => {
+    if (e.code === 'F1') {
+      try {
+        e.preventDefault();
+      } catch {
+        /* key handling best-effort */
+      }
+      toggleHelpOverlay(boot);
+    }
+  };
+
   document.addEventListener('pointerdown', unlock);
   document.addEventListener('keydown', unlock);
   document.addEventListener('keydown', onWeaponKeys);
+  document.addEventListener('keydown', onHelpKey);
 
   let raf = 0;
   let stopped = false;
@@ -2006,6 +2024,7 @@ export function startPlayLoop(
       document.removeEventListener('pointerdown', unlock);
       document.removeEventListener('keydown', unlock);
       document.removeEventListener('keydown', onWeaponKeys);
+      document.removeEventListener('keydown', onHelpKey);
       const p = pool;
       pool = null;
       useAsync = false;

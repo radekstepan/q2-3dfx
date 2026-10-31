@@ -7,6 +7,9 @@ import {
   applyRendererCvar,
   getResolution,
   parseResolution,
+  resizePlay,
+  reservedDisplaySize,
+  applyReservedSizeToCanvas,
   getMapSource,
   availableMapSources,
   MAP_SOURCE_DEFAULT,
@@ -36,10 +39,12 @@ afterEach(() => {
 });
 
 describe('menu reboot: skill + resolution (headless)', () => {
-  it('skill, vid_resolution, and map_source reboot; renderer hot-swaps instead', () => {
+  it('skill and map_source reboot; renderer and resolution preserve sim in place', () => {
     expect(cvarNeedsReboot('skill')).toBe(true);
-    expect(cvarNeedsReboot('vid_resolution')).toBe(true);
     expect(cvarNeedsReboot('map_source')).toBe(true);
+    // RELEASE-7: vid_resolution resizes in place (resizePlay, no sim rebuild)
+    // instead of rebooting — Host/LocalDriver/server state survives.
+    expect(cvarNeedsReboot('vid_resolution')).toBe(false);
     // vid_renderer hot-swaps in place (no reboot): the resolve path reads
     // the cvar every frame, so Host/LocalDriver/server state survives.
     expect(cvarNeedsReboot('vid_renderer')).toBe(false);
@@ -118,7 +123,7 @@ describe('menu reboot: skill + resolution (headless)', () => {
     expect(getResolution()).toEqual({ width: 320, height: 240 });
   });
 
-  it('bootPlay defaults to the menu resolution; rebootPlay resizes the framebuffer', () => {
+  it('bootPlay defaults to the menu resolution; rebootPlay keeps live size, resizePlay resizes in place', () => {
     // Untouched cvar: the classic 320x240 internal buffer.
     const a = bootPlay({ width: 64, height: 48 });
     expect(a.host.fb.width).toBe(64);
@@ -129,13 +134,18 @@ describe('menu reboot: skill + resolution (headless)', () => {
     expect(b.host.fb.width).toBe(640);
     expect(b.host.fb.height).toBe(480);
     expect(b.display.length).toBe(640 * 480);
-    // Reboot keeps the size while the cvar is unchanged…
+    // Reboot keeps the LIVE size while the cvar is unchanged…
     const c = rebootPlay(b);
     expect(c.host.fb.width).toBe(640);
     expect(c.host.fb.height).toBe(480);
-    // …and resizing the dropdown then rebooting resizes the framebuffer.
+    // …and changing the dropdown then rebooting still keeps the live size
+    // (RELEASE-7: resolution no longer reboots — it resizes in place).
     setCVar('vid_resolution', '1024x768');
     const d = rebootPlay(c);
+    expect(d.host.fb.width).toBe(640);
+    expect(d.host.fb.height).toBe(480);
+    // The menu resize path is resizePlay: same boot, new framebuffer, sim kept.
+    expect(resizePlay(d, 1024, 768)).toBe(true);
     expect(d.host.fb.width).toBe(1024);
     expect(d.host.fb.height).toBe(768);
     expect(d.display.length).toBe(1024 * 768);

@@ -322,37 +322,6 @@ Expensive browser tests and benchmarks run sequentially. Intermediate targeted
 passes are not full-suite acceptance. Archive completed cards with evidence;
 commit validated implementation increments with changesets, no push.
 
-### RELEASE-2 — Render the asset-free demo room in WebGL2
-owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit`
-depends: none
-status: review
-starting-points: `play.ts: bootPlay/applyRendererCvar`, `devroom.ts`, `devroom-fallback.test.ts`
-done-when:
-- [ ] Verify the landed procedural palette/world/model replay on GPU cold boot, switching and restoration without a pak. The former palette guard was addressed in `2c4c162`; do not repeat the obsolete diagnosis or rebuild the implementation. Diagnose any remaining failure from rendered evidence.
-- [ ] Real-WebGL pixels show expected room geometry/materials and entities without pak assets; verify cold boot, map switch, renderer switch and context restoration. Check that an intentional missing-world control fails; nonblack clear color alone is insufficient.
-
-### RELEASE-6 — Use game assets for HUD, F1 and level completion
-owns: `apps/web`, `packages/client`, `packages/formats`, `packages/testkit`
-depends: none
-status: in-progress(@opencode)
-starting-points: `play.ts: drawPlayHud`, browser F1/menu handler, pak `pics/` and original client screen/layout code
-review-finding: current HUD draws text such as `hp` and weapon classname; completion uses a custom text block.
-lane-2026-10-30 (@opencode): formats+client lane DONE + testkit lane DONE (35/35, 79-pic manifest noted vs 78 task text); apps/web drawPlayHud replacement + F1 wiring still open for integrator.
-done-when:
-- [ ] Compare startup/F1 help, health/ammo/armor and level-completion/intermission layout with original game assets and layout semantics. Inventory required pak pictures/fonts and stats; implement the appropriate asset-based screens instead of placeholder styling.
-- [ ] Preserve readable asset-free devroom fallback and distinguish game HUD from optional FPS/position diagnostics. Verify real assets, values, transparency, scaling and placement at 640×480 and 1024×768, including death and level completion.
-
-### RELEASE-7 — Change display settings without restarting; stable startup size
-owns: `apps/web`, `packages/host`, `packages/webgl-renderer`, `packages/testkit`
-depends: RELEASE-3
-status: in-progress(@opencode)
-review-findings: `dom.ts: REBOOT_CVARS` includes resolution; renderer already uses `applyRendererCvar` hot-swap; `resizeGpuBackend` exists.
-lane-2026-10-30 (@opencode): host lane DONE (20/20, sim-preserving resize + snapshot/dispose hooks); apps/web + webgl-renderer + testkit wiring still open.
-done-when:
-- [ ] Wire resolution changes through coordinated framebuffer/viewport/HUD resizing without rebuilding the game simulation. Preserve map, position, health, enemies, elapsed time and audio. Confirm renderer changes also preserve these states in the actual menu; diagnose any remaining restart rather than adding another switch path.
-- [ ] Reserve the selected/persisted display dimensions before async asset loading. Show a correctly sized loading surface immediately, then present the first valid frame without a small black box or layout jump. Cover cold cache, cached pak, no pak and failed GPU initialization.
-- [ ] Verify repeated resize/switch, context loss/restore, resource disposal and no duplicate loop/listeners; keep explicit restart behavior only for settings that genuinely require a new level (e.g. map/skill).
-
 ### RELEASE-8 — Retire the old CPU Voodoo renderer
 owns: `apps/web`, `packages/config`, `packages/renderer-api`, `packages/sw-renderer`, `packages/voodoo`, `packages/host`, `packages/testkit`, `tools/bench`, `tools/asset-cooker`, `docs`, root workspace configuration
 depends: RELEASE-2, RELEASE-7
@@ -362,19 +331,6 @@ done-when:
 - [ ] Remove the legacy CPU Voodoo execution mode and its menu/config selection in favor of WebGL2; map persisted legacy selections deliberately and report unsupported-GPU fallback accurately. Preserve the software reference/Node renderer and the WebGL Voodoo appearance.
 - [ ] Inventory shared imports first: WebGL currently reuses `sw-renderer` helpers and `voodoo` is a policy/post-process package. Remove obsolete mode-specific code, workers, controls and benchmarks; retain or relocate shared utilities. Do not delete whole packages blindly or silently turn WebGL into a CPU path.
 - [ ] Update frozen contracts with required major changesets if changed, dependency rules, scripts, docs and tests. Retire obsolete tests explicitly while preserving meaningful software goldens and GPU parity/lifecycle coverage. Update §§2–6 to describe the final architecture, not a planned deletion.
-
-### GPU-FOLLOW-3B — Remove visible water tile boundaries
-owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
-depends: GPU-FOLLOW-3A
-status: in-progress(@opencode)
-starting-points: `shaders.ts: FS_LIT/voodooWarp`, world UVs, diffuse mip generation/sampling
-review-finding: `2c4c162` only added formula tests; no shader repair or sampled-pixel diagnostic landed. LOD/lightmap cause is unproven; the prior TODO claiming diagnostics established it is withdrawn.
-lane-2026-10-30 (@opencode): webgl-renderer lane DONE + testkit lane DONE (water-pixels real-WebGL: wrap 0.0207 < anim 4x, overlap 0.43, det 0); apps/web stationary/moving captures still open for integrator.
-done-when:
-- [ ] Preserve the now-satisfactory water motion. Reproduce the remaining visible tile seams in real water; record map, camera, material, time and crops. Distinguish texture-repeat boundaries from BSP-face/lightmap seams and warp/LOD/precision effects using fixed-time, fixed-LOD and diffuse/unlit diagnostics. Compare adjacent faces at the same world position and the CPU/reference appearance. Record the demonstrated cause before changing the algorithm.
-- [ ] Fix that cause while retaining animated turbulence, intended texture scale, repeat behavior and transparent/depth ordering. Check original versus resized texture dimensions and derivatives if implicated. Do not mask seams by disabling warp, lighting or mipmapping, or globally blurring water.
-- [ ] Add a regression that fails for the observed defect: actual sampled pixels across repeat/face boundaries at multiple times, plus real-page stationary/moving water captures. Include combined turbulent/translucent material coverage. Formula-string/mirror checks alone are insufficient.
-- [ ] Run relevant gates and record `yarn verify` outcome (known suite failures belong to FOLLOW-5); add changesets and commit separately. Confirm sky and prior wall/enemy/barrel repairs remain intact.
 
 ### GPU-FOLLOW-5 — Refresh final fidelity evidence
 owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`

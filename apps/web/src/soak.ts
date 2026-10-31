@@ -20,6 +20,7 @@ import { startPlayLoop } from './dom.js';
 import type { PlayBoot } from './play.js';
 import { bootPlay, buildAsyncView, getGpuStatus, gpuFallbackLabel, gpuFramesSubmitted, playerPosText } from './play.js';
 import { ingestPak } from './pak.js';
+import type { WebPak } from './pak.js';
 
 /** Soak framebuffer geometry (GPU-PROOF-1 gate resolution, both legs). */
 export const SOAK_WIDTH = 640;
@@ -761,15 +762,22 @@ export async function runSoakBoot(params: SoakParams): Promise<void> {
   }
   try {
     applySoakCvars(params);
-    let bytes: ArrayBuffer;
-    try {
-      const res = await fetch(params.pakUrl);
-      if (!res.ok) throw new Error(`pak fetch HTTP ${res.status}`);
-      bytes = await res.arrayBuffer();
-    } catch (e) {
-      throw new Error(`pak fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+    // RELEASE-2 asset-free soak: `q2pak=devroom` boots the procedural room
+    // (no fetch, no pak) through the same production boot + loop, so the
+    // GPU devroom replay (palette/world/box-critter) is observable on a
+    // real page. Any other pakUrl fetches exactly as before.
+    let pak: WebPak | null = null;
+    if (params.pakUrl !== 'devroom') {
+      let bytes: ArrayBuffer;
+      try {
+        const res = await fetch(params.pakUrl);
+        if (!res.ok) throw new Error(`pak fetch HTTP ${res.status}`);
+        bytes = await res.arrayBuffer();
+      } catch (e) {
+        throw new Error(`pak fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      pak = ingestPak(bytes);
     }
-    const pak = ingestPak(bytes);
     const boot = bootPlay({ width: SOAK_WIDTH, height: SOAK_HEIGHT, renderer: params.renderer, pak });
     soakBoot = boot;
     const gpuStatus = getGpuStatus(boot);

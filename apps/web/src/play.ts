@@ -11,15 +11,32 @@ import type { UserCmdT } from '@q2/input';
 import type { PredictCmd, Snapshot } from '@q2/client';
 import {
   calcViewOrigin,
+  drawField,
+  drawPic,
   drawString,
+  executeStatusbar,
+  buildHelpLayout,
+  centerPrintPlacement,
   fillRect,
   lerpAngle,
   makeConcharsFont,
+  parseStatusbar,
   setConcharsFont,
   stringWidth,
   loadConcharsFont as loadConcharsPixels,
 } from '@q2/client';
-import type { ConcharsFont } from '@q2/client';
+import type { ConcharsFont, DigitPics, IndexedPic, StatusbarState } from '@q2/client';
+import {
+  STAT_AMMO,
+  STAT_ARMOR,
+  STAT_HEALTH,
+  STAT_SELECTED_ICON,
+  STAT_PICKUP_ICON,
+  STAT_PICKUP_STRING,
+  STAT_TIMER,
+  STAT_HELPICON,
+  STAT_FLASHES,
+} from '@q2/client';
 import {
   SoftwareRenderer,
   createDevroom,
@@ -346,7 +363,7 @@ export const RESOLUTION_OPTIONS = ['320x240', '640x480', '800x600', '1024x768'] 
 /** Default internal resolution (software path, matches the 60fps sign-off rig). */
 export const RESOLUTION_DEFAULT = '320x240';
 
-registerCVar('vid_resolution', RESOLUTION_DEFAULT, 'internal framebuffer WxH (latched: changing it reboots the level)');
+registerCVar('vid_resolution', RESOLUTION_DEFAULT, 'internal framebuffer WxH (resizes in place, no reboot)');
 
 /** Parse a 'WxH' resolution string; null when malformed or non-positive. */
 export function parseResolution(value: string): { width: number; height: number } | null {
@@ -365,7 +382,7 @@ export function getResolution(): { width: number; height: number } {
     const parsed = parseResolution(raw);
     if (parsed) return parsed;
   }
-  registerCVar('vid_resolution', RESOLUTION_DEFAULT, 'internal framebuffer WxH (latched: changing it reboots the level)');
+  registerCVar('vid_resolution', RESOLUTION_DEFAULT, 'internal framebuffer WxH (resizes in place, no reboot)');
   return parseResolution(RESOLUTION_DEFAULT)!;
 }
 
@@ -3053,6 +3070,29 @@ export interface RetainedSky {
   tileH: number;
 }
 
+/**
+ * Retained decoded HUD pics (RELEASE-6, apps/web only): everything the
+ * asset-based statusbar/F1/completion screens blit, decoded once at boot
+ * from the pak via `parsePCX`. Devroom boots hold null (readable conchars
+ * fallback instead — never a throw on missing art).
+ */
+export interface HudPicCache {
+  /** Normal (`num_*`, white) + alert (`anum_*`, red) digit sets. */
+  digits: { num: DigitPics; anum: DigitPics };
+  /** Damage-flash field (`field_3`, 48x24, drawn behind flashing numbers). */
+  field3: IndexedPic | null;
+  /** Statusbar icons by short name (`i_health`, `w_blaster`, …). */
+  icons: Map<string, IndexedPic>;
+  /** F1 `help` + inventory backgrounds (256x192 each). */
+  help: IndexedPic | null;
+  inventory: IndexedPic | null;
+  /** Scoreboard dogtags (`tag1`/`tag2`, 128x32). */
+  tag1: IndexedPic | null;
+  tag2: IndexedPic | null;
+  /** End-of-unit plaque (`victory`, 320x240). */
+  victory: IndexedPic | null;
+}
+
 export interface PlayBoot {
   host: Host;
   driver: LocalDriver;
@@ -3144,6 +3184,24 @@ export interface PlayBoot {
    * async-loop sim clock for GPU frames. Null on every CPU path.
    */
   gpu: GpuBootState | null;
+  /**
+   * Engine palette bytes (768-byte RGB, from `pics/colormap.pcx`; devroom
+   * uses the procedural ramp). Retained for the asset HUD (`drawPic`/
+   * `drawField` expand 8-bit art through this, never a re-parse per frame).
+   * Null only when neither source produced one (CPU devroom text fallback).
+   */
+  palette: Uint8Array | null;
+  /**
+   * Retained decoded HUD pics (RELEASE-6): digit sets, icons, help/inventory
+   * backgrounds, scoreboard tags, victory plaque. Null in devroom (readable
+   * conchars fallback instead). Built once at boot from the pak.
+   */
+  hudPics: HudPicCache | null;
+  /**
+   * F1 help-computer overlay (RELEASE-6): toggled by the F1 key (see
+   * `toggleHelpOverlay`; dom.ts wires the browser key). False = HUD only.
+   */
+  showHelp: boolean;
 }
 
 /**
@@ -4085,6 +4143,8 @@ export function bootPlay(opts: {
     host.refresh.registerModel({ name: 'monster', kind: 'md2', data: getDevMesh(0) });
   }
   const n = width * height;
+  // RELEASE-6: retain the decoded HUD pics once (same pak the boot used).
+  const hudPics = opts.pak && mainPalette ? buildHudPicCache(opts.pak) : null;
   const boot: PlayBoot = {
     host, driver, refresh, renderer, lastRendererWarning: rendererWarning, source: driver.source,
     display: new Uint32Array(n), fb565: new Uint16Array(n),
@@ -4093,6 +4153,9 @@ export function bootPlay(opts: {
     browserPool: null,
     statScanoutKicks: 0, statScanoutFallbacks: 0, statAsyncFallbacks: 0,
     models, pak: opts.pak ?? null, sky: retainedSky, skyWarning, gpu,
+    palette: mainPalette,
+    hudPics,
+    showHelp: false,
   };
   // Arm the raster policy the cvar selects (RGB path on for voodoo, off for
   // software) so a voodoo boot never starts on the wrong backend.
@@ -4122,20 +4185,120 @@ export function bootPlay(opts: {
 }
 
 /**
- * Reboot a boot at the CURRENT cvar values (skill + vid_resolution +
- * map_source): the menu path for "changing the dropdown reboots the level".
- * Same pak and renderer as the previous boot, fresh driver/server/mini
- * (DoorSync bases re-baked, skill filter re-applied before spawning).
- * map_source decides which world: 'pak' keeps the previous pak (null when
- * the previous boot had none → devroom fallback), anything else boots the
- * asset-free devroom even when a pak is cached.
+ * Reboot a boot at the CURRENT cvar values (skill + map_source): the menu
+ * path for "changing the dropdown reboots the level". Same pak and renderer
+ * as the previous boot, fresh driver/server/mini (DoorSync bases re-baked,
+ * skill filter re-applied before spawning). map_source decides which world:
+ * 'pak' keeps the previous pak (null when the previous boot had none →
+ * devroom fallback), anything else boots the asset-free devroom even when a
+ * pak is cached. Resolution is NOT latched here: `vid_resolution` resizes in
+ * place via `resizePlay` (RELEASE-7, no sim rebuild); reboot keeps the live
+ * framebuffer size.
  */
 export function rebootPlay(prev: PlayBoot): PlayBoot {
   const pak = getMapSource() === MAP_SOURCE_PAK ? prev.pak : null;
   // Renderer is NOT re-latched here: vid_renderer hot-swaps in place
   // (see applyRendererCvar) without rebuilding Host/LocalDriver/server
-  // state. Skill/resolution/map still reboot through this path.
-  return bootPlay({ pak });
+  // state. Skill/map reboot through this path; resolution resizes in place.
+  const next = bootPlay({ pak, width: prev.host.fb.width, height: prev.host.fb.height });
+  return next;
+}
+
+/* --- RELEASE-7 sim-preserving resize (apps/web only) --------------------
+ *
+ * `vid_resolution` changes resize the framebuffer/viewport/HUD in place
+ * WITHOUT rebuilding the game simulation: map, position, health, enemies,
+ * elapsed time and audio survive. The Host owns the framebuffer realloc
+ * (`host.resize` preserves sim + copies the overlap so the first post-resize
+ * present reuses live pixels instead of flashing black); the shell then
+ * reallocates its display planes the same way, syncs the GPU backend
+ * viewport (`resizeGpuBackend`), and re-fits the CSS display box. The
+ * renderer backend never re-inits and no listener/loop is reinstalled, so
+ * repeated resize/switch cycles stay 1:1 with reallocations. Explicit
+ * restart stays only for settings that genuinely need a new level
+ * (map source, skill).
+ */
+
+/**
+ * Resize a live boot in place (RELEASE-7): coordinated framebuffer +
+ * display-plane + GPU viewport + HUD fit, no sim rebuild. Preserved: server
+ * time, player origin/velocity, health, mixer channels, world/driver/refresh
+ * identities. Returns true when the size applied (same-size is a no-op
+ * returning true); false + untouched sim on invalid sizes or resize throw.
+ */
+export function resizePlay(boot: PlayBoot, width: number, height: number): boolean {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return false;
+  try {
+    const prev = boot.host.fb;
+    if (prev.width === width && prev.height === height) return true;
+    const before = boot.host.captureSimState();
+    const beforeHost = boot.host;
+    const beforeDriver = boot.driver;
+    const beforeWorld = boot.host.world;
+    const beforeRefresh = boot.host.refresh;
+    boot.host.resize(width, height);
+    // Shell display planes follow the same overlap-copy rule (no black box).
+    const copyW = Math.min(prev.width, width);
+    const copyH = Math.min(prev.height, height);
+    const nextDisplay = new Uint32Array(width * height);
+    const next565 = new Uint16Array(width * height);
+    for (let y = 0; y < copyH; y++) {
+      nextDisplay.set(boot.display.subarray(y * prev.width, y * prev.width + copyW), y * width);
+      next565.set(boot.fb565.subarray(y * prev.width, y * prev.width + copyW), y * width);
+    }
+    boot.display = nextDisplay;
+    boot.fb565 = next565;
+    if (boot.gpu) resizeGpuBackend(boot, width, height);
+    try {
+      boot.refresh.syncWorkersFromCvar?.();
+    } catch {
+      /* banding best-effort */
+    }
+    // Sim-preservation pin: the resize must not have swapped the sim out.
+    const after = boot.host.captureSimState();
+    if (
+      boot.host !== beforeHost || boot.driver !== beforeDriver ||
+      boot.host.world !== beforeWorld || boot.host.refresh !== beforeRefresh ||
+      after.serverTime !== before.serverTime ||
+      after.playerOrigin[0] !== before.playerOrigin[0] ||
+      after.playerOrigin[1] !== before.playerOrigin[1] ||
+      after.playerOrigin[2] !== before.playerOrigin[2]
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Persisted display size reserved BEFORE any async asset load (RELEASE-7):
+ * reads the latched `vid_resolution` cvar synchronously so the loading
+ * surface is allocated at the selected size immediately — no small black
+ * box or layout jump when assets land. Pure/headless-safe.
+ */
+export function reservedDisplaySize(): { width: number; height: number } {
+  return getResolution();
+}
+
+/**
+ * Apply the reserved size to a canvas backing store synchronously (before
+ * the first async pak/IndexedDB load). Returns true when applied. Never
+ * throws; headless-safe (false without a canvas).
+ */
+export function applyReservedSizeToCanvas(canvas: unknown): boolean {
+  try {
+    const { width, height } = reservedDisplaySize();
+    const c = canvas as { width?: number; height?: number } | null;
+    if (!c || typeof c.width !== 'number' || typeof c.height !== 'number') return false;
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return false;
+    c.width = width;
+    c.height = height;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -4891,6 +5054,257 @@ export function playerPosText(driver: LocalDriver): string {
   );
 }
 
+/* --- RELEASE-6 asset HUD (apps/web only) -------------------------------
+ *
+ * The placeholder bottom rows (`weapon ammo` / `hp N` text) are replaced by
+ * the original asset-based statusbar when a pak is present: the retail
+ * `single_statusbar` script (`game/g_spawn.c`) executed via the production
+ * `executeStatusbar` (coordinate mapping, conditionals, flash rules all owned
+ * by `@q2/client`), with `drawPic`/`drawField`/`drawString` blitting the real
+ * `pics/*.pcx` art through the game palette. F1 uses the original
+ * `buildHelpLayout` + `help` background; level completion uses
+ * `centerPrintPlacement` (`SCR_DrawCenterString` semantics). Devroom keeps
+ * the readable text fallback (never a throw on missing art); the optional
+ * `cl_showfps`/`cl_showpos` diagnostics stay separate top-row readouts and
+ * never enter the statusbar program.
+ */
+
+/** Retail single-player statusbar script (`game/g_spawn.c: single_statusbar`). */
+export const RETAIL_SINGLE_STATUSBAR =
+  'yb -24 xv 0 hnum xv 50 pic 0 ' +
+  'if 2 xv 100 anum xv 150 pic 2 endif ' +
+  'if 4 xv 200 rnum xv 250 pic 4 endif ' +
+  'if 6 xv 296 pic 6 endif ' +
+  'yb -50 if 7 xv 0 pic 7 xv 26 yb -42 stat_string 8 yb -50 endif ' +
+  'if 9 xv 262 num 2 10 xv 296 pic 9 endif ' +
+  'if 11 xv 148 pic 11 endif';
+
+/** Cached parsed ops for the retail script (parsed once, executed per frame). */
+let retailStatusbarOps: ReturnType<typeof parseStatusbar> | null = null;
+function retailOps(): ReturnType<typeof parseStatusbar> {
+  if (!retailStatusbarOps) retailStatusbarOps = parseStatusbar(RETAIL_SINGLE_STATUSBAR);
+  return retailStatusbarOps;
+}
+
+/** Short icon name for the selected weapon (`w_*` art). */
+function weaponIconFor(classname: string): string {
+  const table: Record<string, string> = {
+    weapon_blaster: 'w_blaster',
+    weapon_shotgun: 'w_shotgun',
+    weapon_supershotgun: 'w_sshotgun',
+    weapon_machinegun: 'w_machinegun',
+    weapon_chaingun: 'w_chaingun',
+    weapon_grenadelauncher: 'w_glauncher',
+    weapon_rocketlauncher: 'w_rlauncher',
+    weapon_hyperblaster: 'w_hyperblaster',
+    weapon_railgun: 'w_railgun',
+    weapon_bfg: 'w_bfg',
+  };
+  return table[classname] ?? 'w_blaster';
+}
+
+/** Short icon name for an ammo kind (`a_*` art). */
+function ammoIconFor(kind: string | null): string | null {
+  if (!kind) return null;
+  const table: Record<string, string> = {
+    shells: 'a_shells',
+    bullets: 'a_bullets',
+    grenades: 'a_grenades',
+    cells: 'a_cells',
+    rockets: 'a_rockets',
+    slugs: 'a_slugs',
+  };
+  return table[kind] ?? null;
+}
+
+/**
+ * Decode one HUD pic from the pak (null when missing/unparseable — the
+ * caller falls back to text, never throws inside the frame loop).
+ */
+function decodeHudPic(pak: WebPak, name: string): IndexedPic | null {
+  try {
+    const bytes = tryPakEntry(pak, `pics/${name}.pcx`);
+    if (!bytes) return null;
+    const pcx = parsePCX(bytes);
+    return { width: pcx.width, height: pcx.height, pixels: pcx.pixels };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Build the retained HUD pic cache from a pak (once per boot). Missing or
+ * unparseable lumps decode to null entries — the frame loop tolerates them
+ * (icons/fields skip, text stays readable). Headless-safe.
+ */
+export function buildHudPicCache(pak: WebPak): HudPicCache {
+  const digitSet = (prefix: string): DigitPics => {
+    const digits: IndexedPic[] = [];
+    for (let d = 0; d <= 9; d++) {
+      digits.push(
+        decodeHudPic(pak, `${prefix}_${d}`) ?? { width: 16, height: 24, pixels: new Uint8Array(16 * 24) },
+      );
+    }
+    const minus =
+      decodeHudPic(pak, `${prefix}_minus`) ?? { width: 16, height: 24, pixels: new Uint8Array(16 * 24) };
+    return { digits, minus };
+  };
+  const icons = new Map<string, IndexedPic>();
+  for (const n of [
+    'i_health', 'i_bodyarmor', 'i_jacketarmor', 'w_blaster', 'w_shotgun', 'w_sshotgun',
+    'w_machinegun', 'w_chaingun', 'w_glauncher', 'w_rlauncher', 'w_hyperblaster',
+    'w_railgun', 'w_bfg', 'a_shells', 'a_bullets', 'a_grenades', 'a_cells',
+    'a_rockets', 'a_slugs', 'i_help',
+  ]) {
+    const pic = decodeHudPic(pak, n);
+    if (pic) icons.set(n, pic);
+  }
+  return {
+    digits: { num: digitSet('num'), anum: digitSet('anum') },
+    field3: decodeHudPic(pak, 'field_3'),
+    icons,
+    help: decodeHudPic(pak, 'help'),
+    inventory: decodeHudPic(pak, 'inventory'),
+    tag1: decodeHudPic(pak, 'tag1'),
+    tag2: decodeHudPic(pak, 'tag2'),
+    victory: decodeHudPic(pak, 'victory'),
+  };
+}
+
+/**
+ * Frame state for the retail statusbar program, derived from the live
+ * driver/server (health, ammo, armor, selected weapon, pickup, timer, help).
+ * `serverframe` drives the low-health/ammo blink (`(serverframe>>2)&1`).
+ */
+export function statusbarStateFor(boot: PlayBoot): StatusbarState {
+  const d = boot.driver;
+  const ammoKind = d.weapon.ammoKind ? d.weapon.ammoKind : null;
+  const ammoIcon = ammoIconFor(ammoKind);
+  const ammoCount = ammoKind ? (d.ps.ammo[ammoKind] ?? 0) : 0;
+  const hasAmmoRow = ammoKind !== null && ammoCount >= 0;
+  const armorIcon = d.ps.armor > 0 ? 'i_bodyarmor' : null;
+  const images = [
+    'i_health', '', ammoIcon ?? '', '', armorIcon ?? '', '',
+    weaponIconFor(d.weapon.classname), '', '', 'i_help', '', 'i_help',
+  ];
+  const stats = [
+    0, d.playerHealth,
+    hasAmmoRow ? 2 : 0, ammoCount,
+    armorIcon ? 4 : 0, d.ps.armor,
+    6, 0, 0, 0, 0, 11,
+    0, 0, 0, 0,
+  ];
+  void STAT_SELECTED_ICON; void STAT_PICKUP_ICON; void STAT_PICKUP_STRING;
+  void STAT_TIMER; void STAT_HELPICON; void STAT_FLASHES;
+  void STAT_AMMO; void STAT_ARMOR; void STAT_HEALTH;
+  return {
+    stats,
+    images,
+    configstrings: [],
+    serverframe: Math.floor(boot.host.serverTime * 10),
+    clientInfo: () => null,
+  };
+}
+
+/**
+ * Blit executed statusbar commands with real art: `pic` via drawPic (icons
+ * + field_3 background), `field` via drawField (num_/anum_ digit pics),
+ * `text` via drawString (conchars). Unknown/missing art is skipped without
+ * throwing so one corrupt lump can never blank the HUD.
+ */
+export function drawStatusbarCmds(
+  target: { width: number; height: number; color: Uint32Array },
+  boot: PlayBoot,
+  w: number,
+  h: number,
+): void {
+  const cache = boot.hudPics;
+  const palette = boot.palette;
+  if (!cache || !palette) return;
+  let cmds;
+  try {
+    cmds = executeStatusbar(retailOps(), statusbarStateFor(boot), w, h);
+  } catch {
+    return;
+  }
+  for (const c of cmds) {
+    try {
+      if (c.kind === 'pic') {
+        const pic = c.name === 'field_3' ? cache.field3 : (cache.icons.get(c.name) ?? null);
+        if (pic) drawPic(target, c.x, c.y, pic, palette);
+      } else if (c.kind === 'field') {
+        drawField(target, c.x, c.y, c.style, c.width, c.value, cache.digits, palette);
+      } else if (c.kind === 'text') {
+        const x = c.centerWidth > 0 ? c.x + Math.max(0, ((c.centerWidth - stringWidth(c.text)) / 2) | 0) : c.x;
+        drawString(target, x, c.y, c.text, c.alt ? 0xff33ff33 : 0xffffffff);
+      }
+    } catch {
+      /* one bad cmd never blanks the HUD */
+    }
+  }
+}
+
+/**
+ * F1 help-computer overlay (RELEASE-6): the 256x192 `help` background
+ * centered, plus the `buildHelpLayout` rows executed through the production
+ * path (skill label, level name, help text, kills/goals/secrets). Without
+ * pak art the readable text rows still draw (devroom fallback).
+ */
+export function drawHelpOverlay(
+  target: { width: number; height: number; color: Uint32Array },
+  boot: PlayBoot,
+): void {
+  const cache = boot.hudPics;
+  const palette = boot.palette;
+  const w = target.width;
+  const h = target.height;
+  const hx = Math.max(0, ((w - 256) / 2) | 0);
+  const hy = Math.max(0, ((h - 192) / 2) | 0);
+  if (cache?.help && palette) {
+    try {
+      drawPic(target, hx, hy, cache.help, palette);
+    } catch {
+      /* text rows below still draw */
+    }
+  } else {
+    fillRect(target, hx, hy, 256, 192, 0xcc101010);
+  }
+  const layout = buildHelpLayout({
+    skill: getSkill(),
+    levelName: boot.source === 'pak' ? 'Outer Base' : 'devroom',
+    help1: 'Find the exit.',
+    help2: 'Watch for soldiers.',
+    kills: [boot.driver.server.finishKills, boot.driver.server.totalMonsters],
+    goals: [boot.driver.server.finishGoals, boot.driver.server.totalGoals],
+    secrets: [boot.driver.server.finishSecrets, boot.driver.server.totalSecrets],
+  });
+  let cmds;
+  try {
+    cmds = executeStatusbar(parseStatusbar(layout), statusbarStateFor(boot), w, h);
+  } catch {
+    return;
+  }
+  for (const c of cmds) {
+    try {
+      if (c.kind === 'pic') {
+        const pic = cache?.icons.get(c.name) ?? (c.name === 'help' ? (cache?.help ?? null) : null);
+        if (pic && palette) drawPic(target, c.x, c.y, pic, palette);
+      } else if (c.kind === 'text') {
+        const x = c.centerWidth > 0 ? c.x + Math.max(0, ((c.centerWidth - stringWidth(c.text)) / 2) | 0) : c.x;
+        drawString(target, x, c.y, c.text, c.alt ? 0xff33ff33 : 0xffffffff);
+      }
+    } catch {
+      /* skip bad rows */
+    }
+  }
+}
+
+/** Toggle the F1 help-computer overlay (browser F1 key calls this). */
+export function toggleHelpOverlay(boot: PlayBoot): boolean {
+  boot.showHelp = !boot.showHelp;
+  return boot.showHelp;
+}
+
 /** Draw crosshair + status lines onto a 0xAABBGGRR buffer (runs post-resolve).
  *
  * The play canvas shows world + crosshair + weapon/ammo + hp + message
@@ -4928,28 +5342,33 @@ export function drawPlayHud(
   // 3D view model (pak) replaces the 2D silhouette — never double-draw.
   if (usesViewModel3D(boot)) drawDeathBars(target, boot);
   else drawViewModel(target, boot);
-  const hp = boot.driver.playerHealth;
-  const hpColor = boot.driver.playerDead ? 0xffff3333 : hp <= 25 ? 0xffff9933 : white;
-  drawString(target, 8, target.height - 18, `${boot.driver.weapon.classname} ${boot.driver.hudAmmo()}`, white);
-  drawString(target, 8, target.height - 48, `hp ${hp}`, hpColor);
+  // RELEASE-6 asset statusbar (pak + palette + pics): the retail script with
+  // real digit/icon art, values, transparency, and xv/yv scaling. Devroom
+  // (no pak) keeps the readable text fallback below — never a throw.
+  if (boot.hudPics && boot.palette) {
+    drawStatusbarCmds(target, boot, target.width, target.height);
+  } else {
+    const hp = boot.driver.playerHealth;
+    const hpColor = boot.driver.playerDead ? 0xffff3333 : hp <= 25 ? 0xffff9933 : white;
+    drawString(target, 8, target.height - 18, `${boot.driver.weapon.classname} ${boot.driver.hudAmmo()}`, white);
+    drawString(target, 8, target.height - 48, `hp ${hp}`, hpColor);
+    if (boot.source === 'devroom') {
+      drawString(target, 8, 28, 'devroom - drop pak0.pak for base1', dim);
+    }
+  }
   if (boot.driver.server.finished) {
-    // Finished screen: the multi-line stats block, centered horizontally in
-    // FINISH_BLUE (the original's blue status message), stacked just above
-    // screen center like C's centerprint. Drawn in the same pre-blit HUD
-    // pass as fps/pos — after the `r_brightness` scene lift — so the blue
-    // keeps its authored colour at any brightness.
-    const lines = boot.driver.message.split('\n');
-    const y0 = Math.max(8, ((target.height - lines.length * 8) / 2 - 8) | 0);
-    lines.forEach((line, i) => {
-      drawString(target, finishLineAnchor(target.width, line).x, y0 + i * 10, line, FINISH_BLUE);
-    });
+    // Completion via centerPrintPlacement (SCR_DrawCenterString semantics):
+    // each line centered at 35% screen height (or y=48 for long scrolls).
+    const lines = centerPrintPlacement(boot.driver.message, target.width, target.height);
+    for (const line of lines) {
+      drawString(target, line.x, line.y, line.text, FINISH_BLUE);
+    }
   } else if (boot.driver.message) {
     const msg = boot.driver.message.slice(0, 48);
     drawString(target, 8, target.height - 30, msg, 0xffffff00);
   }
-  if (boot.source === 'devroom') {
-    drawString(target, 8, 28, 'devroom - drop pak0.pak for base1', dim);
-  }
+  // F1 help-computer overlay (toggled by the F1 key, asset bg + layout rows).
+  if (boot.showHelp) drawHelpOverlay(target, boot);
 }
 
 /**

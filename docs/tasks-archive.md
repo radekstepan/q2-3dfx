@@ -489,3 +489,27 @@ owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit` · depe
 lane report (game/server/testkit + web visual, disjoint): per-monster ClipMove trace (live hulls + player box, corpses pass through), AI_HOLD_FRAME freeze, flashless smack + infatck2 swing, burst windows infantry n-6 / soldier k+1 (float-dust fix); t38 normal soldier behind *19 (ambush, yaw 0, hp 30, skill 1) holds floor, crosses only through opened doorway, never ghosts.
 evidence: game 211/211, server 202/202, testkit 3/3 (t38/*19 floor/doorway, geometry *19 slab/shared floor); web release-5-visual 4/4 (t38 z locked, burst MZ2_1 + dlight + infatck1, swing/smacks, browser captures), monster-block 4/4 (*31 C-parity), base1-gate 23/23, elevator 1/1, soak 11/11, phase3 10/10; automated vs visual verdicts logged separately. FOLLOW-3B shader order fix (ANGLE forward-reference) also landed here to unblock WebGL2 in-page tests; resolution-fit 7/7 incl. webgl2 legs.
 changesets: `release-5-monsters-collision.md` + `gpu-follow-3b-shader-order.md` (`@q2/webgl-renderer` patch); web visual has no versioned package. No perf-ledger row: collision/timing + test-only visual.
+
+### RELEASE-2 — Render the asset-free demo room in WebGL2 — DONE 2026-10-30
+owns: `apps/web`, `packages/webgl-renderer`, `packages/testkit` · depends: none
+lane report (web wiring, no packages touched): `q2pak=devroom` soak boot enables real-page legs; cold GPU boot/switch/restore verified without pak.
+evidence: web release-2-web 7/7 (Chromium webgl2, no pak: nonblack 1.0, 40083 distinct colors, quadrant spread, entityRefs 1 after live fire, void control 0.114, uploads 1, no fallback).
+changesets: none (web-only test, ignored). No perf-ledger row.
+
+### RELEASE-6 — Use game assets for HUD, F1 and level completion — DONE 2026-10-30
+owns: `apps/web`, `packages/client`, `packages/formats`, `packages/testkit` · depends: none
+lane report (formats/client + testkit + web wiring): 78-entry manifest landed as 79 (22 digits + field + 44 icons + conchars + help + inventory + 3 crosshairs + 5 overlays + victory; pinned with split documented); statusbar/F1/scoreboard/centerprint/inventory geometry + indexed blits; web drawPlayHud asset statusbar/F1 overlay/completion with devroom fallback.
+evidence: formats 29/29, client 83/83, testkit HUD 35/35 (real-art + tamper negatives), web HUD 12/12 at 640x480 + 1024x768 (scaling, transparency, death/completion/F1, fallback, fps/pos separation).
+changesets: `release-6-hud-assets-formats-client.md` + `release-6-hud-testkit.md` (web wiring ignored). No perf-ledger row.
+
+### RELEASE-7 — Change display settings without restarting; stable startup size — DONE 2026-10-30
+owns: `apps/web`, `packages/host`, `packages/webgl-renderer`, `packages/testkit` · depends: RELEASE-3
+lane report (host + web wiring): sim-preserving resize (validate/reserve, overlap-copy, snapshot/dispose hooks) + `vid_resolution` out of `REBOOT_CVARS`, persisted-size reservation before async load, hot-swap/context-restore without rebuild; explicit restart only for map/skill.
+evidence: host 20/20 (sim fingerprint, overlap, no-op, invalid refusal, cycles 1:1, restore/dispose), web resize 15/15 (preserved sim, overlap, no-op, invalid, repeated, hot-swap/restore, once-only lifecycle, reserved boot).
+changesets: `release-7-host-resize.md` (web wiring ignored). No perf-ledger row.
+
+### GPU-FOLLOW-3B — Remove visible water tile boundaries — DONE 2026-10-30
+owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit` · depends: GPU-FOLLOW-3A
+lane report (webgl + testkit + web captures + ANGLE order fix): LOD from unwarped UVs via `voodooSampleMippedWarped` + `highp` for multi-tile water; warp/scale/REPEAT/lighting/mips intact; forward-declaration order fixed (ANGLE strict).
+evidence: webgl water-seam 16/1skip, full pkg 151pass; testkit water pixels (wrap 0.0207 < anim 4x, overlap 0.43, det 0); web pool 3/3 (stationary roiDiff 0.012, moving 80.0, seam ~0.002, sky/opaque/monsters/barrels intact, console clean).
+changesets: `gpu-follow-3b-water-lod.md` + `gpu-follow-3b-water-pixels-testkit.md` + `gpu-follow-3b-shader-order.md`. No perf-ledger row (bench lane `f884316` carries numbers).

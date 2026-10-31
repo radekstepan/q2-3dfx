@@ -10,7 +10,9 @@ import {
   bootPlay,
   createAsyncLoopState,
   getMapSource,
+  getResolution,
   measureFrameStages,
+  resizePlay,
 } from './play.js';
 import type { AsyncLoopState, PlayBoot, RendererKind, StageReport } from './play.js';
 import { blitToCanvas } from './dom.js';
@@ -27,8 +29,8 @@ export { parsePakEntries, ingestPak, readPakEntry, pakHasMaps } from './pak.js';
 export type { WebPak, WebPakEntry } from './pak.js';
 export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';export { blitToCanvas, blitCopyRGBA, blitIsLittleEndian, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, showFpsEnabled, showPosEnabled, cvarIsCheckbox, CHECKBOX_CVARS, cvarOptions, cvarControlKind, cvarOptionLabels, cvarDescription, CVAR_DESCRIPTIONS, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, MAP_SOURCE_LABELS, VID_RENDERER_LABELS, setMapSourceHasPak, getMapSourceHasPak, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS, pushConsoleLog, clearConsoleLog, resetConsoleLog, getConsoleLines, renderConsoleLines, attachConsoleClear, setModeReadout, MAX_CONSOLE_LINES } from './dom.js';
 export type { PlayLoop, ConsoleKind, ConsoleLine } from './dom.js';
-export { drawPlayHud, resolveDisplay, resolveDisplayAsync, pumpMuzzleLight, pumpExplosionLights, pumpBoltLights, pumpTracers, registerPakModels, replayPakAssetsToGpu, retainedSkyFromPak, syncGpuSky, loadSkyStrip, skyNameForMap, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, posHudAnchor, formatFpsText, fpsVisible, posVisible, formatPlayerPos, playerPosText, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, applyRendererCvar, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, POS_GREY, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, detectGpuCapability, getGpuStatus, resolveBootRenderer, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
-export type { PakModelHandles, RetainedModelAsset, RetainedPakAssets, RetainedSkinAsset, TracerBeam, RetainedSky } from './play.js';
+export { drawPlayHud, resolveDisplay, resolveDisplayAsync, pumpMuzzleLight, pumpExplosionLights, pumpBoltLights, pumpTracers, registerPakModels, replayPakAssetsToGpu, retainedSkyFromPak, syncGpuSky, loadSkyStrip, skyNameForMap, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, posHudAnchor, formatFpsText, fpsVisible, posVisible, formatPlayerPos, playerPosText, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, resizePlay, reservedDisplaySize, applyReservedSizeToCanvas, applyRendererCvar, buildHudPicCache, statusbarStateFor, drawStatusbarCmds, drawHelpOverlay, toggleHelpOverlay, RETAIL_SINGLE_STATUSBAR, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, POS_GREY, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, detectGpuCapability, getGpuStatus, resolveBootRenderer, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
+export type { PakModelHandles, RetainedModelAsset, RetainedPakAssets, RetainedSkinAsset, TracerBeam, RetainedSky, HudPicCache } from './play.js';
 export {
   attachBrowserPool,
   buildAsyncView,
@@ -329,17 +331,43 @@ if (typeof document !== 'undefined') {
       if (topPak) topPak.textContent = effective ? `pak0.pak · ${pak?.entries.length} lumps` : 'pak0.pak · not cached';
       dom.pushConsoleLog(name ? `loaded ${name}: ${pak?.entries.length} entries` : 'video subsystem ready · awaiting changes', 'ok');
     };
-    // Skill/resolution/map-source changes reboot the level at once (id
-    // latches them; the menu applies them immediately by re-calling the
-    // boot path). vid_renderer hot-swaps in place instead: the resolve
-    // path reads the cvar every frame, so only the latched choice needs
-    // updating — Host/LocalDriver/server state (pos/hp/ammo/monsters)
-    // survives the switch.
+    // Skill/map-source changes reboot the level at once (id latches them;
+    // the menu applies them immediately by re-calling the boot path).
+    // vid_renderer hot-swaps in place (applyRendererCvar) and vid_resolution
+    // resizes in place (resizePlay, RELEASE-7) — both keep Host/LocalDriver/
+    // server state (pos/hp/ammo/monsters) alive.
     const onCvar = (cvarName: string): void => {
       dom.savePersistedCVars();
       if (cvarName === 'vid_renderer') {
         if (currentBoot) applyRendererCvar(currentBoot);
         dom.pushConsoleLog(`vid_ref "${cvarName}" hot-swapped in place`, 'cmd');
+        return;
+      }
+      if (cvarName === 'vid_resolution') {
+        // RELEASE-7 sim-preserving resize: coordinated framebuffer/viewport/
+        // HUD resize, no sim rebuild. Falls back to a reboot only when the
+        // in-place resize refuses (should not happen for menu sizes).
+        if (currentBoot) {
+          const res = getResolution();
+          const canvasEl = document.querySelector('#q2');
+          try {
+            const before = currentBoot.host.captureSimState();
+            void before;
+          } catch {
+            /* best-effort */
+          }
+          if (resizePlay(currentBoot, res.width, res.height)) {
+            try {
+              dom.fitPlayCanvas(canvasEl, res.width, res.height);
+            } catch {
+              /* CSS fit best-effort */
+            }
+            dom.pushConsoleLog(`vid_resolution ${res.width}x${res.height} resized in place (sim preserved)`, 'ok');
+            return;
+          }
+        }
+        dom.pushConsoleLog(`vid_restart · restarting video subsystem (${cvarName})`, 'warn');
+        startWithPak(lastPak, lastName);
         return;
       }
       if (!dom.cvarNeedsReboot(cvarName)) {
@@ -355,6 +383,15 @@ if (typeof document !== 'undefined') {
     // Cached-first boot: a previous drop persists in IndexedDB, so one
     // drop survives reloads. Empty/corrupt cache → devroom, no error spam.
     const bootFromCache = async (): Promise<void> => {
+      // RELEASE-7: reserve the persisted display size synchronously, before
+      // any async asset load — the loading surface is correctly sized at
+      // once, so first paint never shows a small black box or layout jump.
+      try {
+        const { applyReservedSizeToCanvas } = await import('./play.js');
+        applyReservedSizeToCanvas(document.querySelector('#q2'));
+      } catch {
+        /* canvas sizing best-effort */
+      }
       dom.setProgress(progress, 0.2, 'loading cached pak0.pak…');
       try {
         const cached = await loadCachedPak();
