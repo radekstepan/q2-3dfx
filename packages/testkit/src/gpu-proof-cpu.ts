@@ -60,8 +60,16 @@ export function loadCpuProofWorld(pakBytes: ArrayBuffer): BenchWorld {
  * renderer, combat particles, pumped dlights; raw-color display leg).
  * Resets cvars + RGB-world mode afterwards (no leakage into sibling tests).
  * `frameIndex`: 0 = F0 stationary, 1 = F1 combat, 2 = F2 moving combat.
+ * `timeOverride`: when set, replaces the route view's level-time (drives the
+ * CPU warp phase `((time*64)|0) & 1023`; sky is time-stable, static
+ * geometry is time-invariant, so an F0 pair at two times isolates warped
+ * water pixels for residual-diff attribution — used by the PROOF-4 leg).
  */
-export async function renderCpuProofFrame(bw: BenchWorld, frameIndex: number): Promise<GpuProofCpuRender> {
+export async function renderCpuProofFrame(
+  bw: BenchWorld,
+  frameIndex: number,
+  timeOverride?: number,
+): Promise<GpuProofCpuRender> {
   pinBenchCvars();
   const W = GPU_PROOF_WIDTH, H = GPU_PROOF_HEIGHT;
   const fb = createFramebuffer(W, H, true);
@@ -90,8 +98,10 @@ export async function renderCpuProofFrame(bw: BenchWorld, frameIndex: number): P
     };
     const entities = gpuProofEntitiesFor(r, bw, frame);
     gpuProofPumpFor(r, origin, frame.yawDeg, frame);
+    const view = gpuProofViewFor(frame);
+    if (timeOverride !== undefined) view.time = timeOverride;
     r.beginFrame();
-    r.renderView(gpuProofViewFor(frame), world, entities);
+    r.renderView(view, world, entities);
     r.endFrame();
     const color = fb.color.slice();
     // RELEASE-8: raw-color software plane only — the legacy CPU Voodoo

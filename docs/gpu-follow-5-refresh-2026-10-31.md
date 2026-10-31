@@ -257,3 +257,31 @@ ignored, docs need none). No `packages/**` file was touched, so no
 package changeset exists to write. DO NOT COMMIT (integrator merges; the
 dirty `BRAIN.md` status line and release10-cvars reconciliation belong to
 other lanes).
+
+## 8. Box-3 implementation result (integrator, 2026-10-31 — user approved the tone-normalized 0.02 proposal)
+
+Implemented exactly as proposed in §5 (testkit lane, no threshold changes):
+tone-normalized PROOF-4 comparison (`toneNormalizeCpuReference`: CPU through
+overbright ×2 + clamp, gamma 1/1.3; formula mirrors `voodooOverbright` and
+`pow(c, 1/uGamma)`), explicit TONE-CURVE gate with mistuned-curve negative
+control, scene mip-dither asserts to report-only (values kept, measured,
+logged). Re-ran PROOF-4 (headless Chromium/SwiftShader, base1 spawn-north,
+pinned cvars, Q2_PAK):
+- TONE-CURVE GATE: PASS (flat 0/0, distinct 3/1, onVsOff 0.4297; ramp
+  R31/G61/B31, membership 0, triples 112>60, gammaFrac 0.9688; resolve 1.0).
+- mip-dither: report-only (count 0, scatter 0.0000 — the 0/0 blocker stands).
+- F1 GATE (tone-normalized CPU): 303945/304964 px (99.666%) maxΔ255 FAIL.
+  F0/F2 report-only: 99.609%/99.604% FAIL. CPU hashes unchanged
+  (F0 930337c1 / F1 730221a2 / F2 84e627e3); water contributes 0 px in-view.
+New finding: tone normalization moved the needle 0.007% (99.659→99.666%).
+The divergence is structural, not tonal: per-level analysis (normalized-CPU
+R → GPU−CPU) shows bias +1…+45 LSB with within-level std 19–53 LSB across
+the 12 most populous levels — the GPU linear pipeline (texel×lightmap,
+overbright, 565, reconstruction, gamma) vs the CPU colormap-graded bytes
+differ per-pixel in ways no global map can absorb. Neither renderer path
+was touched. The 0.02 gate cannot be met by tone work; the remaining
+question is whether this structural divergence is acceptable
+(different-but-faithful pipelines) or a defect — NEW user verdict needed
+(the approved proposal is spent). Artifacts: gitignored
+`packages/testkit/test-output/gpu-proof4-2026-10-31T07-44-03-766Z-*`
+(gate.json carries `toneCurveGate`, `mipReportOnly`, `regions.water`).

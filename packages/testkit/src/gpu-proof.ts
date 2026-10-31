@@ -168,6 +168,14 @@ export function gpuProofPumpFor(
  * anything outside tolerance is never accepted by loosening the numbers.
  * CPU-to-CPU parity is NOT judged by these — same-renderer re-renders must
  * be hash-exact (fnvColorFull equality).
+ *
+ * TONE-NORMALIZED APPLICATION (GPU-FOLLOW-5 approved proposal, lane report
+ * §5): the gate below keeps these EXACT numbers (0.02 / 3 LSB / 1px edge /
+ * maxΔ24) but is applied to a TONE-NORMALIZED comparison — the CPU
+ * reference plane passes through toneNormalizeCpuReference first, so the
+ * gate measures structure (geometry/UV/pose/seams), not the specified
+ * Voodoo tone lift. The F1-vs-CPU browser leg applies the normalization on
+ * the CPU side; CPU-to-CPU parity legs never do.
  */
 export interface GpuProofTolerances {
   /** Fail when diff/compared exceeds this (GPU-vs-CPU display gate). */
@@ -191,6 +199,72 @@ export const GPU_PROOF_TOLERANCES: GpuProofTolerances = {
   maxAbsDeltaWarn: 24,
   edgeExcludePx: 1,
 };
+
+// --- Tone-normalized comparison (GPU-FOLLOW-5 approved proposal) --------------
+
+/**
+ * Overbright factor of the tone-normalization curve (mirrors the GPU
+ * `uOverbright = 2` live uniform when `vd_overbright = 1`).
+ */
+export const TONE_NORMALIZE_OVERBRIGHT = 2;
+
+/**
+ * Display gamma of the tone-normalization curve (mirrors the GPU `uGamma`
+ * live uniform; `vd_gamma` default 1.3).
+ */
+export const TONE_NORMALIZE_GAMMA = 1.3;
+
+/**
+ * Map a raw-color CPU reference plane (0xAABBGGRR) through the SPECIFIED
+ * GPU appearance curve so the 0.02 / 3 LSB / 1px-edge / maxΔ24 gate measures
+ * structure (geometry/UV/pose/seams), not the specified tone lift:
+ * per channel `c`: `v = min(2*c, 255)` (overbright x2 + clamp), then
+ * `out = round(255 * (v/255)^(1/1.3))` (gamma lift). Alpha passes through
+ * verbatim.
+ *
+ * Source lines mirrored (read-only; owned by other lanes/packages):
+ * - overbright x2 + clamp: `voodooOverbright` =
+ *   `min(c * uOverbright, vec3(1.0))`
+ *   (`packages/webgl-renderer/src/appearance.ts` GLSL_FOG_OVERBRIGHT);
+ *   `uOverbright = ap.overbright ? 2 : 1`
+ *   (`packages/webgl-renderer/src/renderer.ts` uniform upload;
+ *   hermetic pin `release10-cvars.test.ts` "vd_overbright toggles the
+ *   uOverbright modulate (2 vs 1)"); `vd_overbright` default 1
+ *   (`packages/config/src/index.ts` cvar registry).
+ * - gamma lift: `pow(c, 1/uGamma)` AFTER reconstruction (RAMDAC placement)
+ *   (`packages/webgl-renderer/src/appearance.ts` FS_APPEARANCE main);
+ *   CPU form `round(255 * (i/255)^(1/gamma))` = `gammaLUTValue`
+ *   (`appearance.ts` gamma section); `vd_gamma` default 1.3
+ *   (`packages/config/src/index.ts` cvar registry).
+ *
+ * Deliberately NOT modelled: ordered dither, RGB565 quantize and the
+ * 2x2 matched reconstruction (they average out structurally; the 3-LSB
+ * forgiveness + 1px edge exclusion absorb their residue). The scene mip
+ * gate is separately report-only; water stays lit on the CPU vs unlit on
+ * the GPU (authorized, out of scope — quantified in the PROOF-4 leg, never
+ * normalized away here).
+ *
+ * Pure: returns a new plane, never mutates the input.
+ */
+export function toneNormalizeCpuReference(reference: Uint32Array): Uint32Array {
+  const gamma = TONE_NORMALIZE_GAMMA;
+  const lut = new Uint8Array(256);
+  for (let i = 0; i < 256; i++) {
+    const v = Math.min(TONE_NORMALIZE_OVERBRIGHT * i, 255);
+    lut[i] = Math.min(255, Math.round(255 * Math.pow(v / 255, 1 / gamma)));
+  }
+  const out = new Uint32Array(reference.length);
+  for (let i = 0; i < reference.length; i++) {
+    const px = reference[i]!;
+    out[i] =
+      ((px & 0xff000000) |
+        (lut[(px >> 16) & 255]! << 16) |
+        (lut[(px >> 8) & 255]! << 8) |
+        lut[px & 255]!) >>>
+      0;
+  }
+  return out;
+}
 
 /** Outcome of one GPU-proof frame comparison. */
 export interface GpuProofDiff {

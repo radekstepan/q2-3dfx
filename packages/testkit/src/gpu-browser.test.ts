@@ -41,6 +41,7 @@ import {
   GPU_PROOF_WIDTH,
   compareGpuProofFrames,
   formatGpuProofReport,
+  toneNormalizeCpuReference,
 } from './gpu-proof.js';
 import {
   abgrToRgb,
@@ -621,6 +622,10 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
       let proofJson: ProofResult | null = null;
       let shot: Uint8Array | null = null;
       let mipScatter = 0;
+      let toneCurveGate: {
+        pass: boolean;
+        checks: Array<{ name: string; pass: boolean; detail: string }>;
+      } | null = null;
       try {
         server = await serveProofTestDir(scratch, packagesDir);
         const pageUrl = `${server.url}/page.html`;
@@ -677,6 +682,78 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         console.log(`[gpu-proof-4] resolveCoverage=${ap.resolveCoverage.toFixed(4)} (need >=${RESOLVE_COVERAGE_MIN})`);
         soft(ap.resolveCoverage).toBeGreaterThanOrEqual(RESOLVE_COVERAGE_MIN);
 
+        // --- TONE-CURVE pin as an explicit passing gate (GPU-FOLLOW-5
+        // approved proposal box 3, applied 2026-10-31): the flat/ramp/
+        // gamma-frac soft asserts above are the enforcement (the file FAILS
+        // loudly if the appearance chain drifts); this block names the gate,
+        // records it in gate.json, and logs one PASS/FAIL line. The
+        // mistuned-curve negative control lives hermetically in
+        // gpu-proof.test.ts ("TONE-CURVE pin": a mistuned overbright-x1 /
+        // gamma-1.0 chain FAILS the 0.02 gate on the same ramp — the gate
+        // bites on drift; asset-free, runs without Q2_PAK or Chromium).
+        {
+          const checks = [
+            {
+              name: 'flat-period',
+              pass: ap.flatPeriodViolations <= FLAT_PERIOD_VIOL_MAX,
+              detail: `${ap.flatPeriodViolations} violations (max ${FLAT_PERIOD_VIOL_MAX})`,
+            },
+            {
+              name: 'flat-membership',
+              pass: ap.flatMembershipViolations <= FLAT_MEMBERSHIP_VIOL_MAX,
+              detail: `${ap.flatMembershipViolations} violations (max ${FLAT_MEMBERSHIP_VIOL_MAX})`,
+            },
+            {
+              name: 'flat-distinct-off',
+              pass: ap.flatDistinctOff === FLAT_DISTINCT_OFF_EXACT,
+              detail: `distinctOff=${ap.flatDistinctOff} (exact ${FLAT_DISTINCT_OFF_EXACT})`,
+            },
+            {
+              name: 'flat-distinct-on',
+              pass: ap.flatDistinctOn >= FLAT_DISTINCT_ON_MIN,
+              detail: `distinctOn=${ap.flatDistinctOn} (min ${FLAT_DISTINCT_ON_MIN})`,
+            },
+            {
+              name: 'flat-on-vs-off',
+              pass: ap.flatOnVsOff.frac >= FLAT_ONOFF_MIN_FRAC,
+              detail: `frac=${ap.flatOnVsOff.frac.toFixed(4)} (min ${FLAT_ONOFF_MIN_FRAC})`,
+            },
+            {
+              name: 'ramp-rgb',
+              pass:
+                ap.rampDistinctR >= RAMP_R_MIN &&
+                ap.rampDistinctG >= RAMP_G_MIN &&
+                ap.rampDistinctB >= RAMP_B_MIN,
+              detail: `R=${ap.rampDistinctR}/${RAMP_R_MIN} G=${ap.rampDistinctG}/${RAMP_G_MIN} B=${ap.rampDistinctB}/${RAMP_B_MIN}`,
+            },
+            {
+              name: 'ramp-membership',
+              pass: ap.rampMembershipViolations <= RAMP_MEMBERSHIP_VIOL_MAX,
+              detail: `${ap.rampMembershipViolations} violations (max ${RAMP_MEMBERSHIP_VIOL_MAX})`,
+            },
+            {
+              name: 'ramp-triples',
+              pass: ap.rampTriplesOn > ap.rampTriplesOff,
+              detail: `triplesOn=${ap.rampTriplesOn} triplesOff=${ap.rampTriplesOff}`,
+            },
+            {
+              name: 'gamma-frac',
+              pass: ap.rampGammaVsLinear.frac >= RAMP_GAMMA_MIN_FRAC,
+              detail: `gammaFrac=${ap.rampGammaVsLinear.frac.toFixed(4)} (min ${RAMP_GAMMA_MIN_FRAC})`,
+            },
+            {
+              name: 'resolve-coverage',
+              pass: ap.resolveCoverage >= RESOLVE_COVERAGE_MIN,
+              detail: `resolveCoverage=${ap.resolveCoverage.toFixed(4)} (min ${RESOLVE_COVERAGE_MIN})`,
+            },
+          ];
+          toneCurveGate = { pass: checks.every((c) => c.pass), checks };
+          console.log(
+            `[gpu-proof-4] TONE-CURVE GATE: ${toneCurveGate.pass ? 'PASS' : 'FAIL'} ` +
+              checks.map((c) => `${c.name}=${c.pass ? 'ok' : 'FAIL'}(${c.detail})`).join(' '),
+          );
+        }
+
         // --- (c) mip chain (asset-free) ---
         soft(proof.mipChain.levels).toBe(CHAIN_LEVELS_EXACT);
         soft(proof.mipChain.lastW).toBe(1);
@@ -702,15 +779,27 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         soft(ap.f1PinnedVsF1.count).toBeLessThanOrEqual(PIN_IDENTITY_MAX);
         console.log(`[gpu-proof-4] pinned-vs-unpinned F1 identity: ${ap.f1PinnedVsF1.count} px`);
 
-        // --- (c) live mip contrast: far view + dither on/off ---
+        // --- (c) live scene contrast: far view (gate) + mip-dither on/off (REPORT-ONLY) ---
+        // GPU-FOLLOW-5 approved proposal box 3, applied 2026-10-31: the two
+        // mip asserts below are log-and-record ONLY (measured + gate.json
+        // fields + console lines kept; they never fail this file). Threshold
+        // VALUES stay in code untouched (MIP_ONOFF_MIN_PX, MIP_SCATTER_MIN_FRAC
+        // — no silent change). Rationale: the scene mip-dither toggle reads
+        // 0/0 at near/mid/far cameras with propagation alive
+        // (mipFlagsMid=[true,false], policyUploads on/off > 0) — a
+        // fixture-regime miss, not dead plumbing. The biting-regime path is
+        // the hermetic webgl fixture `packages/webgl-renderer/src/mip-regime.test.ts`
+        // (synthetic minification through the production sampling path).
         soft(ap.farVsNear.frac).toBeGreaterThanOrEqual(FAR_MIN_FRAC);
-        soft(ap.mipOnOff.count).toBeGreaterThanOrEqual(MIP_ONOFF_MIN_PX);
         const scatter = (ap.mipOnOff.bboxArea ?? 0) / (GPU_PROOF_WIDTH * GPU_PROOF_HEIGHT);
         mipScatter = scatter;
-        soft(scatter).toBeGreaterThanOrEqual(MIP_SCATTER_MIN_FRAC);
+        const mipReportOnly =
+          ap.mipOnOff.count >= MIP_ONOFF_MIN_PX && scatter >= MIP_SCATTER_MIN_FRAC;
         console.log(
           `[gpu-proof-4] far: farVsNear=${ap.farVsNear.frac.toFixed(4)} ` +
-            `mipOnOff=${ap.mipOnOff.count} bboxArea=${ap.mipOnOff.bboxArea} scatter=${scatter.toFixed(4)}`,
+            `mipOnOff=${ap.mipOnOff.count} bboxArea=${ap.mipOnOff.bboxArea} scatter=${scatter.toFixed(4)} ` +
+            `(REPORT-ONLY vs MIP_ONOFF_MIN_PX=${MIP_ONOFF_MIN_PX} MIP_SCATTER_MIN_FRAC=${MIP_SCATTER_MIN_FRAC}: ` +
+            `${mipReportOnly ? 'MEETS' : 'BELOW'} — recorded, never failing)`,
         );
 
         // --- FOLLOW-5 mid-camera regime evidence (report-only pins around the
@@ -862,6 +951,40 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         `[gpu-proof-4] CPU F0: color=${cpuF0.colorHash} F2: color=${cpuF2.colorHash}`,
       );
 
+      // GPU-FOLLOW-5 approved proposal box 3 (applied 2026-10-31): the gate
+      // compares against the TONE-NORMALIZED CPU plane (specified appearance
+      // curve: overbright x2 + clamp, gamma pow(c,1/1.3) — see
+      // toneNormalizeCpuReference). Thresholds are EXACTLY unchanged.
+      const cpuNorm = toneNormalizeCpuReference(cpu.color);
+      const cpuF0Norm = toneNormalizeCpuReference(cpuF0.color);
+      const cpuF2Norm = toneNormalizeCpuReference(cpuF2.color);
+      // Water mask (CPU-side, same camera): F0-stationary carries no
+      // particles and pumps no dlights; sky has no time scroll (ref_soft)
+      // and the TS port has no texture animation, so an F0 pair at two
+      // level-times differs ONLY on warped turbulent pixels (warp phase
+      // ((time*64)|0) & 1023: 1.5s -> phase 96, 2.0s -> phase 128).
+      const cpuF0t2 = await renderCpuProofFrame(bw, 0, 2.0);
+      const MW = GPU_PROOF_WIDTH, MH = GPU_PROOF_HEIGHT;
+      const waterMask = new Uint8Array(MW * MH);
+      let waterN = 0;
+      let wx0 = MW, wy0 = MH, wx1 = -1, wy1 = -1;
+      for (let i = 0; i < MW * MH; i++) {
+        if (cpuF0.color[i]! !== cpuF0t2.color[i]!) {
+          waterMask[i] = 1;
+          waterN++;
+          const x = i % MW, yGl = MH - 1 - Math.floor(i / MW);
+          if (x < wx0) wx0 = x;
+          if (x > wx1) wx1 = x;
+          if (yGl < wy0) wy0 = yGl;
+          if (yGl > wy1) wy1 = yGl;
+        }
+      }
+      console.log(
+        `[gpu-proof-4] water mask (F0 time-pair 1.5s vs 2.0s): ${waterN}/${MW * MH} px ` +
+          `(${(waterN / (MW * MH)).toFixed(4)})` +
+          (waterN > 0 ? ` bboxGL=[${wx0},${wy0},${wx1},${wy1}]` : ' (no time-varying pixels in view)'),
+      );
+
       // Page readPixels rows are bottom-first (GL); CPU planes are
       // top-first: flip vertically before packing to 0xAABBGGRR.
       const W = GPU_PROOF_WIDTH, H = GPU_PROOF_HEIGHT;
@@ -871,9 +994,9 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         gpuTopFirst.set(src.subarray(y * W * 4, (y + 1) * W * 4), (H - 1 - y) * W * 4);
       }
       const gpuPacked = packRgbaBytesToAbgr(gpuTopFirst);
-      const diff = compareGpuProofFrames(gpuPacked, cpu.color, GPU_PROOF_TOLERANCES, W);
+      const diff = compareGpuProofFrames(gpuPacked, cpuNorm, GPU_PROOF_TOLERANCES, W);
       const gateLine = formatGpuProofReport('f1-gpu-vs-cpu', diff, GPU_PROOF_TOLERANCES);
-      console.log(`[gpu-proof-4] F1 GATE: ${gateLine} (gate fraction<=${GPU_PROOF_TOLERANCES.maxFractionDiff})`);
+      console.log(`[gpu-proof-4] F1 GATE (tone-normalized CPU): ${gateLine} (gate fraction<=${GPU_PROOF_TOLERANCES.maxFractionDiff})`);
 
       // FOLLOW-5 matched F0/F2 report-only comparisons (no new gates: the
       // numbers extend the F1 evidence, never re-baseline it).
@@ -886,12 +1009,12 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
       }
       const gpuF0TopFirst = flipBottomFirst(gpuF0BytesBottomFirst as Uint8Array);
       const gpuF2TopFirst = flipBottomFirst(gpuF2BytesBottomFirst as Uint8Array);
-      const diffF0 = compareGpuProofFrames(packRgbaBytesToAbgr(gpuF0TopFirst), cpuF0.color, GPU_PROOF_TOLERANCES, W);
-      const diffF2 = compareGpuProofFrames(packRgbaBytesToAbgr(gpuF2TopFirst), cpuF2.color, GPU_PROOF_TOLERANCES, W);
+      const diffF0 = compareGpuProofFrames(packRgbaBytesToAbgr(gpuF0TopFirst), cpuF0Norm, GPU_PROOF_TOLERANCES, W);
+      const diffF2 = compareGpuProofFrames(packRgbaBytesToAbgr(gpuF2TopFirst), cpuF2Norm, GPU_PROOF_TOLERANCES, W);
       const gateLineF0 = formatGpuProofReport('f0-gpu-vs-cpu', diffF0, GPU_PROOF_TOLERANCES);
       const gateLineF2 = formatGpuProofReport('f2-gpu-vs-cpu', diffF2, GPU_PROOF_TOLERANCES);
-      console.log(`[gpu-proof-4] F0 REPORT-ONLY: ${gateLineF0}`);
-      console.log(`[gpu-proof-4] F2 REPORT-ONLY: ${gateLineF2}`);
+      console.log(`[gpu-proof-4] F0 REPORT-ONLY (tone-normalized CPU): ${gateLineF0}`);
+      console.log(`[gpu-proof-4] F2 REPORT-ONLY (tone-normalized CPU): ${gateLineF2}`);
 
       // --- region analysis for the side-by-side review ---
       // Full-frame coverage (the void split below is ~empty since the
@@ -907,6 +1030,12 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
       const edge = GPU_PROOF_TOLERANCES.edgeExcludePx;
       let gunDiff = 0, gunN = 0, darkDiff = 0, darkN = 0;
       let covDiff = 0, covN = 0, covMax = 0, voidDiff = 0, voidN = 0;
+      // Water attribution: residual (tone-normalized) diff pixels that fall
+      // on CPU time-varying (warped turbulent) pixels. GPU draws warp faces
+      // UNLIT per ref_soft/ref_gl; the in-repo CPU soft backend still lights
+      // them — neither renderer path is touched (out of scope); the share is
+      // quantified here.
+      let waterDiff = 0, waterResidN = 0;
       const gb = proofJson?.stats.gun.bbox ?? null;
       for (let i = 0; i < W * H; i++) {
         const x = i % W, y = Math.floor(i / W); // top-first rows
@@ -914,10 +1043,14 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         const yGl = H - 1 - y;
         const o = i * 4;
         const gr = gpuTopFirst[o]!, gg = gpuTopFirst[o + 1]!, gbb = gpuTopFirst[o + 2]!;
-        const c = cpu.color[i]!;
+        const c = cpuNorm[i]!;
         const cr = c & 255, cg = (c >> 8) & 255, cb = (c >> 16) & 255;
         const isDiff =
           Math.abs(gr - cr) > lsb || Math.abs(gg - cg) > lsb || Math.abs(gbb - cb) > lsb;
+        if (waterMask[i] === 1) {
+          waterResidN++;
+          if (isDiff) waterDiff++;
+        }
         if (coveredGl(x, yGl)) {
           covN++;
           if (isDiff) covDiff++;
@@ -945,7 +1078,16 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
           `(${covDiff}/${covN} maxΔ${covMax}) voidDiff=${voidN > 0 ? (voidDiff / voidN).toFixed(4) : 'n/a'} ` +
           `(${voidDiff}/${voidN}) gunDiff=${gunN > 0 ? (gunDiff / gunN).toFixed(4) : 'n/a'} ` +
           `(${gunDiff}/${gunN} in gun bbox) darkDiff=${darkN > 0 ? (darkDiff / darkN).toFixed(4) : 'n/a'} ` +
-          `(${darkDiff}/${darkN} dark CPU px)`,
+          `(${darkDiff}/${darkN} dark tone-normalized CPU px)`,
+      );
+      console.log(
+        `[gpu-proof-4] water attribution (tone-normalized residual): ` +
+          `waterMask=${waterN} px` +
+          (waterN > 0 ? ` bboxGL=[${wx0},${wy0},${wx1},${wy1}]` : '') +
+          `, in-gate water px=${waterResidN}, waterDiff=${waterDiff} ` +
+          `(frac of water ${waterResidN > 0 ? (waterDiff / waterResidN).toFixed(4) : 'n/a'}), ` +
+          `share of total residual ${diff.diff > 0 ? (waterDiff / diff.diff).toFixed(4) : 'n/a'} ` +
+          `(${waterDiff}/${diff.diff})`,
       );
 
       // --- review artifacts (gitignored test-output/; paths logged) ---
@@ -956,8 +1098,10 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
       writeFileSync(`${base}-gpu.rgba`, gpuTopFirst);
       writeFileSync(`${base}-cpu.rgba`, new Uint8Array(cpu.color.buffer, cpu.color.byteOffset, cpu.color.byteLength));
       writeFileSync(`${base}-gpu.ppm`, encodePpm(W, H, rgbaToRgb(gpuTopFirst)));
-      writeFileSync(`${base}-cpu.ppm`, encodePpm(W, H, abgrToRgb(cpu.color)));
-      writeFileSync(`${base}-diff.ppm`, encodePpm(W, H, buildDiffRgb(gpuTopFirst, cpu.color, W, H)));
+      // -cpu.ppm / -diff.ppm follow the TONE-NORMALIZED gate semantics (the
+      // raw CPU plane stays in -cpu.rgba); -diff.ppm red = gate diff pixels.
+      writeFileSync(`${base}-cpu.ppm`, encodePpm(W, H, abgrToRgb(cpuNorm)));
+      writeFileSync(`${base}-diff.ppm`, encodePpm(W, H, buildDiffRgb(gpuTopFirst, cpuNorm, W, H)));
       if (shot) writeFileSync(`${base}-browser.png`, shot);
       const verdict =
         'human sign-off: STILL NEEDED (pending) — differences below are documented ' +
@@ -966,7 +1110,7 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         stamp,
         pak,
         chromium: CHROMIUM_BIN,
-        gate: 'GPU_PROOF_TOLERANCES (fraction<=0.02 @lsb<=3, 1px edge, maxDeltaWarn=24 — REVIEW GATES, never auto-pass)',
+        gate: 'GPU_PROOF_TOLERANCES (fraction<=0.02 @lsb<=3, 1px edge, maxDeltaWarn=24 — REVIEW GATES, never auto-pass) applied TONE-NORMALIZED (CPU plane through overbright x2 + clamp, gamma pow(c,1/1.3))',
         bands: {
           FLAT_PERIOD_VIOL_MAX,
           FLAT_MEMBERSHIP_VIOL_MAX,
@@ -997,6 +1141,20 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         // FOLLOW-5 triage block (carries the mid-camera regime evidence:
         // midView content + midViewMipOnOff + mipFlagsMid + policyUploads).
         follow2b: proofJson?.follow2b ?? null,
+        // GPU-FOLLOW-5 approved proposal box 3 (applied 2026-10-31):
+        // explicit TONE-CURVE gate record (flat/ramp/gamma-frac checks) +
+        // report-only scene mip-dither record (measured, never failing).
+        toneCurve: 'specified appearance curve: overbright x2 + clamp, gamma pow(c,1/1.3) — mirror of the GPU chain (see toneNormalizeCpuReference)',
+        toneCurveGate,
+        mipReportOnly: {
+          reportOnly: true,
+          count: proofJson?.appearance.mipOnOff.count ?? null,
+          bboxArea: proofJson?.appearance.mipOnOff.bboxArea ?? null,
+          scatter: mipScatter,
+          meetsCount: (proofJson?.appearance.mipOnOff.count ?? 0) >= MIP_ONOFF_MIN_PX,
+          meetsScatter: mipScatter >= MIP_SCATTER_MIN_FRAC,
+          thresholds: { MIP_ONOFF_MIN_PX, MIP_SCATTER_MIN_FRAC },
+        },
         cpu: { colorHash: cpu.colorHash, displayHash: cpu.displayHash, display: cpu.displayKind },
         f1gate: {
           diff: diff.diff,
@@ -1034,6 +1192,14 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
           darkDiff, darkN, darkFrac: darkN > 0 ? darkDiff / darkN : null,
           covDiff, covN, covFrac: covN > 0 ? covDiff / covN : null, covMaxDelta: covMax,
           voidDiff, voidN, voidFrac: voidN > 0 ? voidDiff / voidN : null,
+          water: {
+            maskPx: waterN,
+            maskBboxGL: waterN > 0 ? [wx0, wy0, wx1, wy1] : null,
+            inGateWaterPx: waterResidN,
+            waterDiff,
+            waterDiffFrac: waterResidN > 0 ? waterDiff / waterResidN : null,
+            shareOfResidual: diff.diff > 0 ? waterDiff / diff.diff : null,
+          },
         },
         productionDefectFixed: {
           id: 'VS_POST half-triangle (owns: @q2/webgl-renderer) — FIXED in-tree',
@@ -1071,11 +1237,16 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
           `  transparency: beam/sprite/particles ride TRUE blending on GPU vs screen-door on CPU ` +
           `(pinned beam bboxFrac=${(proofJson?.appearance.pinnedBeam.bboxFrac ?? 0).toFixed(4)}); ` +
           `per-draw quantum rounding between translucent draws is NOT reproduced (contract §4 chosen approximation).\n` +
-          `  dark areas: dark-CPU-pixel diff frac=${darkN > 0 ? (darkDiff / darkN).toFixed(4) : 'n/a'} — ` +
-          `gamma-1.3-after-reconstruction lifts near-black differently than per-luxel CPU shading; inspect -diff.ppm red clusters in shadows.\n` +
+          `  dark areas: dark-tone-normalized-CPU-pixel diff frac=${darkN > 0 ? (darkDiff / darkN).toFixed(4) : 'n/a'} — ` +
+          `tone lift is normalized away here; inspect -diff.ppm red clusters for structural (non-tone) causes.\n` +
+          `  water: mask=${waterN} px` +
+          (waterN > 0 ? ` bboxGL=[${wx0},${wy0},${wx1},${wy1}]` : '') +
+          ` — waterDiff=${waterDiff}/${waterResidN} in-gate water px, ` +
+          `share of tone-normalized residual=${diff.diff > 0 ? (waterDiff / diff.diff).toFixed(4) : 'n/a'} ` +
+          `(GPU warp faces UNLIT per ref_soft/ref_gl; CPU soft backend still lights them — out of scope, quantified only).\n` +
           `  minification: far-vs-near frac=${(proofJson?.appearance.farVsNear.frac ?? 0).toFixed(4)} ` +
           `(repaired: FAR_VIEW capture, was 0/0 degenerate), ` +
-          `mip-dither count=${proofJson?.appearance.mipOnOff.count} scatter=${mipScatter.toFixed(4)} (MID_VIEW pair) — transition is dithered (no hard band); ` +
+          `mip-dither count=${proofJson?.appearance.mipOnOff.count} scatter=${mipScatter.toFixed(4)} (MID_VIEW pair, REPORT-ONLY — recorded, never failing); ` +
           `single-level pick vs CPU baked miplevel blocks remains an authorized approximation.\n` +
           `  matched route: F0 ${gateLineF0} | F2 ${gateLineF2} (report-only, same oracle/tolerances as F1) — ` +
           `GPU F2-vs-F1 frac=${(proofJson?.stats.f2vsF1.frac ?? -1).toFixed(4)} (camera +6deg must move the frame).\n` +
@@ -1085,7 +1256,7 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
           `VS_POST now emits the covering triangle (owns: @q2/webgl-renderer, fixed in-tree, pinned by appearance.test.ts); ` +
           `GPU-vs-CPU diff frac=${covN > 0 ? (covDiff / covN).toFixed(4) : 'n/a'} ` +
           `(${covDiff}/${covN} maxΔ${covMax}) is the appearance-fidelity signal.\n` +
-          `  gate: ${gateLine} — ${diff.pass ? 'inside' : 'OUTSIDE'} the predeclared review gate. ` +
+          `  gate (tone-normalized CPU): ${gateLine} — ${diff.pass ? 'inside' : 'OUTSIDE'} the predeclared review gate. ` +
           'Differences WILL exceed the gate in places (different rasterization is AUTHORIZED). ' +
           `${verdict}.`,
       );
@@ -1099,7 +1270,7 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
           `(need >=${RESOLVE_COVERAGE_MIN}) — artifacts: ${base}-gate.json`,
       ).toBeGreaterThanOrEqual(RESOLVE_COVERAGE_MIN);
       console.log(
-        `[gpu-proof-4] GATE (report-only, acceptance pending): ${gateLine} — artifacts: ${base}-gate.json ${base}-diff.ppm ` +
+        `[gpu-proof-4] GATE (tone-normalized CPU; report-only, acceptance pending): ${gateLine} — artifacts: ${base}-gate.json ${base}-diff.ppm ` +
           '(review the side-by-side captures; do NOT loosen GPU_PROOF_TOLERANCES to pass)',
       );
       // Acceptance pin: the verdict MUST record pending human sign-off.

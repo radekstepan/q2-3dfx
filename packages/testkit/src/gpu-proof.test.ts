@@ -38,6 +38,7 @@ import {
   gpuProofSlotNames,
   gpuProofSlotPaths,
   gpuProofViewFor,
+  toneNormalizeCpuReference,
   writeGpuProofReference,
   type GpuProofFileWriter,
   type GpuProofFrame,
@@ -216,6 +217,67 @@ describe('gpu proof metrics (asset-free)', () => {
     expect(() =>
       writeGpuProofReference(writer, '/ref', 'x', color, new Uint32Array(3), meta),
     ).toThrow();
+  });
+});
+
+// --- Tone-normalized comparison (GPU-FOLLOW-5 approved proposal, asset-free) ---
+
+describe('tone-normalized CPU reference (asset-free)', () => {
+  it('is pure (new plane, input untouched) and preserves alpha', () => {
+    const src = new Uint32Array([0xff102030, 0x80405060]);
+    const out = toneNormalizeCpuReference(src);
+    expect(out).not.toBe(src);
+    expect(out.length).toBe(src.length);
+    expect(Array.from(src)).toEqual([0xff102030, 0x80405060]);
+    expect(out[0]! >>> 24).toBe(0xff);
+    expect(out[1]! >>> 24).toBe(0x80);
+  });
+
+  it('pins the specified curve spot values (overbright x2 + clamp, gamma 1/1.3)', () => {
+    // c=0 -> v=0 -> 0; c=24 -> v=48 -> round(255*(48/255)^(1/1.3)) = 71
+    // (matches the measured GPU dark-bin mean 71.7 in the lane report);
+    // c=128 -> v=256 -> clamp 255 -> 255; c=255 -> 255.
+    const px = (c: number): number => (0xff << 24) | (c << 16) | (c << 8) | c;
+    const ch = (v: number): number => v & 255;
+    const src = new Uint32Array([px(0), px(24), px(128), px(255)]);
+    const out = toneNormalizeCpuReference(src);
+    expect(ch(out[0]!)).toBe(0);
+    expect(ch(out[1]!)).toBe(71);
+    expect(ch(out[2]!)).toBe(255);
+    expect(ch(out[3]!)).toBe(255);
+    // Monotone non-decreasing over the full range (a valid tone curve).
+    const ramp = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) ramp[i] = px(i);
+    const norm = toneNormalizeCpuReference(ramp);
+    for (let i = 1; i < 256; i++) {
+      expect(ch(norm[i]!)).toBeGreaterThanOrEqual(ch(norm[i - 1]!));
+    }
+  });
+
+  it('TONE-CURVE pin: correct-vs-correct passes; mistuned curve FAILS the 0.02 gate', () => {
+    // Full-range gray ramp (all 256 levels, every channel): the normalization
+    // of the identical input is bit-identical (gate PASS, fraction 0).
+    const n = 256;
+    const ramp = new Uint32Array(n);
+    for (let i = 0; i < n; i++) ramp[i] = ((0xff << 24) | (i << 16) | (i << 8) | i) >>> 0;
+    const a = toneNormalizeCpuReference(ramp);
+    const b = toneNormalizeCpuReference(ramp.slice());
+    const same = compareGpuProofFrames(a, b, GPU_PROOF_TOLERANCES);
+    expect(same.diff).toBe(0);
+    expect(same.pass).toBe(true);
+    // NEGATIVE CONTROL (must FAIL — proves the gate bites if the appearance
+    // chain drifts): a mistuned chain (overbright x1, gamma 1.0 = raw plane)
+    // against the specified curve on the same ramp differs on ~every pixel
+    // by far more than 3 LSB. (No width: the 256-px ramp is one row, so the
+    // 1px edge exclusion would exclude everything.)
+    const mistuned = ramp.slice();
+    const drifted = compareGpuProofFrames(mistuned, a, GPU_PROOF_TOLERANCES);
+    expect(drifted.pass).toBe(false);
+    expect(drifted.fraction).toBeGreaterThan(0.5);
+    expect(drifted.maxAbsDelta).toBeGreaterThan(GPU_PROOF_TOLERANCES.maxAbsDeltaWarn);
+    console.log(
+      `[tone-curve] negative control (raw vs specified curve): ${formatGpuProofReport('mistuned-vs-specified', drifted)}`,
+    );
   });
 });
 
