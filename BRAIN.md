@@ -7,12 +7,12 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-30, RELEASE-3 done): sky borders and
-> sky through windows are fixed and user-confirmed; aim/HUD alignment at all
-> resolutions is repaired and browser-verified. Repair water seams,
-> audio and gameplay issues below; retire the legacy CPU Voodoo
-> renderer in favor of WebGL2. CPU optimization stays paused. §8 is the only
-> active queue; old TASK.md and historical reviews do not override it.**
+> **Current direction (2026-10-30, reviewed at `71b58bd`): preserve the
+> user-confirmed sky fixes and landed display-fit repair. Water seams, asset UI,
+> elevator, infantry collision, restart-free settings and legacy Voodoo removal
+> remain open. Investigate the newly reported blaster offset; display alignment
+> does not prove projectile accuracy. CPU optimization stays paused. §8 is the
+> only active queue; old TASK.md and historical reviews do not override it.**
 
 ---
 
@@ -263,9 +263,14 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ### Current status and execution rules
 
-Reviewed source/history at `2c4c162`; user feedback dated 2026-10-30 is the
-current visual verdict. This documentation review did not run browser captures,
-benchmarks or tests. Do not describe its diagnoses as reproduced fixes.
+Reviewed source/history at `71b58bd`; user feedback dated 2026-10-30 is the
+current visual verdict. This review checks the latest diff and local original
+Quake II source; browser captures, gameplay reproduction and full verify were not
+rerun. Focused test results are recorded below; do not treat them as visual acceptance.
+
+Review validation: `yarn workspace web exec vitest run src/aim-hud.test.ts`
+passed 6 tests, with 1 real-asset eye-ray test skipped because Q2_PAK was not
+set for this run. This did not fire a blaster or rerun the browser display probe.
 
 - **Done: GPU-FOLLOW-3A.** Skybox black borders and sky missing through windows
   are fixed, explicitly confirmed by the user. `73c3076` isolates sky faces and
@@ -274,23 +279,37 @@ benchmarks or tests. Do not describe its diagnoses as reproduced fixes.
   opaque occlusion. The older `d934fdc` review is historical, not current status.
 - **Open:** water seams, elevator, infantry collision, asset UI,
   restart-free settings, startup sizing and legacy retirement. The user retested
-  and still sees these defects after `2c4c162`. Wall climbing remains unconfirmed;
+  and still reports water/UI/elevator/collision/restart/retirement issues after
+  `71b58bd`; startup sizing remains open from earlier feedback. Wall climbing remains unconfirmed;
   infantry fire still needs an actual source/visual audit. Water motion is satisfactory.
 - **Implemented, acceptance pending:** volume and devroom changes landed; this
   feedback does not confirm or reject them. Preserve the work, verify outstanding
   acceptance criteria, and do not conflate implementation with visual sign-off.
 - **Review:** `docs/review-2c4c162.md` records unsupported completion claims and
-  test limitations. RELEASE-4/5 remain reopened; RELEASE-3 is re-closed by the
-  fitted-presentation repair (archived with browser evidence). Elapsed effort and
-  test counts are not acceptance evidence.
+  test limitations at the earlier commit. RELEASE-4/5 remain reopened.
+- **Latest implementation: RELEASE-3 display fit.** `71b58bd` fits both canvases
+  to the stage, preserves framebuffer aspect, adds resize cleanup and replaces
+  the earlier ineffective tests. Its archived headless-browser report covers
+  display rectangles/HUD at a 1500×1000 viewport, DPR 1. Preserve that bounded
+  repair; do not generalize it to all devices or actual projectile accuracy.
+  `aim-hud.test.ts` traces from the eye along the view axis, not a fired bolt.
+  New blaster feedback belongs to RELEASE-3B below. No new confirmation of
+  earlier startup, wall-climb or infantry-fire issues was supplied; retain them.
+- **Latest scope:** no water shader, server/game behavior, game-asset HUD,
+  resolution-reboot policy or renderer-selection removal changed in `71b58bd`.
+  The six repeated unresolved reports remain open, not regressions proved fixed
+  by this display-only commit. Elapsed effort and test counts are not acceptance evidence.
 - **Backend terminology:** the user's “new webgpu renderer” refers to the new
   GPU path; this tree implements WebGL2 (`packages/webgl-renderer`), not WebGPU.
 - **Acceptance remains open:** the latest archived sky report records a failing
   full verify (PROOF-4 far/mip and a foreground-recovery timeout under suite load).
-  Earlier reports also mention PROOF-3 CDP timeout. Reproduce current failures
+  The latest RELEASE-3 archive also reports web suite 423/427 and two
+  `sound → config` dependency violations; these are reported results, not fresh
+  passes or failures from this review. Resolve the dependency violations under
+  RELEASE-1/FOLLOW-7. Earlier reports also mention PROOF-3 CDP timeout. Reproduce current failures
   under FOLLOW-5 rather than assuming every historical failure remains current.
 
-Priority: RELEASE-4/5 (gameplay), GPU-FOLLOW-3B (water), RELEASE-6 (asset UI), RELEASE-7
+Priority: RELEASE-4/5 (gameplay), RELEASE-3B (blaster aim), GPU-FOLLOW-3B (water), RELEASE-6 (asset UI), RELEASE-7
 (settings/startup), RELEASE-8 (legacy retirement), then FOLLOW-5/6 → FOLLOW-7. Verify RELEASE-1/2 independently.
 Never tick a behavior/visual box from a constant assertion, formula mirror, stub
 call count or pre-existing unrelated test. Require a reproduction of the actual
@@ -308,7 +327,7 @@ owns: `packages/config`, `packages/sound`, `apps/web`
 depends: none
 status: review
 done-when:
-- [ ] Replace the current `s_volume` default of 0.8 with the requested quiet level. Interpret the new normalized scale as 0..1 mapping to old gain 0..0.05: new default 1 equals old 0.05, and new maximum 1 cannot exceed old 0.05. Document this mapping so the old gain is not multiplied by 0.05 twice.
+- [ ] Verify the landed replacement of the old `s_volume` default of 0.8 with the requested quiet level. Interpret the new normalized scale as 0..1 mapping to old gain 0..0.05: new default 1 equals old 0.05, and new maximum 1 cannot exceed old 0.05. Document this mapping so the old gain is not multiplied by 0.05 twice.
 - [ ] Clamp finite values and handle invalid/legacy configuration at the audio boundary; audit mixer, browser nodes, fallback sounds and menu help so no route bypasses the cap. Preserve positional attenuation and mute.
 - [ ] Verify default, zero, max, out-of-range and invalid settings, including overlapping combat sounds; demonstrate actual output gain, not only the cvar value.
 
@@ -318,8 +337,20 @@ depends: none
 status: review
 starting-points: `play.ts: bootPlay/applyRendererCvar`, `devroom.ts`, `devroom-fallback.test.ts`
 done-when:
-- [ ] Reproduce the black room on GPU cold boot and switching. Review finding: boot GPU world/palette setup is guarded by `mainPalette`; without a pak the current code explicitly leaves the devroom CPU/clear-only. Supply the procedural world, palette and models required by GPU, including restore/replay.
+- [ ] Verify the landed procedural palette/world/model replay on GPU cold boot, switching and restoration without a pak. The former palette guard was addressed in `2c4c162`; do not repeat the obsolete diagnosis or rebuild the implementation. Diagnose any remaining failure from rendered evidence.
 - [ ] Real-WebGL pixels show expected room geometry/materials and entities without pak assets; verify cold boot, map switch, renderer switch and context restoration. Check that an intentional missing-world control fails; nonblack clear color alone is insufficient.
+
+### RELEASE-3B — Verify and repair blaster offset from the crosshair
+owns: `packages/game`, `packages/server`, `apps/web`, `packages/webgl-renderer`, `packages/testkit`
+depends: RELEASE-3 (display-fit implementation archived)
+status: ready
+user-report: the blaster beam/bolt appears slightly below and right of the crosshair.
+starting-points: `packages/game/src/weapons.ts: blasterSpawn`, server bolt spawn/tick/trace, `play.ts` bolt submission, original `game/p_weapon.c: Blaster_Fire`
+review-finding: both local implementations use a muzzle offset of 24 forward, 8 right and viewheight−8, with original C firing along forward. Some visual offset can be intended muzzle parallax; neither source inspection nor an eye-ray test establishes whether the reported appearance/impact is correct.
+done-when:
+- [ ] Capture actual fired bolts and impact points at near/mid/far known targets, level and pitched views, on Software and WebGL2 at 640×480, 800×600 and 1024×768. Record camera, FOV, resolution, viewmodel/recoil state and projected eye/muzzle/bolt positions.
+- [ ] Distinguish intended source muzzle offset from incorrect direction, camera/recoil timing, projectile transform, interpolation or presentation. Compare actual trajectory and effects with original behavior. Do not move the crosshair or zero the muzzle offset merely to hide the symptom; if original parity explains it, document the comparison and get a user verdict rather than silently closing it.
+- [ ] Fix any demonstrated discrepancy and add a production fire/tick/collision/render regression with an intentionally wrong offset/direction control. Eye-ray projection and matched canvas rectangles alone cannot pass this card. Preserve the display-fit and sky repairs.
 
 ### RELEASE-4 — Correct final elevator activation and waiting
 owns: `packages/server`, `packages/game`, `apps/web`
@@ -350,7 +381,6 @@ done-when:
 - [ ] Compare startup/F1 help, health/ammo/armor and level-completion/intermission layout with original game assets and layout semantics. Inventory required pak pictures/fonts and stats; implement the appropriate asset-based screens instead of placeholder styling.
 - [ ] Preserve readable asset-free devroom fallback and distinguish game HUD from optional FPS/position diagnostics. Verify real assets, values, transparency, scaling and placement at 640×480 and 1024×768, including death and level completion.
 
-
 ### RELEASE-7 — Change display settings without restarting; stable startup size
 owns: `apps/web`, `packages/host`, `packages/webgl-renderer`, `packages/testkit`
 depends: RELEASE-3
@@ -361,7 +391,6 @@ done-when:
 - [ ] Reserve the selected/persisted display dimensions before async asset loading. Show a correctly sized loading surface immediately, then present the first valid frame without a small black box or layout jump. Cover cold cache, cached pak, no pak and failed GPU initialization.
 - [ ] Verify repeated resize/switch, context loss/restore, resource disposal and no duplicate loop/listeners; keep explicit restart behavior only for settings that genuinely require a new level (e.g. map/skill).
 
-
 ### RELEASE-8 — Retire the old CPU Voodoo renderer
 owns: `apps/web`, `packages/config`, `packages/renderer-api`, `packages/sw-renderer`, `packages/voodoo`, `packages/host`, `packages/testkit`, `tools/bench`, `tools/asset-cooker`, `docs`, root workspace configuration
 depends: RELEASE-2, RELEASE-7
@@ -370,7 +399,6 @@ done-when:
 - [ ] Remove the legacy CPU Voodoo execution mode and its menu/config selection in favor of WebGL2; map persisted legacy selections deliberately and report unsupported-GPU fallback accurately. Preserve the software reference/Node renderer and the WebGL Voodoo appearance.
 - [ ] Inventory shared imports first: WebGL currently reuses `sw-renderer` helpers and `voodoo` is a policy/post-process package. Remove obsolete mode-specific code, workers, controls and benchmarks; retain or relocate shared utilities. Do not delete whole packages blindly or silently turn WebGL into a CPU path.
 - [ ] Update frozen contracts with required major changesets if changed, dependency rules, scripts, docs and tests. Retire obsolete tests explicitly while preserving meaningful software goldens and GPU parity/lifecycle coverage. Update §§2–6 to describe the final architecture, not a planned deletion.
-
 
 ### GPU-FOLLOW-3B — Remove visible water tile boundaries
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit`
@@ -384,10 +412,9 @@ done-when:
 - [ ] Add a regression that fails for the observed defect: actual sampled pixels across repeat/face boundaries at multiple times, plus real-page stationary/moving water captures. Include combined turbulent/translucent material coverage. Formula-string/mirror checks alone are insufficient.
 - [ ] Run relevant gates and record `yarn verify` outcome (known suite failures belong to FOLLOW-5); add changesets and commit separately. Confirm sky and prior wall/enemy/barrel repairs remain intact.
 
-
 ### GPU-FOLLOW-5 — Refresh final fidelity evidence
 owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`
-depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
+depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-3B, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
 status: ready
 done-when:
 - [ ] Reproduce current full-suite failures, including reported foreground-recovery pool and PROOF-3 CDP timeouts under load: reproduce and isolate resource/process contention, run expensive browser tests with controlled concurrency, and retain bounded useful timeouts. Do not skip the gate or merely inflate timeouts without evidence.
@@ -396,10 +423,9 @@ done-when:
 - [ ] Investigate remaining unexplained UV/lighting/depth/transparency differences and add meaningful regression fixtures. Include repaired sky/water. Do not loosen assertions or replace goldens to conceal defects.
 - [ ] Meet the existing fidelity contract, or present concrete side-by-sides and a precise proposed contract for user approval. Record automated and user verdicts separately; no implicit approval of threshold changes.
 
-
 ### GPU-FOLLOW-6 — Verify complete gameplay on a visible display
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
-depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
+depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-3B, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
 status: ready
 done-when:
 - [ ] Run a hardware-backed visible-browser 640×480 soak ≥5 minutes: stationary, multi-room/PVS movement, doors/lifts and combat, real viewmodel/effects and sky/water. Record actual route state, visible captures, bounded resources and absence of silent fallback.
@@ -407,13 +433,12 @@ done-when:
 - [ ] Measure cached-pak-to-first-frame against the existing ≤2.5 s startup requirement; report separately from steady-state FPS.
 - [ ] If a performance gate fails, make at most the remaining one measured optimization iteration, then report. If display access is absent, record the exact missing prerequisite and leave that gate blocked; continue independent work.
 
-
 ### GPU-FOLLOW-7 — Final integrated acceptance
 owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config` (integrator)
-depends: RELEASE-1 through RELEASE-8, GPU-FOLLOW-3B, GPU-FOLLOW-5, GPU-FOLLOW-6
+depends: RELEASE-1 through RELEASE-8, RELEASE-3B, GPU-FOLLOW-3B, GPU-FOLLOW-5, GPU-FOLLOW-6
 status: ready
 done-when:
-- [ ] Run `yarn verify`, `yarn deps:check`, real-asset base1, retained software and GPU lifecycle/image/gameplay gates after legacy retirement on the integrated result. Record skipped coverage and preserve CPU/Node support.
+- [ ] Resolve the reported `sound → config` dependency-rule violations without weakening the dependency gate; run `yarn verify`, `yarn deps:check`, real-asset base1, retained software and GPU lifecycle/image/gameplay gates after legacy retirement on the integrated result. Record skipped coverage and preserve CPU/Node support.
 - [ ] Publish separate implementation, correctness, fidelity and displayed-performance verdicts with commits/artifacts; reconcile contradictory PASS/GO claims in existing reports. Carry forward precise unresolved blockers.
 - [ ] Only after all required gates pass, close GPU-EXPAND-1 and decide default rollout with accurate selection/fallback labels. Otherwise keep GPU experimental.
 - [ ] Commit validated remaining changes with required changesets, no push; move completed cards to the archive. Keep deferred CPU/hardware-oracle/demo work in the review/history docs, not silently marked complete.
@@ -436,5 +461,5 @@ done-when:
 | `docs/lessons.md` | dual-sim root cause, single-sim rule, base1 play-verified gate, closed/open lists |
 | `docs/gpu-review-d934fdc-sky-water.md` | Historical pre-73c3076 sky/water review; sky findings superseded, water still open |
 | `docs/gpu-review-2026-10-29-lifecycle-sky-water.md` | Dirty-file ownership, review evidence, diagnoses and superseded queue |
-| `docs/review-2c4c162.md` | Current review: reopened acceptance, ineffective tests and unresolved user reports |
+| `docs/review-2c4c162.md` | Earlier review at 2c4c162: reopened acceptance, ineffective tests and unresolved user reports |
 | `docs/tasks-archive.md` | all DONE cards (M0–M9 + TODOs) with lane reports |
