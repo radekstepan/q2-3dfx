@@ -56,11 +56,12 @@ export function loadCpuProofWorld(pakBytes: ArrayBuffer): BenchWorld {
 }
 
 /**
- * Render the F1 combat frame serially under the pinned profile (fresh
+ * Render one proof-route frame serially under the pinned profile (fresh
  * renderer, combat particles, pumped dlights; raw-color display leg).
  * Resets cvars + RGB-world mode afterwards (no leakage into sibling tests).
+ * `frameIndex`: 0 = F0 stationary, 1 = F1 combat, 2 = F2 moving combat.
  */
-export async function renderCpuProofF1(bw: BenchWorld): Promise<GpuProofCpuRender> {
+export async function renderCpuProofFrame(bw: BenchWorld, frameIndex: number): Promise<GpuProofCpuRender> {
   pinBenchCvars();
   const W = GPU_PROOF_WIDTH, H = GPU_PROOF_HEIGHT;
   const fb = createFramebuffer(W, H, true);
@@ -68,17 +69,24 @@ export async function renderCpuProofF1(bw: BenchWorld): Promise<GpuProofCpuRende
   try {
     r.init(fb);
     r.setPalette(bw.palette);
-    const frame = gpuProofRoute()[1]!;
+    const route = gpuProofRoute();
+    const frame = route[frameIndex] ?? route[1]!;
     const origin: [number, number, number] = [128, -320, 54];
     const yawRad = (frame.yawDeg * Math.PI) / 180;
+    // F0 stationary carries no particles (matches the page worldF0);
+    // combat/moving carry the spark cloud (matches the page worldF1).
+    const worldData =
+      frame.workload === 'stationary'
+        ? bw.world
+        : withBenchParticles(
+            bw.world,
+            origin[0] + Math.cos(yawRad) * 48,
+            origin[1] + Math.sin(yawRad) * 48,
+            origin[2] - 20,
+          );
     const world = {
       name: 'base1',
-      data: withBenchParticles(
-        bw.world,
-        origin[0] + Math.cos(yawRad) * 48,
-        origin[1] + Math.sin(yawRad) * 48,
-        origin[2] - 20,
-      ),
+      data: worldData,
     };
     const entities = gpuProofEntitiesFor(r, bw, frame);
     gpuProofPumpFor(r, origin, frame.yawDeg, frame);
@@ -100,6 +108,15 @@ export async function renderCpuProofF1(bw: BenchWorld): Promise<GpuProofCpuRende
   } finally {
     resetCVars();
   }
+}
+
+/**
+ * Render the F1 combat frame serially under the pinned profile (fresh
+ * renderer, combat particles, pumped dlights; raw-color display leg).
+ * Resets cvars + RGB-world mode afterwards (no leakage into sibling tests).
+ */
+export async function renderCpuProofF1(bw: BenchWorld): Promise<GpuProofCpuRender> {
+  return renderCpuProofFrame(bw, 1);
 }
 
 /**

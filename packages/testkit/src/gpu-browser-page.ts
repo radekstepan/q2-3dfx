@@ -199,7 +199,7 @@ function diffStats(a, b) {
   return { count: count, frac: count / N, bbox: [x0, y0, x1, y1], bboxArea: area, bboxFrac: count / area };
 }
 
-function makeRenderer(glImpl, world, palette, soldierMd2, gunMd2, soldierSkin, gunSkin, entities, view) {
+function makeRenderer(glImpl, world, palette, soldierMd2, gunMd2, soldierSkin, gunSkin, entities, view, skipGunSkin) {
   var v = view || VIEW;
   var r = new WebGLRenderer();
   r.init(glImpl, W, H);
@@ -210,7 +210,13 @@ function makeRenderer(glImpl, world, palette, soldierMd2, gunMd2, soldierSkin, g
   r.registerModelData(2, 'sp2', null);
   r.registerModelData(3, 'md2', gunMd2);
   r.registerSkinPixels(0, soldierSkin.pixels, soldierSkin.width, soldierSkin.height);
-  r.registerSkinPixels(1, gunSkin.pixels, gunSkin.width, gunSkin.height);
+  // FOLLOW-5 negative control (skipGunSkin): withhold the gun skin so the
+  // viewmodel renders on the white fallback (production never skips the
+  // registration). The missing-skin warning + the localized diff prove the
+  // lifecycle image checks respond to a removed required asset.
+  if (!skipGunSkin) {
+    r.registerSkinPixels(1, gunSkin.pixels, gunSkin.width, gunSkin.height);
+  }
   var scene = selectGpuScene(world, entities, v, W, H, KINDS);
   r.setScene(scene);
   return { renderer: r, scene: scene };
@@ -413,6 +419,84 @@ async function main() {
   // Restore the F1 scene on the combat renderer for the suites below.
   rrF1.renderer.setScene(savedF1Scene);
   rrF1.scene = savedF1Scene;
+  // FOLLOW-5 renderer creations (before the captures below): MID_VIEW is
+  // the same yaw on the spawn->FAR ray (70/150 of the way, 19/40 of the
+  // elevation), so the camera stays inside valid map space while
+  // wall/floor distances roughly double vs the near camera. The LOD then
+  // straddles the Bayer n/n+1 transition instead of clamping to 0 (near,
+  // magnified) or to uMaxLevel / flat-wall convergence (far).
+  var MID_VIEW = {
+    origin: f32([OX - FX * 70, OY - FY * 70, OZ + 19]),
+    angles: VIEW.angles,
+    fovX: 90,
+    time: 1.5,
+    lightStyles: VIEW.lightStyles,
+  };
+  var rrMid = makeRenderer(counted.gl, worldF1, palette, soldierMd2, gunMd2, soldierSkin, gunSkin, ENT_F1, MID_VIEW);
+  // F2 moving-combat view (proof route yaw +6deg): own selection through
+  // the production selectGpuScene path (the TURN precedent), with entities,
+  // lights and particles re-placed for yaw +6 (same derivation as the yaw-90
+  // fixtures above, so the Node CPU F2 reference matches exactly).
+  var YAW2 = YAW + 6;
+  var YAW2_RAD = (YAW2 * Math.PI) / 180;
+  var FX2 = Math.cos(YAW2_RAD), FY2 = Math.sin(YAW2_RAD);
+  var RX2 = -FY2, RY2 = FX2;
+  var E_SOLDIER2 = { model: 0, origin: f32([OX + FX2 * 48, OY + FY2 * 48, OZ - 30]), angles: f32([0, YAW2 + 180, 0]), frame: 4, skin: 0 };
+  var E_SPRITE2 = { model: 2, origin: f32([OX + FX2 * 48, OY + FY2 * 48, OZ + 18]), angles: f32([0, 0, 0]), frame: 0, skin: 0 };
+  var E_BEAM2 = { model: 1, origin: f32([OX + FX2 * 40 + RX2 * 25, OY + FY2 * 40 + RY2 * 25, OZ - 10]), angles: f32([0, YAW2 + 90, 0]), frame: 96, skin: 231 };
+  var E_GUN2 = { model: 3, origin: f32([OX, OY, OZ]), angles: f32([0, YAW2, 0]), frame: 4, skin: 1, depthHack: true };
+  var ENT_F2 = [E_SOLDIER2, E_SPRITE2, E_BEAM2, E_GUN2];
+  var LIGHTS_F2 = [
+    { origin: f32([OX + FX2 * 48, OY + FY2 * 48, OZ - 20]), intensity: 250, color: f32([1, 0.55, 0.15]) },
+    { origin: f32([OX + FX2 * 90, OY + FY2 * 90, OZ - 10]), intensity: 350, color: f32([1, 0.9, 0.7]) },
+  ];
+  function sparkParticles2() {
+    var cx = OX + FX2 * 48, cy = OY + FY2 * 48, cz = OZ - 20;
+    var out = [];
+    for (var i = 0; i < SPARK_COLORS.length; i++) {
+      out.push({
+        origin: f32([cx + ((i * 37) % 17) - 8, cy + ((i * 53) % 17) - 8, cz + 10 + ((i * 29) % 25)]),
+        color: SPARK_COLORS[i],
+      });
+    }
+    return out;
+  }
+  var worldF2 = Object.assign({}, world, { particles: sparkParticles2() });
+  var F2_VIEW = {
+    origin: f32([OX, OY, OZ]),
+    angles: f32([0, YAW2, 0]),
+    fovX: 90,
+    time: 1.5,
+    lightStyles: VIEW.lightStyles,
+  };
+  var rrF2 = makeRenderer(counted.gl, worldF2, palette, soldierMd2, gunMd2, soldierSkin, gunSkin, ENT_F2, F2_VIEW);
+  // FOLLOW-5 negative control: identical F1 scene/camera with the REQUIRED
+  // gun skin withheld (white fallback + missing-skin warning expected).
+  var rrNoGunSkin = makeRenderer(counted.gl, worldF1, palette, soldierMd2, gunMd2, soldierSkin, gunSkin, ENT_F1, undefined, 1);
+  // FOLLOW-5 mid/F2/negative-control captures (before proof.stats, which
+  // consumes capMid*/capF2; cvar toggles are self-contained and the later
+  // pin block re-pins every vd_* absolutely, so ordering is neutral).
+  // Mid-distance dither pair (same MID camera both sides): two throwaway
+  // renders first (SwiftShader first-submit settle, TURN precedent).
+  for (var wqm = 0; wqm < 2; wqm++) {
+    rrMid.renderer.setEntities(ENT_F1, KINDS);
+    rrMid.renderer.renderFrame({ view: MID_VIEW, scene: rrMid.scene, time: 1.5, lights: LIGHTS_F1 });
+  }
+  var capMidViewOn = renderCapture(rawGL, rrMid, counted.draws, ENT_F1, LIGHTS_F1, MID_VIEW);
+  var mipFlagMidOn = resolveAppearanceFrame().mipDither;
+  setCVar('vd_mipdither', 0);
+  var capMidViewOff = renderCapture(rawGL, rrMid, counted.draws, ENT_F1, LIGHTS_F1, MID_VIEW);
+  var mipFlagMidOff = resolveAppearanceFrame().mipDither;
+  setCVar('vd_mipdither', 1);
+  // F2 + negative-control warmup (same settle rule as the TURN precedent).
+  for (var wqf = 0; wqf < 2; wqf++) {
+    rrF2.renderer.setEntities(ENT_F2, KINDS);
+    rrF2.renderer.renderFrame({ view: F2_VIEW, scene: rrF2.scene, time: 1.5, lights: LIGHTS_F2 });
+    rrNoGunSkin.renderer.setEntities(ENT_F1, KINDS);
+    rrNoGunSkin.renderer.renderFrame({ view: VIEW, scene: rrNoGunSkin.scene, time: 1.5, lights: LIGHTS_F1 });
+  }
+  var capF2 = renderCapture(rawGL, rrF2, counted.draws, ENT_F2, LIGHTS_F2, F2_VIEW);
+  var capNoGunSkin = renderCapture(rawGL, rrNoGunSkin, counted.draws, ENT_F1, LIGHTS_F1);
   var covTurn = coverageOf(capTurn.px);
 
   var covF0 = coverageOf(capF0.px);
@@ -438,6 +522,13 @@ async function main() {
     turnVsF0: summarize(diffStats(capTurn.px, capF0.px)),
     reselectVsFresh: summarize(diffStats(capReselect.px, capTurn.px)),
     uploadsReselect: { before: uploadsBeforeReselect, after: uploadsAfterReselect },
+    // FOLLOW-5: F2 moving-combat capture (proof-route yaw +6deg, own
+    // selection). Matched CPU F0/F2 captures ride in the PROOF-4 leg.
+    // (capF1 here: the pinned capF1P is rendered later; the two are
+    // byte-identical by the f1PinnedVsF1 pin, so this ordering is exact.)
+    coverageF2: coverageOf(capF2.px),
+    drawsF2: capF2.draws,
+    f2vsF1: summarize(diffStats(capF2.px, capF1.px)),
     // >24-centroids (GL coords, y=0 bottom) pin each class on screen.
     centroidGun: centroidOf(capF1.px, capNoGun.px, 24),
     centroidBeam: centroidOf(capF1.px, capNoBeam.px, 24),
@@ -741,6 +832,15 @@ async function main() {
   var capF1P = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
   window.__q2capF1 = capF1P.px;
   window.__q2capSlice = function (a, b) { return Array.prototype.slice.call(window.__q2capF1.subarray(a, b)); };
+  // FOLLOW-5 matched F0/F2 GPU captures for the Node-side report-only
+  // comparison (same scene/time/cvars rule as F1). Slice helper mirrors
+  // __q2capSlice so the PROOF-4 leg fetches them through the same path.
+  window.__q2capF0 = capF0.px;
+  window.__q2capF2 = capF2.px;
+  window.__q2capSliceN = function (which, a, b) {
+    var src = which === 2 ? window.__q2capF2 : window.__q2capF0;
+    return Array.prototype.slice.call(src.subarray(a, b));
+  };
   // FOLLOW-2B dither-liveness probe (near camera, F1 scene): the dither
   // toggle must perturb mid-distance textured content if the uMipDither
   // path is alive. A zero here means globally dead dither (regression);
@@ -793,6 +893,10 @@ async function main() {
     farView: brightStats(capFarViewOn.px),
     farViewVsNear: summarize(diffStats(capFarViewOn.px, capF1P.px)),
     farViewMipOnOff: summarize(diffStats(capFarViewOn.px, capFarViewOff.px)),
+    midView: brightStats(capMidViewOn.px),
+    midViewVsNear: summarize(diffStats(capMidViewOn.px, capF1P.px)),
+    midViewMipOnOff: summarize(diffStats(capMidViewOn.px, capMidViewOff.px)),
+    mipFlagsMid: [mipFlagMidOn, mipFlagMidOff],
     f1MipOnOff: summarize(diffStats(capF1P.px, capF1DitherOff.px)),
     mipFlags: [mipFlagOn, mipFlagOff],
     mipFlagF1Off: mipFlagF1Off,
@@ -810,6 +914,15 @@ async function main() {
     glErrorAfterCaptures: rawGL.getError(),
   };
   log('follow2b: ' + JSON.stringify(proof.follow2b));
+  // FOLLOW-5 negative control: the gun skin is a REQUIRED asset. Withheld
+  // here, the viewmodel must render on the white fallback (production
+  // warns) and differ from the pinned F1 exactly where the gun is.
+  proof.negControl = {
+    noGunSkinVsF1: summarize(diffStats(capNoGunSkin.px, capF1P.px)),
+    warnings: rrNoGunSkin.renderer.testWarnings().slice(0, 20),
+    uploads: rrNoGunSkin.renderer.testUploadStats(),
+  };
+  log('negControl: ' + JSON.stringify(proof.negControl));
   rrF1.renderer.setFogOverride(1, [0.4, 0.5, 0.6]);
   var capFog = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
   rrF1.renderer.setFogOverride(null);
@@ -818,8 +931,13 @@ async function main() {
   var capPinnedNoDepth = renderCapture(rawGL, rrNoDepth, noDepth.draws, ENT_F1, LIGHTS_F1);
   proof.appearance.fogVsOff = summarize(diffStats(capFog.px, capFogOff.px));
   proof.appearance.fogOffIdentity = summarize(diffStats(capFogOff.px, capF1P.px));
-  proof.appearance.farVsNear = summarize(diffStats(capFarOn.px, capF1P.px));
-  proof.appearance.mipOnOff = summarize(diffStats(capFarOn.px, capFarOff.px));
+  // FOLLOW-5 repair (bench-lane §2 exact patch): the shipped far gate is
+  // fed by the FAR_VIEW capture (not the near-camera far pair), and the
+  // shipped mip gate by the MID_VIEW on/off pair (same minifying camera
+  // both sides — the near pair converges to 0 by construction and the far
+  // pair sat at 0/0 in every run to date).
+  proof.appearance.farVsNear = summarize(diffStats(capFarViewOn.px, capF1P.px));
+  proof.appearance.mipOnOff = summarize(diffStats(capMidViewOn.px, capMidViewOff.px));
   proof.appearance.f1PinnedVsF1 = summarize(diffStats(capF1P.px, capF1.px));
   proof.appearance.pinnedBeam = summarize(diffStats(capF1P.px, capPinnedNoBeam.px));
   proof.appearance.pinnedDepth = summarize(diffStats(capF1P.px, capPinnedNoDepth.px));

@@ -321,17 +321,6 @@ Expensive browser tests and benchmarks run sequentially. Intermediate targeted
 passes are not full-suite acceptance. Archive completed cards with evidence;
 commit validated implementation increments with changesets, no push.
 
-### GPU-FOLLOW-5 — Refresh final fidelity evidence
-owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`
-depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-3B, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
-status: ready
-done-when:
-- [ ] Reproduce current full-suite failures, including reported foreground-recovery pool and PROOF-3 CDP timeouts under load: reproduce and isolate resource/process contention, run expensive browser tests with controlled concurrency, and retain bounded useful timeouts. Do not skip the gate or merely inflate timeouts without evidence.
-- [ ] Capture matched F0/F1/F2 CPU/GPU scene/time/cvars on the repaired renderer; report new full-frame and region/material metrics. Repair the degenerate PROOF-4 far/mip fixture so it actually exercises its intended content. Keep historical pre-repair failures labelled historical.
-- [ ] Strengthen lifecycle image evidence with matched deterministic before/after scene crops or independent world/model/skin expectations and negative controls removing a required asset. Existing nonblack, gun-region brightness and distinct-color counts can pass with missing textures; do not label them semantic proof.
-- [ ] Investigate remaining unexplained UV/lighting/depth/transparency differences and add meaningful regression fixtures. Include repaired sky/water. Do not loosen assertions or replace goldens to conceal defects.
-- [ ] Meet the existing fidelity contract, or present concrete side-by-sides and a precise proposed contract for user approval. Record automated and user verdicts separately; no implicit approval of threshold changes.
-
 ### GPU-FOLLOW-6 — Verify complete gameplay on a visible display
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
 depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-3B, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8

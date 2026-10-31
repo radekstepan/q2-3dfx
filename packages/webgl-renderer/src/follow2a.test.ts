@@ -249,6 +249,41 @@ describe('FOLLOW-2A asset registration replay (stub GL, hermetic)', () => {
     void state;
   });
 
+  it('withheld skin draws the white fallback (same draw count, handle warning)', () => {
+    // FOLLOW-5 negative-control mechanism pin: a REQUIRED skin that was
+    // never registered must NOT skip the entity — the draw proceeds on the
+    // white fallback with a handle-context warning. The browser
+    // gun-skin-withheld capture depends on exactly this behavior.
+    const entities: Entity[] = [
+      { model: 0, origin: new Float32Array([50, 0, -10]), angles: new Float32Array([0, 0, 0]), frame: 0, skin: 7 },
+    ];
+    const kinds = new Map<number, GpuEntityModelKind>([[0, 'md2']]);
+    function drive(registerSkin: boolean): { draws: number; warnings: string[] } {
+      const state = stubGLFull();
+      const r = new WebGLRenderer();
+      r.init(state.gl, W, H);
+      r.attachWorld(fixtureWorld());
+      r.setPalette(rampPalette());
+      r.registerModelData(0, 'md2', createBoxMesh());
+      if (registerSkin) {
+        r.registerSkinPixels(7, new Uint8Array(8 * 8).fill(11), 8, 8);
+      }
+      const scene = selectGpuScene(fixtureWorld(), entities, fixtureView(), W, H, kinds);
+      r.setScene(scene);
+      r.setEntities(entities, kinds);
+      r.renderFrame({ view: fixtureView(), scene, time: 0 });
+      return { draws: drawCount(state), warnings: r.testWarnings() };
+    }
+    const withSkin = drive(true);
+    const withoutSkin = drive(false);
+    expect(withSkin.warnings.some((w) => w.includes('skin 7'))).toBe(false);
+    // Same draw count: the missing-skin entity is drawn (fallback), never
+    // skipped like a missing mesh.
+    expect(withoutSkin.draws).toBe(withSkin.draws);
+    expect(withoutSkin.draws).toBeGreaterThan(0);
+    expect(withoutSkin.warnings.some((w) => w.includes('skin 7 missing (white fallback)'))).toBe(true);
+  });
+
   it('invalid handles/kinds are ignored with context, never crash', () => {
     const state = stubGLFull();
     const r = new WebGLRenderer();

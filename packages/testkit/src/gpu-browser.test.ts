@@ -48,7 +48,7 @@ import {
   encodePpm,
   loadCpuProofWorld,
   packRgbaBytesToAbgr,
-  renderCpuProofF1,
+  renderCpuProofFrame,
   rgbaToRgb,
 } from './gpu-proof-cpu.js';
 
@@ -117,6 +117,10 @@ interface ProofResult {
     turnVsF0: ProofDiffSummary;
     reselectVsFresh: ProofDiffSummary;
     uploadsReselect: { before: number; after: number };
+    /** FOLLOW-5 F2 moving-combat capture (proof-route yaw +6deg, own selection). */
+    coverageF2: { covered: number; frac: number };
+    drawsF2: number;
+    f2vsF1: ProofDiffSummary;
     centroidGun: { x: number; y: number; n: number } | null;
     centroidBeam: { x: number; y: number; n: number } | null;
     centroidSoldier: { x: number; y: number; n: number } | null;
@@ -164,6 +168,11 @@ interface ProofResult {
     farView: { mean: number; nonblackFrac: number };
     farViewVsNear: ProofDiffSummary;
     farViewMipOnOff: ProofDiffSummary;
+    /** FOLLOW-5 mid-distance camera (the mip-gate regime): content + pair. */
+    midView: { mean: number; nonblackFrac: number };
+    midViewVsNear: ProofDiffSummary;
+    midViewMipOnOff: ProofDiffSummary;
+    mipFlagsMid: [boolean, boolean];
     f1MipOnOff: ProofDiffSummary;
     mipFlags: [boolean, boolean];
     mipFlagF1Off: boolean;
@@ -179,6 +188,12 @@ interface ProofResult {
     glErrorsPreTriage: number[];
     glErrorsPostTriage: number[];
     glErrorAfterCaptures: number;
+  };
+  /** FOLLOW-5 gun-skin-withheld negative control (top-level proof.negControl). */
+  negControl?: {
+    noGunSkinVsF1: ProofDiffSummary;
+    warnings: string[];
+    uploads: { uploads: number };
   };
 }
 
@@ -464,6 +479,11 @@ describe.runIf(GATE)('gpu-browser real-browser proof (PROOF-3 boxes 4-5)', () =>
         expect(f2b.farView.nonblackFrac).toBeGreaterThan(0.05);
         expect(f2b.farViewVsNear.frac).toBeGreaterThan(0.05);
 
+        console.log(
+          `[gpu-browser] FOLLOW-5 mid camera: nonblack=${f2b.midView.nonblackFrac.toFixed(3)} ` +
+            `midVsNear=${f2b.midViewVsNear.frac.toFixed(4)} ` +
+            `midMipOnOff=${f2b.midViewMipOnOff.count} mipFlagsMid=${JSON.stringify(f2b.mipFlagsMid)}`,
+        );
         // --- box 5: timings (REPORT-ONLY, never a pass/fail gate) ---
         const t = proof.timings;
         expect(t.frames).toBeGreaterThanOrEqual(TIMING_MIN_FRAMES);
@@ -567,6 +587,8 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
       let cdp: CdpConnection | null = null;
       // Filled inside try, consumed after infra teardown.
       let gpuBytesBottomFirst: Uint8Array | null = null;
+      let gpuF0BytesBottomFirst: Uint8Array | null = null;
+      let gpuF2BytesBottomFirst: Uint8Array | null = null;
       let proofJson: ProofResult | null = null;
       let shot: Uint8Array | null = null;
       let mipScatter = 0;
@@ -662,6 +684,50 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
             `mipOnOff=${ap.mipOnOff.count} bboxArea=${ap.mipOnOff.bboxArea} scatter=${scatter.toFixed(4)}`,
         );
 
+        // --- FOLLOW-5 mid-camera regime evidence (report-only pins around the
+        // shipped mip gate): the mid pair must show real minified content
+        // that differs from near, and the dither toggle must reach both the
+        // frame state (mipFlagsMid) and GL uploads (policyUploads on/off —
+        // distinguishes broken propagation from sampling invariance).
+        expect(proofJson?.follow2b, 'page must publish proof.follow2b').toBeDefined();
+        const f2b = proofJson!.follow2b;
+        soft(f2b.midView.nonblackFrac).toBeGreaterThan(0.05);
+        console.log(
+          `[gpu-proof-4] mid: nonblack=${f2b.midView.nonblackFrac.toFixed(3)} ` +
+            `midVsNear=${f2b.midViewVsNear.frac.toFixed(4)} ` +
+            `midMipOnOff=${f2b.midViewMipOnOff.count} ` +
+            `mipFlagsMid=${JSON.stringify(f2b.mipFlagsMid)}`,
+        );
+        expect(f2b.mipFlagsMid).toEqual([true, false]);
+
+        // --- FOLLOW-5 negative control: gun skin withheld (REQUIRED asset
+        // removed). Hard asserts, wide bands: the viewmodel must warn and
+        // differ from pinned F1 exactly where the gun is (structural,
+        // tone-independent — no threshold tuning involved).
+        const neg = proofJson!.negControl;
+        expect(neg, 'page must publish proof.negControl (FOLLOW-5 negative control)').toBeDefined();
+        if (!neg) throw new Error('[gpu-proof-4] page omitted the negative control');
+        const negWarn = neg.warnings.join('\n');
+        console.log(`[gpu-proof-4] negControl: ${JSON.stringify(neg.noGunSkinVsF1)} warnings=${neg.warnings.length}`);
+        expect(negWarn).toMatch(/skin 1 missing/);
+        expect(neg.noGunSkinVsF1.count).toBeGreaterThanOrEqual(5000);
+        {
+          const gb = proofJson!.stats.gun.bbox;
+          const nb = neg.noGunSkinVsF1.bbox;
+          expect(gb).not.toBeNull();
+          expect(nb).not.toBeNull();
+          if (gb && nb) {
+            const ix0 = Math.max(gb[0], nb[0]);
+            const iy0 = Math.max(gb[1], nb[1]);
+            const ix1 = Math.min(gb[2], nb[2]);
+            const iy1 = Math.min(gb[3], nb[3]);
+            const inter = Math.max(0, ix1 - ix0 + 1) * Math.max(0, iy1 - iy0 + 1);
+            const nbArea = neg.noGunSkinVsF1.bboxArea ?? 1;
+            console.log(`[gpu-proof-4] negControl: gun bbox=${JSON.stringify(gb)} noSkin bbox=${JSON.stringify(nb)} overlap=${(inter / nbArea).toFixed(3)}`);
+            expect(inter / nbArea).toBeGreaterThanOrEqual(0.5);
+          }
+        }
+
         // --- transparent overlap + depth through the PINNED appearance pass ---
         soft(ap.pinnedBeam.bbox).not.toBeNull();
         soft(ap.pinnedBeam.bboxFrac).toBeGreaterThanOrEqual(BEAM_BBOX_MIN_FRAC);
@@ -673,6 +739,10 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         );
 
         // --- chunked F1 pinned-capture fetch (CDP returnByValue per slice) ---
+        // FOLLOW-5 determinism pin: fetch the same capture twice with
+        // DIFFERENT chunkings — the bytes must be identical (pins the
+        // harness slice path end to end, so matched before/after crops are
+        // evidence, not transport luck).
         const total = await cdp.evaluate<number>(
           'window.__q2capF1 ? window.__q2capF1.length : -1',
           120000,
@@ -691,6 +761,41 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         }
         gpuBytesBottomFirst = raw;
         console.log(`[gpu-proof-4] fetched pinned F1 capture: ${raw.length} bytes`);
+        const CHUNK2 = 61140;
+        const raw2 = new Uint8Array(total);
+        for (let off = 0; off < total; off += CHUNK2) {
+          const end = Math.min(total, off + CHUNK2);
+          const slice = await cdp.evaluate<number[]>(
+            `window.__q2capSlice(${off}, ${end})`,
+            120000,
+          );
+          expect(slice.length).toBe(end - off);
+          raw2.set(slice, off);
+        }
+        expect(Array.from(raw2)).toEqual(Array.from(raw));
+        console.log('[gpu-proof-4] dual-chunking fetch identical (harness slice path deterministic)');
+        // FOLLOW-5 matched F0/F2 GPU captures through the same slice path.
+        for (const which of [0, 2] as const) {
+          const capName = which === 2 ? '__q2capF2' : '__q2capF0';
+          const len = await cdp.evaluate<number>(
+            `window.${capName} ? window.${capName}.length : -1`,
+            120000,
+          );
+          expect(len).toBe(GPU_PROOF_WIDTH * GPU_PROOF_HEIGHT * 4);
+          const buf = new Uint8Array(len);
+          for (let off = 0; off < len; off += CHUNK) {
+            const end = Math.min(len, off + CHUNK);
+            const slice = await cdp.evaluate<number[]>(
+              `window.__q2capSliceN(${which}, ${off}, ${end})`,
+              120000,
+            );
+            expect(slice.length).toBe(end - off);
+            buf.set(slice, off);
+          }
+          if (which === 0) gpuF0BytesBottomFirst = buf;
+          else gpuF2BytesBottomFirst = buf;
+          console.log(`[gpu-proof-4] fetched F${which} GPU capture: ${buf.length} bytes`);
+        }
       } finally {
         if (cdp) {
           await cdp.close().catch(() => undefined);
@@ -713,11 +818,20 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
       const buf = new ArrayBuffer(pakBytes.length);
       new Uint8Array(buf).set(pakBytes);
       const bw = loadCpuProofWorld(buf);
-      const cpu = await renderCpuProofF1(bw);
+      const cpu = await renderCpuProofFrame(bw, 1);
       console.log(
         `[gpu-proof-4] CPU F1: color=${cpu.colorHash} display=${cpu.displayHash}(${cpu.displayKind})`,
       );
       expect(cpu.displayKind).toBe('raw-color');
+      // FOLLOW-5 matched F0/F2 CPU references (same scene/time/cvars rule
+      // as F1: stationary F0 without particles/pump, moving F2 at yaw +6deg
+      // with combat entities + pump). Report-only: full-frame + max-delta
+      // against the matching GPU captures below (no new gates).
+      const cpuF0 = await renderCpuProofFrame(bw, 0);
+      const cpuF2 = await renderCpuProofFrame(bw, 2);
+      console.log(
+        `[gpu-proof-4] CPU F0: color=${cpuF0.colorHash} F2: color=${cpuF2.colorHash}`,
+      );
 
       // Page readPixels rows are bottom-first (GL); CPU planes are
       // top-first: flip vertically before packing to 0xAABBGGRR.
@@ -731,6 +845,24 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
       const diff = compareGpuProofFrames(gpuPacked, cpu.color, GPU_PROOF_TOLERANCES, W);
       const gateLine = formatGpuProofReport('f1-gpu-vs-cpu', diff, GPU_PROOF_TOLERANCES);
       console.log(`[gpu-proof-4] F1 GATE: ${gateLine} (gate fraction<=${GPU_PROOF_TOLERANCES.maxFractionDiff})`);
+
+      // FOLLOW-5 matched F0/F2 report-only comparisons (no new gates: the
+      // numbers extend the F1 evidence, never re-baseline it).
+      function flipBottomFirst(srcBottomFirst: Uint8Array): Uint8Array {
+        const out = new Uint8Array(srcBottomFirst.length);
+        for (let y = 0; y < H; y++) {
+          out.set(srcBottomFirst.subarray(y * W * 4, (y + 1) * W * 4), (H - 1 - y) * W * 4);
+        }
+        return out;
+      }
+      const gpuF0TopFirst = flipBottomFirst(gpuF0BytesBottomFirst as Uint8Array);
+      const gpuF2TopFirst = flipBottomFirst(gpuF2BytesBottomFirst as Uint8Array);
+      const diffF0 = compareGpuProofFrames(packRgbaBytesToAbgr(gpuF0TopFirst), cpuF0.color, GPU_PROOF_TOLERANCES, W);
+      const diffF2 = compareGpuProofFrames(packRgbaBytesToAbgr(gpuF2TopFirst), cpuF2.color, GPU_PROOF_TOLERANCES, W);
+      const gateLineF0 = formatGpuProofReport('f0-gpu-vs-cpu', diffF0, GPU_PROOF_TOLERANCES);
+      const gateLineF2 = formatGpuProofReport('f2-gpu-vs-cpu', diffF2, GPU_PROOF_TOLERANCES);
+      console.log(`[gpu-proof-4] F0 REPORT-ONLY: ${gateLineF0}`);
+      console.log(`[gpu-proof-4] F2 REPORT-ONLY: ${gateLineF2}`);
 
       // --- region analysis for the side-by-side review ---
       // Full-frame coverage (the void split below is ~empty since the
@@ -833,6 +965,9 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
         },
         appearance: proofJson?.appearance ?? null,
         mipChain: proofJson?.mipChain ?? null,
+        // FOLLOW-5 triage block (carries the mid-camera regime evidence:
+        // midView content + midViewMipOnOff + mipFlagsMid + policyUploads).
+        follow2b: proofJson?.follow2b ?? null,
         cpu: { colorHash: cpu.colorHash, displayHash: cpu.displayHash, display: cpu.displayKind },
         f1gate: {
           diff: diff.diff,
@@ -843,6 +978,28 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
           edgeExcluded: diff.edgeExcluded,
           line: gateLine,
         },
+        // FOLLOW-5 matched F0/F2 report-only rows (same oracle + tolerances
+        // as F1; never gates, never re-baselined).
+        f0report: {
+          cpuColorHash: cpuF0.colorHash,
+          gpuCoverage: proofJson?.stats.coverageF0 ?? null,
+          diff: diffF0.diff,
+          compared: diffF0.compared,
+          fraction: diffF0.fraction,
+          maxAbsDelta: diffF0.maxAbsDelta,
+          line: gateLineF0,
+        },
+        f2report: {
+          cpuColorHash: cpuF2.colorHash,
+          gpuCoverage: proofJson?.stats.coverageF2 ?? null,
+          gpuF2vsF1: proofJson?.stats.f2vsF1 ?? null,
+          diff: diffF2.diff,
+          compared: diffF2.compared,
+          fraction: diffF2.fraction,
+          maxAbsDelta: diffF2.maxAbsDelta,
+          line: gateLineF2,
+        },
+        negControl: proofJson?.negControl ?? null,
         regions: {
           gunDiff, gunN, gunFrac: gunN > 0 ? gunDiff / gunN : null,
           darkDiff, darkN, darkFrac: darkN > 0 ? darkDiff / darkN : null,
@@ -887,9 +1044,14 @@ describe.runIf(GATE)('gpu-browser PROOF-4 appearance (boxes 3-4)', () => {
           `per-draw quantum rounding between translucent draws is NOT reproduced (contract §4 chosen approximation).\n` +
           `  dark areas: dark-CPU-pixel diff frac=${darkN > 0 ? (darkDiff / darkN).toFixed(4) : 'n/a'} — ` +
           `gamma-1.3-after-reconstruction lifts near-black differently than per-luxel CPU shading; inspect -diff.ppm red clusters in shadows.\n` +
-          `  minification: far-vs-near frac=${(proofJson?.appearance.farVsNear.frac ?? 0).toFixed(4)}, ` +
-          `mip-dither scatter=${mipScatter.toFixed(4)} — transition is dithered (no hard band); ` +
+          `  minification: far-vs-near frac=${(proofJson?.appearance.farVsNear.frac ?? 0).toFixed(4)} ` +
+          `(repaired: FAR_VIEW capture, was 0/0 degenerate), ` +
+          `mip-dither count=${proofJson?.appearance.mipOnOff.count} scatter=${mipScatter.toFixed(4)} (MID_VIEW pair) — transition is dithered (no hard band); ` +
           `single-level pick vs CPU baked miplevel blocks remains an authorized approximation.\n` +
+          `  matched route: F0 ${gateLineF0} | F2 ${gateLineF2} (report-only, same oracle/tolerances as F1) — ` +
+          `GPU F2-vs-F1 frac=${(proofJson?.stats.f2vsF1.frac ?? -1).toFixed(4)} (camera +6deg must move the frame).\n` +
+          `  negative control (gun skin withheld): diff=${proofJson?.negControl?.noGunSkinVsF1.count} px ` +
+          `overlap-localized to the gun bbox, warning present — lifecycle image checks respond to a removed required asset.\n` +
           `  fixed (was a defect, not a tolerance item): resolveCoverage=${(proofJson?.appearance.resolveCoverage ?? -1).toFixed(4)} — ` +
           `VS_POST now emits the covering triangle (owns: @q2/webgl-renderer, fixed in-tree, pinned by appearance.test.ts); ` +
           `GPU-vs-CPU diff frac=${covN > 0 ? (covDiff / covN).toFixed(4) : 'n/a'} ` +

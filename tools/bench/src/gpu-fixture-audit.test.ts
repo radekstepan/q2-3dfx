@@ -40,6 +40,17 @@ const REPAIRED_SNIPPET = `
   proof.appearance.mipOnOff = summarize(diffStats(capFarViewOn.px, capFarViewOff.px));
 `;
 
+// FOLLOW-5 testkit-lane wiring: the shipped mip gate rides the MID_VIEW
+// on/off pair (same minifying camera both sides). The rule is camera-name
+// generic — any single non-default camera on both sides is exercising.
+const MID_REPAIRED_SNIPPET = `
+  var capMidViewOn = renderCapture(rawGL, rrMid, counted.draws, ENT_F1, LIGHTS_F1, MID_VIEW);
+  var capMidViewOff = renderCapture(rawGL, rrMid, counted.draws, ENT_F1, LIGHTS_F1, MID_VIEW);
+  var capF1P = renderCapture(rawGL, rrF1, counted.draws, ENT_F1, LIGHTS_F1);
+  proof.appearance.farVsNear = summarize(diffStats(capMidViewOn.px, capF1P.px));
+  proof.appearance.mipOnOff = summarize(diffStats(capMidViewOn.px, capMidViewOff.px));
+`;
+
 describe('proof-4 far/mip fixture wiring audit (FOLLOW-5 bench lane)', () => {
   it('flags the same-camera shipped wiring as DEGENERATE-HISTORICAL', () => {
     const audit = auditProofFixtureWiring(DEGENERATE_SNIPPET);
@@ -56,6 +67,16 @@ describe('proof-4 far/mip fixture wiring audit (FOLLOW-5 bench lane)', () => {
     for (const g of audit.gates) expect(g.degenerate).toBe(false);
     expect(audit.correctPairPresent).toBe(true);
     expect(audit.verdict).toBe('EXERCISING');
+  });
+
+  it('recognises a mid-camera shipped pair as EXERCISING (camera-name generic)', () => {
+    const audit = auditProofFixtureWiring(MID_REPAIRED_SNIPPET);
+    expect(audit.gates).toHaveLength(2);
+    for (const g of audit.gates) expect(g.degenerate).toBe(false);
+    // The correct-pair probe stays FAR_VIEW-specific (historical anchor);
+    // the verdict here is UNKNOWN without that pair — never guessed.
+    expect(audit.correctPairPresent).toBe(false);
+    expect(audit.verdict).toBe('UNKNOWN');
   });
 
   it('returns UNKNOWN (never a guessed verdict) on unparseable source', () => {
