@@ -1044,17 +1044,17 @@ describe.runIf(!!WEB_Q2_PAK)('release-9 render consumption (Q2_PAK)', () => {
     expect(driver.lightStyleScale(201)).toBe(1);
   });
 
-  it('trigger message centerprints surface on the status line as status', { timeout: 60000 }, async () => {
+  it('trigger message centerprints surface on the centered channel, not the status line', { timeout: 60000 }, async () => {
     const boot = await bootBase1();
     const { driver } = boot;
     const trig = spawnEdict({ classname: 'trigger_once', message: 'R9F-6 probe line' });
     driver.server.entities.push(trig);
     stepDriver(driver, neutralCmd(), 5);
-    expect(driver.message).not.toBe('R9F-6 probe line');
+    expect(driver.centerText).not.toBe('R9F-6 probe line');
     fireTargets(driver.server, trig);
     stepDriver(driver, neutralCmd(), 3);
-    expect(driver.message).toBe('R9F-6 probe line');
-    expect(driver.messageKind).toBe('status');
+    expect(driver.centerText).toBe('R9F-6 probe line');
+    expect(driver.message).not.toBe('R9F-6 probe line');
     expect(driver.heardSounds).toContain('misc/talk1.wav');
   });
 });

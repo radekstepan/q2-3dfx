@@ -278,9 +278,9 @@ Sky fixes remain preserved. FOLLOW-5 tone/structural acceptance is recorded in
 `9d99612`/`c3396ab`; it does not close current gameplay/UI defects. GPU remains
 experimental pending FOLLOW-6/7. No runtime tests were rerun in this review.
 
-Priority: RELEASE-11 (message regression) → RELEASE-4 (boarding) → RELEASE-12
+Priority: RELEASE-4 (boarding) → RELEASE-12
 (movement) → RELEASE-6 (help) → RELEASE-13 (dying collision/patrols) →
-RELEASE-10/14/15. Independent bounded fixes can proceed without waiting for
+RELEASE-10/14/15 (RELEASE-11 message repair landed this session). Independent bounded fixes can proceed without waiting for
 the elevator investigation; do not leave the rest untouched after one diagnostic.
 Use disjoint ownership for independent work. Claim one card, run expensive tests
 sequentially, and keep implementation/test/user verdicts separate. Real-map
@@ -324,13 +324,13 @@ done-when:
 ### RELEASE-11 — Fix message flicker, centered hints and status toggle
 owns: `apps/web`, `packages/client`, `packages/config`, `packages/server`
 depends: none
-status: ready (reopened)
+status: done (repaired 2026-10-31; see docs/tasks-archive.md RELEASE-11 repair entry)
 review-findings: successful firing calls `setMessage('', 'status')`, clearing the shared string; `setMessage` has no duration/deadline. Continued shooting can therefore erase “soldier minced” almost immediately. This is a concrete clearing path, not a browser reproduction. `cl_showmessages` already exists, is persisted and gates status text. The driver drains server centerprints into `setMessage(..., 'status')`, sharing the cosmetic one-line channel; this loses original centered presentation and lets the status toggle hide hints/secrets.
 done-when:
-- [ ] Give transient status messages an explicit readable lifetime and deterministic expiry. Successful shots and unrelated empty updates must not erase a fresh kill/status message. Verify duration under held fire, automatic weapons, varying FPS and successive events, with screenshots/time samples; preserve deliberate death/respawn/finish transitions.
-- [ ] Make the existing gameplay-status toggle easy to find and verify it hides/shows messages such as “soldier minced” immediately, across both renderers and reloads. Diagnose why the user still requests it; do not add a duplicate cvar.
-- [ ] Give trigger/ladder/secret messages their own centerprint presentation with white game-font text, source-matched centering, multiline handling and lifetime. Verify original source/message assets and real trigger routes. Keep these messages distinct from cosmetic kill/status text, F1 and completion; explicitly test toggle behavior for each channel.
-- [ ] Add rendered regressions for “crouch here,” ladder hint, secret discovery, kill status on/off, message expiry and simultaneous events without overwriting essential completion/errors.
+- [x] Give transient status messages an explicit readable lifetime and deterministic expiry. Successful shots and unrelated empty updates must not erase a fresh kill/status message. Verify duration under held fire, automatic weapons, varying FPS and successive events, with screenshots/time samples; preserve deliberate death/respawn/finish transitions.
+- [x] Make the existing gameplay-status toggle easy to find and verify it hides/shows messages such as “soldier minced” immediately, across both renderers and reloads. Diagnose why the user still requests it; do not add a duplicate cvar.
+- [x] Give trigger/ladder/secret messages their own centerprint presentation with white game-font text, source-matched centering, multiline handling and lifetime. Verify original source/message assets and real trigger routes. Keep these messages distinct from cosmetic kill/status text, F1 and completion; explicitly test toggle behavior for each channel.
+- [x] Add rendered regressions for “crouch here,” ladder hint, secret discovery, kill status on/off, message expiry and simultaneous events without overwriting essential completion/errors.
 
 ### RELEASE-10 — Tooltip-only disabled explanations; matching checkbox styling
 owns: `apps/web`

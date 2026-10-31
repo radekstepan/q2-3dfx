@@ -1020,6 +1020,15 @@ function loopChannelKey(name: string, pos: Vec3): string {
   return `${name}@${pos[0]},${pos[1]},${pos[2]}`;
 }
 
+/**
+ * RELEASE-11 message lifetimes (server-time seconds, never wall-clock):
+ * STATUS_TTL covers the cosmetic one-line status channel (kill/pickup/
+ * dry-fire); CENTER_TTL mirrors id `scr_centertime` (cl_scrn.c, 2.5s) for
+ * the centered trigger/hint channel.
+ */
+export const STATUS_TTL = 3.0;
+export const CENTER_TTL = 2.5;
+
 export class LocalDriver implements HostDriver {
   readonly source: 'devroom' | 'pak';
   readonly pm: PmoveState = makePmoveState();
@@ -1040,12 +1049,29 @@ export class LocalDriver implements HostDriver {
    * pickups, weapon swaps, dry-fire); 'alert' = the death notice. The
    * render gate hides ONLY 'status' when the cvar is 0 — death, the
    * finished screen and loading/fallback warnings always draw. Every
-   * cosmetic producer passes 'status' explicitly; `setMessage('')` clears
-   * reset to 'status', and `respawn()` resets to 'status' with the clear.
+   * cosmetic producer passes 'status' explicitly; empty writes are a NO-OP
+   * (the old fire-clear retired — shots never erase fresh kill text);
+   * non-empty writes stamp `messageAt` for the STATUS_TTL draw expiry, and
+   * `respawn()` resets to 'status' with the clear.
    * The finished-screen mirror leaves the kind as-is (that branch never
    * consults the gate — it keys off `server.finished`).
    */
   messageKind: 'status' | 'alert' = 'status';
+  /**
+   * Server-time write stamps for the two transient channels (RELEASE-11).
+   * `messageAt` tags the cosmetic status line; `centerAt` tags the centered
+   * trigger/hint channel. Both init far in the past so empty channels read
+   * expired before their first write.
+   */
+  messageAt = -10;
+  /**
+   * Centered trigger/hint text (server centerprints: `SCR_CenterPrint`
+   * semantics — last wins, white game-font, source-matched placement via
+   * `centerPrintPlacement`, CENTER_TTL lifetime). Never gated by
+   * `cl_showmessages`; never shares the cosmetic status string.
+   */
+  centerText = '';
+  centerAt = -10;
   exited = false;
   /** Finish screen already mirrored from the server (event pushed once). */
   private finishShown = false;
@@ -1418,7 +1444,10 @@ export class LocalDriver implements HostDriver {
     // text updates every tick even while cosmetic messages hide — the
     // render gate keys off `server.finished`, never `messageKind`, so the
     // kind is deliberately left as-is here.
-    if (this.server.finished) this.message = formatFinishMessage(this.server);
+    if (this.server.finished) {
+      this.message = formatFinishMessage(this.server);
+      this.messageAt = this.server.time;
+    }
     this.stepSparks(dt);
     this.checkPickups();
     this.handleAttack(cmd);
@@ -1446,13 +1475,38 @@ export class LocalDriver implements HostDriver {
    * / clears the screen for the new life). The kind tags the severity for
    * the RELEASE-11 `cl_showmessages` render gate (cosmetic 'status' hides,
    * death 'alert' never does); backward compatible — omitting it keeps the
-   * cosmetic default.
+   * cosmetic default. RELEASE-11: an empty write is a NO-OP (the old
+   * fire-clear retired — successful shots must never erase a fresh
+   * kill/status line); non-empty writes stamp `messageAt = server.time` for
+   * the STATUS_TTL draw expiry.
    */
   private setMessage(s: string, kind: 'status' | 'alert' = 'status'): void {
-    if (!this.server.finished) {
-      this.message = s;
-      this.messageKind = kind;
-    }
+    if (this.server.finished) return;
+    if (s === '') return;
+    this.message = s;
+    this.messageKind = kind;
+    this.messageAt = this.server.time;
+  }
+
+  /**
+   * Centered trigger/hint write (`SCR_CenterPrint` semantics): overwrites
+   * the string and resets the timer (last wins). Never overwrites completion
+   * (`server.finished` guard) and never touches the status channel.
+   */
+  private setCenter(text: string): void {
+    if (this.server.finished) return;
+    this.centerText = text;
+    this.centerAt = this.server.time;
+  }
+
+  /** True once the cosmetic status line has outlived STATUS_TTL. */
+  messageExpired(): boolean {
+    return this.server.time - this.messageAt > STATUS_TTL;
+  }
+
+  /** True once the centered channel has outlived CENTER_TTL. */
+  centerExpired(): boolean {
+    return this.server.time - this.centerAt > CENTER_TTL;
   }
 
   /**
@@ -1482,6 +1536,7 @@ export class LocalDriver implements HostDriver {
       // the `cl_showmessages` render gate never hides it.
       this.message = 'YOU DIED — respawning…';
       this.messageKind = 'alert';
+      this.messageAt = this.server.time;
       this.events.push('death');
       // C player_die (p_client.c): gibbed past -40hp (udeath only), else
       // the sexed *deathN (rand()%4+1) — resolved to the male lump here.
@@ -1597,11 +1652,13 @@ export class LocalDriver implements HostDriver {
     // are untouched by the sync below.
     this.syncLoopChannels();
     // Trigger/entity centerprints (R9F-6, G_UseTargets message branch):
-    // driver-readable queue → status line (kind 'status', so the RELEASE-11
-    // toggle gates these hints like other cosmetic text; death/finish never
-    // flow through here). Last line wins, like the status line it shares.
+    // the centered hint channel (`SCR_CenterPrint` semantics — last wins,
+    // CENTER_TTL lifetime, white centered text, never gated by
+    // `cl_showmessages`). Deliberately NOT the cosmetic status line:
+    // hints/secrets/ladder messages are essential and keep their centered
+    // presentation. Death/finish never flow through here.
     for (const line of SV_DrainCenterprints(this.server)) {
-      this.setMessage(line, 'status');
+      this.setCenter(line);
     }
   }
 
@@ -2441,6 +2498,7 @@ export class LocalDriver implements HostDriver {
     // (a stale death 'alert' must never leak into the next life's gating).
     this.message = '';
     this.messageKind = 'status';
+    this.messageAt = this.server.time;
     this.events.push('respawn');
     this.playerEdict.origin = v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]);
   }
@@ -2960,7 +3018,8 @@ export class LocalDriver implements HostDriver {
     }
     if (this.weapon.ammoKind) this.setAmmo(this.weapon.ammoKind, res.ammoLeft);
     this.lastShotAt = t;
-    this.setMessage('', 'status');
+    // RELEASE-11: successful fire never clears the status line (the old
+    // `setMessage('', 'status')` erased fresh kill text under held fire).
     this.events.push('shot');
     if (res.bolt) this.events.push('bolt');
     // Weapon_Generic-lite: firing starts at FIRE_FIRST (activate+1); the
@@ -5356,7 +5415,9 @@ export function toggleHelpOverlay(boot: PlayBoot): boolean {
 /** Draw crosshair + status lines onto a 0xAABBGGRR buffer (runs post-resolve).
  *
  * The play canvas shows world + crosshair + weapon/ammo + hp + message
- * (+ the devroom hint and death bars) + the in-canvas `fps N` counter
+ * (+ the devroom hint and death bars) + the centered trigger/hint channel
+ * (white, `SCR_CenterPrint` placement, CENTER_TTL, never gated) + the
+ * in-canvas `fps N` counter
  * top-right (gated by `cl_showfps`) + the in-canvas player-position readout
  * top-left (gated by `cl_showpos`, default ON) + the transient gameplay
  * status line (gated by `cl_showmessages`, default ON — cosmetic 'status'
@@ -5428,15 +5489,27 @@ export function drawPlayHud(
     for (const line of lines) {
       drawString(target, line.x, line.y, line.text, FINISH_BLUE);
     }
-  } else if (boot.driver.message) {
-    // RELEASE-11 `cl_showmessages`: skip ONLY the transient cosmetic status
-    // line (kind 'status') when the cvar is 0. Death ('alert') always draws;
-    // the finished screen above never consults this gate. Draw-only: the
-    // string, events and stats still update while hidden, and toggling
-    // applies immediately (cvar read per frame, no reboot).
-    if (messagesVisible() || boot.driver.messageKind !== 'status') {
-      const msg = boot.driver.message.slice(0, 48);
-      drawString(target, 8, target.height - 30, msg, 0xffffff00);
+  } else {
+    // RELEASE-11 centered hint channel (`SCR_CenterPrint` semantics): white
+    // game-font text at the source-matched placement, CENTER_TTL lifetime.
+    // ALWAYS draws (ignores `cl_showmessages` — hints/secrets/ladder
+    // messages are essential). Multiline supported by the placement.
+    if (boot.driver.centerText && !boot.driver.centerExpired()) {
+      const lines = centerPrintPlacement(boot.driver.centerText, target.width, target.height);
+      for (const line of lines) {
+        drawString(target, line.x, line.y, line.text, 0xffffffff);
+      }
+    }
+    if (boot.driver.message && !boot.driver.messageExpired()) {
+      // RELEASE-11 `cl_showmessages`: skip ONLY the transient cosmetic status
+      // line (kind 'status') when the cvar is 0. Death ('alert') always draws;
+      // the finished screen above never consults this gate. Draw-only: the
+      // string, events and stats still update while hidden, and toggling
+      // applies immediately (cvar read per frame, no reboot).
+      if (messagesVisible() || boot.driver.messageKind !== 'status') {
+        const msg = boot.driver.message.slice(0, 48);
+        drawString(target, 8, target.height - 30, msg, 0xffffff00);
+      }
     }
   }
   // F1 help-computer overlay (toggled by the F1 key, asset bg + layout rows).

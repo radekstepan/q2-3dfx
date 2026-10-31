@@ -57,7 +57,7 @@ const DEFAULT_CVARS: ReadonlyArray<[string, CVarValue, string]> = [
   ['r_drawworld', 1, 'draw world geometry'],
   ['cl_predict', 1, 'predict local player between 10Hz snapshots'],
   ['cl_interp', 1, 'interpolate remote entities between snapshots'],
-  ['cl_showmessages', 1, 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); death/finish/loading/fallback warnings unaffected (essential, never gated)'],
+  ['cl_showmessages', 1, 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); e.g. "soldier minced"; death/finish/loading/fallback warnings unaffected (essential, never gated)'],
   ['s_volume', 1, 'master sound volume 0..1 normalized (1 = quiet reference output gain 0.05; max output never exceeds 0.05)'],
   ['sensitivity', 3, 'mouse sensitivity'],
   ['m_yaw', 0.022, 'mouse yaw scale'],

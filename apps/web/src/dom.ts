@@ -13,7 +13,7 @@ import type { WebPak } from './pak.js';
 
 registerCVar('cl_showfps', 1, 'show in-canvas fps readout top-right (conchars glyphs)');
 registerCVar('cl_showpos', 1, 'show in-canvas player-position readout top-left (pos X Y Z)');
-registerCVar('cl_showmessages', 1, 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); death/finish/loading/fallback warnings unaffected (essential, never gated)');
+registerCVar('cl_showmessages', 1, 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); e.g. "soldier minced"; death/finish/loading/fallback warnings unaffected (essential, never gated)');
 
 /** Cvar gate for the fps readout (`cl_showfps`, default 1). */
 
@@ -330,7 +330,7 @@ function ensureHudCvars(): void {
     registerCVar('cl_showpos', 1, 'show in-canvas player-position readout top-left (pos X Y Z)');
   }
   if (getCVar('cl_showmessages') === undefined) {
-    registerCVar('cl_showmessages', 1, 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); death/finish/loading/fallback warnings unaffected (essential, never gated)');
+    registerCVar('cl_showmessages', 1, 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); e.g. "soldier minced"; death/finish/loading/fallback warnings unaffected (essential, never gated)');
   }
 }
 
@@ -487,7 +487,7 @@ export function cvarGroup(name: string): (typeof GROUP_ORDER)[number] {
 export const CVAR_DESCRIPTIONS: Readonly<Record<string, string>> = {
   cl_showfps: 'show in-canvas fps readout top-right (conchars glyphs)',
   cl_showpos: 'show in-canvas player-position readout top-left (pos X Y Z)',
-  cl_showmessages: 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); death/finish/loading/fallback warnings unaffected (essential, never gated)',
+  cl_showmessages: 'transient in-canvas gameplay status text on/off (1 = show, 0 = hide); e.g. "soldier minced"; death/finish/loading/fallback warnings unaffected (essential, never gated)',
   r_brightness: 'display-only post-resolve brightness lift 0.5..2.0',
   skill: 'difficulty 0 easy 1 medium 2 hard 3 nightmare (latched at boot)',
   map_source: 'map source: cached pak0.pak game (pak) or built-in devroom (devroom); changing it reboots the level',

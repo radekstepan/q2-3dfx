@@ -8,18 +8,21 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { UserCmdT } from '@q2/input';
 import { getCVarNumber, getCVarString, resetCVars, setCVar } from '@q2/config';
+import { centerPrintPlacement } from '@q2/client';
 import { v3 } from '@q2/math';
 import { monsterPain, spawnEdict } from '@q2/game';
-import { SV_SpawnMonster } from '@q2/server';
+import { SV_SpawnMonster, fireTargets } from '@q2/server';
 import type { ServerMonster } from '@q2/server';
 import {
   bootPlay,
+  CENTER_TTL,
   drawPlayHud,
   FINISH_BLUE,
   FPS_GREEN,
   messagesVisible,
   paintHudOverlay,
   POS_GREY,
+  STATUS_TTL,
   toggleHelpOverlay,
 } from './play.js';
 import type { LocalDriver, PlayBoot } from './play.js';
@@ -219,6 +222,161 @@ function uninstallLocalStorage(): void {
   storageMap.clear();
 }
 
+/** Fire a synthetic trigger message through the real server path (G_UseTargets message branch). */
+function fireCenter(driver: LocalDriver, text: string): void {
+  const trig = spawnEdict({ classname: 'trigger_once', message: text });
+  driver.server.entities.push(trig);
+  fireTargets(driver.server, trig);
+  stepDriver(driver, neutralCmd(), 3);
+}
+
+/** Count a color inside a horizontal row band (isolates the centered channel from HUD chrome). */
+function countColorInBand(color: Uint32Array, width: number, rgba: number, y0: number, y1: number): number {
+  let n = 0;
+  for (let y = y0; y < y1; y++) {
+    for (let x = 0; x < width; x++) {
+      if (color[y * width + x] === rgba) n++;
+    }
+  }
+  return n;
+}
+
+describe('RELEASE-11 message lifetimes + center channel (real bootPlay + ticks)', () => {
+  it('kill message survives held fire; later status restamps, fire never clears', () => {
+    const boot = bootPlay({ width: 320, height: 240 });
+    const { driver } = boot;
+    killSoldier(driver);
+    expect(driver.message).toBe('soldier down');
+    expect(driver.messageAt).toBeGreaterThan(-10);
+    const stamped = driver.messageAt;
+    // Ten successful blaster rounds aimed away from the corpse (yaw 180, so
+    // no stray bolt can re-gib the body and move the line legitimately).
+    const shotsBefore = driver.events.filter((e) => e === 'shot').length;
+    driver.step(attackCmd([0, 180, 0]), 0.1);
+    stepDriver(driver, neutralCmd(), 3);
+    expect(driver.events.filter((e) => e === 'shot').length).toBe(shotsBefore + 1);
+    expect(driver.message).toBe('soldier down');
+    expect(driver.messageAt).toBe(stamped);
+    expect(countColor(drawHud(boot, 320, 240), STATUS_YELLOW)).toBeGreaterThan(0);
+    for (let i = 0; i < 9; i++) {
+      driver.step(attackCmd([0, 180, 0]), 0.1);
+      stepDriver(driver, neutralCmd(), 3);
+    }
+    expect(driver.events.filter((e) => e === 'shot').length).toBe(shotsBefore + 10);
+    // The string is never cleared by fire (it may legitimately age past
+    // STATUS_TTL on the canvas after 4s of held fire — the store keeps it).
+    expect(driver.message).toBe('soldier down');
+    expect(driver.messageAt).toBe(stamped);
+    // A successive real status event updates the string AND the timestamp.
+    gibSoldier(driver);
+    expect(driver.message).toBe('soldier minced');
+    expect(driver.messageAt).toBeGreaterThan(stamped);
+    // ...and live fire after that still never clears.
+    driver.step(attackCmd([0, 180, 0]), 0.1);
+    expect(driver.events).toContain('shot');
+    expect(driver.message).toBe('soldier minced');
+  });
+
+  it('status line expires after STATUS_TTL but the string is retained', () => {
+    const boot = bootPlay({ width: 320, height: 240 });
+    const { driver } = boot;
+    killSoldier(driver);
+    expect(driver.messageExpired()).toBe(false);
+    expect(countColor(drawHud(boot, 320, 240), STATUS_YELLOW)).toBeGreaterThan(0);
+    // 1s in: still within the 3s lifetime.
+    stepDriver(driver, neutralCmd(), 10);
+    expect(driver.messageExpired()).toBe(false);
+    expect(countColor(drawHud(boot, 320, 240), STATUS_YELLOW)).toBeGreaterThan(0);
+    // Past STATUS_TTL: hidden from the canvas, string retained for re-reads.
+    stepDriver(driver, neutralCmd(), Math.ceil(STATUS_TTL / 0.1) + 5);
+    expect(driver.message).toBe('soldier down');
+    expect(driver.messageExpired()).toBe(true);
+    expect(countColor(drawHud(boot, 320, 240), STATUS_YELLOW)).toBe(0);
+  });
+
+  for (const [w, h] of [[320, 240], [1024, 768]] as const) {
+    it(`center channel draws white centered at ${w}x${h}, ignores the toggle, expires on CENTER_TTL`, () => {
+      const boot = bootPlay({ width: w, height: h });
+      const { driver } = boot;
+      fireCenter(driver, 'probe hint');
+      expect(driver.centerText).toBe('probe hint');
+      expect(driver.message).not.toBe('probe hint');
+      expect(driver.centerExpired()).toBe(false);
+      const placed = centerPrintPlacement('probe hint', w, h);
+      expect(placed).toHaveLength(1);
+      const band = (color: Uint32Array): number =>
+        countColorInBand(color, w, 0xffffffff, placed[0]!.y, placed[0]!.y + 8);
+      expect(band(drawHud(boot, w, h))).toBeGreaterThan(0);
+      // Essential hints survive `cl_showmessages=0` (the old shared channel hid them).
+      setCVar('cl_showmessages', 0);
+      expect(band(drawHud(boot, w, h))).toBeGreaterThan(0);
+      setCVar('cl_showmessages', 1);
+      // Past CENTER_TTL: hidden, string retained.
+      stepDriver(driver, neutralCmd(), Math.ceil(CENTER_TTL / 0.1) + 5);
+      expect(driver.centerText).toBe('probe hint');
+      expect(driver.centerExpired()).toBe(true);
+      expect(band(drawHud(boot, w, h))).toBe(0);
+    });
+  }
+
+  it('multiline centerprint rows match centerPrintPlacement', () => {
+    const boot = bootPlay({ width: 1024, height: 768 });
+    const { driver } = boot;
+    const text = 'crouch here\nsecret found';
+    fireCenter(driver, text);
+    expect(driver.centerText).toBe(text);
+    const placed = centerPrintPlacement(text, 1024, 768);
+    expect(placed).toHaveLength(2);
+    // Source rows: 8px apart, short message at 35% height.
+    expect(placed[0]!.y).toBe(Math.trunc(768 * 0.35));
+    expect(placed[1]!.y - placed[0]!.y).toBe(8);
+    // Per-line centering: the longer second line starts further left, and
+    // every line is centered on the screen middle.
+    expect(placed[1]!.x).toBeLessThan(placed[0]!.x);
+    for (const line of placed) {
+      expect(line.x + (line.text.length * 8) / 2).toBe(1024 / 2);
+    }
+    // The canvas carries ink inside every placed line cell...
+    const color = drawHud(boot, 1024, 768);
+    for (const line of placed) {
+      let ink = 0;
+      for (let y = line.y; y < line.y + 8; y++) {
+        for (let x = line.x; x < line.x + line.text.length * 8; x++) {
+          if (color[y * 1024 + x] === 0xffffffff) ink++;
+        }
+      }
+      expect(ink).toBeGreaterThan(0);
+    }
+    // ...and no white in the row band just above the block (exact placement).
+    expect(countColorInBand(color, 1024, 0xffffffff, placed[0]!.y - 8, placed[0]!.y)).toBe(0);
+  });
+
+  it('simultaneous kill + centerprint both draw; finish overrides center, center never corrupts finish', () => {
+    const boot = bootPlay({ width: 320, height: 240 });
+    const { driver } = boot;
+    killSoldier(driver);
+    fireCenter(driver, 'ladder hint');
+    expect(driver.message).toBe('soldier down');
+    expect(driver.centerText).toBe('ladder hint');
+    const both = drawHud(boot, 320, 240);
+    expect(countColor(both, STATUS_YELLOW)).toBeGreaterThan(0);
+    const placed = centerPrintPlacement('ladder hint', 320, 240);
+    expect(countColorInBand(both, 320, 0xffffffff, placed[0]!.y, placed[0]!.y + 8)).toBeGreaterThan(0);
+    // Completion: the finish block draws, the center channel is skipped.
+    driver.server.finished = true;
+    stepDriver(driver, neutralCmd(), 1);
+    expect(driver.message).toContain('LEVEL COMPLETE');
+    const done = drawHud(boot, 320, 240);
+    expect(countColor(done, FINISH_BLUE)).toBeGreaterThan(0);
+    expect(countColorInBand(done, 320, 0xffffffff, placed[0]!.y, placed[0]!.y + 8)).toBe(0);
+    // Late centerprints never overwrite completion on either channel.
+    fireCenter(driver, 'late hint');
+    expect(driver.centerText).toBe('ladder hint');
+    expect(driver.message).toContain('LEVEL COMPLETE');
+    expect(countColor(drawHud(boot, 320, 240), FINISH_BLUE)).toBeGreaterThan(0);
+  });
+});
+
 describe('RELEASE-11 message producer tagging (real bootPlay + ticks)', () => {
   it("kill gib lines are cosmetic 'status'", () => {
     const boot = bootPlay({ width: 320, height: 240 });
@@ -283,7 +441,7 @@ describe('RELEASE-11 message producer tagging (real bootPlay + ticks)', () => {
     expect(driver.messageKind).toBe('status');
   });
 
-  it("dry-fire NO AMMO and the fire clear are cosmetic 'status'", () => {
+  it("dry-fire NO AMMO never clears on a live round (RELEASE-11: no fire-clear)", () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
     driver.ps.weapons.push('weapon_shotgun');
@@ -294,13 +452,14 @@ describe('RELEASE-11 message producer tagging (real bootPlay + ticks)', () => {
     expect(driver.events).toContain('empty');
     expect(driver.message).toBe('NO AMMO');
     expect(driver.messageKind).toBe('status');
-    // A live round clears the line (still a cosmetic write): settle past
+    // A live round leaves the line alone (still a cosmetic channel, but the
+    // old `setMessage('', 'status')` fire-clear is retired): settle past
     // the shotgun refire window first, or the trigger stays latched.
     driver.shells = 8;
     stepDriver(driver, neutralCmd(), 12);
     driver.step(attackCmd(), 0.1);
     expect(driver.events).toContain('shot');
-    expect(driver.message).toBe('');
+    expect(driver.message).toBe('NO AMMO');
     expect(driver.messageKind).toBe('status');
   });
 
