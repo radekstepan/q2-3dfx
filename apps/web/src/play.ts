@@ -49,6 +49,12 @@ import type { MiniWorld, MiniSurf } from '@q2/sw-renderer';
 import { loadBsp, MODEL_EXTRA_STRIDE } from '@q2/bsp';
 import type { BspMap } from '@q2/bsp';
 import {
+  eyeContentsAt,
+  underwaterBlendForContents,
+  warpIndexBufferUnderwater,
+  type UnderwaterKind,
+} from './underwater.js';
+import {
   parseEntities,
   parseFloat,
   spawnEdict,
@@ -1044,6 +1050,17 @@ function loopChannelKey(name: string, pos: Vec3): string {
 export const STATUS_TTL = 3.0;
 export const CENTER_TTL = 2.5;
 
+/** RELEASE-15 eye-contents wash (SV_CalcBlend contents block, 0..255 + 0..1). */
+export interface UnderwaterOverlay {
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+  kind: UnderwaterKind;
+  /** RDF_UNDERWATER equivalent: the software screen warp applies. */
+  submerged: boolean;
+}
+
 export class LocalDriver implements HostDriver {
   readonly source: 'devroom' | 'pak';
   readonly pm: PmoveState = makePmoveState();
@@ -1740,6 +1757,42 @@ export class LocalDriver implements HostDriver {
       g: this.dmgBlend[1]! * 255,
       b: this.dmgBlend[2]! * 255,
       a: this.dmgAlpha,
+    };
+  }
+
+  /**
+   * Current eye-contents screen blend (RELEASE-15: game/p_view.c
+   * SV_CalcBlend contents block). Classifies the authoritative pm eye
+   * (origin + viewheight, duck-aware — the server-side viewoffset point C
+   * samples, before client kick) through the solid-aware world contents
+   * with the cl_view.c +1/16 nudge. Null when the eye is dry. Pure read
+   * like damageOverlay; the caller composites it UNDER the damage wash
+   * (C order: contents, then damage). `submerged` is the RDF_UNDERWATER
+   * equivalent gating the software screen warp (ref_gl never warps).
+   */
+  underwaterOverlay(): UnderwaterOverlay | null {
+    const eye = v3(
+      this.pm.origin[0]!,
+      this.pm.origin[1]!,
+      this.pm.origin[2]! + this.pm.viewheight,
+    );
+    const st = underwaterBlendForContents(eyeContentsAt(this.worldContents, eye));
+    // Presentation scope is LIQUIDS (water/slime/lava): a solid eye (camera
+    // inside rock — unreachable in legitimate play, collision blocks it) is
+    // deliberately left unwashed even though SV_CalcBlend would tint it
+    // orange (solid sets the blend but never RDF_UNDERWATER). Rationale:
+    // the fullscreen orange would mask capture gates (e.g. the pool-view
+    // tile-seam captures teleport into rock), while no real view can reach
+    // it. underwaterBlendForContents keeps the C-exact solid branch so the
+    // port stays auditable; only the presentation gates on liquids.
+    if (!st || st.kind === 'solid') return null;
+    return {
+      r: st.r * 255,
+      g: st.g * 255,
+      b: st.b * 255,
+      a: st.a,
+      kind: st.kind,
+      submerged: st.submerged,
     };
   }
 
@@ -5101,6 +5154,29 @@ export function resolveDisplay(boot: PlayBoot, hud?: HudState, frameState?: unkn
   return boot.display;
 }
 
+/**
+ * RELEASE-15 software underwater screen warp (ref_soft/r_scan.c
+ * D_WarpScreen, gated on sw_waterwarp default 1 + RDF_UNDERWATER).
+ *
+ * Runs on the indexed plane between renderView and endFrame
+ * (warp-then-palettize, like R_RenderFrame: D_WarpScreen, then
+ * R_CalcPalette). Returns true when the warp applied, false when there is
+ * nothing to do: no index plane (GPU backend — ref_gl never reads
+ * RDF_UNDERWATER, so WebGL2 views are never screen-warped), a dry eye, or
+ * a solid eye (C blends but never warps). `force` bypasses the submerged
+ * gate for the omitted-warp control and tests; it never bypasses the
+ * index-plane guard. `timeSec` is the render clock (RefDef.time).
+ */
+export function applyUnderwaterWarp(boot: PlayBoot, timeSec: number, force = false): boolean {
+  const fb = boot.refresh.getFramebuffer();
+  if (!fb.index) return false;
+  if (!force) {
+    const uw = boot.driver.underwaterOverlay();
+    if (!uw || !uw.submerged) return false;
+  }
+  return warpIndexBufferUnderwater(fb.index, fb.width, fb.height, timeSec);
+}
+
 export function pumpMuzzleLight(boot: PlayBoot): boolean {
   const hooks = boot.refresh as unknown as {
     testExpireDynamicLights?: () => void;
@@ -5703,21 +5779,88 @@ export function toggleHelpOverlay(boot: PlayBoot): boolean {
  * like the crosshair. `hud.fps` feeds the fps counter; `hud.frame` is
  * kept for signature compat and ignored.
  */
+/** drawPlayHud options (additive; default = CPU resolve-path behavior). */
+export interface DrawPlayHudOpts {
+  /**
+   * GPU overlay path: write washes as translucent pixels (rgb + alpha)
+   * over the cleared buffer so the browser composites tint-over-GL.
+   * The caller must clear the buffer first (paintHudOverlay does).
+   */
+  translucentWash?: boolean;
+}
+
+/**
+ * Fullscreen wash painter (RELEASE-14 damage + RELEASE-15 underwater, C
+ * compositing order: contents, then damage). Opaque SRC_OVER onto scene
+ * pixels by default; translucent SRC pixels when `translucent` (GPU
+ * overlay over a cleared buffer — the browser then composites
+ * tint-over-GL and the scene stays visible and animated underneath).
+ */
+export function paintWash(
+  target: { width: number; height: number; color: Uint32Array },
+  boot: PlayBoot,
+  translucent = false,
+): void {
+  const uw = boot.driver.underwaterOverlay();
+  const dmg = boot.driver.damageOverlay();
+  if (!uw && !dmg) return;
+  if (!translucent) {
+    if (uw) fillRectAlpha(target, 0, 0, target.width, target.height, uw.r, uw.g, uw.b, uw.a);
+    if (dmg) fillRectAlpha(target, 0, 0, target.width, target.height, dmg.r, dmg.g, dmg.b, dmg.a);
+    return;
+  }
+  // Translucent overlay path: combine the washes into one SRC pixel over
+  // the cleared (transparent) buffer. Stored non-premultiplied (canvas
+  // putImageData semantics): the browser applies out = src.rgb*src.a +
+  // dst*(1-src.a) over the GL canvas. Combined with the over operator in
+  // C order (contents, then damage).
+  const layers = [
+    uw ? { r: uw.r, g: uw.g, b: uw.b, a: uw.a } : null,
+    dmg ? { r: dmg.r, g: dmg.g, b: dmg.b, a: dmg.a } : null,
+  ];
+  let pr = 0;
+  let pg = 0;
+  let pb = 0;
+  let pa = 0;
+  for (const L of layers) {
+    if (!L || !(L.a > 0)) continue;
+    const a = Math.min(1, L.a);
+    const sr = Math.max(0, Math.min(255, Math.round(L.r)));
+    const sg = Math.max(0, Math.min(255, Math.round(L.g)));
+    const sb = Math.max(0, Math.min(255, Math.round(L.b)));
+    pr = sr * a + pr * (1 - a);
+    pg = sg * a + pg * (1 - a);
+    pb = sb * a + pb * (1 - a);
+    pa = a + pa * (1 - a);
+  }
+  if (!(pa > 0)) return;
+  const px =
+    (Math.min(255, Math.round(pa * 255)) << 24) |
+    (Math.min(255, Math.round(pb / pa)) << 16) |
+    (Math.min(255, Math.round(pg / pa)) << 8) |
+    Math.min(255, Math.round(pr / pa));
+  target.color.fill(px >>> 0);
+}
+
 export function drawPlayHud(
   target: { width: number; height: number; color: Uint32Array },
   boot: PlayBoot,
   hud: HudState,
+  opts?: DrawPlayHudOpts,
 ): void {
-  // RELEASE-14 damage blend (P_DamageFeedback color + SV_CalcBlend alpha):
-  // fullscreen translucent wash FIRST — id blends the 3D view inside the
-  // renderer and draws every 2D element (crosshair, statusbar, text) after,
-  // unblended. This is the single application point for both the CPU
-  // resolve path and the GPU overlay path (paintHudOverlay funnels through
-  // here), so the wash can never apply twice in one frame.
-  const dmg = boot.driver.damageOverlay();
-  if (dmg) {
-    fillRectAlpha(target, 0, 0, target.width, target.height, dmg.r, dmg.g, dmg.b, dmg.a);
-  }
+  // RELEASE-14 damage blend (P_DamageFeedback color + SV_CalcBlend alpha)
+  // + RELEASE-15 underwater blend (SV_CalcBlend contents block, composited
+  // FIRST: C order is contents, then damage). On the CPU resolve path the
+  // target holds the rendered scene, so both washes composite opaque
+  // SRC_OVER (id blends the 3D view inside the renderer and draws every 2D
+  // element after, unblended). On the GPU overlay path
+  // (opts.translucentWash, buffer cleared by paintHudOverlay) the washes
+  // write TRANSLUCENT pixels instead: the browser composites tint-over-GL,
+  // so the scene stays visible and animated under the tint. Opaque washes
+  // there would seal the overlay and hide the GL canvas entirely.
+  // This stays the single application point for both paths (paintHudOverlay
+  // funnels through here), so no wash can apply twice in one frame.
+  paintWash(target, boot, opts?.translucentWash === true);
   // In-canvas readouts first, so later HUD rows paint over them on tiny
   // buffers instead of the reverse.
   if (fpsVisible() && Number.isFinite(hud.fps) && hud.fps > 0) {
@@ -6156,6 +6299,7 @@ export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: numb
   const { view, renderables } = buildAsyncView(boot.host, st.serverAcc);
   boot.refresh.beginFrame();
   await boot.refresh.renderViewAsync(view, boot.host.world, renderables);
+  applyUnderwaterWarp(boot, view.time);
   await boot.refresh.endFrameAsync();
   return resolveDisplay(boot);
 }
@@ -6464,6 +6608,7 @@ export function paintHudOverlay(boot: PlayBoot, hud: HudState): Uint32Array {
     { width: boot.host.fb.width, height: boot.host.fb.height, color: boot.display },
     boot,
     hud,
+    { translucentWash: true },
   );
   return boot.display;
 }
@@ -6618,6 +6763,7 @@ export async function measureFrameStages(
   const t04 = performance.now();
   const stats = await boot.refresh.renderViewAsync(view, boot.host.world, renderables);
   const t05 = performance.now();
+  applyUnderwaterWarp(boot, view.time);
   await boot.refresh.endFrameAsync();
   const t06 = performance.now();
   const target = resolveDisplay(boot);

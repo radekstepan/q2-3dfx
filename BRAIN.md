@@ -365,11 +365,11 @@ done-when:
 ### RELEASE-15 — Underwater view distortion and transitions
 owns: `packages/client`, `apps/web`, `packages/webgl-renderer`, `packages/sw-renderer`, `packages/renderer-api`, `packages/testkit`
 depends: none
-status: ready
+status: done (repaired 2026-10-31; see docs/tasks-archive.md RELEASE-15 entry)
 done-when:
-- [ ] Inspect original renderer/client handling of submerged view, contents flags, blend and underwater warp; distinguish being underwater from looking through an animated surface at submerged objects. Compare matched scene/camera/time to the original OpenGL behavior before assuming distortion is wrong or adding surface refraction.
-- [ ] Audit current view/projection/render flags and implement missing or repair excessive distortion to match the source. Preserve Software reference semantics, water-surface motion, HUD/crosshair alignment and source FOV behavior.
-- [ ] Verify above/below/partially submerged transitions, opaque submerged objects and moving views with deterministic captures and an omitted-warp control. Record backend differences explicitly.
+- [x] Inspect original renderer/client handling of submerged view, contents flags, blend and underwater warp; distinguish being underwater from looking through an animated surface at submerged objects. Compare matched scene/camera/time to the original OpenGL behavior before assuming distortion is wrong or adding surface refraction.
+- [x] Audit current view/projection/render flags and implement missing or repair excessive distortion to match the source. Preserve Software reference semantics, water-surface motion, HUD/crosshair alignment and source FOV behavior.
+- [x] Verify above/below/partially submerged transitions, opaque submerged objects and moving views with deterministic captures and an omitted-warp control. Record backend differences explicitly.
 
 ### GPU-FOLLOW-6 — Verify gameplay on a visible display
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
