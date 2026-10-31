@@ -321,17 +321,6 @@ Expensive browser tests and benchmarks run sequentially. Intermediate targeted
 passes are not full-suite acceptance. Archive completed cards with evidence;
 commit validated implementation increments with changesets, no push.
 
-### RELEASE-8 — Retire the old CPU Voodoo renderer
-owns: `apps/web`, `packages/config`, `packages/renderer-api`, `packages/sw-renderer`, `packages/voodoo`, `packages/host`, `packages/testkit`, `tools/bench`, `tools/asset-cooker`, `docs`, root workspace configuration
-depends: RELEASE-2, RELEASE-7
-status: in-progress(@opencode)
-lane-2026-10-30 (@opencode): step 1 DONE (config 17/17 + renderer-api 7/7 majors, vocab software|webgl2-experimental, persisted-voodoo→software warned); sw-renderer/bench/docs lanes running.
-inventory-2026-10-30 (@opencode, read-only): static `@q2/voodoo` importers are `apps/web/play.ts` (resolve/scanout), `render-workers.ts` (SAB/scanout), `tools/bench` rgb legs, dynamic `testkit` resolve reference — all retire-execution; policy tables already duplicated in `webgl-renderer/appearance.ts` (keep/relocate, not blind delete). `webgl-renderer→sw-renderer` imports are all KEEP (MiniWorld/camera/alias front-end). `vid_renderer` vocab `software|voodoo|webgl2-experimental` → `software|webgl2-experimental` with persisted-`voodoo`→`software` warned fallback; `vd_*` stay (WebGL uniforms). Workers/bench/tests RGB legs retire, software+GPU goldens preserved; frozen majors required for `config`+`renderer-api` (+`sw-renderer`/`voodoo`/`webgl-renderer` if APIs change). Ordered plan: selection vocab → web CPU-resolve removal → sw-renderer RGB strip → bench legs → voodoo package decision → obsolete tests → contracts/docs/gates.
-done-when:
-- [ ] Remove the legacy CPU Voodoo execution mode and its menu/config selection in favor of WebGL2; map persisted legacy selections deliberately and report unsupported-GPU fallback accurately. Preserve the software reference/Node renderer and the WebGL Voodoo appearance.
-- [ ] Inventory shared imports first: WebGL currently reuses `sw-renderer` helpers and `voodoo` is a policy/post-process package. Remove obsolete mode-specific code, workers, controls and benchmarks; retain or relocate shared utilities. Do not delete whole packages blindly or silently turn WebGL into a CPU path.
-- [ ] Update frozen contracts with required major changesets if changed, dependency rules, scripts, docs and tests. Retire obsolete tests explicitly while preserving meaningful software goldens and GPU parity/lifecycle coverage. Update §§2–6 to describe the final architecture, not a planned deletion.
-
 ### GPU-FOLLOW-5 — Refresh final fidelity evidence
 owns: `packages/webgl-renderer`, `packages/testkit`, `tools/bench`, `docs`
 depends: GPU-FOLLOW-3B, RELEASE-2, RELEASE-3, RELEASE-3B, RELEASE-4, RELEASE-5, RELEASE-6, RELEASE-7, RELEASE-8
