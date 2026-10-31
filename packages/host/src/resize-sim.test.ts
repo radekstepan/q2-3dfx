@@ -172,6 +172,63 @@ describe('sim-preserving resize', () => {
     }
   });
 
+  it('rapid bidirectional cycles keep refresh planes in sync with correct stride', () => {
+    // Host-side pin for the RELEASE-7 skew defect (app shell cached the old
+    // width/height and blitted new pixels with the old row stride): after
+    // every resize the refresh MUST render into the new planes at the new
+    // stride, and the old planes must be detached. Paints after each resize
+    // and probes stride-sensitive pixels in both directions.
+    const refresh = new PaintRefresh();
+    const host = new Host({ refresh, width: 64, height: 48, driver: movingDriver() });
+    const before = simFingerprint(host.captureSimState());
+    const sizes = [
+      [320, 240], [640, 480], [1024, 768], [800, 600], [64, 48],
+      [1024, 768], [320, 240], [640, 480], [64, 48],
+    ] as const;
+    let count = 0;
+    for (const [w, h] of sizes) {
+      const oldFb = host.fb;
+      const oldColor = oldFb.color;
+      host.resize(w, h);
+      count++;
+      // New framebuffer object with fresh planes; the refresh follows it.
+      expect(host.fb).not.toBe(oldFb);
+      expect(host.fb.color).not.toBe(oldColor);
+      expect(refresh.fb).toBe(host.fb);
+      expect(refresh.fb!.width).toBe(w);
+      expect(refresh.fb!.height).toBe(h);
+      expect(refresh.fb!.color).toBe(host.fb.color);
+      expect(refresh.fb!.depth).toBe(host.fb.depth);
+      expect(refresh.initCount).toBe(1 + count); // 1 construction + resizes
+      expect(simFingerprint(host.captureSimState())).toBe(before);
+      // Paint at the NEW stride, then probe stride-sensitive pixels: full
+      // first/last rows + first/last columns catch any old-stride skew.
+      host.renderCurrentView();
+      const fb = host.fb;
+      const paint = (x: number, y: number): void => {
+        const i = y * w + x;
+        expect(fb.color[i]).toBe((0xff000000 | (y * 257 + x)) >>> 0);
+        expect(fb.index![i]).toBe((x + y) & 255);
+        expect(fb.depth[i]).toBe(x * 1000 + y);
+      };
+      for (let x = 0; x < w; x++) {
+        paint(x, 0);
+        paint(x, h - 1);
+      }
+      for (let y = 0; y < h; y++) {
+        paint(0, y);
+        paint(w - 1, y);
+      }
+      paint(w >> 1, h >> 1);
+      // Stale old planes are detached: mutating them leaks nothing live.
+      oldColor.fill(0xdeadbeef);
+      expect(host.fb.color[0]).not.toBe(0xdeadbeef);
+      expect(refresh.fb!.color[0]).not.toBe(0xdeadbeef);
+    }
+    expect(host.resizeCount).toBe(sizes.length);
+    expect(simFingerprint(host.captureSimState())).toBe(before);
+  });
+
   it('rejects invalid sizes without touching fb or sim', () => {
     const host = new Host({ refresh: new NullRefresh(), width: 64, height: 48, driver: movingDriver() });
     host.frame(0);

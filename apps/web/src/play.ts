@@ -4155,8 +4155,10 @@ export function rebootPlay(prev: PlayBoot): PlayBoot {
  * elapsed time and audio survive. The Host owns the framebuffer realloc
  * (`host.resize` preserves sim + copies the overlap so the first post-resize
  * present reuses live pixels instead of flashing black); the shell then
- * reallocates its display planes the same way, syncs the GPU backend
- * viewport (`resizeGpuBackend`), and re-fits the CSS display box. The
+ * reallocates its display planes the same way and syncs the GPU backend
+ * viewport (`resizeGpuBackend`). The running loop (dom.ts finishFrame)
+ * re-fits the CSS display box the first frame it observes the new dims, and
+ * the menu caller re-fits synchronously — this module stays DOM-free. The
  * renderer backend never re-inits and no listener/loop is reinstalled, so
  * repeated resize/switch cycles stay 1:1 with reallocations. Explicit
  * restart stays only for settings that genuinely need a new level
@@ -4165,16 +4167,19 @@ export function rebootPlay(prev: PlayBoot): PlayBoot {
 
 /**
  * Resize a live boot in place (RELEASE-7): coordinated framebuffer +
- * display-plane + GPU viewport + HUD fit, no sim rebuild. Preserved: server
+ * display-plane + GPU viewport sync, no sim rebuild. Preserved: server
  * time, player origin/velocity, health, mixer channels, world/driver/refresh
  * identities. Returns true when the size applied (same-size is a no-op
- * returning true); false + untouched sim on invalid sizes or resize throw.
+ * returning true); false + coherent state on invalid sizes, resize throw,
+ * or GPU backend failure (host/display rolled back to the previous size,
+ * never success-with-mismatch — the menu caller reboots on false).
  */
 export function resizePlay(boot: PlayBoot, width: number, height: number): boolean {
   if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) return false;
   try {
     const prev = boot.host.fb;
     if (prev.width === width && prev.height === height) return true;
+    const prevDisplay = boot.display;
     const before = boot.host.captureSimState();
     const beforeHost = boot.host;
     const beforeDriver = boot.driver;
@@ -4189,7 +4194,29 @@ export function resizePlay(boot: PlayBoot, width: number, height: number): boole
       nextDisplay.set(boot.display.subarray(y * prev.width, y * prev.width + copyW), y * width);
     }
     boot.display = nextDisplay;
-    if (boot.gpu) resizeGpuBackend(boot, width, height);
+    // GPU viewport follows the framebuffer. A backend failure must NOT be
+    // reported as success with mismatched state: roll the host + display
+    // back to the previous size (Host.resize preserves sim, same overlap
+    // rule in reverse) and surface the failure. Best-effort canvas restore
+    // keeps the GL backing store paired with whatever size won.
+    if (boot.gpu && !resizeGpuBackend(boot, width, height)) {
+      try {
+        boot.host.resize(prev.width, prev.height);
+      } catch {
+        /* rollback throw: re-derive the display from the live fb below */
+      }
+      const fb = boot.host.fb;
+      if (fb.width === prev.width && fb.height === prev.height) {
+        boot.display = prevDisplay;
+      } else {
+        // Rollback itself failed: keep the NEW size everywhere (host + fresh
+        // display planes) so buffer lengths never disagree; still report
+        // failure so the caller reboots instead of trusting the GPU view.
+        boot.display = new Uint32Array(fb.width * fb.height);
+      }
+      resizeGpuBackend(boot, fb.width, fb.height);
+      return false;
+    }
     try {
       boot.refresh.syncWorkersFromCvar?.();
     } catch {
@@ -4383,6 +4410,13 @@ export function resolveDisplay(boot: PlayBoot, hud?: HudState, frameState?: unkn
     return live;
   }
   boot.lastResolveOrder = 'software-lifted';
+  if (boot.display.length !== live.length) {
+    // Size skew (e.g. a direct Host.resize bypassing resizePlay's display
+    // realloc, or an in-flight async frame across a resize): realloc once
+    // so set() below can never throw RangeError and no stale tail pixels
+    // survive. Resize frames only, never per-frame steady state.
+    boot.display = new Uint32Array(live.length);
+  }
   boot.display.set(live);
   applyBrightness(boot.display, brightness);
   return boot.display;

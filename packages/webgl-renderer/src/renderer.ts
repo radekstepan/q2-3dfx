@@ -381,6 +381,16 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   }
 
   resize(width: number, height: number): void {
+    // Invalid sizes are ignored WITHOUT mutating state: dims, viewport and
+    // the live target stay coherent (warn + early return, never throw, never
+    // half-mutate). Precedent is the registry guards (registerSkyStrip /
+    // registerSkinPixels warn-and-ignore); the play layer validates first,
+    // so this is a renderer-side backstop for direct callers. Same-size is
+    // a no-op (no viewport, no target drop, no GL traffic).
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+      this.warn(`resize: invalid ${String(width)}x${String(height)} (ignored, kept ${this.width}x${this.height})`);
+      return;
+    }
     if (width === this.width && height === this.height) return; // no-op
     this.width = width;
     this.height = height;

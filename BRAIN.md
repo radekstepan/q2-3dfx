@@ -280,7 +280,7 @@ FAIL and a proposed, unapproved tone-normalized threshold. Reopen acceptance;
 no threshold change is authorized. Historical full verify was reported 78/80,
 and deps:check 676 passed after the sound/config fix; neither was rerun here.
 
-Priority: RELEASE-7 → RELEASE-6 → RELEASE-4 → GPU-FOLLOW-3B → RELEASE-9/10/11,
+Priority (2026-10-31: RELEASE-7 repaired + archived, next): RELEASE-6 → RELEASE-4 → GPU-FOLLOW-3B → RELEASE-9/10/11,
 then FOLLOW-5/6/7. Independent cards can proceed with disjoint ownership.
 Claim one card; preserve software goldens and sky/lifecycle behavior. Expensive
 validation runs sequentially. Require actual production-path regressions and
@@ -288,16 +288,6 @@ before/after captures for visible defects, not only helper arithmetic, nonblack
 pixels or counts. Distinguish implementation, automated results and user verdict.
 Historical DONE cards in `docs/tasks-archive.md` are superseded by reopened cards
 here. A missing display blocks displayed-performance acceptance, not code repairs.
-
-### RELEASE-7 — Repair resize/switch distortion without resetting gameplay
-owns: `apps/web`, `packages/host`, `packages/webgl-renderer`, `packages/testkit`
-depends: none
-status: ready (reopened)
-review-finding: `dom.ts: startPlayLoop` constructs `blitFb` once from the initial framebuffer; `finishFrame` only updates its color. After `Host.resize` replaces the framebuffer, the blit wrapper retains old width/height (and index/depth references). New pixels can therefore be copied with the old row stride or overflow the cached ImageData. `resizePlay` also ignores `resizeGpuBackend`'s boolean failure result after mutating host state.
-done-when:
-- [ ] Reproduce skewed/zoomed views using actual menu resolution and renderer changes, including repeated and rapid cycles in both directions at all offered sizes. Record the exact sequence, renderer, viewport, DPR and screenshots.
-- [ ] Keep blit wrapper/cache, backing buffers, projection/aspect, viewport, HUD and CSS fit synchronized. Audit in-flight async rendering and stale buffer captures; handle failed GPU resize coherently instead of reporting success with mismatched state.
-- [ ] Add a real running-loop resize regression (not just direct `resizePlay` calls): assert new row stride and output dimensions, fresh rendered pixels, no RangeError, matching canvas content bounds and undistorted known geometry across switches/restores. Preserve map/player/enemy/time/audio state and correctly sized startup loading surface.
 
 ### RELEASE-6 — Correct HUD, live F1 help and completion presentation
 owns: `apps/web`, `packages/client`, `packages/formats`, `packages/server`, `packages/testkit`

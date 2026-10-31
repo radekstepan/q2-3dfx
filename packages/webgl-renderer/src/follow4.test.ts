@@ -15,6 +15,7 @@ import { describe, expect, it } from 'vitest';
 import { createBoxMesh, type MiniWorld } from '@q2/sw-renderer';
 import type { Entity, GpuFrameInput, GpuSceneInput } from '@q2/renderer-api';
 import { selectGpuScene, type GpuEntityModelKind } from './scene.js';
+import { buildProjectionMatrix } from './matrices.js';
 import { WebGLRenderer } from './renderer.js';
 
 const GLC = {
@@ -508,5 +509,77 @@ describe('FOLLOW-4 renderer lifecycle (stub GL)', () => {
     const delLost = { ...r2.testDeleteCounts() };
     expect(() => r2.dispose()).not.toThrow();
     expect(r2.testDeleteCounts()).toEqual(delLost); // invalid handles: no deletes
+  });
+
+  it('rapid repeated resize cycles both directions stay in sync; invalid sizes leave coherent state', () => {
+    const s = stubGL4();
+    const r = new WebGLRenderer();
+    r.init(s.gl, 320, 240);
+    const world = wire(r);
+    drive(r, world, 1);
+    expect(r.testTargetInfo()).toMatchObject({ w: 320, h: 240 });
+
+    // Camera re-derives per frame from width/height (renderer holds no cached
+    // projection): aspect actually moves the matrix, so a stale cache would
+    // skew/zoom. Pin the derivation the resize path relies on.
+    const p43 = buildProjectionMatrix(90, 320, 240);
+    const pWide = buildProjectionMatrix(90, 512, 256);
+    expect(pWide[5]).not.toBe(p43[5]);
+
+    // Offered sizes forward + back, one frame per step (both directions).
+    const sizes: Array<[number, number]> = [[640, 480], [800, 600], [1024, 768], [800, 600], [640, 480], [320, 240]];
+    for (const [w, h] of sizes) {
+      r.resize(w, h);
+      expect(r.getStatus()).toMatchObject({ width: w, height: h });
+      expect(r.testTargetInfo()).toBeNull(); // obsolete target dropped, not leaked
+      expect(s.calls).toContain(`viewport 0 0 ${w} ${h}`);
+      const drawsBefore = draws(s.calls);
+      const subBefore = r.getStatus().framesSubmitted;
+      drive(r, world, 1); // same generation: static kept, target recreated
+      expect(r.testTargetInfo()).toMatchObject({ w, h });
+      expect(draws(s.calls)).toBeGreaterThan(drawsBefore);
+      expect(r.getStatus().framesSubmitted).toBeGreaterThan(subBefore);
+      expect(s.calls).toContain(`viewport 0 0 ${w} ${h}`); // per-frame re-sync
+    }
+
+    // Rapid: three resizes with no frame between — final size wins, one recreate.
+    r.resize(640, 480);
+    r.resize(800, 600);
+    r.resize(320, 240);
+    expect(r.getStatus()).toMatchObject({ width: 320, height: 240 });
+    expect(r.testTargetInfo()).toBeNull();
+    drive(r, world, 1);
+    expect(r.testTargetInfo()).toMatchObject({ w: 320, h: 240 });
+
+    // Same-size no-op: zero GL traffic, live target kept.
+    const n = s.calls.length;
+    const delsNoop = { ...r.testDeleteCounts() };
+    r.resize(320, 240);
+    expect(s.calls.length).toBe(n);
+    expect(r.testDeleteCounts()).toEqual(delsNoop);
+    expect(r.testTargetInfo()).toMatchObject({ w: 320, h: 240 });
+
+    // Invalid sizes: ignored with a warning, no half-mutated dims, no
+    // viewport, no target drop (coherent state, never throws).
+    const bad: Array<[number, number]> = [[0, 48], [320, 0], [-1, 96], [64.5, 48], [NaN, 48], [Infinity, 48]];
+    for (const [bw, bh] of bad) {
+      const stBefore = r.getStatus();
+      const targetBefore = r.testTargetInfo();
+      const callsBefore = s.calls.length;
+      const delsBefore = { ...r.testDeleteCounts() };
+      expect(() => r.resize(bw, bh)).not.toThrow();
+      expect(r.getStatus()).toMatchObject({ width: stBefore.width, height: stBefore.height });
+      expect(r.testTargetInfo()).toEqual(targetBefore);
+      expect(s.calls.length).toBe(callsBefore);
+      expect(r.testDeleteCounts()).toEqual(delsBefore);
+    }
+    expect(r.testWarnings().some((w) => w.startsWith('resize: invalid'))).toBe(true);
+
+    // Renderer still draws at the kept size after the invalid attempts.
+    const drawsBefore = draws(s.calls);
+    drive(r, world, 1);
+    expect(r.testTargetInfo()).toMatchObject({ w: 320, h: 240 });
+    expect(draws(s.calls)).toBeGreaterThan(drawsBefore);
+    expect(r.testDeleteCounts().framebuffers).toBeGreaterThan(0);
   });
 });

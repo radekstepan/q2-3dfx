@@ -1514,8 +1514,12 @@ export function startPlayLoop(
   let useAsync = pool !== null;
   let busy = false;
 
-  // Reused blit wrapper: points at the resolved display buffer every frame
-  // (avoids the old per-frame `{...host.fb, color: target}` spread garbage).
+  // Reused blit wrapper (RELEASE-7): dims + index/depth are re-synced from
+  // the LIVE host framebuffer every frame in finishFrame — never a
+  // construction-time snapshot. Host.resize replaces host.fb, so frozen dims
+  // would blit new pixels with the old row stride (blitCopyRGBA fills by
+  // min-prefix, row-stride unaware) and skew/zoom the present. No per-frame
+  // allocation: the same object is updated in place.
   const blitFb: Framebuffer = {
     width: host.fb.width,
     height: host.fb.height,
@@ -1524,21 +1528,73 @@ export function startPlayLoop(
     depth: host.fb.depth,
   };
 
+  // Last CSS-fit dims (RELEASE-7): resizePlay mutates the framebuffer
+  // without touching the DOM (play.ts stays DOM-free) and installs no
+  // listeners, so the loop re-fits the display box itself the first frame
+  // it observes new dims. Viewport resizes keep flowing through onResize
+  // above; neither path reinstalls the loop.
+  let fitW = host.fb.width;
+  let fitH = host.fb.height;
+
   /** Shared post-render tail (HUD + blit + sound/event cues), both paths. */
   const finishFrame = (target: Uint32Array, hud: { fps: number; frame: number }, hudDone = false): void => {
+    const fb = host.fb;
+    // Display-box sync: first frame at new dims re-fits (headless-safe,
+    // best-effort like onResize above).
+    if (fb.width !== fitW || fb.height !== fitH) {
+      fitW = fb.width;
+      fitH = fb.height;
+      try {
+        fitPlayCanvas(el, fb.width, fb.height);
+      } catch {
+        /* sticky best-effort */
+      }
+      // Backing-store sync: Host.resize drops the renderer to the classic
+      // planes (band dispatcher cleared) while this loop's BrowserBandPool
+      // still targets the old size, so re-pair the pool at the new size and
+      // keep the pooled path live. Failure (or a pool-less boot) keeps the
+      // classic sync path — pixel-identical either way. Resize frames only,
+      // never per-frame; never throws. Skipped on the GPU lane (no CPU
+      // banding there).
+      if (pool !== null && useAsync && !boot.gpu) {
+        try {
+          const old = pool;
+          pool = null;
+          void old.dispose().catch(() => undefined);
+          pool = attachBrowserPool(boot);
+          if (pool === null) useAsync = false;
+        } catch {
+          pool = null;
+          useAsync = false;
+        }
+      }
+    }
+    // Stale-capture guard: an async frame in flight across a resize resolves
+    // against live (new-size) planes while its raster targeted the old ones.
+    // Presenting that buffer with new dims would fill by min-prefix
+    // row-stride-unaware (skew), so drop this present instead — the next
+    // frame is fresh. HUD is skipped too (its stride math assumes live
+    // dims). Sound/events/stats below still run so queues never backlog.
+    const live = fb.width * fb.height === target.length ? target : null;
     // RELEASE-8: HUD is always painted post-resolve (no CPU voodoo
     // pre-scanout composition). `hudDone` covers the live-GPU overlay path
     // (HUD already painted transparently over the GL canvas via
     // paintHudOverlay).
-    if (!hudDone) {
+    if (live !== null && !hudDone) {
       drawPlayHud(
-        { width: host.fb.width, height: host.fb.height, color: target },
+        { width: fb.width, height: fb.height, color: live },
         boot,
         hud,
       );
     }
-    blitFb.color = target;
-    blitToCanvas(el, blitFb);
+    if (live !== null) {
+      blitFb.width = fb.width;
+      blitFb.height = fb.height;
+      blitFb.index = fb.index;
+      blitFb.depth = fb.depth;
+      blitFb.color = live;
+      blitToCanvas(el, blitFb);
+    }
     // Headless/browser-soak observability (no behavior change): publish the
     // loop's fps EMA + frame counter for CDP-driven measurement (the
     // in-canvas glyphs are not machine-readable). Single reused record, one

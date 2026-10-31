@@ -508,6 +508,12 @@ lane report (host + web wiring): sim-preserving resize (validate/reserve, overla
 evidence: host 20/20 (sim fingerprint, overlap, no-op, invalid refusal, cycles 1:1, restore/dispose), web resize 15/15 (preserved sim, overlap, no-op, invalid, repeated, hot-swap/restore, once-only lifecycle, reserved boot).
 changesets: `release-7-host-resize.md` (web wiring ignored). No perf-ledger row.
 
+### RELEASE-7 repair — Fix resize/switch distortion without resetting gameplay — DONE 2026-10-31 (reopened 2026-10-30, repaired by @opencode, 4 lanes)
+owns: `apps/web`, `packages/host`, `packages/webgl-renderer`, `packages/testkit` · depends: none
+lane report (apps/web fix + host audit + webgl guard + testkit regression, disjoint owns): `dom.ts` finishFrame re-syncs blit wrapper dims/index/depth from live `host.fb` every frame (same object, no alloc), drops stale in-flight async presents, re-fits CSS + re-pairs BrowserBandPool on observed dims change; `play.ts` resizePlay rolls back host/display on GPU-backend failure (never success-with-mismatch) and resolveDisplay re-allocs on length skew; `WebGLRenderer.resize` warn-and-ignores invalid sizes without mutating state; host audit confirmed `Host.resize` correct (row-stride overlap copy, refresh.init, no-op, Com_Error-before-mutate); testkit running-loop regression covers all offered sizes both directions incl. DPR 1+2, stale-skew demo, sim preservation, pixel-identical restore.
+evidence: web 39/39 (resize 15 + gpu-lifecycle + reboot, incl. real-Chromium resolution-fit legs in full web suite 297 pass); host resize-sim 11/11; webgl renderer+follow4 11/11 (full pkg 153 pass); testkit loop-resize 8/1skip (9/9 with Q2_PAK); deps:check 683 edges ok; full `yarn verify` 78/80 — sole failure `@q2/testkit#test` with the same 4 known GPU-browser classes as the archived baseline (CDP timeouts + follow-2a pose, display-dependent, pre-existing).
+changesets: `release-7-webgl-resize-guard.md` + `release-7-host-resize-regression.md` + `release-7-testkit-loop-resize.md` (apps/web fix private, ignored). No perf-ledger row (correctness-only, O(1) per-frame wrapper sync; CPU optimization paused).
+
 ### GPU-FOLLOW-3B — Remove visible water tile boundaries — DONE 2026-10-30
 owns: `packages/webgl-renderer`, `apps/web`, `packages/testkit` · depends: GPU-FOLLOW-3A
 lane report (webgl + testkit + web captures + ANGLE order fix): LOD from unwarped UVs via `voodooSampleMippedWarped` + `highp` for multi-tile water; warp/scale/REPEAT/lighting/mips intact; forward-declaration order fixed (ANGLE strict).
