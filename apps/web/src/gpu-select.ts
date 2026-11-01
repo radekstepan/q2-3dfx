@@ -38,6 +38,7 @@ export function detectGpuCapability(): GpuCapability {
     }
     const gl = canvas.getContext('webgl2') as {
       getParameter?: (p: number) => unknown;
+      getExtension?: (name: string) => unknown;
       VERSION?: number;
     } | null;
     if (!gl) {
@@ -50,6 +51,19 @@ export function detectGpuCapability(): GpuCapability {
       }
     } catch {
       version = 'webgl2';
+    }
+    // Release the probe context immediately: every probe burns one of the
+    // page's live WebGL contexts until GC, so repeated selection checks
+    // (boot/switch/panel) would exhaust the budget and force a spurious
+    // software fallback while the menu still shows the WebGL request.
+    try {
+      const ext =
+        typeof gl.getExtension === 'function'
+          ? (gl.getExtension('WEBGL_lose_context') as { loseContext?: () => void } | null)
+          : null;
+      if (ext !== null && typeof ext.loseContext === 'function') ext.loseContext();
+    } catch {
+      /* release best-effort: the probe result above still stands */
     }
     return { backend: GPU_BACKEND_ID, available: true, reason: version };
   } catch {
@@ -76,6 +90,26 @@ export function resolveBootRenderer(requested?: string): {
   const raw = requested ?? getCVarString('vid_renderer');
   const sel = resolveRendererSelection(raw, detectGpuCapability());
   return { kind: sel.active, warning: sel.warning };
+}
+
+/**
+ * Renderer ids offered in the menu dropdown: every backend this device can
+ * actually run. WebGL2 is listed only when the capability probe passes —
+ * offering it on a WebGL-less browser is a dead choice that silently falls
+ * back to software. The saved cvar value is NOT rewritten here (a persisted
+ * webgl choice stays stored and takes effect again once the browser can do
+ * WebGL); the panel row still shows the saved value with the fallback reason
+ * when it can't be honored. Probes are free (released immediately), so this
+ * is safe to call per render. Never throws.
+ */
+export function offeredRendererOptions(): ResolvedBackend[] {
+  try {
+    return detectGpuCapability().available
+      ? ['software', 'webgl2-experimental']
+      : ['software'];
+  } catch {
+    return ['software'];
+  }
 }
 
 /**

@@ -109,6 +109,22 @@ export function bspToMiniWorld(map: BspMap, opts: BspWorldOptions = {}): MiniWor
   };
 
   const LUXEL = 16;
+  // Animated-texture chains (R_TextureAnimation): walk the texinfo `next`
+  // links from ti, collecting WAL names. Terminates on next < 0, a repeat
+  // (base1 button chains cycle back to the start), or the cap. Only faces
+  // with >1 frame record animTexIds; [0] is always the base texture.
+  const animChainFor = (ti: number): string[] | null => {
+    if (!map.texinfoNext || ti < 0 || ti >= map.texinfoNext.length) return null;
+    const names: string[] = [map.texinfoNames[ti] ?? ''];
+    const seen = new Set<number>([ti]);
+    let next = map.texinfoNext[ti]!;
+    while (next >= 0 && next < map.texinfoNext.length && !seen.has(next) && names.length < 8) {
+      seen.add(next);
+      names.push(map.texinfoNames[next] ?? '');
+      next = map.texinfoNext[next]!;
+    }
+    return names.length > 1 ? names : null;
+  };
   for (let f = 0; f < nFaces; f++) {
     const d = f * FACE_STRIDE;
     const firstedge = map.faces[d + 2]!;
@@ -192,13 +208,16 @@ export function bspToMiniWorld(map: BspMap, opts: BspWorldOptions = {}): MiniWor
     const pn = map.faces[d]!;
     const side = map.faces[d + 1]!;
     const sgn = side !== 0 ? -1 : 1;
+    const baseTexId = texIdFor(map.texinfoNames[ti] ?? '');
+    const chain = animChainFor(ti);
     surfaces[f] = {
       id: f,
       verts,
       uvs,
       lux,
       n: numedges,
-      texId: texIdFor(map.texinfoNames[ti] ?? ''),
+      texId: baseTexId,
+      animTexIds: chain ? chain.map((nm) => texIdFor(nm)) : undefined,
       lightId: f,
       center: bb.center,
       radius: bb.radius,

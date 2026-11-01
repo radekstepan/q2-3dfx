@@ -306,6 +306,14 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private vertBase = new Map<number, { vStart: number; vCount: number }>();
   /** CPU shadow of the uploaded positions (mover re-sync compare). */
   private worldPositions: Float32Array | null = null;
+  /**
+   * Animated-texture faces (RELEASE-16 button art): surface ids whose
+   * MiniSurf carries a multi-frame animTexIds chain. The play-layer DoorSync
+   * writes the picked frame into surf.texId per tick; syncDynamicTexIds
+   * mirrors the live texId into worldRanges before draws (no GL re-upload —
+   * diffuse binds per range at draw). Rebuilt at uploadStatic.
+   */
+  private animFaceIds: number[] = [];
   private skyPosBuf: WebGLBuffer | null = null;
   private skyColBuf: WebGLBuffer | null = null;
   private skyIdxBuf: WebGLBuffer | null = null;
@@ -943,6 +951,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     this.worldRanges = new Map();
     this.vertBase = new Map();
     this.worldPositions = null;
+    this.animFaceIds = [];
     this.skyPosBuf = null;
     this.skyColBuf = null;
     this.skyIdxBuf = null;
@@ -1153,6 +1162,16 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     }
     this.worldPositions = store.world.positions.slice();
     this.worldPosBuf = this.createStaticBuffer(gl, store.world.positions);
+    // Animated-texture inventory for the per-frame texId re-sync below.
+    this.animFaceIds = [];
+    if (this.world) {
+      for (let i = 0; i < this.world.surfaces.length; i++) {
+        const s = this.world.surfaces[i];
+        if (s && s.animTexIds && s.animTexIds.length > 1 && this.worldRanges.has(i)) {
+          this.animFaceIds.push(i);
+        }
+      }
+    }
     this.worldUVBuf = this.createStaticBuffer(gl, store.world.uvs);
     this.worldLUVBuf = this.createStaticBuffer(gl, store.world.lightUVs);
     this.worldAlphaBuf = this.createStaticBuffer(gl, store.world.alphas);
@@ -1554,6 +1573,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const scene = input.scene ?? this.scene;
     if (!scene) return;
     this.syncDynamicVerts(gl, scene);
+    this.syncDynamicTexIds();
 
     // Sky first (flat fill, no depth write so nothing z-fights the hull).
     {
@@ -2101,6 +2121,26 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     if (dirty) {
       gl.bindBuffer(gl.ARRAY_BUFFER, this.worldPosBuf);
       gl.bufferData(gl.ARRAY_BUFFER, this.worldPositions, gl.DYNAMIC_DRAW);
+    }
+  }
+
+  /**
+   * Re-sync uploaded world texIds for animated faces (RELEASE-16 button
+   * art; the syncDynamicVerts twin for textures): the play-layer DoorSync
+   * writes the picked animation frame into the live MiniSurf texId per tick,
+   * and the static worldRanges snapshot would otherwise keep serving the
+   * bake-time frame. No GL re-upload — positions/UVs/indices are untouched
+   * by animation, and diffuse binds per range at draw (diffuseFor uploads on
+   * demand). Steady state is one compare per animated face (a handful).
+   */
+  private syncDynamicTexIds(): void {
+    const world = this.world;
+    if (!world || this.animFaceIds.length === 0) return;
+    for (const id of this.animFaceIds) {
+      const s = world.surfaces[id];
+      const range = this.worldRanges.get(id);
+      if (!s || !range) continue;
+      if (range.texId !== s.texId) range.texId = s.texId;
     }
   }
 

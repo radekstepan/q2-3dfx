@@ -438,25 +438,60 @@ export interface ServerState {
    * the stood-upon mover/train clip num, linked by pmove's ground trace).
    * Set by the driver every tick before SV_Tick and before E-use (the
    * server never moves the player body itself). The 'lift' finish
-   * (wait -1 button + train start) requires this to be the exit train's
-   * edict num — boarding alone never finishes, pressing/shooting the call
-   * button from outside starts the train (C-correct, secret found) but does
-   * NOT finish. Default -1 (never aboard).
+   * (wait -1 button + train start) requires STANDING on the exit train —
+   * see SV_StandingOn — boarding alone never finishes, pressing/shooting
+   * the call button from outside starts the train (C-correct, secret found)
+   * but does NOT finish. Default -1 (never aboard).
    */
   playerGroundEntity: number;
+  /**
+   * Driver-latched player feet (origin + hull mins.z), or null when unknown.
+   * Latched alongside playerGroundEntity; SV_StandingOn needs both because
+   * the ground link alone grazes: a body leaning on a clip face parks at
+   * contact rest overlapping the box (fraction-0 ground), so face-leaning
+   * the plug latches its num without standing on it. Default null (the
+   * finish guard refuses without feet).
+   */
+  playerFeet: Vec3 | null;
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], timerRand: mulberry32(0x71E4), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0, lastPlayerShotAt: -10, lastPlayerDamage: 0, lastPlayerDamageFrom: null, playerGroundEntity: -1 };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], timerRand: mulberry32(0x71E4), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0, lastPlayerShotAt: -10, lastPlayerDamage: 0, lastPlayerDamageFrom: null, playerGroundEntity: -1, playerFeet: null };
 }
 
 /**
- * RELEASE-4: latch the driver's current ground entity for the aboard guard
- * (see ServerState.playerGroundEntity). Call every tick before SV_Tick and
- * before E-use; the server never sets this itself.
+ * RELEASE-4: latch the driver's current ground entity + feet for the aboard
+ * guard (see ServerState.playerGroundEntity/playerFeet). Call every tick
+ * before SV_Tick and before E-use; the server never sets these itself.
+ * Feet null clears the feet latch (the finish guard refuses without feet).
  */
-export function SV_SetPlayerGround(st: ServerState, groundEntity: number): void {
+export function SV_SetPlayerGround(st: ServerState, groundEntity: number, feet: Vec3 | null = null): void {
   st.playerGroundEntity = groundEntity;
+  st.playerFeet = feet;
+}
+
+/**
+ * Genuine-standing check for the 'lift' finish (RELEASE-4): the latched
+ * ground link PLUS feet on the clip's live box top (4u tolerance) PLUS the
+ * XY footprint (hull half-width margin). The ground link alone is not
+ * standing: contact rest parks a face-leaning body overlapping the box, so
+ * leaning on the shut plug face latches its num with deck feet — the height
+ * gate rejects exactly that. Works for movers (plug lift) and trains (exit
+ * lift) via their live clip boxes.
+ */
+export function SV_StandingOn(st: ServerState, num: number): boolean {
+  if (num < 0 || st.playerGroundEntity !== num || !st.playerFeet) return false;
+  const mover = st.movers.find((m) => !m.ent.freed && m.ent.num === num);
+  let b: { mins: Float32Array; maxs: Float32Array } | null = mover ? SV_MoverClipBox(st, mover) : null;
+  if (!b) {
+    const tr = st.trains.find((t) => !t.ship && !t.ent.freed && t.ent.num === num);
+    b = tr ? SV_TrainClipBox(st, tr) : null;
+  }
+  if (!b) return false;
+  if (Math.abs(st.playerFeet[2]! - b.maxs[2]!) > 4) return false;
+  if (st.playerFeet[0]! < b.mins[0]! - 16 || st.playerFeet[0]! > b.maxs[0]! + 16) return false;
+  if (st.playerFeet[1]! < b.mins[1]! - 16 || st.playerFeet[1]! > b.maxs[1]! + 16) return false;
+  return true;
 }
 
 /**
@@ -1437,10 +1472,10 @@ export function SV_SpawnEntities(
           const bounds = modelSizes(model);
           if (bounds) {
             // RELEASE-4 departure (base1 *34 only): see BUTTON_34_SHIFT in
-            // buttons.ts — lump entombed in shut plug, shifted to east face
-            // center (Y preserved) so normal central entry faces it. Both
-            // collision (here) and rendering (apps/web DoorSync/graft) apply
-            // the same shift; visual/collision divergence is a blocker.
+            // buttons.ts — lump entombed in shut plug, shifted to hover
+            // centered above the east-face doorway (out of every walk line).
+            // Both collision (here) and rendering (apps/web DoorSync/graft)
+            // apply the same shift; visual/collision divergence is a blocker.
             let bmins = bounds.mins;
             let bmaxs = bounds.maxs;
             if (model === '*34') {
@@ -2281,9 +2316,11 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     // RELEASE-4 aboard guard: boarding alone never finishes; pressing or
     // shooting the call button from outside starts the train (C-correct,
     // secret still found) but does NOT finish. Only activation while
-    // standing on the exit train (driver-latched playerGroundEntity ==
-    // train num) completes the level — repeated presses (TOP hold),
-    // outside presses and unrelated triggers never finish. Base1 scope
+    // genuinely STANDING on the exit train (SV_StandingOn: ground link +
+    // feet on the live box top + footprint — face-lean grazes latch the num
+    // with deck feet and are rejected) completes the level — repeated
+    // presses (TOP hold), outside presses and unrelated triggers never
+    // finish. Base1 scope
     // note: the *12 slot is C-identical 16-wide (player hull 32), so
     // train-aboard is unreachable on foot in any engine — the reachable
     // elevator-button completion is the *31 plug lift below (t4, aboard
@@ -2292,7 +2329,7 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     const btn = st.movers.find((mm) => mm.ent === user);
     if (btn && btn.wait < 0) {
       const aboard = st.trains.some(
-        (tr) => !tr.ship && tr.started && tr.ent.num === st.playerGroundEntity,
+        (tr) => !tr.ship && tr.started && SV_StandingOn(st, tr.ent.num),
       );
       if (aboard) SV_FinishLevel(st, 'lift');
     }
@@ -2305,17 +2342,18 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     // 32 drop from the doorway slot (no world surgery, mover clip only).
     // Pressing *34 from the doorway face opens the plug (no finish, not
     // aboard); boarding the open plug alone never finishes; pressing *34
-    // while standing on the plug (playerGroundEntity == *31 num) completes
-    // the level (first-reason-wins, TOP/return timing unchanged, C movement
-    // otherwise intact). Boarding is a 32u drop west off the face onto the
-    // open top; the finishing press is an aimed E-use from aboard over the
-    // lowered plug (west of the slider plane, so LOS never crosses the
-    // *32/*33 sweeps). Unrelated triggers (t91 secret/train, t37 pit
-    // exit) never finish here; outside *34 presses never finish.
+    // while genuinely standing on the plug (SV_StandingOn == *31 num + feet
+    // on the live top + footprint) completes the level (first-reason-wins,
+    // TOP/return timing unchanged, C movement otherwise intact). Boarding
+    // is a 32u drop west off the face onto the open top; the finishing press
+    // is an aimed E-use from aboard over the lowered plug (west of the
+    // slider plane, so LOS never crosses the *32/*33 sweeps). Unrelated
+    // triggers (t91 secret/train, t37 pit exit) never finish here; outside
+    // *34 presses never finish.
     const btn = st.movers.find((mm) => mm.ent === user);
     if (btn && btn.ent.target === 't4') {
       const plug = st.movers.find((mm) => mm.ent.model === '*31');
-      if (plug && st.playerGroundEntity === plug.ent.num) {
+      if (plug && SV_StandingOn(st, plug.ent.num)) {
         SV_FinishLevel(st, 'lift');
       }
     }

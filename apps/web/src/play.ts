@@ -87,6 +87,7 @@ import {
   decayDamageKick,
   velocityLean,
   bobLean,
+  buttonAnimFrame,
   DEATH_PITCH,
   DEATH_ROLL,
   FLASH_HEALTH,
@@ -152,13 +153,13 @@ import type { GpuCapability } from '@q2/renderer-api';
  * capability-gated — see `resolveBootRenderer` in `./gpu-select.ts`.
  */
 export type RendererKind = ResolvedBackend;
-export { detectGpuCapability, getGpuStatus, resolveBootRenderer };
+export { detectGpuCapability, getGpuStatus, offeredRendererOptions, resolveBootRenderer };
 export type { GpuCapability };
 import { readPakEntry } from './pak.js';
 import type { WebPak } from './pak.js';
 import { BrowserBandPool, browserPoolAvailable } from './render-workers.js';
 import type { DiagSnapshot, KickTiming } from './render-workers.js';
-import { detectGpuCapability, getGpuStatus, resolveBootRenderer } from './gpu-select.js';
+import { detectGpuCapability, getGpuStatus, offeredRendererOptions, resolveBootRenderer } from './gpu-select.js';
 import { acquireGpuCanvas, attachGpuCanvasLifecycle, hasGpuCanvasLifecycle, removeGpuCanvas, setGpuCanvasSize, setHudTransparent, syncGpuCanvasToHud } from './gpu-canvas.js';
 import { modelKindsForFrame, synthesizeBeamEntities } from './gpu-effects.js';
 import { WebGLRenderer, fullWorldRefs, refreshGpuScene, selectGpuScene } from '@q2/webgl-renderer';
@@ -1450,12 +1451,13 @@ export class LocalDriver implements HostDriver {
     // monster think (C cadence fire resolution), bolts, fuses, debris/gibs,
     // explosions, monster door touches. The driver only moves its own body
     // (above) and renders server state below.
-    // RELEASE-4 aboard latch: the 'lift' finish requires standing on the
-    // exit train at activation (boarding alone never finishes, outside
+    // RELEASE-4 aboard latch: the 'lift' finish requires genuinely standing
+    // on the exit platform at activation (SV_StandingOn: ground link + feet
+    // on the live top + footprint — boarding alone never finishes, outside
     // presses start the train but do NOT finish). Latch before the tick so
     // bolt-kill activations (which run inside SV_Tick) see this tick's
     // ground; re-latched before E-use below for the press path.
-    SV_SetPlayerGround(this.server, this.pm.groundEntity);
+    SV_SetPlayerGround(this.server, this.pm.groundEntity, this.playerFeet());
     SV_Tick(this.server, dt, {
       player: {
         pos: v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]),
@@ -1563,11 +1565,11 @@ export class LocalDriver implements HostDriver {
     // within reach inside the facing cone (C button_use semantics via
     // SV_UseButton: UP/TOP no-op, wait/-1 holds TOP, only the aimed button
     // fires). The exit lift is un-ridable without its *13/*34 call buttons.
-    // RELEASE-4: re-latch ground before the press so the aboard guard sees
-    // the post-carry ground (standing on the train finishes, standing
-    // elsewhere starts the train but does NOT finish).
+    // RELEASE-4: re-latch ground + feet before the press so the aboard
+    // guard sees the post-carry stance (standing on the platform finishes,
+    // standing elsewhere starts the train but does NOT finish).
     if ((cmd.buttons & BUTTON_USE) !== 0) {
-      SV_SetPlayerGround(this.server, this.pm.groundEntity);
+      SV_SetPlayerGround(this.server, this.pm.groundEntity, this.playerFeet());
       this.pressUseButton();
     }
     // Single drain point: server event queues from the tick AND the fire
@@ -3166,6 +3168,18 @@ export class LocalDriver implements HostDriver {
   }
 
   /**
+   * Test hook (RELEASE-16 button texture animation): live MiniSurf refs of a
+   * brush model's synced faces, in face order. Animated button faces change
+   * texId as the mover's fx/frame/time advances (syncButtonAnim); static
+   * faces never do. Null when the model has no synced faces. Tests may
+   * overwrite texId for the negative control (forced-frame render).
+   */
+  doorAnimFaces(model: string): MiniSurf[] | null {
+    const d = this.doors.find((x) => x.ent.model === model);
+    if (!d || d.faces.length === 0) return null;
+    return [...d.faces];
+  }
+  /**
    * Test hook (RELEASE-4 render-vs-collision): union of the baked visual
    * bounds for a brush model (baseMins/baseMaxs, already shifted for *34).
    * At rest this must equal the server collision box (moverBounds); if the
@@ -3224,6 +3238,34 @@ export class LocalDriver implements HostDriver {
         s.maxs[1] = bx[1]! + oy;
         s.maxs[2] = bx[2]! + oz;
       }
+      this.syncButtonAnim(d);
+    }
+  }
+
+  /**
+   * Button texture animation (RELEASE-16, R_TextureAnimation): the picked
+   * chain frame for a func_button door's faces, from the mover's C
+   * frame/effects (buttonAnimFrame: ANIM01 0-1 / ANIM23 2-3 at 2Hz, else the
+   * server frame) modulo the baked chain length. Writes the live MiniSurf
+   * texId both renderers sample; the software surface cache drops on texId
+   * drift and the GPU re-syncs ranges per frame, so no renderer changes were
+   * needed beyond drift tolerance. Non-button doors and single-frame faces
+   * are untouched (no global illumination change).
+   */
+  private syncButtonAnim(d: DoorSync): void {
+    let hasAnim = false;
+    for (const s of d.faces) {
+      if (s.animTexIds && s.animTexIds.length > 1) { hasAnim = true; break; }
+    }
+    if (!hasAnim) return;
+    const m = this.server.movers.find((mm) => mm.ent === d.ent);
+    if (!m || m.ent.classname !== 'func_button') return;
+    const frame = buttonAnimFrame(m.fx, m.frame, this.server.time);
+    for (const s of d.faces) {
+      const chain = s.animTexIds;
+      if (!chain || chain.length < 2) continue;
+      const pick = chain[frame % chain.length]!;
+      if (s.texId !== pick) s.texId = pick;
     }
   }
 
@@ -3336,6 +3378,15 @@ export class LocalDriver implements HostDriver {
    * rejected) and presses it with C button_use semantics. Emits 'use' when
    * a button actually starts moving (drives the gate (v) verdict).
    */
+  /**
+   * Driver-latched player feet for the server aboard guard (RELEASE-4):
+   * origin + hull mins.z (feet plane the standing check compares against
+   * the platform's live box top). Called wherever the ground latch runs.
+   */
+  private playerFeet(): Vec3 {
+    return v3(this.pm.origin[0]!, this.pm.origin[1]!, this.pm.origin[2]! + this.pm.mins[2]!);
+  }
+
   private pressUseButton(): void {
     if (this.playerDead) return;
     // RELEASE-6 intermission-lite: no world interaction once finished.
@@ -4548,6 +4599,33 @@ export function unwireGpuLifecycle(boot: PlayBoot): void {
     /* best-effort only */
   }
   g.disposeLifecycle = null;
+}
+
+/**
+ * Dispose a boot's live GPU backend (reboot path): unwire the canvas
+ * lifecycle pair first so the detached backend/canvas fire nothing, then
+ * dispose the backend and drop the GL canvas. No-op without a GPU backend.
+ * Never throws (dispose/remove are best-effort).
+ */
+export function detachGpuBackend(boot: PlayBoot): void {
+  if (!boot.gpu) return;
+  try {
+    unwireGpuLifecycle(boot);
+  } catch {
+    /* unwire best-effort */
+  }
+  try {
+    boot.gpu.gpu.dispose();
+  } catch {
+    /* dispose is idempotent by contract; belt-and-braces for reboot */
+  }
+  boot.gpu = null;
+  try {
+    setHudTransparent(undefined, false);
+    removeGpuCanvas(undefined);
+  } catch {
+    /* CPU presentation already correct; best-effort cleanup only */
+  }
 }
 
 /**

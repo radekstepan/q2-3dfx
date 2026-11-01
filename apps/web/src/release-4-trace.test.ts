@@ -670,31 +670,37 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
   });
 
   it('box-4 gate: visible doorway entry boards plug lift, E-use finishes + F1 (multi-offset)', { timeout: 300000 }, async () => {
-    // RELEASE-4 production gate (user-contract, reopened fix):
+    // RELEASE-4 production gate (user-contract, over-door fix):
     // - Visible doorway: hall (-1560,Y) straight west through *32/*33 to the
-    //   *31 plug east face. No hidden south slide, no teleport: the *34 housing
-    //   sits at the east-face south-gap (-1703..-1694, 1472..1504, center
-    //   -1698.5,1488) — 1u east of the shut face (-1704), 6u west of the slider
-    //   band (-1688), fully inside the open-slider gap (1472..1600) so it is
-    //   drawn visible (not behind the open *32 slab like the old -72 south
-    //   end), but 16u south of the central walk (Y 1536) so the straight-in
-    //   walk neither touches nor blocks on it. First press is an aimed E-use
-    //   from the face (visible, within C 96 reach, facing+LOS); walking west
+    //   *31 plug east face. No hidden side slide, no teleport: the *34 housing
+    //   hovers centered ABOVE the doorway (-1703..-1694, 1520..1552, 160..192;
+    //   center -1698.5,1536,176) — 1u east of the shut face (-1704), 15u west
+    //   of the slider band (-1688), on the doorway centerline (no south/north
+    //   side-route bias), 8u above a standing head (152) so EVERY straight-in
+    //   walk passes under it without touching or blocking. It is E-use-only
+    //   (no hull overlap at any stance, so touch can never pre-fire t4).
+    //   First press is an aimed E-use from the slot face (~36u, within C 96,
+    //   facing+LOS, both endpoints west of the slider plane); walking west
     //   off the face drops onto the open top (origin 112 == top 88+24,
     //   ge==plug, no fall-through, no finish); second press is an aimed E-use
-    //   from aboard and finishes 'lift' exactly once with frozen F1.
+    //   from aboard (~70u) and finishes 'lift' exactly once with frozen F1.
     // - Render-vs-collision: the relocated housing must be DRAWN where it
     //   collides (DoorSync/graft shift == server moverBounds shift), not just
     //   present in the server fixture. Without the web shift the visual would
     //   sit at the lump spot (-1848..-1839, inside the shut plug, invisible)
-    //   while colliding 145E-48Y away — the reported invisible blockage.
-    //   Old side routes (-1688,1488 touch -> -1720,1470 board, 145E+72S;
-    //   central touch) are superseded: normal entry now E-uses a visible button.
-    // - Multi-offset: Y 1536 (center), 1552 and 1568 (north of center) all
-    //   complete without repositioning inside any leg and without directly
-    //   firing targets. All three avoid touch (16u+ Y gap, no overlap), so the
-    //   first press is always the visible E-use — no hidden contact. Outside/
-    //   unrelated/repeat presses never finish.
+    //   while colliding 145E+40U away — the reported invisible blockage.
+    //   Older placements (south-gap touch at Y 1488, side board at -1720,1470)
+    //   are superseded: the south-half doorway blocked on the old housing.
+    // - Multi-offset: Y 1492 (south — the old-blockage regression line),
+    //   1536 (center) and 1568 (north) all complete without repositioning
+    //   inside any leg and without directly firing targets. All three avoid
+    //   touch (housing is above every hull), so the first press is always
+    //   the visible E-use — no hidden contact. Outside/unrelated/repeat
+    //   presses never finish. (Y 1492, not 1488: the exact 1488.0 line
+    //   grazes the open *32's edge plane corner-exact and reads contact —
+    //   C-identical 1/32-rest + DIST_EPSILON behavior, unholdable by a human
+    //   and unrelated to the housing. 1492 still overlaps the old housing's
+    //   y-band, so the regression stands.)
     // Lump truth: *31 plug targetname t4, *34 button target t4, *12 train
     // targetname t91 (secret, never started here), *13 button target t91
     // wait -1 (never fired here). C travel/TOUCH/shooting intact (pos2 from
@@ -703,7 +709,7 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
     // repeats.
     const START_X = -1560;
     const FACE_X = -1688;
-    const Y_OFFSETS = [1536, 1552, 1568];
+    const Y_OFFSETS = [1492, 1536, 1568];
     for (const startY of Y_OFFSETS) {
       const boot = await bootBase1();
       const { driver } = boot;
@@ -719,10 +725,10 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
       expect(btn34.ent.target).toBe('t4');
       expect(train.started).toBe(false);
       const off = (m: string): [number, number, number] => driver.doorRenderOffset(m)!;
-      // Collision truth (south-gap housing): -1703..-1694, 1472..1504.
+      // Collision truth (over-door housing): -1703..-1694, 1520..1552, 160..192.
       const b34box = driver.server.moverBounds.get(btn34.ent.num)!;
-      expect([...b34box.mins]).toEqual([-1703, 1472, 120]);
-      expect([...b34box.maxs]).toEqual([-1694, 1504, 152]);
+      expect([...b34box.mins]).toEqual([-1703, 1520, 160]);
+      expect([...b34box.maxs]).toEqual([-1694, 1552, 192]);
       // Render-vs-collision: visual bounds (DoorSync, shifted) must equal
       // collision bounds at rest.
       const vis = driver.doorVisualBounds('*34')!;
@@ -733,14 +739,14 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
       expect(vis.maxs[0]!).toBeCloseTo(b34box.maxs[0]!, 0);
       expect(vis.maxs[1]!).toBeCloseTo(b34box.maxs[1]!, 0);
       expect(vis.maxs[2]!).toBeCloseTo(b34box.maxs[2]!, 0);
-      // Visual is east of the shut plug face (not entombed) and inside the
-      // open-slider gap (not behind the slab): center X -1698.5 > -1704,
-      // center Y 1488 within 1472..1600.
+      // Visual is east of the shut plug face (not entombed), centered over the
+      // doorway and above every walk line: center (-1698.5,1536,176).
 
       // ---- approach: settle, walk straight west to the plug face ----
-      // Sliders cycle open by touch; the straight walk at Y 1536/1552/1568
-      // passes 16u+ north of the south-gap *34 (no touch, no block), so the
-      // plug stays shut, no t4, no finish — the visible doorway blockage
+      // Sliders cycle open by touch; the straight walk at Y 1492/1536/1568
+      // passes UNDER the over-door *34 (head 152 < housing 160: no touch, no
+      // block at any offset — Y 1492 is the old-housing blockage line), so
+      // the plug stays shut, no t4, no finish — the visible doorway blockage
       // reproduced (shut plug east face, mover clip, +X normal).
       driver.pm.origin = v3(START_X, startY, 150);
       driver.pm.velocity = v3();
@@ -760,7 +766,7 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
         expect(face.reached).toBe(true);
         expect(driver.pm.origin[0]!).toBeGreaterThan(-1705);
         expect(driver.pm.origin[0]!).toBeLessThanOrEqual(-1680);
-        // No hidden touch: central walk does not press the south-gap button.
+        // No hidden touch: every walk passes under the over-door button.
         expect(fired.has('t4')).toBe(false);
         expect(btn34.state).toBe('bottom');
         expect(plug.state).toBe('bottom');
@@ -780,7 +786,7 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
       }
 
       // ---- first press: aimed E-use from the face (visible button) ----
-      // Eye to south-gap center: ~50u (within C 96), facing cone, LOS over
+      // Eye to over-door center: ~36u (within C 96), facing cone, LOS over
       // the deck, west of the slider plane. Opens the plug (t4, no finish —
       // not aboard). No touch, no teleport, no direct target fire.
       {
@@ -823,7 +829,7 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
       // WalkTo stops on XY arrival (possibly still airborne from the 8u
       // drop), so settle a few ticks to land before asserting ge/onGround.
       // Arrive radius 6 (not 12) keeps the aboard E-use within C 96 even at
-      // the worst stop (Y 1568: dy 80+6, dx 21.5+6 → ~90 <96).
+      // the worst stop (Y 1568: dx 21.5+6, dy 32+6, dz 42 → ~66 <96).
       {
         const board = walkTo(driver, -1720, startY, 200, noteFired, 6);
         expect(board.reached).toBe(true);
@@ -842,8 +848,9 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
       }
 
       // ---- finishing press: aimed E-use from aboard → finish 'lift' ----
-      // Eye to south-gap center from aboard: within C 96, facing cone,
-      // wall-checked LOS over the lowered plug, west of the slider plane.
+      // Eye to over-door center from aboard: ~70u (within C 96), facing
+      // cone, wall-checked LOS over the lowered plug, west of the slider
+      // plane.
       // Button cycled (wait 3 returns to BOTTOM); E-use fires t4 on TOP while
       // aboard → 'lift' (first-wins, TOP hold blocks repeats, outside/
       // unrelated never finish here).

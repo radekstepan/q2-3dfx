@@ -1223,26 +1223,36 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect([...plug.ent.origin]).toEqual([...plug.pos1]);
     expect(fired.has('t91')).toBe(false);
     expect(fired.has('t4')).toBe(false);
-    // Phase 2: the C-intended opener — press the *34 elevator button. It
-    // sits at the plug east-face south end (RELEASE-4 east-face housing),
-    // so the press is delivered as an overlap lean from the face (the
-    // server-lane lean pattern): the driver loop fires t4 on the button's
-    // TOP arrival, never on touch.
-    driver.pm.origin = v3(-1688, 1490, 150);
+    // Phase 2: the C-intended opener — E-use the *34 elevator button. It
+    // hovers centered above the doorway (RELEASE-4 over-door housing), so
+    // the press is an aimed E-use from the slot face at the live bounds
+    // center (the server-lane E-use pattern): the driver loop fires t4 on
+    // the button's TOP arrival, never on touch.
+    driver.pm.origin = v3(-1688, 1536, 120);
     driver.pm.velocity = v3();
+    const aimUse34 = (): void => {
+      const b = driver.server.moverBounds.get(btn34.ent.num)!;
+      const cx = (b.mins[0]! + b.maxs[0]!) / 2, cy = (b.mins[1]! + b.maxs[1]!) / 2, cz = (b.mins[2]! + b.maxs[2]!) / 2;
+      const ex = driver.pm.origin[0]!, ey = driver.pm.origin[1]!, ez = driver.pm.origin[2]! + 22;
+      const dx = cx - ex, dy = cy - ey, dz = cz - ez;
+      const lh = Math.hypot(dx, dy) || 1;
+      const pitch = (Math.atan2(-dz, lh) * 180) / Math.PI;
+      const yaw = (Math.atan2(dy, dx) * 180) / Math.PI;
+      driver.step({ msec: 100, angles: [pitch, yaw, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_USE }, 0.1);
+    };
     let t4first = -1;
     let tick = 0;
     for (let i = 0; i < 10 && t4first < 0; i++) {
       SV_SetPlayerHealth(driver.server, 100);
-      driver.step(neutralCmd(), 0.1);
+      aimUse34();
       tick++;
       if (driver.server.firedThisTick.includes('t4')) t4first = tick;
     }
-    expect(t4first).toBeGreaterThanOrEqual(0); // the face lean fired t4
+    expect(t4first).toBeGreaterThanOrEqual(0); // the face E-use fired t4
     expect(btn34.state).not.toBe('bottom');
-    // Leave the overlap at once: a body parked in the touch volume would
-    // re-fire t4 every button cycle and stretch the door's TOP hold, so the
-    // pure C cycle below is measured without a rider in the button.
+    // Step out of the slot at once: the E-use press holds no overlap (the
+    // housing is above every hull), so the pure C cycle below is measured
+    // without a rider near the button.
     driver.pm.origin = v3(-1669, 1514, 120);
     driver.pm.velocity = v3();
     // The plug drops the full 156 (pos1 z 0 → pos2 z -156), rendered and
@@ -1278,14 +1288,14 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect([...plug.ent.origin]).toEqual([...plug.pos1]);
     expect(off('*31')).toEqual([0, 0, 0]);
     // Repeat use: the button cycled back to BOTTOM on its own 3s, so a
-    // second face lean re-fires t4 and the plug drops again.
+    // second face E-use re-fires t4 and the plug drops again.
     expect(btn34.state).toBe('bottom');
-    driver.pm.origin = v3(-1688, 1490, 150);
+    driver.pm.origin = v3(-1688, 1536, 120);
     driver.pm.velocity = v3();
     let t4second = -1;
     for (let i = 0; i < 10 && t4second < 0; i++) {
       SV_SetPlayerHealth(driver.server, 100);
-      driver.step(neutralCmd(), 0.1);
+      aimUse34();
       tick++;
       if (driver.server.firedThisTick.includes('t4')) t4second = tick;
     }
@@ -1614,27 +1624,30 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     }
     expect(btn13.state).toBe('top');
     expect(driver.doorRenderOffset('*13')).toEqual([0, 0, 4]);
-    // Touch path: the *34 elevator button sits at the plug east-face south
-    // end (RELEASE-4 east-face housing, 1u off the shut face), so the press
-    // is delivered as an overlap lean from the face (the server-lane lean
-    // pattern): the driver loop fires t4 on the button's TOP arrival, never
-    // on touch. The health-gated *13 answers use only — it never fires here.
+    // E-use path: the *34 elevator button hovers centered above the doorway
+    // (RELEASE-4 over-door housing, 1u off the shut face) — out of every
+    // hull, so touch can never press it. Aim from the slot face at the live
+    // bounds center: the driver loop fires t4 on the button's TOP arrival.
+    // The health-gated *13 answers use only — it never fires here.
     // Ambient ship relays are not collected here (see the audit note above).
     window = null;
-    driver.pm.origin = v3(-1688, 1490, 150);
+    driver.pm.origin = v3(-1688, 1536, 120);
     driver.pm.velocity = v3();
     window = new Set<string>();
     const w34 = window;
     let saw34 = false;
     let sawOffset = false;
+    let useOk = false;
     for (let i = 0; i < 10 && !saw34; i++) {
       SV_SetPlayerHealth(driver.server, 100);
-      driver.step(neutralCmd(), 0.1);
-      collectTargets();
+      const b = driver.server.moverBounds.get(btn34.ent.num)!;
+      const cx = (b.mins[0]! + b.maxs[0]!) / 2, cy = (b.mins[1]! + b.maxs[1]!) / 2, cz = (b.mins[2]! + b.maxs[2]!) / 2;
+      if (press(aimAt(cx, cy, cz))) useOk = true;
       if (driver.server.firedThisTick.includes('t4')) saw34 = true;
       const off = driver.doorRenderOffset('*34')!;
       if (Math.abs(off[0]!) + Math.abs(off[1]!) + Math.abs(off[2]!) > 1) sawOffset = true;
     }
+    expect(useOk).toBe(true); // the aimed E-use pressed
     expect(saw34).toBe(true);
     expect(sawOffset).toBe(true);
     expect(btn34.state).not.toBe('bottom');

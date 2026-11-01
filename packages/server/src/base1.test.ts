@@ -360,19 +360,19 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       expect(report.doorsOpened.length).toBeGreaterThan(0);
       expect(report.doorsCrossed.length).toBeGreaterThan(0);
       // WIRE-EXIT (C-parity RELEASE-4): the bot walks the low road to the
-      // slot mouth, cycling the *32/*33 sliders — and pressing the reachable
-      // *34 south-gap (touch via contact slop during the approach), so t4
-      // cycles the plug C-correctly (opened at least once; it may have
-      // returned to BOTTOM by the end of the 39s run since the 3s wait lapses
-      // and the stuck point sits 14u east of touch range with no re-press —
-      // still C-correct, no premature lift). The named lift never starts
-      // without its button's t91. Boarding + riding the operable lift is
-      // proven by the scripted pmove-rider test, not by this bot.
+      // slot mouth, cycling the *32/*33 sliders — and E-using the over-door
+      // *34 (aimed production path at the consumed route), so t4 cycles the
+      // plug C-correctly (opened at least once; it may have returned to
+      // BOTTOM by the end of the 39s run since the 3s wait lapses and the
+      // endgame E-use only fires near the face — still C-correct, no
+      // premature lift). The named lift never starts without its button's
+      // t91. Boarding + riding the operable lift is proven by the scripted
+      // pmove-rider test, not by this bot.
       expect(report.doorsOpened).toContain('*32');
-      expect(report.doorsOpened).toContain('*31'); // via the reachable *34 (t4)
+      expect(report.doorsOpened).toContain('*31'); // via the E-used *34 (t4)
       expect([[0, 0, -156], [0, 0, 0]]).toContainEqual(report.plugOrigin); // cycled (open or returned)
       expect(report.trainStarted).toBe(false);
-      // lean point (-1688,1488) sits ~104 XY from the exit volume center
+      // stand-off (-1672,1536) sits ~104 XY from the exit volume center
       // (through the *32 doorway): the bot reaches the complex, never the
       // sealed volume itself.
       expect(report.slotClosest).toBeLessThan(120);
@@ -598,8 +598,10 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       const btn = st.movers.find((m) => m.ent.model === '*13')!;
       expect(btn).toBeDefined();
       expect(btn.wait).toBe(-1);
-      // Simulate boarding: driver latched groundEntity == train num.
-      SV_SetPlayerGround(st, train.ent.num);
+      // Simulate boarding: driver latched groundEntity == train num with
+      // feet on the parked top (SV_StandingOn needs both — the ground link
+      // alone grazes on face leans).
+      SV_SetPlayerGround(st, train.ent.num, v3(-2056, 1536, 0));
       moverUse(btn, st.time);
       let ticks = 0;
       while (!train.started && ticks++ < 10) SV_Tick(st, 0.1);
@@ -658,6 +660,58 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       fireTargets(st, again);
       expect(st.finished).toBe(false);
       expect(st.foundSecrets).toBe(1);
+    } finally {
+      resetPmoveWorld();
+    }
+  });
+
+  it('exit stats: face-leaning the plug never finishes, boarding does', { timeout: 120000 }, () => {
+    // RELEASE-4 premature-finish guard (SV_StandingOn): leaning on the shut
+    // plug face parks the body at contact rest overlapping the box, so the
+    // pmove ground trace latches the plug num with DECK feet — the old
+    // ground-only guard finished 'lift' on the very first face E-use without
+    // boarding. The height gate rejects exactly that; genuinely standing on
+    // the open top (feet == live top + footprint) still finishes.
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st: ServerState = SV_Init();
+    SV_SpawnEntities(st, map.entities, (model) => {
+      if (!model.startsWith('*')) return null;
+      const n = Number.parseInt(model.slice(1), 10);
+      if (!Number.isFinite(n)) return null;
+      return modelBounds(map, n);
+    });
+    try {
+      SV_SetPmoveWorldFromBsp(map);
+      const plug = st.movers.find((m) => m.ent.model === '*31')!;
+      const b34 = st.movers.find((m) => m.ent.model === '*34')!;
+      // Face lean: ground link grazed the plug, feet on the deck.
+      SV_SetPlayerGround(st, plug.ent.num, v3(-1688, 1536, 96));
+      moverUse(b34, st.time);
+      let guard = 0;
+      let sawT4 = false;
+      while (plug.state !== 'waiting' && plug.state !== 'top' && guard++ < 100) {
+        SV_Tick(st, 0.1);
+        if (st.firedThisTick.includes('t4')) sawT4 = true;
+      }
+      expect(plug.ent.origin[2]!).toBeCloseTo(-156, 0); // open, no finish
+      expect(sawT4).toBe(true);
+      expect(st.finished).toBe(false);
+      expect(st.finishReason).toBe('');
+      // Board for real: feet on the live open top inside the footprint.
+      // The button must be back at BOTTOM first (C button_fire no-op while
+      // WAITING) — it returns ~1.5s before the plug does, so the plug is
+      // still open here.
+      guard = 0;
+      while (b34.state !== 'bottom' && guard++ < 100) SV_Tick(st, 0.1);
+      expect(b34.state).toBe('bottom');
+      expect(plug.state === 'waiting' || plug.state === 'top').toBe(true);
+      SV_SetPlayerGround(st, plug.ent.num, v3(-1755, 1536, 88));
+      moverUse(b34, st.time);
+      guard = 0;
+      while (!st.finished && guard++ < 20) SV_Tick(st, 0.1);
+      expect(st.finished).toBe(true);
+      expect(st.finishReason).toBe('lift');
     } finally {
       resetPmoveWorld();
     }
@@ -848,13 +902,14 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
     SV_CarryRiders(st, [body]);
     slotClosest = Math.min(slotClosest, Math.hypot(bot.origin[0]! - exitCenter[0], bot.origin[1]! - exitCenter[1]));
     // ENDGAME (C-parity RELEASE-4): once the planned route is consumed,
-    // lean on the plug's east face at the slot mouth, then slide 48u south
-    // to the *34 center (Y 1488) to press. The targetname'd plug owns no
-    // touch trigger, so the lean cycles the *32/*33 sliders — and, since
-    // *34 sits reachable at the face south-gap (east-face, Y 1472..1504),
-    // leaning on *34 too, so t4 cycles the plug C-correctly. The sealed pit
-    // (driver header) means delivery ends at the slot edge.
-    const slotTouch: [number, number] = [-1688, 1488];
+    // stand off the plug's east face at the slot mouth center, then E-use
+    // the over-door *34 (aimed, production path): the targetname'd plug owns
+    // no touch trigger, so the lean cycles the *32/*33 sliders — and the
+    // E-use presses *34, so t4 cycles the plug C-correctly. The stand-off
+    // (16u east of the face) keeps the route bot off the open plug top —
+    // boarding + riding is proven by the scripted rider legs, not this bot.
+    // The sealed pit (driver header) means delivery ends at the slot edge.
+    const slotTouch: [number, number] = [-1672, 1536];
     let target = waypoints[Math.min(wpIndex, waypoints.length - 1)]!;
     if (wpIndex >= waypoints.length - 1) target = slotTouch;
     // Door-transit hold: never walk into a slab that is still travelling.
@@ -900,11 +955,14 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
       wpIndex++;
       continue;
     }
-    // hold override the heading: hold = neutral (stand and lean).
-    const yaw = hold ? bot.viewAngles[1]! : (Math.atan2(dy, dx) * 180) / Math.PI;
-    const fwd = hold ? 0 : 300;
+    // hold override the heading: hold = neutral (stand and lean). The
+    // consumed route also stands (endgame lean): without this the bot pushes
+    // past the stand-off onto the open plug top and rides it back up.
+    const done = wpIndex >= waypoints.length - 1 && dist < 40;
+    const yaw = hold || done ? bot.viewAngles[1]! : (Math.atan2(dy, dx) * 180) / Math.PI;
+    const fwd = hold || done ? 0 : 300;
     // stuck detection: waypoint distance must shrink over time (hop on stalls)
-    if (hold) {
+    if (hold || done) {
       stuckTicks = 0;
       jumpTicks = 0;
     } else if (dist < lastProgress - 1) {
@@ -914,7 +972,7 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
       stuckTicks++;
     }
     let upmove = 0;
-    if (!hold && stuckTicks > 25 && jumpTicks === 0) jumpTicks = 8; // hop over lips
+    if (!hold && !done && stuckTicks > 25 && jumpTicks === 0) jumpTicks = 8; // hop over lips
     if (jumpTicks > 0) {
       upmove = 120;
       jumpTicks--;
@@ -973,7 +1031,8 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
       }
     }
     // C button_touch (id g_func.c): touchable buttons (no targetname, no
-    // health — base1's *34) press on brush overlap; the target fires on TOP
+    // health — base1's *34) press on brush overlap; the over-door housing
+    // overlaps no hull, so touch never fires here. The target fires on TOP
     // arrival in SV_Tick (id button_wait), never instantly here. *13
     // (health 1) answers use only, never touch.
     SV_TouchButtonsAt(
@@ -981,6 +1040,27 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
       { origin: bot.origin, mins: PLAYER_MINS, maxs: PLAYER_MAXS },
       'player',
     );
+    // ENDGAME E-use (production press path): at the consumed route's slot
+    // face, aim at the *34 live center (reach + facing + wall trace — the
+    // driver pressUseButton path). buttonCanFire gates repeats; the plug
+    // cycles t4 exactly like the headless E-use legs below.
+    if (wpIndex >= waypoints.length - 1) {
+      const b34 = st.movers.find((m) => m.ent.model === '*34');
+      const box = b34 ? SV_MoverClipBox(st, b34) : null;
+      if (b34 && box) {
+        const cx = (box.mins[0]! + box.maxs[0]!) / 2;
+        const cy = (box.mins[1]! + box.maxs[1]!) / 2;
+        const cz = (box.mins[2]! + box.maxs[2]!) / 2;
+        const ex = bot.origin[0]!, ey = bot.origin[1]!, ez = bot.origin[2]! + 22;
+        const dx = cx - ex, dy = cy - ey, dz = cz - ez;
+        const len = Math.hypot(dx, dy, dz);
+        if (len < 96 && Math.hypot(ex - -1688, ey - 1536) < 60) {
+          SV_UseButton(st, v3(ex, ey, ez), v3(dx / len, dy / len, dz / len), {
+            trace: SV_ClipTrace(st, SV_TraceFor(map)),
+          });
+        }
+      }
+    }
     // brush triggers: real volume overlap
     for (const bt of brushTriggers) {
       if (!boxOverlap(bot.origin, PLAYER_MINS, PLAYER_MAXS, bt.mins, bt.maxs)) continue;
@@ -1697,14 +1777,28 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(d31.state).toBe('bottom');
     expect([...d31.ent.origin]).toEqual([...d31.pos1]);
 
-    // PART B — C-intended activation: lean into *34 (touchable) from the
-    // plug east face south-gap center. RELEASE-4: *34 housing moved 145E-48Y
-    // for reachability (lump entombed 5u in the shut plug, Y south-gap to stay
-    // visible in the open-slider gap without blocking the central walk);
-    // lean into the shifted touch box from the face (central entry Y 1536
-    // passes 16u north, no touch there — press is explicit).
-    const lean = { origin: v3(-1688, 1488, 120), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) };
-    expect(SV_TouchButtonsAt(st, lean, 'player').map((m) => m.ent.model)).toContain('*34');
+    // PART B — C-intended activation: E-use *34 (E-use-only: the over-door
+    // housing overlaps no hull, so touch can never press it) from the slot
+    // face. RELEASE-4: *34 housing moved 145E+40U for reachability (lump
+    // entombed 5u in the shut plug) to hover centered above the doorway;
+    // aim at the live center — press is explicit.
+    const use34 = (): void => {
+      const box = SV_MoverClipBox(st, b34)!;
+      const ctr = v3((box.mins[0]! + box.maxs[0]!) / 2, (box.mins[1]! + box.maxs[1]!) / 2, (box.mins[2]! + box.maxs[2]!) / 2);
+      const eye = v3(-1688, 1536, 142);
+      const dx = ctr[0]! - eye[0]!, dy = ctr[1]! - eye[1]!, dz = ctr[2]! - eye[2]!;
+      const len = Math.hypot(dx, dy, dz);
+      expect(len).toBeLessThan(96);
+      const pressed = SV_UseButton(st, eye, v3(dx / len, dy / len, dz / len), {
+        trace: SV_ClipTrace(st, SV_TraceFor(map)),
+      });
+      expect(pressed?.ent.model).toBe('*34');
+    };
+    // Touch alone can never press the over-door housing (no hull overlap).
+    expect(
+      SV_TouchButtonsAt(st, { origin: v3(-1688, 1536, 120), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) }, 'player').map((m) => m.ent.model),
+    ).not.toContain('*34');
+    use34();
     expect(b34.state).toBe('going_up');
     expect(st.firedThisTick).not.toContain('t4'); // not yet: fires at the top
     // C travel is |movedir| . size - lip = 5 at speed 40 (0.125s), so TOP
@@ -1726,10 +1820,10 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(holdTicks).toBeGreaterThanOrEqual(28);
     expect(holdTicks).toBeLessThanOrEqual(32);
     expect(d31.state).toBe('bottom');
-    // repeat use: the button cycled back on its own 3s, so a second lean
+    // repeat use: the button cycled back on its own 3s, so a second E-use
     // re-fires and the plug drops again.
     expect(b34.state).toBe('bottom');
-    SV_TouchButtonsAt(st, lean, 'player');
+    use34();
     guard = 0;
     while (d31.state === 'bottom' && guard++ < 20) SV_Tick(st, 0.1);
     expect(d31.state).toBe('going_up');
@@ -1963,20 +2057,32 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       const d32box = SV_MoverClipBox(st, d32)!;
       expect([...d32box.mins]).toEqual([-1688, 1376, 96]);
       expect([...d32box.maxs]).toEqual([-1680, 1472, 224]);
-      // Lower the plug through the *34 overlap press (touch only).
-      // RELEASE-4: *34 housing moved 145E-48Y for reachability (lump entombed
-      // 5u in the shut plug, Y south-gap visible without blocking central);
-      // lean into the shifted touch box from the plug east face south-gap
-      // center. The press lowers the plug WITHOUT finishing when not aboard
+      // The shifted *34 rest box hovers centered above the doorway (out of
+      // every walk line: head 152 < housing 160).
+      const b34rest = SV_MoverClipBox(st, b34)!;
+      expect([...b34rest.mins]).toEqual([-1703, 1520, 160]);
+      expect([...b34rest.maxs]).toEqual([-1694, 1552, 192]);
+      // Lower the plug through the *34 E-use press (touch can never reach
+      // the over-door housing: no hull overlaps it at any stance).
+      // RELEASE-4: *34 housing moved 145E+40U for reachability (lump entombed
+      // 5u in the shut plug); aim from the slot face at the live center.
+      // The press lowers the plug WITHOUT finishing when not aboard
       // (t4 door cycle, transient) — only an aboard *34 press (plug lift,
       // driver-gated) or an aboard *13 press (train, unreachable in any
       // engine) takes the 'lift' finish. The walk below then boards the
       // lowered plug for real.
-      SV_TouchButtonsAt(
-        st,
-        { origin: v3(-1688, 1488, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
-        'player',
-      );
+      {
+        const box = SV_MoverClipBox(st, b34)!;
+        const ctr = v3((box.mins[0]! + box.maxs[0]!) / 2, (box.mins[1]! + box.maxs[1]!) / 2, (box.mins[2]! + box.maxs[2]!) / 2);
+        const eye = v3(-1688, 1536, 142);
+        const dx = ctr[0]! - eye[0]!, dy = ctr[1]! - eye[1]!, dz = ctr[2]! - eye[2]!;
+        const len = Math.hypot(dx, dy, dz);
+        expect(len).toBeLessThan(96);
+        const pressed = SV_UseButton(st, eye, v3(dx / len, dy / len, dz / len), {
+          trace: SV_ClipTrace(st, SV_TraceFor(map)),
+        });
+        expect(pressed?.ent.model).toBe('*34');
+      }
       expect(b34.state).toBe('going_up');
       // C travel: |movedir| . size - lip = 9 - 4 = 5 (not lip 4).
       expect(b34.pos2[0]! - b34.pos1[0]!).toBeCloseTo(-5, 6);
@@ -1989,8 +2095,8 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       // The pressed *34 sits flush: clip == shifted bounds + travelled offset.
       expect([...b34.ent.origin]).toEqual([...b34.pos2]);
       const b34box = SV_MoverClipBox(st, b34)!;
-      expect([...b34box.mins]).toEqual([-1708, 1472, 120]);
-      expect([...b34box.maxs]).toEqual([-1699, 1504, 152]);
+      expect([...b34box.mins]).toEqual([-1708, 1520, 160]);
+      expect([...b34box.maxs]).toEqual([-1699, 1552, 192]);
       // The waiting train's clip sits exactly on its brush (no stale
       // offset); deck top 0 over pit floor -48 was never a step-up.
       expect(train.started).toBe(false);
@@ -2213,10 +2319,10 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     // spawns NO touch trigger — think = Think_CalcMoveSpeed, not
     // Think_SpawnDoorTrigger. Base1's *31 plug (targetname t4) therefore
     // ignores the camper that opens the *32/*33 sliders; only the *34
-    // button (t4, C button_touch — touchable: no targetname, no health)
-    // lowers it. The old build touch-opened *31 (the reported "elevator
-    // descends as its door opens"), so the *31 leg below is a negative
-    // control plus the C-intended button cycle.
+    // button (t4 — E-use aimed at the over-door housing) lowers it. The
+    // old build touch-opened *31 (the reported "elevator descends as its
+    // door opens"), so the *31 leg below is a negative control plus the
+    // C-intended button cycle.
     const { map } = loadBase1();
     const dicts = parseEntities(map.entities);
     const doorDicts = dicts.filter((d) => d.classname === 'func_door');
@@ -2289,22 +2395,38 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     for (let i = 0; i < 30; i++) SV_Tick(st, 0.1);
     expect(d31.state).toBe('bottom');
     expect([...d31.ent.origin]).toEqual([...d31.pos1]);
-    // C-intended opener: lean into the *34 platform button (touchable —
-    // no targetname, no health). The button fires t4 on reaching the TOP
-    // (id button_wait), the plug drops the full 156, holds the C-default
-    // 3s wait at the top, returns, and answers a second press (repeat use).
-    // RELEASE-4: *34 housing moved 145E-48Y (lump entombed 5u in the shut
-    // plug, Y south-gap visible without blocking central); lean into the
-    // shifted touch box from the plug east face south-gap center.
+    // C-intended opener: press the *34 platform button (touchable in C terms —
+    // no targetname, no health — but the over-door housing overlaps no hull,
+    // so the production press is an aimed E-use from the slot face). The
+    // button fires t4 on reaching the TOP (id button_wait), the plug drops
+    // the full 156, holds the C-default 3s wait at the top, returns, and
+    // answers a second press (repeat use).
+    // RELEASE-4: *34 housing moved 145E+40U (lump entombed 5u in the shut
+    // plug) to hover centered above the doorway; aim from the slot face.
     const b34 = st.movers.find((m) => m.ent.model === '*34')!;
     expect(b34.ent.target).toBe('t4');
     expect(b34.wait).toBe(3); // C SP_func_button default, not 1
-    const lean = SV_TouchButtonsAt(
-      st,
-      { origin: v3(-1688, 1488, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
-      'player',
-    );
-    expect(lean.map((m) => m.ent.model)).toContain('*34');
+    const use34 = (): void => {
+      const box = SV_MoverClipBox(st, b34)!;
+      const ctr = v3((box.mins[0]! + box.maxs[0]!) / 2, (box.mins[1]! + box.maxs[1]!) / 2, (box.mins[2]! + box.maxs[2]!) / 2);
+      const eye = v3(-1688, 1536, 142);
+      const dx = ctr[0]! - eye[0]!, dy = ctr[1]! - eye[1]!, dz = ctr[2]! - eye[2]!;
+      const len = Math.hypot(dx, dy, dz);
+      expect(len).toBeLessThan(96);
+      const pressed = SV_UseButton(st, eye, v3(dx / len, dy / len, dz / len), {
+        trace: SV_ClipTrace(st, SV_TraceFor(map)),
+      });
+      expect(pressed?.ent.model).toBe('*34');
+    };
+    // Touch alone can never press the over-door housing (no hull overlap).
+    expect(
+      SV_TouchButtonsAt(
+        st,
+        { origin: v3(-1688, 1536, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+        'player',
+      ).map((m) => m.ent.model),
+    ).not.toContain('*34');
+    use34();
     let guard = 0;
     while (d31.state === 'bottom' && guard++ < 20) SV_Tick(st, 0.1);
     expect(d31.state).toBe('going_up');
@@ -2317,13 +2439,9 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(d31.state).toBe('bottom');
     expect(d31.ent.origin[2]!).toBeCloseTo(d31.pos1[2]!, 3);
     // repeat use: the button returned to BOTTOM on its own 3s cycle, so a
-    // second lean re-fires and the plug drops again.
+    // second E-use re-fires and the plug drops again.
     expect(b34.state).toBe('bottom');
-    SV_TouchButtonsAt(
-      st,
-      { origin: v3(-1688, 1488, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
-      'player',
-    );
+    use34();
     guard = 0;
     while (d31.state === 'bottom' && guard++ < 20) SV_Tick(st, 0.1);
     expect(d31.state).toBe('going_up');

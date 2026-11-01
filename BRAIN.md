@@ -7,11 +7,14 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-11-01, RELEASE-4 visible entry done): elevator entry
-> fixed with render-vs-collision parity and multi-offset visible-doorway gates;
-> next is shootable-button art states (RELEASE-16). Software underwater warping
-> is user-confirmed correct. Preserve landed patrol/tooltip/elevator repairs;
-> §8 is the only active queue.**
+> **Current direction (2026-11-01, over-door + standing-guard + button-anim
+> landed): elevator entry is fixed without side routes (over-door housing,
+> genuine-standing finish guard) and secret-button art states are implemented
+> (C frame/effects end to end) — both in review awaiting the user's browser
+> verdicts. Software underwater warping is user-confirmed correct (source
+> parity: eye-under warp is soft-only, GL is tint-only — no code change).
+> Preserve landed patrol/tooltip/elevator/button repairs; §8 is the only
+> active queue.**
 
 ---
 
@@ -268,10 +271,17 @@ Latest changes: `b1123a4` elevator button relocation/boarding guard, `1f5d982`
 patrol arrival wait and live-route checks, `00c5790` underwater audit, `e11cfe0`
 custom tooltips, plus this session's render-vs-collision parity (BUTTON_34_SHIFT
 145,-48, visual==collision, C 96 reach) and multi-offset visible-doorway gates.
-Preserve valid increments. RELEASE-4 reopened entry is now fixed (archived DONE
-above supersedes both the old side-route and the reopened blockage); awaiting
-user verdict on the visible route. Software underwater warp is explicitly
-confirmed correct; no further software warp redesign is requested.
+User retest: south-half entries still blocked on the south-gap housing, and the
+ground-only aboard guard finished on face leans via contact-rest graze. This
+session answers both: BUTTON_34_SHIFT is now [145,0,40] (over-door housing,
+out of every walk line, E-use-only) and SV_StandingOn requires the latched
+ground link PLUS feet on the live box top PLUS footprint (face leans open
+without finishing; boarding still finishes exactly once). RELEASE-16 is
+implemented end to end (Mover fx/frame, chain bake, per-tick pick, sw drift
+invalidation, WebGL2 range re-sync). Preserve valid increments. Both repair
+lanes are in review below awaiting the user's browser verdicts. Software
+underwater warp is explicitly confirmed correct; no further software warp
+redesign is requested.
 
 Patrol and custom-tooltip cards remain archived with their evidence; omission
 from this feedback is not a new visual sign-off. Sky fixes, software support,
@@ -279,17 +289,69 @@ legacy Voodoo retirement and recorded FOLLOW-5 approval remain preserved. GPU
 stays experimental pending integrated/display acceptance. Display absence does
 not block gameplay or button-texture repairs.
 
-Priority: RELEASE-16 (RELEASE-4 done, awaiting user verdict); RELEASE-15 retains
+Priority: user verdicts on RELEASE-4B + RELEASE-16; RELEASE-15 retains
 only the narrower OpenGL comparison uncertainty. Claim one card; use disjoint
 ownership for independent work and run expensive validation sequentially.
 Actual entry/visual symptoms need production-browser evidence, not a direct
 target invocation or synthetic render. Separate implementation, automated
 results and user verdicts.
 
+### RELEASE-4B — Over-door housing + genuine-standing finish guard
+owns: `packages/server`, `apps/web`, `packages/testkit`
+depends: none
+status: review (automated green; awaiting user browser verdict)
+user-contract: walk onto the waiting/open final elevator at ANY doorway
+offset, then press its button to finish and show frozen F1 completion stats.
+Boarding alone never finishes; face leans never finish.
+lane-report: south-gap housing blocked south-half entries at head height;
+ground-only aboard guard finished on face leans (contact rest parks the body
+overlapping the clip, latching its num with deck feet). Fix: over-door
+housing [145,0,40] (1u off the shut face, west of the slider plane, 8u above
+every hull, E-use-only, both E-use endpoints west of the sliders so LOS never
+crosses them); SV_StandingOn (ground link + feet within 4u of the live box
+top + hull-margin footprint, latched with the ground every tick and E-use).
+No noclip/teleport/collision bypass; C 96 reach; first-reason-wins.
+evidence: server base1 33/33 (rest/pressed housing boxes, PART B + repeat
+E-use, boarding walk with no phantom obstruction, traversal E-use endgame,
+face-lean no-finish + boarding finish); web release-4-trace 6/6 (box-4
+Y 1492/1536/1568: visual==collision, face stop owns the plug mover, E-use
+opens with t4 and no finish, board ge==plug origin 112 no finish, aboard
+E-use finishes 'lift' once, F1 frozen; box-3b outside-press guard intact),
+elevator 1/1, elevator-ride-gate 1/1, base1-gate 24/24; typecheck clean.
+Y 1488.0-exact grazes the open *32 edge plane and reads contact — C-identical
+1/32-rest + DIST_EPSILON corner behavior, unholdable in play; the gate uses
+Y 1492 (still inside the old housing's band, so the regression stands).
+done-when:
+- [x] Reproduce the blockage from the visible doorway and fix the
+blocking state/geometry/activation locally, preserving waiting and valid
+mover/button fixes.
+- [x] Normal entry onto the platform at multiple offsets → reachable button
+press → exactly one finished state with F1 time/kills/secrets/goals; no
+hidden preliminary contact or aim point; outside/unrelated/duplicate
+finish triggers still rejected (incl. the face-lean graze).
+- [x] Browser and real-base1 regressions for the user-visible entry without
+repositioning inside the route or directly firing targets.
+- [ ] User browser verdict on the visible route (walk on, press button, F1).
+
 ### RELEASE-16 — Shootable secret-button texture/lighting states
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/sw-renderer`, `packages/webgl-renderer`, `packages/testkit`
 depends: none
-status: ready
+status: review (automated green; awaiting user visual verdict)
+lane-report 2026-11-01: the button is base1 *13 (func_button, target t91,
+wait -1, health 1); its up/down faces carry 4-frame +0btshoot chains, sides
+are static box1_1. frame/effects were never modeled, submitted, or selected
+(always base texture = always lit). Now: Mover fx/frame with C transitions,
+buttonAnimFrame client rule, texinfo-next chain bake (animTexIds),
+per-tick DoorSync pick, sw texId-drift invalidation, WebGL2 range re-sync
+(no re-upload). Damage activation, target firing, travel (+4z TOP hold) and
+illumination otherwise untouched.
+evidence: game 259/259; sw-renderer 189/189; web button-anim 4/4 (real base1:
+*13 shot swaps ANIM01->ANIM23 with travel/secret preserved, repeat shots
+never re-fire, *34 cycle ANIM01->ANIM23->ANIM23->ANIM01 + 2Hz rest flips,
+WebGL2 scene handles follow live texIds, forced-frame negative control fails
+the held assertion and moves only button pixels); webgl-renderer button-anim
+3/3 (stub-GL rebind without re-upload, no-chain negative control,
+scene-side handles); underwater 13/13 unaffected; typecheck clean.
 user-report: near **(-2146.2, 1556.6, -24)** the secret's shootable button is always lit; its inward motion when shot is correct and must be preserved.
 review-finding: original `game/g_func.c` changes `s.frame` and animation flags: button_wait selects frame 1 and EF_ANIM23; button_return resets frame 0; button_done restores EF_ANIM01. Physical mover position alone is not the complete visual state. The specific brush/material at this camera still needs identification; do not assume every button shares the same art.
 done-when:
@@ -303,6 +365,12 @@ depends: none
 status: review (Software appearance user-confirmed; original OpenGL comparison remains unverified)
 review-finding: `a42e951` adds contents tint on both backends and full-frame software warp; WebGL2 gets tint only. Local original `ref_soft` uses D_WarpScreen, whereas reviewed `ref_gl/gl_rmain.c` uses normal projection and polyblend, with no corresponding RDF_UNDERWATER screen-warp path. Animated water surface UVs are a separate effect. This source finding does not replace a matched visual check of the user's observation.
 user-verdict 2026-10-31: Software underwater warping renders correctly; preserve it. This is not a request to add the software warp to WebGL2.
+distortion-answer 2026-11-01 (source parity, no code change): neither original
+backend refracts objects seen through the surface. ref_soft warps the FULL
+screen only while the eye is under contents (D_WarpScreen + R_CalcPalette);
+ref_gl never warps (R_PolyBlend tint quad only, zero RDF_UNDERWATER readers).
+This project matches both: software warps when submerged (preserved), WebGL2
+tints only (by design). Water-surface UV animation is separate on all sides.
 box-1 remaining scope: matched original-OpenGL-vs-project-WebGL2 captures (eye above/below/crossing, engine/version/map/camera/FOV/time/contents + screenshots or video) plus the user verdict on warp vs tint vs refraction. No headless path to a running original binary in this environment.
 done-when:
 - [ ] Compare matched original OpenGL and project views: eye above water looking at submerged objects, eye below water, and crossing the surface. Record engine/version, map/camera/FOV/time, contents and screenshots/video. Distinguish surface animation, full-screen warp, tint and genuine refraction; identify the observed distortion rather than adding an invented effect.

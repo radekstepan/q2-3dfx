@@ -13,6 +13,16 @@ export const MOVER_GOING_UP = 'going_up';
 export const MOVER_GOING_DOWN = 'going_down';
 export const MOVER_WAITING = 'waiting';
 
+/**
+ * Button texture-animation effects (game/q_shared.h: EF_ANIM01 = 0x400,
+ * EF_ANIM23 = 0x800): SP_func_button installs ANIM01 at spawn (cycles frames
+ * 0-1 at 2Hz); button_wait swaps to ANIM23 + s.frame 1 (frames 2-3);
+ * button_return resets s.frame 0 (still ANIM23 while closing); button_done
+ * restores ANIM01. Doors/plats never carry these (fx 0).
+ */
+export const EF_ANIM01 = 0x400;
+export const EF_ANIM23 = 0x800;
+
 export interface Mover {
   ent: Edict;
   pos1: Vec3;
@@ -21,6 +31,10 @@ export interface Mover {
   wait: number; // seconds at top before returning (-1 = stay)
   lip: number;
   state: string;
+  /** C s.effects animation bits (func_button EF_ANIM01/23; 0 otherwise). */
+  fx: number;
+  /** C s.frame (button_wait sets 1, button_return resets 0). */
+  frame: number;
   /** time at which the current leg finishes */
   legEnd: number;
   /** time at which a waiting mover should start returning (or -1) */
@@ -89,6 +103,8 @@ export function spawnDoor(ent: Edict, angleDeg: number, distance: number): Mover
     wait: ent.wait === 0 ? 3 : ent.wait,
     lip,
     state: ent.spawnflags & DOOR_START_OPEN ? MOVER_TOP : MOVER_BOTTOM,
+    fx: 0,
+    frame: 0,
     legEnd: 0,
     waitEnd: -1,
   };
@@ -109,6 +125,8 @@ export function spawnPlat(ent: Edict, height: number): Mover {
     wait: ent.wait === 0 ? 3 : ent.wait,
     lip,
     state: MOVER_BOTTOM,
+    fx: 0,
+    frame: 0,
     legEnd: 0,
     waitEnd: -1,
   };
@@ -132,11 +150,28 @@ export function spawnButton(ent: Edict, angleDeg: number): Mover {
     wait: ent.wait === 0 ? 3 : ent.wait,
     lip,
     state: MOVER_BOTTOM,
+    // C SP_func_button: s.effects |= EF_ANIM01 at spawn (cycles frames 0-1).
+    fx: EF_ANIM01,
+    frame: 0,
     legEnd: 0,
     waitEnd: -1,
   };
   ent.state = m.state;
   return m;
+}
+
+/**
+ * Client entity frame for a button (client/cl_ents.c): ANIM01 cycles frames
+ * 0-1 at 2Hz, ANIM23 cycles 2-3 at 2Hz, otherwise the server s.frame holds.
+ * `timeSec` is level time (deterministic; C uses cl.time, same 2Hz phase).
+ * The renderer takes this modulo the texture chain length
+ * (R_TextureAnimation, ref_soft/r_surf.c + ref_gl/gl_rsurf.c).
+ */
+export function buttonAnimFrame(fx: number, frame: number, timeSec: number): number {
+  const auto = Math.floor(timeSec * 2) & 1;
+  if (fx & EF_ANIM01) return auto;
+  if (fx & EF_ANIM23) return 2 + auto;
+  return frame;
 }
 
 export function moverUse(m: Mover, now: number): void {
@@ -159,6 +194,9 @@ export function moverUse(m: Mover, now: number): void {
 /** Advance one mover to `now` (seconds). Returns true when a leg completed. */
 export function moverThink(m: Mover, now: number): boolean {
   const o = m.ent.origin;
+  // C button art lives only on func_button (SP_func_button installs
+  // EF_ANIM01; button_wait/button_return/button_done mutate frame/effects).
+  const isBtn = m.ent.classname === 'func_button';
   if (m.state === MOVER_GOING_UP || m.state === MOVER_GOING_DOWN) {
     const dest = m.state === MOVER_GOING_UP ? m.pos2 : m.pos1;
     const { dir, dist } = dirBetween(o, dest);
@@ -167,6 +205,12 @@ export function moverThink(m: Mover, now: number): boolean {
       o[1] = dest[1]!;
       o[2] = dest[2]!;
       if (m.state === MOVER_GOING_UP) {
+        // C button_wait: state TOP, ANIM01 -> ANIM23, G_UseTargets,
+        // s.frame 1 (target firing itself happens in the server tick).
+        if (isBtn) {
+          m.fx = (m.fx & ~EF_ANIM01) | EF_ANIM23;
+          m.frame = 1;
+        }
         m.state = MOVER_TOP;
         if (m.wait < 0 || m.ent.spawnflags & DOOR_TOGGLE) {
           m.waitEnd = -1;
@@ -175,6 +219,8 @@ export function moverThink(m: Mover, now: number): boolean {
           m.waitEnd = now + m.wait;
         }
       } else {
+        // C button_done: state BOTTOM, ANIM23 -> ANIM01 (frame stays 0).
+        if (isBtn) m.fx = (m.fx & ~EF_ANIM23) | EF_ANIM01;
         m.state = MOVER_BOTTOM;
         m.waitEnd = -1;
       }
@@ -191,6 +237,8 @@ export function moverThink(m: Mover, now: number): boolean {
   }
   if (m.state === MOVER_WAITING && m.waitEnd >= 0 && now >= m.waitEnd) {
     m.state = MOVER_GOING_DOWN;
+    // C button_return: s.frame 0 while closing (effects stay ANIM23).
+    if (isBtn) m.frame = 0;
     const { dist } = dirBetween(o, m.pos1);
     m.legEnd = now + (m.speed > 0 ? dist / m.speed : 0);
     m.ent.state = m.state;

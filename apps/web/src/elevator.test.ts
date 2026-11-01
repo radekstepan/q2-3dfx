@@ -135,31 +135,38 @@ describe.runIf(!!WEB_Q2_PAK)('final elevator report repro (Q2_PAK)', () => {
     expect(fired.has('t91')).toBe(false);
 
     // Phase 3 — the C-intended plug opener: press the *34 platform button.
-    // RELEASE-4: *34 housing is east-face south-gap (-1703..-1694,1472..1504),
-    // visible in the open-slider gap, 1u east of the shut plug face. Press
-    // from the east-face lean ([-1688,1488] overlaps via hull+slop, touch) —
-    // the west alcove (-1860,1536) no longer presses (lump west-face entombed,
-    // collision moved east — render-vs-collision fix). The plug drops the
-    // full 156 on the press, holds the C-default ~3s at the top, and returns
-    // — while the lift sits out the whole cycle. The reported "elevator rides
-    // down" is this C-correct plug motion, never the lift.
+    // RELEASE-4: *34 housing hovers centered above the doorway
+    // (-1703..-1694, 1520..1552, 160..192) — visible, out of every walk line,
+    // E-use-only (no hull overlap at any stance, so touch can never fire).
+    // Press from the slot face ([-1688,1536], aimed E-use at the live bounds
+    // center, ~36u). The plug drops the full 156 on the press, holds the
+    // C-default ~3s at the top, and returns — while the lift sits out the
+    // whole cycle. The reported "elevator rides down" is this C-correct plug
+    // motion, never the lift.
     const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
     const btn34 = driver.server.movers.find((m) => m.ent.model === '*34')!;
     expect(btn34.wait).toBe(3); // C SP_func_button default (not 1)
-    driver.pm.origin = v3(-1688, 1488, 120);
+    driver.pm.origin = v3(-1688, 1536, 120);
     driver.pm.velocity = v3();
     let t4seen = false;
     for (let i = 0; i < 10 && !t4seen; i++) {
       SV_SetPlayerHealth(driver.server, 100);
-      driver.step(neutralCmd(), 0.1);
+      const b = driver.server.moverBounds.get(btn34.ent.num)!;
+      const cx = (b.mins[0]! + b.maxs[0]!) / 2, cy = (b.mins[1]! + b.maxs[1]!) / 2, cz = (b.mins[2]! + b.maxs[2]!) / 2;
+      const ex = driver.pm.origin[0]!, ey = driver.pm.origin[1]!, ez = driver.pm.origin[2]! + 22;
+      const dx = cx - ex, dy = cy - ey, dz = cz - ez;
+      const lh = Math.hypot(dx, dy) || 1;
+      const pitch = (Math.atan2(-dz, lh) * 180) / Math.PI;
+      const yaw = (Math.atan2(dy, dx) * 180) / Math.PI;
+      driver.step({ msec: 100, angles: [pitch, yaw, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_USE }, 0.1);
       for (const t of driver.server.firedThisTick) fired.add(t);
       if (driver.server.firedThisTick.includes('t4')) t4seen = true;
     }
-    expect(t4seen, 'the alcove press fired t4').toBe(true);
+    expect(t4seen, 'the face E-use fired t4').toBe(true);
     expect(btn34.state).not.toBe('bottom');
-    // Leave the overlap at once: a parked rider would re-fire t4 every
-    // button cycle and stretch the door's hold.
-    driver.pm.origin = v3(-1669, 1514, 120);
+    // Step out of the slot at once: the E-use press holds no overlap (the
+    // housing is above every hull), so nothing re-fires t4 from here.
+    driver.pm.origin = v3(-1669, 1536, 120);
     driver.pm.velocity = v3();
     let guard = 0;
     while (plug.ent.origin[2]! > -155 && guard++ < 100) {

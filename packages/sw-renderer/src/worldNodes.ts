@@ -49,6 +49,15 @@ export interface MiniSurf {
   lux: Float32Array;
   n: number;
   texId: number;
+  /**
+   * Animated-texture chain (R_TextureAnimation, r_surf.c): texIds of the
+   * texinfo `next` chain starting with this surface's own texture ([0] ===
+   * texId at bake). Present only when the chain has >1 frame (base1 button
+   * faces like +0btshoot1..3). The submission layer (web DoorSync) writes
+   * the picked frame into texId per frame from the mover's fx/frame/time;
+   * renderers treat texId as live and invalidate on drift.
+   */
+  animTexIds?: number[];
   lightId: number;
   center: Float32Array;
   radius: number;

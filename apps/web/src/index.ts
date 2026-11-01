@@ -9,6 +9,7 @@ import {
   attachBrowserPool,
   bootPlay,
   createAsyncLoopState,
+  detachGpuBackend,
   getMapSource,
   getResolution,
   measureFrameStages,
@@ -49,7 +50,7 @@ export {
   TOOLTIP_TEXT_ATTR,
 } from './tooltip.js';
 export type { TooltipAnchorRect, TooltipPlacement, TooltipSize, TooltipViewport } from './tooltip.js';
-export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpExplosionLights, pumpBoltLights, pumpTracers, registerPakModels, replayPakAssetsToGpu, retainedSkyFromPak, syncGpuSky, loadSkyStrip, skyNameForMap, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, posHudAnchor, formatFpsText, fpsVisible, posVisible, formatPlayerPos, playerPosText, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, resizePlay, reservedDisplaySize, applyReservedSizeToCanvas, applyRendererCvar, buildHudPicCache, statusbarStateFor, drawStatusbarCmds, drawHelpOverlay, toggleHelpOverlay, RETAIL_SINGLE_STATUSBAR, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, POS_GREY, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, detectGpuCapability, getGpuStatus, resolveBootRenderer, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
+export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpExplosionLights, pumpBoltLights, pumpTracers, registerPakModels, replayPakAssetsToGpu, retainedSkyFromPak, syncGpuSky, loadSkyStrip, skyNameForMap, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, posHudAnchor, formatFpsText, fpsVisible, posVisible, formatPlayerPos, playerPosText, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, resizePlay, reservedDisplaySize, applyReservedSizeToCanvas, applyRendererCvar, detachGpuBackend, buildHudPicCache, statusbarStateFor, drawStatusbarCmds, drawHelpOverlay, toggleHelpOverlay, RETAIL_SINGLE_STATUSBAR, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, POS_GREY, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, detectGpuCapability, getGpuStatus, offeredRendererOptions, resolveBootRenderer, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
 export type { PakModelHandles, RetainedModelAsset, RetainedPakAssets, RetainedSkinAsset, TracerBeam, RetainedSky, HudPicCache } from './play.js';
 export { setPanelRefreshHook } from './play.js';
 export {
@@ -328,6 +329,11 @@ if (typeof document !== 'undefined') {
     let lastName: string | undefined;
     const startWithPak = (pak: WebPak | null, name?: string): void => {
       current?.stop();
+      // Dispose the replaced boot's GPU backend (when live) before booting
+      // fresh: abandoning it strands GL resources, lifecycle listeners and
+      // the GL canvas, and repeated reboots exhaust the page's WebGL context
+      // budget until every webgl request spuriously falls back to software.
+      if (currentBoot) detachGpuBackend(currentBoot);
       lastPak = pak;
       lastName = name;
       // Map-source dropdown: the pak appears in the list from now on, and
@@ -351,6 +357,11 @@ if (typeof document !== 'undefined') {
       dom.setModeReadout(mode, 0);
       if (topPak) topPak.textContent = effective ? `pak0.pak · ${pak?.entries.length} lumps` : 'pak0.pak · not cached';
       dom.pushConsoleLog(name ? `loaded ${name}: ${pak?.entries.length} entries` : 'video subsystem ready · awaiting changes', 'ok');
+      // A webgl request that fell back to software must say why HERE (not
+      // just in devtools): otherwise the menu shows the WebGL choice while
+      // every row behaves software.
+      if (boot.lastRendererWarning !== null) dom.pushConsoleLog(boot.lastRendererWarning, 'warn');
+      if (boot.lastRendererWarning !== null) dom.pushConsoleLog('no WebGL2? check chrome://gpu, or devtools: document.createElement(\'canvas\').getContext(\'webgl2\')', 'info');
     };
     // Skill/map-source changes reboot the level at once (id latches them;
     // the menu applies them immediately by re-calling the boot path).
@@ -364,7 +375,15 @@ if (typeof document !== 'undefined') {
         // RELEASE-10: the effective renderer (incl. failed-GPU fallback) may
         // have changed — re-render the menu so capability labels stay live.
         renderCvars();
-        dom.pushConsoleLog(`vid_ref "${cvarName}" hot-swapped in place`, 'cmd');
+        // Surface a failed-GPU fallback where the user can see it: the menu
+        // keeps showing the requested WebGL choice while every row follows
+        // the effective software renderer, so the reason belongs in the
+        // console panel, not just devtools.
+        const warning = currentBoot?.lastRendererWarning ?? null;
+        if (warning !== null) {
+          dom.pushConsoleLog(warning, 'warn');
+          dom.pushConsoleLog('no WebGL2? check chrome://gpu, or devtools: document.createElement(\'canvas\').getContext(\'webgl2\')', 'info');
+        } else dom.pushConsoleLog(`vid_ref "${cvarName}" hot-swapped in place`, 'cmd');
         return;
       }
       if (cvarName === 'vid_resolution') {

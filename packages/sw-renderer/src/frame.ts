@@ -410,6 +410,17 @@ export class SoftwareRenderer implements Refresh {
    */
   private styleHashStyles: Float32Array | null = null;
   private boundsWorld: MiniWorld | null = null;
+  /**
+   * Live-texture drift stamp (RELEASE-16 button texture animation): the
+   * surface cache key is (surface, styles, mip), so a submission-side texId
+   * swap (animated button frame picked per tick by the driver) would serve
+   * stale texels. Last-seen texId per surface, world-gated like surfBounds;
+   * on drift the surface's entries are dropped before the cache lookup, so
+   * the new frame builds (and serves) in the same frame. Steady state is one
+   * compare per visible surface; flips invalidate only the flipped faces.
+   */
+  private texStampWorld: MiniWorld | null = null;
+  private texStamp = new Int32Array(0);
   private polyInput: PolyInput = {
     verts: new Float32Array(0), uvs: new Float32Array(0), lux: new Float32Array(0), n: 0,
   };
@@ -978,6 +989,27 @@ export class SoftwareRenderer implements Refresh {
   }
 
   /**
+   * Live-texture drift gate (RELEASE-16): call before the surface-cache
+   * lookup. When the submission layer swapped surf.texId since this surface
+   * was last seen (animated button frame), drop its cached entries so the
+   * lookup below misses and rebuilds from the new texels in the same frame.
+   * World-gated (surface ids are world-relative); steady state is one array
+   * compare per visible surface, zero invalidation traffic.
+   */
+  private noteSurfaceTex(world: MiniWorld, surf: MiniSurf): void {
+    if (this.texStampWorld !== world || this.texStamp.length < world.surfaces.length) {
+      this.texStampWorld = world;
+      this.texStamp = new Int32Array(world.surfaces.length).fill(-1);
+    }
+    const id = surf.id;
+    if (id < 0 || id >= this.texStamp.length) return;
+    if (this.texStamp[id]! !== surf.texId) {
+      if (this.texStamp[id]! !== -1) this.cache.invalidateSurfaces([id]);
+      this.texStamp[id] = surf.texId;
+    }
+  }
+
+  /**
    * Surgical dlight invalidation: invalidate the union of the previous
    * frame's touched set and the current frame's affected set (both sorted
    * ascending — markLights sorts, and lastTouched is always a copy of a
@@ -1438,6 +1470,7 @@ export class SoftwareRenderer implements Refresh {
         this.styleHashStyles = view.lightStyles;
       }
       if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
+      this.noteSurfaceTex(worldData, surf);
       let block: SurfaceBlock | null = this.cache.get(surf.id, stylesHash, mip);
       if (!block) {
         // copy the style scales out of scratch (build is a miss-only path;
@@ -1585,6 +1618,7 @@ export class SoftwareRenderer implements Refresh {
         this.styleHashStyles = view.lightStyles;
       }
       if (ph) { ph.cull += phaseNow() - pt; pt = phaseNow(); }
+      this.noteSurfaceTex(worldData, surf);
       let block: SurfaceBlock | null = this.cache.get(surf.id, stylesHash, mip);
       if (!block) {
           // Shared scratch (task 6, same contract as the world miss path).

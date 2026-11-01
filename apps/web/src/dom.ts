@@ -6,7 +6,7 @@
 import { getCVar, getCVarNumber, getCVarString, isCVarSupportedBy, listCVars, registerCVar, setCVarFromString, supportReason, sVolumeToOutputGain } from '@q2/config';
 import type { EffectiveRenderer } from '@q2/config';
 import { availableMapSources } from './play.js';
-import { resolveBootRenderer } from './gpu-select.js';
+import { offeredRendererOptions, resolveBootRenderer } from './gpu-select.js';
 import {
   attachPanelTooltips,
   hidePanelTooltip,
@@ -1098,7 +1098,13 @@ function renderCvarRow(
     bindControlId(select, controlId);
     // Reflect out-of-list values (e.g. sw_workers=8, r_brightness=1.1)
     // instead of silently showing the wrong preset.
-    const choices = options.includes(current) ? options : [current, ...options];
+    // vid_renderer only offers backends this device can actually run: on a
+    // WebGL-less browser the WebGL choice is a dead entry that silently falls
+    // back, so it is not listed (see offeredRendererOptions). A saved but
+    // currently-unrunnable value still shows (prepended below) with the
+    // fallback reason in its tooltip — the choice is retained, not rewritten.
+    const offered = name === 'vid_renderer' ? offeredRendererOptions() : options;
+    const choices = offered.includes(current) ? offered : [current, ...offered];
     // Labeled domains (skill 0-3 → Easy/Medium/Hard/Nightmare, resolution
     // WxH → 320×240…) persist the bare value; the label is display-only.
     const labels = cvarOptionLabels(name);
