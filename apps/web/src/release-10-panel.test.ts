@@ -33,9 +33,15 @@ import {
   effectivePanelRenderer,
   renderCvarPanel,
 } from './dom.js';
+import {
+  getTooltipText,
+  hasNativeTitle,
+  resetPanelTooltipForTests,
+} from './tooltip.js';
 
 afterEach(() => {
   resetCVars();
+  resetPanelTooltipForTests();
   setPanelRefreshHook(null);
   const g = globalThis as unknown as { document?: unknown };
   if (g.document instanceof FakeDocument) g.document = undefined;
@@ -155,6 +161,10 @@ function expectMatrix(active: 'software' | 'webgl2-experimental'): void {
       expect(control.getAttribute('disabled'), `${name} has no disabled attribute`).toBeNull();
       expect(control.getAttribute('tabindex'), `${name} has no wrapper tab stop`).toBeNull();
       expect(row.children.some((c) => c.className === 'q2-cvar-why')).toBe(false);
+      // Converted elements carry the shared custom tooltip, never a
+      // duplicate native popup.
+      expect(hasNativeTitle(control), `${name} has no native title`).toBe(false);
+      expect(hasNativeTitle(row), `${name} row has no native title`).toBe(false);
     } else {
       // Real `disabled` attribute + tooltip-only reason (no visible text) +
       // screen-reader label + keyboard-focusable wrapper (tabindex) for the
@@ -163,8 +173,14 @@ function expectMatrix(active: 'software' | 'webgl2-experimental'): void {
       const reason = supportReason(name, active);
       expect(reason.length).toBeGreaterThan(0);
       expect(row.children.some((c) => c.className === 'q2-cvar-why'), `${name} has no visible reason text`).toBe(false);
-      expect(control.title).toContain(reason);
-      expect(row.title).toContain(reason);
+      // Shared custom tooltip (description + disabled reason) with no
+      // duplicate native popup on any converted element.
+      expect(getTooltipText(control)).toContain(reason);
+      expect(getTooltipText(row)).toContain(reason);
+      expect(getTooltipText(row.children[0])).toContain(reason);
+      expect(hasNativeTitle(control), `${name} control has no native title`).toBe(false);
+      expect(hasNativeTitle(row), `${name} row has no native title`).toBe(false);
+      expect(hasNativeTitle(row.children[0]), `${name} label has no native title`).toBe(false);
       // Row child count is identical to the enabled shape (label + control —
       // no extra visible note node, so no layout shift).
       expect(row.children).toHaveLength(2);
@@ -381,7 +397,8 @@ describe('RELEASE-10 panel fallback refresh + value retention', () => {
       expect(back.control.disabled).toBe(true);
       expect(back.row.children.filter((c) => c.className === 'q2-cvar-why')).toHaveLength(0);
       expect(back.row.children).toHaveLength(2);
-      expect(back.control.title).toContain(supportReason('vd_dither', 'software'));
+      expect(getTooltipText(back.control)).toContain(supportReason('vd_dither', 'software'));
+      expect(hasNativeTitle(back.control)).toBe(false);
       expect(back.control.getAttribute('tabindex')).toBe('0');
       // rebootPlay preserves the mapping (renderer unchanged headless).
       const boot = bootPlay({ width: 64, height: 64 });

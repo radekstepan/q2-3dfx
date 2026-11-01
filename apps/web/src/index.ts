@@ -31,6 +31,24 @@ export type { WebPak, WebPakEntry } from './pak.js';
 export { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';export { blitToCanvas, blitCopyRGBA, blitIsLittleEndian, attachDropZone, renderCvarPanel, setProgress, startPlayLoop, showFpsEnabled, showPosEnabled, cvarIsCheckbox, CHECKBOX_CVARS, cvarOptions, cvarControlKind, cvarOptionLabels, cvarDescription, CVAR_DESCRIPTIONS, skillLabel, skillValueForLabel, SKILL_LABELS, RESOLUTION_LABELS, MAP_SOURCE_LABELS, VID_RENDERER_LABELS, setMapSourceHasPak, getMapSourceHasPak, REBOOT_CVARS, cvarNeedsReboot, CVAR_OPTIONS, pushConsoleLog, clearConsoleLog, resetConsoleLog, getConsoleLines, renderConsoleLines, attachConsoleClear, setModeReadout, MAX_CONSOLE_LINES } from './dom.js';
 export type { PlayLoop, ConsoleKind, ConsoleLine } from './dom.js';
 export { effectivePanelRenderer } from './dom.js';
+export {
+  attachPanelTooltips,
+  computeTooltipPosition,
+  getTooltipText,
+  hasNativeTitle,
+  hidePanelTooltip,
+  isPanelTooltipVisible,
+  panelTooltipText,
+  resetPanelTooltipForTests,
+  setTooltipText,
+  showPanelTooltip,
+  tooltipMaxWidthFor,
+  TOOLTIP_ID,
+  TOOLTIP_MARGIN,
+  TOOLTIP_MAX_WIDTH,
+  TOOLTIP_TEXT_ATTR,
+} from './tooltip.js';
+export type { TooltipAnchorRect, TooltipPlacement, TooltipSize, TooltipViewport } from './tooltip.js';
 export { drawPlayHud, resolveDisplay, pumpMuzzleLight, pumpExplosionLights, pumpBoltLights, pumpTracers, registerPakModels, replayPakAssetsToGpu, retainedSkyFromPak, syncGpuSky, loadSkyStrip, skyNameForMap, loadConcharsFont, concharsFontFromPCX, fpsHudAnchor, posHudAnchor, formatFpsText, fpsVisible, posVisible, formatPlayerPos, playerPosText, getBrightness, applyBrightness, getSkill, getMapSource, availableMapSources, getResolution, parseResolution, rebootPlay, resizePlay, reservedDisplaySize, applyReservedSizeToCanvas, applyRendererCvar, buildHudPicCache, statusbarStateFor, drawStatusbarCmds, drawHelpOverlay, toggleHelpOverlay, RETAIL_SINGLE_STATUSBAR, skillInhibits, parseSpawnflags, worldModelForPickup, skinForItemModel, SKILL_DEFAULT, SKILL_MIN, SKILL_MAX, RESOLUTION_OPTIONS, RESOLUTION_DEFAULT, MAP_SOURCE_DEFAULT, MAP_SOURCE_DEVROOM, MAP_SOURCE_PAK, MAP_SOURCE_OPTIONS, CONTROLS_HINT, SHIP_MODEL, SHIP_SKIN, BANNER_MODEL, BANNER_SKIN, FPS_GREEN, POS_GREY, BRIGHTNESS_DEFAULT, BRIGHTNESS_MIN, BRIGHTNESS_MAX, detectGpuCapability, getGpuStatus, resolveBootRenderer, TRACER_TTL_FRAMES, BLASTER_TRACER_COLOR, HITSCAN_TRACER_COLOR, PELLET_TRACER_COLOR, ENEMY_TRACER_LENGTH } from './play.js';
 export type { PakModelHandles, RetainedModelAsset, RetainedPakAssets, RetainedSkinAsset, TracerBeam, RetainedSky, HudPicCache } from './play.js';
 export { setPanelRefreshHook } from './play.js';

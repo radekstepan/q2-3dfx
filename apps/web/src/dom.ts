@@ -7,6 +7,11 @@ import { getCVar, getCVarNumber, getCVarString, isCVarSupportedBy, listCVars, re
 import type { EffectiveRenderer } from '@q2/config';
 import { availableMapSources } from './play.js';
 import { resolveBootRenderer } from './gpu-select.js';
+import {
+  attachPanelTooltips,
+  hidePanelTooltip,
+  setTooltipText,
+} from './tooltip.js';
 import type { Framebuffer } from '@q2/renderer-api';
 import { ingestPak } from './pak.js';
 import type { WebPak } from './pak.js';
@@ -916,12 +921,15 @@ export function effectivePanelRenderer(active?: string | null): EffectiveRendere
 /**
  * Disable one panel control with its capability reason: a real `disabled`
  * attribute (not operable) + `aria-label` carrying the reason for screen
- * readers + extended tooltip on the WRAPPER (the q2-* custom element, which
- * still receives hover/focus — the disabled native input inside does not) +
- * `tabindex="0"` so keyboard users can focus the wrapper and read the reason
- * + `aria-disabled="true"`. Tooltip-only: no visible reason text is added
- * (RELEASE-10). Returns the full tooltip text (also applied to the row/label
- * by the caller). Headless-safe: fake nodes get the expando + recorded
+ * readers + the shared custom tooltip text on the WRAPPER (the q2-*
+ * custom element, which still receives hover/focus — the disabled native
+ * input inside does not) + `tabindex="0"` so keyboard users can focus the
+ * wrapper and read the reason + `aria-disabled="true"`. Tooltip-only: no
+ * visible reason text is added (RELEASE-10). The tooltip lives in the
+ * shared `#q2-tooltip` node (see tooltip.ts) — no native `title` is left
+ * behind, so converted elements never show a duplicate native popup.
+ * Returns the full tooltip text (also applied to the row/label by the
+ * caller). Headless-safe: fake nodes get the expando + recorded
  * attributes. Never throws.
  */
 function disablePanelControl(
@@ -938,7 +946,7 @@ function disablePanelControl(
   try {
     const el = control as {
       disabled?: boolean;
-      title?: string;
+      title?: unknown;
       setAttribute?: (k: string, v: string) => void;
     };
     el.disabled = true;
@@ -949,7 +957,8 @@ function disablePanelControl(
       el.setAttribute?.('aria-label', label);
     } catch { /* fake node: expando below covers it */ }
     (control as Record<string, unknown>)['ariaLabel'] = label;
-    el.title = full;
+    // Shared custom tooltip text; strip the native popup source.
+    setTooltipText(control, full);
     // Wrapper path: the disabled native input inside cannot receive
     // hover/focus, so the wrapper itself must be keyboard-focusable.
     try {
@@ -980,6 +989,9 @@ export function renderCvarPanel(
   // Capability mapping keys on the EFFECTIVE renderer (explicit boot record
   // wins; otherwise live cvar + capability probe incl. failed-GPU fallback).
   const effective = effectivePanelRenderer(active ?? undefined);
+  // RELEASE-10: a rebuild replaces every row node — dismiss the shared
+  // tooltip first so no stale node/text outlives its anchor.
+  hidePanelTooltip();
   const node = container as HTMLElement;
   node.innerHTML = '';
   const names: string[] = [];
@@ -1002,6 +1014,10 @@ export function renderCvarPanel(
       names.push(name);
     }
   }
+  // RELEASE-10: wire the shared custom tooltip triggers (hover + keyboard
+  // focus, incl. disabled-control wrappers). Idempotent: re-renders and
+  // renderer switches never accumulate listeners.
+  attachPanelTooltips(node);
   return names;
 }
 
@@ -1025,10 +1041,13 @@ function renderCvarRow(
   const fullTip = reason !== null
     ? (tip ? `${tip} (disabled on ${effective}: ${reason})` : `disabled on ${effective}: ${reason}`)
     : tip;
-  if (fullTip) row.title = fullTip;
+  // RELEASE-10: the shared custom tooltip owns all hover/focus text — set
+  // it off-band and strip the native `title` so converted elements never
+  // show a duplicate native popup.
+  if (fullTip) setTooltipText(row, fullTip);
   const label = document.createElement('label');
   label.textContent = name;
-  if (fullTip) label.title = fullTip;
+  if (fullTip) setTooltipText(label, fullTip);
   // Keyboard access: label linked to the inner native control (real DOM
   // forwards via bindControlId; fakes keep the expando harmlessly).
   const controlId = `q2c-${name}`;
@@ -1057,7 +1076,7 @@ function renderCvarRow(
     const box = document.createElement('q2-checkbox') as unknown as Q2BoxNode;
     box.type = 'checkbox';
     box.checked = getCVarNumber(name) !== 0;
-    if (tip) box.title = tip;
+    if (tip) setTooltipText(box, tip);
     bindControlId(box, controlId);
     box.addEventListener('change', () => {
       gated(() => {
@@ -1075,7 +1094,7 @@ function renderCvarRow(
     noteDisabled(box);
   } else if (options !== null) {
     const select = document.createElement('q2-select') as unknown as Q2ValueNode;
-    if (tip) select.title = tip;
+    if (tip) setTooltipText(select, tip);
     bindControlId(select, controlId);
     // Reflect out-of-list values (e.g. sw_workers=8, r_brightness=1.1)
     // instead of silently showing the wrong preset.
@@ -1107,7 +1126,7 @@ function renderCvarRow(
   } else {
     const input = document.createElement('q2-text') as unknown as Q2ValueNode;
     input.value = current;
-    if (tip) input.title = tip;
+    if (tip) setTooltipText(input, tip);
     bindControlId(input, controlId);
     input.addEventListener('change', () => {
       gated(() => {

@@ -8,9 +8,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { getCVarNumber, getCVarString, isCVarSupportedBy, resetCVars, setCVar } from '@q2/config';
 import { bootPlay, drawPlayHud, formatPlayerPos, playerPosText, posHudAnchor, posVisible, POS_GREY } from './play.js';
 import { CHECKBOX_CVARS, cvarControlKind, cvarDescription, cvarIsCheckbox, effectivePanelRenderer, renderCvarPanel, showPosEnabled } from './dom.js';
+import { getTooltipText, hasNativeTitle, resetPanelTooltipForTests } from './tooltip.js';
 
 afterEach(() => {
   resetCVars();
+  resetPanelTooltipForTests();
   const g = globalThis as unknown as { document?: unknown };
   if (g.document instanceof FakeDocument) g.document = undefined;
 });
@@ -270,7 +272,7 @@ describe('player position readout (in-canvas conchars, top-left, cl_showpos)', (
     }
   });
 
-  it('checkbox rows expose their description as a title tooltip', () => {
+  it('checkbox rows expose their description via the shared custom tooltip (no native title)', () => {
     const { prev } = install();
     try {
       resetCVars();
@@ -278,9 +280,12 @@ describe('player position readout (in-canvas conchars, top-left, cl_showpos)', (
       renderCvarPanel(container, '', () => undefined);
       const row = container.children.find((r) => r.children[0]?.textContent === 'cl_showpos');
       expect(row).toBeDefined();
-      expect((row as unknown as { title?: string }).title).toContain('pos X Y Z');
-      expect((row!.children[0] as unknown as { title?: string }).title).toContain('pos X Y Z');
-      expect((row!.children[1] as unknown as { title?: string }).title).toContain('pos X Y Z');
+      expect(getTooltipText(row)).toContain('pos X Y Z');
+      expect(getTooltipText(row!.children[0])).toContain('pos X Y Z');
+      expect(getTooltipText(row!.children[1])).toContain('pos X Y Z');
+      expect(hasNativeTitle(row)).toBe(false);
+      expect(hasNativeTitle(row!.children[0])).toBe(false);
+      expect(hasNativeTitle(row!.children[1])).toBe(false);
     } finally {
       (globalThis as unknown as { document?: unknown }).document = prev;
     }

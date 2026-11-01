@@ -296,16 +296,6 @@ done-when:
 - [x] Audit warp/blend ordering, eye-contents detection, viewmodel and HUD behavior, plus renderer switches underwater. Fix demonstrated regressions, preserving backend-specific source behavior and intended water motion. Do not apply software full-screen warp to WebGL solely because it exists in the software source.
 - [x] Capture deterministic known-object geometry and transition tests with omitted-effect controls at multiple resolutions. Record source parity and user visual verdict separately; keep uncertainty open if the original comparison is unavailable.
 
-### RELEASE-10 — Custom, width-limited sidebar tooltips
-owns: `apps/web`
-depends: none
-status: ready (new enhancement; disabled-control styling retained)
-review-status: visible disabled explanations were removed and native title tooltips retained. Native tooltips do not provide the requested controlled width; implement a shared custom tooltip for config descriptions and disabled reasons.
-done-when:
-- [ ] Add a custom tooltip with wrapped text and a definite max-width (start at 320 CSS px, bounded by viewport minus margins). Position near the hovered/focused label/control, flip or clamp at viewport edges, and avoid clipping by sidebar scroll containers.
-- [ ] Support mouse hover and keyboard focus on labels/wrappers, including disabled controls; dismiss on leave/blur/Escape, sidebar scroll and renderer/panel rebuild as appropriate. Use role=tooltip and aria-describedby, no focus trap. Remove duplicate native-title popups on converted elements.
-- [ ] Preserve disabled checkbox size/style/alignment, capability updates, saved settings and tooltip-only explanations. Verify long descriptions, disabled reasons, small viewport, zoom, scrolling and repeated renderer switches; no stale or orphaned tooltip nodes/listeners.
-
 ### GPU-FOLLOW-6 — Verify gameplay on a visible display
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
 depends: RELEASE-4, RELEASE-10, RELEASE-13, RELEASE-15

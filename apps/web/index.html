@@ -82,6 +82,11 @@ q2-select select:focus-visible,q2-text input:focus-visible,q2-checkbox input:foc
  * disabled native input inside cannot take focus), so they need the same
  * focus ring when focused directly. */
 q2-checkbox:focus-visible,q2-select:focus-visible,q2-text:focus-visible{outline:1px solid var(--amber);outline-offset:1px}
+/* RELEASE-10 shared custom tooltip: single fixed node under body (never
+ * clipped by the sidebar scroller), wrapped text with a definite max-width
+ * (JS clamps further to viewport minus margins on narrow viewports/zoom). */
+#q2-tooltip{position:fixed;z-index:60;max-width:320px;padding:8px 10px;font-family:var(--font-mono);font-size:10.5px;line-height:1.6;color:var(--bone);background:#101216;border:1px solid var(--linehi);box-shadow:0 12px 32px -12px rgba(0,0,0,.9);white-space:normal;overflow-wrap:anywhere;pointer-events:none}
+#q2-tooltip[hidden]{display:none}
 #q2-ui button.silkbtn{background:none;border:0;cursor:pointer}
 :focus-visible{outline:1px solid var(--amber);outline-offset:1px}
 @media(min-width:1024px){
