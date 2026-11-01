@@ -7,10 +7,10 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-31, reviewed at `9031fe6`): finish elevator
-> boarding/button completion, verify live soldier patrols and underwater parity,
-> and add bounded custom sidebar tooltips. Preserve the latest message, ladder,
-> help, collision, damage-feedback and renderer repairs. §8 is the active queue.**
+> **Current direction (2026-10-31, reviewed at `e11cfe0`): elevator entry
+> remains unresolved; fix the visible boarding route and shootable-button art
+> states. Software underwater warping is user-confirmed correct. Preserve
+> landed patrol/tooltip repairs; §8 is the only active queue.**
 
 ---
 
@@ -260,37 +260,56 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ### Review checkpoint and rules
 
-Reviewed source/history at `9031fe6` on 2026-10-31. User reports good progress;
-remaining feedback is captured below. This review did not rerun gameplay,
-browser captures or full verification. A concrete patrol timing defect was
-found by comparing the new code with local original `game/g_misc.c`.
+Source/history reviewed at `e11cfe0` on 2026-10-31. This was a source/documentation
+review; no browser reproduction or test suite was rerun. Latest changes:
+`b1123a4` elevator button relocation/boarding guard, `1f5d982` patrol arrival wait
+and live-route checks, `00c5790` underwater audit, `e11cfe0` custom tooltips.
+Preserve valid increments. User still cannot enter the elevator: RELEASE-4's
+archived DONE claim is superseded below. Software underwater warp is explicitly
+confirmed correct; no further software warp redesign is requested.
 
-Latest landed increments: message TTL/centerprint separation (`f65e717`), ladder
-contents and movement (`bbce0e7`), help/secrets (`0b961c5`), dying collision/death
-variants/patrol setup (`7c3f461`), disabled-row cleanup (`56fb3a9`), damage/view
-feedback (`db82b66`), and underwater tint/software warp (`a42e951`). Completed
-cards and reported test counts already live in `docs/tasks-archive.md`; duplicate
-DONE checklists and obsolete pre-fix diagnoses are removed from this queue.
-Preserve these changes. No new user verdict on an omitted older issue is inferred.
+Patrol and custom-tooltip cards remain archived with their evidence; omission
+from this feedback is not a new visual sign-off. Sky fixes, software support,
+legacy Voodoo retirement and recorded FOLLOW-5 approval remain preserved. GPU
+stays experimental pending integrated/display acceptance. Display absence does
+not block gameplay or button-texture repairs.
 
-Sky fixes, software reference, legacy CPU Voodoo retirement and recorded FOLLOW-5
-fidelity approval remain preserved. GPU remains experimental pending integrated
-and displayed-performance gates. Display absence blocks displayed FPS evidence,
-not these repairs. Archive reports are not fresh verification on this review.
+Priority: RELEASE-4 → RELEASE-16; RELEASE-15 retains only the narrower OpenGL
+comparison uncertainty. Claim one card; use disjoint ownership for independent
+work and run expensive validation sequentially. Actual entry/visual symptoms
+need production-browser evidence, not a direct target invocation or synthetic
+render. Separate implementation, automated results and user verdicts.
 
-Priority: RELEASE-4 → RELEASE-13 → RELEASE-15 → RELEASE-10. Independent bounded
-work may proceed with disjoint ownership; one writer per package. Run expensive
-validation sequentially. Close visual/gameplay cards only with production-path
-regressions and captures covering the reported scenario; report automated and
-user verdicts separately. Current cards supersede archived DONE claims only for
-the reopened scope, not for unrelated completed work.
+### RELEASE-4 — Fix visible elevator entry before accepting button completion
+owns: `packages/server`, `packages/game`, `apps/web`, `packages/testkit`
+depends: none
+status: ready (reopened after user retest)
+user-contract: walk onto the waiting/open final elevator, then press its button to finish and show frozen F1 completion stats. Boarding alone must not finish. The original game permits entry; invisible blockage remains in this project.
+review-finding: `b1123a4` relocates *34 housing 145 units east/72 south and uses touch to open *31, then aimed E-use while aboard to finish. Its test starts in the hall, sidesteps south to a specific contact point and boards at roughly (-1720,1470). This is useful route evidence, but does not prove the visible doorway affords the normal entry the user attempts. The relocation and extended E reach are project deviations, not original-map facts.
+done-when:
+- [ ] Reproduce the blockage in the actual browser from the visible doorway, identifying build/map, approach, player hull, blocking entity/brush and render-versus-collision transforms. Compare the normal central entry with the test's side approach. Verify relocated button geometry is drawn where it collides, discoverable and reachable, and not just present in the server fixture.
+- [ ] Fix the actual blocking state/geometry/activation discrepancy locally. Preserve waiting and existing valid mover/button fixes; no noclip, teleport, global collision bypass or undocumented side-route requirement. Do not reassert that the original route is impossible from this port's traces.
+- [ ] Make the requested sequence clear and playable: normal entry onto the platform → reachable button press → exactly one finished state with F1 time/kills/secrets/goals. Do not require the user to infer a hidden preliminary contact or precise aim point; retain protection against outside/unrelated/duplicate finish triggers.
+- [ ] Extend browser and real-base1 regressions to the user-visible entry at multiple approach offsets, without repositioning inside the route or directly firing targets. Capture boarding and button use; require no obstruction, no premature finish and the final stats screen. The archived custom side-route pass alone does not close this reopened card.
+
+### RELEASE-16 — Shootable secret-button texture/lighting states
+owns: `packages/game`, `packages/server`, `apps/web`, `packages/sw-renderer`, `packages/webgl-renderer`, `packages/testkit`
+depends: none
+status: ready
+user-report: near **(-2146.2, 1556.6, -24)** the secret's shootable button is always lit; its inward motion when shot is correct and must be preserved.
+review-finding: original `game/g_func.c` changes `s.frame` and animation flags: button_wait selects frame 1 and EF_ANIM23; button_return resets frame 0; button_done restores EF_ANIM01. Physical mover position alone is not the complete visual state. The specific brush/material at this camera still needs identification; do not assume every button shares the same art.
+done-when:
+- [ ] Identify the button brush/entity and WAL/texinfo animation chain at the reported position. Compare original unpressed, pressing, held and returning appearances; distinguish authored lit/unlit texture variants from dynamic lighting. Record camera and close crops before/after shooting.
+- [ ] Trace original frame/effect state through server mover updates, retained brush/scene submission and each renderer's animated texture selection. Implement missing state propagation or selection without hardcoded recoloring or globally changing illumination. Preserve damage activation, target firing and correct physical press motion.
+- [ ] Render real-asset before/after/return states on Software and WebGL2, including repeated shots, held buttons and resize/switch while pressed. Add an effective negative control that forces one visual state and fails; mover-distance assertions alone cannot establish button-art correctness.
 
 ### RELEASE-15 — Verify underwater object appearance against the original
 owns: `apps/web`, `packages/webgl-renderer`, `packages/sw-renderer`, `packages/testkit`
 depends: none
-status: review (boxes 2-3 done 2026-11-01; box 1 needs user/original-game captures)
+status: review (Software appearance user-confirmed; original OpenGL comparison remains unverified)
 review-finding: `a42e951` adds contents tint on both backends and full-frame software warp; WebGL2 gets tint only. Local original `ref_soft` uses D_WarpScreen, whereas reviewed `ref_gl/gl_rmain.c` uses normal projection and polyblend, with no corresponding RDF_UNDERWATER screen-warp path. Animated water surface UVs are a separate effect. This source finding does not replace a matched visual check of the user's observation.
-box-1 needs: matched original-vs-project captures (eye above/below/crossing, engine/version/map/camera/FOV/time/contents + screenshots or video) plus the user verdict on warp vs tint vs refraction. No headless path to a running original binary in this environment.
+user-verdict 2026-10-31: Software underwater warping renders correctly; preserve it. This is not a request to add the software warp to WebGL2.
+box-1 remaining scope: matched original-OpenGL-vs-project-WebGL2 captures (eye above/below/crossing, engine/version/map/camera/FOV/time/contents + screenshots or video) plus the user verdict on warp vs tint vs refraction. No headless path to a running original binary in this environment.
 done-when:
 - [ ] Compare matched original OpenGL and project views: eye above water looking at submerged objects, eye below water, and crossing the surface. Record engine/version, map/camera/FOV/time, contents and screenshots/video. Distinguish surface animation, full-screen warp, tint and genuine refraction; identify the observed distortion rather than adding an invented effect.
 - [x] Audit warp/blend ordering, eye-contents detection, viewmodel and HUD behavior, plus renderer switches underwater. Fix demonstrated regressions, preserving backend-specific source behavior and intended water motion. Do not apply software full-screen warp to WebGL solely because it exists in the software source.
@@ -298,7 +317,7 @@ done-when:
 
 ### GPU-FOLLOW-6 — Verify gameplay on a visible display
 owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
-depends: RELEASE-4, RELEASE-10, RELEASE-13, RELEASE-15
+depends: RELEASE-4, RELEASE-16, RELEASE-15 (other repair evidence archived)
 status: blocked (displayed-performance evidence only)
 blocker: archived `docs/gpu-follow-6-gate-record.md` reports hardware GL but no connected monitor/vsync/scanout. This review did not recheck display availability. Submitted-frame throughput is not displayed FPS. Historical startup 3.05s exceeds the 2.5s target.
 done-when:
