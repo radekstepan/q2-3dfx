@@ -117,11 +117,31 @@ not transparency.
 - Redistributable fixtures (synthetic BSPs, original `q2ts/…` textures)
   live in the repo; game PAKs and id textures never do.
 
+## Enemies
+
+Monster spawns (`monster_*` entities with usable origins) render as static
+MD2s at their BSP spawn poses — the same soldier/gunner/infantry meshes and
+PCX skins the game uses, resolved from the asset + map PAKs first-wins.
+Unknown `monster_*` variants render with the soldier fallback mesh so mappers
+still see the spawn. Anything without a usable origin is skipped (listed as
+unsupported in the panel, never placed).
+
+- Placement preview only: no AI, patrols, attacks, or animation — frame 0,
+  yaw from the `angle`/`angles` keys. Verify behavior in the game, not here.
+- Asset-free visibility: with no PAKs, spawns render with the engine's
+  procedural mesh/checker skin instead of vanishing.
+- Toggle: the `enemies` checkbox in the viewer bar shows/hides the installed
+  spawns without dropping their handles; the status line reports
+  `enemies: N (kind xN, …)` or `(hidden)`.
+- Switching maps clears the previous spawn list; re-adding asset PAKs
+  re-resolves MD2/PCX lumps for the current map without moving the camera.
+
 ## Known limitations
 
 - **Static submodels:** brush models (doors, lifts, buttons) render at
   their static pose. The viewer does not simulate movers, game logic, or
-  dynamic lighting — verify those in the game, not here.
+  dynamic lighting — verify those in the game, not here. (Monster spawns
+  are the exception above: posed MD2s, still without simulation.)
 - **Missing assets:** unlit/unvis'd maps render, but lighting/PVS
   fidelity checks require compiled output (`tools/compile-map/`).
 - **No collision:** the camera flies freely by design; walkability must

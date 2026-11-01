@@ -314,6 +314,83 @@ describe('viewer brightness + palette (dark-map fix)', () => {
   });
 });
 
+describe('viewer enemies (static spawn MD2s)', () => {
+  it('setEnemies installs fallback spawns and renders without assets', () => {
+    const { canvas } = makeCanvas();
+    const r = createViewerRenderer(canvas);
+    try {
+      r.setMap(buildEmptyTestMap());
+      expect(r.getStatus().enemies).toBe(0);
+      r.setEnemies([
+        { index: 1, classname: 'monster_soldier', kind: 'soldier', origin: [0, 0, 8], yaw: 90 },
+        { index: 2, classname: 'monster_infantry', kind: 'infantry', origin: [64, 0, 8], yaw: 0 },
+      ]);
+      expect(r.getStatus().enemies).toBe(2);
+      expect(r.getStatus().enemiesVisible).toBe(true);
+      // Procedural fallback meshes must not break the frame.
+      const stats = r.render({ origin: [0, -64, 32], angles: [0, 90, 0] }, 16);
+      expect(r.getStatus().lastError).toBeNull();
+      expect(stats.spans).toBeGreaterThanOrEqual(0);
+    } finally {
+      r.dispose();
+    }
+  });
+
+  it('hides enemies without dropping them; setMap clears the list', () => {
+    const { canvas } = makeCanvas();
+    const r = createViewerRenderer(canvas);
+    try {
+      r.setMap(buildEmptyTestMap());
+      r.setEnemies([
+        { index: 0, classname: 'monster_gunner', kind: 'gunner', origin: [0, 0, 8], yaw: 0 },
+      ]);
+      r.setEnemiesVisible(false);
+      expect(r.getStatus().enemiesVisible).toBe(false);
+      expect(r.getStatus().enemies).toBe(1);
+      r.render({ origin: [0, -64, 32], angles: [0, 90, 0] }, 16);
+      expect(r.getStatus().lastError).toBeNull();
+      r.setEnemiesVisible(true);
+      r.render({ origin: [0, -64, 32], angles: [0, 90, 0] }, 16);
+      // A new world drops the previous map's spawns until reinstalled.
+      r.setMap(buildEmptyTestMap());
+      expect(r.getStatus().enemies).toBe(0);
+    } finally {
+      r.dispose();
+    }
+  });
+
+  it('uses supplied MD2/skin resolvers when present, nulls fall back', () => {
+    const { canvas } = makeCanvas();
+    const r = createViewerRenderer(canvas);
+    try {
+      r.setMap(buildEmptyTestMap());
+      // Null resolvers = asset-free fallback path (never throws).
+      r.setEnemies(
+        [{ index: 0, classname: 'monster_berserk', kind: null, origin: [0, 0, 8], yaw: 45 }],
+        { md2For: () => null, skinFor: () => null },
+      );
+      expect(r.getStatus().enemies).toBe(1);
+      r.render({ origin: [0, -64, 32], angles: [0, 90, 0] }, 16);
+      expect(r.getStatus().lastError).toBeNull();
+      // Throwing resolvers degrade to the fallback instead of breaking setEnemies.
+      r.setEnemies(
+        [{ index: 0, classname: 'monster_soldier', kind: 'soldier', origin: [0, 0, 8], yaw: 0 }],
+        {
+          md2For: () => {
+            throw new Error('pak missing');
+          },
+          skinFor: () => {
+            throw new Error('pak missing');
+          },
+        },
+      );
+      expect(r.getStatus().enemies).toBe(1);
+    } finally {
+      r.dispose();
+    }
+  });
+});
+
 describe('viewer sky install', () => {
   it('setSkyTexture installs a valid strip, clears on null/invalid; never throws', () => {
     const { canvas } = makeCanvas();

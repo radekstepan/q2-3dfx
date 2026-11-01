@@ -4,6 +4,8 @@
 // (renderer + free camera + panel) and the frame-rate-independent render loop.
 
 import { parseEntities } from '@q2/game';
+import { parseMD2, parsePCX } from '@q2/formats';
+import { collectEnemySpawns, summarizeEnemies } from './enemies.js';
 import {
   buildGreySkyStrip,
   loadPakMap,
@@ -17,6 +19,7 @@ import { listPakMaps } from './pak-view.js';
 import { describePrecedence } from './pak-view.js';
 import type { AssetPakSlot } from './pak-view.js';
 import type { WebPak } from '../pak.js';
+import { readPakEntry } from '../pak.js';
 import { createViewerRenderer } from './renderer.js';
 import type { ViewerRenderer } from './renderer.js';
 import { createFreeCamera } from './camera.js';
@@ -38,6 +41,8 @@ let lastT = 0;
 let loopRunning = false;
 /** Installed engine palette (768-byte RGB) for sky remapping; persists like brightness. */
 let lastPalette: Uint8Array | null = null;
+/** Enemies toggle state; persists across map switches like brightness. */
+let enemiesVisible = true;
 
 function el<T extends HTMLElement>(id: string): T | null {
   if (typeof document === 'undefined') return null;
@@ -168,6 +173,66 @@ function installSky(): string {
   }
 }
 
+/** PAKs searched for enemy MD2/PCX lumps: asset PAKs first, then the map's own PAK. */
+function enemyPaks(): WebPak[] {
+  const list = assetPaks();
+  if (mapPak) list.push(mapPak.pak);
+  return list;
+}
+
+/**
+ * Install monster spawns as static MD2s at their BSP spawn poses (no
+ * gameplay, no AI — a placement preview). Real MD2/PCX lumps resolve from
+ * the asset + map PAKs first-wins; anything missing falls back to the
+ * engine's procedural mesh/checker skin so spawns stay visible asset-free.
+ * Returns a one-line status suffix. Never throws.
+ */
+function installEnemies(): string {
+  try {
+    if (!renderer || !current) return 'enemies: 0';
+    let dicts: Array<Record<string, string>> = [];
+    try {
+      dicts = parseEntities(current.bsp.entities);
+    } catch {
+      dicts = [];
+    }
+    const spawns = collectEnemySpawns(dicts);
+    const paks = enemyPaks();
+    renderer.setEnemies(spawns, {
+      md2For: (path: string) => {
+        for (const pak of paks) {
+          try {
+            return parseMD2(readPakEntry(pak, path));
+          } catch {
+            continue;
+          }
+        }
+        return null;
+      },
+      skinFor: (path: string) => {
+        for (const pak of paks) {
+          try {
+            const pcx = parsePCX(readPakEntry(pak, path));
+            return { pixels: pcx.pixels, width: pcx.width, height: pcx.height };
+          } catch {
+            continue;
+          }
+        }
+        return null;
+      },
+    });
+    try {
+      renderer.setEnemiesVisible(enemiesVisible);
+    } catch {
+      /* keep installed list even if the toggle fails */
+    }
+    const summary = summarizeEnemies(spawns);
+    return enemiesVisible ? summary : `${summary} (hidden)`;
+  } catch {
+    return 'enemies: install failed (world only)';
+  }
+}
+
 function startLoop(): void {
   if (loopRunning || typeof window === 'undefined') return;
   loopRunning = true;
@@ -243,6 +308,7 @@ async function showLoaded(map: LoadedMap, gen: number): Promise<void> {
     showError(err instanceof Error ? err.message : String(err));
     return;
   }
+  const enemyLine = installEnemies();
   resetCameraToSpawn();
   try {
     panelHandle?.setMap(map.bsp as never, map.name);
@@ -254,6 +320,7 @@ async function showLoaded(map: LoadedMap, gen: number): Promise<void> {
     ...statusFor(map),
     `surfaces: ${st.surfaces} · submodels: ${st.submodels} (static) · mode: ${st.mode}`,
     `palette: ${st.palette} · brightness: ${st.brightness.toFixed(1)} · ${skyLine}`,
+    enemyLine,
   ]);
 }
 
@@ -329,7 +396,8 @@ async function onAssetPakFiles(files: File[]): Promise<void> {
     }
     assetSlots = slots;
     refreshPrecedence();
-    // Re-resolve textures + palette/sky for the current map without losing camera pose.
+    // Re-resolve textures + palette/sky/enemies for the current map without losing camera pose.
+    let enemyLine = 'enemies: 0';
     if (current && renderer) {
       const texelFor = resolveTexelFor(assetPaks());
       try {
@@ -347,11 +415,12 @@ async function onAssetPakFiles(files: File[]): Promise<void> {
       } catch {
         /* keep old conversion on failure */
       }
+      enemyLine = installEnemies();
     }
     status([
       `asset PAKs: ${slots.length}`,
       describePrecedence(assetSlots),
-      ...(current ? statusFor(current) : ['no map loaded']),
+      ...(current ? [...statusFor(current), enemyLine] : ['no map loaded']),
     ]);
   } catch (err) {
     if (gen !== generation) return;
@@ -418,6 +487,24 @@ function ensureCaptureButton(): void {
   });
   brightLabel.appendChild(bright);
   bar.appendChild(brightLabel);
+  const enemyLabel = document.createElement('label');
+  enemyLabel.htmlFor = 'mv-enemies';
+  enemyLabel.textContent = 'enemies';
+  enemyLabel.title = 'render monster spawns as static MD2s at their spawn poses (no AI)';
+  const enemyBox = document.createElement('input');
+  enemyBox.id = 'mv-enemies';
+  enemyBox.type = 'checkbox';
+  enemyBox.checked = enemiesVisible;
+  enemyBox.addEventListener('change', () => {
+    enemiesVisible = enemyBox.checked;
+    try {
+      renderer?.setEnemiesVisible(enemiesVisible);
+    } catch {
+      /* toggle must never break the loop */
+    }
+  });
+  enemyLabel.appendChild(enemyBox);
+  bar.appendChild(enemyLabel);
   const hint = document.createElement('div');
   hint.id = 'mv-hint';
   hint.textContent = 'click the canvas to capture mouse look (Esc releases) · WASD move · Space/C vertical · Shift fast';
@@ -482,6 +569,7 @@ export function __resetViewerForTest(): void {
   assetSlots = [];
   mapPak = null;
   lastPalette = null;
+  enemiesVisible = true;
   stopLoop();
   try {
     detachCamera?.();

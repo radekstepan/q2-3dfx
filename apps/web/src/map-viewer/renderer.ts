@@ -16,7 +16,12 @@ import { SoftwareRenderer, bspToMiniWorld, createDevroom, isValidSkySize } from 
 import type { BspTexelSource, MiniWorld } from '@q2/sw-renderer';
 import type { BspMap } from '@q2/bsp';
 import { createFramebuffer } from '@q2/renderer-api';
-import type { FrameStats, WorldModel } from '@q2/renderer-api';
+import type { Entity, FrameStats, WorldModel } from '@q2/renderer-api';
+import {
+  modelPathForEnemyKind,
+  skinPathForEnemyClassname,
+} from './enemies.js';
+import type { EnemySpawn } from './enemies.js';
 
 /** Mip-0 texel lookup by WAL name (e.g. `e1u1/metal2_1`); null = checker fallback. */
 export type ViewerTexelFor = (walName: string) => BspTexelSource | null;
@@ -81,10 +86,39 @@ export interface ViewerStatus {
   palette: 'pak' | 'procedural';
   /** Whether a textured skybox is installed or the flat-fill fallback shows. */
   sky: 'textured' | 'flat-fallback';
+  /** Installed enemy spawn count (static MD2s at spawn poses). */
+  enemies: number;
+  /** Whether installed enemies render (toggle keeps handles). */
+  enemiesVisible: boolean;
+}
+
+/** Parsed MD2 data for one enemy model lump (opaque to the viewer). */
+export type EnemyMd2Data = unknown;
+
+/** Decoded PCX pixels for one enemy skin lump (palette indices). */
+export interface EnemySkinData {
+  pixels: Uint8Array;
+  width: number;
+  height: number;
+}
+
+/** Asset resolvers for enemy MD2/PCX lumps; null = procedural fallback. */
+export interface EnemyAssetResolvers {
+  md2For?: ((path: string) => EnemyMd2Data | null) | null;
+  skinFor?: ((path: string) => EnemySkinData | null) | null;
 }
 
 export interface ViewerRenderer {
   setMap(bsp: BspMap, texelFor?: ViewerTexelFor | null): void;
+  /**
+   * Install the enemy spawn poses to render as static MD2s. Unknown
+   * MD2/skin lumps (or absent resolvers) fall back to the engine's
+   * procedural mesh/checker skin so spawns stay visible asset-free.
+   * Replaces any previous enemy list. Never throws.
+   */
+  setEnemies(spawns: EnemySpawn[], assets?: EnemyAssetResolvers | null): void;
+  /** Show/hide the installed enemies without dropping their handles. */
+  setEnemiesVisible(visible: boolean): void;
   /**
    * Install the real palette from `pics/colormap.pcx` (768-byte RGB) plus
    * optional raw PCX pixels for C-exact blend tables. Null palette keeps the
@@ -157,6 +191,10 @@ export function createViewerRenderer(
   let brightness = VIEWER_BRIGHTNESS_DEFAULT;
   let paletteSource: 'pak' | 'procedural' = 'procedural';
   let skyTextured = false;
+  let enemyEntities: Entity[] = [];
+  let enemiesVisible = true;
+  const enemyModelCache = new Map<string, number>();
+  const enemySkinCache = new Map<string, number>();
 
   // No-map placeholder: shared cached devroom (createDevroom memoises; the
   // renderer never mutates the world) so the canvas shows *something*
@@ -342,11 +380,71 @@ export function createViewerRenderer(
     }
     mapName = 'maps/viewer';
     assetsBound = !!texelFor;
+    // New world, new spawn set: drop the previous map's enemies. The shell
+    // installs the new list via setEnemies right after setMap.
+    enemyEntities = [];
     lastError = null;
     generation += 1;
     // Release the previous MiniWorld's backing stores: dropping our refs lets
     // GC reclaim the old surfaces/textures/lightmaps (refresh holds no world
     // refs past endFrame; the surface cache was just invalidated).
+  }
+
+  function setEnemies(spawns: EnemySpawn[], assets?: EnemyAssetResolvers | null): void {
+    if (disposed) return;
+    try {
+      const next: Entity[] = [];
+      for (const spawn of spawns) {
+        try {
+          const kind = spawn.kind ?? 'soldier';
+          const modelPath = spawn.kind ? modelPathForEnemyKind(spawn.kind) : modelPathForEnemyKind('soldier');
+          const skinPath = skinPathForEnemyClassname(spawn.classname, spawn.kind);
+          let model = enemyModelCache.get(modelPath);
+          if (model === undefined) {
+            let data: unknown = null;
+            try {
+              data = assets?.md2For?.(modelPath) ?? null;
+            } catch {
+              data = null;
+            }
+            model = refresh.registerModel({ name: modelPath, kind: 'md2', data });
+            enemyModelCache.set(modelPath, model);
+          }
+          let skin = enemySkinCache.get(skinPath);
+          if (skin === undefined) {
+            let tex: { pixels: Uint8Array; width: number; height: number } | null = null;
+            try {
+              tex = assets?.skinFor?.(skinPath) ?? null;
+            } catch {
+              tex = null;
+            }
+            if (tex && tex.pixels.length === tex.width * tex.height) {
+              skin = refresh.registerSkinData(skinPath, tex.pixels, tex.width, tex.height);
+            } else {
+              skin = refresh.registerSkin(skinPath);
+            }
+            enemySkinCache.set(skinPath, skin);
+          }
+          next.push({
+            model,
+            origin: new Float32Array([spawn.origin[0], spawn.origin[1], spawn.origin[2]]) as unknown as Entity['origin'],
+            angles: new Float32Array([0, spawn.yaw, 0]) as unknown as Entity['angles'],
+            frame: 0,
+            skin,
+          });
+          void kind;
+        } catch {
+          /* skip one bad spawn, keep the rest */
+        }
+      }
+      enemyEntities = next;
+    } catch {
+      /* keep the previous enemy list on failure */
+    }
+  }
+
+  function setEnemiesVisible(visible: boolean): void {
+    enemiesVisible = visible;
   }
 
   function render(view: ViewerView, timeMs: number): FrameStats {
@@ -374,7 +472,7 @@ export function createViewerRenderer(
           lightStyles,
         },
         active,
-        EMPTY_ENTITIES,
+        enemiesVisible ? enemyEntities : EMPTY_ENTITIES,
       );
       refresh.endFrame();
       blit();
@@ -411,6 +509,7 @@ export function createViewerRenderer(
     world = null;
     mini = null;
     devWorld = null;
+    enemyEntities = [];
     img = null;
     ctx = null;
     generation += 1;
@@ -469,6 +568,8 @@ export function createViewerRenderer(
       brightness,
       palette: paletteSource,
       sky: skyTextured ? 'textured' : 'flat-fallback',
+      enemies: enemyEntities.length,
+      enemiesVisible,
     };
   }
 
@@ -481,5 +582,5 @@ export function createViewerRenderer(
     /* stub canvas: ignore */
   }
 
-  return { setMap, setColormap, setSkyTexture, setBrightness, render, resize, dispose, getStatus };
+  return { setMap, setEnemies, setEnemiesVisible, setColormap, setSkyTexture, setBrightness, render, resize, dispose, getStatus };
 }
