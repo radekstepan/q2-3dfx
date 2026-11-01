@@ -285,17 +285,6 @@ regressions and captures covering the reported scenario; report automated and
 user verdicts separately. Current cards supersede archived DONE claims only for
 the reopened scope, not for unrelated completed work.
 
-### RELEASE-13 — Verify visible patrols and fix corner timing
-owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
-depends: none
-status: ready (patrol scope reopened; dying/death repairs retained)
-review-finding: `SV_TickMonsters` resolves `patrolAdvance(arrivedName)` to the next corner, then applies `next.wait`. Original `path_corner_touch` uses `self->wait`, the corner just reached. This moves pauses to the wrong waypoint. Existing chain tests do not establish correct unequal-wait behavior.
-done-when:
-- [ ] Apply arrival-corner wait at the proper transition; cover two consecutive corners with different waits, zero wait and terminal paths. Preserve next-target selection and source path-corner behavior (including relevant trigger/teleport flags when present).
-- [ ] Identify the base1 soldiers the user expects to patrol; verify spawn target/path chain, walking frame motion, collision, waiting and visibility in the actual running game. A map inventory or synthetic moving monster is insufficient. Diagnose any immediate wake/noise/sight/trigger state suppressing their beat.
-- [ ] Reproduce approaching/jumping a patroller from behind with original sight/hearing/ambush rules. Compare normal gameplay with local `g_ai.c`/`g_monster.c`; do not grant omnidirectional detection or suppress legitimate hearing to pass a test. Record specific locations and routes.
-- [ ] Preserve dying-body collision timing, settled-corpse behavior and death variants; rerun relevant regressions and real-base1 gate after patrol fixes.
-
 ### RELEASE-15 — Verify underwater object appearance against the original
 owns: `apps/web`, `packages/webgl-renderer`, `packages/sw-renderer`, `packages/testkit`
 depends: none

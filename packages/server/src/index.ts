@@ -132,8 +132,8 @@ import {
   duckShootEvent,
   maybeBurstRefire,
   acquireSight,
+  arrivePatrol,
   monsterHullMaxs,
-  patrolAdvance,
   patrolCornersOf,
   patrolStart,
   patrolWalkMove,
@@ -2910,7 +2910,9 @@ export function SV_MonsterTick(
     // arrival advances the targetname chain (loops run forever), an ended
     // chain stands, and wait corners hold the stand pose. Corner waits and
     // arrivals below run on the same gated sight (ai_walk checks FindTarget
-    // every frame, which already ran).
+    // every frame, which already ran). C path_corner_touch order: fire the
+    // arrived corner's pathtarget, resolve + teleport through the next link,
+    // install movetarget, then stand out the ARRIVED corner's own wait.
     if (!m.seen && m.patrolCorner && m.patrolGoal) {
       if (now < m.patrolWaitUntil) {
         const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
@@ -2926,8 +2928,8 @@ export function SV_MonsterTick(
       if (Math.hypot(gx, gy) <= 24) {
         const corners = patrolCornersOf(st);
         const arrivedName = m.patrolCorner;
-        const next = patrolAdvance(corners, arrivedName);
-        if (!next) {
+        const arrival = arrivePatrol(corners, arrivedName);
+        if (!arrival) {
           m.patrolCorner = '';
           m.patrolGoal = null;
           const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
@@ -2936,16 +2938,48 @@ export function SV_MonsterTick(
           monsterThink(ms);
           continue;
         }
-        m.patrolCorner = next.name;
-        m.patrolGoal = v3(next.pos[0], next.pos[1], next.pos[2]);
-        if (next.wait > 0) {
-          m.patrolWaitUntil = now + next.wait;
+        if (arrival.fire) fireTargets(st, { ...m.edict, target: arrival.fire });
+        if (arrival.teleported && arrival.teleportPos) {
+          // C TELEPORT corner: snap to the teleport (corner mins -8 above the
+          // monster hull mins -24 puts z +16), chain through to its target.
+          // No travel leg to the teleport itself. (C also flags s.event; the
+          // lite sim has no teleport event channel — the origin snap is the
+          // observable.) In-place: the tick's `pos` alias must see the snap
+          // for the walk leg below (C VectorCopy into other->s.origin).
+          m.edict.origin[0] = arrival.teleportPos[0]!;
+          m.edict.origin[1] = arrival.teleportPos[1]!;
+          m.edict.origin[2] = arrival.teleportPos[2]! + 16;
+          m.slideDir = 0;
+        }
+        if (arrival.wait > 0) {
+          // C installs movetarget (the NEXT corner) before the wait check, so
+          // the leg is already armed while the body stands out the ARRIVED
+          // corner's own wait (self->wait, never the next corner's).
+          if (arrival.next) {
+            m.patrolCorner = arrival.next.name;
+            m.patrolGoal = v3(arrival.next.pos[0], arrival.next.pos[1], arrival.next.pos[2]);
+          } else {
+            m.patrolCorner = '';
+            m.patrolGoal = null;
+          }
+          m.patrolWaitUntil = now + arrival.wait;
           const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
           ms.move = stand;
           ms.frame = 0;
           monsterThink(ms);
           continue;
         }
+        if (!arrival.next) {
+          m.patrolCorner = '';
+          m.patrolGoal = null;
+          const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
+          ms.move = stand;
+          ms.frame = 0;
+          monsterThink(ms);
+          continue;
+        }
+        m.patrolCorner = arrival.next.name;
+        m.patrolGoal = v3(arrival.next.pos[0], arrival.next.pos[1], arrival.next.pos[2]);
       }
       const walk = patrolWalkMove(m.kind);
       if (ms.move !== walk) {

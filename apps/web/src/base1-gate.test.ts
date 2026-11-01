@@ -1223,11 +1223,12 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect([...plug.ent.origin]).toEqual([...plug.pos1]);
     expect(fired.has('t91')).toBe(false);
     expect(fired.has('t4')).toBe(false);
-    // Phase 2: the C-intended opener — press the *34 platform button. It
-    // sits in a rock alcove east of the walkway dead-end, so the press is
-    // delivered as an overlap (the server-lane lean pattern): the driver
-    // loop fires t4 on the button's TOP arrival, never on touch.
-    driver.pm.origin = v3(-1860, 1536, 150);
+    // Phase 2: the C-intended opener — press the *34 elevator button. It
+    // sits at the plug east-face south end (RELEASE-4 east-face housing),
+    // so the press is delivered as an overlap lean from the face (the
+    // server-lane lean pattern): the driver loop fires t4 on the button's
+    // TOP arrival, never on touch.
+    driver.pm.origin = v3(-1688, 1490, 150);
     driver.pm.velocity = v3();
     let t4first = -1;
     let tick = 0;
@@ -1237,7 +1238,7 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
       tick++;
       if (driver.server.firedThisTick.includes('t4')) t4first = tick;
     }
-    expect(t4first).toBeGreaterThanOrEqual(0); // the alcove press fired t4
+    expect(t4first).toBeGreaterThanOrEqual(0); // the face lean fired t4
     expect(btn34.state).not.toBe('bottom');
     // Leave the overlap at once: a body parked in the touch volume would
     // re-fire t4 every button cycle and stretch the door's TOP hold, so the
@@ -1277,9 +1278,9 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     expect([...plug.ent.origin]).toEqual([...plug.pos1]);
     expect(off('*31')).toEqual([0, 0, 0]);
     // Repeat use: the button cycled back to BOTTOM on its own 3s, so a
-    // second alcove press re-fires t4 and the plug drops again.
+    // second face lean re-fires t4 and the plug drops again.
     expect(btn34.state).toBe('bottom');
-    driver.pm.origin = v3(-1860, 1536, 150);
+    driver.pm.origin = v3(-1688, 1490, 150);
     driver.pm.velocity = v3();
     let t4second = -1;
     for (let i = 0; i < 10 && t4second < 0; i++) {
@@ -1613,14 +1614,14 @@ describe.runIf(!!WEB_Q2_PAK)('base1 play-verified gate (Q2_PAK)', () => {
     }
     expect(btn13.state).toBe('top');
     expect(driver.doorRenderOffset('*13')).toEqual([0, 0, 4]);
-    // Touch path: the *34 platform button sits in a rock alcove east of the
-    // walkway dead-end (hull stop x -1904, 40u short of the button's west
-    // face), so the press is delivered as an overlap (the server-lane lean
+    // Touch path: the *34 elevator button sits at the plug east-face south
+    // end (RELEASE-4 east-face housing, 1u off the shut face), so the press
+    // is delivered as an overlap lean from the face (the server-lane lean
     // pattern): the driver loop fires t4 on the button's TOP arrival, never
     // on touch. The health-gated *13 answers use only — it never fires here.
     // Ambient ship relays are not collected here (see the audit note above).
     window = null;
-    driver.pm.origin = v3(-1860, 1536, 150);
+    driver.pm.origin = v3(-1688, 1490, 150);
     driver.pm.velocity = v3();
     window = new Set<string>();
     const w34 = window;

@@ -44,7 +44,8 @@ import {
   playerNoiseWake,
 } from './index.js';
 import type { ServerMonster } from './index.js';
-import { acquireSight } from './monster-ai.js';
+import { acquireSight, arrivePatrol } from './monster-ai.js';
+import type { PatrolCorner } from './monster-ai.js';
 
 const Q2_PAK = process.env.Q2_PAK;
 
@@ -435,6 +436,175 @@ describe('RELEASE-13 patrol beats (synthetic lump)', () => {
     st.time += 0.1;
     SV_MonsterTick(st, v3(-672 + 200, 336, 24), trace, null, () => 0, { sightTrace: trace });
     expect(cop.seen).toBe(true);
+  });
+});
+
+describe('RELEASE-13 arrival-corner wait (C path_corner_touch: self->wait)', () => {
+  // The wait honored on arrival is the ARRIVED corner's own (self->wait),
+  // never the next corner's. Pin it with two consecutive UNEQUAL waits
+  // (2s then 5s), a zero wait (walk straight through) and a terminal path
+  // (empty target link ends the beat standing), through the real tick loop.
+  const CHAIN: PatrolCorner[] = [
+    { name: 't0', pos: v3(-200, 0, 24), target: 't1', wait: 0, pathtarget: '', teleport: false },
+    { name: 't1', pos: v3(-100, 0, 24), target: 't2', wait: 2, pathtarget: '', teleport: false },
+    { name: 't2', pos: v3(100, 0, 24), target: 't3', wait: 5, pathtarget: 'wake', teleport: false },
+    { name: 't3', pos: v3(300, 0, 24), target: '', wait: 0, pathtarget: '', teleport: false },
+  ];
+  it('arrivePatrol honors the arrived wait + fires pathtarget, keeps the next link', () => {
+    // Zero wait passes through: t0 arrival arms no wait, next already t1.
+    expect(arrivePatrol(CHAIN, 't0')).toEqual({
+      next: CHAIN[1],
+      wait: 0,
+      fire: null,
+      teleported: false,
+      teleportPos: null,
+    });
+    // Unequal consecutive waits: t1 arrival waits 2 (NOT t2's 5) with t2
+    // pre-installed; t2 arrival waits 5 (NOT t1's 2) and fires 'wake'.
+    const a1 = arrivePatrol(CHAIN, 't1')!;
+    expect(a1.next?.name).toBe('t2');
+    expect(a1.wait).toBe(2);
+    expect(a1.fire).toBeNull();
+    const a2 = arrivePatrol(CHAIN, 't2')!;
+    expect(a2.next?.name).toBe('t3');
+    expect(a2.wait).toBe(5);
+    expect(a2.fire).toBe('wake');
+    // Terminal: empty link ends the beat (stand, C pausetime 1e8).
+    expect(arrivePatrol(CHAIN, 't3')).toEqual({
+      next: null,
+      wait: 0,
+      fire: null,
+      teleported: false,
+      teleportPos: null,
+    });
+    // Unknown corner: no arrival (caller stands defensively).
+    expect(arrivePatrol(CHAIN, 'nope')).toBeNull();
+  });
+  it('arrivePatrol chains through a TELEPORT corner (snap + skip, no leg)', () => {
+    const corners: PatrolCorner[] = [
+      { name: 't1', pos: v3(-100, 0, 24), target: 'tT', wait: 2, pathtarget: '', teleport: false },
+      { name: 'tT', pos: v3(0, 0, 24), target: 't2', wait: 0, pathtarget: '', teleport: true },
+      { name: 't2', pos: v3(200, 0, 24), target: '', wait: 0, pathtarget: '', teleport: false },
+    ];
+    const a = arrivePatrol(corners, 't1')!;
+    // The teleport is consumed on arrival: snap to tT, walk to t2 next.
+    expect(a.teleported).toBe(true);
+    expect(a.teleportPos).toEqual(v3(0, 0, 24));
+    expect(a.next?.name).toBe('t2');
+    // The ARRIVED corner's wait still applies (self->wait before the hop).
+    expect(a.wait).toBe(2);
+    // Dangling teleport target ends the beat after the snap.
+    const dangling: PatrolCorner[] = [
+      { name: 't1', pos: v3(-100, 0, 24), target: 'tT', wait: 0, pathtarget: '', teleport: false },
+      { name: 'tT', pos: v3(0, 0, 24), target: 'gone', wait: 0, pathtarget: '', teleport: true },
+    ];
+    const d = arrivePatrol(dangling, 't1')!;
+    expect(d.teleported).toBe(true);
+    expect(d.next).toBeNull();
+  });
+  it('tick: unequal waits arm at the arrived corner (2s then 5s), zero passes, terminal stands', () => {
+    const TEXT =
+      `{ "classname" "worldspawn" }\n` +
+      `{ "classname" "path_corner" "targetname" "t0" "target" "t1" "origin" "-200 0 24" }\n` +
+      `{ "classname" "path_corner" "targetname" "t1" "target" "t2" "origin" "-100 0 24" "wait" "2" }\n` +
+      `{ "classname" "path_corner" "targetname" "t2" "target" "t3" "origin" "100 0 24" "wait" "5" "pathtarget" "wake" }\n` +
+      `{ "classname" "path_corner" "targetname" "t3" "origin" "300 0 24" }\n` +
+      `{ "classname" "monster_soldier" "origin" "-260 0 24" "angle" "0" "target" "t0" }\n` +
+      // Dormant TRIGGER_SPAWN body: t2's pathtarget fires 'wake' on arrival.
+      `{ "classname" "monster_soldier" "targetname" "wake" "spawnflags" "2" "origin" "0 500 24" "angle" "0" }\n`;
+    resetEdictNums();
+    const st = SV_Init();
+    SV_SpawnEntities(st, TEXT);
+    const cop = st.monsters.find((m) => m.edict.origin[1] === 0)!;
+    const sleeper = st.monsters.find((m) => m.edict.targetname === 'wake')!;
+    expect(cop.patrolCorner).toBe('t0');
+    expect(sleeper.woken).toBe(false);
+    const trace = floorTrace();
+    const away = v3(9000, 9000, 24);
+    const armings: Array<{ arrived: string; wait: number; cornerNow: string }> = [];
+    const walkFrames = new Set<number>();
+    let stoodOutWait = false;
+    let prevCorner = cop.patrolCorner;
+    let prevWait = cop.patrolWaitUntil;
+    let terminal = false;
+    for (let t = 0; t < 3000 && !terminal; t++) {
+      st.time += 0.1;
+      SV_MonsterTick(st, away, trace, null, () => 0.99, { sightTrace: trace });
+      expect(cop.seen).toBe(false);
+      if (cop.state.move === 'walk1') walkFrames.add(cop.state.frame);
+      if (cop.patrolWaitUntil > prevWait) {
+        armings.push({
+          arrived: prevCorner,
+          wait: cop.patrolWaitUntil - st.time,
+          cornerNow: cop.patrolCorner,
+        });
+        prevWait = cop.patrolWaitUntil;
+      }
+      if (cop.state.move === 'stand1' && st.time < cop.patrolWaitUntil) stoodOutWait = true;
+      if (cop.patrolCorner === '' && cop.patrolGoal === null) {
+        terminal = true;
+        expect(cop.state.move).toBe('stand1');
+      }
+      prevCorner = cop.patrolCorner;
+    }
+    expect(terminal).toBe(true);
+    // Two waits, at the ARRIVED corners with the NEXT corner pre-installed
+    // (C movetarget advances before the wait): t1 arms 2s heading to t2,
+    // t2 arms 5s heading to t3. The old bug armed t2's 5s at t1.
+    expect(armings).toHaveLength(2);
+    expect(armings[0]).toEqual({ arrived: 't1', wait: 2, cornerNow: 't2' });
+    expect(armings[1]).toEqual({ arrived: 't2', wait: 5, cornerNow: 't3' });
+    // Zero wait passed straight through: no arming at t0, beat never stood
+    // before the first real wait.
+    expect(armings.some((a) => a.arrived === 't0')).toBe(false);
+    expect(stoodOutWait).toBe(true);
+    // Walking frames actually played (not stuck on one frame).
+    expect(cop.state.move).toBe('stand1');
+    expect(walkFrames.size).toBeGreaterThan(3);
+    for (const f of walkFrames) expect(f).toBeGreaterThanOrEqual(0);
+    // t2's pathtarget fired through production G_UseTargets on arrival: the
+    // dormant body woke (SV_UseMonster) while the beat stood out its wait.
+    expect(sleeper.woken).toBe(true);
+  });
+  it('tick: TELEPORT corner snaps the body (no travel leg) and the beat continues', () => {
+    const TEXT =
+      `{ "classname" "worldspawn" }\n` +
+      `{ "classname" "path_corner" "targetname" "t1" "origin" "-100 0 24" "target" "tT" }\n` +
+      `{ "classname" "path_corner" "targetname" "tT" "origin" "0 0 24" "target" "t2" "spawnflags" "1" }\n` +
+      `{ "classname" "path_corner" "targetname" "t2" "origin" "200 0 24" }\n` +
+      `{ "classname" "monster_soldier" "origin" "-160 0 24" "angle" "0" "target" "t1" }\n`;
+    resetEdictNums();
+    const st = SV_Init();
+    SV_SpawnEntities(st, TEXT);
+    const cop = st.monsters.find((m) => m.edict.origin[1] === 0)!;
+    const trace = floorTrace();
+    const away = v3(9000, 9000, 24);
+    let snapped = false;
+    let prevX = cop.edict.origin[0]!;
+    for (let t = 0; t < 3000 && !snapped; t++) {
+      st.time += 0.1;
+      SV_MonsterTick(st, away, trace, null, () => 0.99, { sightTrace: trace });
+      if (cop.patrolCorner === 't2') {
+        // One tick carried the body ~100u (t1 -> tT): walking covers < 8u.
+        expect(prevX).toBeLessThan(-70);
+        expect(Math.abs(cop.edict.origin[0]!)).toBeLessThan(8);
+        expect(Math.abs(cop.edict.origin[1]!)).toBeLessThan(8);
+        expect(cop.patrolWaitUntil).toBe(0); // arrival wait was 0: no stand
+        snapped = true;
+      }
+      prevX = cop.edict.origin[0]!;
+    }
+    expect(snapped).toBe(true);
+    // The beat walks on from the snap to the terminal corner, then stands.
+    let terminal = false;
+    for (let t = 0; t < 3000 && !terminal; t++) {
+      st.time += 0.1;
+      SV_MonsterTick(st, away, trace, null, () => 0.99, { sightTrace: trace });
+      if (cop.patrolCorner === '' && cop.patrolGoal === null) terminal = true;
+    }
+    expect(terminal).toBe(true);
+    expect(cop.edict.origin[0]!).toBeGreaterThan(150);
+    expect(cop.state.move).toBe('stand1');
   });
 });
 

@@ -220,10 +220,14 @@ export function arriveCombatPoint(st: ServerState, m: ServerMonster): string | n
 // Corners advance on touch (C path_corner_touch): the corner's own `target`
 // names the next corner (re-resolved by targetname each arrival, so t5<->t6
 // ping-pongs loop forever); an empty/dangling link ends the beat (stand).
-// `wait` corners hold the stand pose until level.time + wait. TELEPORT
-// corners (spawnflags & 1) and pathtarget firing are omitted: no base1
-// monster-route corner carries either (teleports exist only on the
-// misc_strogg_ship loops t130/t131/t137/t141/t143/t147).
+// The WAIT belongs to the corner just reached (self->wait): the monster
+// stands until level.time + arrived.wait, with the next leg already
+// installed. TELEPORT corners (spawnflags & 1) snap the body to the corner
+// (z +16: corner mins -8 minus the monster hull -24) and chain through
+// to the teleport's own target; pathtarget fires via G_UseTargets. No base1
+// monster-route corner carries wait/teleport/pathtarget (teleports live only
+// on the misc_strogg_ship loops t130/t131/t137/t141/t143/t147), so the live
+// beats walk every leg — the fields exist for C fidelity, pinned by tests.
 
 /** One resolved patrol corner (g_misc.c SP_path_corner fields we honor). */
 export interface PatrolCorner {
@@ -234,6 +238,10 @@ export interface PatrolCorner {
   target: string;
   /** wait seconds the monster stands on arrival (0 = keep walking). */
   wait: number;
+  /** pathtarget fired on arrival (G_UseTargets). */
+  pathtarget: string;
+  /** spawnflags & 1 TELEPORT corner (snap, no travel leg). */
+  teleport: boolean;
 }
 
 /** Collect the map's patrol corners from the spawned edict roster. */
@@ -241,7 +249,14 @@ export function patrolCornersOf(st: ServerState): PatrolCorner[] {
   const out: PatrolCorner[] = [];
   for (const e of st.entities) {
     if (e.freed || e.classname !== 'path_corner' || !e.targetname) continue;
-    out.push({ name: e.targetname, pos: v3(e.origin[0], e.origin[1], e.origin[2]), target: e.target, wait: e.wait > 0 ? e.wait : 0 });
+    out.push({
+      name: e.targetname,
+      pos: v3(e.origin[0], e.origin[1], e.origin[2]),
+      target: e.target,
+      wait: e.wait > 0 ? e.wait : 0,
+      pathtarget: e.extra['pathtarget'] ?? '',
+      teleport: (e.spawnflags & 1) !== 0,
+    });
   }
   return out;
 }
@@ -261,12 +276,51 @@ export function patrolStart(corners: PatrolCorner[], target: string): PatrolCorn
  * Advance the beat on arrival at `arrivedName` (C path_corner_touch
  * chaining): the arrived corner's own target link names the next corner.
  * Null when the beat ends there (empty/dangling link → stand, C pausetime
- * 1e8). The caller honors `wait` by standing until now + wait.
+ * 1e8). Prefer arrivePatrol (C-exact wait/pathtarget/teleport); this stays
+ * as the next-target selection primitive the tick used before.
  */
 export function patrolAdvance(corners: PatrolCorner[], arrivedName: string): PatrolCorner | null {
   const arrived = corners.find((c) => c.name === arrivedName);
   if (!arrived || !arrived.target) return null;
   return corners.find((c) => c.name === arrived.target) ?? null;
+}
+
+/**
+ * C path_corner_touch arrival (g_misc.c), next-target selection included:
+ * the arrived corner's pathtarget fires, its target link names the next
+ * corner, a TELEPORT next snaps the body (z +16) and chains through to
+ * the teleport's own target, and the WAIT honored is the arrived corner's
+ * own (self->wait) — never the next corner's. movetarget advances before
+ * the wait check, so the next leg is installed even while standing out a
+ * wait; an empty/dangling link ends the beat (stand, C pausetime 1e8).
+ */
+export interface PatrolArrival {
+  /** Next corner to walk to (null = beat ends, stand). */
+  next: PatrolCorner | null;
+  /** Seconds to stand on the arrived corner (0 = keep walking). */
+  wait: number;
+  /** pathtarget to fire via G_UseTargets (null = none). */
+  fire: string | null;
+  /** A TELEPORT corner was consumed on this arrival (origin snaps). */
+  teleported: boolean;
+  /** Teleport corner position snapped to (null unless teleported). */
+  teleportPos: Vec3 | null;
+}
+
+export function arrivePatrol(corners: PatrolCorner[], arrivedName: string): PatrolArrival | null {
+  const arrived = corners.find((c) => c.name === arrivedName);
+  if (!arrived) return null;
+  const fire = arrived.pathtarget ? arrived.pathtarget : null;
+  let next = arrived.target ? (corners.find((c) => c.name === arrived.target) ?? null) : null;
+  let teleported = false;
+  let teleportPos: Vec3 | null = null;
+  if (next && next.teleport) {
+    teleported = true;
+    teleportPos = next.pos;
+    const hop = next.target;
+    next = hop ? (corners.find((c) => c.name === hop) ?? null) : null;
+  }
+  return { next, wait: arrived.wait, fire, teleported, teleportPos };
 }
 
 /** Walk move per kind for the patrol beat (C monsterinfo.walk). */
