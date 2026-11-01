@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>q2ts — map viewer</title>
+<style>
+  body{margin:0;background:#0c0d10;color:#ece7de;font:13px/1.5 system-ui,sans-serif}
+  #mv-wrap{display:flex;flex-direction:column;min-height:100vh}
+  #mv-bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 14px;border-bottom:1px solid #272b31}
+  #mv-bar label{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#9aa1ab}
+  #mv{flex:1;min-height:50vh;background:#000;image-rendering:pixelated}
+  #mv-drop{border:1px dashed #383e47;margin:10px 14px;padding:10px;color:#767d88}
+  #mv-status{white-space:pre-wrap;font-family:monospace;font-size:12px;margin:0 14px 10px;color:#9aa1ab}
+  #mv-assets{white-space:pre-wrap;font-family:monospace;font-size:12px;margin:0 14px 10px;color:#767d88}
+  #mv-map-select{max-width:100%}
+</style>
+</head>
+<body>
+<div id="mv-wrap">
+  <div id="mv-bar">
+    <label>standalone .bsp <input id="mv-bsp-file" type="file" accept=".bsp"></label>
+    <label>map .pak <input id="mv-pak-file" type="file" accept=".pak"></label>
+    <label>asset .paks <input id="mv-asset-paks" type="file" accept=".pak" multiple></label>
+    <label>map <select id="mv-map-select"></select></label>
+  </div>
+  <canvas id="mv" width="640" height="480"></canvas>
+  <div id="mv-drop">drop a .bsp (standalone) or .pak (map bundle) anywhere on this page</div>
+  <div id="mv-assets"></div>
+  <div id="mv-status">no map loaded</div>
+  <div id="mv-panel"></div>
+</div>
+<script type="module" src="/src/map-viewer/main.ts"></script>
+</body>
+</html>

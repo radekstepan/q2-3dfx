@@ -3,6 +3,9 @@ dist/
 coverage/
 *.q2pkg
 *.pak
+# Compiled map output is reproducible from .map source + tool versions
+# (see tools/compile-map); never commit build/ directories.
+maps/*/build/
 .yarn/*
 !.yarnrc.yml
 __golden__/out/
