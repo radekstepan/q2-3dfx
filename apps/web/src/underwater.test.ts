@@ -19,7 +19,7 @@
 //        objects (viewmodel gun), moving views, source FOV, GPU overlay
 //        parity (tint, never warp).
 import { describe, expect, it, afterEach } from 'vitest';
-import { resetCVars } from '@q2/config';
+import { resetCVars, setCVar } from '@q2/config';
 import type { UserCmdT } from '@q2/input';
 import { v3, type Vec3 } from '@q2/math';
 import {
@@ -32,12 +32,14 @@ import {
 } from '@q2/game';
 import {
   applyUnderwaterWarp,
+  applyRendererCvar,
   bootPlay,
   buildAsyncView,
   createAsyncLoopState,
   drawPlayHud,
   frameAsync,
   paintHudOverlay,
+  resizePlay,
   resolveDisplay,
 } from './play.js';
 import {
@@ -130,18 +132,18 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-15 base1 underwater presentation', () => {
     throw new Error('no water found in pool column');
   }
 
-  async function placeEye(originZ: number, angles: [number, number, number] = [0, 0, 0], time = 3.7) {
-    // NOTE: buildAsyncView reads predictor entities (stale across a bare
-    // pm teleport), so the view is built from the authoritative pm eye
-    // directly — origin + viewheight, the exact point SV_CalcBlend samples
-    // and underwaterOverlay() classifies. Renderables (gun tail) come from
-    // buildAsyncView with the depthHack gun re-anchored to this eye.
-    const boot = await bootBase1();
+  /**
+   * Teleport an already-settled boot's authoritative eye and build the
+   * matching view + renderables (no boot). Split from placeEye so resize and
+   * switch tests can re-derive the view WITHOUT stepping (a settle step
+   * would sink the player and move the eye, breaking byte equality).
+   */
+  function framePartsForEye(
+    boot: ReturnType<typeof bootPlay>,
+    angles: [number, number, number] = [0, 0, 0],
+    time = 3.7,
+  ) {
     const { driver } = boot;
-    for (let i = 0; i < 5; i++) driver.step(neutralCmd(), 0.1);
-    driver.pm.origin = v3(POOL_X, POOL_Y, originZ);
-    driver.pm.velocity = v3();
-    driver.step(neutralCmd(), 0.1);
     const eye: [number, number, number] = [
       driver.pm.origin[0]!,
       driver.pm.origin[1]!,
@@ -158,7 +160,32 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-15 base1 underwater presentation', () => {
     for (const e of renderables) {
       if (e.depthHack) e.origin = new Float32Array(eye) as typeof e.origin;
     }
-    return { boot, view, renderables };
+    return { view, renderables };
+  }
+
+  function submergeBoot(
+    boot: ReturnType<typeof bootPlay>,
+    originZ: number,
+    angles: [number, number, number] = [0, 0, 0],
+    time = 3.7,
+  ) {
+    const { driver } = boot;
+    driver.pm.origin = v3(POOL_X, POOL_Y, originZ);
+    driver.pm.velocity = v3();
+    driver.step(neutralCmd(), 0.1);
+    return framePartsForEye(boot, angles, time);
+  }
+
+  async function placeEye(originZ: number, angles: [number, number, number] = [0, 0, 0], time = 3.7, width = 96, height = 72) {
+    // NOTE: buildAsyncView reads predictor entities (stale across a bare
+    // pm teleport), so the view is built from the authoritative pm eye
+    // directly — origin + viewheight, the exact point SV_CalcBlend samples
+    // and underwaterOverlay() classifies. Renderables (gun tail) come from
+    // buildAsyncView with the depthHack gun re-anchored to this eye.
+    const boot = await bootBase1(width, height);
+    const { driver } = boot;
+    for (let i = 0; i < 5; i++) driver.step(neutralCmd(), 0.1);
+    return { boot, ...submergeBoot(boot, originZ, angles, time) };
   }
 
   function renderFrame(
@@ -373,5 +400,151 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-15 base1 underwater presentation', () => {
     // does (predictor convergence is a live-loop property; the hook reads
     // the authoritative pm eye either way).
     expect(driver.underwaterOverlay()).not.toBeNull();
+  });
+
+  it('(u2-res) warp gating + determinism hold at 160x120 and survive a resizePlay round-trip', { timeout: 240000 }, async () => {
+    const W = 160;
+    const H = 120;
+    const boot = await bootBase1(W, H);
+    const contents = bspPointContentsFor(boot.driver.map!);
+    const surf = await surveySurface(contents);
+    const eyeZ = surf - 22 - 12;
+    for (let i = 0; i < 5; i++) boot.driver.step(neutralCmd(), 0.1);
+    const placed = submergeBoot(boot, eyeZ);
+    expect(boot.driver.underwaterOverlay()?.kind).toBe('water');
+    const snapPlain = (): Uint8Array => {
+      boot.refresh.beginFrame();
+      boot.refresh.renderView(placed.view as never, boot.host.world, placed.renderables);
+      return new Uint8Array(boot.refresh.getFramebuffer().index!);
+    };
+    const snapWarped = (t: number): Uint8Array => {
+      boot.refresh.beginFrame();
+      boot.refresh.renderView(placed.view as never, boot.host.world, placed.renderables);
+      expect(applyUnderwaterWarp(boot, t)).toBe(true);
+      return new Uint8Array(boot.refresh.getFramebuffer().index!);
+    };
+    // Omitted-warp control at the second resolution: no warp = no change.
+    expect([...snapPlain()]).toEqual([...snapPlain()]);
+    const warpedBig = snapWarped(placed.view.time);
+    expect([...warpedBig]).not.toEqual([...snapPlain()]);
+    expect([...snapWarped(placed.view.time)]).toEqual([...warpedBig]);
+    expect([...snapWarped(placed.view.time + 1.7)]).not.toEqual([...warpedBig]);
+    // Resize down: the per-resolution compression tables rebuild and the
+    // smaller frame is deterministic too. framePartsForEye re-derives the
+    // view WITHOUT stepping (resizePlay preserves sim; a settle step would
+    // sink the player and move the eye).
+    expect(resizePlay(boot, 96, 72)).toBe(true);
+    const smallFb = boot.refresh.getFramebuffer();
+    expect(smallFb.width).toBe(96);
+    expect(smallFb.height).toBe(72);
+    const small = framePartsForEye(boot, [0, 0, 0], placed.view.time);
+    const snapSmallWarped = (): Uint8Array => {
+      boot.refresh.beginFrame();
+      boot.refresh.renderView(small.view as never, boot.host.world, small.renderables);
+      expect(applyUnderwaterWarp(boot, small.view.time)).toBe(true);
+      return new Uint8Array(boot.refresh.getFramebuffer().index!);
+    };
+    expect(boot.driver.underwaterOverlay()?.kind).toBe('water');
+    expect([...snapSmallWarped()]).toEqual([...snapSmallWarped()]);
+    // Resize back: the rebuilt 160x120 tables give back bit-identical bytes.
+    expect(resizePlay(boot, W, H)).toBe(true);
+    expect(boot.refresh.getFramebuffer().width).toBe(W);
+    const back = framePartsForEye(boot, [0, 0, 0], placed.view.time);
+    boot.refresh.beginFrame();
+    boot.refresh.renderView(back.view as never, boot.host.world, back.renderables);
+    expect(applyUnderwaterWarp(boot, back.view.time)).toBe(true);
+    expect([...new Uint8Array(boot.refresh.getFramebuffer().index!)]).toEqual([...warpedBig]);
+    // Transition flip at the second size: eye just above the surface is dry.
+    // ±8 absorbs the single settle-tick gravity sink (~4u).
+    const aboveEye = submergeBoot(boot, surf - 22 + 8);
+    expect(aboveEye.view.origin[2]!).toBeGreaterThan(surf);
+    expect(boot.driver.underwaterOverlay()).toBeNull();
+    expect(applyUnderwaterWarp(boot, aboveEye.view.time)).toBe(false);
+  });
+
+  it('(u2-locality) warped texels relocate within the AMP2+MARGIN neighborhood', { timeout: 180000 }, async () => {
+    // D_WarpScreen displaces by table[phase+v] (0..AMP2) through the
+    // compression tables, so |dx|,|dy| <= AMP2 (=3) plus the edge-compression
+    // shift (<= MARGIN = 2*AMP2 = 6 total). Radius 8 has headroom; anything
+    // beyond it would be an invented distortion, not the C sine warp.
+    const W = 160;
+    const H = 120;
+    const R = 8;
+    const boot = await bootBase1(W, H);
+    const contents = bspPointContentsFor(boot.driver.map!);
+    const surf = await surveySurface(contents);
+    for (let i = 0; i < 5; i++) boot.driver.step(neutralCmd(), 0.1);
+    const { view, renderables } = submergeBoot(boot, surf - 22 - 12);
+    boot.refresh.beginFrame();
+    boot.refresh.renderView(view as never, boot.host.world, renderables);
+    const plain = new Uint8Array(boot.refresh.getFramebuffer().index!);
+    boot.refresh.beginFrame();
+    boot.refresh.renderView(view as never, boot.host.world, renderables);
+    expect(applyUnderwaterWarp(boot, view.time)).toBe(true);
+    const warped = new Uint8Array(boot.refresh.getFramebuffer().index!);
+    expect([...warped]).not.toEqual([...plain]);
+    let missing = 0;
+    let first = '';
+    for (let v = 0; v < H; v++) {
+      for (let u = 0; u < W; u++) {
+        const val = warped[v * W + u]!;
+        let found = false;
+        for (let dv = -R; dv <= R && !found; dv++) {
+          const vv = v + dv;
+          if (vv < 0 || vv >= H) continue;
+          for (let du = -R; du <= R; du++) {
+            const uu = u + du;
+            if (uu < 0 || uu >= W) continue;
+            if (plain[vv * W + uu] === val) {
+              found = true;
+              break;
+            }
+          }
+        }
+        if (!found) {
+          if (missing === 0) first = `pixel (${u},${v}) value ${val} has no match within Chebyshev ${R}`;
+          missing++;
+        }
+      }
+    }
+    expect(`${missing} ${first}`).toBe(`0 `);
+  });
+
+  it('(u3-switch) renderer switch + failed-GPU fallback while submerged keep tint and warp', { timeout: 180000 }, async () => {
+    const probe = await bootBase1();
+    const contents = bspPointContentsFor(probe.driver.map!);
+    const surf = await surveySurface(contents);
+    const { boot, view, renderables } = await placeEye(surf - 22 - 12);
+    expect(boot.driver.underwaterOverlay()?.kind).toBe('water');
+    // software->software hot-swap: sim untouched, stale display pixels zeroed.
+    boot.display.fill(0xdeadbeef);
+    setCVar('vid_renderer', 'software');
+    expect(applyRendererCvar(boot)).toBe('software');
+    expect(boot.lastRendererWarning).toBeNull();
+    expect(boot.display.every((v) => v === 0)).toBe(true);
+    expect(boot.driver.underwaterOverlay()?.kind).toBe('water');
+    boot.refresh.beginFrame();
+    boot.refresh.renderView(view as never, boot.host.world, renderables);
+    expect(applyUnderwaterWarp(boot, view.time)).toBe(true);
+    // Failed GPU attach while submerged (no GL in node): graceful fallback
+    // WITH a warning — the wash and the warp both survive on the CPU path.
+    setCVar('vid_renderer', 'webgl2-experimental');
+    expect(applyRendererCvar(boot)).toBe('software');
+    expect(boot.lastRendererWarning).not.toBeNull();
+    expect(boot.gpu).toBeNull();
+    expect(boot.driver.underwaterOverlay()?.kind).toBe('water');
+    boot.refresh.beginFrame();
+    boot.refresh.renderView(view as never, boot.host.world, renderables);
+    expect(applyUnderwaterWarp(boot, view.time)).toBe(true);
+    boot.refresh.endFrame();
+    const shown = new Uint32Array(resolveDisplay(boot));
+    const w = 96;
+    const h = 72;
+    const target = { width: w, height: h, color: shown };
+    const px = 2;
+    const py = (h / 2) | 0;
+    const before = target.color[py * w + px]!;
+    drawPlayHud(target, boot, { fps: 0, frame: 1 });
+    expect(target.color[py * w + px]).not.toBe(before);
   });
 });

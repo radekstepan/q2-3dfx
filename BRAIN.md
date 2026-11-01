@@ -288,12 +288,13 @@ the reopened scope, not for unrelated completed work.
 ### RELEASE-15 — Verify underwater object appearance against the original
 owns: `apps/web`, `packages/webgl-renderer`, `packages/sw-renderer`, `packages/testkit`
 depends: none
-status: review (implementation landed; user requests parity check)
+status: review (boxes 2-3 done 2026-11-01; box 1 needs user/original-game captures)
 review-finding: `a42e951` adds contents tint on both backends and full-frame software warp; WebGL2 gets tint only. Local original `ref_soft` uses D_WarpScreen, whereas reviewed `ref_gl/gl_rmain.c` uses normal projection and polyblend, with no corresponding RDF_UNDERWATER screen-warp path. Animated water surface UVs are a separate effect. This source finding does not replace a matched visual check of the user's observation.
+box-1 needs: matched original-vs-project captures (eye above/below/crossing, engine/version/map/camera/FOV/time/contents + screenshots or video) plus the user verdict on warp vs tint vs refraction. No headless path to a running original binary in this environment.
 done-when:
 - [ ] Compare matched original OpenGL and project views: eye above water looking at submerged objects, eye below water, and crossing the surface. Record engine/version, map/camera/FOV/time, contents and screenshots/video. Distinguish surface animation, full-screen warp, tint and genuine refraction; identify the observed distortion rather than adding an invented effect.
-- [ ] Audit warp/blend ordering, eye-contents detection, viewmodel and HUD behavior, plus renderer switches underwater. Fix demonstrated regressions, preserving backend-specific source behavior and intended water motion. Do not apply software full-screen warp to WebGL solely because it exists in the software source.
-- [ ] Capture deterministic known-object geometry and transition tests with omitted-effect controls at multiple resolutions. Record source parity and user visual verdict separately; keep uncertainty open if the original comparison is unavailable.
+- [x] Audit warp/blend ordering, eye-contents detection, viewmodel and HUD behavior, plus renderer switches underwater. Fix demonstrated regressions, preserving backend-specific source behavior and intended water motion. Do not apply software full-screen warp to WebGL solely because it exists in the software source.
+- [x] Capture deterministic known-object geometry and transition tests with omitted-effect controls at multiple resolutions. Record source parity and user visual verdict separately; keep uncertainty open if the original comparison is unavailable.
 
 ### RELEASE-10 — Custom, width-limited sidebar tooltips
 owns: `apps/web`
