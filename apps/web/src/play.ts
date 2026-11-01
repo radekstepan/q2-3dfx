@@ -1325,7 +1325,7 @@ export class LocalDriver implements HostDriver {
       // from the driver path (it dropped through clip floors into the void).
       this.worldTrace = SV_ClipTrace(this.server, SV_TraceFor(built.map));
       this.pmoveTrace = SV_ClipTrace(this.server, SV_TraceFor(built.map), -1, true);
-      this.sightTrace = SV_TraceFor(built.map, MASK_OPAQUE_C);
+      this.sightTrace = SV_ClipTrace(this.server, SV_TraceFor(built.map, MASK_OPAQUE_C));
       // Solid-aware contents (water.ts bspPointContentsFor, NOT the legacy
       // solid-less bspContentsFor): the pmove vault probe (`& CONTENTS_SOLID`)
       // and the server P_WorldEffects sampler both read through this. With
@@ -6691,7 +6691,18 @@ export function frameGpuPlay(boot: PlayBoot, nowMs: number): GpuRendererStatus |
   g.gpu.setScene(scene);
   g.gpu.setEntities(entities, modelKinds.size > 0 ? modelKinds : undefined);
   g.scene = scene;
-  g.gpu.renderFrame({ view, scene, time: view.time, lights });
+  // DIVERGENCE underwater screen warp (user-requested): the WebGL appearance
+  // pass warps when the eye is submerged (SV_CalcBlend contents rule via
+  // underwaterOverlay().submerged). The tint still rides paintHudOverlay, so
+  // ordering stays warp-then-tint like software. Dry/solid eyes pass
+  // submerged:false (verbatim passthrough, ref_gl parity).
+  let submerged = false;
+  try {
+    submerged = boot.driver.underwaterOverlay()?.submerged === true;
+  } catch {
+    submerged = false;
+  }
+  g.gpu.renderFrame({ view, scene, time: view.time, lights, underwater: { submerged } });
   const tEnd = performance.now();
   recordGpuWork(
     tSim0 - tDrain0,

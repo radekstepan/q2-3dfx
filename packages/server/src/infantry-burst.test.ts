@@ -162,6 +162,27 @@ describe('RELEASE-5 infantry burst timing (m_infantry.c AI_HOLD_FRAME)', () => {
 });
 
 describe('RELEASE-5 infantry muzzle/flash/light/sound/impact (cl_fx.c)', () => {
+  it('a committed shot cannot damage through a newly closed obstruction', () => {
+    resetEdictNums();
+    const st = SV_Init();
+    const m = SV_SpawnMonster(st, 'monster_infantry', v3(0, 0, 24));
+    m.state.yaw = 0;
+    m.state.move = 'attack1';
+    m.state.frame = 10;
+    const floor = floorTrace();
+    const blocked: TraceFn = (start, mins, maxs, end) => {
+      const hit = floor(start, mins, maxs, end);
+      if (mins[0] === 0 && start[0]! < 100 && end[0]! > 100) {
+        return { ...hit, fraction: 0.5, endpos: v3(100, 0, 40) };
+      }
+      return hit;
+    };
+    // Sight was acquired earlier; the current shot trace sees the door.
+    SV_Tick(st, 0.1, { player: playerAt(300), trace: blocked, sightTrace: floor, rand: () => 0 });
+    expect(st.sounds.some((s) => s.name === INFANTRY_GUN_SOUND)).toBe(true);
+    expect(st.playerHealth).toBe(100);
+  });
+
   it('representative burst round: MZ2_1 muzzle, foe dlight, infatck1, streak, impact sparks', () => {
     resetEdictNums();
     const st = SV_Init();

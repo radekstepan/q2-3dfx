@@ -143,7 +143,7 @@ describe('RELEASE-5 live bodies block movement', () => {
     expect(minGap).toBeGreaterThanOrEqual(30);
   });
 
-  it('the downed player body still blocks (C keeps the client edict solid)', () => {
+  it('monsters do not pursue a downed player', () => {
     resetEdictNums();
     const st = SV_Init();
     const m = SV_SpawnMonster(st, 'monster_infantry', v3(200, 0, 24));
@@ -157,9 +157,7 @@ describe('RELEASE-5 live bodies block movement', () => {
       const gap = Math.hypot(m.edict.origin[0]! - game.player.pos[0]!, m.edict.origin[1]! - game.player.pos[1]!);
       minGap = Math.min(minGap, gap);
     }
-    // Closes to contact but never enters the downed body.
-    expect(minGap).toBeLessThan(60);
-    expect(minGap).toBeGreaterThanOrEqual(30);
+    expect(minGap).toBe(200);
   });
 });
 

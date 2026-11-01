@@ -2881,7 +2881,10 @@ export function SV_MonsterTick(
     // the player fired in the last second (show_hostile), mid (< 1000)
     // needs facing, far never acquires. Damage and noise acquire separately.
     const hostile = now - st.lastPlayerShotAt < 1;
-    const spotted = !m.seen && acquireSight(m, playerPos, dist, los, hostile);
+    // A dead player is no longer a valid target. Forget the old target so a
+    // respawn elsewhere cannot become an instant, omniscient pursuit goal.
+    if (st.playerHealth <= 0) m.seen = false;
+    const spotted = st.playerHealth > 0 && !m.seen && acquireSight(m, playerPos, dist, los, hostile);
     // FoundTarget (g_ai.c): first sight acquires the enemy plus the
     // sight-delay hold (HuntTarget AttackFinished) before any attack.
     if (spotted) {
@@ -2894,7 +2897,7 @@ export function SV_MonsterTick(
       // movetarget FIRST and checks FindTarget after, so patrolling
       // ambushers keep walking while unseen (the patrol branch below runs
       // the same gated acquisition before stepping).
-      if (!los || !acquireSight(m, playerPos, dist, true, hostile)) {
+      if (st.playerHealth <= 0 || !los || !acquireSight(m, playerPos, dist, true, hostile)) {
         const stand = m.kind === 'soldier' ? 'stand1' : 'stand';
         if (ms.move !== stand) {
           ms.move = stand;
@@ -3861,6 +3864,11 @@ export function SV_HealPlayer(st: ServerState, amount: number): number {
 
 /** Set the pool directly (respawn path; clamped to 0..max). */
 export function SV_SetPlayerHealth(st: ServerState, hp: number): number {
+  if (st.playerHealth <= 0 && hp > 0) {
+    st.trail = trailInit(true);
+    for (const m of st.monsters) m.seen = false;
+    st.lastPlayerShotAt = -10;
+  }
   st.playerHealth = Math.min(st.playerMaxHealth, Math.max(0, hp));
   return st.playerHealth;
 }
@@ -4391,6 +4399,7 @@ function resolveMonsterFire(
   ev: MonsterEvent,
   player: SVPlayerBody,
   rand: () => number,
+  trace: TraceFn,
 ): void {
   if (st.playerHealth <= 0) return;
   const eye = v3(player.pos[0], player.pos[1], player.pos[2]! + player.view);
@@ -4438,7 +4447,7 @@ function resolveMonsterFire(
   // they fire their guns point-blank, so non-infantry events fall through
   // to the gunfire branches below with the guns' real sounds.
   if (m.kind === 'infantry' && move === 'attack2') {
-    if (dist < 96) {
+    if (dist < 96 && trace(m.edict.origin, ZERO_HULL, ZERO_HULL, eye).fraction === 1) {
       SV_DamagePlayer(st, infantryMeleeDamage(rand), m.edict.origin);
       st.sounds.push({ name: INFANTRY_MELEE_SOUND, pos: chest, born: st.time });
     }
@@ -4474,6 +4483,10 @@ function resolveMonsterFire(
     return;
   }
   const pHit = dist < 500 ? 0.6 : 0.25;
+  // A committed burst can continue after a door closes. Resolve each round
+  // against current geometry before allowing the approximate hit roll.
+  const shot = trace(muzzle, ZERO_HULL, ZERO_HULL, eye);
+  const clearShot = shot.fraction === 1 && !shot.startsolid && !shot.allsolid;
   // Infantry machinegun: single bullet per trigger (m_infantry.c
   // InfantryMachineGun -> monster_fire_bullet dmg 3 kick 4 spread 300/500,
   // infatck1.wav). The C AI_HOLD_FRAME hold re-fires this frame across
@@ -4494,7 +4507,7 @@ function resolveMonsterFire(
     }
     st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(shotDir[0], shotDir[1], shotDir[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
     st.sounds.push({ name: INFANTRY_GUN_SOUND, pos: chest, born: st.time });
-    if (rand() < pHit) {
+    if (rand() < pHit && clearShot) {
       SV_DamagePlayer(st, INFANTRY_C.bulletDamage, m.edict.origin);
       st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
     }
@@ -4509,7 +4522,7 @@ function resolveMonsterFire(
   if (skinWeapon === 'machinegun') {
     st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
     st.sounds.push({ name: SOLDIER_WEAPON_STATS.machinegun.sound, pos: chest, born: st.time });
-    if (rand() < pHit) {
+    if (rand() < pHit && clearShot) {
       SV_DamagePlayer(st, SOLDIER_WEAPON_STATS.machinegun.damage, m.edict.origin);
       st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
     }
@@ -4523,7 +4536,7 @@ function resolveMonsterFire(
   }
   st.tracers.push({ origin: v3(muzzle[0], muzzle[1], muzzle[2]), dir: v3(dirToEye[0], dirToEye[1], dirToEye[2]), color: HITSCAN_TRACER_COLOR, length: SERVER_ENEMY_TRACER_LENGTH, born: st.time });
   st.sounds.push({ name: sound, pos: chest, born: st.time });
-  if (rand() < pHit) {
+  if (rand() < pHit && clearShot) {
     SV_DamagePlayer(st, dmg, m.edict.origin);
     st.sparks.push({ pos: v3(eye[0], eye[1], eye[2]), color: 200 + ((rand() * 55) | 0), vel: null, ttl: SV_SPARK_TTL, born: st.time });
   }
@@ -4895,7 +4908,7 @@ function SV_GameTick(st: ServerState, game: SVGameTick, dt: number): void {
   for (const ev of SV_MonsterTick(st, game.player.pos, game.trace, game.nav ?? null, rand, { sightTrace, playerViewheight: game.player.view, playerBody: { mins: game.player.mins, maxs: game.player.maxs } })) {
     const m = st.monsters.find((mm) => mm.edict.num === ev.num);
     if (!m) continue;
-    resolveMonsterFire(st, m, ev, game.player, rand);
+    resolveMonsterFire(st, m, ev, game.player, rand, game.trace);
   }
   // Bolts fly and touch.
   stepBoltFlight(st, game.player, game.trace, rand, dt);

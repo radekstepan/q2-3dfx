@@ -481,6 +481,43 @@ export function warpUv(u: number, v: number, timeSec: number): [number, number] 
   return [u + tu, v + tv];
 }
 
+// --- Underwater screen warp (DIVERGENCE CPU mirror, D_WarpScreen) -------------
+//
+// FS_APPEARANCE warpSrcPx mirror (software top-origin orientation):
+// phase = floor(mod(time*20,128)), table int(3+3*sin(2*pi*(idx%128)/128)),
+// tv = table[(phase+vTop)%1280], tu = table[(phase+u)%1280],
+// sx = ((tv+u)/(w+6))*w, syTop = ((vTop+tu)/(h+6))*h, sy = h-1-syTop.
+// Pure, tested against apps/web underwater.ts warpTablesFor parity.
+
+/** Underwater warp phase for level-time seconds (floor(mod(t*20,128)), 0..127). */
+export function underwaterWarpPhaseFor(timeSec: number): number {
+  if (!Number.isFinite(timeSec)) return 0;
+  return Math.floor(((timeSec * 20) % 128 + 128) % 128);
+}
+
+/** Underwater warp table int at index (C truncation, values 0..6). */
+export function underwaterWarpIntAt(idx: number): number {
+  const c = ((idx % 128) + 128) % 128;
+  return Math.floor(3 + 3 * Math.sin((2 * Math.PI * c) / 128));
+}
+
+/** Underwater screen-warp source pixel (GL bottom-origin in/out, software top-origin inside). */
+export function underwaterWarpSrc(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  timeSec: number,
+): [number, number] {
+  const phase = underwaterWarpPhaseFor(timeSec);
+  const vTop = h - 1 - y;
+  const tv = underwaterWarpIntAt((phase + vTop) % 1280);
+  const tu = underwaterWarpIntAt((phase + x) % 1280);
+  const sx = Math.floor(((tv + x) / (w + 6)) * w);
+  const syTop = Math.floor(((vTop + tu) / (h + 6)) * h);
+  return [sx, h - 1 - syTop];
+}
+
 // --- Lightmap overbright (duplicate of voodoo modulateLightmap, CPU form) ---
 
 /**
@@ -700,6 +737,8 @@ uniform int uReconMode;
 uniform vec3 uRgbMaxDelta;
 uniform float uGamma;
 uniform int u16bit;
+uniform int uWarpOn;
+uniform float uWarpTime;
 out vec4 oColor;
 const int BAYER4A[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);
 const int BAYER2A[4] = int[4](0, 2, 3, 1);
@@ -794,24 +833,53 @@ vec3 recon4x1(ivec2 px, ivec2 size) {
   if (passesGate(a, b, c, d)) return floor((a + b + c + d + vec3(2.0)) / 4.0);
   return b;
 }
+// Underwater screen warp (DIVERGENCE from ref_gl, user-requested):
+// ref_soft r_scan.c D_WarpScreen mirror in the appearance pass, applied to
+// the scene-target fetch BEFORE dither/565/recon/gamma (warp-then-Voodoo,
+// like software warp-then-palettize). Integer table:
+//   intsintable[i] = int(3 + 3*sin(2*pi*(i%128)/128)) (r_main.c R_InitTurb,
+//   AMP2=3/SPEED=20/CYCLE=128), phase = floor(mod(time*20,128)).
+// dest[u,v] = src[col[tv+u], row[v+tu]] with col[i]=(i/(w+6))*w,
+// row[i]=((i/(h+6))*h) (edge compression MARGIN=2*AMP2=6, underwater.ts
+// warpTablesFor parity). Y uses the software top-origin convention:
+// vTop = h-1-py so the phase matches the software warp orientation;
+// the GL bottom-origin flip is undone around the lookup. uWarpOn 0 =
+// verbatim passthrough (dry / ref_gl parity path).
+int warpIntAt(int idx) {
+  int c = idx - (idx / 128) * 128;
+  float s = sin(6.283185307179586 * float(c) / 128.0);
+  return int(floor(3.0 + 3.0 * s));
+}
+ivec2 warpSrcPx(ivec2 px, ivec2 size) {
+  if (uWarpOn == 0) return px;
+  float ph = floor(mod(uWarpTime * 20.0, 128.0));
+  int vTop = size.y - 1 - px.y;
+  int tv = warpIntAt(int(mod(ph + float(vTop), 1280.0)));
+  int tu = warpIntAt(int(mod(ph + float(px.x), 1280.0)));
+  int sx = int(float(tv + px.x) / float(size.x + 6) * float(size.x));
+  int syTop = int(float(vTop + tu) / float(size.y + 6) * float(size.y));
+  int sy = size.y - 1 - syTop;
+  return ivec2(sx, sy);
+}
 void main() {
   ivec2 size = textureSize(uScene, 0);
   ivec2 px = ivec2(gl_FragCoord.xy);
-  float alpha = fetchAlpha(px, size);
+  ivec2 srcPx = warpSrcPx(px, size);
+  float alpha = fetchAlpha(srcPx, size);
   vec3 col;
   if (u16bit == 0) {
-    col = fetchLin(px, size);
+    col = fetchLin(srcPx, size);
   } else {
     if (uPostfilter == 0) {
-      col = quantTap(px, size) / 255.0;
+      col = quantTap(srcPx, size) / 255.0;
       col = pow(max(col, vec3(0.0)), vec3(1.0 / uGamma));
       oColor = vec4(col, alpha);
       return;
     }
     vec3 rec;
-    if (uReconMode == 0) rec = reconLegacy(px, size);
-    else if (uReconMode == 2) rec = recon4x1(px, size);
-    else rec = recon2x2(px, size);
+    if (uReconMode == 0) rec = reconLegacy(srcPx, size);
+    else if (uReconMode == 2) rec = recon4x1(srcPx, size);
+    else rec = recon2x2(srcPx, size);
     col = rec / 255.0;
   }
   col = pow(max(col, vec3(0.0)), vec3(1.0 / uGamma));

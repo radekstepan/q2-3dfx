@@ -18,6 +18,7 @@ import {
   SV_MonsterTick,
   SV_PlayerFire,
   SV_SetSkill,
+  SV_SetPlayerHealth,
   SV_SpawnEntities,
   SV_SpawnMonster,
   SV_Tick,
@@ -70,6 +71,20 @@ function seq(...vs: number[]): () => number {
   let i = 0;
   return () => vs[Math.min(i++, vs.length - 1)]!;
 }
+
+it('forgets a dead player and does not track their respawn through walls', () => {
+  const st = SV_Init();
+  const m = SV_SpawnMonster(st, 'monster_infantry', v3(0, 0, 24));
+  m.seen = true;
+  st.playerHealth = 0;
+  const trace = floorTrace();
+  SV_MonsterTick(st, v3(200, 0, 24), trace, null, () => 0);
+  expect(m.seen).toBe(false);
+  SV_SetPlayerHealth(st, 100);
+  const blind: TraceFn = (start, mins, maxs, end) => ({ ...trace(start, mins, maxs, end), fraction: 0.5 });
+  SV_MonsterTick(st, v3(300, 0, 24), trace, null, () => 0, { sightTrace: blind });
+  expect(m.seen).toBe(false);
+});
 
 describe('combat points (point_combat / combattarget)', () => {
   const TEXT =

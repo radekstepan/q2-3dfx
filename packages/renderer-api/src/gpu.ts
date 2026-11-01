@@ -131,6 +131,17 @@ export interface GpuFrameInput {
    * compiling; the backend clamps to MAX_GPU_LIGHTS (8), first-come wins.
    */
   lights?: GpuLight[];
+  /**
+   * Underwater eye state (DIVERGENCE from ref_gl, user-requested): when
+   * `submerged` is true the WebGL appearance pass applies the fullscreen
+   * sine warp (ref_soft D_WarpScreen mirror) before the Voodoo resolve.
+   * Optional (absent = dry, no warp) so existing callers keep compiling.
+   * The play layer derives this from `driver.underwaterOverlay()?.submerged`
+   * (SV_CalcBlend contents + RDF_UNDERWATER rule); the tint itself still
+   * rides the 2D overlay (`paintHudOverlay`), so ordering stays warp-then-tint
+   * like software (D_WarpScreen, then R_CalcPalette).
+   */
+  underwater?: { submerged: boolean };
 }
 
 /**

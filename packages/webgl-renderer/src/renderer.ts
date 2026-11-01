@@ -233,6 +233,8 @@ interface PostLocs {
   uRgbMaxDelta: WebGLUniformLocation | null;
   uGamma: WebGLUniformLocation | null;
   u16bit: WebGLUniformLocation | null;
+  uWarpOn: WebGLUniformLocation | null;
+  uWarpTime: WebGLUniformLocation | null;
 }
 
 /** Linear scene render target (float when renderable, else RGBA8 fallback). */
@@ -1107,6 +1109,8 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
           uRgbMaxDelta: L('uRgbMaxDelta'),
           uGamma: L('uGamma'),
           u16bit: L('u16bit'),
+          uWarpOn: L('uWarpOn'),
+          uWarpTime: L('uWarpTime'),
         };
       }
     } catch (err) {
@@ -1730,10 +1734,12 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     gl.disable(gl.BLEND);
 
     // Appearance resolve: ONE fullscreen pass from the linear scene target
-    // to the canvas (dither -> 565 quantize -> reconstruction -> gamma).
-    // Resident on GPU through presentation; never a readback.
+    // to the canvas (underwater warp, then dither -> 565 quantize ->
+    // reconstruction -> gamma). Resident on GPU through presentation;
+    // never a readback.
     if (target) {
-      this.runAppearance(gl, target);
+      const warpOn = input.underwater?.submerged === true;
+      this.runAppearance(gl, target, warpOn, input.time);
     }
   }
 
@@ -1821,7 +1827,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   }
 
   /** Fullscreen appearance resolve from the scene target to the canvas. */
-  private runAppearance(gl: WebGL2RenderingContext, target: SceneTarget): void {
+  private runAppearance(gl: WebGL2RenderingContext, target: SceneTarget, warpOn = false, warpTime = 0): void {
     const post = this.postProg;
     const ap = this.apFrame;
     if (!post || !ap) return;
@@ -1841,6 +1847,8 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     }
     if (post.uGamma) gl.uniform1f(post.uGamma, ap.gamma);
     if (post.u16bit) gl.uniform1i(post.u16bit, ap.use16bit ? 1 : 0);
+    if (post.uWarpOn) gl.uniform1i(post.uWarpOn, warpOn ? 1 : 0);
+    if (post.uWarpTime) gl.uniform1f(post.uWarpTime, Number.isFinite(warpTime) ? warpTime : 0);
     // Buffer-less fullscreen triangle (gl_VertexID in VS_POST).
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.enable(gl.DEPTH_TEST);
