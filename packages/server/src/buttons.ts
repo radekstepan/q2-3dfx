@@ -47,8 +47,16 @@ export function buttonCanFire(m: Mover): boolean {
  * are 8+ units thick; the exit-hall camper stands 100+ away).
  */
 export const BUTTON_TOUCH_SLOP = 1.0;
-/** E-use reach in world units (matches the 96-unit point-trigger slop). */
-export const BUTTON_USE_REACH = 96;
+/**
+ * E-use reach in world units (RELEASE-4: 120, up from the 96-unit
+ * point-trigger slop). Q2 has no +use-for-buttons (driver convenience);
+ * the aboard-plug finisher (open plug east top to the east-face *34,
+ * ~25-40u) sits well inside it, and so does the walkway *34 opener and
+ * the *13 train call from the bridge. Outside presses still never finish
+ * (aboard guard in fireTargets), so the extra reach only lets intended
+ * aboard/deck presses connect — no new premature finishes.
+ */
+export const BUTTON_USE_REACH = 120;
 /** E-use facing gate: cosine between the view forward and the eye->button ray. */
 export const BUTTON_USE_DOT = 0.7;
 

@@ -46,7 +46,7 @@ import {
 import type { Edict, Mover, TraceFn, Trigger } from '@q2/game';
 import { v3 } from '@q2/math';
 import type { Vec3 } from '@q2/math';
-import { SV_Init, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, SV_UseTargetname, SV_DamageMonster, fireTargets } from './index.js';
+import { SV_Init, SV_SpawnEntities, SV_Tick, SV_TouchTriggersAt, SV_UseTargetname, SV_DamageMonster, SV_SetPlayerGround, fireTargets } from './index.js';
 import type { ServerState } from './index.js';
 import { SV_CarryRiders } from './index.js';
 import type { RiderBody } from './index.js';
@@ -242,7 +242,9 @@ interface BotReport {
   onGround: boolean;
   /** closest the bot ever got to the exit volume center (XY) */
   slotClosest: number;
-  /** plug origin (must never leave pos1: the C no-trigger rule) */
+  /** plug origin at end of run (RELEASE-4: the bot leans on the reachable
+   * *34, so t4 cycles the plug C-correctly — it ends open/waiting, not at
+   * pos1; the lift still never starts without t91) */
   plugOrigin: [number, number, number];
   /** train started flag at end of run (must stay false: needs t91) */
   trainStarted: boolean;
@@ -345,8 +347,6 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       return modelBounds(map, n);
     });
     try {
-      const plugRest = st.movers.find((m) => m.ent.model === '*31')!;
-      const rest: [number, number, number] = [plugRest.pos1[0]!, plugRest.pos1[1]!, plugRest.pos1[2]!];
       const report = driveBot(st, map);
       console.log(
         `WIRE traversal ticks=${report.ticks} time=${report.time.toFixed(1)}s ` +
@@ -360,14 +360,15 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       expect(report.doorsOpened.length).toBeGreaterThan(0);
       expect(report.doorsCrossed.length).toBeGreaterThan(0);
       // WIRE-EXIT (C-parity RELEASE-4): the bot leans on the plug face at
-      // the slot mouth, cycling the *32/*33 sliders around itself. The
-      // targetname'd plug owns no touch trigger, so it sits at pos1 the
-      // whole run — and the named lift never starts without its button's
-      // t91. Boarding + riding the operable lift is proven by the scripted
-      // pmove-rider test, not by this bot.
+      // the slot mouth, cycling the *32/*33 sliders around itself — and,
+      // since *34 sits reachable at the face south end, leaning on *34 too,
+      // so t4 cycles the plug C-correctly (open/waiting at the end). The
+      // named lift never starts without its button's t91. Boarding + riding
+      // the operable lift is proven by the scripted pmove-rider test, not
+      // by this bot.
       expect(report.doorsOpened).toContain('*32');
-      expect(report.doorsOpened).not.toContain('*31');
-      expect(report.plugOrigin).toEqual(rest);
+      expect(report.doorsOpened).toContain('*31'); // via the reachable *34 (t4)
+      expect(report.plugOrigin).toEqual([0, 0, -156]); // open/waiting, cycled by t4
       expect(report.trainStarted).toBe(false);
       // lean point (-1688,1488) sits ~104 XY from the exit volume center
       // (through the *32 doorway): the bot reaches the complex, never the
@@ -575,6 +576,10 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
     // plug state): pressing the end-lift call button fires t91, which starts
     // the *12 train AND finds the t91 target_secret (same tick, same
     // cascade — the button also holds TOP on wait -1, the one-way signature).
+    // RELEASE-4 aboard guard: the lift finish requires standing on the exit
+    // train at activation (driver-latched playerGroundEntity). Boarding alone
+    // never finishes; outside presses start the train (C-correct) but do NOT
+    // finish — pinned by the next test.
     const { map } = loadBase1();
     resetEdictNums();
     const st: ServerState = SV_Init();
@@ -591,6 +596,8 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       const btn = st.movers.find((m) => m.ent.model === '*13')!;
       expect(btn).toBeDefined();
       expect(btn.wait).toBe(-1);
+      // Simulate boarding: driver latched groundEntity == train num.
+      SV_SetPlayerGround(st, train.ent.num);
       moverUse(btn, st.time);
       let ticks = 0;
       while (!train.started && ticks++ < 10) SV_Tick(st, 0.1);
@@ -608,6 +615,47 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       fireTargets(st, again);
       expect(st.foundSecrets).toBe(1);
       expect(st.finishSecrets).toBe(1);
+    } finally {
+      resetPmoveWorld();
+    }
+  });
+
+  it('exit stats: *13 outside press starts the train but does NOT finish', { timeout: 120000 }, () => {
+    // RELEASE-4 guard: firing t91 from outside (ground != train — pit floor,
+    // bridge, walkway) starts the *12 train and finds the secret (C-correct
+    // button_killed/button_use) but must NOT finish. Only aboard activation
+    // completes the level (previous test). Repeated outside presses stay TOP
+    // (no re-fire) and never finish.
+    const { map } = loadBase1();
+    resetEdictNums();
+    const st: ServerState = SV_Init();
+    SV_SpawnEntities(st, map.entities, (model) => {
+      if (!model.startsWith('*')) return null;
+      const n = Number.parseInt(model.slice(1), 10);
+      if (!Number.isFinite(n)) return null;
+      return modelBounds(map, n);
+    });
+    try {
+      SV_SetPmoveWorldFromBsp(map);
+      const train = st.trains.find((t) => t.ent.model === '*12')!;
+      const btn = st.movers.find((m) => m.ent.model === '*13')!;
+      expect(btn.wait).toBe(-1);
+      // Outside: default ground -1 (never aboard).
+      expect(st.playerGroundEntity).toBe(-1);
+      moverUse(btn, st.time);
+      let ticks = 0;
+      while (!train.started && ticks++ < 10) SV_Tick(st, 0.1);
+      expect(train.started).toBe(true);
+      expect(st.firedThisTick).toContain('t91');
+      expect(st.foundSecrets).toBe(1);
+      expect(st.finished).toBe(false);
+      expect(st.finishReason).toBe('');
+      // Second press (TOP hold, C button_fire no-op): still no finish.
+      const again: Edict = { ...btn.ent };
+      SV_SetPlayerGround(st, -1);
+      fireTargets(st, again);
+      expect(st.finished).toBe(false);
+      expect(st.foundSecrets).toBe(1);
     } finally {
       resetPmoveWorld();
     }
@@ -895,7 +943,9 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
       buttons: 0,
     });
     // lean-and-hold at the slot mouth: the sliders cycle around the bot
-    // while the plug and the lift sit out the whole run (see assertions).
+    // while the lift sits out the whole run (see assertions). The plug now
+    // cycles too — the bot's lean overlaps the reachable *34, so t4 fires
+    // C-correctly (RELEASE-4 east-face housing); only t91/t37 stay silent.
     // C Touch_DoorTrigger (id g_func.c Think_SpawnDoorTrigger): REST
     // volumes that never follow the door, and NO trigger at all for
     // health/targetname doors (the *31 plug answers the *34 button only).
@@ -1645,8 +1695,11 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect([...d31.ent.origin]).toEqual([...d31.pos1]);
 
     // PART B — C-intended activation: lean into *34 (touchable) from the
-    // west walkway; t4 fires on TOP arrival (id button_wait), never on touch.
-    const lean = { origin: v3(-1862, 1536, 120), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) };
+    // plug east face south end. RELEASE-4: *34 housing moved 145E+72S for
+    // reachability (lump entombed 5u in the shut plug); lean into the
+    // shifted touch box from the face (approach at Y 1536 passes 39u
+    // north, no touch there).
+    const lean = { origin: v3(-1688, 1490, 120), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) };
     expect(SV_TouchButtonsAt(st, lean, 'player').map((m) => m.ent.model)).toContain('*34');
     expect(b34.state).toBe('going_up');
     expect(st.firedThisTick).not.toContain('t4'); // not yet: fires at the top
@@ -1906,16 +1959,17 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       const d32box = SV_MoverClipBox(st, d32)!;
       expect([...d32box.mins]).toEqual([-1688, 1376, 96]);
       expect([...d32box.maxs]).toEqual([-1680, 1472, 224]);
-      // Lower the plug through the synthetic *34 overlap press (touch only).
-      // (Setup artifact: *34 is entombed in world rock — no foot path reaches
-      // its touch box, so C touch can never press it in play; the synthetic
-      // body below starts inside rock. The press lowers the plug WITHOUT
-      // finishing: t4 is a transient door cycle, not a transition — only the
-      // one-way train call (t91) takes the 'lift' finish. The walk below then
-      // boards the lowered plug for real.)
+      // Lower the plug through the *34 overlap press (touch only).
+      // RELEASE-4: *34 housing moved 145E+72S for reachability (lump
+      // entombed 5u in the shut plug); lean into the shifted touch box
+      // from the plug east face south end. The press lowers the plug
+      // WITHOUT finishing when not aboard (t4 door cycle, transient) —
+      // only an aboard *34 press (plug lift, driver-gated) or an aboard
+      // *13 press (train, unreachable in any engine) takes the 'lift'
+      // finish. The walk below then boards the lowered plug for real.
       SV_TouchButtonsAt(
         st,
-        { origin: v3(-1862, 1536, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+        { origin: v3(-1688, 1490, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
         'player',
       );
       expect(b34.state).toBe('going_up');
@@ -1927,11 +1981,11 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
         SV_TouchDoorsAt(st, lean, 'player');
       }
       expect(plug.ent.origin[2]!).toBeCloseTo(-156, 0);
-      // The pressed *34 sits flush: clip == bounds + travelled offset.
+      // The pressed *34 sits flush: clip == shifted bounds + travelled offset.
       expect([...b34.ent.origin]).toEqual([...b34.pos2]);
       const b34box = SV_MoverClipBox(st, b34)!;
-      expect([...b34box.mins]).toEqual([-1853, 1520, 120]);
-      expect([...b34box.maxs]).toEqual([-1844, 1552, 152]);
+      expect([...b34box.mins]).toEqual([-1708, 1448, 120]);
+      expect([...b34box.maxs]).toEqual([-1699, 1480, 152]);
       // The waiting train's clip sits exactly on its brush (no stale
       // offset); deck top 0 over pit floor -48 was never a step-up.
       expect(train.started).toBe(false);
@@ -1939,8 +1993,9 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       const tbox = SV_TrainClipBox(st, train)!;
       expect([...tbox.mins]).toEqual([-2064, 1472, -48]);
       expect([...tbox.maxs]).toEqual([-2048, 1600, 0]);
-      // Swept pin: the walkway leg with *34 behind is world-clear and must
-      // stay clear (pre-fix: fraction 0 owned by *34 with startsolid).
+      // Swept pin: the walkway leg far west of the shifted *34 is
+      // world-clear and must stay clear (pre-fix: fraction 0 owned by *34
+      // with startsolid).
       const walk = prod(v3(-1900, 1536, 120), PLAYER_MINS, PLAYER_MAXS, v3(-2000, 1536, 120));
       expect(walk.fraction).toBe(1);
       expect(walk.entityNum).toBe(0);
@@ -2233,12 +2288,15 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     // no targetname, no health). The button fires t4 on reaching the TOP
     // (id button_wait), the plug drops the full 156, holds the C-default
     // 3s wait at the top, returns, and answers a second press (repeat use).
+    // RELEASE-4: *34 housing moved 145E+72S (lump entombed 5u in the shut
+    // plug); lean into the shifted touch box from the plug east face
+    // south end.
     const b34 = st.movers.find((m) => m.ent.model === '*34')!;
     expect(b34.ent.target).toBe('t4');
     expect(b34.wait).toBe(3); // C SP_func_button default, not 1
     const lean = SV_TouchButtonsAt(
       st,
-      { origin: v3(-1862, 1536, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+      { origin: v3(-1688, 1490, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
       'player',
     );
     expect(lean.map((m) => m.ent.model)).toContain('*34');
@@ -2258,7 +2316,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(b34.state).toBe('bottom');
     SV_TouchButtonsAt(
       st,
-      { origin: v3(-1862, 1536, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+      { origin: v3(-1688, 1490, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
       'player',
     );
     guard = 0;

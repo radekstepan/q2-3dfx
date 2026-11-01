@@ -106,6 +106,7 @@ import type {
 import {
   SV_CarryRiders,
   SV_Init,
+  SV_SetPlayerGround,
   SV_SetSkill,
   SV_SpawnEntities,
   SV_Tick,
@@ -1448,6 +1449,12 @@ export class LocalDriver implements HostDriver {
     // monster think (C cadence fire resolution), bolts, fuses, debris/gibs,
     // explosions, monster door touches. The driver only moves its own body
     // (above) and renders server state below.
+    // RELEASE-4 aboard latch: the 'lift' finish requires standing on the
+    // exit train at activation (boarding alone never finishes, outside
+    // presses start the train but do NOT finish). Latch before the tick so
+    // bolt-kill activations (which run inside SV_Tick) see this tick's
+    // ground; re-latched before E-use below for the press path.
+    SV_SetPlayerGround(this.server, this.pm.groundEntity);
     SV_Tick(this.server, dt, {
       player: {
         pos: v3(this.pm.origin[0], this.pm.origin[1], this.pm.origin[2]),
@@ -1555,7 +1562,13 @@ export class LocalDriver implements HostDriver {
     // within reach inside the facing cone (C button_use semantics via
     // SV_UseButton: UP/TOP no-op, wait/-1 holds TOP, only the aimed button
     // fires). The exit lift is un-ridable without its *13/*34 call buttons.
-    if ((cmd.buttons & BUTTON_USE) !== 0) this.pressUseButton();
+    // RELEASE-4: re-latch ground before the press so the aboard guard sees
+    // the post-carry ground (standing on the train finishes, standing
+    // elsewhere starts the train but does NOT finish).
+    if ((cmd.buttons & BUTTON_USE) !== 0) {
+      SV_SetPlayerGround(this.server, this.pm.groundEntity);
+      this.pressUseButton();
+    }
     // Single drain point: server event queues from the tick AND the fire
     // above (muzzles, tracers, sparks, sounds) become driver cosmetics here.
     // Ambient func_timer → target_splash sparks/sounds arrive through the

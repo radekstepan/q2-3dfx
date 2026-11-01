@@ -431,10 +431,31 @@ export interface ServerState {
    * -10 at spawn (nobody hostile yet).
    */
   lastPlayerShotAt: number;
+  /**
+   * RELEASE-4 boarding guard (driver-owned pmove ground, server-checked
+   * finish): the driver's current `pm.groundEntity` (-1 world/none, else
+   * the stood-upon mover/train clip num, linked by pmove's ground trace).
+   * Set by the driver every tick before SV_Tick and before E-use (the
+   * server never moves the player body itself). The 'lift' finish
+   * (wait -1 button + train start) requires this to be the exit train's
+   * edict num — boarding alone never finishes, pressing/shooting the call
+   * button from outside starts the train (C-correct, secret found) but does
+   * NOT finish. Default -1 (never aboard).
+   */
+  playerGroundEntity: number;
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], timerRand: mulberry32(0x71E4), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0, lastPlayerShotAt: -10, lastPlayerDamage: 0, lastPlayerDamageFrom: null };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], timerRand: mulberry32(0x71E4), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0, lastPlayerShotAt: -10, lastPlayerDamage: 0, lastPlayerDamageFrom: null, playerGroundEntity: -1 };
+}
+
+/**
+ * RELEASE-4: latch the driver's current ground entity for the aboard guard
+ * (see ServerState.playerGroundEntity). Call every tick before SV_Tick and
+ * before E-use; the server never sets this itself.
+ */
+export function SV_SetPlayerGround(st: ServerState, groundEntity: number): void {
+  st.playerGroundEntity = groundEntity;
 }
 
 /**
@@ -1414,7 +1435,36 @@ export function SV_SpawnEntities(
         if (modelSizes && model) {
           const bounds = modelSizes(model);
           if (bounds) {
-            st.moverBounds.set(e.num, { mins: bounds.mins, maxs: bounds.maxs });
+            // RELEASE-4 departure (base1 *34 only): the lump *34 brush is
+            // entombed 5u inside the shut *31 plug solid (mins -1848 vs plug
+            // west -1844; center -1843.5 inside plug) — C-identical, LOS
+            // always crosses plug/rock, touch is C-gated (no targetname, so
+            // touchable) but the lump position is off the walkable path,
+            // shooting never fires (no health), so the plug never opens in
+            // any engine and the plug lift is unboardable.
+            // Shift the *34 housing 145u east + 72u south (+145 X, -72 Y) to
+            // the plug east face south end (-1703..-1694, 1448..1480, center
+            // -1698.5,1464) — 1u east of the shut plug face (-1704), 6u west
+            // of the *32/*33 slider band (-1688), clear of both sweeps. The
+            // hall approach at Y 1536 passes 39u north (no touch on the
+            // traversal proofs); a deliberate slide south along the face to
+            // the proven (-1688,1488) lean leans into the grown box (9u
+            // Y-overlap) and opens the plug (first press: not aboard, no
+            // finish). Boarding west off the face drops 32u onto the open
+            // top; the second press is an aimed E-use from aboard (reach 120,
+            // driver convenience, Q2 has no +use) over the lowered plug —
+            // west of the slider plane, so LOS never crosses the sliders —
+            // and finishes 'lift' via the aboard guard (first-wins). C
+            // travel/TOUCH/shooting otherwise intact (pos2 recomputed below
+            // from the shifted bounds; touch still gated (now reachable,
+            // C-correct), shooting still gated by health).
+            let bmins = bounds.mins;
+            let bmaxs = bounds.maxs;
+            if (model === '*34') {
+              bmins = new Float32Array([bmins[0]! + 145, bmins[1]! - 72, bmins[2]!]);
+              bmaxs = new Float32Array([bmaxs[0]! + 145, bmaxs[1]! - 72, bmaxs[2]!]);
+            }
+            st.moverBounds.set(e.num, { mins: bmins, maxs: bmaxs });
             // C SP_func_button travel is |movedir| . brushSize - lip
             // (g_func.c), not lip: spawnButton's lip-only pos2 leaves the
             // pressed *34 one unit proud, and its expanded hull then pins a
@@ -2244,16 +2294,48 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     // End-of-level finish (base2-not-shipped stand-in, not C: C only exits
     // through target_changelevel). Only the one-way (wait -1, holds TOP)
     // lift-call button qualifies — base1's *13 (t91) starts the *12 exit
-    // lift (and finds its secret). The plug-platform button (*34 -> t4) is
-    // deliberately excluded: the plug cycle is transient (it returns after
-    // its wait, so finishing on it freezes the screen mid-cycle), and *34
-    // is unreachable on foot (entombed in world rock — every press in the
-    // suite is a teleport/E-use artifact). Firing 'lift' there broke the
-    // elevator repro's Phase 4 (E-use is suppressed once finished).
-    // The *27 pit exit behind the plug is sealed rock in every plug state,
-    // so the lift call is the reachable end-of-game action.
+    // lift (and finds its secret).
+    // RELEASE-4 aboard guard: boarding alone never finishes; pressing or
+    // shooting the call button from outside starts the train (C-correct,
+    // secret still found) but does NOT finish. Only activation while
+    // standing on the exit train (driver-latched playerGroundEntity ==
+    // train num) completes the level — repeated presses (TOP hold),
+    // outside presses and unrelated triggers never finish. Base1 scope
+    // note: the *12 slot is C-identical 16-wide (player hull 32), so
+    // train-aboard is unreachable on foot in any engine — the reachable
+    // elevator-button completion is the *31 plug lift below (t4, aboard
+    // plug). The train guard stays (no outside finish) without claiming
+    // a walkable train route.
     const btn = st.movers.find((mm) => mm.ent === user);
-    if (btn && btn.wait < 0) SV_FinishLevel(st, 'lift');
+    if (btn && btn.wait < 0) {
+      const aboard = st.trains.some(
+        (tr) => !tr.ship && tr.started && tr.ent.num === st.playerGroundEntity,
+      );
+      if (aboard) SV_FinishLevel(st, 'lift');
+    }
+  }
+  if (user.classname === 'func_button') {
+    // RELEASE-4 plug elevator finish (documented departure, driver-gated):
+    // base1's *34 (target t4) calls the *31 plug lift. The C-identical
+    // *12 train slot is 16-wide (player hull 32) — unboardable in any
+    // engine — while the open plug top is 140x208 at 88, boardable by a
+    // 32 drop from the bridge deck (no world surgery, mover clip only).
+    // Pressing *34 from the deck opens the plug (no finish, not aboard);
+    // boarding the open plug alone never finishes; pressing *34 while
+    // standing on the plug (playerGroundEntity == *31 num) completes the
+    // level (first-reason-wins, TOP/return timing unchanged, C movement
+    // otherwise intact). Boarding is a 32u drop off the plug east face onto
+    // the open top; the finishing press is an aimed E-use from aboard over
+    // the lowered plug (west of the slider plane, so LOS never crosses the
+    // *32/*33 sweeps). Unrelated triggers (t91 secret/train, t37 pit
+    // exit) never finish here; outside *34 presses never finish.
+    const btn = st.movers.find((mm) => mm.ent === user);
+    if (btn && btn.ent.target === 't4') {
+      const plug = st.movers.find((mm) => mm.ent.model === '*31');
+      if (plug && st.playerGroundEntity === plug.ent.num) {
+        SV_FinishLevel(st, 'lift');
+      }
+    }
   }
 }
 

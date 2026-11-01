@@ -285,18 +285,6 @@ regressions and captures covering the reported scenario; report automated and
 user verdicts separately. Current cards supersede archived DONE claims only for
 the reopened scope, not for unrelated completed work.
 
-### RELEASE-4 — Board the elevator, press its button, show final stats
-owns: `packages/server`, `packages/game`, `apps/web`, `packages/testkit`
-depends: none
-status: ready
-user-contract: let the player walk onto the waiting/open final elevator, then press the elevator button to finish the game and show the F1 stats screen. Boarding alone must not finish the game. No next-map loading is required.
-review-status: shootable-button support (`6e3c842`) and approach diagnostics landed, but no complete on-foot boarding/button route passes. Earlier *12/*31/*34 geometric investigations describe tested candidates in this port; they do not refute the user's original-game observation or constitute a completed fix. The latest request supplies the desired interaction; do not leave this awaiting another choice between speculative routes.
-done-when:
-- [ ] Identify the visible elevator, its doorway/platform/button and collision/target chain from a normal player approach. Log the exact blocking brush/edict and transforms. Compare actual decoded geometry, coordinate conventions and original behavior rather than treating the port's trace as proof that the original route is impossible.
-- [ ] Remove the demonstrated entry obstruction and keep the elevator waiting while the player approaches and boards. Repair collision/activation state locally; no global solidity bypass, teleport, noclip, hidden shoot-to-open workaround or forced pit route. Implement the requested reachable elevator-button interaction; document any narrowly necessary departure from original transition semantics.
-- [ ] Only button activation after boarding completes the level, freezes final time/kills/secrets/goals and opens the F1 completion/stats screen explicitly. Guard against repeated presses, pressing from outside and premature completion from unrelated lift/secret triggers. Preserve working buttons elsewhere.
-- [ ] Real-base1 production-driver/browser gate walks from outside through the doorway onto the elevator, activates its button through real input and sees completion. Assert no finish before activation and exactly one finish after it. A test beginning on the platform or directly calling finish/targets cannot close this card.
-
 ### RELEASE-13 — Verify visible patrols and fix corner timing
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/testkit`
 depends: none
