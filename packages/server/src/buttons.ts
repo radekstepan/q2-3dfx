@@ -48,17 +48,31 @@ export function buttonCanFire(m: Mover): boolean {
  */
 export const BUTTON_TOUCH_SLOP = 1.0;
 /**
- * E-use reach in world units (RELEASE-4: 120, up from the 96-unit
- * point-trigger slop). Q2 has no +use-for-buttons (driver convenience);
- * the aboard-plug finisher (open plug east top to the east-face *34,
- * ~25-40u) sits well inside it, and so does the walkway *34 opener and
- * the *13 train call from the bridge. Outside presses still never finish
- * (aboard guard in fireTargets), so the extra reach only lets intended
- * aboard/deck presses connect — no new premature finishes.
+ * E-use reach in world units (C point-trigger slop 96; Q2 has no
+ * +use-for-buttons — driver convenience). The aboard-plug finisher sits
+ * ~25-70u inside it; outside presses still never finish (aboard guard in
+ * fireTargets), so no premature finishes.
  */
-export const BUTTON_USE_REACH = 120;
+export const BUTTON_USE_REACH = 96;
 /** E-use facing gate: cosine between the view forward and the eye->button ray. */
 export const BUTTON_USE_DOT = 0.7;
+
+/**
+ * RELEASE-4 documented departure (base1 *34 only): the lump *34 brush is
+ * entombed in the shut *31 plug solid (mins -1848 vs plug west -1844),
+ * off the walkable path, so the plug never opens in any engine. The housing
+ * shifts +145 X, -48 Y to the plug east face south-gap
+ * (-1703..-1694, 1472..1504, center -1698.5,1488) — 1u east of the shut face
+ * (-1704), 6u west of the *32/*33 band (-1688), fully inside the open-slider
+ * gap (1472..1600) so it is drawn visible (not behind the open *32 slab like
+ * the old -72 south end), but 16u south of the central walk (Y 1536) so the
+ * straight-in walk neither touches nor blocks on it. First press is an aimed
+ * E-use from the face (visible, within C 96 reach); boarding west off the
+ * face drops onto the open top; second press is an aimed E-use from aboard.
+ * Collision (moverBounds) and rendering (DoorSync/graft) must both apply
+ * this shift, or the button is drawn where it does not collide.
+ */
+export const BUTTON_34_SHIFT: readonly [number, number, number] = [145, -48, 0] as const;
 
 /**
  * Aim selection for the E-use path: the nearest button whose center sits

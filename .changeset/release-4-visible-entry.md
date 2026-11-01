@@ -1,0 +1,5 @@
+---
+"@q2/server": patch
+---
+
+RELEASE-4 visible entry: centered-south-gap *34 housing with render-vs-collision parity. The lump *34 brush is entombed in the shut *31 plug, so its housing shifts +145 X, -48 Y to the east-face south-gap (-1703..-1694, 1472..1504, center -1698.5,1488) — 1u east of the face, 6u west of the slider band, fully inside the open-slider gap (1472..1600) so it draws visible (not behind the open *32 slab), but 16u south of the central walk so the straight-in entry neither touches nor blocks. Both collision (moverBounds) and rendering (DoorSync base + live verts, graft unions) apply BUTTON_34_SHIFT, so the button is drawn where it collides (doorVisualBounds == moverBounds, doorRenderOffset 0 at spawn). E-use reach reverts to the C 96-unit slop (no 120 extension); first press is an aimed E-use from the face (visible, within reach), boarding west drops onto the open top (ge==plug, no finish), second E-use from aboard finishes 'lift' once (first-wins, TOP hold blocks repeats, outside/unrelated never finish).

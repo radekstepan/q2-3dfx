@@ -104,6 +104,7 @@ import type {
   PlayerState,
 } from '@q2/game';
 import {
+  BUTTON_34_SHIFT,
   SV_CarryRiders,
   SV_Init,
   SV_SetPlayerGround,
@@ -2920,14 +2921,43 @@ export class LocalDriver implements HostDriver {
       const baseCenter: Float32Array[] = [];
       const baseMins: Float32Array[] = [];
       const baseMaxs: Float32Array[] = [];
+      // RELEASE-4: *34 housing shift must match server collision (BUTTON_34_SHIFT).
+      // Without this the button renders at its lump spot (inside the shut plug,
+      // invisible) while colliding 145E away — render-vs-collision divergence.
+      // Both base (DoorSync rest) and live (mini surfaces, first frame before
+      // the first syncDoors) shift, so doorRenderOffset is 0 at spawn (closed).
+      const sx = model === '*34' ? BUTTON_34_SHIFT[0] : 0;
+      const sy = model === '*34' ? BUTTON_34_SHIFT[1] : 0;
+      const sz = model === '*34' ? BUTTON_34_SHIFT[2] : 0;
       for (let f = first; f < first + num; f++) {
         const s = this.mini.surfaces[f];
         if (!s || s.n === 0) continue;
         faces.push(s);
-        baseVerts.push(new Float32Array(s.verts));
-        baseCenter.push(new Float32Array(s.center));
-        baseMins.push(new Float32Array(s.mins));
-        baseMaxs.push(new Float32Array(s.maxs));
+        const bv = new Float32Array(s.verts);
+        const bc = new Float32Array(s.center);
+        const bmin = new Float32Array(s.mins);
+        const bmax = new Float32Array(s.maxs);
+        if (sx !== 0 || sy !== 0 || sz !== 0) {
+          for (let i = 0; i < bv.length; i += 3) {
+            bv[i]! += sx; bv[i + 1]! += sy; bv[i + 2]! += sz;
+          }
+          bc[0]! += sx; bc[1]! += sy; bc[2]! += sz;
+          bmin[0]! += sx; bmin[1]! += sy; bmin[2]! += sz;
+          bmax[0]! += sx; bmax[1]! += sy; bmax[2]! += sz;
+          // Shift live verts now (not just the base): the graft renders live
+          // faces, and the (g) spawn-closed gate reads live-vs-base before the
+          // first tick sync. Without this the first frame draws the lump spot.
+          for (let i = 0; i < s.verts.length; i += 3) {
+            s.verts[i]! += sx; s.verts[i + 1]! += sy; s.verts[i + 2]! += sz;
+          }
+          s.center[0]! += sx; s.center[1]! += sy; s.center[2]! += sz;
+          s.mins[0]! += sx; s.mins[1]! += sy; s.mins[2]! += sz;
+          s.maxs[0]! += sx; s.maxs[1]! += sy; s.maxs[2]! += sz;
+        }
+        baseVerts.push(bv);
+        baseCenter.push(bc);
+        baseMins.push(bmin);
+        baseMaxs.push(bmax);
       }
       if (faces.length > 0) {
         this.doors.push({
@@ -3009,11 +3039,15 @@ export class LocalDriver implements HostDriver {
       }
     };
     // Movers ride ent.origin - pos1 (0 at spawn) out to pos2 - pos1.
+    // RELEASE-4: *34 visual shift matches server collision shift.
     for (const m of this.server.movers) {
       const n = brushModelNum(m.ent.model);
       if (n === null) continue;
-      include(n, 0, 0, 0);
-      include(n, m.pos2[0]! - m.pos1[0]!, m.pos2[1]! - m.pos1[1]!, m.pos2[2]! - m.pos1[2]!);
+      const shx = m.ent.model === '*34' ? BUTTON_34_SHIFT[0] : 0;
+      const shy = m.ent.model === '*34' ? BUTTON_34_SHIFT[1] : 0;
+      const shz = m.ent.model === '*34' ? BUTTON_34_SHIFT[2] : 0;
+      include(n, shx, shy, shz);
+      include(n, shx + m.pos2[0]! - m.pos1[0]!, shy + m.pos2[1]! - m.pos1[1]!, shz + m.pos2[2]! - m.pos1[2]!);
     }
     // Secret doors translate origin0 -> pos1 -> pos2 (same union pattern).
     for (const s of this.server.secretDoors) {
@@ -3129,6 +3163,31 @@ export class LocalDriver implements HostDriver {
     const s = d.faces[0]!;
     const b = d.baseVerts[0]!;
     return [s.verts[0]! - b[0]!, s.verts[1]! - b[1]!, s.verts[2]! - b[2]!];
+  }
+
+  /**
+   * Test hook (RELEASE-4 render-vs-collision): union of the baked visual
+   * bounds for a brush model (baseMins/baseMaxs, already shifted for *34).
+   * At rest this must equal the server collision box (moverBounds); if the
+   * visual stayed at the lump spot while collision moved, the button would
+   * be invisible where it collides. Null when no synced faces.
+   */
+  doorVisualBounds(model: string): { mins: [number, number, number]; maxs: [number, number, number] } | null {
+    const d = this.doors.find((x) => x.ent.model === model);
+    if (!d || d.baseMins.length === 0) return null;
+    let mnx = Infinity, mny = Infinity, mnz = Infinity;
+    let mxx = -Infinity, mxy = -Infinity, mxz = -Infinity;
+    for (let i = 0; i < d.baseMins.length; i++) {
+      const mn = d.baseMins[i]!;
+      const mx = d.baseMaxs[i]!;
+      if (mn[0]! < mnx) mnx = mn[0]!;
+      if (mn[1]! < mny) mny = mn[1]!;
+      if (mn[2]! < mnz) mnz = mn[2]!;
+      if (mx[0]! > mxx) mxx = mx[0]!;
+      if (mx[1]! > mxy) mxy = mx[1]!;
+      if (mx[2]! > mxz) mxz = mx[2]!;
+    }
+    return { mins: [mnx, mny, mnz], maxs: [mxx, mxy, mxz] };
   }
 
   private syncDoors(): void {

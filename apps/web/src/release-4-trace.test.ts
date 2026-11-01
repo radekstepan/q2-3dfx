@@ -669,92 +669,144 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
     }
   });
 
-  it('box-4 gate: walk hall->plug face->button, board, press button, finish + F1', { timeout: 300000 }, async () => {
-    // RELEASE-4 production gate (user-contract): walk from the hall to the
-    // plug east face, slide south to the waiting/open final elevator's
-    // call button (*34, target t4), board the open plug (*31 lift, wide
-    // 140x208 top at 88 — C-identical world + C-mover travel, only the *34
-    // housing moved 145E+72S for reachability, lump entombed 5u in the shut
-    // plug in any engine), then press its button from aboard (*34, aimed
-    // E-use, reach+facing+LOS over the lowered plug) to finish.
-    // Boarding alone never finishes; only aboard activation completes
-    // (first-reason-wins, TOP hold blocks repeats, outside presses cycle
-    // the plug (C-correct) but do NOT finish, unrelated t91/t37 never
-    // finish here). No teleports inside any leg (setup places only the
-    // hall start, the file convention); no direct finish/target calls.
-    const boot = await bootBase1();
-    const { driver } = boot;
-    const map = driver.map!;
-    const fired = new Set<string>();
-    const noteFired = (): void => {
-      for (const t of driver.server.firedThisTick) fired.add(t);
-    };
-    const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
-    const btn34 = driver.server.movers.find((m) => m.ent.model === '*34')!;
-    const train = driver.server.trains.find((t) => !t.ship)!;
-    expect(plug.ent.targetname).toBe('t4');
-    expect(btn34.ent.target).toBe('t4');
-    expect(train.started).toBe(false);
-    const off = (m: string): [number, number, number] => driver.doorRenderOffset(m)!;
-    // Lump truth (shifted *34 housing, RELEASE-4 departure): plug east face
-    // south end (-1703..-1694, 1448..1480, center -1698.5,1464) — 1u east
-    // of the shut plug face (-1704), 6u west of the *32/*33 slider band
-    // (-1688), clear of both sweeps.
-    const b34box = driver.server.moverBounds.get(btn34.ent.num)!;
-    expect([...b34box.mins]).toEqual([-1703, 1448, 120]);
-    expect([...b34box.maxs]).toEqual([-1694, 1480, 152]);
+  it('box-4 gate: visible doorway entry boards plug lift, E-use finishes + F1 (multi-offset)', { timeout: 300000 }, async () => {
+    // RELEASE-4 production gate (user-contract, reopened fix):
+    // - Visible doorway: hall (-1560,Y) straight west through *32/*33 to the
+    //   *31 plug east face. No hidden south slide, no teleport: the *34 housing
+    //   sits at the east-face south-gap (-1703..-1694, 1472..1504, center
+    //   -1698.5,1488) — 1u east of the shut face (-1704), 6u west of the slider
+    //   band (-1688), fully inside the open-slider gap (1472..1600) so it is
+    //   drawn visible (not behind the open *32 slab like the old -72 south
+    //   end), but 16u south of the central walk (Y 1536) so the straight-in
+    //   walk neither touches nor blocks on it. First press is an aimed E-use
+    //   from the face (visible, within C 96 reach, facing+LOS); walking west
+    //   off the face drops onto the open top (origin 112 == top 88+24,
+    //   ge==plug, no fall-through, no finish); second press is an aimed E-use
+    //   from aboard and finishes 'lift' exactly once with frozen F1.
+    // - Render-vs-collision: the relocated housing must be DRAWN where it
+    //   collides (DoorSync/graft shift == server moverBounds shift), not just
+    //   present in the server fixture. Without the web shift the visual would
+    //   sit at the lump spot (-1848..-1839, inside the shut plug, invisible)
+    //   while colliding 145E-48Y away — the reported invisible blockage.
+    //   Old side routes (-1688,1488 touch -> -1720,1470 board, 145E+72S;
+    //   central touch) are superseded: normal entry now E-uses a visible button.
+    // - Multi-offset: Y 1536 (center), 1552 and 1568 (north of center) all
+    //   complete without repositioning inside any leg and without directly
+    //   firing targets. All three avoid touch (16u+ Y gap, no overlap), so the
+    //   first press is always the visible E-use — no hidden contact. Outside/
+    //   unrelated/repeat presses never finish.
+    // Lump truth: *31 plug targetname t4, *34 button target t4, *12 train
+    // targetname t91 (secret, never started here), *13 button target t91
+    // wait -1 (never fired here). C travel/TOUCH/shooting intact (pos2 from
+    // brush size, touch gated, shooting gated by health); E-use reach is the
+    // C 96-unit slop (no 120 extension); first-reason-wins, TOP hold blocks
+    // repeats.
+    const START_X = -1560;
+    const FACE_X = -1688;
+    const Y_OFFSETS = [1536, 1552, 1568];
+    for (const startY of Y_OFFSETS) {
+      const boot = await bootBase1();
+      const { driver } = boot;
+      const map = driver.map!;
+      const fired = new Set<string>();
+      const noteFired = (): void => {
+        for (const t of driver.server.firedThisTick) fired.add(t);
+      };
+      const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
+      const btn34 = driver.server.movers.find((m) => m.ent.model === '*34')!;
+      const train = driver.server.trains.find((t) => !t.ship)!;
+      expect(plug.ent.targetname).toBe('t4');
+      expect(btn34.ent.target).toBe('t4');
+      expect(train.started).toBe(false);
+      const off = (m: string): [number, number, number] => driver.doorRenderOffset(m)!;
+      // Collision truth (south-gap housing): -1703..-1694, 1472..1504.
+      const b34box = driver.server.moverBounds.get(btn34.ent.num)!;
+      expect([...b34box.mins]).toEqual([-1703, 1472, 120]);
+      expect([...b34box.maxs]).toEqual([-1694, 1504, 152]);
+      // Render-vs-collision: visual bounds (DoorSync, shifted) must equal
+      // collision bounds at rest.
+      const vis = driver.doorVisualBounds('*34')!;
+      expect(vis).not.toBeNull();
+      expect(vis.mins[0]!).toBeCloseTo(b34box.mins[0]!, 0);
+      expect(vis.mins[1]!).toBeCloseTo(b34box.mins[1]!, 0);
+      expect(vis.mins[2]!).toBeCloseTo(b34box.mins[2]!, 0);
+      expect(vis.maxs[0]!).toBeCloseTo(b34box.maxs[0]!, 0);
+      expect(vis.maxs[1]!).toBeCloseTo(b34box.maxs[1]!, 0);
+      expect(vis.maxs[2]!).toBeCloseTo(b34box.maxs[2]!, 0);
+      // Visual is east of the shut plug face (not entombed) and inside the
+      // open-slider gap (not behind the slab): center X -1698.5 > -1704,
+      // center Y 1488 within 1472..1600.
 
-    // ---- approach: settle in the hall, walk the slot to the plug face ----
-    // (box-1 leg-1 pattern: sliders cycle open by touch, walk sticks at the
-    // shut east face). The approach at Y 1536 passes 39u north of the
-    // grown *34 box (max 1481) — no touch here, plug stays shut, no t4.
-    driver.pm.origin = v3(-1560, 1536, 150);
-    driver.pm.velocity = v3();
-    for (let i = 0; i < 20; i++) {
-      SV_SetPlayerHealth(driver.server, 100);
-      driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
-      noteFired();
-      if (driver.pm.onGround) break;
-    }
-    expect(driver.pm.onGround).toBe(true);
-    expect(driver.server.finished).toBe(false);
-    expect(fired.has('t91')).toBe(false);
-    expect(fired.has('t4')).toBe(false);
-    expect(fired.has('t37')).toBe(false);
-    {
-      const face = walkTo(driver, -1688, 1536, 200, noteFired);
-      expect(face.reached).toBe(true);
-      expect(driver.pm.origin[0]!).toBeGreaterThan(-1705);
-      expect(driver.pm.origin[0]!).toBeLessThanOrEqual(-1680);
-      expect(driver.server.finished).toBe(false);
-      expect(fired.has('t4')).toBe(false);
-      expect(plug.state).toBe('bottom');
-    }
-
-    // ---- first press: slide south along the face to the *34 (TOUCH) ----
-    // Touch (overlap, no E-use/LOS/reach needed): the open-slider gap spans
-    // Y 1488..1584 (open *32 north face + hull), so the slide rests leaning
-    // on the *34 south face (box max Y 1480 + hull 16 = 1496) 9u into the
-    // grown *34 box — presses *34 (going_up, t4 fires on TOP), opens the
-    // plug (DOWN to TOP, top 88). Not aboard (ground==world/deck, not plug)
-    // → no finish (guard).
-    {
-      const slide = walkTo(driver, -1688, 1488, 200, noteFired, 12);
-      expect(slide.reached).toBe(true);
-      expect(driver.server.finished).toBe(false);
-      // Touch may need a few ticks to travel TOP (5u at 40u/s) and fire t4.
-      let t4at = -1;
-      for (let i = 0; i < 20 && t4at < 0; i++) {
+      // ---- approach: settle, walk straight west to the plug face ----
+      // Sliders cycle open by touch; the straight walk at Y 1536/1552/1568
+      // passes 16u+ north of the south-gap *34 (no touch, no block), so the
+      // plug stays shut, no t4, no finish — the visible doorway blockage
+      // reproduced (shut plug east face, mover clip, +X normal).
+      driver.pm.origin = v3(START_X, startY, 150);
+      driver.pm.velocity = v3();
+      for (let i = 0; i < 20; i++) {
         SV_SetPlayerHealth(driver.server, 100);
-        driver.step({ msec: 100, angles: [0, -90, 0], forwardmove: 40, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+        driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
         noteFired();
-        if (fired.has('t4')) t4at = i;
+        if (driver.pm.onGround) break;
       }
-      expect(t4at).toBeGreaterThanOrEqual(0);
-      expect(btn34.state).not.toBe('bottom');
+      expect(driver.pm.onGround).toBe(true);
+      // After the settle ticks syncDoors has run: the shifted visual sits at
+      // rest (offset 0), i.e. drawn where it collides.
+      expect(off('*34')).toEqual([0, 0, 0]);
       expect(driver.server.finished).toBe(false);
-      expect(driver.server.finishReason).toBe('');
-      // Wait for TOP (open, top 88, offset -156) — boardable (32 below deck).
+      {
+        const face = walkTo(driver, FACE_X, startY, 200, noteFired);
+        expect(face.reached).toBe(true);
+        expect(driver.pm.origin[0]!).toBeGreaterThan(-1705);
+        expect(driver.pm.origin[0]!).toBeLessThanOrEqual(-1680);
+        // No hidden touch: central walk does not press the south-gap button.
+        expect(fired.has('t4')).toBe(false);
+        expect(btn34.state).toBe('bottom');
+        expect(plug.state).toBe('bottom');
+        expect(driver.server.finished).toBe(false);
+        // Blocker is the shut *31 plug mover (not world rock, not train).
+        const clip = SV_ClipTrace(driver.server, SV_TraceFor(driver.map!));
+        const o = driver.pm.origin;
+        const hit = clip(
+          v3(o[0]!, o[1]!, o[2]!),
+          v3(-16, -16, -24) as Vec3,
+          v3(16, 16, 32) as Vec3,
+          v3(o[0]! - 64, o[1]!, o[2]!),
+        );
+        expect(hit.fraction).toBeLessThan(1);
+        expect(hit.entityNum).toBe(plug.ent.num);
+        expect(hit.planeNormal[0]!).toBeGreaterThan(0.9);
+      }
+
+      // ---- first press: aimed E-use from the face (visible button) ----
+      // Eye to south-gap center: ~50u (within C 96), facing cone, LOS over
+      // the deck, west of the slider plane. Opens the plug (t4, no finish —
+      // not aboard). No touch, no teleport, no direct target fire.
+      {
+        let t4at = -1;
+        for (let i = 0; i < 40 && t4at < 0; i++) {
+          const b = driver.server.moverBounds.get(btn34.ent.num)!;
+          const center: [number, number, number] = [(b.mins[0]! + b.maxs[0]!) / 2, (b.mins[1]! + b.maxs[1]!) / 2, (b.mins[2]! + b.maxs[2]!) / 2];
+          const eye0: [number, number, number] = [driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + driver.pm.viewheight];
+          const dx = center[0] - eye0[0]!, dy = center[1] - eye0[1]!, dz = center[2] - eye0[2]!;
+          const dist = Math.hypot(dx, dy, dz);
+          expect(dist).toBeLessThan(96);
+          const lh = Math.hypot(dx, dy) || 1;
+          const pitch = (Math.atan2(-dz, lh) * 180) / Math.PI;
+          const yaw = (Math.atan2(dy, dx) * 180) / Math.PI;
+          SV_SetPlayerHealth(driver.server, 100);
+          driver.step({ msec: 100, angles: [pitch, yaw, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_USE }, 0.1);
+          noteFired();
+          if (fired.has('t4')) t4at = i;
+          expect(driver.server.finished).toBe(false);
+        }
+        expect(t4at).toBeGreaterThanOrEqual(0);
+        expect(btn34.state).not.toBe('bottom');
+        expect(driver.server.finished).toBe(false);
+        expect(driver.events).toContain('use');
+      }
+      // Wait for TOP (open, top 88, offset -156) — boardable.
       for (let i = 0; i < 60 && plug.state !== 'top' && plug.state !== 'waiting'; i++) {
         SV_SetPlayerHealth(driver.server, 100);
         driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
@@ -763,124 +815,114 @@ describe.runIf(!!WEB_Q2_PAK)('RELEASE-4 approach trace (Q2_PAK)', () => {
       expect(['top', 'waiting']).toContain(plug.state);
       expect(off('*31')[2]!).toBeCloseTo(-156, 0);
       expect(driver.server.finished).toBe(false);
-    }
 
-    // ---- board: walk west off the face onto the open plug top ----
-    // From the south-end lean (-1688,1490) west to (-1720,1470): crosses
-    // the east face plane, drops 32u onto the open top (origin 112 ==
-    // top 88+24). Grounded, ge==plug, no fall-through — and boarding alone
-    // never finishes.
-    {
-      const east = walkTo(driver, -1720, 1470, 200, noteFired, 12);
-      expect(east.reached).toBe(true);
-      expect(driver.server.finished).toBe(false);
-      expect(driver.pm.groundEntity).toBe(plug.ent.num);
-      expect(driver.pm.onGround).toBe(true);
-      expect(driver.pm.origin[2]!).toBeCloseTo(112, 0); // feet 88 (origin 112 = top 88+24)
-      expect(driver.server.finished).toBe(false);
-      expect(driver.server.finishReason).toBe('');
-    }
-
-    // ---- second press: E-use *34 while aboard (reach+facing+LOS) → finish 'lift' ----
-    // Eye (~-1720,1470,134) to button center (-1698.5,1464,136): ~25u east,
-    // well inside E-use reach 120 (driver convenience — Q2 has no +use).
-    // LOS crosses the plug east-face plane above the lowered plug (top 88),
-    // west of the *32/*33 slider plane (-1688), so neither the plug nor the
-    // sliders block. The first touch press cycled the button (wait 3, back
-    // to BOTTOM before the plug's own 3s hold lapses); E-use no-ops until
-    // BOTTOM (C button_fire gate) and fires t4 on TOP arrival — while
-    // aboard, so the guard finishes 'lift' (first-reason-wins, TOP hold
-    // blocks repeats, outside presses never finish, unrelated t91/t37 never
-    // finish here).
-    {
-      expect(driver.server.finished).toBe(false);
-      let finishedAt = -1;
-      for (let i = 0; i < 60 && finishedAt < 0; i++) {
-        const b = driver.server.moverBounds.get(btn34.ent.num)!;
-        const center: [number, number, number] = [(b.mins[0]! + b.maxs[0]!) / 2, (b.mins[1]! + b.maxs[1]!) / 2, (b.mins[2]! + b.maxs[2]!) / 2];
-        const eye0: [number, number, number] = [driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + driver.pm.viewheight];
-        const dx = center[0] - eye0[0]!, dy = center[1] - eye0[1]!, dz = center[2] - eye0[2]!;
-        const dist = Math.hypot(dx, dy, dz);
-        expect(dist).toBeLessThan(120);
-        const lh = Math.hypot(dx, dy) || 1;
-        const pitch = (Math.atan2(-dz, lh) * 180) / Math.PI;
-        const yaw = (Math.atan2(dy, dx) * 180) / Math.PI;
-        SV_SetPlayerHealth(driver.server, 100);
-        driver.step({ msec: 100, angles: [pitch, yaw, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_USE }, 0.1);
-        noteFired();
-        if (driver.server.finished) {
-          finishedAt = i;
-          break;
+      // ---- board: walk west onto the open plug top ----
+      // From the face lean west to (-1720,startY): crosses the east face
+      // plane, drops onto the open top (origin 112 == top 88+24). Grounded,
+      // ge==plug, no fall-through — boarding alone never finishes.
+      // WalkTo stops on XY arrival (possibly still airborne from the 8u
+      // drop), so settle a few ticks to land before asserting ge/onGround.
+      // Arrive radius 6 (not 12) keeps the aboard E-use within C 96 even at
+      // the worst stop (Y 1568: dy 80+6, dx 21.5+6 → ~90 <96).
+      {
+        const board = walkTo(driver, -1720, startY, 200, noteFired, 6);
+        expect(board.reached).toBe(true);
+        for (let i = 0; i < 10; i++) {
+          SV_SetPlayerHealth(driver.server, 100);
+          driver.step({ msec: 100, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 }, 0.1);
+          noteFired();
+          if (driver.pm.onGround && driver.pm.groundEntity === plug.ent.num) break;
         }
+        expect(driver.server.finished).toBe(false);
+        expect(driver.pm.groundEntity).toBe(plug.ent.num);
+        expect(driver.pm.onGround).toBe(true);
+        expect(driver.pm.origin[2]!).toBeCloseTo(112, 0);
+        expect(driver.server.finished).toBe(false);
+        expect(driver.server.finishReason).toBe('');
       }
-      expect(finishedAt).toBeGreaterThanOrEqual(0);
-      expect(driver.server.finished).toBe(true);
-      expect(driver.server.finishReason).toBe('lift');
-      expect(driver.server.finishTime).toBeGreaterThan(0);
-      expect(driver.events).toContain('finished');
-      expect(driver.events).toContain('use');
-      expect(driver.events).not.toContain('exit');
-      expect(driver.exited).toBe(false);
-      expect(fired.has('t4')).toBe(true);
-      expect(fired.has('t91')).toBe(false);
-      expect(fired.has('t37')).toBe(false);
-      expect(train.started).toBe(false);
-      // Boarding alone never finished (asserted above); only this aboard press did (exactly once).
-      // Repeated presses (TOP hold) never re-fire/finish (first-wins).
-      const finishTime = driver.server.finishTime;
-      const finishKills = driver.server.finishKills;
-      for (let i = 0; i < 20; i++) {
-        const b = driver.server.moverBounds.get(btn34.ent.num)!;
-        const center: [number, number, number] = [(b.mins[0]! + b.maxs[0]!) / 2, (b.mins[1]! + b.maxs[1]!) / 2, (b.mins[2]! + b.maxs[2]!) / 2];
-        const eye0: [number, number, number] = [driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + driver.pm.viewheight];
-        const dx = center[0] - eye0[0]!, dy = center[1] - eye0[1]!, dz = center[2] - eye0[2]!;
-        const lh = Math.hypot(dx, dy) || 1;
-        const pitch = (Math.atan2(-dz, lh) * 180) / Math.PI;
-        const yaw = (Math.atan2(dy, dx) * 180) / Math.PI;
-        SV_SetPlayerHealth(driver.server, 100);
-        driver.step({ msec: 100, angles: [pitch, yaw, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_USE }, 0.1);
-        noteFired();
-      }
-      expect(driver.server.finished).toBe(true);
-      expect(driver.server.finishTime).toBe(finishTime);
-      expect(driver.server.finishKills).toBe(finishKills);
-      expect(btn34.state).toBe('waiting'); // C-default 3s hold (repeats no-op, first-wins)
-    }
 
-    // ---- F1 completion panel: frozen counters, LEVEL COMPLETE, stats ----
-    {
-      const facts = helpFactsFor(boot);
-      expect(facts.kills[0]).toBe(driver.server.finishKills);
-      expect(facts.kills[1]).toBe(driver.server.totalMonsters);
-      expect(facts.kills[0]).toBeLessThanOrEqual(facts.kills[1]);
-      expect(facts.secrets).toEqual([0, 3]); // t91 secret NOT found (train never started) — plug lift only
-      // The *11 doorway slot (trigger_once -> t92 goal) overlaps the face
-      // lean, so walking the exit doorway earns the goal on foot (C-correct
-      // volume overlap, fired before the aboard finish froze the snapshot).
-      expect(facts.goals).toEqual([1, 1]);
-      expect(formatLevelTime(driver.server.finishTime)).toMatch(/^\d+:\d\d$/);
-      // Post-finish play must not move the frozen rows.
-      driver.server.killedMonsters = driver.server.totalMonsters;
-      driver.server.foundSecrets = 3;
-      driver.server.foundGoals = 1;
-      const frozen = helpFactsFor(boot);
-      expect(frozen.kills[0]).toBe(facts.kills[0]);
-      expect(frozen.secrets).toEqual([0, 3]);
-      expect(frozen.goals).toEqual([1, 1]);
-      toggleHelpOverlay(boot);
-      expect(boot.showHelp).toBe(true);
-      const done = blank(320, 240);
-      drawHelpOverlay(done, boot);
-      expect(done.color.some((c) => c === FINISH_BLUE)).toBe(true);
-      expect(driver.message).toContain('LEVEL COMPLETE');
-      expect(driver.message).toContain('kills');
-      expect(driver.message).toContain('secrets');
-      expect(driver.message).toContain('goals');
-      expect(driver.message).toContain('time');
-      const hud = blank(320, 240);
-      drawPlayHud(hud, boot, { fps: 0, frame: 1 });
-      expect(hud.color.some((c) => c === FINISH_BLUE)).toBe(true);
-      expectInWorld(driver.pm.origin, map);
+      // ---- finishing press: aimed E-use from aboard → finish 'lift' ----
+      // Eye to south-gap center from aboard: within C 96, facing cone,
+      // wall-checked LOS over the lowered plug, west of the slider plane.
+      // Button cycled (wait 3 returns to BOTTOM); E-use fires t4 on TOP while
+      // aboard → 'lift' (first-wins, TOP hold blocks repeats, outside/
+      // unrelated never finish here).
+      {
+        expect(driver.server.finished).toBe(false);
+        let finishedAt = -1;
+        for (let i = 0; i < 80 && finishedAt < 0; i++) {
+          const b = driver.server.moverBounds.get(btn34.ent.num)!;
+          const center: [number, number, number] = [(b.mins[0]! + b.maxs[0]!) / 2, (b.mins[1]! + b.maxs[1]!) / 2, (b.mins[2]! + b.maxs[2]!) / 2];
+          const eye0: [number, number, number] = [driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + driver.pm.viewheight];
+          const dx = center[0] - eye0[0]!, dy = center[1] - eye0[1]!, dz = center[2] - eye0[2]!;
+          const dist = Math.hypot(dx, dy, dz);
+          expect(dist).toBeLessThan(96);
+          const lh = Math.hypot(dx, dy) || 1;
+          const pitch = (Math.atan2(-dz, lh) * 180) / Math.PI;
+          const yaw = (Math.atan2(dy, dx) * 180) / Math.PI;
+          SV_SetPlayerHealth(driver.server, 100);
+          driver.step({ msec: 100, angles: [pitch, yaw, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_USE }, 0.1);
+          noteFired();
+          if (driver.server.finished) {
+            finishedAt = i;
+            break;
+          }
+        }
+        expect(finishedAt).toBeGreaterThanOrEqual(0);
+        expect(driver.server.finished).toBe(true);
+        expect(driver.server.finishReason).toBe('lift');
+        expect(driver.server.finishTime).toBeGreaterThan(0);
+        expect(driver.events).toContain('finished');
+        expect(driver.events).toContain('use');
+        expect(driver.events).not.toContain('exit');
+        expect(driver.exited).toBe(false);
+        expect(fired.has('t4')).toBe(true);
+        expect(fired.has('t91')).toBe(false);
+        expect(fired.has('t37')).toBe(false);
+        expect(train.started).toBe(false);
+        const finishTime = driver.server.finishTime;
+        const finishKills = driver.server.finishKills;
+        for (let i = 0; i < 20; i++) {
+          const b = driver.server.moverBounds.get(btn34.ent.num)!;
+          const center: [number, number, number] = [(b.mins[0]! + b.maxs[0]!) / 2, (b.mins[1]! + b.maxs[1]!) / 2, (b.mins[2]! + b.maxs[2]!) / 2];
+          const eye0: [number, number, number] = [driver.pm.origin[0]!, driver.pm.origin[1]!, driver.pm.origin[2]! + driver.pm.viewheight];
+          const dx = center[0] - eye0[0]!, dy = center[1] - eye0[1]!, dz = center[2] - eye0[2]!;
+          const lh = Math.hypot(dx, dy) || 1;
+          const pitch = (Math.atan2(-dz, lh) * 180) / Math.PI;
+          const yaw = (Math.atan2(dy, dx) * 180) / Math.PI;
+          SV_SetPlayerHealth(driver.server, 100);
+          driver.step({ msec: 100, angles: [pitch, yaw, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: BUTTON_USE }, 0.1);
+          noteFired();
+        }
+        expect(driver.server.finished).toBe(true);
+        expect(driver.server.finishTime).toBe(finishTime);
+        expect(driver.server.finishKills).toBe(finishKills);
+        expect(btn34.state).toBe('waiting');
+      }
+
+      // ---- F1 completion: frozen counters, LEVEL COMPLETE ----
+      {
+        const facts = helpFactsFor(boot);
+        expect(facts.kills[0]).toBe(driver.server.finishKills);
+        expect(facts.kills[1]).toBe(driver.server.totalMonsters);
+        expect(facts.secrets).toEqual([0, 3]);
+        expect(facts.goals).toEqual([1, 1]);
+        expect(formatLevelTime(driver.server.finishTime)).toMatch(/^\d+:\d\d$/);
+        driver.server.killedMonsters = driver.server.totalMonsters;
+        driver.server.foundSecrets = 3;
+        const frozen = helpFactsFor(boot);
+        expect(frozen.kills[0]).toBe(facts.kills[0]);
+        expect(frozen.secrets).toEqual([0, 3]);
+        expect(frozen.goals).toEqual([1, 1]);
+        toggleHelpOverlay(boot);
+        expect(boot.showHelp).toBe(true);
+        const done = blank(320, 240);
+        drawHelpOverlay(done, boot);
+        expect(done.color.some((c) => c === FINISH_BLUE)).toBe(true);
+        expect(driver.message).toContain('LEVEL COMPLETE');
+        expectInWorld(driver.pm.origin, map);
+      }
+      console.log(`RELEASE-4 box-4 visible offset Y=${startY}: finished lift, F1 frozen`);
     }
   });
 });

@@ -134,15 +134,19 @@ describe.runIf(!!WEB_Q2_PAK)('final elevator report repro (Q2_PAK)', () => {
     expect(doorCycle).toBeGreaterThan(30);
     expect(fired.has('t91')).toBe(false);
 
-    // Phase 3 — the C-intended plug opener: press the *34 platform button
-    // (gate (t) pattern). The plug drops the full 156 on the press, holds
-    // the C-default ~3s at the top, and returns — while the lift sits out
-    // the whole cycle. The reported "elevator rides down" is this
-    // C-correct plug motion, never the lift.
+    // Phase 3 — the C-intended plug opener: press the *34 platform button.
+    // RELEASE-4: *34 housing is east-face south-gap (-1703..-1694,1472..1504),
+    // visible in the open-slider gap, 1u east of the shut plug face. Press
+    // from the east-face lean ([-1688,1488] overlaps via hull+slop, touch) —
+    // the west alcove (-1860,1536) no longer presses (lump west-face entombed,
+    // collision moved east — render-vs-collision fix). The plug drops the
+    // full 156 on the press, holds the C-default ~3s at the top, and returns
+    // — while the lift sits out the whole cycle. The reported "elevator rides
+    // down" is this C-correct plug motion, never the lift.
     const plug = driver.server.movers.find((m) => m.ent.model === '*31')!;
     const btn34 = driver.server.movers.find((m) => m.ent.model === '*34')!;
     expect(btn34.wait).toBe(3); // C SP_func_button default (not 1)
-    driver.pm.origin = v3(-1860, 1536, 150);
+    driver.pm.origin = v3(-1688, 1488, 120);
     driver.pm.velocity = v3();
     let t4seen = false;
     for (let i = 0; i < 10 && !t4seen; i++) {

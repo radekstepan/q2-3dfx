@@ -359,16 +359,18 @@ describe.runIf(!!Q2_PAK)('wire: real base1 end to end (Q2_PAK)', () => {
       // minimum proof: a door opened on its trigger volume and the bot passed it
       expect(report.doorsOpened.length).toBeGreaterThan(0);
       expect(report.doorsCrossed.length).toBeGreaterThan(0);
-      // WIRE-EXIT (C-parity RELEASE-4): the bot leans on the plug face at
-      // the slot mouth, cycling the *32/*33 sliders around itself — and,
-      // since *34 sits reachable at the face south end, leaning on *34 too,
-      // so t4 cycles the plug C-correctly (open/waiting at the end). The
-      // named lift never starts without its button's t91. Boarding + riding
-      // the operable lift is proven by the scripted pmove-rider test, not
-      // by this bot.
+      // WIRE-EXIT (C-parity RELEASE-4): the bot walks the low road to the
+      // slot mouth, cycling the *32/*33 sliders — and pressing the reachable
+      // *34 south-gap (touch via contact slop during the approach), so t4
+      // cycles the plug C-correctly (opened at least once; it may have
+      // returned to BOTTOM by the end of the 39s run since the 3s wait lapses
+      // and the stuck point sits 14u east of touch range with no re-press —
+      // still C-correct, no premature lift). The named lift never starts
+      // without its button's t91. Boarding + riding the operable lift is
+      // proven by the scripted pmove-rider test, not by this bot.
       expect(report.doorsOpened).toContain('*32');
       expect(report.doorsOpened).toContain('*31'); // via the reachable *34 (t4)
-      expect(report.plugOrigin).toEqual([0, 0, -156]); // open/waiting, cycled by t4
+      expect([[0, 0, -156], [0, 0, 0]]).toContainEqual(report.plugOrigin); // cycled (open or returned)
       expect(report.trainStarted).toBe(false);
       // lean point (-1688,1488) sits ~104 XY from the exit volume center
       // (through the *32 doorway): the bot reaches the complex, never the
@@ -773,7 +775,7 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
   // scripted pmove rider below — no BFS jump choreography.
   const spawn = v3(128, -320, 32); // info_player_start origin, feet 8 up
   const exitCenter: [number, number] = [-1776, 1544];
-  const slotMouth: [number, number] = [-1664, 1456];
+  const slotMouth: [number, number] = [-1664, 1536];
   const plug31 = doors.find((d) => d.model === 31);
   const planTrace: PlanTrace = (sx, sy, sz, ex, ey, ez) => {
     const w = worldTrace(v3(sx, sy, sz), PLAYER_MINS, PLAYER_MAXS, v3(ex, ey, ez));
@@ -846,12 +848,13 @@ function driveBot(st: ServerState, map: BspMap): BotReport {
     SV_CarryRiders(st, [body]);
     slotClosest = Math.min(slotClosest, Math.hypot(bot.origin[0]! - exitCenter[0], bot.origin[1]! - exitCenter[1]));
     // ENDGAME (C-parity RELEASE-4): once the planned route is consumed,
-    // lean on the plug's east face at the slot mouth. The targetname'd plug
-    // owns no touch trigger, so the lean cycles only the *32/*33 sliders —
-    // the plug (and the lift) sitting out the whole run is the full-scale
-    // no-premature-departure proof. The sealed pit (driver header) means
-    // delivery ends at the slot edge.
-    const slotTouch: [number, number] = [-1688, 1456];
+    // lean on the plug's east face at the slot mouth, then slide 48u south
+    // to the *34 center (Y 1488) to press. The targetname'd plug owns no
+    // touch trigger, so the lean cycles the *32/*33 sliders — and, since
+    // *34 sits reachable at the face south-gap (east-face, Y 1472..1504),
+    // leaning on *34 too, so t4 cycles the plug C-correctly. The sealed pit
+    // (driver header) means delivery ends at the slot edge.
+    const slotTouch: [number, number] = [-1688, 1488];
     let target = waypoints[Math.min(wpIndex, waypoints.length - 1)]!;
     if (wpIndex >= waypoints.length - 1) target = slotTouch;
     // Door-transit hold: never walk into a slab that is still travelling.
@@ -1695,11 +1698,12 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect([...d31.ent.origin]).toEqual([...d31.pos1]);
 
     // PART B — C-intended activation: lean into *34 (touchable) from the
-    // plug east face south end. RELEASE-4: *34 housing moved 145E+72S for
-    // reachability (lump entombed 5u in the shut plug); lean into the
-    // shifted touch box from the face (approach at Y 1536 passes 39u
-    // north, no touch there).
-    const lean = { origin: v3(-1688, 1490, 120), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) };
+    // plug east face south-gap center. RELEASE-4: *34 housing moved 145E-48Y
+    // for reachability (lump entombed 5u in the shut plug, Y south-gap to stay
+    // visible in the open-slider gap without blocking the central walk);
+    // lean into the shifted touch box from the face (central entry Y 1536
+    // passes 16u north, no touch there — press is explicit).
+    const lean = { origin: v3(-1688, 1488, 120), mins: v3(-16, -16, -24), maxs: v3(16, 16, 32) };
     expect(SV_TouchButtonsAt(st, lean, 'player').map((m) => m.ent.model)).toContain('*34');
     expect(b34.state).toBe('going_up');
     expect(st.firedThisTick).not.toContain('t4'); // not yet: fires at the top
@@ -1960,16 +1964,17 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       expect([...d32box.mins]).toEqual([-1688, 1376, 96]);
       expect([...d32box.maxs]).toEqual([-1680, 1472, 224]);
       // Lower the plug through the *34 overlap press (touch only).
-      // RELEASE-4: *34 housing moved 145E+72S for reachability (lump
-      // entombed 5u in the shut plug); lean into the shifted touch box
-      // from the plug east face south end. The press lowers the plug
-      // WITHOUT finishing when not aboard (t4 door cycle, transient) —
-      // only an aboard *34 press (plug lift, driver-gated) or an aboard
-      // *13 press (train, unreachable in any engine) takes the 'lift'
-      // finish. The walk below then boards the lowered plug for real.
+      // RELEASE-4: *34 housing moved 145E-48Y for reachability (lump entombed
+      // 5u in the shut plug, Y south-gap visible without blocking central);
+      // lean into the shifted touch box from the plug east face south-gap
+      // center. The press lowers the plug WITHOUT finishing when not aboard
+      // (t4 door cycle, transient) — only an aboard *34 press (plug lift,
+      // driver-gated) or an aboard *13 press (train, unreachable in any
+      // engine) takes the 'lift' finish. The walk below then boards the
+      // lowered plug for real.
       SV_TouchButtonsAt(
         st,
-        { origin: v3(-1688, 1490, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+        { origin: v3(-1688, 1488, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
         'player',
       );
       expect(b34.state).toBe('going_up');
@@ -1984,8 +1989,8 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
       // The pressed *34 sits flush: clip == shifted bounds + travelled offset.
       expect([...b34.ent.origin]).toEqual([...b34.pos2]);
       const b34box = SV_MoverClipBox(st, b34)!;
-      expect([...b34box.mins]).toEqual([-1708, 1448, 120]);
-      expect([...b34box.maxs]).toEqual([-1699, 1480, 152]);
+      expect([...b34box.mins]).toEqual([-1708, 1472, 120]);
+      expect([...b34box.maxs]).toEqual([-1699, 1504, 152]);
       // The waiting train's clip sits exactly on its brush (no stale
       // offset); deck top 0 over pit floor -48 was never a step-up.
       expect(train.started).toBe(false);
@@ -2288,15 +2293,15 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     // no targetname, no health). The button fires t4 on reaching the TOP
     // (id button_wait), the plug drops the full 156, holds the C-default
     // 3s wait at the top, returns, and answers a second press (repeat use).
-    // RELEASE-4: *34 housing moved 145E+72S (lump entombed 5u in the shut
-    // plug); lean into the shifted touch box from the plug east face
-    // south end.
+    // RELEASE-4: *34 housing moved 145E-48Y (lump entombed 5u in the shut
+    // plug, Y south-gap visible without blocking central); lean into the
+    // shifted touch box from the plug east face south-gap center.
     const b34 = st.movers.find((m) => m.ent.model === '*34')!;
     expect(b34.ent.target).toBe('t4');
     expect(b34.wait).toBe(3); // C SP_func_button default, not 1
     const lean = SV_TouchButtonsAt(
       st,
-      { origin: v3(-1688, 1490, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+      { origin: v3(-1688, 1488, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
       'player',
     );
     expect(lean.map((m) => m.ent.model)).toContain('*34');
@@ -2316,7 +2321,7 @@ describe.runIf(!!Q2_PAK)('M5.2 fidelity: barrels/runner/armor/ships/doors/gunner
     expect(b34.state).toBe('bottom');
     SV_TouchButtonsAt(
       st,
-      { origin: v3(-1688, 1490, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
+      { origin: v3(-1688, 1488, 120), mins: PLAYER_MINS, maxs: PLAYER_MAXS },
       'player',
     );
     guard = 0;

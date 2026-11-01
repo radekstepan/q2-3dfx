@@ -7,10 +7,11 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-10-31, reviewed at `e11cfe0`): elevator entry
-> remains unresolved; fix the visible boarding route and shootable-button art
-> states. Software underwater warping is user-confirmed correct. Preserve
-> landed patrol/tooltip repairs; §8 is the only active queue.**
+> **Current direction (2026-11-01, RELEASE-4 visible entry done): elevator entry
+> fixed with render-vs-collision parity and multi-offset visible-doorway gates;
+> next is shootable-button art states (RELEASE-16). Software underwater warping
+> is user-confirmed correct. Preserve landed patrol/tooltip/elevator repairs;
+> §8 is the only active queue.**
 
 ---
 
@@ -260,12 +261,16 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ### Review checkpoint and rules
 
-Source/history reviewed at `e11cfe0` on 2026-10-31. This was a source/documentation
-review; no browser reproduction or test suite was rerun. Latest changes:
-`b1123a4` elevator button relocation/boarding guard, `1f5d982` patrol arrival wait
-and live-route checks, `00c5790` underwater audit, `e11cfe0` custom tooltips.
-Preserve valid increments. User still cannot enter the elevator: RELEASE-4's
-archived DONE claim is superseded below. Software underwater warp is explicitly
+Source/history reviewed at `e11cfe0` on 2026-10-31, plus RELEASE-4 visible-entry
+fix 2026-11-01 (this session). This was a source/documentation review; no
+browser reproduction or test suite was rerun for the checkpoint itself.
+Latest changes: `b1123a4` elevator button relocation/boarding guard, `1f5d982`
+patrol arrival wait and live-route checks, `00c5790` underwater audit, `e11cfe0`
+custom tooltips, plus this session's render-vs-collision parity (BUTTON_34_SHIFT
+145,-48, visual==collision, C 96 reach) and multi-offset visible-doorway gates.
+Preserve valid increments. RELEASE-4 reopened entry is now fixed (archived DONE
+above supersedes both the old side-route and the reopened blockage); awaiting
+user verdict on the visible route. Software underwater warp is explicitly
 confirmed correct; no further software warp redesign is requested.
 
 Patrol and custom-tooltip cards remain archived with their evidence; omission
@@ -274,23 +279,12 @@ legacy Voodoo retirement and recorded FOLLOW-5 approval remain preserved. GPU
 stays experimental pending integrated/display acceptance. Display absence does
 not block gameplay or button-texture repairs.
 
-Priority: RELEASE-4 → RELEASE-16; RELEASE-15 retains only the narrower OpenGL
-comparison uncertainty. Claim one card; use disjoint ownership for independent
-work and run expensive validation sequentially. Actual entry/visual symptoms
-need production-browser evidence, not a direct target invocation or synthetic
-render. Separate implementation, automated results and user verdicts.
-
-### RELEASE-4 — Fix visible elevator entry before accepting button completion
-owns: `packages/server`, `packages/game`, `apps/web`, `packages/testkit`
-depends: none
-status: ready (reopened after user retest)
-user-contract: walk onto the waiting/open final elevator, then press its button to finish and show frozen F1 completion stats. Boarding alone must not finish. The original game permits entry; invisible blockage remains in this project.
-review-finding: `b1123a4` relocates *34 housing 145 units east/72 south and uses touch to open *31, then aimed E-use while aboard to finish. Its test starts in the hall, sidesteps south to a specific contact point and boards at roughly (-1720,1470). This is useful route evidence, but does not prove the visible doorway affords the normal entry the user attempts. The relocation and extended E reach are project deviations, not original-map facts.
-done-when:
-- [ ] Reproduce the blockage in the actual browser from the visible doorway, identifying build/map, approach, player hull, blocking entity/brush and render-versus-collision transforms. Compare the normal central entry with the test's side approach. Verify relocated button geometry is drawn where it collides, discoverable and reachable, and not just present in the server fixture.
-- [ ] Fix the actual blocking state/geometry/activation discrepancy locally. Preserve waiting and existing valid mover/button fixes; no noclip, teleport, global collision bypass or undocumented side-route requirement. Do not reassert that the original route is impossible from this port's traces.
-- [ ] Make the requested sequence clear and playable: normal entry onto the platform → reachable button press → exactly one finished state with F1 time/kills/secrets/goals. Do not require the user to infer a hidden preliminary contact or precise aim point; retain protection against outside/unrelated/duplicate finish triggers.
-- [ ] Extend browser and real-base1 regressions to the user-visible entry at multiple approach offsets, without repositioning inside the route or directly firing targets. Capture boarding and button use; require no obstruction, no premature finish and the final stats screen. The archived custom side-route pass alone does not close this reopened card.
+Priority: RELEASE-16 (RELEASE-4 done, awaiting user verdict); RELEASE-15 retains
+only the narrower OpenGL comparison uncertainty. Claim one card; use disjoint
+ownership for independent work and run expensive validation sequentially.
+Actual entry/visual symptoms need production-browser evidence, not a direct
+target invocation or synthetic render. Separate implementation, automated
+results and user verdicts.
 
 ### RELEASE-16 — Shootable secret-button texture/lighting states
 owns: `packages/game`, `packages/server`, `apps/web`, `packages/sw-renderer`, `packages/webgl-renderer`, `packages/testkit`

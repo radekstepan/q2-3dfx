@@ -170,6 +170,7 @@ import {
 } from './doors.js';
 import type { RotMover, SecretMover } from './doors.js';
 import {
+  BUTTON_34_SHIFT,
   BUTTON_TOUCH_SLOP,
   BUTTON_USE_DOT,
   BUTTON_USE_REACH,
@@ -1435,34 +1436,16 @@ export function SV_SpawnEntities(
         if (modelSizes && model) {
           const bounds = modelSizes(model);
           if (bounds) {
-            // RELEASE-4 departure (base1 *34 only): the lump *34 brush is
-            // entombed 5u inside the shut *31 plug solid (mins -1848 vs plug
-            // west -1844; center -1843.5 inside plug) — C-identical, LOS
-            // always crosses plug/rock, touch is C-gated (no targetname, so
-            // touchable) but the lump position is off the walkable path,
-            // shooting never fires (no health), so the plug never opens in
-            // any engine and the plug lift is unboardable.
-            // Shift the *34 housing 145u east + 72u south (+145 X, -72 Y) to
-            // the plug east face south end (-1703..-1694, 1448..1480, center
-            // -1698.5,1464) — 1u east of the shut plug face (-1704), 6u west
-            // of the *32/*33 slider band (-1688), clear of both sweeps. The
-            // hall approach at Y 1536 passes 39u north (no touch on the
-            // traversal proofs); a deliberate slide south along the face to
-            // the proven (-1688,1488) lean leans into the grown box (9u
-            // Y-overlap) and opens the plug (first press: not aboard, no
-            // finish). Boarding west off the face drops 32u onto the open
-            // top; the second press is an aimed E-use from aboard (reach 120,
-            // driver convenience, Q2 has no +use) over the lowered plug —
-            // west of the slider plane, so LOS never crosses the sliders —
-            // and finishes 'lift' via the aboard guard (first-wins). C
-            // travel/TOUCH/shooting otherwise intact (pos2 recomputed below
-            // from the shifted bounds; touch still gated (now reachable,
-            // C-correct), shooting still gated by health).
+            // RELEASE-4 departure (base1 *34 only): see BUTTON_34_SHIFT in
+            // buttons.ts — lump entombed in shut plug, shifted to east face
+            // center (Y preserved) so normal central entry faces it. Both
+            // collision (here) and rendering (apps/web DoorSync/graft) apply
+            // the same shift; visual/collision divergence is a blocker.
             let bmins = bounds.mins;
             let bmaxs = bounds.maxs;
             if (model === '*34') {
-              bmins = new Float32Array([bmins[0]! + 145, bmins[1]! - 72, bmins[2]!]);
-              bmaxs = new Float32Array([bmaxs[0]! + 145, bmaxs[1]! - 72, bmaxs[2]!]);
+              bmins = new Float32Array([bmins[0]! + BUTTON_34_SHIFT[0], bmins[1]! + BUTTON_34_SHIFT[1], bmins[2]! + BUTTON_34_SHIFT[2]]);
+              bmaxs = new Float32Array([bmaxs[0]! + BUTTON_34_SHIFT[0], bmaxs[1]! + BUTTON_34_SHIFT[1], bmaxs[2]! + BUTTON_34_SHIFT[2]]);
             }
             st.moverBounds.set(e.num, { mins: bmins, maxs: bmaxs });
             // C SP_func_button travel is |movedir| . brushSize - lip
@@ -2319,14 +2302,14 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
     // base1's *34 (target t4) calls the *31 plug lift. The C-identical
     // *12 train slot is 16-wide (player hull 32) — unboardable in any
     // engine — while the open plug top is 140x208 at 88, boardable by a
-    // 32 drop from the bridge deck (no world surgery, mover clip only).
-    // Pressing *34 from the deck opens the plug (no finish, not aboard);
-    // boarding the open plug alone never finishes; pressing *34 while
-    // standing on the plug (playerGroundEntity == *31 num) completes the
-    // level (first-reason-wins, TOP/return timing unchanged, C movement
-    // otherwise intact). Boarding is a 32u drop off the plug east face onto
-    // the open top; the finishing press is an aimed E-use from aboard over
-    // the lowered plug (west of the slider plane, so LOS never crosses the
+    // 32 drop from the doorway slot (no world surgery, mover clip only).
+    // Pressing *34 from the doorway face opens the plug (no finish, not
+    // aboard); boarding the open plug alone never finishes; pressing *34
+    // while standing on the plug (playerGroundEntity == *31 num) completes
+    // the level (first-reason-wins, TOP/return timing unchanged, C movement
+    // otherwise intact). Boarding is a 32u drop west off the face onto the
+    // open top; the finishing press is an aimed E-use from aboard over the
+    // lowered plug (west of the slider plane, so LOS never crosses the
     // *32/*33 sweeps). Unrelated triggers (t91 secret/train, t37 pit
     // exit) never finish here; outside *34 presses never finish.
     const btn = st.movers.find((mm) => mm.ent === user);
@@ -3472,6 +3455,7 @@ export interface ServerDelayedUse {
 
 /** C button_fire voice (game/g_func.c SP_func_button: sounds != 1). */
 export const BUTTON_SOUND_START = 'switches/butn2.wav';
+export { BUTTON_34_SHIFT } from './buttons.js';
 
 /**
  * id water-contents bits for hitscan splash color (game/q_shared.h BSP
