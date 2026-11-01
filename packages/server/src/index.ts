@@ -170,7 +170,6 @@ import {
 } from './doors.js';
 import type { RotMover, SecretMover } from './doors.js';
 import {
-  BUTTON_34_SHIFT,
   BUTTON_TOUCH_SLOP,
   BUTTON_USE_DOT,
   BUTTON_USE_REACH,
@@ -453,10 +452,11 @@ export interface ServerState {
    * finish guard refuses without feet).
    */
   playerFeet: Vec3 | null;
+  exitElevator: 'idle' | 'closing' | 'descending';
 }
 
 export function SV_Init(): ServerState {
-  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], timerRand: mulberry32(0x71E4), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0, lastPlayerShotAt: -10, lastPlayerDamage: 0, lastPlayerDamageFrom: null, playerGroundEntity: -1, playerFeet: null };
+  return { time: 0, skill: 1, entities: [], movers: [], trains: [], secretDoors: [], rotDoors: [], monsters: [], triggers: [] as Trigger[], firedThisTick: [], delayed: [], centerprints: [], lightStyles: {}, lightToggles: [], areaPortals: {}, moverDeltas: new Map(), moverBounds: new Map(), triggerBounds: new Map(), brushClips: new Map(), bolts: [], barrels: [], explosions: [], muzzles: [], tracers: [], sparks: [], sounds: [], debris: [], gibs: [], fuses: [], explosionTargets: new Map(), splashes: new Map(), speakers: new Map(), timers: [], timerRand: mulberry32(0x71E4), playerHealth: 100, playerMaxHealth: 100, playerWorld: makeWorldEffectsState(), playerAirLeft: AIR_GRACE, playerBreatherUntil: 0, playerEnviroUntil: 0, playerBreatherLeft: 0, playerEnviroLeft: 0, breathToggle: false, nextBreathAt: 0, breatherWarned: false, enviroWarned: false, trail: trailInit(false), combatPoints: [], totalMonsters: 0, killedMonsters: 0, totalSecrets: 0, foundSecrets: 0, totalGoals: 0, foundGoals: 0, helpChangedSeq: 0, helpMessage1: '', helpMessage2: '', levelName: '', finished: false, finishReason: '', finishTime: 0, finishKills: 0, finishSecrets: 0, finishGoals: 0, lastPlayerShotAt: -10, lastPlayerDamage: 0, lastPlayerDamageFrom: null, playerGroundEntity: -1, playerFeet: null, exitElevator: 'idle' };
 }
 
 /**
@@ -981,6 +981,9 @@ export function SV_ClipTrace(
     for (const [num, b] of st.brushClips) consider(num, b);
     for (const m of st.movers) {
       if (m.ent.classname !== 'func_door' && m.ent.classname !== 'func_button' && m.ent.classname !== 'func_plat') continue;
+      // The Outer Base exit button is use-only. Keep its bounds for aiming,
+      // but do not let its embedded brush obstruct the boarding platform.
+      if (st.levelName === 'Outer Base' && m.ent.model === '*34' && m.ent.target === 't4') continue;
       consider(m.ent.num, SV_MoverClipBox(st, m));
     }
     for (const tr of st.trains) consider(tr.ent.num, SV_TrainClipBox(st, tr));
@@ -1382,6 +1385,7 @@ export function SV_SpawnEntities(
   st.trail = trailInit(true);
   st.combatPoints = [];
   st.levelName = '';
+  st.exitElevator = 'idle';
   dicts.forEach((dict, index) => {
     const spawnflags = parseFloat(dict['spawnflags'], 0);
     // Skill inhibit (g_spawn.c); worldspawn (first block) is exempt.
@@ -1417,6 +1421,13 @@ export function SV_SpawnEntities(
             const lip = e.lip || 8;
             distance = doorTravel(new Float32Array(size), angle, lip) + lip;
             const m = spawnDoor(e, angle, distance);
+            // Put the exit platform at the entrance floor at rest. The
+            // original brush occupies the doorway at its lump position.
+            if (st.levelName === 'Outer Base' && model === '*31' && e.targetname === 't4') {
+              e.origin[2] = m.pos2[2]!;
+              m.pos2[2] = m.pos2[2]! * 2;
+              m.wait = -1;
+            }
             SV_SpawnMover(st, m);
             st.moverBounds.set(e.num, { mins: bounds.mins, maxs: bounds.maxs });
             break;
@@ -1471,18 +1482,7 @@ export function SV_SpawnEntities(
         if (modelSizes && model) {
           const bounds = modelSizes(model);
           if (bounds) {
-            // RELEASE-4 departure (base1 *34 only): see BUTTON_34_SHIFT in
-            // buttons.ts — lump entombed in shut plug, shifted to hover
-            // centered above the east-face doorway (out of every walk line).
-            // Both collision (here) and rendering (apps/web DoorSync/graft)
-            // apply the same shift; visual/collision divergence is a blocker.
-            let bmins = bounds.mins;
-            let bmaxs = bounds.maxs;
-            if (model === '*34') {
-              bmins = new Float32Array([bmins[0]! + BUTTON_34_SHIFT[0], bmins[1]! + BUTTON_34_SHIFT[1], bmins[2]! + BUTTON_34_SHIFT[2]]);
-              bmaxs = new Float32Array([bmaxs[0]! + BUTTON_34_SHIFT[0], bmaxs[1]! + BUTTON_34_SHIFT[1], bmaxs[2]! + BUTTON_34_SHIFT[2]]);
-            }
-            st.moverBounds.set(e.num, { mins: bmins, maxs: bmaxs });
+            st.moverBounds.set(e.num, { mins: bounds.mins, maxs: bounds.maxs });
             // C SP_func_button travel is |movedir| . brushSize - lip
             // (g_func.c), not lip: spawnButton's lip-only pos2 leaves the
             // pressed *34 one unit proud, and its expanded hull then pins a
@@ -2334,30 +2334,7 @@ export function fireTargets(st: ServerState, user: Edict, depth = 0): void {
       if (aboard) SV_FinishLevel(st, 'lift');
     }
   }
-  if (user.classname === 'func_button') {
-    // RELEASE-4 plug elevator finish (documented departure, driver-gated):
-    // base1's *34 (target t4) calls the *31 plug lift. The C-identical
-    // *12 train slot is 16-wide (player hull 32) — unboardable in any
-    // engine — while the open plug top is 140x208 at 88, boardable by a
-    // 32 drop from the doorway slot (no world surgery, mover clip only).
-    // Pressing *34 from the doorway face opens the plug (no finish, not
-    // aboard); boarding the open plug alone never finishes; pressing *34
-    // while genuinely standing on the plug (SV_StandingOn == *31 num + feet
-    // on the live top + footprint) completes the level (first-reason-wins,
-    // TOP/return timing unchanged, C movement otherwise intact). Boarding
-    // is a 32u drop west off the face onto the open top; the finishing press
-    // is an aimed E-use from aboard over the lowered plug (west of the
-    // slider plane, so LOS never crosses the *32/*33 sweeps). Unrelated
-    // triggers (t91 secret/train, t37 pit exit) never finish here; outside
-    // *34 presses never finish.
-    const btn = st.movers.find((mm) => mm.ent === user);
-    if (btn && btn.ent.target === 't4') {
-      const plug = st.movers.find((mm) => mm.ent.model === '*31');
-      if (plug && SV_StandingOn(st, plug.ent.num)) {
-        SV_FinishLevel(st, 'lift');
-      }
-    }
-  }
+
 }
 
 /** True when the edict is a brush-model trigger (model *N, no usable origin). */
@@ -2398,6 +2375,9 @@ export function SV_TouchTriggersAt(
 ): void {
   for (const t of st.triggers) {
     if (t.ent.freed) continue;
+    // The shaft's original changelevel trigger intersects the new ride.
+    // Finish after the platform arrives instead of cutting the ride short.
+    if (st.exitElevator !== 'idle' && st.levelName === 'Outer Base' && t.ent.model === '*27') continue;
     if (isBrushTrigger(t.ent)) {
       const b = st.triggerBounds.get(t.ent.num);
       if (!b) continue;
@@ -2448,9 +2428,8 @@ export function SV_TouchTriggersAt(
  * health or a targetname gets NO touch trigger at all (think =
  * Think_CalcMoveSpeed, not Think_SpawnDoorTrigger) — it answers use (a
  * button relay like base1's *34 -> t4, or damage) but never proximity.
- * Base1's *31 plug (targetname t4) is such a door: the entry-hall camper
- * overlapping its expanded rest bounds must NOT lower it; only the *34
- * press may. Skipping those movers here is that rule.
+ * Outer Base's exit platform is opened alongside its entrance doors as a
+ * deliberate exception so the player can reach its completion button.
  *
  * Returns the doors that started moving (sliders and rotators).
  */
@@ -2462,6 +2441,7 @@ export function SV_TouchDoorsAt(
   const used: Array<Mover | RotMover> = [];
   for (const m of st.movers) {
     if (m.ent.classname !== 'func_door') continue;
+    if (st.exitElevator !== 'idle' && st.levelName === 'Outer Base' && (m.ent.model === '*32' || m.ent.model === '*33')) continue;
     // id SP_func_door: health/targetname doors spawn no trigger (see above).
     if (m.ent.targetname || m.ent.health > 0) continue;
     // id Touch_DoorTrigger: NOMONSTER doors ignore monster touches.
@@ -2530,6 +2510,7 @@ export function SV_TouchButtonsAt(
   if (st.playerHealth <= 0) return used;
   for (const m of st.movers) {
     if (m.ent.classname !== 'func_button' || m.ent.freed) continue;
+    if (st.levelName === 'Outer Base' && m.ent.model === '*34' && m.ent.target === 't4') continue;
     if (!isButtonTouchable(m.ent)) continue;
     const box = SV_MoverClipBox(st, m);
     if (!box) continue;
@@ -3249,8 +3230,26 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
       m.ent.classname === 'func_button' &&
       (m.state === MOVER_WAITING || m.state === MOVER_TOP)
     ) {
-      // id button_wait fires the button's target on reaching the top.
-      fireTargets(st, m.ent);
+      if (st.levelName === 'Outer Base' && m.ent.model === '*34' && m.ent.target === 't4') {
+        const platform = st.movers.find((door) => door.ent.classname === 'func_door' && door.ent.model === '*31' && door.ent.targetname === 't4');
+        if (platform && st.exitElevator === 'idle' && SV_StandingOn(st, platform.ent.num)) {
+          st.exitElevator = 'closing';
+          for (const door of st.movers) {
+            if (door.ent.classname !== 'func_door' || (door.ent.model !== '*32' && door.ent.model !== '*33')) continue;
+            const distance = Math.hypot(door.ent.origin[0]! - door.pos1[0]!, door.ent.origin[1]! - door.pos1[1]!, door.ent.origin[2]! - door.pos1[2]!);
+            if (distance > 0) {
+              door.state = MOVER_GOING_DOWN;
+              door.ent.state = door.state;
+              door.legEnd = now + distance / door.speed;
+              door.waitEnd = -1;
+              doorLegStartSound(st, door);
+            }
+          }
+        }
+      } else {
+        // id button_wait fires the button's target on reaching the top.
+        fireTargets(st, m.ent);
+      }
     }
     // id door_hit_top / door_hit_bottom: arrivals play sound_end; the DOWN
     // leg landing closes the door's areaportals (door_use_areaportals(false)).
@@ -3264,6 +3263,19 @@ export function SV_Tick(st: ServerState, dt: number = SERVER_DT, game?: SVGameTi
       }
       if (m.state === MOVER_BOTTOM) setDoorPortals(st, m.ent, false);
     }
+  }
+  if (st.exitElevator === 'closing') {
+    const doors = st.movers.filter((m) => m.ent.classname === 'func_door' && (m.ent.model === '*32' || m.ent.model === '*33'));
+    if (doors.every((door) => door.state === MOVER_BOTTOM)) {
+      const platform = st.movers.find((m) => m.ent.classname === 'func_door' && m.ent.model === '*31' && m.ent.targetname === 't4');
+      if (platform) {
+        st.exitElevator = 'descending';
+        SV_UseMover(st, platform);
+      }
+    }
+  } else if (st.exitElevator === 'descending') {
+    const platform = st.movers.find((m) => m.ent.classname === 'func_door' && m.ent.model === '*31' && m.ent.targetname === 't4');
+    if (platform && platform.state === MOVER_TOP) SV_FinishLevel(st, 'lift');
   }
   for (const tr of st.trains) {
     if (tr.ent.freed) continue;
@@ -3493,7 +3505,6 @@ export interface ServerDelayedUse {
 
 /** C button_fire voice (game/g_func.c SP_func_button: sounds != 1). */
 export const BUTTON_SOUND_START = 'switches/butn2.wav';
-export { BUTTON_34_SHIFT } from './buttons.js';
 
 /**
  * id water-contents bits for hitscan splash color (game/q_shared.h BSP

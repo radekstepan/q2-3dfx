@@ -59,6 +59,9 @@ yarn turbo run build typecheck test --filter=...[origin/main]
   on the page to boot base1: BSP collision, WAL textures, PCX palette,
   doors that open, exit trigger, shootable soldier/gunner placeholders.
   **Never commit `pak0.pak`.**
+- At the end of Outer Base, enter the stationary elevator and press the
+  switch at the back with E. The doors close and the elevator descends; at
+  the bottom, the game pauses on an F1-style level results screen.
 - Internal render res is 320×240, CSS-upscaled 2× (base1 spawn ≈10.8 ms/frame
   single-threaded; 640×480 native needs the M8.1 worker bands).
 - Headless use (Node/tests) is via `bootWeb({ width, height, renderer, pak })`.

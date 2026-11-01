@@ -58,25 +58,6 @@ export const BUTTON_USE_REACH = 96;
 export const BUTTON_USE_DOT = 0.7;
 
 /**
- * RELEASE-4 documented departure (base1 *34 only): the lump *34 brush is
- * entombed in the shut *31 plug solid (mins -1848 vs plug west -1844),
- * off the walkable path, so the plug never opens in any engine. The housing
- * shifts +145 X, +0 Y, +40 Z to sit centered ABOVE the plug east-face
- * doorway (-1703..-1694, 1520..1552, 160..192; center -1698.5,1536,176) —
- * 1u east of the shut face (-1704), 15u west of the *32/*33 band (-1688),
- * on the doorway centerline (no south/north side-route bias), and 8u above
- * a standing head (152) so EVERY straight-in walk passes under it without
- * touching or blocking. It is E-use-only (no hull overlap at any stance,
- * so touch can never pre-fire t4); both presses are aimed E-use within the
- * C 96 reach — from the slot face (d ~36) to open, and from aboard the open
- * plug top (d ~70) to finish. Both slot endpoints sit west of the slider
- * plane, so *32/*33 state never blocks the E-use LOS. Collision
- * (moverBounds) and rendering (DoorSync/graft) must both apply this shift,
- * or the button is drawn where it does not collide.
- */
-export const BUTTON_34_SHIFT: readonly [number, number, number] = [145, 0, 40] as const;
-
-/**
  * Aim selection for the E-use path: the nearest button whose center sits
  * within `reach` of the eye and inside the facing cone (`dot`). Ties and
  * far/behind buttons never win, so only the aimed button fires.

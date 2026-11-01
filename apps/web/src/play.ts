@@ -105,7 +105,6 @@ import type {
   PlayerState,
 } from '@q2/game';
 import {
-  BUTTON_34_SHIFT,
   SV_CarryRiders,
   SV_Init,
   SV_SetPlayerGround,
@@ -1358,6 +1357,7 @@ export class LocalDriver implements HostDriver {
       // the leaves they intersect so doors render CLOSED at spawn and glass
       // renders at all. Must run after snapshotDoorBases (same faces).
       this.graftBrushModels();
+      this.syncDoors();
       for (const e of this.server.entities) {
         if (e.classname === 'target_changelevel' && e.targetname) this.changeTargets.add(e.targetname);
       }
@@ -1399,6 +1399,7 @@ export class LocalDriver implements HostDriver {
   }
 
   step(cmd: UserCmdT, dt: number): void {
+    if (this.server.finished) return;
     // Firing kick from the previous tick expires here: the host consumed it
     // via viewKick() during the last tick (compute-then-clear ordering), so
     // a kick is visible for exactly one 10Hz tick.
@@ -2923,14 +2924,6 @@ export class LocalDriver implements HostDriver {
       const baseCenter: Float32Array[] = [];
       const baseMins: Float32Array[] = [];
       const baseMaxs: Float32Array[] = [];
-      // RELEASE-4: *34 housing shift must match server collision (BUTTON_34_SHIFT).
-      // Without this the button renders at its lump spot (inside the shut plug,
-      // invisible) while colliding 145E away — render-vs-collision divergence.
-      // Both base (DoorSync rest) and live (mini surfaces, first frame before
-      // the first syncDoors) shift, so doorRenderOffset is 0 at spawn (closed).
-      const sx = model === '*34' ? BUTTON_34_SHIFT[0] : 0;
-      const sy = model === '*34' ? BUTTON_34_SHIFT[1] : 0;
-      const sz = model === '*34' ? BUTTON_34_SHIFT[2] : 0;
       for (let f = first; f < first + num; f++) {
         const s = this.mini.surfaces[f];
         if (!s || s.n === 0) continue;
@@ -2939,23 +2932,6 @@ export class LocalDriver implements HostDriver {
         const bc = new Float32Array(s.center);
         const bmin = new Float32Array(s.mins);
         const bmax = new Float32Array(s.maxs);
-        if (sx !== 0 || sy !== 0 || sz !== 0) {
-          for (let i = 0; i < bv.length; i += 3) {
-            bv[i]! += sx; bv[i + 1]! += sy; bv[i + 2]! += sz;
-          }
-          bc[0]! += sx; bc[1]! += sy; bc[2]! += sz;
-          bmin[0]! += sx; bmin[1]! += sy; bmin[2]! += sz;
-          bmax[0]! += sx; bmax[1]! += sy; bmax[2]! += sz;
-          // Shift live verts now (not just the base): the graft renders live
-          // faces, and the (g) spawn-closed gate reads live-vs-base before the
-          // first tick sync. Without this the first frame draws the lump spot.
-          for (let i = 0; i < s.verts.length; i += 3) {
-            s.verts[i]! += sx; s.verts[i + 1]! += sy; s.verts[i + 2]! += sz;
-          }
-          s.center[0]! += sx; s.center[1]! += sy; s.center[2]! += sz;
-          s.mins[0]! += sx; s.mins[1]! += sy; s.mins[2]! += sz;
-          s.maxs[0]! += sx; s.maxs[1]! += sy; s.maxs[2]! += sz;
-        }
         baseVerts.push(bv);
         baseCenter.push(bc);
         baseMins.push(bmin);
@@ -3041,15 +3017,11 @@ export class LocalDriver implements HostDriver {
       }
     };
     // Movers ride ent.origin - pos1 (0 at spawn) out to pos2 - pos1.
-    // RELEASE-4: *34 visual shift matches server collision shift.
     for (const m of this.server.movers) {
       const n = brushModelNum(m.ent.model);
       if (n === null) continue;
-      const shx = m.ent.model === '*34' ? BUTTON_34_SHIFT[0] : 0;
-      const shy = m.ent.model === '*34' ? BUTTON_34_SHIFT[1] : 0;
-      const shz = m.ent.model === '*34' ? BUTTON_34_SHIFT[2] : 0;
-      include(n, shx, shy, shz);
-      include(n, shx + m.pos2[0]! - m.pos1[0]!, shy + m.pos2[1]! - m.pos1[1]!, shz + m.pos2[2]! - m.pos1[2]!);
+      include(n, 0, 0, 0);
+      include(n, m.pos2[0]! - m.pos1[0]!, m.pos2[1]! - m.pos1[1]!, m.pos2[2]! - m.pos1[2]!);
     }
     // Secret doors translate origin0 -> pos1 -> pos2 (same union pattern).
     for (const s of this.server.secretDoors) {
@@ -5875,19 +5847,6 @@ export function drawHelpOverlay(
       /* skip bad rows */
     }
   }
-  // RELEASE-4 completion headline: once the server owns the finished state
-  // the F1 panel states it explicitly (frozen counters arrive via
-  // `helpFactsFor`; the time reads the frozen snapshot, never wall-clock).
-  // Panel-native pixels so the lines stay inside the unscaled 256x192
-  // backdrop at every resolution (`drawString` clips on tiny buffers).
-  // The yv 128/138 band sits between the help2 row (110) and the counters
-  // header (164), so live rows never shift.
-  if (boot.driver.server.finished) {
-    const headline = 'LEVEL COMPLETE';
-    const timeLine = `time ${formatLevelTime(boot.driver.server.finishTime)}`;
-    drawString(target, hx + (((256 - stringWidth(headline)) / 2) | 0), hy + 128, headline, FINISH_BLUE);
-    drawString(target, hx + (((256 - stringWidth(timeLine)) / 2) | 0), hy + 138, timeLine, 0xffffffff);
-  }
 }
 
 /**
@@ -5998,6 +5957,10 @@ export function drawPlayHud(
   hud: HudState,
   opts?: DrawPlayHudOpts,
 ): void {
+  if (boot.driver.server.finished) {
+    drawHelpOverlay(target, boot);
+    return;
+  }
   // RELEASE-14 damage blend (P_DamageFeedback color + SV_CalcBlend alpha)
   // + RELEASE-15 underwater blend (SV_CalcBlend contents block, composited
   // FIRST: C order is contents, then damage). On the CPU resolve path the
