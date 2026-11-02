@@ -1,6 +1,7 @@
 // damageFeedback arithmetic pins (game/p_view.c, cvar defaults g_save.c).
 import { describe, expect, it } from 'vitest';
 import {
+  BOB_HEIGHT_MAX,
   DAMAGE_ALPHA_MAX,
   DAMAGE_ALPHA_MIN,
   DAMAGE_KICK_MAX,
@@ -9,13 +10,19 @@ import {
   DEATH_ROLL,
   accumulateDamageAlpha,
   addScreenBlend,
+  bobClock,
   bobLean,
   damageKickAngles,
   decayDamageAlpha,
   decayDamageKick,
+  gunBobAngles,
+  gunSwayAngles,
+  gunTurnLag,
   mixDamageBlend,
   svCalcRoll,
   velocityLean,
+  viewBobHeight,
+  wrapAngleDelta,
 } from './damageFeedback.js';
 
 describe('P_DamageFeedback blend arithmetic', () => {
@@ -127,6 +134,48 @@ describe('SV_CalcViewOffset camera lean', () => {
   });
   it('ducked bob leans 6x', () => {
     expect(bobLean(200, 1, 0, true).roll).toBeCloseTo(2.4, 9);
+  });
+});
+
+describe('SV_CalcGunOffset viewmodel sway (p_view.c)', () => {
+  it('bob clock restarts when still, steps by speed band on ground', () => {
+    expect(bobClock(3.5, 0, true, false).bobtime).toBe(0);
+    expect(bobClock(0, 300, true, false).bobtime).toBeCloseTo(0.25, 9);
+    expect(bobClock(0, 150, true, false).bobtime).toBeCloseTo(0.125, 9);
+    expect(bobClock(0, 50, true, false).bobtime).toBeCloseTo(0.0625, 9);
+    // Airborne: no accumulation (bobbing only cycles on ground).
+    expect(bobClock(1, 300, false, false).bobtime).toBe(1);
+  });
+  it('ducked multiplies the shown cycle by 4, accumulator stays raw', () => {
+    const up = bobClock(0, 150, true, false);
+    const duck = bobClock(0, 150, true, true);
+    expect(duck.bobtime).toBe(up.bobtime);
+    expect(duck.bobcycle).toBe(Math.trunc(up.bobtime * 4));
+    expect(duck.bobfracsin).toBeCloseTo(Math.abs(Math.sin(up.bobtime * 4 * Math.PI)), 9);
+  });
+  it('view bob height scales with speed and clamps at 6', () => {
+    expect(viewBobHeight(200, 1)).toBeCloseTo(1, 9);
+    expect(viewBobHeight(0, 1)).toBe(0);
+    expect(viewBobHeight(2000, 1)).toBe(BOB_HEIGHT_MAX);
+  });
+  it('gun bob sway is zero when still, flips yaw/roll on odd cycles', () => {
+    expect(gunBobAngles(0, 1, 0)).toEqual([0, 0, 0]);
+    expect(gunBobAngles(200, 1, 0)).toEqual([1, 2, 1]);
+    expect(gunBobAngles(200, 1, 1)).toEqual([1, -2, -1]);
+  });
+  it('turn lag applies standing still, wraps and clamps at ±45', () => {
+    // 60° yaw snap in place: yaw 0.2*-45 (clamped), roll 0.1*-45.
+    expect(gunTurnLag([0, 0, 0], [0, 60, 0])).toEqual([0, -9, -4.5]);
+    expect(gunTurnLag([0, 350, 0], [0, 10, 0])).toEqual([0, -4, -2]);
+    expect(gunTurnLag([0, 0, 0], [0, 0, 0])).toEqual([0, 0, 0]);
+  });
+  it('full sway sums bob + lag (delta wraps)', () => {
+    expect(gunSwayAngles(0, 0, 0, [0, 0, 0], [0, 0, 0])).toEqual([0, 0, 0]);
+    expect(gunSwayAngles(200, 1, 0, [0, 0, 0], [0, 60, 0])).toEqual([1, -7, -3.5]);
+  });
+  it('angle wrap is ±180', () => {
+    expect(wrapAngleDelta(350)).toBeCloseTo(-10, 9);
+    expect(wrapAngleDelta(-350)).toBeCloseTo(10, 9);
   });
 });
 

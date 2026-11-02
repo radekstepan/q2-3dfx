@@ -449,24 +449,49 @@ describe('play driver (devroom, headless)', () => {
     for (const p of fresh) expect(p.color).toBe(0xe0);
   });
 
-  it('H: gunframe walks fire-first to idle-first (blaster 5→9, p_weapon.c)', () => {
+  it('H: gunframe walks fire then the READY idle poses with pause holds (p_weapon.c)', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
-    // READY holds the idle-first frame (Weapon_Blaster 9..52).
+    // READY starts at the idle-first frame (Weapon_Blaster 9..52).
     expect(driver.gunFrame).toBe(9);
     driver.pm.viewAngles = v3(0, 0, 0);
     driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
     expect(driver.events).toContain('shot');
-    // Firing starts at FIRE_FIRST (activate 4 + 1); the per-tick stepper
-    // walks it to IDLE_FIRST+1 (fire 8 + 2) — never a frozen fire frame.
+    // Firing starts at FIRE_FIRST (activate 4 + 1) and walks +1/tick: the
+    // fire() itself advances past fire frames, like the original.
     expect(driver.gunFrame).toBe(5);
     stepDriver(driver, neutralCmd(), 1);
     expect(driver.gunFrame).toBe(6);
     stepDriver(driver, neutralCmd(), 3);
     expect(driver.gunFrame).toBe(9);
-    // READY holds idle-first (does not stick at 10 or wrap to 0).
-    stepDriver(driver, neutralCmd(), 3);
-    expect(driver.gunFrame).toBe(9);
+    // READY keeps walking the idle poses (never a frozen frame): 10, 11...
+    stepDriver(driver, neutralCmd(), 1);
+    expect(driver.gunFrame).toBe(10);
+    // ... up to the first pause frame (19), where rand()&15 hesitations
+    // hold the outstretched pose across consecutive ticks.
+    const seen: number[] = [];
+    for (let i = 0; i < 12; i++) {
+      stepDriver(driver, neutralCmd(), 1);
+      seen.push(driver.gunFrame);
+    }
+    expect(seen[0]).toBe(11);
+    expect(seen).toContain(19);
+    let repeats = 0;
+    for (let i = 1; i < seen.length; i++) {
+      if (seen[i] === 19 && seen[i - 1] === 19) repeats++;
+    }
+    expect(repeats).toBeGreaterThan(0);
+    // Bounded: 60 idle ticks never leave 9..52 yet keep moving (many poses).
+    const idle: number[] = [];
+    for (let i = 0; i < 60; i++) {
+      stepDriver(driver, neutralCmd(), 1);
+      idle.push(driver.gunFrame);
+    }
+    for (const f of idle) {
+      expect(f).toBeGreaterThanOrEqual(9);
+      expect(f).toBeLessThanOrEqual(52);
+    }
+    expect(new Set(idle).size).toBeGreaterThan(20);
   });
 
   it('H: firing kick is visible for exactly one tick (blaster -2/-1)', () => {
@@ -511,8 +536,14 @@ describe('play driver (devroom, headless)', () => {
     const boot = bootPlay({ width: 64, height: 48 });
     const { driver } = boot;
     stepDriver(driver, neutralCmd(), 3);
-    // Static (xyspeed < 5): gunoffset stays 0, sway zeros.
+    // Static, no turn (xyspeed < 5): gunoffset stays 0, sway zeros.
     expect(driver.gunAnglesDelta()).toEqual([0, 0, 0]);
+    // Turn in place (C SV_CalcGunOffset never early-outs: the delta term
+    // applies standing still). 60° yaw snap -> yaw 0.2*-45, roll 0.1*-45.
+    driver.step(neutralCmd([0, 60, 0]), 0.1);
+    const stillTurn = driver.gunAnglesDelta()!;
+    expect(stillTurn[1]!).toBeCloseTo(-9, 6);
+    expect(stillTurn[2]!).toBeCloseTo(-4.5, 6);
     // Run facing +Y (open room, no pillar): bob sway builds (xyspeed-scaled,
     // sign flips per bobcycle).
     const run: UserCmdT = { msec: 100, angles: [0, 90, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 };
@@ -527,6 +558,33 @@ describe('play driver (devroom, headless)', () => {
     driver.step({ ...run, angles: [0, 150, 0] }, 0.1);
     const turned = driver.gunAnglesDelta()!;
     expect(turned[1]!).toBeLessThan(-4);
+  });
+
+  it('H: gun sway lerps prev->curr tick, bob height rides the camera (p_view.c)', () => {
+    const boot = bootPlay({ width: 64, height: 48 });
+    const { driver } = boot;
+    stepDriver(driver, neutralCmd(), 3);
+    // Idle: no bob height, kick reads null (still-life contract intact).
+    expect(driver.viewKick()).toBeNull();
+    const run: UserCmdT = { msec: 100, angles: [0, 90, 0], forwardmove: 200, sidemove: 0, upmove: 0, buttons: 0 };
+    stepDriver(driver, run, 6);
+    // Moving: the camera carries the SV_CalcViewOffset bob lift (0..6).
+    const kick = driver.viewKick()!;
+    expect(kick.origin[2]).toBeGreaterThanOrEqual(0);
+    expect(kick.origin[2]).toBeLessThanOrEqual(6);
+    // Render lerp: frac 0 reads the prev tick, frac 1 the current tick,
+    // midpoint their average (CL_AddViewWeapon / CL_CalcViewValues lerp).
+    const g0 = driver.gunAnglesDelta(0)!;
+    const g1 = driver.gunAnglesDelta(1)!;
+    const g05 = driver.gunAnglesDelta(0.5)!;
+    for (let i = 0; i < 3; i++) {
+      expect(g05[i]!).toBeCloseTo((g0[i]! + g1[i]!) / 2, 9);
+    }
+    // Bob height lerps the same way through viewKick(frac).
+    const k0 = driver.viewKick(0)!;
+    const k1 = driver.viewKick(1)!;
+    const k05 = driver.viewKick(0.5)!;
+    expect(k05.origin[2]).toBeCloseTo((k0.origin[2] + k1.origin[2]) / 2, 9);
   });
 
   it('I: lethal barrel hit schedules a 0.2s fuse, then explosion + 14 debris', () => {
@@ -851,11 +909,18 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     expect(vm!.model).toBe(boot.models!.weapons['weapon_blaster']);
     expect(vm!.skin).toBe(boot.models!.weaponSkins['weapon_blaster']);
     expect(vm!.frame).toBe(9); // blaster idle-first (Weapon_Blaster 9..52)
+    expect(vm!.oldframe).toBe(9); // fresh gun: no morph yet (ops == ps)
     // Muzzle-lit → fire anim frame (renderer wraps; v_blast has 56).
     driver.pm.viewAngles = v3(0, 0, 0);
     driver.step({ ...neutralCmd([0, 0, 0]), buttons: BUTTON_ATTACK }, 0.1);
     expect(driver.events).toContain('shot');
     expect(driver.viewModel()!.frame).toBe(VIEWMODEL_FIRE_FRAME);
+    // Morph pair: current fire frame + prev-tick READY frame (CL_AddViewWeapon
+    // gun.oldframe = ops->gunframe) — the renderer glides between them.
+    expect(driver.viewModel()!.oldframe).toBe(9);
+    stepDriver(driver, neutralCmd(), 1);
+    expect(driver.viewModel()!.frame).toBe(6);
+    expect(driver.viewModel()!.oldframe).toBe(5);
     // Render: the gun entity rides the camera (close, same angles).
     runFrames(host, 0, 500);
     let rendered: Entity[] = [];
@@ -868,6 +933,11 @@ describe.runIf(!!WEB_Q2_PAK)('play driver (real base1, Q2_PAK)', () => {
     const gun = rendered.find((e) => e.model === vm!.model);
     expect(gun).toBeDefined();
     expect(gun!.skin).toBe(vm!.skin);
+    // Frame morph rides the submission (RF_FRAMELERP pair + sub-tick weight).
+    expect(gun!.oldframe).toBeDefined();
+    expect(Number.isFinite(gun!.oldframe)).toBe(true);
+    expect(gun!.backlerp).toBeGreaterThanOrEqual(0);
+    expect(gun!.backlerp).toBeLessThanOrEqual(1);
     const dg = Math.hypot(
       gun!.origin[0]! - host.playerOrigin[0]!,
       gun!.origin[1]! - host.playerOrigin[1]!,

@@ -1,0 +1,12 @@
+---
+'@q2/game': patch
+'@q2/host': patch
+---
+
+Recreate the original viewmodel motion (game/p_view.c SV_CalcGunOffset + ClientEndServerFrame bob clock, game/p_weapon.c Weapon_Generic anim, client/cl_ents.c lerp).
+
+- `@q2/game` `damageFeedback`: new pure ports — `bobClock` (still-reset, ground-gated 0.25/0.125/0.0625 bands, ducked x4 cycle/frac display), `viewBobHeight` (speed-scaled lift clamped to 6, rides vieworg so the eye-anchored gun inherits it), `gunBobAngles` / `gunTurnLag` / `gunSwayAngles` (0.2xdelta turn-lag with ±180 wrap and ±45 clamp + 0.1 yaw-to-roll, live standing still like C; bob 0.005/0.01/0.005 with yaw+roll flipped on odd cycles). Previously only the camera bob lean existed; the gun path early-returned to zeros when still, killing turn-lag in place, and the bob lift was missing entirely.
+- `@q2/game` `weaponAnim`: `Weapon_Generic` frame tables (`GUN_PAUSE_FRAMES` / `GUN_FIRE_FRAMES` for all 11 weapons, incl. the custom `Weapon_Grenade` pauses) plus the pure `stepGunReady` stepper (IDLE_FIRST..IDLE_LAST walk, wrap, `rand()&15` pause holds) and `isGunFireFrame`. Previously READY froze on IDLE_FIRST, so the hand never moved at rest; now it walks the ~44 idle poses and lingers on pause frames (blaster 19/32) — the occasional stretch.
+- `@q2/host`: `HostDriver.viewKick`/`gunAnglesDelta` accept an optional sub-tick `frac` (0 = prev tick, 1 = current); `renderCurrentView` passes `serverAcc/SERVER_DT` so sway interpolates like `cl.lerpfrac` instead of stepping at 10 Hz. Extra args are ignored by old drivers.
+- `@q2/host` viewmodel morph: `viewModel()` may report `oldframe` (prev-tick gunframe); the gun entity is submitted with the RF_FRAMELERP pair plus the frac as the new-frame weight (same front-lerp convention as the explosion path, C-identical on both backends), so the 10Hz poses morph at display rate instead of popping. Absent `oldframe` renders unlerped, as before. Frozen `Entity`/`RefDef` contracts untouched (optional fields only).
+- Web driver: per-tick prev/curr gun + bob-height endpoints with render-time lerp, prev-tick gunframe (`oldframe`, 0-pinned on weapon swap like id) for the morph, duck-aware clock, turn-lag standing still, bob lift folded into the camera origin, READY idle walk on a dedicated anim rand stream (gameplay randomness untouched), FIRING keeps the +1/tick cadence (in C the fire() itself advances past fire frames) and flows into the idle walk instead of snapping back to IDLE_FIRST (both renderers inherit it; the frozen RefDef/Entity contracts are untouched).

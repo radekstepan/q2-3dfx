@@ -265,6 +265,50 @@ describe('host loop', () => {
     expect(gun2!.depthHack).toBe(true);
   });
 
+  it('viewmodel frame morph rides the gun entity (RF_FRAMELERP pair + frac weight)', () => {
+    // id CL_AddViewWeapon: gun.oldframe = ops->gunframe with the sub-tick
+    // frac as the new-frame weight, so the 10Hz poses glide at display
+    // rate. Drivers without oldframe render unlerped, exactly as before.
+    const withMorph: HostDriver = {
+      spawn: () => ({ origin: [0, 0, 0] }),
+      step: () => {},
+      snapshot: (t: number) => ({
+        serverTime: t,
+        entities: [{ id: 1, origin: [0, 0, 0] as [number, number, number], velocity: [0, 0, 0] as [number, number, number] }],
+      }),
+      viewModel: () => ({ model: 5, skin: 2, frame: 10, oldframe: 9 }),
+    };
+    const refresh = new CaptureRefresh();
+    const host = new Host({ refresh, width: 64, height: 48, driver: withMorph });
+    host.lastCmd = { msec: 16, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
+    host.renderCurrentView();
+    const gun = refresh.lastEntities!.find((e) => e.model === 5);
+    expect(gun).toBeDefined();
+    expect(gun!.frame).toBe(10);
+    expect(gun!.oldframe).toBe(9);
+    expect(gun!.backlerp).toBeGreaterThanOrEqual(0);
+    expect(gun!.backlerp).toBeLessThanOrEqual(1);
+
+    const plain: HostDriver = {
+      spawn: () => ({ origin: [0, 0, 0] }),
+      step: () => {},
+      snapshot: (t: number) => ({
+        serverTime: t,
+        entities: [{ id: 1, origin: [0, 0, 0] as [number, number, number], velocity: [0, 0, 0] as [number, number, number] }],
+      }),
+      viewModel: () => ({ model: 5, skin: 2, frame: 10 }),
+    };
+    const refresh2 = new CaptureRefresh();
+    const host2 = new Host({ refresh: refresh2, width: 64, height: 48, driver: plain });
+    host2.lastCmd = { msec: 16, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
+    host2.renderCurrentView();
+    const gun2 = refresh2.lastEntities!.find((e) => e.model === 5);
+    expect(gun2).toBeDefined();
+    expect(gun2!.frame).toBe(10);
+    expect(gun2!.oldframe).toBeUndefined();
+    expect(gun2!.backlerp).toBeUndefined();
+  });
+
   it('propagates per-entity yaw and model/skin, defaults to legacy zeros', () => {
     const driver: HostDriver = {
       spawn: () => ({ origin: [0, 0, 0] }),

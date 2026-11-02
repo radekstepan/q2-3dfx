@@ -87,6 +87,11 @@ import {
   decayDamageKick,
   velocityLean,
   bobLean,
+  bobClock,
+  viewBobHeight,
+  gunSwayAngles,
+  stepGunReady,
+  gunPauseFrames,
   buttonAnimFrame,
   DEATH_PITCH,
   DEATH_ROLL,
@@ -808,8 +813,9 @@ export const VIEWMODEL_FIRE_FRAMES: Record<string, number> = {
  * (5,16,59,64), RocketLauncher (4,12,50,54), HyperBlaster (5,20,49,53),
  * Railgun (3,18,56,61), BFG (8,32,55,58). Hand grenades run the custom
  * Weapon_Grenade (READY 16 = fire+1, throw run-up 1..15, wrap 48): the lite
- * (0,15,48,51) is the Generic-shaped equivalent. The driver walks gunframe
- * FIRE_FIRST..IDLE_FIRST+1 while firing, then holds IDLE_FIRST (READY) —
+ * (0,15,48,51) is the Generic-shaped equivalent. FIRING walks
+ * FIRE_FIRST..IDLE_FIRST+1 (holding on fire_frames), then READY walks the
+ * idle range with pause holds (see stepGunframe / @q2/game weaponAnim) —
  * viewModel() reports the live gunframe, not a frozen fire frame.
  */
 export interface GunBounds {
@@ -1134,6 +1140,13 @@ export class LocalDriver implements HostDriver {
   rockets = 0;
   slugs = 0;
   readonly rand = mulberry32(0x51ab);
+  /**
+   * Dedicated viewmodel-animation stream (Weapon_Generic READY pause holds).
+   * Separate from gameplay `rand` so the idle hesitations never perturb
+   * sim randomness (monster rolls, damage, spreads). C reads libc rand()
+   * for both; here determinism of the sim matters more than sharing one.
+   */
+  private readonly gunRand = mulberry32(0x1d1e);
   private lastShotAt = -10;
   private doors: DoorSync[] = [];
   /** Live submodel face indices the graft appended (unique, for the test hook). */
@@ -1234,8 +1247,10 @@ export class LocalDriver implements HostDriver {
    */
   private particleVel: (Vec3 | null)[] = [];
   private particleTtl: number[] = [];
-  /** Weapon_Generic-lite gunframe (p_weapon.c): walks fire→idle while firing. */
+  /** Weapon_Generic gunframe (p_weapon.c): fire walk, then the READY idle walk. */
   private gunframe = 0;
+  /** Previous-tick gunframe for the RF_FRAMELERP viewmodel morph (ops->gunframe). */
+  private prevGunframe = 0;
   private firing = false;
   /**
    * Lower/raise switch (p_weapon.c Weapon_Generic WEAPON_DROPPING /
@@ -1260,12 +1275,23 @@ export class LocalDriver implements HostDriver {
   private kickOrigin: Vec3 = v3();
   private kickAngles: Vec3 = v3();
   private kickPending = false;
-  /** SV_CalcGunOffset-lite bob clock (p_view.c ClientEndServerFrame). */
+  /** SV_CalcGunOffset bob clock (p_view.c ClientEndServerFrame). */
   private bobtime = 0;
   private bobcycle = 0;
   private bobfracsin = 0;
   /** Previous-tick view angles for the turn-lag term (oldviewangles). */
   private oldview: Vec3 = v3();
+  /**
+   * Per-tick gun sway + view bob-height endpoints for render-time lerp
+   * (client/cl_ents.c CL_AddViewWeapon / CL_CalcViewValues lerp ops->ps
+   * with cl.lerpfrac). step() shifts curr->prev then recomputes curr;
+   * gunAnglesDelta/viewKick interpolate with the host's sub-tick frac
+   * (0 = prev tick, 1 = current). No-arg reads stay at curr (frac 1).
+   */
+  private prevGun: [number, number, number] = [0, 0, 0];
+  private currGun: [number, number, number] = [0, 0, 0];
+  private prevBobHeight = 0;
+  private currBobHeight = 0;
   /**
    * P_DamageFeedback + SV_CalcBlend driver state (game/p_view.c), derived
    * from the authoritative server pool via SV_DrainPlayerDamage each tick:
@@ -1383,6 +1409,7 @@ export class LocalDriver implements HostDriver {
     while (this.particleTtl.length < this.mini.particles.length) this.particleTtl.unshift(Infinity);
     this.oldview = v3(this.pm.viewAngles[0], this.pm.viewAngles[1], this.pm.viewAngles[2]);
     this.gunframe = gunBoundsFor(this.weapon.classname).fire + 1;
+    this.prevGunframe = this.gunframe;
     this.syncAmmo();
     this.updateMixerListener();
     this.monHealth = new Map(this.server.monsters.map((m) => [m.edict.num, m.state.health]));
@@ -2293,7 +2320,7 @@ export class LocalDriver implements HostDriver {
     return this.server.time < this.flashUntil;
   }
 
-  /** Current Weapon_Generic-lite gunframe (test hook; viewModel() is the
+  /** Current Weapon_Generic gunframe (test hook; viewModel() is the
    * render path and needs registered pak models, this exposes the raw walk). */
   get gunFrame(): number {
     return this.gunframe;
@@ -2302,39 +2329,48 @@ export class LocalDriver implements HostDriver {
   /**
    * First-person 3D weapon view model (HostDriver contract): the registered
    * `v_weap` MD2 handle + its PCX skin for the selected weapon. Reports the
-   * live Weapon_Generic-lite gunframe (fire frame on the firing tick, then
-   * +1 per server tick until idle-first holds READY) — never a frozen fire
-   * frame. Null without a pak — the caller falls back to the 2D silhouette.
+   * live Weapon_Generic gunframe (fire walk, then the READY idle walk with
+   * pause holds) — never a frozen frame. Null without a pak — the caller
+   * falls back to the 2D silhouette.
+   * `oldframe` is the prev-tick gunframe for the RF_FRAMELERP morph
+   * (CL_AddViewWeapon `gun.oldframe = ops->gunframe`); frame 0 reports
+   * oldframe 0 (just-swapped gun, don't smear — like id). The host turns
+   * the pair into a per-render morph with the sub-tick frac, so the 10Hz
+   * poses glide at display rate on both renderers.
    * Null once the level finishes (RELEASE-6 intermission-lite: id
    * `MoveClientToIntermission` drops `ps.gunindex` to 0 — gun down, no world
    * interaction; the 2D silhouette honors the same gate in `drawViewModel`).
    * The 0.09s muzzleLit window is dlight/HUD-only (flash + 2D icon glow).
    */
-  viewModel(): { model: number; skin: number; frame: number } | null {
+  viewModel(): { model: number; skin: number; frame: number; oldframe: number } | null {
     if (this.server.finished) return null;
     const model = this.models?.weapons[this.weapon.classname];
     const skin = this.models?.weaponSkins[this.weapon.classname];
     if (model === undefined || skin === undefined) return null;
-    return { model, skin, frame: this.gunframe };
+    return { model, skin, frame: this.gunframe, oldframe: this.gunframe === 0 ? 0 : this.prevGunframe };
   }
 
   /**
    * Camera kick for the frame (HostDriver pairing): the C `ps.kick_angles`
    * equivalent — firing kick (p_weapon.c, exactly one 10Hz tick) PLUS the
    * P_DamageFeedback directional kick decayed over DAMAGE_TIME PLUS the
-   * SV_CalcViewOffset velocity lean (run_pitch/run_roll, unclamped) and bob
-   * lean (duck x6, roll flipped on odd bob cycles). The host adds `angles`
-   * to its view and `origin` to the view offset; gunAnglesDelta (sway) stays
-   * gun-only — weapon sway is NOT camera lean. Null when the total is
-   * exactly zero (idle still-life), so the old one-tick firing contract
-   * reads unchanged at rest. Pure read: rendering never mutates feedback
-   * state, so the CPU + GPU builders sharing a tick cannot double-apply.
+   * SV_CalcViewOffset velocity lean (run_pitch/run_roll, unclamped), bob
+   * lean (duck x6, roll flipped on odd bob cycles) and bob height
+   * (speed-scaled lift clamped to 6, riding vieworg like C's viewoffset).
+   * The host adds `angles` to its view and `origin` to the view offset;
+   * gunAnglesDelta (sway) stays gun-only — weapon sway is NOT camera lean.
+   * `frac` lerps the bob-height term between the previous and current
+   * server ticks (CL_CalcViewValues viewoffset lerp); the kick/lean terms
+   * read the live tick. Null when the total is exactly zero (idle
+   * still-life), so the old one-tick firing contract reads unchanged at
+   * rest. Pure read: rendering never mutates feedback state, so the CPU +
+   * GPU builders sharing a tick cannot double-apply.
    *
    * Aim consistency: the sim fires from the unleaned pm.viewAngles — lean
    * is render-only, exactly like C (kick_angles enter in CL_CalcViewValues
    * at render time, never into v_angle). The crosshair stays centered.
    */
-  viewKick(): { angles: [number, number, number]; origin: [number, number, number] } | null {
+  viewKick(frac = 1): { angles: [number, number, number]; origin: [number, number, number] } | null {
     // Dead: C's deadflag branch poses the camera (pitch -15, roll 40, yaw
     // = killer_yaw — untracked here, so yaw holds) with no kick or lean.
     // Additive hook, so return the delta from the current base view.
@@ -2362,67 +2398,61 @@ export class LocalDriver implements HostDriver {
     const pitch = (fa ? fa[0]! : 0) + dk.pitch + vl.pitch + bl.pitch;
     const yaw = fa ? fa[1]! : 0;
     const roll = (fa ? fa[2]! : 0) + dk.roll + vl.roll + bl.roll;
+    const f = Number.isFinite(frac) ? Math.min(1, Math.max(0, frac)) : 1;
+    const bobZ = this.prevBobHeight + (this.currBobHeight - this.prevBobHeight) * f;
     const ox = fo ? fo[0]! : 0;
     const oy = fo ? fo[1]! : 0;
-    const oz = fo ? fo[2]! : 0;
+    const oz = (fo ? fo[2]! : 0) + bobZ;
     if (pitch === 0 && yaw === 0 && roll === 0 && ox === 0 && oy === 0 && oz === 0) return null;
     return { angles: [pitch, yaw, roll], origin: [ox, oy, oz] };
   }
 
   /**
-   * Gun sway (HostDriver pairing, exact shape): SV_CalcGunOffset-lite
-   * (p_view.c). Turn lag 0.2*deltaAngle per axis (deltas wrapped to ±180,
-   * clamped to ±45, yaw delta also rolls 0.1×) plus speed-scaled bob sway
-   * (xyspeed*bobfracsin*0.005 pitch / 0.01 yaw / 0.005 roll, yaw+roll sign
-   * flipped on odd bobcycle). Static when still (xyspeed < 5 → zeros);
-   * gunoffset stays 0 (gun_x/y/z are 0 dev tools in SP).
+   * Gun sway (HostDriver pairing, exact shape): SV_CalcGunOffset (p_view.c)
+   * — turn lag 0.2*deltaAngle per axis (deltas wrapped to ±180, clamped to
+   * ±45, yaw delta also rolls 0.1×, applies standing still like C) plus
+   * speed-scaled bob sway (xyspeed*bobfracsin*0.005 pitch / 0.01 yaw /
+   * 0.005 roll, yaw+roll sign flipped on odd bobcycle, zero when still);
+   * gunoffset stays 0 (gun_x/y/z are 0 dev tools in SP). `frac` lerps the
+   * per-tick endpoints (CL_AddViewWeapon gunangles lerp); no-arg reads the
+   * current tick.
    */
-  gunAnglesDelta(): [number, number, number] | null {
-    const vx = this.pm.velocity[0]!;
-    const vy = this.pm.velocity[1]!;
-    const xyspeed = Math.hypot(vx, vy);
-    if (xyspeed < 5) return [0, 0, 0];
-    let pitch = xyspeed * this.bobfracsin * 0.005;
-    let yaw = xyspeed * this.bobfracsin * 0.01;
-    let roll = xyspeed * this.bobfracsin * 0.005;
-    if (this.bobcycle & 1) {
-      yaw = -yaw;
-      roll = -roll;
-    }
-    const cur = this.pm.viewAngles;
-    const deltas = [this.oldview[0]! - cur[0]!, this.oldview[1]! - cur[1]!, this.oldview[2]! - cur[2]!];
-    const out = [pitch, yaw, roll];
-    for (let i = 0; i < 3; i++) {
-      let delta = deltas[i]!;
-      while (delta > 180) delta -= 360;
-      while (delta < -180) delta += 360;
-      if (delta > 45) delta = 45;
-      if (delta < -45) delta = -45;
-      if (i === 1) out[2] = out[2]! + 0.1 * delta;
-      out[i] = out[i]! + 0.2 * delta;
-    }
-    return [out[0]!, out[1]!, out[2]!];
+  gunAnglesDelta(frac = 1): [number, number, number] | null {
+    const f = Number.isFinite(frac) ? Math.min(1, Math.max(0, frac)) : 1;
+    const px = this.prevGun[0]!;
+    const py = this.prevGun[1]!;
+    const pz = this.prevGun[2]!;
+    return [px + (this.currGun[0]! - px) * f, py + (this.currGun[1]! - py) * f, pz + (this.currGun[2]! - pz) * f];
   }
 
   /**
    * Bob clock (p_view.c ClientEndServerFrame): xyspeed from the planar
    * velocity; below 5 the cycle restarts, otherwise grounded motion steps
-   * 0.25/0.125/0.0625 by speed band. Ducked ×4 omitted (no crouch anim
-   * state here). Runs once per server tick, before gunAnglesDelta reads it.
+   * 0.25/0.125/0.0625 by speed band; ducked ×4 on the cycle/frac display
+   * (the accumulator stays raw, like C). Runs once per server tick, then
+   * snapshots the SV_CalcGunOffset gun angles + SV_CalcViewOffset bob
+   * height into the prev/curr render-lerp endpoints.
    */
   private updateBob(): void {
-    const xyspeed = Math.hypot(this.pm.velocity[0]!, this.pm.velocity[1]!);
-    if (xyspeed < 5) {
-      this.bobtime = 0;
-    } else if (this.pm.onGround) {
-      this.bobtime += xyspeed > 210 ? 0.25 : xyspeed > 100 ? 0.125 : 0.0625;
-    }
-    this.bobcycle = Math.trunc(this.bobtime);
-    this.bobfracsin = Math.abs(Math.sin(this.bobtime * Math.PI));
+    const vx = this.pm.velocity[0]!;
+    const vy = this.pm.velocity[1]!;
+    const xyspeed = Math.hypot(vx, vy);
+    const ducked = (this.pm.pmFlags & PMF_DUCKED) !== 0;
+    const ck = bobClock(this.bobtime, xyspeed, this.pm.onGround, ducked);
+    this.bobtime = ck.bobtime;
+    this.bobcycle = ck.bobcycle;
+    this.bobfracsin = ck.bobfracsin;
+    this.prevGun = this.currGun;
+    this.prevBobHeight = this.currBobHeight;
+    this.currGun = gunSwayAngles(xyspeed, this.bobfracsin, this.bobcycle, this.oldview, this.pm.viewAngles);
+    this.currBobHeight = viewBobHeight(xyspeed, this.bobfracsin);
   }
 
-  /** Advance the Weapon_Generic-lite gunframe one step per server tick. */
+  /** Advance the Weapon_Generic gunframe one step per server tick. */
   private stepGunframe(): void {
+    // Snapshot first: prev is the end-of-last-step frame (C ops->gunframe),
+    // covering every path below plus handleAttack's late fire write.
+    this.prevGunframe = this.gunframe;
     if (this.switching) {
       if (!this.raising) {
         // WEAPON_DROPPING: walk the outgoing DEACTIVATE range; reaching
@@ -2451,14 +2481,29 @@ export class LocalDriver implements HostDriver {
       }
       return;
     }
-    if (!this.firing) return;
     const b = gunBoundsFor(this.weapon.classname);
-    this.gunframe++;
-    if (this.gunframe >= b.fire + 2) {
-      // Reached IDLE_FIRST+1 (blaster 10): READY, hold the idle-first frame.
-      this.firing = false;
-      this.gunframe = b.fire + 1;
+    if (this.firing) {
+      // WEAPON_FIRING: +1 per tick (in C the fire() itself advances past
+      // fire frames; the tables only select which frames shoot). At
+      // IDLE_FIRST+1 flip to READY and let the idle walk carry on from
+      // there — C never snaps back to IDLE_FIRST.
+      this.gunframe++;
+      if (this.gunframe >= b.fire + 2) {
+        this.firing = false;
+      }
+      return;
     }
+    // WEAPON_READY idle walk (p_weapon.c): IDLE_FIRST..IDLE_LAST with
+    // rand()&15 hesitations on the weapon's pause_frames — the occasional
+    // hand stretch. viewModel() reports every pose, like the original.
+    const hold = ((this.gunRand() * 16) | 0) !== 0;
+    this.gunframe = stepGunReady(
+      this.gunframe,
+      b.fire + 1,
+      b.idle,
+      gunPauseFrames(this.weapon.classname),
+      hold,
+    );
   }
 
   /**
@@ -6324,7 +6369,10 @@ export function buildAsyncView(host: Host, remainder = 0): { view: RefDef; rende
   const viewBase: [number, number, number] = host.lastCmd
     ? [host.lastCmd.angles[0], host.lastCmd.angles[1], host.lastCmd.angles[2]]
     : [0, 0, 0];
-  const kick = host.driver?.viewKick?.() ?? null;
+  // Sub-tick lerp frac (cl.lerpfrac): remainder is the async loop's
+  // serverAcc remainder within the 10Hz tick.
+  const frac = Math.min(1, Math.max(0, remainder / 0.1));
+  const kick = host.driver?.viewKick?.(frac) ?? null;
   const angles: [number, number, number] = kick
     ? [viewBase[0] + kick.angles[0], viewBase[1] + kick.angles[1], viewBase[2] + kick.angles[2]]
     : viewBase;
@@ -6380,7 +6428,7 @@ export function buildAsyncView(host: Host, remainder = 0): { view: RefDef; rende
   }
   const vm = host.driver?.viewModel?.() ?? null;
   if (vm && view.fovX <= 90) {
-    const gunDelta = host.driver?.gunAnglesDelta?.() ?? null;
+    const gunDelta = host.driver?.gunAnglesDelta?.(frac) ?? null;
     const gunAngles: [number, number, number] = gunDelta
       ? [angles[0] + gunDelta[0], angles[1] + gunDelta[1], angles[2] + gunDelta[2]]
       : angles;
@@ -6391,6 +6439,7 @@ export function buildAsyncView(host: Host, remainder = 0): { view: RefDef; rende
       frame: vm.frame,
       skin: vm.skin,
       depthHack: true,
+      ...(vm.oldframe !== undefined ? { oldframe: vm.oldframe, backlerp: frac } : {}),
     });
   }
   return { view, renderables };

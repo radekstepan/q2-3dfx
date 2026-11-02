@@ -87,9 +87,11 @@ describe('weapon lower/raise switch (Weapon_Generic-lite)', () => {
     stepDriver(driver, neutralCmd(), 1);
     expect(driver.weaponSwitching).toBe(false);
     expect(driver.gunFrame).toBe(18 + 1);
-    // READY holds across further ticks.
+    // READY walks the idle poses from there (shotgun 19..36, pauses
+    // 22/28/34): three ticks move off 19, never past 22.
     stepDriver(driver, neutralCmd(), 3);
-    expect(driver.gunFrame).toBe(19);
+    expect(driver.gunFrame).toBeGreaterThan(19);
+    expect(driver.gunFrame).toBeLessThanOrEqual(22);
     expect(driver.message).toContain('shotgun');
   });
 

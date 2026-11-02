@@ -44,8 +44,11 @@ export interface HostDriver {
   /**
    * First-person weapon view model (camera-attached 3D gun). Null hides it
    * (2D fallback or no gun). The driver owns model/skin handles + anim.
+   * `oldframe` is the previous-tick gunframe for RF_FRAMELERP vertex morph
+   * (id CL_AddViewWeapon: `gun.oldframe = ops->gunframe`, held pose when
+   * fresh). Absent → the gun renders unlerped, exactly as before.
    */
-  viewModel?(): { model: number; skin: number; frame: number } | null;
+  viewModel?(): { model: number; skin: number; frame: number; oldframe?: number } | null;
   /**
    * MD2 frame for a snapshot entity (monster move table first + offset).
    * Defaults to 0 when absent. The renderer wraps out-of-range indices.
@@ -67,15 +70,22 @@ export interface HostDriver {
    * `SV_CalcGunOffset` — pitch/yaw/roll delta plus eye-offset delta).
    * Added to the RefDef angles/origin in renderCurrentView; the driver
    * clears it next tick (returns null) so it lands on exactly one frame.
+   * The host passes the sub-tick frac (0 = prev tick, 1 = current) so
+   * bob-height/viewoffset terms can lerp like CL_CalcViewValues; drivers
+   * may ignore it (extra JS args are free).
    */
-  viewKick?(): { angles: [number, number, number]; origin: [number, number, number] } | null;
+  viewKick?(frac?: number): { angles: [number, number, number]; origin: [number, number, number] } | null;
   /**
    * Sway/turn-lag added to the viewmodel entity angles (RF/gunoffset-lite:
-   * the driver computes the SV_CalcGunOffset-lite term — 0.2*delta
-   * turn-lag ±45 clamp + speed-scaled bob sway; static when still).
-   * Added to the full view angles on the eye-anchored gun entity.
+   * the driver computes the SV_CalcGunOffset term — full C arithmetic:
+   * 0.2*delta turn-lag ±45 clamp (+0.1 yaw→roll) even standing still, plus
+   * speed-scaled bob sway; bob-only terms are zero when still).
+   * Added to the full view angles on the eye-anchored gun entity. The host
+   * passes the sub-tick frac so the driver can lerp prev->curr tick
+   * endpoints like CL_AddViewWeapon (cl.lerpfrac); no-arg reads the
+   * current tick.
    */
-  gunAnglesDelta?(): [number, number, number] | null;
+  gunAnglesDelta?(frac?: number): [number, number, number] | null;
   /**
    * Light-style brightness scale for a style index (R9F-3: id
    * `CL_SetLightstyle` maps style letters to `(c-'a')/('m'-'a')`, so 'm'
@@ -411,7 +421,10 @@ export class Host {
       : [0, 0, 0];
     // One-tick camera kick (p_weapon.c kick via p_view.c SV_CalcGunOffset):
     // added to the RefDef angles/origin; the driver returns null next tick.
-    const kick = this.driver?.viewKick?.() ?? null;
+    // frac lerps prev->curr tick endpoints (cl.lerpfrac); the async GPU
+    // builder (buildAsyncView) passes its remainder the same way.
+    const frac = Math.min(1, Math.max(0, this.serverAcc / SERVER_DT));
+    const kick = this.driver?.viewKick?.(frac) ?? null;
     const angles: [number, number, number] = kick
       ? [viewBase[0] + kick.angles[0], viewBase[1] + kick.angles[1], viewBase[2] + kick.angles[2]]
       : viewBase;
@@ -483,15 +496,22 @@ export class Host {
     // view angles + gunangles. No forward push (VIEWMODEL_FORWARD = 0),
     // no yaw-only flattening: the gun rides the view exactly, bottom-right
     // placement coming from the baked v_weap verts. The gunangles term is
-    // the RF/gunoffset-lite driver hook (p_view.c SV_CalcGunOffset-lite:
-    // 0.2*delta turn-lag ±45 clamp + speed-scaled bob sway; static when
-    // still). The breech half behind the eye survives via view-space
+    // the RF/gunoffset-lite driver hook (p_view.c SV_CalcGunOffset: full
+    // C arithmetic — 0.2*delta turn-lag ±45 clamp + speed-scaled bob sway,
+    // turn-lag live even standing still; bob terms zero when still),
+    // lerped prev->curr tick with the sub-tick frac (cl.lerpfrac). The
+    // breech half behind the eye survives via view-space
     // near-plane Sutherland clipping in the alias backend (r_aclip.c), and
     // Entity.depthHack (RF_DEPTHHACK) keeps the gun ahead of nearby walls.
+    // Frame morph (CL_AddViewWeapon RF_FRAMELERP): the driver reports the
+    // prev-tick gunframe as oldframe; the backlerp slot carries the
+    // new-frame weight (frac — same front-lerp convention as the explosion
+    // path, which renders C-identical on both backends), so the 10Hz poses
+    // morph instead of popping. Absent oldframe renders unlerped, as before.
     // Hidden when fovX > 90, like id.
     const vm = this.driver?.viewModel?.() ?? null;
     if (vm && view.fovX <= 90) {
-      const gunDelta = this.driver?.gunAnglesDelta?.() ?? null;
+      const gunDelta = this.driver?.gunAnglesDelta?.(frac) ?? null;
       const gunAngles: [number, number, number] = gunDelta
         ? [angles[0] + gunDelta[0], angles[1] + gunDelta[1], angles[2] + gunDelta[2]]
         : angles;
@@ -502,6 +522,7 @@ export class Host {
         frame: vm.frame,
         skin: vm.skin,
         depthHack: true,
+        ...(vm.oldframe !== undefined ? { oldframe: vm.oldframe, backlerp: frac } : {}),
       });
     }
     this.refresh.beginFrame();

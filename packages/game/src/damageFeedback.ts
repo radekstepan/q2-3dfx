@@ -39,6 +39,26 @@ export const RUN_ROLL = 0.005;
 export const BOB_UP = 0.005;
 export const BOB_PITCH = 0.002;
 export const BOB_ROLL = 0.002;
+/** View bob-height ceiling, world units (SV_CalcViewOffset `if (bob > 6)`). */
+export const BOB_HEIGHT_MAX = 6;
+/** SV_CalcGunOffset bob scales (p_view.c, no duck multiplier on the gun). */
+export const GUN_BOB_PITCH = 0.005;
+export const GUN_BOB_YAW = 0.01;
+export const GUN_BOB_ROLL = 0.005;
+/** SV_CalcGunOffset turn-lag scales + delta clamp (p_view.c). */
+export const GUN_TURN_SCALE = 0.2;
+export const GUN_TURN_ROLL_SCALE = 0.1;
+export const GUN_TURN_CLAMP = 45;
+/** Planar speed below which the bob cycle restarts (p_view.c `xyspeed < 5`). */
+export const BOB_STILL_SPEED = 5;
+/** Bob clock steps by speed band, per 10Hz server tick (p_view.c). */
+export const BOB_STEP_FAST = 0.25;
+export const BOB_STEP_MID = 0.125;
+export const BOB_STEP_SLOW = 0.0625;
+export const BOB_SPEED_FAST = 210;
+export const BOB_SPEED_MID = 100;
+/** Ducked bob-clock multiplier for cycle/frac (p_view.c `bobtime *= 4`). */
+export const DUCK_BOB_CLOCK = 4;
 /** Ducked bob multiplier (crouching, SV_CalcViewOffset). */
 export const DUCK_BOB_SCALE = 6;
 /** sv_rollangle / sv_rollspeed cvar defaults (SV_CalcRoll). */
@@ -173,6 +193,103 @@ export function bobLean(
   let roll = bobfracsin * BOB_ROLL * xyspeed * duck;
   if ((bobcycle & 1) !== 0) roll = -roll;
   return { pitch, roll };
+}
+
+/**
+ * Bob clock (p_view.c ClientEndServerFrame): planar speed gates the cycle,
+ * grounded motion steps 0.25/0.125/0.0625 by speed band, below-5 restarts at
+ * the cycle start. Ducked multiplies the accumulated time by 4 for the
+ * cycle/frac display (the accumulator itself is unscaled, like C).
+ */
+export function bobClock(
+  bobtime: number,
+  xyspeed: number,
+  onGround: boolean,
+  ducked: boolean,
+): { bobtime: number; bobcycle: number; bobfracsin: number } {
+  let next = bobtime;
+  if (xyspeed < BOB_STILL_SPEED) {
+    next = 0;
+  } else if (onGround) {
+    next += xyspeed > BOB_SPEED_FAST ? BOB_STEP_FAST : xyspeed > BOB_SPEED_MID ? BOB_STEP_MID : BOB_STEP_SLOW;
+  }
+  const shown = ducked ? next * DUCK_BOB_CLOCK : next;
+  return { bobtime: next, bobcycle: Math.trunc(shown), bobfracsin: Math.abs(Math.sin(shown * Math.PI)) };
+}
+
+/**
+ * View bob height (SV_CalcViewOffset "add bob height"): speed-scaled
+ * sin-cycled lift, clamped to 6. Rides vieworg, so the gun (vieworg +
+ * gunoffset) inherits it — id's gunoffset itself stays 0 (gun_x/y/z are
+ * 0 dev tools in SP).
+ */
+export function viewBobHeight(xyspeed: number, bobfracsin: number): number {
+  const bob = bobfracsin * xyspeed * BOB_UP;
+  return bob > BOB_HEIGHT_MAX ? BOB_HEIGHT_MAX : bob;
+}
+
+/** Wrap a view-angle delta to ±180 like SV_CalcGunOffset. */
+export function wrapAngleDelta(delta: number): number {
+  while (delta > 180) delta -= 360;
+  while (delta < -180) delta += 360;
+  return delta;
+}
+
+/**
+ * Gun turn-lag (SV_CalcGunOffset "gun angles from delta movement"):
+ * per-axis 0.2*delta with deltas wrapped to ±180 and clamped to ±45;
+ * yaw delta additionally rolls 0.1x. Applies standing still — C never
+ * early-outs on speed.
+ */
+export function gunTurnLag(
+  oldAngles: ArrayLike<number>,
+  newAngles: ArrayLike<number>,
+): [number, number, number] {
+  const out: [number, number, number] = [0, 0, 0];
+  for (let i = 0; i < 3; i++) {
+    let delta = wrapAngleDelta(oldAngles[i]! - newAngles[i]!);
+    if (delta > GUN_TURN_CLAMP) delta = GUN_TURN_CLAMP;
+    if (delta < -GUN_TURN_CLAMP) delta = -GUN_TURN_CLAMP;
+    if (i === 1) out[2]! += GUN_TURN_ROLL_SCALE * delta;
+    out[i]! += GUN_TURN_SCALE * delta;
+  }
+  return out;
+}
+
+/**
+ * Gun bob sway (SV_CalcGunOffset "gun angles from bobbing"): speed-scaled
+ * sin sway, yaw+roll sign flipped on odd bob cycles. Zero when still.
+ */
+export function gunBobAngles(
+  xyspeed: number,
+  bobfracsin: number,
+  bobcycle: number,
+): [number, number, number] {
+  if (!(xyspeed >= BOB_STILL_SPEED)) return [0, 0, 0];
+  const pitch = xyspeed * bobfracsin * GUN_BOB_PITCH;
+  let yaw = xyspeed * bobfracsin * GUN_BOB_YAW;
+  let roll = xyspeed * bobfracsin * GUN_BOB_ROLL;
+  if ((bobcycle & 1) !== 0) {
+    yaw = -yaw;
+    roll = -roll;
+  }
+  return [pitch, yaw, roll];
+}
+
+/**
+ * Full SV_CalcGunOffset viewmodel angles (bob sway + turn lag). gunoffset
+ * stays 0 (gun_x/y/z dev tools default 0), so only angles are returned.
+ */
+export function gunSwayAngles(
+  xyspeed: number,
+  bobfracsin: number,
+  bobcycle: number,
+  oldAngles: ArrayLike<number>,
+  newAngles: ArrayLike<number>,
+): [number, number, number] {
+  const bob = gunBobAngles(xyspeed, bobfracsin, bobcycle);
+  const lag = gunTurnLag(oldAngles, newAngles);
+  return [bob[0] + lag[0], bob[1] + lag[1], bob[2] + lag[2]];
 }
 
 /**
