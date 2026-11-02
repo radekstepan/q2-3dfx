@@ -40,8 +40,26 @@ export interface BspWorldOptions {
   texelFor?: (walName: string) => BspTexelSource | null;
 }
 
-function isPow2(v: number): boolean {
-  return v > 0 && (v & (v - 1)) === 0;
+function nextPot(v: number): number {
+  let p = 1;
+  while (p < v) p <<= 1;
+  return p;
+}
+
+/** Nearest-neighbor stretch of palette indices to the next POT (GL_Upload32 parity).
+ *  Original ref_gl rescales NPOT WALs (e.g. 96x32 box1_1, 240x128 walls) up to
+ *  POT before upload; sampling stays POT-masked. Indices are never blended. */
+function resampleToPot(src: Uint8Array, w: number, h: number, potW: number, potH: number): Uint8Array {
+  if (potW === w && potH === h) return src.slice(0, w * h);
+  const out = new Uint8Array(potW * potH);
+  for (let y = 0; y < potH; y++) {
+    const sy = (y * h / potH) | 0;
+    for (let x = 0; x < potW; x++) {
+      const sx = (x * w / potW) | 0;
+      out[y * potW + x] = src[sy * w + sx]!;
+    }
+  }
+  return out;
 }
 
 function checker(size: number, a: number, b: number): Uint8Array {
@@ -94,13 +112,22 @@ export function bspToMiniWorld(map: BspMap, opts: BspWorldOptions = {}): MiniWor
   const surfaces: MiniSurf[] = new Array(nFaces);
 
   const texelFor = opts.texelFor;
+  // UV scale per WAL for NPOT -> POT stretches (1 when already POT or missing).
+  const texScale = new Map<string, { s: number; t: number }>();
   const texIdFor = (walName: string): number => {
     const hit = texIndex.get(walName);
     if (hit !== undefined) return hit;
     let tex: MiniTexture = FALLBACK;
     const src = texelFor ? texelFor(walName) : null;
-    if (src && isPow2(src.width) && isPow2(src.height) && src.texels.length >= src.width * src.height) {
-      tex = { texels: src.texels.slice(0, src.width * src.height), width: src.width, height: src.height };
+    if (src && Number.isInteger(src.width) && Number.isInteger(src.height) &&
+        src.width >= 1 && src.height >= 1 && src.texels.length >= src.width * src.height) {
+      const potW = nextPot(src.width);
+      const potH = nextPot(src.height);
+      const texels = resampleToPot(src.texels, src.width, src.height, potW, potH);
+      tex = { texels, width: potW, height: potH };
+      if (potW !== src.width || potH !== src.height) {
+        texScale.set(walName, { s: potW / src.width, t: potH / src.height });
+      }
     }
     const id = textures.length;
     textures.push(tex);
@@ -209,6 +236,16 @@ export function bspToMiniWorld(map: BspMap, opts: BspWorldOptions = {}): MiniWor
     const side = map.faces[d + 1]!;
     const sgn = side !== 0 ? -1 : 1;
     const baseTexId = texIdFor(map.texinfoNames[ti] ?? '');
+    // NPOT -> POT stretch parity (GL_Upload32): the baked texture is POT,
+    // so scale this face's texel-space UVs by the same factor to preserve
+    // tiling. Lightmap lux above stays in original texel space (C extents).
+    const sc = texScale.get(map.texinfoNames[ti] ?? '');
+    if (sc && (sc.s !== 1 || sc.t !== 1)) {
+      for (let k = 0; k < numedges; k++) {
+        uvs[k * 2] = uvs[k * 2]! * sc.s;
+        uvs[k * 2 + 1] = uvs[k * 2 + 1]! * sc.t;
+      }
+    }
     const chain = animChainFor(ti);
     surfaces[f] = {
       id: f,
