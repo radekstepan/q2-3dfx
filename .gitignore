@@ -3,6 +3,8 @@ dist/
 coverage/
 *.q2pkg
 *.pak
+# Shareware demo mirror (unmodified original archive only, never committed).
+apps/web/public/demo/*.exe
 # Compiled map output is reproducible from .map source + tool versions
 # (see tools/compile-map); never commit build/ directories.
 maps/*/build/

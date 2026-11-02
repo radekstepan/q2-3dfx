@@ -20,7 +20,17 @@ import type { AsyncLoopState, PlayBoot, RendererKind, StageReport } from './play
 import { blitToCanvas } from './dom.js';
 import { pakHasMaps } from './pak.js';
 import type { WebPak } from './pak.js';
-import { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';
+import { ingestPak } from './pak.js';
+import { clearCachedPak, loadCachedPak, storeCachedPak } from './pak-cache.js';import { fetchDemoPak } from './demo.js';
+import {
+  attachLanding,
+  cachedButtonLabel,
+  hideLanding,
+  setCachedAvailable,
+  setLandingBusy,
+  setLandingStatus,
+  showLanding,
+} from './landing.js';
 import { parseSoakParams, runSoakBoot } from './soak.js';
 
 export { bootToFirstFrame };
@@ -336,6 +346,7 @@ if (typeof document !== 'undefined') {
       if (currentBoot) detachGpuBackend(currentBoot);
       lastPak = pak;
       lastName = name;
+      hideLanding();
       // Map-source dropdown: the pak appears in the list from now on, and
       // the selection latches here (drop/cache = pak, clear = devroom).
       // A reboot honors getMapSource(): 'pak' boots the cached game map,
@@ -431,9 +442,22 @@ if (typeof document !== 'undefined') {
     // (switch/fallback/restore paths re-render the menu; no listener leak —
     // one replaceable callback, installed once here).
     setPanelRefreshHook(() => renderCvars());
-    // Cached-first boot: a previous drop persists in IndexedDB, so one
-    // drop survives reloads. Empty/corrupt cache → devroom, no error spam.
-    const bootFromCache = async (): Promise<void> => {
+    // Landing-first boot (qwasm2-style): the overlay is visible from HTML.
+    // A cached pak enables the continue button but never auto-boots (the
+    // click is also the audio-unlock gesture). Demo/devroom/drop boot from
+    // the landing; the footer menu button returns here.
+    const refreshCachedButton = (cached: { pak: WebPak; name: string } | null): void => {
+      if (cached) {
+        try {
+          setCachedAvailable(cachedButtonLabel(cached.name, cached.pak.entries.length));
+        } catch {
+          setCachedAvailable('continue cached pak');
+        }
+      } else {
+        setCachedAvailable(null);
+      }
+    };
+    const bootLanding = async (): Promise<void> => {
       // RELEASE-7: reserve the persisted display size synchronously, before
       // any async asset load — the loading surface is correctly sized at
       // once, so first paint never shows a small black box or layout jump.
@@ -443,25 +467,98 @@ if (typeof document !== 'undefined') {
       } catch {
         /* canvas sizing best-effort */
       }
-      dom.setProgress(progress, 0.2, 'loading cached pak0.pak…');
+      showLanding();
+      setLandingStatus('');
+      dom.setProgress(progress, 0.2, 'landing — pick a source');
       try {
         const cached = await loadCachedPak();
         if (cached) {
-          // Persist the map selection for the cached game map (the
-          // map_source default is already 'pak'; this keeps an explicit
-          // earlier choice intact while guaranteeing the cached boot).
+          lastPak = cached.pak;
+          lastName = cached.name;
           if (getMapSource() !== 'devroom') setCVarFromString('map_source', 'pak');
-          startWithPak(cached.pak, cached.name);
-          return;
+          refreshCachedButton(cached);
+          dom.setMapSourceHasPak(true);
+          setLandingStatus(`cached ${cached.name} · ${cached.pak.entries.length} lumps — continue, or pick another source.`);
+        } else {
+          refreshCachedButton(null);
+          dom.setMapSourceHasPak(false);
         }
       } catch {
-        /* corrupt IDB → fall through to devroom */
+        refreshCachedButton(null);
       }
-      // No pak cached: devroom only, so latch the menu there.
-      setCVarFromString('map_source', 'devroom');
-      startWithPak(null);
+      renderCvars();
     };
-    void bootFromCache();
+    const startDemoDownload = (): void => {
+      setLandingBusy(true);
+      setLandingStatus('downloading shareware demo…');
+      dom.pushConsoleLog('fetching shareware demo (q2-314-demo-x86.exe)…', 'cmd');
+      void fetchDemoPak({
+        onStatus: (t) => {
+          setLandingStatus(t);
+          dom.pushConsoleLog(t, 'info');
+        },
+        onProgress: (p) => {
+          if (p.fraction >= 0) {
+            setLandingStatus(`downloading shareware demo… ${(p.fraction * 100).toFixed(0)}%`);
+            dom.setProgress(progress, p.fraction, 'downloading demo');
+          } else {
+            setLandingStatus(`downloading shareware demo… ${(p.loaded / 1048576).toFixed(1)} MiB`);
+          }
+        },
+      }).then(({ pakBytes }) => {
+        const pak = ingestPak(pakBytes);
+        void storeCachedPak('pak0.pak', pakBytes).catch(() => undefined);
+        setLandingBusy(false);
+        refreshCachedButton({ pak, name: 'pak0.pak' });
+        setCVarFromString('map_source', 'pak');
+        startWithPak(pak, 'pak0.pak (shareware demo)');
+        dom.setProgress(progress, 1, `demo ready: ${pak.entries.length} entries`);
+        dom.pushConsoleLog(`demo ready: ${pak.entries.length} entries — base1`, 'ok');
+      }).catch((e: unknown) => {
+        setLandingBusy(false);
+        const msg = e instanceof Error ? e.message : String(e);
+        setLandingStatus(`demo download failed: ${msg} — drop your pak0.pak or try devroom.`);
+        dom.pushConsoleLog(`demo download failed: ${msg}`, 'warn');
+        dom.pushConsoleLog('tip: the demo host may block cross-origin reads — drop pak0.pak manually, or mirror q2-314-demo-x86.exe next to the page as /demo/', 'info');
+      });
+    };
+    attachLanding({
+      onDemo: () => startDemoDownload(),
+      onPick: (file) => {
+        setLandingStatus(`reading ${file.name}…`);
+        void file.arrayBuffer().then((buf) => {
+          try {
+            const pak = ingestPak(buf);
+            void storeCachedPak(file.name, buf).catch(() => undefined);
+            refreshCachedButton({ pak, name: file.name });
+            setCVarFromString('map_source', 'pak');
+            startWithPak(pak, file.name);
+          } catch (e) {
+            setLandingStatus(`that file is not a pak: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        });
+      },
+      onDevroom: () => {
+        setCVarFromString('map_source', 'devroom');
+        startWithPak(null);
+      },
+      onCached: () => {
+        if (lastPak) {
+          if (getMapSource() !== 'devroom') setCVarFromString('map_source', 'pak');
+          startWithPak(lastPak, lastName);
+        } else {
+          void loadCachedPak().then((cached) => {
+            if (cached) {
+              if (getMapSource() !== 'devroom') setCVarFromString('map_source', 'pak');
+              startWithPak(cached.pak, cached.name);
+            } else {
+              setLandingStatus('no cached pak — download the demo or pick a file.');
+            }
+          });
+        }
+      },
+    });
+    void bootLanding();
     if (canvas) {
       dom.attachDropZone(document.body, (pak, name) => {
         // Persist the raw drop, then boot as today.
@@ -488,17 +585,31 @@ if (typeof document !== 'undefined') {
       () => { current?.stop(); current = null; },
     );
     // Static faceplate footer buttons (present in index.html): revert just
-    // re-renders the panel, clear drops the cached pak and latches devroom.
+    // re-renders the panel, clear drops the cached pak and returns to the
+    // landing, menu reopens the landing without clearing anything.
     const clearBtn = document.querySelector('#q2-clear-pak');
     clearBtn?.addEventListener('click', () => {
       void clearCachedPak().then(() => {
         lastPak = null;
         // Clearing drops the pak from the dropdown and latches devroom.
         setCVarFromString('map_source', 'devroom');
-        startWithPak(null);
-        dom.setProgress(progress, 1, 'cached pak cleared — drop pak0.pak for base1');
-        dom.pushConsoleLog('cached pak cleared — drop pak0.pak for base1', 'warn');
+        dom.setMapSourceHasPak(false);
+        setCachedAvailable(null);
+        current?.stop();
+        current = null;
+        currentBoot = null;
+        showLanding();
+        setLandingStatus('cached pak cleared — download the demo, drop a pak, or play devroom.');
+        dom.setProgress(progress, 1, 'cached pak cleared');
+        dom.pushConsoleLog('cached pak cleared', 'warn');
       });
+    });
+    document.querySelector('#q2-menu')?.addEventListener('click', () => {
+      current?.stop();
+      current = null;
+      showLanding();
+      setLandingStatus(lastPak ? 'paused — continue or pick another source.' : '');
+      dom.pushConsoleLog('menu — pick a source to boot', 'cmd');
     });
     document.querySelector('#q2-revert')?.addEventListener('click', () => {
       renderCvars();

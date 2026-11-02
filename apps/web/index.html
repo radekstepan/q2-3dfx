@@ -88,6 +88,21 @@ q2-checkbox:focus-visible,q2-select:focus-visible,q2-text:focus-visible{outline:
 #q2-tooltip{position:fixed;z-index:60;max-width:320px;padding:8px 10px;font-family:var(--font-mono);font-size:10.5px;line-height:1.6;color:var(--bone);background:#101216;border:1px solid var(--linehi);box-shadow:0 12px 32px -12px rgba(0,0,0,.9);white-space:normal;overflow-wrap:anywhere;pointer-events:none}
 #q2-tooltip[hidden]{display:none}
 #q2-ui button.silkbtn{background:none;border:0;cursor:pointer}
+#q2-landing{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:rgba(7,8,10,.93);padding:20px}
+#q2-landing[hidden]{display:none}
+#q2-landing-card{width:min(600px,100%);max-height:calc(100vh - 40px);overflow-y:auto;background:var(--panel);border:1px solid var(--linehi);box-shadow:0 24px 60px -30px rgba(0,0,0,.95);padding:28px 28px 24px}
+#q2-landing-card h1{margin:0 0 4px;font-size:22px;letter-spacing:.02em}
+#q2-landing-card h1 .amber{color:var(--amber)}
+#q2-landing-card p{color:var(--muted);font-size:13px;line-height:1.65;margin:8px 0}
+#q2-landing-card p.small{font-size:11.5px;color:var(--dim)}
+#q2-landing-card p.small a{color:var(--muted)}
+#q2-landing-btns{display:flex;flex-direction:column;gap:8px;margin:16px 0 8px}
+#q2-landing-btns button{padding:12px 14px;font-size:12px;letter-spacing:.14em;background:var(--raise);color:var(--bone);border:1px solid var(--linehi);cursor:pointer;text-transform:uppercase;font-family:var(--font-mono)}
+#q2-landing-btns button:hover:not([disabled]){border-color:var(--amber);color:var(--amber)}
+#q2-landing-btns button[disabled]{opacity:.5;cursor:wait}
+#q2-landing-btns button[hidden]{display:none}
+#q2-landing-btns button.primary{background:var(--ember);border-color:var(--amber);color:#fff}
+#q2-landing-status{font-family:var(--font-mono);font-size:11px;line-height:1.6;color:var(--amber);min-height:18px;margin:8px 0 0;overflow-wrap:anywhere}
 :focus-visible{outline:1px solid var(--amber);outline-offset:1px}
 @media(min-width:1024px){
   #q2-shell{height:100vh;overflow:hidden}
@@ -104,5 +119,17 @@ q2-checkbox:focus-visible,q2-select:focus-visible,q2-text:focus-visible{outline:
 <section id="q2-console" aria-label="Engine console"><div id="q2-console-head"><div class="left"><span class="silk dim">console</span><span id="q2-console-count" class="tnum">000 lines</span></div><button id="q2-console-clear" class="silk silkbtn" type="button">clear</button></div><div id="q2-console-lines" class="thin-scroll" aria-live="polite"></div></section>
 </div>
 <aside id="q2-ui" aria-label="Settings sidebar"><div id="q2-cvars-wrap" class="thin-scroll"><q2-settings-panel id="q2-cvars"></q2-settings-panel></div>
-<div id="q2-ui-foot"><div class="hint"><span class="silk dim">q2ts · base1 / devroom</span><span class="silk dim" id="q2-pending">no pending changes</span></div><div id="q2-actions"><button id="q2-revert" class="silk" type="button">revert view</button><button id="q2-clear-pak" class="silk" type="button">clear cached pak</button></div></div></aside></main>
-</div><script type="module" src="/src/index.ts"></script></body></html>
+<div id="q2-ui-foot"><div class="hint"><span class="silk dim">q2ts · base1 / devroom</span><span class="silk dim" id="q2-pending">no pending changes</span></div><div id="q2-actions"><button id="q2-revert" class="silk" type="button">revert view</button><button id="q2-menu" class="silk" type="button">menu</button><button id="q2-clear-pak" class="silk" type="button">clear cached pak</button></div></div></aside></main>
+</div><div id="q2-landing"><div id="q2-landing-card">
+<h1>QUAKE II <span class="amber">in the browser</span></h1>
+<p>Software renderer + Voodoo-3dfx look. Play the free shareware demo (Outer Base, first levels) right here, drop your own retail <span class="tnum">pak0.pak</span> for the full game, or boot the built-in devroom with no assets.</p>
+<div id="q2-landing-btns">
+<button id="q2-play-demo" class="primary" type="button">play shareware demo (download)</button>
+<button id="q2-play-cached" type="button" hidden>continue</button>
+<button id="q2-pick-pak" type="button">drop / pick my pak0.pak</button>
+<button id="q2-play-devroom" type="button">play devroom (no assets)</button>
+</div>
+<input id="q2-pak-file" type="file" accept=".pak" hidden>
+<p id="q2-landing-status" aria-live="polite"></p>
+<p class="small">Demo: the original <span class="tnum">q2-314-demo-x86.exe</span> shareware release (id, mirrored by Yamagi), downloaded in-browser, verified (SHA-256), unpacked to <span class="tnum">pak0.pak</span> locally — nothing is uploaded, the pak stays in your browser cache. License covers the unmodified demo archive; the full game needs your own retail pak. Sources: yamagi.org · tastyspleen.net. You can also drop a pak anywhere on the page.</p>
+</div></div><script type="module" src="/src/index.ts"></script></body></html>
