@@ -44,6 +44,13 @@ export interface Entity {
    * path. Optional, defaults to 1 (opaque); clamped.
    */
   alpha?: number;
+  /**
+   * RF_GLOW: bonus-item pulse (game SP_item sets it on every pre-placed
+   * pickup; ITEM_NO_TOUCH spawnflag clears it). Both backends pulse the
+   * sample by 0.1*sin(time*7), floored at 0.8x the sample. Optional,
+   * defaults to false (steady).
+   */
+  glow?: boolean;
 }
 
 export interface WorldModel {

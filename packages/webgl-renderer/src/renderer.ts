@@ -99,6 +99,7 @@ import {
   SKY_BOX_HALF,
   SKY_SIDE_IMAGE,
   isValidSkySize,
+  sampleStaticEntityLight,
   type Camera,
   type MiniWorld,
 } from '@q2/sw-renderer';
@@ -141,6 +142,7 @@ import {
 } from './worldMesh.js';
 import {
   aliasShadeBase,
+  aliasShadeLightGL,
   gpuMeshFromMd2,
   interpolateAliasFrame,
   resolveAliasLerp,
@@ -166,6 +168,9 @@ export interface WebGLUploadStats {
 export const GUN_DEPTH_SCALE = 0.02;
 /** Gun NDC depth bias (centers the remapped gun near the near plane). */
 export const GUN_DEPTH_BIAS = -0.9;
+
+/** Unit shade base for the legacy fixed-table alias path (no-world stub). */
+const UNIT_SHADE_BASE = new Float32Array([1, 1, 1]);
 
 const CLEAR_R = 0;
 const CLEAR_G = 0;
@@ -204,6 +209,8 @@ interface ProgLocs {
   uLightColor: WebGLUniformLocation | null;
   uNumLights: WebGLUniformLocation | null;
   uAlpha: WebGLUniformLocation | null;
+  /** Per-entity RGB shade level for the alias program (uShadeBase). */
+  uShadeBase: WebGLUniformLocation | null;
   uUVScale: WebGLUniformLocation | null;
   // PROOF-4 live-policy uniforms (all set per frame/use; null when the stub
   // or a program lacks them — setVoodooPolicy guards every one).
@@ -217,6 +224,8 @@ interface ProgLocs {
   uFogTable: WebGLUniformLocation | null;
   // FOLLOW-2B test-only diagnostic view (debug-gated; production stays 0).
   uDebugMode: WebGLUniformLocation | null;
+  /** Entity rigid transform for the alias program (world-space vWorldPos). */
+  uModel: WebGLUniformLocation | null;
   // FOLLOW-3 turbulent warp (FS_LIT only; null on other programs, guarded).
   uWarpOn: WebGLUniformLocation | null;
   uTime: WebGLUniformLocation | null;
@@ -349,6 +358,9 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
   private dynPos: WebGLBuffer | null = null;
   private dynShade: WebGLBuffer | null = null;
   private dynSize = 0;
+  /** Entity-lighting scratch (static RGB sample + uniform base). */
+  private entStatic = new Float32Array(3);
+  private entShadeBase = new Float32Array(3);
   private flatPos: WebGLBuffer | null = null;
   private flatCol: WebGLBuffer | null = null;
   private flatUV: WebGLBuffer | null = null;
@@ -1078,6 +1090,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
         uLightColor: L('uLightColor[0]'),
         uNumLights: L('uNumLights'),
         uAlpha: L('uAlpha'),
+        uShadeBase: L('uShadeBase'),
         uUVScale: L('uUVScale'),
         uLodBias: L('uLodBias'),
         uMipDither: L('uMipDither'),
@@ -1088,6 +1101,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
         uFogColor: L('uFogColor'),
         uFogTable: L('uFogTable'),
         uDebugMode: L('uDebugMode'),
+        uModel: L('uModel'),
         uWarpOn: L('uWarpOn'),
         uTime: L('uTime'),
       };
@@ -1656,7 +1670,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
         const alpha = clamp01(e.alpha ?? 1);
         if (alpha <= 0) continue;
         if (kind === 'md2') {
-          if (alpha >= 1 && e.depthHack !== true) this.drawAlias(gl, V, P, e, false, lights);
+          if (alpha >= 1 && e.depthHack !== true) this.drawAlias(gl, V, P, e, false, lights, input.view.lightStyles, input.time);
         } else if (kind === 'sp2') {
           if (alpha >= 1) this.drawSpriteSingle(gl, VP, e, cam, alpha);
         }
@@ -1670,7 +1684,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
       if (this.entityKind(e.model) !== 'md2') continue;
       const alpha = clamp01(e.alpha ?? 1);
       if (alpha <= 0 || alpha < 1) continue; // translucent guns ride the blend pass
-      this.drawAlias(gl, V, P, e, true, lights);
+      this.drawAlias(gl, V, P, e, true, lights, input.view.lightStyles, input.time);
     }
 
     // Particles (POINTS, depth-tested, depth-writing).
@@ -1715,7 +1729,7 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
         const alpha = clamp01(e.alpha ?? 1);
         if (alpha <= 0 || alpha >= 1) continue;
         if (kind === 'md2') {
-          this.drawAlias(gl, V, P, e, e.depthHack === true, lights, alpha);
+          this.drawAlias(gl, V, P, e, e.depthHack === true, lights, input.view.lightStyles, input.time, alpha);
         } else if (kind === 'sp2') {
           this.drawSpriteSingle(gl, VP, e, cam, alpha);
         }
@@ -1886,6 +1900,8 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     e: Entity,
     gun: boolean,
     lights: GpuLight[],
+    lightStyles: Float32Array,
+    time: number,
     alphaOverride?: number,
   ): void {
     const progs = this.progs;
@@ -1912,7 +1928,29 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     const posArr = new Float32Array(nv * 3);
     const shadeArr = new Float32Array(nv);
     interpolateAliasFrame(mesh, frameA, frameB, lerp, posArr);
-    aliasShadeBase(mesh, frameA, frameB, lerp, ((e.angles[1]! * 256) / 360) & 255, shadeArr);
+    // Position-dependent lighting (ref_gl gl_mesh.c parity): on real BSP
+    // worlds the per-vertex buffer carries the directional dot factor and
+    // uShadeBase carries the per-channel static RGB sample (MINLIGHT for
+    // the depth-hack viewmodel, like the gun's RF_MINLIGHT); the
+    // fragment-shader dynamics stay per-pixel, so the base excludes them.
+    // Node-less worlds (devroom/stub) keep the legacy fixed table with a
+    // unit base, exactly reproducing the old shade values.
+    let glYaw = 0;
+    let shadeBase: Float32Array = UNIT_SHADE_BASE;
+    const world = this.world;
+    if (world && world.nodes.length > 0) {
+      sampleStaticEntityLight(world, e.origin, lightStyles, this.entStatic);
+      aliasShadeLightGL(this.entStatic, {
+        minlight: (e as { depthHack?: boolean }).depthHack === true,
+        glow: (e as { glow?: boolean }).glow === true,
+        time,
+      }, this.entShadeBase);
+      glYaw = (e.angles[1]! * Math.PI) / 180;
+      shadeBase = this.entShadeBase;
+      aliasShadeBase(mesh, frameA, frameB, lerp, 0, shadeArr, { yaw: glYaw, base: shadeBase });
+    } else {
+      aliasShadeBase(mesh, frameA, frameB, lerp, ((e.angles[1]! * 256) / 360) & 255, shadeArr);
+    }
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dynPos);
     gl.bufferData(gl.ARRAY_BUFFER, posArr, gl.DYNAMIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.dynShade);
@@ -1926,12 +1964,16 @@ export class WebGLRenderer implements GpuRenderer<WebGL2RenderingContext> {
     gl.useProgram(alias.prog);
     if (alias.uDebugMode) gl.uniform1i(alias.uDebugMode, this.debugView);
     this.setMVP(gl, alias, MVP, gun ? GUN_DEPTH_SCALE : 1);
+    // World-space varying for per-pixel dynamic lights (VS_ALIAS computes
+    // vWorldPos = uModel * aPos; lights arrive in world space).
+    if (alias.uModel) gl.uniformMatrix4fv(alias.uModel, false, M);
     if (alias.uDepthBias) gl.uniform1f(alias.uDepthBias, gun ? GUN_DEPTH_BIAS : 0);
     this.setLights(gl, alias, lights);
     this.setVoodooPolicy(gl, alias);
     this.bindDiffuse(gl, alias, skin?.tex ?? this.whiteFor(gl));
     const alpha = alphaOverride ?? clamp01(e.alpha ?? 1);
     if (alias.uAlpha) gl.uniform1f(alias.uAlpha, alpha);
+    if (alias.uShadeBase) gl.uniform3f(alias.uShadeBase, shadeBase[0]!, shadeBase[1]!, shadeBase[2]!);
     // Skin st are texel units; uUVScale normalizes by the ORIGINAL skin dims
     // (upload may be a capped resample of the same image, so original dims
     // keep the mapping exact). CLAMP addressing is equivalent here (CPU wraps

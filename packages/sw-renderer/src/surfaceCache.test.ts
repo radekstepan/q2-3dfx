@@ -22,15 +22,15 @@ describe('buildLightMap', () => {
     expect([...out]).toEqual([32, 32, 32, 32]);
   });
 
-  it('lightstyle scales the block (dark style -> dark grades)', () => {
+  it('lightstyle scales the block (dark style -> dark grades, floored)', () => {
     const bright = new Uint8Array(4);
     const dark = new Uint8Array(4);
     const s = flatSamples(2, 2, 200);
     buildLightMap(bright, s, 2, 2, [1.5], [], new Float32Array([0, 0, 0]), 0);
     buildLightMap(dark, s, 2, 2, [0.25], [], new Float32Array([0, 0, 0]), 0);
-    // 200/255=0.784; *1.5 clamps to 1 -> 63; *0.25=0.196 -> 12
+    // 200/255=0.784; *1.5 clamps to 1 -> 63; *0.25=0.196 -> 12 -> floor 16
     expect([...bright]).toEqual([63, 63, 63, 63]);
-    expect([...dark]).toEqual([12, 12, 12, 12]);
+    expect([...dark]).toEqual([16, 16, 16, 16]);
   });
 
   it('dynamic light adds falloff-limited contribution', () => {
@@ -40,7 +40,8 @@ describe('buildLightMap', () => {
     const dl = { origin: new Float32Array([0, 0, 0]), intensity: 100, color: new Float32Array([1, 1, 1]) };
     buildLightMap(base, s, 1, 1, [1], [], new Float32Array([0, 0, 0]), 0);
     buildLightMap(lit, s, 1, 1, [1], [dl], new Float32Array([0, 0, 0]), 1);
-    expect(base[0]).toBe(0);
+    // unlit static reads the dark-end floor, not pure black
+    expect(base[0]).toBe(16);
     // dist 0 < 100: f = 1, luma(white) = 1 -> grade 63
     expect(lit[0]).toBe(63);
   });
@@ -124,8 +125,9 @@ describe('luxelWorldPositions (per-luxel dlight falloff grid)', () => {
     // light at luxel-0 center, radius 32: covers luxels 0 (fully) and 1 (half)
     const dl = { origin: new Float32Array([8, 8, 0]), intensity: 32, color: new Float32Array([1, 1, 1]) };
     buildLightMap(out, samples, w, h, [1], [dl], center, 1, 1, pos);
-    // dists 0/16/32/48 -> f 1/0.5/0/0 -> grades 63/31/0/0 (31: fp luma sum)
-    expect([...out]).toEqual([63, 31, 0, 0]);
+    // dists 0/16/32/48 -> f 1/0.5/0/0 -> grades 63/31/16/16 (31: fp luma
+    // sum; the dark end reads the grade floor, never pure black)
+    expect([...out]).toEqual([63, 31, 16, 16]);
   });
 
   it('legacy center path stays uniform when no luxel grid is supplied', () => {

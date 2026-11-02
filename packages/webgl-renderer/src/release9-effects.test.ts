@@ -276,6 +276,33 @@ describe('RELEASE-9 GPU lane: alias selection/dispatch contracts (hermetic)', ()
     expect(log.some((c) => c === 'uniform1f uDepthBias -0.9')).toBe(false);
     expect(r.testWarnings().some((w) => w.includes('no mesh'))).toBe(false);
   });
+
+  it('alias pass uploads uModel so per-pixel dlights evaluate in world space', () => {
+    const state = stubGLFull();
+    const r = new WebGLRenderer();
+    r.init(state.gl as unknown as WebGL2RenderingContext, W, H);
+    r.attachWorld(fixtureWorld());
+    r.setPalette(rampPalette());
+    const box = createBoxMesh();
+    r.registerModelData(0, 'md2', box);
+    r.registerSkinPixels(0, new Uint8Array(8 * 8).fill(11), 8, 8);
+    const kinds = new Map<number, GpuEntityModelKind>([[0, 'md2']]);
+    const entities: Entity[] = [
+      { model: 0, origin: new Float32Array([50, 0, -10]), angles: new Float32Array([0, 0, 0]), frame: 1, oldframe: 0, backlerp: 0.5, skin: 0, alpha: 1 },
+    ];
+    const scene = refreshGpuScene(fixtureWorld(), entities, fixtureView(), W, H, kinds);
+    r.setScene(scene);
+    r.setEntities(entities, kinds);
+    r.renderFrame({
+      view: fixtureView(), scene, time: 0,
+      lights: [{ origin: new Float32Array([50, 0, 0]), color: new Float32Array([1, 1, 0]), intensity: 200 }],
+    });
+    expect(r.getStatus().framesSubmitted).toBe(1);
+    // The entity model matrix reaches the alias vertex shader (VS_ALIAS
+    // computes vWorldPos = uModel * aPos); without it the varying stays in
+    // model space and every world-space dynamic light misses its entity.
+    expect(state.calls).toContain('uniformMatrix4fv uModel len=16');
+  });
 });
 
 // --- Real-asset legs (Q2_PAK): model facts + CPU/GPU size parity ---

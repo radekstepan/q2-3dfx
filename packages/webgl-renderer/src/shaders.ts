@@ -132,13 +132,14 @@ void main() {
 }
 `;
 
-/** Alias vertex shader: MVP + skin UV + CPU shade-dot base + alpha attr. */
+/** Alias vertex shader: MVP + skin UV + directional dot factor + alpha attr. The per-entity RGB level rides uShadeBase (fragment). */
 export const VS_ALIAS = `#version 300 es
 layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec2 aUV;
 layout(location = 2) in float aShade;
 layout(location = 3) in float aAlpha;
 uniform mat4 uMVP;
+uniform mat4 uModel;
 uniform float uDepthScale;
 uniform vec2 uUVScale;
 out vec2 vUV;
@@ -153,12 +154,17 @@ void main() {
   vUV = aUV * uUVScale;
   vShade = aShade;
   vAlpha = aAlpha;
-  vWorldPos = aPos;
+  // uModel carries the entity rigid transform: the fragment shader compares
+  // vWorldPos against world-space dynamic lights, so the varying must be in
+  // world space too. (Previously vWorldPos = aPos compared model-space verts
+  // against world-space lights, pushing every light out of range for entities
+  // away from the origin — muzzle/explosion flashes never affected them.)
+  vWorldPos = (uModel * vec4(aPos, 1.0)).xyz;
   vFogW = clamp(clip.z / max(clip.w, 1e-6) * 0.5 + 0.5, 0.0, 1.0);
 }
 `;
 
-/** Alias fragment shader: mipped skin x (shade base + per-pixel dlights). */
+/** Alias fragment shader: mipped skin x (directional dot x RGB shade base + per-pixel dlights). */
 export const FS_ALIAS = `#version 300 es
 precision mediump float;
 in vec2 vUV;
@@ -167,6 +173,7 @@ in float vAlpha;
 in vec3 vWorldPos;
 in float vFogW;
 uniform sampler2D uDiffuse;
+uniform vec3 uShadeBase;
 uniform vec4 uLightPos[8];
 uniform vec3 uLightColor[8];
 uniform int uNumLights;
@@ -179,13 +186,13 @@ void main() {
   vec3 texel = voodooSampleMipped(uDiffuse, vUV);
   // FOLLOW-2B test-only diagnostic views (debug-gated, production stays 0):
   // 1 = unlit skin (upload/UV/palette triage), 2 = shade base only
-  // (normal/shading triage). Final (0) is the shipped path.
+  // (directional dot x RGB level, no dynamics). Final (0) is the shipped path.
   if (uDebugMode == 1) {
     oColor = vec4(texel, vAlpha * uAlpha);
     return;
   }
   if (uDebugMode == 2) {
-    oColor = vec4(vec3(vShade), vAlpha * uAlpha);
+    oColor = vec4(vShade * uShadeBase, vAlpha * uAlpha);
     return;
   }
   vec3 dyn = vec3(0.0);
@@ -198,7 +205,7 @@ void main() {
       dyn += f * uLightColor[i];
     }
   }
-  vec3 col = voodooOverbright(texel * (vec3(vShade) + dyn));
+  vec3 col = voodooOverbright(texel * (vShade * uShadeBase + dyn));
   col = voodooApplyFog(col, vFogW);
   oColor = vec4(col, vAlpha * uAlpha);
 }

@@ -8,6 +8,10 @@ import type {
 } from '@q2/renderer-api';
 import { Com_Error, getCVarNumber, registerCVar } from '@q2/config';
 import type { MiniLightmap } from './worldNodes.js';import { DLightState, LIGHT_OVERBRIGHT, LIGHT_STYLE_UNUSED, buildLightMap, luxelWorldPositions, type DynamicLight, type SurfaceBounds } from './light.js';
+import {
+  sampleStaticEntityLight, addEntityDynamicLights, aliasAmbientShade,
+  plightvecForAngles, entityMonoSample,
+} from './entityLight.js';
 import { SurfaceCache, hashLightStyles, type SurfaceBlock } from './surfaceCache.js';
 import { setupCamera, setupCameraInto, culledByFlatFrustum, type Camera } from './camera.js';
 import {
@@ -42,7 +46,7 @@ import { isValidSkySize, SKY_BOX_CORNERS, SKY_BOX_HALF, skyUvOnFace } from './sk
 import { AngleVectors } from '@q2/math';
 import { drawSprite, emitSpriteSpans } from './sprites.js';
 import { drawParticles, projectParticles, type ScreenParticle } from './particles.js';
-import { buildColormap, buildAlphamapPair, defaultPalette, extractAlphamap33, extractAlphamap66, COLORMAP_PCX_PIXELS } from './colormap.js';
+import { buildColormap, buildAlphamapPair, defaultPalette, extractAlphamap33, extractAlphamap66, COLORMAP_GRADES, COLORMAP_PCX_PIXELS, COLORMAP_SIZE } from './colormap.js';
 import { createDevroom, getDevMesh } from './devroom.js';
 
 export const MAX_SPANS = 16384;
@@ -381,6 +385,10 @@ export class SoftwareRenderer implements Refresh {
   private pool: Span[] = [];
   private spanList: SpanList = { spans: [], count: 0 };
   private spriteScratch: SpanList = { spans: [], count: 0 };
+  /** Entity-lighting scratch (R_LightPoint + R_AliasSetupLighting, no per-frame alloc). */
+  private entStatic = new Float32Array(3);
+  private entRgb = new Float32Array(3);
+  private entPlight = new Float32Array(3);
   private tmpSort: Span[] = [];
   private rowBase = new Int32Array(MAX_ROW + 1);
   private visSurfs: number[] = [];
@@ -733,6 +741,36 @@ export class SoftwareRenderer implements Refresh {
     this.alphaReady = false;
     this.alpha33 = new Uint8Array(0);
     this.alpha66 = new Uint8Array(0);
+  }
+
+  /**
+   * Install C-exact shade rows from parsed `pics/colormap.pcx` pixels
+   * (the 64x256 head, vid.colormap in ref_soft). Port grades uniformly
+   * mean brightness g/63 on both paths (world: round(luma*63); entities:
+   * the aliasGradeFromTemp curve inverts id's measured (255-4r)/128 row
+   * brightness back to linear), so grade g installs the physical row r
+   * whose measured brightness matches: r = round((255 - 128*g/63)/4).
+   * Grade 63 lands on row 32 (near-identity, preserving the validated
+   * no-blown-brights look — id rows 0..30 are the overbright range the
+   * port's 63-saturation already discards); grade 0 lands on row 63.
+   * Dark rows regain id's authored faint structure instead of crushing
+   * every texel to palette black (the procedural buildColormap fallback).
+   * No-pak worlds (devroom fallback, pinned golden `8f61c755`) keep the
+   * procedural table: only call this when the pak parsed. Returns false
+   * (keeping the procedural table) when the pixels are too short.
+   */
+  setShadeRowsFromColormapPcx(pixels: Uint8Array): boolean {
+    if (pixels.length < COLORMAP_PCX_PIXELS) return false;
+    const table = new Uint8Array(COLORMAP_SIZE);
+    for (let g = 0; g < COLORMAP_GRADES; g++) {
+      const r = Math.min(63, Math.max(0, Math.round((255 - (128 * g) / 63) / 4)));
+      table.set(pixels.subarray(r * 256, r * 256 + 256), g * 256);
+    }
+    this.colormap = table;
+    this.backend.colormap = this.colormap;
+    if (this.wasmBackend) this.wasmBackend.colormap = this.colormap;
+    this.bandBackend.colormap = this.colormap;
+    return true;
   }
 
   /**
@@ -1810,10 +1848,35 @@ export class SoftwareRenderer implements Refresh {
           continue;
         }
         this.fgDrawn++;
+        // Position-dependent entity lighting (R_LightPoint +
+        // R_AliasSetupLighting): sample the static lightmap at the entity
+        // origin on real BSP worlds, add dynamic lights, then map through
+        // the ambient/shade/clamp chain with the model-frame (-1,0,0)
+        // light vector. Node-less worlds (devroom fallback) keep the
+        // legacy fixed table so the pinned golden is untouched.
+        let lighting: AliasInstance['lighting'];
+        if (worldData.nodes.length > 0) {
+          sampleStaticEntityLight(worldData, e.origin, view.lightStyles, this.entStatic);
+          // ref_soft mono (Mod_LoadLighting brightest-component rule): the
+          // dynamic lights below add per-channel colour onto this gray base,
+          // exactly like R_LightPoint (mono static + RGB dynamics) feeding
+          // R_AliasSetupLighting (which averages, floors per channel, glows).
+          const mono = entityMonoSample(this.entStatic);
+          this.entRgb[0] = mono; this.entRgb[1] = mono; this.entRgb[2] = mono;
+          addEntityDynamicLights(this.entRgb, e.origin, dyn, this.entRgb);
+          const { ambient, shade } = aliasAmbientShade(this.entRgb, {
+            minlight: e.depthHack === true,
+            glow: e.glow === true,
+            time: view.time,
+          });
+          plightvecForAngles(e.angles, this.entPlight);
+          lighting = { ambient, shade, plight: this.entPlight };
+        }
         drawAliasInstance(this.idx, this.zb, this.fbW, this.fbH, {
           mesh: m.data, origin: e.origin, angles: e.angles,
           frameA: frA, frameB: fr, lerp,
           lightAngle: ((e.angles[1]! * 256) / 360) & 255,
+          lighting,
           // First-person viewmodel (Entity.depthHack = RF_DEPTHHACK):
           // bias stored 1/z so the eye-anchored gun wins vs nearby walls.
           depthScale: e.depthHack === true ? DEPTHHACK_SCALE : 1,

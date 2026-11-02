@@ -17,6 +17,7 @@ describe('Entity contract (frozen + additive evolution)', () => {
     expect(e.oldframe).toBeUndefined();
     expect(e.backlerp).toBeUndefined();
     expect(e.alpha).toBeUndefined();
+    expect(e.glow).toBeUndefined();
     expect(e.depthHack).toBeUndefined();
   });
 
@@ -30,10 +31,12 @@ describe('Entity contract (frozen + additive evolution)', () => {
       oldframe: 4,
       backlerp: 0.5,
       alpha: 0.75,
+      glow: true,
       depthHack: true,
     };
     expect(e.oldframe).toBe(4);
     expect(e.backlerp).toBe(0.5);
     expect(e.alpha).toBe(0.75);
+    expect(e.glow).toBe(true);
   });
 });

@@ -428,5 +428,28 @@ describe('extraEntities RF_FRAMELERP/alpha forwarding', () => {
     expect(plain.oldframe).toBeUndefined();
     expect(plain.backlerp).toBeUndefined();
     expect(plain.alpha).toBeUndefined();
+    expect(plain.glow).toBeUndefined();
+  });
+
+  it('forwards glow when set (RF_GLOW pickup pulse)', () => {
+    const snap = (t: number) => ({
+      serverTime: t,
+      entities: [{ id: 1, origin: [0, 0, 32] as [number, number, number], velocity: [0, 0, 0] as [number, number, number] }],
+    });
+    const withGlow: HostDriver = {
+      spawn: () => ({ origin: [0, 0, 0] }),
+      step: () => {},
+      snapshot: snap,
+      extraEntities: () => [
+        { origin: [9, 9, 9], model: 3, skin: 4, frame: 0, glow: true },
+      ],
+    };
+    const refresh = new CaptureRefresh();
+    const host = new Host({ refresh, width: 64, height: 48, driver: withGlow });
+    host.ingestSnapshot({ serverTime: 1.0, entities: [{ id: 1, origin: [0, 0, 32], velocity: [0, 0, 0] }] });
+    host.lastCmd = { msec: 16, angles: [0, 0, 0], forwardmove: 0, sidemove: 0, upmove: 0, buttons: 0 };
+    host.renderCurrentView();
+    const item = refresh.lastEntities!.find((e) => e.origin[0] === 9)!;
+    expect(item.glow).toBe(true);
   });
 });

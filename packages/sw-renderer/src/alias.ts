@@ -3,6 +3,7 @@
 // with per-vertex lighting from shade dots (anorms table).
 
 import type { Camera } from './camera.js';
+import { aliasGradeFromTemp } from './entityLight.js';
 
 /** 162-entry averaged-normals table (anorms equivalent, fibonacci sphere). */
 export const ANORM_COUNT = 162;
@@ -334,8 +335,16 @@ export interface AliasInstance {
   origin: Float32Array;
   angles: Float32Array;
   frameA: number; frameB: number; lerp: number;
-  /** yaw-quantised light angle 0..255 */
+  /** yaw-quantised light angle 0..255 (legacy fixed-light path) */
   lightAngle: number;
+  /**
+   * Position-dependent lighting (R_AliasSetupLighting): when present the
+   * per-vertex grade comes from ambient/shade + the model-frame light
+   * vector, not from the fixed shadeDots table. New code (frame.ts entity
+   * pass on real BSP worlds) supplies this; legacy callers (tests,
+   * devroom node-less fallback) omit it and keep the old table lookup.
+   */
+  lighting?: { ambient: number; shade: number; plight: Float32Array };
   /**
    * Depth-bias multiplier on stored 1/z (Entity.depthHack feeds
    * DEPTHHACK_SCALE here; default 1 = unbiased). Screen x/y projection
@@ -463,6 +472,25 @@ export function drawAliasInstance(
   const alpha = inst.alpha;
   // Fully transparent: no pixels, no depth writes (freed-sky style fade).
   if (alpha !== undefined && alpha <= 0) return 0;
+  // Position-dependent lighting (entityLight): per-vert grade from the
+  // entity ambient/shade + model-frame light vector. Legacy path keeps
+  // the fixed shadeDots table lookup.
+  const lighting = inst.lighting;
+  let lightAmbient = 0, lightShade = 0;
+  let lightPlight: Float32Array | null = null;
+  if (lighting) {
+    lightAmbient = lighting.ambient;
+    lightShade = lighting.shade;
+    lightPlight = lighting.plight;
+    // C-exact integer front end (shared with entityLight.aliasGradeForNormal,
+    // finished per-vert with aliasGradeFromTemp): hoist the
+    // (255-ambient)<<6 + LIGHT_MIN clamps out of the per-vert loop.
+    if (lightAmbient < 5) lightAmbient = 5;
+    lightAmbient = (255 - lightAmbient) * 64;
+    if (lightAmbient < 5) lightAmbient = 5;
+    if (lightShade < 0) lightShade = 0;
+    lightShade *= 64;
+  }
   // Hoisted: identical for every vert of this instance (was recomputed
   // per vert with the same result).
   const shadeFrame = t < 0.5 ? inst.frameA : inst.frameB;
@@ -480,7 +508,18 @@ export function drawAliasInstance(
       clipIU[k] = mesh.st[vi * 2]!;
       clipIV[k] = mesh.st[vi * 2 + 1]!;
       const ni = mesh.normals[(shadeFrame * nv + vi) % mesh.normals.length]! % ANORM_COUNT;
-      clipIG[k] = shadeDots[row + ni]!;
+      if (lightPlight) {
+        const nx = anorms[ni * 3]!, ny = anorms[ni * 3 + 1]!, nz = anorms[ni * 3 + 2]!;
+        const cos = nx * lightPlight[0]! + ny * lightPlight[1]! + nz * lightPlight[2]!;
+        let temp = lightAmbient;
+        if (cos < 0) {
+          temp += Math.trunc(lightShade * cos);
+          if (temp < 0) temp = 0;
+        }
+        clipIG[k] = aliasGradeFromTemp(temp);
+      } else {
+        clipIG[k] = shadeDots[row + ni]!;
+      }
       if (vz2 < cam.near) allIn = false;
     }
     if (allIn) {

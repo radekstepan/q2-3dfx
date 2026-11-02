@@ -1185,6 +1185,7 @@ import {
   frameGpuPlay,
   paintHudOverlay,
   pumpExplosionLights,
+  pumpBoltLights,
   pumpMuzzleLight,
   pumpTracers,
   resolveDisplay,
@@ -1891,7 +1892,10 @@ export function startPlayLoop(
       return;
     }
     // Muzzle dlight + tracer beams must be registered before the renderer draws the frame.
+    // pumpMuzzleLight expires the previous frame's lights first, so bolt and
+    // explosion pumps must run AFTER it (they add this frame's lights).
     pumpMuzzleLight(boot);
+    pumpBoltLights(boot);
     pumpExplosionLights(boot);
     pumpTracers(boot);
     host.frame(nowMs);

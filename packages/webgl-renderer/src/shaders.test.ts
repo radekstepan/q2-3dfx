@@ -113,11 +113,19 @@ describe('proof-3 shader sources (reviewable consts)', () => {
     expect(FS_ALIAS).toContain('textureLod');
     expect(FS_ALIAS).toContain('uDiffuse');
     expect(FS_ALIAS).toContain('vShade');
+    expect(FS_ALIAS).toContain('uShadeBase');
     expect(FS_ALIAS).toContain('uLightPos');
     expect(FS_ALIAS).toContain('uAlpha');
     expect(FS_ALIAS).toContain('uLodBias');
     expect(FS_ALIAS).toContain('uFogTable');
     expect(VS_ALIAS).toContain('uUVScale');
+    // Dynamic lights arrive in world space, so the dlight varying must be
+    // world space too: uModel transforms model-space verts for the
+    // per-pixel distance (previously vWorldPos = aPos compared model-space
+    // verts against world-space lights, pushing every light out of range
+    // for entities away from the origin).
+    expect(VS_ALIAS).toContain('uniform mat4 uModel');
+    expect(VS_ALIAS).toContain('uModel * vec4(aPos, 1.0)');
   });
 
   it('flat program supports textured (sprite) and vertex-color (beam/particle) modes', () => {

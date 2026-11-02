@@ -63,6 +63,13 @@ describe.runIf(!!WEB_Q2_PAK)('base1 pickup wiring (Q2_PAK)', () => {
     expect(driver.ps.silencerShots).toBe(0);
     const liveBefore = driver.livePickupCount();
     expect(liveBefore).toBeGreaterThan(0);
+    // RF_GLOW (game SP_item): every pickup pulses unless ITEM_NO_TOUCH —
+    // the dark-nook silencer breathes ±0.1 instead of sitting black.
+    const silExtra = (driver.extraEntities() ?? []).find(
+      (x) => Math.hypot(x.origin![0]! + 408, x.origin![1]! - 704) < 1,
+    )!;
+    expect(silExtra).toBeDefined();
+    expect(silExtra.glow).toBe(true);
     // The nook is a LOW crawl (standing hull never fits — ceiling above the
     // -96 walk line is solid): enter ducked into open air and crouch-walk
     // the corridor north to the item. Mapper origin kept (never

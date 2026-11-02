@@ -2093,12 +2093,16 @@ export class LocalDriver implements HostDriver {
         if (skillInhibits(parseSpawnflags(e.extra ?? {}), getSkill())) continue;
         const h = this.models.items[e.classname];
         if (!h) continue;
+        // RF_GLOW (game SP_item): every pickup pulses unless ITEM_NO_TOUCH
+        // (0x2) is set — that spawnflag also clears the flag in C.
+        const glow = (parseSpawnflags(e.extra ?? {}) & 0x2) === 0;
         out.push({
           origin: [e.origin[0]!, e.origin[1]!, e.origin[2]!],
           angles: [0, (this.server.time * 90) % 360, 0],
           model: h.model,
           skin: h.skin,
           frame: 0,
+          ...(glow ? { glow: true as const } : {}),
         });
       }
       // Banners wave through MD2 frames 0..15 at 10Hz (misc_banner_think);
@@ -4874,8 +4878,11 @@ export function bootPlay(opts: {
     const pcxBytes = tryPakEntry(opts.pak, 'pics/colormap.pcx');
     if (pcxBytes) {
       try {
-        mainPalette = parsePCX(pcxBytes).palette;
+        const pcx = parsePCX(pcxBytes);
+        mainPalette = pcx.palette;
         refresh.setPalette(mainPalette);
+        // C-exact shade rows (dark-end structure, not procedural crush).
+        refresh.setShadeRowsFromColormapPcx(pcx.pixels);
       } catch {
         /* procedural palette fallback */
       }
@@ -5381,9 +5388,8 @@ export function pumpMuzzleLight(boot: PlayBoot): boolean {
  * Pump one in-flight dlight per live blaster bolt (id CL_BlasterTrail /
  * V_AddLight: 200-intensity pure yellow every frame). Same
  * testAddDynamicLight path as the muzzle/explosion pumps; call alongside
- * them before the frame renders. The dom tick wires muzzle + explosion;
- * wire this next to them when the tick is next touched (dom.ts is outside
- * this change's file lock, so headless/tests pump it explicitly).
+ * them before the frame renders (after pumpMuzzleLight, which expires the
+ * previous frame's lights first — all three production pump sites wire it).
  */
 export function pumpBoltLights(boot: PlayBoot): number {
   let n = 0;
@@ -6455,6 +6461,7 @@ export function buildAsyncView(host: Host, remainder = 0): { view: RefDef; rende
 export async function frameAsync(boot: PlayBoot, st: AsyncLoopState, nowMs: number, hud?: HudState): Promise<Uint32Array> {
   void hud;
   pumpMuzzleLight(boot);
+  pumpBoltLights(boot);
   pumpExplosionLights(boot);
   pumpTracers(boot);
   stepAsyncSim(boot.host, st, nowMs);
@@ -6890,6 +6897,7 @@ export async function measureFrameStages(
   // JS heap baseline (Chromium-only; null everywhere else — see heapDelta).
   const heapBefore = heapNowMB();
   pumpMuzzleLight(boot);
+  pumpBoltLights(boot);
   pumpExplosionLights(boot);
   pumpTracers(boot);
   const t01 = performance.now();

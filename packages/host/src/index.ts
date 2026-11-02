@@ -118,6 +118,8 @@ export interface ExtraRenderable {
   backlerp?: number;
   /** Translucency 0..1 (1 = opaque); defaults to 1. */
   alpha?: number;
+  /** RF_GLOW bonus-item pulse (pickups unless ITEM_NO_TOUCH); defaults to steady. */
+  glow?: boolean;
 }
 
 /**
@@ -487,6 +489,7 @@ export class Host {
           ...(x.oldframe !== undefined ? { oldframe: x.oldframe } : {}),
           ...(x.backlerp !== undefined ? { backlerp: x.backlerp } : {}),
           ...(x.alpha !== undefined ? { alpha: x.alpha } : {}),
+          ...(x.glow !== undefined ? { glow: x.glow } : {}),
         });
       }
     }

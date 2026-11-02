@@ -71,6 +71,14 @@ export {
   type DynamicLight, type SurfaceBounds,
 } from './light.js';
 
+export {
+  sampleStaticEntityLight, addEntityDynamicLights, aliasAmbientShade,
+  plightvecForAngles, aliasGradeForNormal, aliasGradeFromTemp,
+  entityMonoSample,
+  ENTITY_LIGHT_MIN, ENTITY_LIGHTVEC,
+  RF_MINLIGHT_BIT, RF_FULLBRIGHT_BIT, RF_GLOW_BIT,
+} from './entityLight.js';
+
 export { setupCamera, setupCameraInto, buildFrustum, boxOnFrustumSide, culledByFrustum, culledByFlatFrustum, type Camera } from './camera.js';
 
 export {

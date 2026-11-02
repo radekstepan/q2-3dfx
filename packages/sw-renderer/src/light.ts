@@ -33,6 +33,18 @@ export const LIGHT_STYLE_UNUSED = 255;
 export const LIGHT_OVERBRIGHT = 1;
 
 /**
+ * Dark-end floor for world light grades (0..63). id has no world floor —
+ * unlit luxels land on its darkest authored row — but the darkest rows of
+ * the (real or procedural) shade table resolve dim texels to palette black,
+ * so walkable areas with faint light render as completely, absolutely
+ * black instead of faintly visible. Flooring sub-floor grades keeps every
+ * lit surface at least dimly structured; grades at/above the floor
+ * (all normally-lit gameplay, devroom's ~37) are byte-identical, so the
+ * pinned golden `8f61c755` is unaffected.
+ */
+export const WORLD_GRADE_FLOOR = 16;
+
+/**
  * Build per-luxel light grades 0..63 (R_BuildLightMap equivalent).
  * samples: RGB luxels (w*h*3, 0..255). styleScales: per-style 0..2 multipliers
  * (from RefDef.lightStyles at the surface's style indices, 255 slots already
@@ -70,8 +82,14 @@ export function buildLightMap(
     const r = samples[i * 3]! / 255;
     const g = samples[i * 3 + 1]! / 255;
     const b = samples[i * 3 + 2]! / 255;
-    // luma of the static sample, scaled by the summed lightstyles
-    // (overbright-style modulate happens here, before the grade clamp)
+    // Luma of the static sample, scaled by the summed lightstyles
+    // (overbright-style modulate happens here, before the grade clamp).
+    // NOTE: id folds baked lightmaps by brightest channel (ref_soft
+    // r_model.c Mod_LoadLighting), which reads warm sconce light ~2x
+    // brighter than this Rec.601 fold. Switching the shared path to max
+    // would re-pin the warm-tinted devroom golden (8f61c755), so the mono
+    // rule stays luma here; the WORLD_GRADE_FLOOR below carries the
+    // dark-end lift instead, with byte-identical bright grades.
     let l = (0.299 * r + 0.587 * g + 0.114 * b) * styleScale * overbright;
     // dynamic lights: linear falloff from the luxel position
     // (R_AddDynamicLights). Per-luxel world pos when the caller supplies
@@ -89,13 +107,19 @@ export function buildLightMap(
       const rad = dl.intensity;
       if (dist < rad) {
         const f = (rad - dist) / rad;
+        // Same luma fold as the static sample (see note above): keeps the
+        // shared mono rule — and the warm-tinted devroom golden — stable.
         const dlLuma = 0.299 * dl.color[0]! + 0.587 * dl.color[1]! + 0.114 * dl.color[2]!;
         l += f * dlLuma;
       }
     }
     if (l < 0) l = 0;
     if (l > 1) l = 1;
-    out[i] = Math.round(l * 63);
+    let grade = Math.round(l * 63);
+    // Dark-end lift (WORLD_GRADE_FLOOR): never emit grades below the floor,
+    // which the shade table resolves to palette black for dim texels.
+    if (grade < WORLD_GRADE_FLOOR) grade = WORLD_GRADE_FLOOR;
+    out[i] = grade;
   }
 }
 

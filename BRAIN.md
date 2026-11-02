@@ -151,6 +151,8 @@ export interface Entity {
   backlerp?: number;
   /** Translucency 0..1 (1 = opaque): screen-door fade for explosions. */
   alpha?: number;
+  /** RF_GLOW: bonus-item pulse (every pre-placed pickup unless ITEM_NO_TOUCH). */
+  glow?: boolean;
 }
 export interface Refresh {
   init(fb: Framebuffer): void;
