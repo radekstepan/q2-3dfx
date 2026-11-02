@@ -5868,16 +5868,15 @@ export function drawHelpOverlay(
   const palette = boot.palette;
   const w = target.width;
   const h = target.height;
-  const hx = Math.max(0, ((w - 256) / 2) | 0);
-  const hy = Math.max(0, ((h - 192) / 2) | 0);
-  if (cache?.help && palette) {
-    try {
-      drawPic(target, hx, hy, cache.help, palette);
-    } catch {
-      /* text rows below still draw */
-    }
-  } else {
-    fillRect(target, hx, hy, 256, 192, 0xcc101010);
+  // The `help` background is drawn exactly once via the `xv 32 yv 8 picn
+  // help` row in the layout below (id `HelpComputer` position). A manual
+  // pre-draw here at the centered ((w-256)/2,(h-192)/2) offset duplicates
+  // the bottom border 16px lower, so only paint a fallback panel when the
+  // art is missing (devroom) — at the same layout origin the rows expect.
+  if (!cache?.help || !palette) {
+    const bx = Math.max(0, Math.trunc(w / 2) - 160 + 32);
+    const by = Math.max(0, Math.trunc(h / 2) - 120 + 8);
+    fillRect(target, bx, by, 256, 192, 0xcc101010);
   }
   const layout = buildHelpLayout(helpFactsFor(boot));
   let cmds;

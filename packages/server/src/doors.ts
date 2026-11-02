@@ -351,7 +351,6 @@ export function secretThink(sm: SecretMover, now: number, dt: number): Vec3 {
       break;
     case 'idle':
     case 'open':
-    case 'hold':
       break;
   }
   return v3(sm.ent.origin[0]! - ox, sm.ent.origin[1]! - oy, sm.ent.origin[2]! - oz);

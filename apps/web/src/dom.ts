@@ -1728,6 +1728,18 @@ export function startPlayLoop(
   let lastT = -1;
   let fps = 60;
   let frame = 0;
+  // In-canvas `fps N` readout is throttled so it stays readable: the EMA
+  // above still updates every frame (and feeds `publishQ2Stats`), but the
+  // value painted by `drawPlayHud` refreshes at most twice per second.
+  let displayFps = 60;
+  let lastFpsPush = -1;
+  const FPS_DISPLAY_INTERVAL_MS = 500;
+  const pushDisplayFps = (nowMs: number): void => {
+    if (lastFpsPush < 0 || nowMs - lastFpsPush >= FPS_DISPLAY_INTERVAL_MS) {
+      displayFps = fps;
+      lastFpsPush = nowMs;
+    }
+  };
 
   // Worker pool warm-up (M7.1 perf lane): pre-spawn ONCE per loop, never per
   // frame. When the browser can run workers and the operator left sw_workers
@@ -1874,7 +1886,8 @@ export function startPlayLoop(
       if (dt > 0) fps += (1000 / dt - fps) * 0.05;
     }
     lastT = nowMs;
-    const hud = { fps, frame: frame++ };
+    pushDisplayFps(nowMs);
+    const hud = { fps: displayFps, frame: frame++ };
     if (boot.gpu) {
       // GPU-PROOF-3 live lane: sim + GPU submit with NO CPU world span
       // rasterization (frameGpuPlay never calls refresh.renderView); HUD is
@@ -1937,7 +1950,8 @@ export function startPlayLoop(
             if (dt > 0) fps += (1000 / dt - fps) * 0.05;
           }
           lastT = nowMs;
-          const hud = { fps, frame: frame++ };
+          pushDisplayFps(nowMs);
+          const hud = { fps: displayFps, frame: frame++ };
           const target = await frameAsync(boot, asyncSt, nowMs, hud);
           finishFrame(target, hud);
         } catch {
