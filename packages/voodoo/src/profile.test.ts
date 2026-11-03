@@ -16,7 +16,7 @@ const ALLOWED: ReadonlySet<string> = new Set([
 describe('VOODOO_APPROX_PROFILE', () => {
   it('is frozen and pins every setting with a valid source tag', () => {
     expect(Object.isFrozen(VOODOO_APPROX_PROFILE)).toBe(true);
-    expect(VOODOO_APPROX_PROFILE.length).toBe(28);
+    expect(VOODOO_APPROX_PROFILE.length).toBe(30);
     const settings = VOODOO_APPROX_PROFILE.map((e) => e.setting);
     // No duplicates, stable order.
     expect(new Set(settings).size).toBe(settings.length);
@@ -29,6 +29,8 @@ describe('VOODOO_APPROX_PROFILE', () => {
       'scanout.rgbMaxDelta-register',
       'scanout.rgbMaxDelta-values',
       'scanout.default',
+      'scanout.tap-3bit',
+      'scanout.bilinear-11b',
       'gamma.curve',
       'gamma.value',
       'gamma.stage',
@@ -81,6 +83,12 @@ describe('VOODOO_APPROX_PROFILE', () => {
     expect(by('fog.deltas').value).toBe('per-entry 6.2 delta factors NOT applied');
     expect(by('fog.dither-zones').source).toBe('approx:chosen');
     expect(by('scanout.default').source).toBe('approx:chosen');
+    expect(by('scanout.tap-3bit').source).toBe('approx:chosen');
+    expect(by('scanout.tap-3bit').value).toContain('NOT implemented');
+    expect(by('scanout.tap-3bit').note).toContain('§17.8');
+    expect(by('scanout.bilinear-11b').source).toBe('approx:chosen');
+    expect(by('scanout.bilinear-11b').value).toContain('NOT implemented');
+    expect(by('scanout.bilinear-11b').note).toContain('11b');
     expect(by('lightmap.overbright-x2').source).toBe('approx:chosen');
     expect(by('lightmap.overbright-x2').value).toContain('overbright ? 2 : 1');
   });

@@ -70,7 +70,15 @@ export function expandRGB565(v: number): number {
 export type DitherMode = '2x2' | '4x4';
 
 /**
- * Scanout reconstruction profile (vidProcCfg):
+ * Scanout reconstruction profile (vidProcCfg OVERLAY path, PG §6.5.3):
+ * dithered-565 reconstruction lives on the overlay video-processor path —
+ * overlay formats include 111b RGB565 dithered, desktop formats (bits 20:18)
+ * offer no dithered option, and filter modes 01b/10b are marked 3D-only.
+ * Whether the Quake II MiniGL driver presents 3D via the overlay surface is
+ * UNVERIFIED from repo evidence (no MiniGL source in packages//tools/); the
+ * overlay path label follows the manual's format/mode placement, not a
+ * captured MiniGL programming.
+ * - '2x2sub+2x2box' (DEFAULT): subtract the 2x2 dither pattern, then 2x2
  * - '2x2sub+2x2box' (DEFAULT): subtract the 2x2 dither pattern, then 2x2
  *   box with rgbMaxDelta edge rejection — the matched hardware pairing.
  * - '4x4sub+4x1': subtract the 4x4 dither pattern, then a horizontal 4x1 box
@@ -258,7 +266,7 @@ export function testAndWriteDepth16(
 // --- Scanout reconstruction thresholds (vidProcCfg/rgbMaxDelta) --------------
 
 /**
- * Per-component substitution thresholds for scanout reconstruction,
+ * Per-component substitution thresholds for overlay-path scanout reconstruction,
  * mirroring the rgbMaxDelta register (prog guide §6.5.2 vidProcCfg,
  * 6-bit fields: rmax bits 21:16, gmax 13:8, bmax 5:0): when a tap's
  * absolute deviation from the CENTRE exceeds the threshold in any channel,

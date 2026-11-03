@@ -42,7 +42,8 @@ export function bayerThreshold(x: number, y: number): number {
   return BAYER4[((y & 3) << 2) | (x & 3)]!;
 }
 
-// --- 2x2 ordered dither (fbzMode 2x2 mode, vidProcCfg 2x2-sub pairing) --------
+// --- 2x2 ordered dither (fbzMode 2x2 mode, overlay video-processor 2x2-sub pairing) --------
+// (vidProcCfg §6.5.3 overlay filter mode 01b, marked 3D-only) //
 //
 // DETERMINISTIC APPROXIMATION UNTIL HW CAPTURE: the Voodoo3 fbzMode register
 // supports both 2x2 and 4x4 ordered dither, but the exact 2x2 matrix weights,

@@ -352,7 +352,7 @@ done-when:
 ### VF-6 — Scanout path label + unmodeled filter modes (INVESTIGATE)
 owns: `packages/voodoo`
 depends: none
-status: ready
+status: done
 review-finding: the dithered-565 reconstruction path is the *overlay* path
 (PG §6.5.3 overlay formats incl. `111b RGB565 dithered`; desktop formats have
 no dithered option) — if the implementation presents reconstruction as desktop
@@ -360,8 +360,8 @@ scanout, the chain is right but the path label is wrong (unless MiniGL presents
 3D via the overlay — unverified). Unmodeled: PG §17.8 3-bit tap alternative
 and `vidProcCfg` mode `11b` bilinear scaling.
 done-when:
-- [ ] Determine which path MiniGL/Quake-II 3D presentation uses (overlay vs desktop); fix path labels in profile/README/comments.
-- [ ] Scope decision per unmodeled mode (implement vs tracked omission entry): 3-bit tap filter, bilinear-scaling 11b.
+- [x] Determine which path MiniGL/Quake-II 3D presentation uses (overlay vs desktop); fix path labels in profile/README/comments.
+- [x] Scope decision per unmodeled mode (implement vs tracked omission entry): 3-bit tap filter, bilinear-scaling 11b.
 
 ### VF-7 — Unimplemented pipeline stages: track + scope (INVESTIGATE)
 owns: `packages/voodoo`

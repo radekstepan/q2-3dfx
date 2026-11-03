@@ -797,3 +797,15 @@ done-when:
 - [x] Whichever way: cvar doc + profile `scanout.default` entry updated; goldens re-pinned only with recorded cause.
 lane-report:
 - Decision (b): keep 4x4 default, accepted mismatch. Flip would break webgl-renderer pins (out of owns) + goldens; PG note too weak vs MiniGL. No goldens re-pinned. Changeset `.changeset/vf-5-pairing.md`. Scoped gate green.
+
+---
+
+### VF-6 — Scanout path label + unmodeled filter modes (INVESTIGATE)
+owns: `packages/voodoo`
+depends: none
+status: done (2026-11-03, subagent lane; docs/labels only)
+done-when:
+- [x] Determine which path MiniGL/Quake-II 3D presentation uses (overlay vs desktop); fix path labels in profile/README/comments.
+- [x] Scope decision per unmodeled mode (implement vs tracked omission entry): 3-bit tap filter, bilinear-scaling 11b.
+lane-report:
+- Path relabeled to overlay video-processor (PG §6.5.3; MiniGL unverified — no in-repo MiniGL source). New omissions scanout.tap-3bit / scanout.bilinear-11b. Changeset `.changeset/vf-6-overlay.md`. Scoped gate green (101 passed).
