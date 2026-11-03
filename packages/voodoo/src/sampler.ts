@@ -400,9 +400,22 @@ export function applyFog(
 // --- Lightmap modulate x2 ---------------------------------------------------
 
 /**
- * No per-pixel overbright on Voodoo: diffuse x lightmap x (overbright ? 2 : 1),
- * clamped — highlights clip like the real thing. Inputs/outputs 0..255.
- * Returns packed 0xFFBBGGRR.
+ * Game-pipeline lightmap lift (NOT a Voodoo combine stage): diffuse x
+ * lightmap x (overbright ? 2 : 1), clamped — highlights saturate in the
+ * 8-bit pipeline. Inputs/outputs 0..255. Returns packed 0xFFBBGGRR.
+ *
+ * Provenance (VF-4): no x2/overbright/lightmap scale stage exists in the
+ * Voodoo3 combine units (PG §10.3.1 CCU / §10.3.2 ACU / §10.6.1
+ * texture-combine: mux/add-local/invert only, no scale stage). id ref_gl
+ * ships gl_modulate default 1 (gl_rmain.c:994, declared gl_local.h:226,
+ * applied gl_light.c:276,347,509,546) with GL_MODULATE/GL_REPLACE texenvs
+ * only (gl_rsurf.c) — no GL_RGB_SCALE/COMBINE, no OVERBRIGHT token (the
+ * only "overbright" hit in the id source is an unrelated ref_soft
+ * r_alias.c:937 comment). The x2 is a post-id game/driver-pipeline
+ * convention (Q3-era overbright / gl_modulate 2 / MiniGL-style lift
+ * saturated in 8-bit). Rounding ((m*tr*lr+127)/255)|0 and clamp are this
+ * package's deterministic stand-in (profile 'lightmap.overbright-x2'),
+ * uncalibrated.
  */
 export function modulateLightmap(
   tr: number,

@@ -192,6 +192,12 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
     note: 'PG describes driver-provided mip chains only; the box generation kernel is a deterministic stand-in.',
   }),
   Object.freeze({
+    setting: 'lightmap.overbright-x2',
+    value: 'diffuse x lightmap x (overbright ? 2 : 1), ((m*tr*lr+127)/255)|0 per channel, clamp 255',
+    source: 'approx:chosen',
+    note: 'Post-id game/driver-pipeline convention (Q3-era overbright / gl_modulate 2 / MiniGL-style lift saturated in 8-bit), NOT id ref_gl (default 1: gl_rmain.c:994, gl_local.h:226, gl_light.c) and NOT a Voodoo combine stage (PG §10.3.1/§10.3.2/§10.6.1: mux/add-local/invert only, no scale). Rounding/clamp uncalibrated.',
+  }),
+  Object.freeze({
     setting: 'depth.z16',
     value: 'normalized Z16: depth01 from near/far planes, quantise BEFORE test, LESS wins, ties keep stored, clear = far',
     source: 'approx:chosen',

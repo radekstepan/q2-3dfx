@@ -771,3 +771,17 @@ lane-report:
 - `manual:tLOD` → `manual:textureMode`; new entries `lod.pick-mechanism`, `texture.bilinear-weights`, `texture.mip-kernel` (27 entries). §4 citations re-anchored (depth → fbzMode §9.3.31 + §10.4.2/Table 10.7; texture → textureMode §9.3.58). "Trilinear" renamed everywhere in voodoo (NOT PG two-pass blend).
 - webgl-renderer mirror noted as follow-up (different owner, untouched).
 - Evidence: `turbo ... --filter=@q2/voodoo --force` green, 100 passed. Changeset `.changeset/vf-3-labels.md`.
+
+---
+
+### VF-4 — Overbright ×2 provenance (INVESTIGATE)
+owns: `packages/voodoo`, `packages/webgl-renderer`
+depends: none
+status: done (2026-11-03, subagent lane; no math change)
+done-when:
+- [x] Grep `../external/quake-2-source/ref_gl/` + Glide docs for the ×2 convention; record the actual provenance (file/symbol).
+- [x] Relabel helper + profile entry as Glide/game-pipeline policy (`approx:chosen` or manual-with-source); soften the hardware claim.
+- [x] No math change unless the source shows different rounding/clamp.
+lane-report:
+- Provenance verified: ref_gl gl_modulate default 1 (gl_rmain.c:994), no RGB_SCALE/COMBINE, no OVERBRIGHT token; PG CCU/ACU/combine have no scale stage. x2 = post-id pipeline convention.
+- New `lightmap.overbright-x2` approx:chosen entry; no-math-change guard pins. Changeset `.changeset/vf-4-overbright.md`. Scoped gate green.

@@ -323,7 +323,7 @@ done-when:
 ### VF-4 — Overbright ×2 provenance (INVESTIGATE)
 owns: `packages/voodoo`, `packages/webgl-renderer`
 depends: none
-status: ready
+status: done
 review-finding: no ×2/overbright/lightmap stage exists in PG's combine units
 (CCU §10.3.1, ACU §10.3.2, texture-combine §10.6.1 — mux/add-local/invert only).
 The ×2 (`modulateLightmap`, `sampler.ts:391`) is plausibly Glide/Quake-II-level
@@ -331,9 +331,9 @@ convention (multipass lightmap `SCALE_OTHER`-style programming saturated in the
 8-bit pipeline), but the "No per-pixel overbright on Voodoo" header asserts a
 hardware negative the manuals don't establish.
 done-when:
-- [ ] Grep `../external/quake-2-source/ref_gl/` + Glide docs for the ×2 convention; record the actual provenance (file/symbol).
-- [ ] Relabel helper + profile entry as Glide/game-pipeline policy (`approx:chosen` or manual-with-source); soften the hardware claim.
-- [ ] No math change unless the source shows different rounding/clamp.
+- [x] Grep `../external/quake-2-source/ref_gl/` + Glide docs for the ×2 convention; record the actual provenance (file/symbol).
+- [x] Relabel helper + profile entry as Glide/game-pipeline policy (`approx:chosen` or manual-with-source); soften the hardware claim.
+- [x] No math change unless the source shows different rounding/clamp.
 
 ### VF-5 — Write/scanout default pairing mismatch (INVESTIGATE)
 owns: `packages/voodoo`, `packages/config`

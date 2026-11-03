@@ -266,7 +266,7 @@ describe('appearance pure policy (CPU mirrors of the voodoo source)', () => {
     expect(reconModeToInt('4x4sub+4x1')).toBe(2);
     expect(ditherModeToInt('2x2')).toBe(0);
     expect(ditherModeToInt('4x4')).toBe(1);
-    expect(applyOverbrightCPU(200, 200, true)).toBe(255); // clips like hardware
+    expect(applyOverbrightCPU(200, 200, true)).toBe(255); // saturates in 8-bit
     expect(applyOverbrightCPU(100, 100, true)).toBe(78); // (100*100*2+127)/255
     expect(applyOverbrightCPU(100, 100, false)).toBe(39);
   });

@@ -16,7 +16,7 @@ const ALLOWED: ReadonlySet<string> = new Set([
 describe('VOODOO_APPROX_PROFILE', () => {
   it('is frozen and pins every setting with a valid source tag', () => {
     expect(Object.isFrozen(VOODOO_APPROX_PROFILE)).toBe(true);
-    expect(VOODOO_APPROX_PROFILE.length).toBe(27);
+    expect(VOODOO_APPROX_PROFILE.length).toBe(28);
     const settings = VOODOO_APPROX_PROFILE.map((e) => e.setting);
     // No duplicates, stable order.
     expect(new Set(settings).size).toBe(settings.length);
@@ -46,6 +46,7 @@ describe('VOODOO_APPROX_PROFILE', () => {
       'upload.clamp-nonpot',
       'texture.bilinear-weights',
       'texture.mip-kernel',
+      'lightmap.overbright-x2',
       'depth.z16',
       'depth.wbuffer',
     ]);
@@ -80,5 +81,7 @@ describe('VOODOO_APPROX_PROFILE', () => {
     expect(by('fog.deltas').value).toBe('per-entry 6.2 delta factors NOT applied');
     expect(by('fog.dither-zones').source).toBe('approx:chosen');
     expect(by('scanout.default').source).toBe('approx:chosen');
+    expect(by('lightmap.overbright-x2').source).toBe('approx:chosen');
+    expect(by('lightmap.overbright-x2').value).toContain('overbright ? 2 : 1');
   });
 });

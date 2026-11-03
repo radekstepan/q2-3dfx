@@ -559,8 +559,13 @@ export function underwaterWarpSrc(
 // --- Lightmap overbright (duplicate of voodoo modulateLightmap, CPU form) ---
 
 /**
- * No per-pixel overbright on Voodoo: diffuse x lightmap x (overbright ? 2:1),
- * clamped (voodoo modulateLightmap). The GPU evaluates the same rule in-shader
+ * Game-pipeline lightmap lift, CPU form (duplicate of voodoo
+ * modulateLightmap): diffuse x lightmap x (overbright ? 2:1), clamped.
+ * NOT a Voodoo combine stage (PG §10.3.1 CCU / §10.3.2 ACU / §10.6.1
+ * texture-combine have no scale stage) and NOT id ref_gl (gl_modulate
+ * default 1, gl_rmain.c:994) — a post-id game/driver-pipeline convention
+ * saturated in 8-bit (profile 'lightmap.overbright-x2' in @q2/voodoo;
+ * rounding/clamp uncalibrated). The GPU evaluates the same rule in-shader
  * (uOverbright uniform); this CPU form pins spot values in tests.
  */
 export function applyOverbrightCPU(tr: number, lr: number, overbright: boolean): number {
@@ -961,7 +966,7 @@ export const APPEARANCE_CVAR_DOC: ReadonlyArray<CvarInterpretation> = Object.fre
   { cvar: 'vd_reconmode', kind: 'live-uniform', note: 'uReconMode: matched 2x2sub+2x2box default; legacy = unconditional box alias; 4x4sub+4x1 centered window.' },
   { cvar: 'vd_rgbmaxdelta', kind: 'live-uniform', note: 'uRgbMaxDelta per-component substitute-with-centre thresholds (6-bit 0..63, per-tap deviation from centre); 0,0,0 disables (= unconditional box).' },
   { cvar: 'vd_16bit', kind: 'live-uniform', note: 'u16bit; =0 is the RGB888 debug bypass (gamma on, dither/reconstruction off), mirroring resolveRGB888.' },
-  { cvar: 'vd_overbright', kind: 'live-uniform', note: 'uOverbright modulate x2 + clamp (clipping highlights like hardware); blanket x2 pending the gl_image audit.' },
+  { cvar: 'vd_overbright', kind: 'live-uniform', note: 'uOverbright game-pipeline lightmap lift x2 + clamp (highlights saturate in 8-bit; NOT a Voodoo combine stage — PG CCU/ACU/texture-combine have no scale stage; ref_gl gl_modulate defaults to 1); blanket x2 pending the gl_image audit.' },
   { cvar: 'vd_fog', kind: 'live-uniform', note: 'uFogEnabled capability gate; scene contribution (uFogAmount) is 0 in base1 — no haze expected.' },
   { cvar: 'vd_lodbias', kind: 'live-uniform', note: 'uLodBias added to log2(rho); pinned -0.35 for the proof baseline (negative favours finer).' },
   { cvar: 'vd_mipdither', kind: 'live-uniform', note: 'uMipDither single-TMU n/n+1 Bayer pick (avg +0.375 comp); =0 forces level-n LINEAR (round-to-nearest).' },

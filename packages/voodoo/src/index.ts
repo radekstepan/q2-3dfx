@@ -156,7 +156,8 @@ export function sampleRGBTextureFrame(
 }
 
 /**
- * Cvar-aware shade: lightmap modulate (vd_overbright x2 + clamp) then
+ * Cvar-aware shade: game-pipeline lightmap lift (vd_overbright x2 + clamp,
+ * profile 'lightmap.overbright-x2' — NOT a Voodoo combine stage) then
  * table-fog blend (vd_fog). factor is the 0..255 fog table lookup.
  * Returns packed 0xFFBBGGRR.
  */

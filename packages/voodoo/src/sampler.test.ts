@@ -277,6 +277,14 @@ describe('modulateLightmap', () => {
     expect(modulateLightmap(128, 128, 128, 128, 128, 128, false)).toBe(0xff404040);
     expect(modulateLightmap(255, 200, 100, 255, 255, 255, false)).toBe(0xff64c8ff);
   });
+  it('VF-4 no-math-change guard: x2+clamp spot values stay identical', () => {
+    // Mid-range rounding: ((100*100*2+127)/255)|0 = 78.
+    expect(modulateLightmap(100, 100, 100, 100, 100, 100, true)).toBe(0xff4e4e4e);
+    expect(modulateLightmap(100, 100, 100, 100, 100, 100, false)).toBe(0xff272727);
+    // Per-channel clamp: r,g saturate, b passes through
+    // (((64*255*2+127)/255)|0 = 128).
+    expect(modulateLightmap(255, 128, 64, 255, 255, 255, true)).toBe(0xff80ffff);
+  });
 });
 
 describe('capTextureSize', () => {
