@@ -140,7 +140,7 @@ export const DEPTH_CLEAR_01 = 1.0;
 
 /**
  * Quantise NORMALIZED depth to an integer depth-buffer value BEFORE the depth
- * test/write (guide §4 "Alpha, depth, fog and HUD"). depth01 is derived from
+ * test/write (fbzMode §9.3.31; depth §10.4.2 / Table 10.7). depth01 is derived from
  * the SAME projection near/far planes used for clipping (0 = near, 1 = far),
  * clamped into range; bits is the vd_zbits profile (16 on hardware).
  * Returns round(depth01 * (2^bits - 1)) in [0, 2^bits - 1] (0..65535 at 16).
@@ -174,7 +174,7 @@ export function depthTestLess(quantNew: number, quantStored: number): boolean {
 
 // --- Internal quantized depth plane (true pre-test depthbuffer) --------------
 //
-// Z vs W MAPPING CONTRACT (guide §4 "Alpha, depth, fog and HUD").
+// Z vs W MAPPING CONTRACT (fbzMode §9.3.31; depth §10.4.2 / Table 10.7).
 //
 // These helpers implement a Z-buffer: depth01 is NORMALIZED window depth,
 // 0 = near plane, 1 = far plane, derived from the SAME projection near/far

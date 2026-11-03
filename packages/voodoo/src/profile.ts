@@ -9,10 +9,10 @@
 // reference. Pinned by src/profile.test.ts; summarized in README.md.
 //
 // Source tags:
-// - manual:fbzMode    — defined by the guide's fbzMode register/section.
-// - manual:vidProcCfg — defined by the guide's vidProcCfg/rgbMaxDelta section.
-// - manual:tLOD       — defined by the guide's textureMode/tLOD section.
-// - manual:fogTable   — defined by the guide's fogTable register (§9.3.45) / fog unit (§10.3.4).
+// - manual:fbzMode      — defined by the guide's fbzMode register/section.
+// - manual:vidProcCfg   — defined by the guide's vidProcCfg/rgbMaxDelta section.
+// - manual:textureMode  — defined by the guide's textureMode register (§9.3.58, incl. bit 4 tloddither / lodbias).
+// - manual:fogTable     — defined by the guide's fogTable register (§9.3.45) / fog unit (§10.3.4).
 // - approx:chosen     — deterministic approximation chosen by this package.
 // - preset:appearance — appearance preset (looks right, not measured).
 
@@ -20,7 +20,7 @@
 export type ApproxSource =
   | 'manual:fbzMode'
   | 'manual:vidProcCfg'
-  | 'manual:tLOD'
+  | 'manual:textureMode'
   | 'manual:fogTable'
   | 'approx:chosen'
   | 'preset:appearance';
@@ -55,15 +55,15 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
   }),
   Object.freeze({
     setting: 'scanout.order',
-    value: 'linear pack -> reconstruct/box -> display gamma for all modes (incl. legacy box)',
-    source: 'manual:vidProcCfg',
-    note: 'Single hardware-correct RAMDAC order; the legacy gamma-on-source ordering is removed.',
+    value: 'linear pack -> reconstruct/box in the video processor -> display gamma for all modes (incl. legacy box)',
+    source: 'approx:chosen',
+    note: 'Inferred order from video-proc vs RAMDAC placement (PG §6.5.3 overlay/desktop formats + CLUT-bypass bits); no explicit order sentence in the manual. Video-processor (not RAMDAC) wording.',
   }),
   Object.freeze({
     setting: 'scanout.matched-pairs',
-    value: '2x2sub+2x2box and 4x4sub+4x1 only; subtract matrix dictated by the mode',
+    value: '2x2sub+2x2box and 4x4sub+4x1; subtract matrix dictated by the mode (PG §17.8 3-bit-tap alternative tracked, scope decision in VF-6)',
     source: 'manual:vidProcCfg',
-    note: 'A blanket 2x2 blur after 4x4 dither is not an established hardware pairing.',
+    note: 'A blanket 2x2 blur after 4x4 dither is not the established pairing; PG §17.8 retains a 3-bit tap filter for RGB565 dithered as an alternative to the 2x2 box — unmodeled, scope decision in VF-6.',
   }),
   Object.freeze({
     setting: 'scanout.tap-alignment',
@@ -105,25 +105,31 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
     setting: 'gamma.stage',
     value: 'all modes: linear pack + reconstruct/box, LUT on the display plane after',
     source: 'approx:chosen',
-    note: 'Single hardware-correct RAMDAC order; the legacy gamma-on-source ordering is removed.',
+    note: 'Single video-processor order (not RAMDAC); the legacy gamma-on-source ordering is removed.',
   }),
   Object.freeze({
     setting: 'lod.bias-sign',
     value: 'additive: lod = log2(rho) + bias (negative bias favours finer detail)',
-    source: 'manual:tLOD',
-    note: 'Follows the tLOD.lodbias register convention.',
+    source: 'manual:textureMode',
+    note: 'Follows the textureMode lodbias convention (PG §9.3.58 / tLOD).',
   }),
   Object.freeze({
     setting: 'lod.dither-mean',
-    value: 'hardware LOD dithering averages +0.375',
-    source: 'manual:tLOD',
-    note: 'Documented tloddither average per the programming guide.',
+    value: 'hardware LOD dithering (tloddither, textureMode bit 4) averages +0.375',
+    source: 'manual:textureMode',
+    note: 'textureMode bit 4 tloddither (PG §9.3.58): average +0.375, bias-compensated.',
   }),
   Object.freeze({
     setting: 'lod.compensation',
     value: 'single +0.375 added in mipLevel for the tlodDither path only; round-to-nearest path uncompensated',
     source: 'approx:chosen',
-    note: 'Applied exactly once (never in pickMipLevel); pairing rule: both flags agree. Not smooth trilinear.',
+    note: 'Applied exactly once in mipLevel (never in pickMipLevel); pairing rule: both flags agree. +0.375 addend is manual:textureMode (PG §9.3.58 bit 4); the pick itself is NOT PG trilinear (two-pass blend).',
+  }),
+  Object.freeze({
+    setting: 'lod.pick-mechanism',
+    value: 'dithered single-level selection: per-pixel pick of LOD n or n+1 by fractional LOD vs Bayer threshold',
+    source: 'approx:chosen',
+    note: 'Bayer-threshold pick is package invention (approx:chosen); NOT PG trilinear, which is two-pass blend. +0.375 mean addend is manual:textureMode (PG §9.3.58 bit 4).',
   }),
   Object.freeze({
     setting: 'lod.bias-value',
@@ -172,6 +178,18 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
     value: 'CLAMPED textures: pad to POT + UV scale adjust (padTextureToPOT edge replication)',
     source: 'approx:chosen',
     note: 'Application/driver policy choice: texels preserved byte-exact; resampling would blur.',
+  }),
+  Object.freeze({
+    setting: 'texture.bilinear-weights',
+    value: '4-tap bilinear with 8-bit fixed-point weights',
+    source: 'approx:chosen',
+    note: 'PG confirms 4 taps; silent on weight precision — 8-bit weights are a deterministic stand-in.',
+  }),
+  Object.freeze({
+    setting: 'texture.mip-kernel',
+    value: 'missing mip levels generated by 2x2 box filter (halveRGB)',
+    source: 'approx:chosen',
+    note: 'PG describes driver-provided mip chains only; the box generation kernel is a deterministic stand-in.',
   }),
   Object.freeze({
     setting: 'depth.z16',

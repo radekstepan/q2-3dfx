@@ -301,7 +301,7 @@ done-when:
 ### VF-3 — Profile/comment attribution corrections (BUG-labels)
 owns: `packages/voodoo`
 depends: none
-status: ready
+status: done
 review-finding: (a) `scanout.order` tagged `manual:vidProcCfg` — no explicit
 order sentence exists in PG; filter-before-CLUT is inferred from video-proc vs
 RAMDAC placement, and "RAMDAC order" mislabels video-processor logic.
@@ -315,10 +315,10 @@ bit 4. (d) "guide §4 'Alpha, depth, fog and HUD'" citations (`resolve.ts:143,
 Bayer-threshold pick has no profile entry (the +0.375 addend is manual; the
 pick mechanism is `approx:chosen` invention).
 done-when:
-- [ ] `scanout.order` → `approx:chosen` with inference note; video-proc (not RAMDAC) wording.
-- [ ] `matched-pairs` drops "only"; §17.8 3-bit-tap alternative recorded (scope decision goes to VF-6).
-- [ ] `lod.dither-mean` source → `manual:textureMode`; new entries for the Bayer-pick mechanism, 8-bit bilinear weights, box mip kernel.
-- [ ] All "guide §4" citations fixed; "trilinear" renamed to dithered single-level selection with PG/SP citations.
+- [x] `scanout.order` → `approx:chosen` with inference note; video-proc (not RAMDAC) wording.
+- [x] `matched-pairs` drops "only"; §17.8 3-bit-tap alternative recorded (scope decision goes to VF-6).
+- [x] `lod.dither-mean` source → `manual:textureMode`; new entries for the Bayer-pick mechanism, 8-bit bilinear weights, box mip kernel.
+- [x] All "guide §4" citations fixed; "trilinear" renamed to dithered single-level selection with PG/SP citations.
 
 ### VF-4 — Overbright ×2 provenance (INVESTIGATE)
 owns: `packages/voodoo`, `packages/webgl-renderer`

@@ -755,3 +755,19 @@ lane-report:
 - Implemented inter-entry lerp both paths: `fogFactor` delegates to `fogFactorLerp` (t=w01*64, fi+frac); GLSL `voodooApplyFog` mixes `uFogTable[fi]`/`uFogTable[fi+1]`; new `fogTableLerpFor`/`fogFactorLerpFor` mirrors. Deltas (6.2) + fogdither/forzones recorded as tracked NOT-implemented omissions.
 - New profile entries `fog.formula`, `fog.index-domain`, `fog.interpolation` (manual:fogTable), `fog.deltas`, `fog.dither-zones` (24 entries total).
 - Evidence: subagent `turbo run build typecheck lint test --filter=@q2/voodoo --filter=@q2/webgl-renderer --force` green (voodoo 100 passed, webgl 209 passed); integrator re-ran scoped gate green. Changeset `.changeset/vf-2-fog-lerp.md`.
+
+---
+
+### VF-3 — Profile/comment attribution corrections (BUG-labels)
+owns: `packages/voodoo`
+depends: none
+status: done (2026-11-03, subagent lane; no behavior change)
+done-when:
+- [x] `scanout.order` → `approx:chosen` with inference note; video-proc (not RAMDAC) wording.
+- [x] `matched-pairs` drops "only"; §17.8 3-bit-tap alternative recorded (scope decision goes to VF-6).
+- [x] `lod.dither-mean` source → `manual:textureMode`; new entries for the Bayer-pick mechanism, 8-bit bilinear weights, box mip kernel.
+- [x] All "guide §4" citations fixed; "trilinear" renamed to dithered single-level selection with PG/SP citations.
+lane-report:
+- `manual:tLOD` → `manual:textureMode`; new entries `lod.pick-mechanism`, `texture.bilinear-weights`, `texture.mip-kernel` (27 entries). §4 citations re-anchored (depth → fbzMode §9.3.31 + §10.4.2/Table 10.7; texture → textureMode §9.3.58). "Trilinear" renamed everywhere in voodoo (NOT PG two-pass blend).
+- webgl-renderer mirror noted as follow-up (different owner, untouched).
+- Evidence: `turbo ... --filter=@q2/voodoo --force` green, 100 passed. Changeset `.changeset/vf-3-labels.md`.

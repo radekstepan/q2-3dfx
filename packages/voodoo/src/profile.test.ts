@@ -7,7 +7,7 @@ import { VOODOO_APPROX_PROFILE, type ApproxSource } from './index.js';
 const ALLOWED: ReadonlySet<string> = new Set([
   'manual:fbzMode',
   'manual:vidProcCfg',
-  'manual:tLOD',
+  'manual:textureMode',
   'manual:fogTable',
   'approx:chosen',
   'preset:appearance',
@@ -16,7 +16,7 @@ const ALLOWED: ReadonlySet<string> = new Set([
 describe('VOODOO_APPROX_PROFILE', () => {
   it('is frozen and pins every setting with a valid source tag', () => {
     expect(Object.isFrozen(VOODOO_APPROX_PROFILE)).toBe(true);
-    expect(VOODOO_APPROX_PROFILE.length).toBe(24);
+    expect(VOODOO_APPROX_PROFILE.length).toBe(27);
     const settings = VOODOO_APPROX_PROFILE.map((e) => e.setting);
     // No duplicates, stable order.
     expect(new Set(settings).size).toBe(settings.length);
@@ -35,6 +35,7 @@ describe('VOODOO_APPROX_PROFILE', () => {
       'lod.bias-sign',
       'lod.dither-mean',
       'lod.compensation',
+      'lod.pick-mechanism',
       'lod.bias-value',
       'fog.formula',
       'fog.index-domain',
@@ -43,6 +44,8 @@ describe('VOODOO_APPROX_PROFILE', () => {
       'fog.dither-zones',
       'upload.repeat-nonpot',
       'upload.clamp-nonpot',
+      'texture.bilinear-weights',
+      'texture.mip-kernel',
       'depth.z16',
       'depth.wbuffer',
     ]);
@@ -56,10 +59,15 @@ describe('VOODOO_APPROX_PROFILE', () => {
   });
   it('anchors manual behavior to the guide, approximations to chosen/preset tags', () => {
     const by = (s: string) => VOODOO_APPROX_PROFILE.find((e) => e.setting === s)!;
-    expect(by('scanout.order').source).toBe('manual:vidProcCfg');
+    expect(by('scanout.order').source).toBe('approx:chosen');
     expect(by('scanout.matched-pairs').source).toBe('manual:vidProcCfg');
-    expect(by('lod.bias-sign').source).toBe('manual:tLOD');
-    expect(by('lod.dither-mean').source).toBe('manual:tLOD');
+    expect(by('scanout.matched-pairs').value).not.toContain('only');
+    expect(by('scanout.matched-pairs').note).toContain('§17.8');
+    expect(by('lod.bias-sign').source).toBe('manual:textureMode');
+    expect(by('lod.dither-mean').source).toBe('manual:textureMode');
+    expect(by('lod.pick-mechanism').source).toBe('approx:chosen');
+    expect(by('texture.bilinear-weights').source).toBe('approx:chosen');
+    expect(by('texture.mip-kernel').source).toBe('approx:chosen');
     expect(by('dither.modes').source).toBe('manual:fbzMode');
     expect(by('gamma.value').source).toBe('preset:appearance');
     expect(by('gamma.value').value).toContain('1.3');

@@ -1,6 +1,6 @@
 // @q2/voodoo — shared 4x4 Bayer ordered-dither tables.
 // Used both by the resolve chain (M4.1, pre-quantise dither) and the
-// sampler (M4.2, single-TMU "trilinear" mip-dithering).
+// sampler (M4.2, dithered single-level selection — NOT PG trilinear — mip-dithering).
 //
 // The matrix is the canonical 4x4 Bayer matrix, fixed and deterministic:
 // no RNG anywhere in this package so golden frames are tight.

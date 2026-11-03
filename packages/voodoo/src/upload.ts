@@ -7,7 +7,7 @@
 // texel coordinates; samplers apply NO hidden +0.5/-0.5 of their own, so there
 // is exactly one -0.5 between normalized and texel space. NEVER apply it twice.
 //
-// Upload policy (guide §4 "Texture policy"):
+// Upload policy (textureMode §9.3.58):
 // - Load original WAL assets. Keep WAL mip levels where present and fitting the
 //   cap, else generate missing levels by 2x2 box filtering (completeMipChainRGB
 //   halves with halveRGB; indexed sources must be expanded first — see below).
@@ -229,7 +229,7 @@ function resampleIndexedInto(
 }
 
 /**
- * REAL texel resampling for texture upload (guide §4 "Texture policy") — the
+ * REAL texel resampling for texture upload (textureMode §9.3.58) — the
  * companion to capTextureSize, which only computes smaller DIMENSIONS. Box
  * filter from srcW/srcH to dstW/dstH, preserving aspect when the caller passes
  * capped dimensions (typical: `const {w,h} = capTextureSize(srcW,srcH,max)`).
@@ -365,8 +365,7 @@ export interface PaddedTexture {
 }
 
 /**
- * Pad a non-POT texture to POT for CLAMPED addressing (guide §4 "Texture
- * policy"): edge-replicate into a next-POT buffer, preserving every source
+ * Pad a non-POT texture to POT for CLAMPED addressing (textureMode §9.3.58): edge-replicate into a next-POT buffer, preserving every source
  * texel byte-exact. RGB input (default) pads triplets; indexed input
  * (opts.palette present) pads indices — padding replicates the EDGE index
  * as-is, so transparentIndex texels on the border stay transparent (no

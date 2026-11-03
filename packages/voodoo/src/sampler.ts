@@ -230,7 +230,7 @@ export function mipRho(dudx: number, dvdx: number, dudy: number, dvdy: number): 
 }
 
 /**
- * LOD bias compensation for textureMode.tloddither (prog guide §tLOD).
+ * LOD bias compensation for textureMode.tloddither (textureMode §9.3.58 bit 4).
  *
  * When the hardware dithers LOD selection between adjacent levels it adds an
  * AVERAGE of +0.375 to the level; a single-level software pick (which is what
@@ -240,7 +240,7 @@ export function mipRho(dudx: number, dvdx: number, dudy: number, dvdy: number): 
  * compensation applies. Pairing rule: mipLevel(..., tlodDither) and
  * pickMipLevel(..., mipDither) must agree — both true (hardware tloddither
  * profile) or both false (crisp single-level profile). This is a documented
- * average-match, NOT smooth trilinear filtering and NOT anisotropy (both are
+ * average-match, NOT PG trilinear (two-pass blend) and NOT anisotropy (both are
  * explicitly out of scope: the game profile is GL_LINEAR_MIPMAP_NEAREST).
  */
 export function lodBiasCompensation(tlodDither: boolean): number {
@@ -251,8 +251,7 @@ export function lodBiasCompensation(tlodDither: boolean): number {
  * Mipmap LOD: lod = log2(rho) + bias [+ 0.375 when tlodDither], clamped to
  * [0, maxLevel].
  *
- * Sign convention follows the Voodoo tLOD.lodbias register (prog guide
- * §textureMode/tLOD): the bias is ADDED to log2(rho), so a NEGATIVE bias
+ * Sign convention follows the Voodoo textureMode lodbias (PG §9.3.58): the bias is ADDED to log2(rho), so a NEGATIVE bias
  * (Glide default vd_lodbias = -0.35) favours FINER detail and a positive
  * bias favours coarser levels. (The previous `- bias` sign was backwards;
  * changed intentionally per astra §2.4 — negative bias now sharpens.)
@@ -282,7 +281,7 @@ export function mipLevel(
 }
 
 /**
- * Single-TMU "trilinear": per-pixel pick of LOD n or n+1 by comparing the
+ * Dithered single-level selection (NOT PG trilinear = two-pass blend): per-pixel pick of LOD n or n+1 by comparing the
  * fractional LOD against the Bayer threshold (b/16) at this pixel.
  *   f * 16 <= bayer(x, y) ? n : n + 1
  * f = 0 always picks n, f -> 1 always picks n+1. With mipDither=false this
