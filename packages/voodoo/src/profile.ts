@@ -51,7 +51,13 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
     setting: 'dither.weights-phase',
     value: 'canonical Bayer matrices, +/-0.5 LSB amplitude, absolute screen phase',
     source: 'approx:chosen',
-    note: 'Exact MiniGL matrix weights/amplitude/phase uncalibrated; deterministic stand-in.',
+    note: 'Exact MiniGL matrix weights/amplitude/phase uncalibrated; deterministic stand-in. PG silent on color-dither amplitude/phase; fog-XOR diagrams (fogdither/fog zones) dither the fog blend component, NOT color channels — never cited as color-dither evidence.',
+  }),
+  Object.freeze({
+    setting: 'dither.g-asymmetry',
+    value: '2x2 G offsets [-1,+1,+2,0]: +2 vs -1 from JS Math.round half-up on exact .5 fractions, kept verbatim',
+    source: 'approx:chosen',
+    note: 'Deterministic JS-rounding stand-in (bayer.ts buildOffset2 amp 2: (3-1.5)*2/2=+1.5 rounds to +2 while (0-1.5)*2/2=-1.5 rounds to -1); MiniGL G rounding uncalibrated, PG silent. The 4x4 G table is symmetric under the same formula (no exact .5 fractions at amp 2/8).',
   }),
   Object.freeze({
     setting: 'scanout.order',
@@ -120,6 +126,12 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
     note: 'Single video-processor order (not RAMDAC); the legacy gamma-on-source ordering is removed.',
   }),
   Object.freeze({
+    setting: 'gamma.table-shape',
+    value: 'single 256-entry display LUT vs hardware triple 512-entry video/graphics tables + desktop/overlay select NOT modeled',
+    source: 'approx:chosen',
+    note: 'PG §6.4.4–6.4.5 + SP §11.1.3: hardware holds three 512-entry tables (R/G/B) with separate video/graphics gamma and desktop/overlay select; this package applies one 256-entry power-curve LUT on the display plane for all modes — deterministic stand-in, table count and select unmodeled.',
+  }),
+  Object.freeze({
     setting: 'lod.bias-sign',
     value: 'additive: lod = log2(rho) + bias (negative bias favours finer detail)',
     source: 'manual:textureMode',
@@ -147,7 +159,7 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
     setting: 'lod.bias-value',
     value: 'adjustable (vd_lodbias); default -0.35',
     source: 'preset:appearance',
-    note: '-0.35 is a project preset, not a universal hardware constant.',
+    note: '-0.35 is a project preset, not a universal hardware constant; unrepresentable in the HW 4.2 signed tLOD lodbias format (PG §9.3.59), confirming software-side preset status.',
   }),
   Object.freeze({
     setting: 'fog.formula',

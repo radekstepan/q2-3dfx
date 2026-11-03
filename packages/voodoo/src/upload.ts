@@ -280,7 +280,9 @@ export function resampleTexture(
 }
 
 /**
- * Halve an expanded-RGB image by 2x2 box filtering (one mip step down).
+ * Halve an expanded-RGB image by 2x2 box filtering (one mip step down;
+ * profile 'texture.mip-kernel': PG describes driver-provided chains only —
+ * the box kernel is the deterministic stand-in).
  * Odd dimensions cover the full footprint (3x1 halves to the average of all
  * three, not just the first two). Minimum 1x1; 1x1 input returns a 1x1 copy.
  * Upload-time allocation. Indexed sources: expand first (never average indices).
@@ -299,7 +301,7 @@ export function halveRGB(src: Uint8Array, srcW: number, srcH: number): MipLevel 
 /**
  * WAL mip-chain policy: KEEP the provided levels (WAL's own chain) where
  * present, GENERATE the missing tail by repeated 2x2 box halving from the
- * last present level. Truncates to wantLevels when more are present. Throws on
+ * last present level (profile 'texture.mip-kernel'). Truncates to wantLevels when more are present. Throws on
  * an empty chain or non-positive wantLevels. Stops early at 1x1 (a chain can
  * never be longer than log2(max(w,h)) + 1). Levels are RGB-triplet MipLevels;
  * indexed WAL chains must be expanded at upload before generating.

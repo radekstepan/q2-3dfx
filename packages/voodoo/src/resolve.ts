@@ -18,9 +18,11 @@ let cachedGamma = Number.NaN;
 let cachedLUT: Uint8Array = new Uint8Array(256);
 
 /**
- * Glide-style gamma lift LUT. out[i] = round(255 * (i/255)^(1/gamma)).
- * gamma = 1 is the identity. Glide default ~1.3 brightens midtones
- * (LUT[128] == 150 at gamma 1.3).
+ * Gamma lift LUT (project appearance preset, NOT a measured hardware curve).
+ * out[i] = round(255 * (i/255)^(1/gamma)); gamma = 1 is the identity.
+ * Profiles 'gamma.curve' (power-curve form) + 'gamma.value' (1.3 preset) +
+ * 'gamma.table-shape' (single 256-entry LUT vs hardware triple 512-entry
+ * video/graphics tables). Default 1.3 brightens midtones (LUT[128] == 150).
  */
 export function gammaLUT(gamma: number): Uint8Array {
   if (!(gamma > 0) || !Number.isFinite(gamma)) {

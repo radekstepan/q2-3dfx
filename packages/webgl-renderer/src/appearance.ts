@@ -54,7 +54,8 @@ export const BAYER4: ReadonlyArray<number> = Object.freeze([
 export const BAYER2: ReadonlyArray<number> = Object.freeze([0, 2, 3, 1]);
 
 // Pre-quantise dither offsets in 8-bit units (voodoo DITHER_RB_POS /
-// DITHER_G_POS, verbatim): offset = round((b - 7.5) * amp / 8),
+// DITHER_G_POS, verbatim; profile 'dither.weights-phase': +/-0.5 LSB
+// stand-in, absolute screen phase): offset = round((b - 7.5) * amp / 8),
 // RB amp 4 (LSB 8 -> amplitude 4), G amp 2 (LSB 4 -> amplitude 2).
 export const DITHER_RB4: ReadonlyArray<number> = Object.freeze(
   [-4, 0, -3, 1, 2, -2, 3, -1, -2, 2, -3, 1, 4, 0, 3, -1],
@@ -65,7 +66,8 @@ export const DITHER_G4: ReadonlyArray<number> = Object.freeze(
 
 // 2x2-mode offsets (voodoo DITHER2_RB_POS / DITHER2_G_POS, verbatim):
 // offset = round((b - 1.5) * amp / 2); G asymmetry (+2 vs -1) is JS
-// Math.round half-up on exact .5 fractions, kept verbatim.
+// Math.round half-up on exact .5 fractions, kept verbatim
+// (profile 'dither.g-asymmetry' in @q2/voodoo).
 export const DITHER_RB2: ReadonlyArray<number> = Object.freeze([-3, 1, 3, -1]);
 export const DITHER_G2: ReadonlyArray<number> = Object.freeze([-1, 1, 2, 0]);
 
@@ -105,9 +107,11 @@ export function expand565(v: number): [number, number, number] {
 
 /**
  * Glide-style gamma LUT entry: out = round(255 * (i/255)^(1/gamma))
- * (voodoo gammaLUT, per-entry formula). gamma = 1 is the identity.
+ * (voodoo gammaLUT, per-entry formula; profiles 'gamma.curve' +
+ * 'gamma.value' + 'gamma.table-shape' — single 256-entry display LUT vs
+ * hardware triple 512-entry tables). gamma = 1 is the identity.
  * The GPU evaluates the same curve as pow(c, 1/gamma) in FS_APPEARANCE
- * (RAMDAC placement: after reconstruction); this CPU form pins spot values.
+ * (display-plane placement, after reconstruction); this CPU form pins spot values.
  */
 export function gammaLUTValue(i: number, gamma: number): number {
   if (!(gamma > 0) || !Number.isFinite(gamma) || !Number.isInteger(i) || i < 0 || i > 255) {
@@ -238,11 +242,14 @@ export function fogFactorLerpFor(w01: number, lut: Float32Array = buildFogLUT01(
  */
 export const LOD_DITHER_MEAN = 0.375;
 
-/** Pinned proof-baseline LOD bias (vd_lodbias contract value). */
+/** Pinned proof-baseline LOD bias (vd_lodbias contract value; profile
+ * 'lod.bias-value' in @q2/voodoo — software-side preset, unrepresentable in
+ * the HW 4.2 signed tLOD format). */
 export const PINNED_LOD_BIAS = -0.35;
 
 /**
- * Mipmap LOD (voodoo mipLevel): lod = log2(rho) + bias [+ 0.375 when the
+ * Mipmap LOD (voodoo mipLevel; profile 'lod.bias-value' for the -0.35
+ * software-side preset): lod = log2(rho) + bias [+ 0.375 when the
  * dither path is on], clamped to [0, maxLevel]. rho <= 0 clamps to epsilon
  * (LOD 0); non-finite rho/bias throw. Sign follows the tLOD.lodbias
  * register: NEGATIVE bias favours finer detail.
@@ -267,10 +274,12 @@ export function mipLevelFor(
 }
 
 /**
- * Single-TMU "trilinear" pick (voodoo pickMipLevel): per-pixel choice of LOD
- * n or n+1 by comparing the fractional LOD against the Bayer threshold
- * (b/16) at this pixel — f * 16 <= bayer(x, y) ? n : n + 1. mipDither=false
- * degrades to round-to-nearest. maxLevel clamps. Deterministic (no RNG).
+ * Dithered single-level selection (NOT PG trilinear = two-pass blend;
+ * duplicate of voodoo pickMipLevel, profile 'lod.pick-mechanism' in
+ * @q2/voodoo): per-pixel choice of LOD n or n+1 by comparing the fractional
+ * LOD against the Bayer threshold (b/16) at this pixel — f * 16 <= bayer(x, y)
+ * ? n : n + 1. mipDither=false degrades to round-to-nearest. maxLevel clamps.
+ * Deterministic (no RNG).
  */
 export function pickMipLevelFor(
   lod: number,
@@ -313,7 +322,10 @@ export function mipUVScale(lvl: number): number {
  * level, every tap positive-modulo wrapped. Texel units: texel (i, j)
  * occupies [i, i+1) x [j, j+1) (centre i+0.5), matching GL's (i+0.5)/w
  * convention, so i0 = floor(x - 0.5). Pure, typed arrays, no allocation;
- * GPU float rounding may differ by ~1 LSB. Used by the FOLLOW-3B pixel
+ * GPU float rounding may differ by ~1 LSB. Weight precision itself is a
+ * stand-in (profile 'texture.bilinear-weights' in @q2/voodoo: PG confirms 4
+ * taps, silent on precision; the CPU voodoo path uses 8-bit fixed-point,
+ * this float mirror included). Used by the FOLLOW-3B pixel
  * regression to sample across repeat/face boundaries at fixed times.
  */
 export function sampleLevelBilinearRepeat(
@@ -429,7 +441,9 @@ export interface MipLevelRGB {
 }
 
 /**
- * Halve an expanded-RGB image by 2x2 box filtering (voodoo halveRGB):
+ * Halve an expanded-RGB image by 2x2 box filtering (voodoo halveRGB;
+ * profile 'texture.mip-kernel' in @q2/voodoo — PG describes
+ * driver-provided chains only, the box kernel is the stand-in):
  * odd dimensions cover the full footprint; floor at 1x1.
  */
 export function halveRGBBox(src: Uint8Array, srcW: number, srcH: number): MipLevelRGB {
@@ -639,7 +653,8 @@ export function ditherModeToInt(m: DitherModeStr): number {
 
 // --- GLSL chunks shared by the scene programs (shaders.ts interpolates) -----
 
-/** Canonical 4x4 Bayer table as GLSL (row-major BAYER4, absolute phase). */
+/** Canonical 4x4 Bayer table as GLSL (row-major BAYER4, absolute phase;
+ * profile 'dither.weights-phase' in @q2/voodoo). */
 export const GLSL_BAYER4 =
   `const int VOODOO_BAYER4[16] = int[16](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);\n`;
 
@@ -959,7 +974,7 @@ export interface CvarInterpretation {
 }
 
 export const APPEARANCE_CVAR_DOC: ReadonlyArray<CvarInterpretation> = Object.freeze([
-  { cvar: 'vd_gamma', kind: 'live-uniform', note: 'uGamma display LUT AFTER reconstruction (RAMDAC placement); 1.3 is a project preset, not a hardware constant.' },
+  { cvar: 'vd_gamma', kind: 'live-uniform', note: 'uGamma display LUT AFTER reconstruction (display-plane video-processor placement); 1.3 is a project preset, not a hardware constant; single 256-entry LUT vs hardware triple 512-entry tables unmodeled (profile gamma.table-shape).' },
   { cvar: 'vd_dither', kind: 'live-uniform', note: 'uDitherOn write-matrix dither at target resolve; independent of mip dithering.' },
   { cvar: 'vd_dithermode', kind: 'live-uniform', note: 'uDitherMode write matrix 4x4 (default) / 2x2; the scanout subtract matrix is dictated by vd_reconmode, never this.' },
   { cvar: 'vd_postfilter', kind: 'live-uniform', note: 'uPostfilter; off shows the quantized target per-pixel (never stale), then display gamma.' },
@@ -968,7 +983,7 @@ export const APPEARANCE_CVAR_DOC: ReadonlyArray<CvarInterpretation> = Object.fre
   { cvar: 'vd_16bit', kind: 'live-uniform', note: 'u16bit; =0 is the RGB888 debug bypass (gamma on, dither/reconstruction off), mirroring resolveRGB888.' },
   { cvar: 'vd_overbright', kind: 'live-uniform', note: 'uOverbright game-pipeline lightmap lift x2 + clamp (highlights saturate in 8-bit; NOT a Voodoo combine stage — PG CCU/ACU/texture-combine have no scale stage; ref_gl gl_modulate defaults to 1); blanket x2 pending the gl_image audit.' },
   { cvar: 'vd_fog', kind: 'live-uniform', note: 'uFogEnabled capability gate; scene contribution (uFogAmount) is 0 in base1 — no haze expected.' },
-  { cvar: 'vd_lodbias', kind: 'live-uniform', note: 'uLodBias added to log2(rho); pinned -0.35 for the proof baseline (negative favours finer).' },
+  { cvar: 'vd_lodbias', kind: 'live-uniform', note: 'uLodBias added to log2(rho); pinned -0.35 for the proof baseline (negative favours finer; software-side preset, unrepresentable in the HW 4.2 tLOD format — profile lod.bias-value).' },
   { cvar: 'vd_mipdither', kind: 'live-uniform', note: 'uMipDither single-TMU n/n+1 Bayer pick (avg +0.375 comp); =0 forces level-n LINEAR (round-to-nearest).' },
   { cvar: 'vd_bilinear', kind: 'live-uniform', note: 'Sampler MIN/MAG LINEAR vs NEAREST, switched per frame via texParameteri (no re-upload); mip levels still sampled with textureLod.' },
   { cvar: 'vd_maxtexsize', kind: 'upload-time', note: 'Cap enforced at upload: aspect-preserving box resample + recorded warning (closes the CPU dims-only gap on the GPU path).' },

@@ -16,13 +16,14 @@ const ALLOWED: ReadonlySet<string> = new Set([
 describe('VOODOO_APPROX_PROFILE', () => {
   it('is frozen and pins every setting with a valid source tag', () => {
     expect(Object.isFrozen(VOODOO_APPROX_PROFILE)).toBe(true);
-    expect(VOODOO_APPROX_PROFILE.length).toBe(37);
+    expect(VOODOO_APPROX_PROFILE.length).toBe(39);
     const settings = VOODOO_APPROX_PROFILE.map((e) => e.setting);
     // No duplicates, stable order.
     expect(new Set(settings).size).toBe(settings.length);
     expect(settings).toEqual([
       'dither.modes',
       'dither.weights-phase',
+      'dither.g-asymmetry',
       'scanout.order',
       'scanout.matched-pairs',
       'scanout.tap-alignment',
@@ -34,6 +35,7 @@ describe('VOODOO_APPROX_PROFILE', () => {
       'gamma.curve',
       'gamma.value',
       'gamma.stage',
+      'gamma.table-shape',
       'lod.bias-sign',
       'lod.dither-mean',
       'lod.compensation',
@@ -81,8 +83,15 @@ describe('VOODOO_APPROX_PROFILE', () => {
     expect(by('dither.modes').source).toBe('manual:fbzMode');
     expect(by('gamma.value').source).toBe('preset:appearance');
     expect(by('gamma.value').value).toContain('1.3');
+    expect(by('gamma.table-shape').source).toBe('approx:chosen');
+    expect(by('gamma.table-shape').value).toContain('512-entry');
+    expect(by('gamma.table-shape').note).toContain('§6.4.4');
+    expect(by('dither.g-asymmetry').source).toBe('approx:chosen');
+    expect(by('dither.g-asymmetry').value).toContain('+2 vs -1');
+    expect(by('dither.weights-phase').note).toContain('fog-XOR');
     expect(by('lod.bias-value').source).toBe('preset:appearance');
     expect(by('lod.bias-value').value).toContain('-0.35');
+    expect(by('lod.bias-value').note).toContain('4.2');
     expect(by('depth.wbuffer').value).toBe('W-buffer NOT implemented');
     expect(by('fog.formula').source).toBe('approx:chosen');
     expect(by('fog.index-domain').source).toBe('approx:chosen');

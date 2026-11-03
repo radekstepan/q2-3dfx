@@ -21,7 +21,7 @@ export function captureCVarTable(): CaptureCVar[] {
   return [
     { name: 'vd_16bit', value: 1, meaning: 'quantise 8:8:8 to RGB565 at resolve' },
     { name: 'vd_dither', value: 1, meaning: '4x4 ordered dither before quantise' },
-    { name: 'vd_postfilter', value: 1, meaning: '2x2 "22-bit" RAMDAC post filter' },
+    { name: 'vd_postfilter', value: 1, meaning: '2x2 "22-bit" overlay video-processor post filter' },
     { name: 'vd_bilinear', value: 1, meaning: 'bilinear filtering' },
     { name: 'vd_mipdither', value: 1, meaning: 'dithered single-level selection via mip dithering (NOT PG trilinear)' },
     { name: 'vd_lodbias', value: -0.35, meaning: 'Glide LOD bias' },

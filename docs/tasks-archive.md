@@ -821,3 +821,15 @@ done-when:
 - [x] No silent gaps remain: every PG §10.3–10.4 stage is either implemented or tracked.
 lane-report:
 - 7 pipeline.* omission entries (37 total). Anchors verified verbatim. Changeset `.changeset/vf-7-pipeline.md`. Scoped gate green (101 passed).
+
+---
+
+### VF-8 — Uncalibrated numerics: profile entries (INVESTIGATE-docs)
+owns: `packages/voodoo`, `packages/webgl-renderer`
+depends: none
+status: done (2026-11-03, subagent lane; docs/labels only)
+done-when:
+- [x] One `approx:chosen`/`preset:appearance` entry per item above; code comments point at entries instead of asserting equivalence.
+- [x] `parseRgbMaxDelta`-style overstatements swept: no "what the Voodoo does" phrasing for host-API concepts (`GL_EXT_shared_texture_palette`, NPT).
+lane-report:
+- New entries gamma.table-shape, dither.g-asymmetry (39 total); lod.bias-value 4.2 note; fog-XOR exclusion; GL_EXT/what-the-Voodoo sweep (3 sampler.ts sites). Reused texture.bilinear-weights/mip-kernel/fog.index-domain/lod.pick-mechanism. Changeset `.changeset/vf-8-numerics.md`. Scoped gate green (voodoo 101, webgl 209 passed).

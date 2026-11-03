@@ -1,8 +1,11 @@
 // @q2/voodoo — M4.2 sampler: bilinear, mip LOD + mip-dithering, table fog,
 // lightmap modulate x2, palettised textures, 256x256 cap.
 //
-// All texture data stays palettised (Uint8 indices, GL_EXT_shared_texture_palette
-// style); expansion through the 256-entry palette happens at sample time.
+// All texture data stays palettised (Uint8 indices; host-API palettised-upload
+// convention — this package filters AFTER palette expansion as its
+// deterministic stand-in, profile 'texture.bilinear-weights' for weight
+// precision; NOT a hardware-equivalence claim); expansion through the 256-entry
+// palette happens at sample time.
 // Fixed-point 8-bit fractional weights, clamp-to-edge, zero-alloc.
 
 import { BAYER4 } from './bayer.js';
@@ -22,7 +25,9 @@ function wrapCentre(coord: number, size: number): number {
 /**
  * 4-tap bilinear on a byte texture. u/v are texel coordinates (integer =
  * texel centre — see TEXEL-CENTRE CONVENTION in upload.ts). Fractional parts
- * use 8-bit fixed-point weights: acc = w00*a + w01*b + w10*c + w11*d,
+ * use 8-bit fixed-point weights (profile 'texture.bilinear-weights': PG
+ * confirms 4 taps, silent on precision — 8-bit is the deterministic stand-in):
+ * acc = w00*a + w01*b + w10*c + w11*d,
  * result (acc + 32768) >> 16 with the 16-bit weight products summed exactly.
  * Addressing is per-axis (repeat wraps EACH tap via wrapTap; clamp pins to
  * the edge texel); default clamp preserves the historical behaviour.
@@ -102,8 +107,10 @@ function expandInto(index: number, palette: Uint8Array, tmp: Uint8Array): void {
 
 /**
  * Sample a palettised texture, expanding through the palette at sample time.
- * bilinear=true filters AFTER expansion (what the Voodoo does with
- * GL_EXT_shared_texture_palette); false = point sample. Writes RGB to
+ * bilinear=true filters AFTER expansion (host-API palettised-upload
+ * convention as this package's deterministic stand-in — profile
+ * 'texture.bilinear-weights' for weight precision, NOT a hardware claim);
+ * false = point sample. Writes RGB to
  * out[off..off+2]. Module scratch only (no per-call allocation). Addressing
  * is per-axis (repeat wraps EACH of the 4 taps); default clamp preserves the
  * historical behaviour. u/v are texel coordinates (see upload.ts convention).
@@ -157,7 +164,9 @@ export function samplePalette(
  * (tex[(y*w+x)*3 + c], c = 0..2 for R,G,B), i.e. palette/WAL data already
  * expanded to 8:8:8 at upload time. Same bilinear/nearest policy as
  * samplePalette — bilinear=true filters the four neighbouring TEXELS'
- * colours (what the Voodoo does with non-paletted textures); false point
+ * colours (host-API expanded-upload convention as this package's
+ * deterministic stand-in — profile 'texture.bilinear-weights', NOT a
+ * hardware claim); false point
  * samples. Writes RGB to out[off..off+2]. Module scratch only.
  *
  * Representation note (astra §2.3): vd_palettetex selects the UPLOAD
@@ -252,7 +261,9 @@ export function lodBiasCompensation(tlodDither: boolean): number {
  * [0, maxLevel].
  *
  * Sign convention follows the Voodoo textureMode lodbias (PG §9.3.58): the bias is ADDED to log2(rho), so a NEGATIVE bias
- * (Glide default vd_lodbias = -0.35) favours FINER detail and a positive
+ * (project default vd_lodbias = -0.35, profile 'lod.bias-value' — a
+ * software-side preset, unrepresentable in the HW 4.2 signed tLOD format)
+ * favours FINER detail and a positive
  * bias favours coarser levels. (The previous `- bias` sign was backwards;
  * changed intentionally per astra §2.4 — negative bias now sharpens.)
  *
@@ -281,7 +292,8 @@ export function mipLevel(
 }
 
 /**
- * Dithered single-level selection (NOT PG trilinear = two-pass blend): per-pixel pick of LOD n or n+1 by comparing the
+ * Dithered single-level selection (NOT PG trilinear = two-pass blend;
+ * profile 'lod.pick-mechanism'): per-pixel pick of LOD n or n+1 by comparing the
  * fractional LOD against the Bayer threshold (b/16) at this pixel.
  *   f * 16 <= bayer(x, y) ? n : n + 1
  * f = 0 always picks n, f -> 1 always picks n+1. With mipDither=false this
