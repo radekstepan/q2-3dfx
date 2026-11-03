@@ -1,5 +1,7 @@
 # Q2TS — Quake II in TypeScript
 
+![Q2TS gameplay screenshot](docs/screenshot.png)
+
 Software (`ref_soft`) + Voodoo 3 3000 (`ref_gl` look) port of Quake II that runs
 in the browser. Yarn 4 monorepo with Turbo. See `BRAIN.md` for architecture
 (the normative spec) and `apps/web/src/index.ts` for the current web entry.
