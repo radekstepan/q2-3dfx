@@ -23,6 +23,8 @@ import {
   downsampleToCap,
   expand565,
   fogTableIndex,
+  fogTableLerpFor,
+  fogFactorLerpFor,
   gammaLUTValue,
   halveRGBBox,
   LOD_DITHER_MEAN,
@@ -127,6 +129,56 @@ describe('appearance pure policy (CPU mirrors of the voodoo source)', () => {
     expect(fogTableIndex(0.5)).toBe(32);
     expect(fogTableIndex(1)).toBe(63);
     expect(fogTableIndex(2)).toBe(63);
+  });
+
+  it('fog lerp: mapping pins, smooth ramp, CPU/GPU parity', () => {
+    const lut = buildFogLUT01();
+    // Mapping pins (clamp-to-edge; t = w01*64 saturates at entry 63).
+    expect(fogTableLerpFor(-1)).toEqual({ index: 0, frac: 0 });
+    expect(fogTableLerpFor(0)).toEqual({ index: 0, frac: 0 });
+    expect(fogTableLerpFor(1)).toEqual({ index: 63, frac: 0 });
+    expect(fogTableLerpFor(2)).toEqual({ index: 63, frac: 0 });
+    expect(fogTableLerpFor(63.5 / 64)).toEqual({ index: 63, frac: 0 });
+    const mid = fogTableLerpFor(0.5); // t = 32 exactly
+    expect(mid.index).toBe(32);
+    expect(mid.frac).toBeCloseTo(0, 9);
+    const q = fogTableLerpFor(32.5 / 64); // halfway between entries 32/33
+    expect(q.index).toBe(32);
+    expect(q.frac).toBeCloseTo(0.5, 9);
+    // Endpoints exact through the factor path.
+    expect(fogFactorLerpFor(0)).toBe(0);
+    expect(fogFactorLerpFor(1)).toBe(lut[63]);
+    expect(fogFactorLerpFor(-5)).toBe(0);
+    expect(fogFactorLerpFor(99)).toBe(lut[63]);
+    // Smooth 256-step ramp: lerp peaks at adjacent step ~0.010 (11/255 per
+    // entry over ~4 substeps); nearest-entry lookup would cliff by 11/255
+    // ~= 0.043. Threshold 0.02 discriminates the two.
+    let peak = 0;
+    let prev = fogFactorLerpFor(0);
+    for (let k = 1; k <= 255; k++) {
+      const v = fogFactorLerpFor(k / 255);
+      peak = Math.max(peak, Math.abs(v - prev));
+      prev = v;
+    }
+    expect(peak).toBeLessThan(0.02);
+    // CPU/GPU parity on fixed vectors: voodoo fogFactor uint8 literals
+    // (copied from packages/voodoo buildFogTable, density 3.0) vs the GPU
+    // float-LUT lerp. Tolerance 0.005 (~1.3 LSB): the CPU table rounds each
+    // entry to uint8 (<= 0.5/255 per end) while the GPU LUT keeps unrounded
+    // floats, plus float32 LUT precision.
+    const expected: Array<[number, number]> = [
+      [0, 0],
+      [0.01, 1],
+      [0.13, 37],
+      [0.25, 112],
+      [0.5, 230],
+      [0.77, 254],
+      [0.99, 255],
+      [1, 255],
+    ];
+    for (const [w, cpu] of expected) {
+      expect(Math.abs(fogFactorLerpFor(w) - cpu / 255)).toBeLessThan(0.005);
+    }
   });
 
   it('mip-level selection: bias, +0.375 dither mean, Bayer pick, UV scale', () => {

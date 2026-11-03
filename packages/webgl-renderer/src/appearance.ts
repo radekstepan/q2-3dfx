@@ -29,9 +29,10 @@
 //              parseReconMode/parseRgbMaxDelta/defaultRgbMaxDelta
 //           -> pack565/expand565/gammaLUTValue/parseDitherModeStr/
 //              parseReconModeStr/parseRgbMaxDeltaStr/DEFAULT_RGB_MAX_DELTA.
-//   sampler.ts buildFogTable/fogFactor/mipLevel/pickMipLevel/
+//   sampler.ts buildFogTable/fogFactor/fogFactorLerp/mipLevel/pickMipLevel/
 //              lodBiasCompensation/capTextureSize/modulateLightmap
-//           -> buildFogLUT01/fogTableIndex/mipLevelFor/pickMipLevelFor/
+//           -> buildFogLUT01/fogTableIndex/fogTableLerpFor/fogFactorLerpFor/
+//              mipLevelFor/pickMipLevelFor/
 //              LOD_DITHER_MEAN/capCappedDims/applyOverbrightCPU.
 //   upload.ts halveRGB/resampleRGBInto/nextPOT
 //           -> halveRGBBox/resampleRGBBox (expanded-RGB only: the GPU always
@@ -157,7 +158,7 @@ export function parseRgbMaxDeltaStr(s: string): [number, number, number] {
   return out;
 }
 
-// --- Table fog (duplicate of voodoo/src/sampler.ts buildFogTable/fogFactor) -
+// --- Table fog (duplicate of voodoo/src/sampler.ts buildFogTable/fogFactor/fogFactorLerp) -
 
 /** Fog density for the 64-entry LUT upload (voodoo buildFogTable default). */
 export const FOG_DENSITY = 3.0;
@@ -165,6 +166,8 @@ export const FOG_DENSITY = 3.0;
 /**
  * 64-entry exp^2 fog LUT as 0..1 floats (voodoo buildFogTable, normalized):
  * entry[i] = 1 - exp(-(density * i/63)^2). [0] = 0 (no fog), [63] ~ 1.
+ * The formula + density are driver policy (profile 'fog.formula'): PG
+ * §9.3.45/§10.3.4 leaves the table contents to the application.
  * Uploaded as a `uniform float uFogTable[64]`; the scene contribution is 0
  * in base1 (uFogAmount 0), so the state is live but inert there.
  */
@@ -181,13 +184,47 @@ export function buildFogLUT01(density = FOG_DENSITY): Float32Array {
 }
 
 /**
- * Fog table index for normalized depth w01 in [0, 1] (voodoo fogFactor):
- * clamp-to-edge, index (w01*64)|0. Pure; used by tests to pin the mapping.
+ * Fog table index for normalized depth w01 in [0, 1] (voodoo fogFactor's
+ * entry address): clamp-to-edge, index (w01*64)|0. Pure; used by tests to
+ * pin the mapping. NOTE: the scene shader does NOT sample this nearest
+ * entry — voodooApplyFog lerps between adjacent entries (profile
+ * 'fog.interpolation'); see fogTableLerpFor/fogFactorLerpFor.
  */
 export function fogTableIndex(w01: number): number {
   if (!(w01 > 0)) return 0;
   if (w01 >= 1) return 63;
   return (w01 * 64) | 0;
+}
+
+/**
+ * Fog table lerp position for normalized depth w01 in [0, 1] (voodoo
+ * fogFactorLerp's entry address): clamp-to-edge entry fi = floor(w01*64)
+ * with fraction frac toward fi+1; w01 >= 63/64 saturates at entry 63.
+ * Pure; used by tests to pin the CPU/GPU parity mapping. The w01 domain
+ * itself is caller-side NDC depth, NOT raw 1/W bits (profile
+ * 'fog.index-domain').
+ */
+export function fogTableLerpFor(w01: number): { index: number; frac: number } {
+  if (!(w01 > 0)) return { index: 0, frac: 0 };
+  if (w01 >= 1) return { index: 63, frac: 0 };
+  const t = w01 * 64;
+  if (t >= 63) return { index: 63, frac: 0 };
+  const fi = t | 0;
+  return { index: fi, frac: t - fi };
+}
+
+/**
+ * Lerped fog factor 0..1 for normalized depth w01 (voodoo fogFactorLerp,
+ * normalized): mix(lut[fi], lut[fi+1], frac). CPU/GPU parity holds within
+ * ~1.3 LSB (0.005, pinned in appearance.test.ts): the CPU table rounds each
+ * entry to uint8 while this LUT keeps unrounded floats, plus float32 LUT
+ * precision.
+ */
+export function fogFactorLerpFor(w01: number, lut: Float32Array = buildFogLUT01()): number {
+  const { index, frac } = fogTableLerpFor(w01);
+  const a = lut[index]!;
+  const b = lut[index + 1 > 63 ? 63 : index + 1]!;
+  return a + (b - a) * frac;
 }
 
 // --- Mip LOD (duplicates of voodoo/src/sampler.ts mip policy) ---------------
@@ -674,9 +711,15 @@ vec3 voodooOverbright(vec3 c) {
 vec3 voodooApplyFog(vec3 col, float w01) {
   if (uFogEnabled == 0) return col;
   if (!(uFogAmount > 0.0)) return col;
-  float t = clamp(w01, 0.0, 1.0);
-  int fi = min(int(t * 64.0), 63);
-  float f = clamp(uFogTable[fi] * uFogAmount, 0.0, 1.0);
+  // Inter-entry lerp (profile 'fog.interpolation', PG §10.3.4: low 8 bits
+  // of 1/W blend between entries to reduce banding): t = w01*64 selects
+  // entry fi with fraction fract(t) toward fi+1; fi saturates at 63 so
+  // endpoints stay exact (fract(64)=0 and fi+1 clamps to 63).
+  float t = clamp(w01, 0.0, 1.0) * 64.0;
+  int fi = int(min(floor(t), 63.0));
+  float f0 = uFogTable[fi];
+  float f1 = uFogTable[min(fi + 1, 63)];
+  float f = clamp(mix(f0, f1, fract(t)) * uFogAmount, 0.0, 1.0);
   return mix(col, uFogColor, f);
 }
 `;

@@ -9,6 +9,7 @@ import {
   capTextureSizeFrame,
   expandPalette,
   fogFactor,
+  fogFactorLerp,
   mipLevel,
   mipRho,
   modulateLightmap,
@@ -215,6 +216,40 @@ describe('table fog', () => {
     expect(t[0]).toBe(0);
     expect(t[63]).toBe(255);
     for (let i = 1; i < 64; i++) expect(t[i]).toBeGreaterThanOrEqual(t[i - 1]!);
+  });
+  it('fogFactorLerp lerps between entries: no 64-step banding cliff', () => {
+    const t = buildFogTable();
+    // Endpoints + clamp pins (clamp-to-edge).
+    expect(fogFactorLerp(0)).toBe(0);
+    expect(fogFactorLerp(-3)).toBe(0);
+    expect(fogFactorLerp(1)).toBe(255);
+    expect(fogFactorLerp(99)).toBe(255);
+    // Smooth 256-step ramp over w01 0..1: lerp peaks at adjacent step 3,
+    // while nearest-entry lookup would cliff by up to 11 (max entry delta).
+    let peak = 0;
+    let prev = fogFactorLerp(0);
+    for (let k = 1; k <= 255; k++) {
+      const v = fogFactorLerp(k / 255);
+      peak = Math.max(peak, Math.abs(v - prev));
+      prev = v;
+    }
+    expect(peak).toBeLessThanOrEqual(4);
+    // fogFactor IS the lerp path (same values on fixed vectors).
+    for (const w of [0, 0.01, 0.13, 0.25, 0.5, 0.77, 0.99, 1]) {
+      expect(fogFactor(w)).toBe(fogFactorLerp(w));
+    }
+    // Midpoint between entries 32/33 interpolates instead of picking nearest.
+    expect(fogFactorLerp(32.5 / 64)).toBe(Math.round((t[32]! + t[33]!) / 2));
+  });
+  it('fogFactorLerp is exact on a synthetic table', () => {
+    const st = new Uint8Array(64);
+    for (let i = 0; i < 64; i++) st[i] = i * 4; // 0..252, step 4
+    expect(fogFactorLerp(0, st)).toBe(0);
+    expect(fogFactorLerp(-1, st)).toBe(0);
+    expect(fogFactorLerp(1, st)).toBe(252); // table[63] edge, not 255
+    expect(fogFactorLerp(99, st)).toBe(252);
+    expect(fogFactorLerp(32.5 / 64, st)).toBe(130); // (128+132)/2
+    expect(fogFactorLerp(63.5 / 64, st)).toBe(252); // t >= 63 saturates
   });
   it('fogFactor clamps and hits endpoints', () => {
     expect(fogFactor(0)).toBe(0);

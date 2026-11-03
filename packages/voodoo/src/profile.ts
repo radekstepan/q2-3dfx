@@ -12,6 +12,7 @@
 // - manual:fbzMode    — defined by the guide's fbzMode register/section.
 // - manual:vidProcCfg — defined by the guide's vidProcCfg/rgbMaxDelta section.
 // - manual:tLOD       — defined by the guide's textureMode/tLOD section.
+// - manual:fogTable   — defined by the guide's fogTable register (§9.3.45) / fog unit (§10.3.4).
 // - approx:chosen     — deterministic approximation chosen by this package.
 // - preset:appearance — appearance preset (looks right, not measured).
 
@@ -20,6 +21,7 @@ export type ApproxSource =
   | 'manual:fbzMode'
   | 'manual:vidProcCfg'
   | 'manual:tLOD'
+  | 'manual:fogTable'
   | 'approx:chosen'
   | 'preset:appearance';
 
@@ -36,7 +38,7 @@ export interface ApproxEntry {
 
 /**
  * The documented approximation profile. Order is stable (test-pinned):
- * dither, scanout, gamma, LOD, texture upload, depth.
+ * dither, scanout, gamma, LOD, fog, texture upload, depth.
  */
 export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Object.freeze([
   Object.freeze({
@@ -128,6 +130,36 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
     value: 'adjustable (vd_lodbias); default -0.35',
     source: 'preset:appearance',
     note: '-0.35 is a project preset, not a universal hardware constant.',
+  }),
+  Object.freeze({
+    setting: 'fog.formula',
+    value: 'exp^2 table, density 3.0 default (buildFogTable / buildFogLUT01)',
+    source: 'approx:chosen',
+    note: 'PG §9.3.45/§10.3.4: the table is loaded by the application — formula and density are driver policy, not hardware.',
+  }),
+  Object.freeze({
+    setting: 'fog.index-domain',
+    value: 'caller maps NDC depth to w01 [0,1] first (shaders.ts vFogW); hardware indexes raw 1/W bits',
+    source: 'approx:chosen',
+    note: 'w01*64 stands in for the hardware hi-6-bit index + lo-8-bit blend split; linear w01 is NOT 1/W-bit space.',
+  }),
+  Object.freeze({
+    setting: 'fog.interpolation',
+    value: 'inter-entry lerp by fractional position (CPU fogFactor/fogFactorLerp, GLSL voodooApplyFog)',
+    source: 'manual:fogTable',
+    note: 'PG §10.3.4: low 8 bits of 1/W blend between entries to reduce banding; implemented on the caller w01 domain.',
+  }),
+  Object.freeze({
+    setting: 'fog.deltas',
+    value: 'per-entry 6.2 delta factors NOT applied',
+    source: 'approx:chosen',
+    note: 'PG §9.3.45 defines 6.2 deltas (diff <= 63, sum <= 255); tracked omission — hardware behavior not invented.',
+  }),
+  Object.freeze({
+    setting: 'fog.dither-zones',
+    value: 'fogdither (fogMode[6]) and forzones (fogMode bit 7) NOT implemented',
+    source: 'approx:chosen',
+    note: 'Tracked omission: no dithering of the fog blend component, no signed fog delta.',
   }),
   Object.freeze({
     setting: 'upload.repeat-nonpot',

@@ -740,3 +740,18 @@ lane-report:
 - Tests: `voodoo policy.test.ts` mixed-tap + 6-bit clamp pins; `webgl-renderer appearance.test.ts` GLSL-structure + parity pin; `release10-cvars.test.ts` CPU mirror updated to substitute.
 - Also fixed pre-existing typecheck break: `button-anim.test.ts` `RefDef` import moved from `@q2/sw-renderer` to `@q2/renderer-api`.
 - Evidence: `turbo run build typecheck lint test --filter=@q2/voodoo --filter=@q2/webgl-renderer --force` 15/15 green (21 webgl-renderer files, 208 passed). Full `yarn verify` still has a flaky `testkit gpu-browser` timeout under load (passes in isolation) + the now-fixed typecheck; scoped gate is the card gate. Changeset `.changeset/vf-1-rgbmaxdelta-substitute.md`. No bench row: pure-policy helpers (zero-alloc) + GLSL ALU delta negligible; no frame-loop path changed.
+
+---
+
+### VF-2 — Fog: inter-entry interpolation + fog provenance (BUG-gap)
+owns: `packages/voodoo`, `packages/webgl-renderer`
+depends: none
+status: done (2026-11-03, subagent lane)
+done-when:
+- [x] Either implement the low-8-bit inter-entry lerp (CPU + shader) or add a tracked `approx:chosen` omission entry; same decision for deltas/dither.
+- [x] Profile entries: fog-table formula (driver policy), fog input-domain mapping (who converts to 1/W-bit space), interpolation status.
+- [x] Banding pin: smooth-depth ramp shows no 64-step banding, or the omission entry says so.
+lane-report:
+- Implemented inter-entry lerp both paths: `fogFactor` delegates to `fogFactorLerp` (t=w01*64, fi+frac); GLSL `voodooApplyFog` mixes `uFogTable[fi]`/`uFogTable[fi+1]`; new `fogTableLerpFor`/`fogFactorLerpFor` mirrors. Deltas (6.2) + fogdither/forzones recorded as tracked NOT-implemented omissions.
+- New profile entries `fog.formula`, `fog.index-domain`, `fog.interpolation` (manual:fogTable), `fog.deltas`, `fog.dither-zones` (24 entries total).
+- Evidence: subagent `turbo run build typecheck lint test --filter=@q2/voodoo --filter=@q2/webgl-renderer --force` green (voodoo 100 passed, webgl 209 passed); integrator re-ran scoped gate green. Changeset `.changeset/vf-2-fog-lerp.md`.

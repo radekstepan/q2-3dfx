@@ -284,7 +284,7 @@ same PR (duplicated-by-value rule); `yarn verify` green + changeset per card.
 ### VF-2 — Fog: inter-entry interpolation + fog provenance (BUG-gap)
 owns: `packages/voodoo`, `packages/webgl-renderer`
 depends: none
-status: ready
+status: done
 review-finding: 64-entry table + high-6-bits-of-1/W index CONFIRMED (PG §9.3.45,
 §10.3.4). But PG documents hardware de-banding the implementation skips:
 *"Eight lower order bits of… 1/W are used to blend between multiple entries"*,
@@ -294,9 +294,9 @@ formula + density 3.0 is driver-table policy (PG: *"table is loaded by the
 application"*) with no profile entry; `fogFactor`'s linear-w01 input domain ≠
 hardware's raw-1/W-bit indexing and the caller mapping is unspecified.
 done-when:
-- [ ] Either implement the low-8-bit inter-entry lerp (CPU + shader) or add a tracked `approx:chosen` omission entry; same decision for deltas/dither.
-- [ ] Profile entries: fog-table formula (driver policy), fog input-domain mapping (who converts to 1/W-bit space), interpolation status.
-- [ ] Banding pin: smooth-depth ramp shows no 64-step banding, or the omission entry says so.
+- [x] Either implement the low-8-bit inter-entry lerp (CPU + shader) or add a tracked `approx:chosen` omission entry; same decision for deltas/dither.
+- [x] Profile entries: fog-table formula (driver policy), fog input-domain mapping (who converts to 1/W-bit space), interpolation status.
+- [x] Banding pin: smooth-depth ramp shows no 64-step banding, or the omission entry says so.
 
 ### VF-3 — Profile/comment attribution corrections (BUG-labels)
 owns: `packages/voodoo`

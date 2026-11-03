@@ -350,14 +350,31 @@ export function fogContribution(fogEnabled: boolean, factor: number): number {
 }
 
 /**
- * Fog blend factor 0..255 for normalised depth w01 in [0, 1].
- * The hardware addresses the table with the high bits of 1/W; here the
- * caller maps its depth to [0, 1] first. Clamp-to-edge.
+ * Fog blend factor 0..255 for normalised depth w01 in [0, 1], with
+ * inter-entry lerp (VOODOO_APPROX_PROFILE 'fog.interpolation', PG §10.3.4:
+ * the low 8 bits of 1/W blend between entries to reduce banding).
+ * t = w01 * 64 selects entry fi = floor(t) plus the fraction toward fi+1;
+ * t >= 63 saturates at table[63] so clamp-to-edge endpoints stay exact.
+ * The caller maps its depth to [0, 1] first — the hardware instead indexes
+ * raw 1/W bits (see profile 'fog.index-domain').
  */
 export function fogFactor(w01: number, table: Uint8Array = buildFogTable()): number {
+  return fogFactorLerp(w01, table);
+}
+
+/**
+ * Explicit inter-entry-lerp form of fogFactor: round(table[fi] * (1-frac) +
+ * table[fi+1] * frac). Endpoints exact: w01 <= 0 -> table[0], w01 >= 1 (or
+ * t >= 63) -> table[63].
+ */
+export function fogFactorLerp(w01: number, table: Uint8Array = buildFogTable()): number {
   if (!(w01 > 0)) return table[0]!;
   if (w01 >= 1) return table[63]!;
-  return table[(w01 * 64) | 0]!;
+  const t = w01 * 64;
+  if (t >= 63) return table[63]!;
+  const fi = t | 0;
+  const frac = t - fi;
+  return Math.round(table[fi]! + (table[fi + 1]! - table[fi]!) * frac);
 }
 
 /**
