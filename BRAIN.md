@@ -338,7 +338,7 @@ done-when:
 ### VF-5 — Write/scanout default pairing mismatch (INVESTIGATE)
 owns: `packages/voodoo`, `packages/config`
 depends: none
-status: ready
+status: done
 review-finding: writes default 4x4 (`index.ts:62`) under a `2x2sub+2x2box`
 scanout default (`index.ts:63`) — a mismatched pair by the package's own
 subtract-matrix doctrine; PG notes 3Dfx software often hard-codes 2x2
@@ -346,8 +346,8 @@ subtract-matrix doctrine; PG notes 3Dfx software often hard-codes 2x2
 Mismatch tolerance is guide-silent (separate registers, so tolerated — but
 unverified against MiniGL).
 done-when:
-- [ ] Decide: default `vd_dithermode` to `2x2` for a matched default, or document the mismatch as accepted with rationale.
-- [ ] Whichever way: cvar doc + profile `scanout.default` entry updated; goldens re-pinned only with recorded cause.
+- [x] Decide: default `vd_dithermode` to `2x2` for a matched default, or document the mismatch as accepted with rationale.
+- [x] Whichever way: cvar doc + profile `scanout.default` entry updated; goldens re-pinned only with recorded cause.
 
 ### VF-6 — Scanout path label + unmodeled filter modes (INVESTIGATE)
 owns: `packages/voodoo`

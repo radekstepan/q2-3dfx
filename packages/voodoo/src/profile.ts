@@ -85,9 +85,9 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
   }),
   Object.freeze({
     setting: 'scanout.default',
-    value: "reconmode defaults to '2x2sub+2x2box' (matched 2x2 subtract + box with 8,8,8 rejection); 'legacy' is an accepted alias for the unconditional 2x2 box (no subtraction)",
+    value: "write defaults to 4x4 while reconmode defaults to '2x2sub+2x2box' (accepted mismatch); 'legacy' is an accepted alias for the unconditional 2x2 box (no subtraction)",
     source: 'approx:chosen',
-    note: 'Matched mode is the hardware-correct default; legacy alias kept for compat tests.',
+    note: 'VF-5 decision: PG fbzMode 9.3.31 notes some 3Dfx software hard-codes 2x2, but MiniGL programming is unverified and the flip would break appearance pins + goldens; separate registers tolerate the mismatch (subtract matrix follows recon mode, never vd_dithermode), so 4x4 writes under 2x2 scanout stay the default.',
   }),
   Object.freeze({
     setting: 'gamma.curve',

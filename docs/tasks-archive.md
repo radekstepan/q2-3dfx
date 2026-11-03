@@ -785,3 +785,15 @@ done-when:
 lane-report:
 - Provenance verified: ref_gl gl_modulate default 1 (gl_rmain.c:994), no RGB_SCALE/COMBINE, no OVERBRIGHT token; PG CCU/ACU/combine have no scale stage. x2 = post-id pipeline convention.
 - New `lightmap.overbright-x2` approx:chosen entry; no-math-change guard pins. Changeset `.changeset/vf-4-overbright.md`. Scoped gate green.
+
+---
+
+### VF-5 — Write/scanout default pairing mismatch (INVESTIGATE)
+owns: `packages/voodoo`, `packages/config`
+depends: none
+status: done (2026-11-03, subagent lane)
+done-when:
+- [x] Decide: default `vd_dithermode` to `2x2` for a matched default, or document the mismatch as accepted with rationale.
+- [x] Whichever way: cvar doc + profile `scanout.default` entry updated; goldens re-pinned only with recorded cause.
+lane-report:
+- Decision (b): keep 4x4 default, accepted mismatch. Flip would break webgl-renderer pins (out of owns) + goldens; PG note too weak vs MiniGL. No goldens re-pinned. Changeset `.changeset/vf-5-pairing.md`. Scoped gate green.
