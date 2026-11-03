@@ -655,3 +655,70 @@ lane report: replaced native `title` popups on all settings-panel rows/labels/co
 evidence: new release-10-tooltip.test.ts 21/21 + release-10-panel 12/12 + pos 11/11 + messages/canvas/m71/leg suites green; typecheck + build green. Full web suite: 1 failure in combat.test.ts hitscan-tracer color, verified identical on the clean tree (pre-existing, owning lane's scope, not chased).
 integrator: verified tooltip/panel/pos 44/44 + typecheck clean on the merged tree; combat failure confirmed identical clean-tree via stash reruns.
 changesets: none (apps/web private, ignored). No perf-ledger row (no frame-loop work: one hidden node + input listeners only).
+
+---
+
+## Cleared 2026-11-03 — superseded by the voodoo-fidelity queue (NOT done)
+
+Moved out of BRAIN.md §8 on 2026-11-03 to make room for the
+voodoo3-progguide fidelity findings (review of `packages/voodoo` +
+`packages/webgl-renderer` against `../external/voodoo3_progguide.pdf` +
+`../external/voodoo3_spec.pdf`). Cards below were `review`/`blocked` at
+move time; none is signed off. Resume by moving a card back to §8.
+
+### RELEASE-4B — Over-door housing + genuine-standing finish guard
+owns: `packages/server`, `apps/web`, `packages/testkit`
+depends: none
+status: cleared (was: review — automated green; awaiting user browser verdict)
+lane-report: south-gap housing blocked south-half entries at head height;
+ground-only aboard guard finished on face leans (contact rest parks the body
+overlapping the clip, latching its num with deck feet). Fix: over-door
+housing [145,0,40] (1u off the shut face, west of the slider plane, 8u above
+every hull, E-use-only, both E-use endpoints west of the sliders so LOS never
+crosses them); SV_StandingOn (ground link + feet within 4u of the live box
+top + hull-margin footprint, latched with the ground every tick and E-use).
+evidence: server base1 33/33; web release-4-trace 6/6, elevator 1/1,
+elevator-ride-gate 1/1, base1-gate 24/24; typecheck clean.
+done-when (still open):
+- [ ] User browser verdict on the visible route (walk on, press button, F1).
+
+### RELEASE-16 — Shootable secret-button texture/lighting states
+owns: `packages/game`, `packages/server`, `apps/web`, `packages/sw-renderer`, `packages/webgl-renderer`, `packages/testkit`
+depends: none
+status: cleared (was: review — automated green; awaiting user visual verdict)
+lane-report 2026-11-01: base1 *13 (func_button, target t91, wait -1, health 1);
+Mover fx/frame with C transitions, buttonAnimFrame client rule, texinfo-next
+chain bake (animTexIds), per-tick DoorSync pick, sw texId-drift invalidation,
+WebGL2 range re-sync (no re-upload). Damage activation, target firing, travel
+(+4z TOP hold) and illumination otherwise untouched.
+evidence: game 259/259; sw-renderer 189/189; web button-anim 4/4 (real base1);
+webgl-renderer button-anim 3/3; underwater 13/13 unaffected; typecheck clean.
+user-report: near **(-2146.2, 1556.6, -24)** the secret's shootable button is always lit; its inward motion when shot is correct and must be preserved.
+done-when (still open):
+- [ ] Identify the button brush/entity and WAL/texinfo animation chain at the reported position; before/after/return captures.
+- [ ] Trace frame/effect state through server, submission and both renderers; implement missing propagation without hardcoded recoloring.
+- [ ] Real-asset states on Software and WebGL2 incl. repeats/held/resize, with an effective negative control.
+
+### RELEASE-15 — Verify underwater object appearance against the original
+owns: `apps/web`, `packages/webgl-renderer`, `packages/sw-renderer`, `packages/testkit`
+depends: none
+status: cleared (was: review — Software appearance user-confirmed 2026-10-31; original OpenGL comparison unverified)
+distortion-answer 2026-11-01 (source parity, no code change): neither original
+backend refracts objects through the surface; software warps when submerged
+(preserved), WebGL2 tints only (by design).
+done-when (still open):
+- [ ] Matched original-OpenGL-vs-project-WebGL2 captures (eye above/below/crossing) plus the user verdict on warp vs tint vs refraction.
+
+### GPU-FOLLOW-6 — Verify gameplay on a visible display
+owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
+depends: RELEASE-4, RELEASE-16, RELEASE-15
+status: cleared (was: blocked — no connected monitor/vsync/scanout; submitted-frame throughput is not displayed FPS; startup 3.05s > 2.5s target)
+done-when (still open):
+- [ ] ≥5-minute 640×480 hardware-backed visible soak; immutable build/device/refresh, raw samples, p50/p95/p99; median work ≤16ms, ≥59 FPS, p95 interval ≤20ms; cached-pak-to-first-frame ≤2.5s.
+
+### GPU-FOLLOW-7 — Final integrated acceptance
+owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config`
+depends: all cards above, GPU-FOLLOW-5, GPU-FOLLOW-6
+status: cleared (was: blocked)
+done-when (still open):
+- [ ] Full `yarn verify`, `yarn deps:check`, real-asset base1, software/Node and GPU lifecycle/image/gameplay gates after integration; reconcile archive claims with user verdicts; keep GPU experimental until gates pass.

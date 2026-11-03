@@ -7,14 +7,14 @@
 > Detail docs live in `docs/`: `architecture.md`, `renderers.md`, `data-pipeline.md`,
 > `process.md`, `perf-ledger.md`, `lessons.md`, `tasks-archive.md`.
 > This file states the rules and the *active* work. Everything else is a pointer.
-> **Current direction (2026-11-01, over-door + standing-guard + button-anim
-> landed): elevator entry is fixed without side routes (over-door housing,
-> genuine-standing finish guard) and secret-button art states are implemented
-> (C frame/effects end to end) — both in review awaiting the user's browser
-> verdicts. Software underwater warping is user-confirmed correct (source
-> parity: eye-under warp is soft-only, GL is tint-only — no code change).
-> Preserve landed patrol/tooltip/elevator/button repairs; §8 is the only
-> active queue.**
+> **Current direction (2026-11-03, voodoo-fidelity queue): `packages/voodoo`
+> (+ its duplicated-by-value mirror in `packages/webgl-renderer`) reviewed
+> against `../external/voodoo3_progguide.pdf` + `../external/voodoo3_spec.pdf`.
+> The review found 1 behavioral bug in a hot path (rgbMaxDelta gate), 1 more
+> behavioral deviation (fog interpolation), and labeling/provenance fixes —
+> plus investigation cards for unattested mechanisms and unimplemented stages.
+> Old queue (RELEASE-4B/16/15, GPU-FOLLOW-6/7) is parked cleared-not-done in
+> `docs/tasks-archive.md`. VF-1 first; §8 is the only active queue.**
 
 ---
 
@@ -264,139 +264,157 @@ Full tooling + turbo tasks + risks + glossary: `docs/process.md`.
 
 ## 8. Actionable queue
 
-### Review checkpoint and rules
+### Fidelity review source (2026-11-03)
 
-Source/history reviewed at `e11cfe0` on 2026-10-31, plus RELEASE-4 visible-entry
-fix 2026-11-01 (this session). This was a source/documentation review; no
-browser reproduction or test suite was rerun for the checkpoint itself.
-Latest changes: `b1123a4` elevator button relocation/boarding guard, `1f5d982`
-patrol arrival wait and live-route checks, `00c5790` underwater audit, `e11cfe0`
-custom tooltips, plus this session's render-vs-collision parity (BUTTON_34_SHIFT
-145,-48, visual==collision, C 96 reach) and multi-offset visible-doorway gates.
-User retest: south-half entries still blocked on the south-gap housing, and the
-ground-only aboard guard finished on face leans via contact-rest graze. This
-session answers both: BUTTON_34_SHIFT is now [145,0,40] (over-door housing,
-out of every walk line, E-use-only) and SV_StandingOn requires the latched
-ground link PLUS feet on the live box top PLUS footprint (face leans open
-without finishing; boarding still finishes exactly once). RELEASE-16 is
-implemented end to end (Mover fx/frame, chain bake, per-tick pick, sw drift
-invalidation, WebGL2 range re-sync). Preserve valid increments. Both repair
-lanes are in review below awaiting the user's browser verdicts. Software
-underwater warp is explicitly confirmed correct; no further software warp
-redesign is requested.
+`packages/voodoo` (+ the duplicated-by-value mirror in
+`packages/webgl-renderer/src/appearance.ts`, shaders + `*For` CPU helpers)
+reviewed against `../external/voodoo3_progguide.pdf` (rev 1.4, 14 Jun 1999)
+and `../external/voodoo3_spec.pdf`. Extracted text: `/tmp/opencode/voodoo-review/`
+(regenerable via `pdftotext -layout`). Verdict scale: **BUG** (contradicted by
+the manuals) vs **INVESTIGATE** (unverifiable from the manuals, or a scope
+decision to make). Guide shorthand below: PG = prog guide, SP = spec.
+Old queue (RELEASE-4B/16/15, GPU-FOLLOW-6/7) moved to `docs/tasks-archive.md`
+cleared-not-done on 2026-11-03; resume by moving a card back here.
 
-Patrol and custom-tooltip cards remain archived with their evidence; omission
-from this feedback is not a new visual sign-off. Sky fixes, software support,
-legacy Voodoo retirement and recorded FOLLOW-5 approval remain preserved. GPU
-stays experimental pending integrated/display acceptance. Display absence does
-not block gameplay or button-texture repairs.
+Priority: VF-1 first — the only behavioral bug in a hot path, mirrored in the
+GLSL gate. VF-2/VF-3 next (one more behavioral deviation + labeling). Claim one
+card; keep `packages/voodoo` and its `webgl-renderer` mirror in sync in the
+same PR (duplicated-by-value rule); `yarn verify` green + changeset per card.
 
-Priority: user verdicts on RELEASE-4B + RELEASE-16; RELEASE-15 retains
-only the narrower OpenGL comparison uncertainty. Claim one card; use disjoint
-ownership for independent work and run expensive validation sequentially.
-Actual entry/visual symptoms need production-browser evidence, not a direct
-target invocation or synthetic render. Separate implementation, automated
-results and user verdicts.
-
-### RELEASE-4B — Over-door housing + genuine-standing finish guard
-owns: `packages/server`, `apps/web`, `packages/testkit`
+### VF-1 — rgbMaxDelta gate: per-component substitute-then-filter (BUG)
+owns: `packages/voodoo`, `packages/webgl-renderer`
 depends: none
-status: review (automated green; awaiting user browser verdict)
-user-contract: walk onto the waiting/open final elevator at ANY doorway
-offset, then press its button to finish and show frozen F1 completion stats.
-Boarding alone never finishes; face leans never finish.
-lane-report: south-gap housing blocked south-half entries at head height;
-ground-only aboard guard finished on face leans (contact rest parks the body
-overlapping the clip, latching its num with deck feet). Fix: over-door
-housing [145,0,40] (1u off the shut face, west of the slider plane, 8u above
-every hull, E-use-only, both E-use endpoints west of the sliders so LOS never
-crosses them); SV_StandingOn (ground link + feet within 4u of the live box
-top + hull-margin footprint, latched with the ground every tick and E-use).
-No noclip/teleport/collision bypass; C 96 reach; first-reason-wins.
-evidence: server base1 33/33 (rest/pressed housing boxes, PART B + repeat
-E-use, boarding walk with no phantom obstruction, traversal E-use endgame,
-face-lean no-finish + boarding finish); web release-4-trace 6/6 (box-4
-Y 1492/1536/1568: visual==collision, face stop owns the plug mover, E-use
-opens with t4 and no finish, board ge==plug origin 112 no finish, aboard
-E-use finishes 'lift' once, F1 frozen; box-3b outside-press guard intact),
-elevator 1/1, elevator-ride-gate 1/1, base1-gate 24/24; typecheck clean.
-Y 1488.0-exact grazes the open *32 edge plane and reads contact — C-identical
-1/32-rest + DIST_EPSILON corner behavior, unholdable in play; the gate uses
-Y 1492 (still inside the old housing's band, so the regression stands).
+status: ready
+review-finding: PG §6.5.2 (SP §11.1.2 identical): on a threshold breach *"the
+particular component will be replaced with that corresponding component of the
+center pixel before the pixel is used in the filter"* — per-component
+substitute-and-still-filter, gated on each tap's absolute deviation from the
+centre. Implementation (`resolve.ts:319 passesReconstructionThreshold`,
+`:353 passesReconstructionThresholdRow`, mirrored in GLSL
+`appearance.ts:723-792`) rejects the whole 2x2/4x1 block on max−min spread.
+Observably different (e.g. taps {0,0,0,10}, centre 0: hardware filters with one
+clamped component; ours keeps the block sharp). Parser (`resolve.ts:295`,
+`appearance.ts:149`) accepts 0–255; hardware fields are 6-bit (0–63, PG
+§6.5.2 bits 21:16/13:8/5:0).
 done-when:
-- [x] Reproduce the blockage from the visible doorway and fix the
-blocking state/geometry/activation locally, preserving waiting and valid
-mover/button fixes.
-- [x] Normal entry onto the platform at multiple offsets → reachable button
-press → exactly one finished state with F1 time/kills/secrets/goals; no
-hidden preliminary contact or aim point; outside/unrelated/duplicate
-finish triggers still rejected (incl. the face-lean graze).
-- [x] Browser and real-base1 regressions for the user-visible entry without
-repositioning inside the route or directly firing targets.
-- [ ] User browser verdict on the visible route (walk on, press button, F1).
+- [ ] CPU gates + GLSL gate implement per-component substitute-with-centre then filter; metric is per-tap deviation from centre, not block spread.
+- [ ] Both parsers clamp to 0–63; defaults stay 8,8,8; `0,0,0` still disables.
+- [ ] `scanout.rgbMaxDelta-register` profile entry restated (substitute rule, deviation metric, 6-bit range); mirrored cvar note in `appearance.ts:906` updated.
+- [ ] Fail-before tests: mixed-tap block ({0,0,0,10} centre 0) filters with clamped component; >63 parses clamp; CPU↔GLSL gate parity pin.
 
-### RELEASE-16 — Shootable secret-button texture/lighting states
-owns: `packages/game`, `packages/server`, `apps/web`, `packages/sw-renderer`, `packages/webgl-renderer`, `packages/testkit`
+### VF-2 — Fog: inter-entry interpolation + fog provenance (BUG-gap)
+owns: `packages/voodoo`, `packages/webgl-renderer`
 depends: none
-status: review (automated green; awaiting user visual verdict)
-lane-report 2026-11-01: the button is base1 *13 (func_button, target t91,
-wait -1, health 1); its up/down faces carry 4-frame +0btshoot chains, sides
-are static box1_1. frame/effects were never modeled, submitted, or selected
-(always base texture = always lit). Now: Mover fx/frame with C transitions,
-buttonAnimFrame client rule, texinfo-next chain bake (animTexIds),
-per-tick DoorSync pick, sw texId-drift invalidation, WebGL2 range re-sync
-(no re-upload). Damage activation, target firing, travel (+4z TOP hold) and
-illumination otherwise untouched.
-evidence: game 259/259; sw-renderer 189/189; web button-anim 4/4 (real base1:
-*13 shot swaps ANIM01->ANIM23 with travel/secret preserved, repeat shots
-never re-fire, *34 cycle ANIM01->ANIM23->ANIM23->ANIM01 + 2Hz rest flips,
-WebGL2 scene handles follow live texIds, forced-frame negative control fails
-the held assertion and moves only button pixels); webgl-renderer button-anim
-3/3 (stub-GL rebind without re-upload, no-chain negative control,
-scene-side handles); underwater 13/13 unaffected; typecheck clean.
-user-report: near **(-2146.2, 1556.6, -24)** the secret's shootable button is always lit; its inward motion when shot is correct and must be preserved.
-review-finding: original `game/g_func.c` changes `s.frame` and animation flags: button_wait selects frame 1 and EF_ANIM23; button_return resets frame 0; button_done restores EF_ANIM01. Physical mover position alone is not the complete visual state. The specific brush/material at this camera still needs identification; do not assume every button shares the same art.
+status: ready
+review-finding: 64-entry table + high-6-bits-of-1/W index CONFIRMED (PG §9.3.45,
+§10.3.4). But PG documents hardware de-banding the implementation skips:
+*"Eight lower order bits of… 1/W are used to blend between multiple entries"*,
+plus 6.2 per-entry deltas and `fogdither` (fogMode[6]). `fogFactor`
+(`sampler.ts:357`, `appearance.ts:183`) does nearest-entry lookup. The exp²
+formula + density 3.0 is driver-table policy (PG: *"table is loaded by the
+application"*) with no profile entry; `fogFactor`'s linear-w01 input domain ≠
+hardware's raw-1/W-bit indexing and the caller mapping is unspecified.
 done-when:
-- [ ] Identify the button brush/entity and WAL/texinfo animation chain at the reported position. Compare original unpressed, pressing, held and returning appearances; distinguish authored lit/unlit texture variants from dynamic lighting. Record camera and close crops before/after shooting.
-- [ ] Trace original frame/effect state through server mover updates, retained brush/scene submission and each renderer's animated texture selection. Implement missing state propagation or selection without hardcoded recoloring or globally changing illumination. Preserve damage activation, target firing and correct physical press motion.
-- [ ] Render real-asset before/after/return states on Software and WebGL2, including repeated shots, held buttons and resize/switch while pressed. Add an effective negative control that forces one visual state and fails; mover-distance assertions alone cannot establish button-art correctness.
+- [ ] Either implement the low-8-bit inter-entry lerp (CPU + shader) or add a tracked `approx:chosen` omission entry; same decision for deltas/dither.
+- [ ] Profile entries: fog-table formula (driver policy), fog input-domain mapping (who converts to 1/W-bit space), interpolation status.
+- [ ] Banding pin: smooth-depth ramp shows no 64-step banding, or the omission entry says so.
 
-### RELEASE-15 — Verify underwater object appearance against the original
-owns: `apps/web`, `packages/webgl-renderer`, `packages/sw-renderer`, `packages/testkit`
+### VF-3 — Profile/comment attribution corrections (BUG-labels)
+owns: `packages/voodoo`
 depends: none
-status: review (Software appearance user-confirmed; original OpenGL comparison remains unverified)
-review-finding: `a42e951` adds contents tint on both backends and full-frame software warp; WebGL2 gets tint only. Local original `ref_soft` uses D_WarpScreen, whereas reviewed `ref_gl/gl_rmain.c` uses normal projection and polyblend, with no corresponding RDF_UNDERWATER screen-warp path. Animated water surface UVs are a separate effect. This source finding does not replace a matched visual check of the user's observation.
-user-verdict 2026-10-31: Software underwater warping renders correctly; preserve it. This is not a request to add the software warp to WebGL2.
-distortion-answer 2026-11-01 (source parity, no code change): neither original
-backend refracts objects seen through the surface. ref_soft warps the FULL
-screen only while the eye is under contents (D_WarpScreen + R_CalcPalette);
-ref_gl never warps (R_PolyBlend tint quad only, zero RDF_UNDERWATER readers).
-This project matches both: software warps when submerged (preserved), WebGL2
-tints only (by design). Water-surface UV animation is separate on all sides.
-box-1 remaining scope: matched original-OpenGL-vs-project-WebGL2 captures (eye above/below/crossing, engine/version/map/camera/FOV/time/contents + screenshots or video) plus the user verdict on warp vs tint vs refraction. No headless path to a running original binary in this environment.
+status: ready
+review-finding: (a) `scanout.order` tagged `manual:vidProcCfg` — no explicit
+order sentence exists in PG; filter-before-CLUT is inferred from video-proc vs
+RAMDAC placement, and "RAMDAC order" mislabels video-processor logic.
+(b) `scanout.matched-pairs` claims "only" — PG §17.8 retains a *"3-bit tap
+filter for RGB565 dithered as an alternative to the 2x2 box filter"*.
+(c) `lod.dither-mean` tagged `manual:tLOD` — `tloddither` is `textureMode`
+bit 4. (d) "guide §4 'Alpha, depth, fog and HUD'" citations (`resolve.ts:143,
+177, 202`) — PG §4 is unrelated; correct anchors are `fbzMode` §9.3.31, depth
+§10.4.2/Table 10.7, zaColor §9.3.35, fastfill §9.3.25. (e) "Single-TMU
+'trilinear'" (`sampler.ts:285`) misnames PG trilinear (two-pass blending); the
+Bayer-threshold pick has no profile entry (the +0.375 addend is manual; the
+pick mechanism is `approx:chosen` invention).
 done-when:
-- [ ] Compare matched original OpenGL and project views: eye above water looking at submerged objects, eye below water, and crossing the surface. Record engine/version, map/camera/FOV/time, contents and screenshots/video. Distinguish surface animation, full-screen warp, tint and genuine refraction; identify the observed distortion rather than adding an invented effect.
-- [x] Audit warp/blend ordering, eye-contents detection, viewmodel and HUD behavior, plus renderer switches underwater. Fix demonstrated regressions, preserving backend-specific source behavior and intended water motion. Do not apply software full-screen warp to WebGL solely because it exists in the software source.
-- [x] Capture deterministic known-object geometry and transition tests with omitted-effect controls at multiple resolutions. Record source parity and user visual verdict separately; keep uncertainty open if the original comparison is unavailable.
+- [ ] `scanout.order` → `approx:chosen` with inference note; video-proc (not RAMDAC) wording.
+- [ ] `matched-pairs` drops "only"; §17.8 3-bit-tap alternative recorded (scope decision goes to VF-6).
+- [ ] `lod.dither-mean` source → `manual:textureMode`; new entries for the Bayer-pick mechanism, 8-bit bilinear weights, box mip kernel.
+- [ ] All "guide §4" citations fixed; "trilinear" renamed to dithered single-level selection with PG/SP citations.
 
-### GPU-FOLLOW-6 — Verify gameplay on a visible display
-owns: `apps/web`, `tools/bench`, `packages/testkit`, `docs`
-depends: RELEASE-4, RELEASE-16, RELEASE-15 (other repair evidence archived)
-status: blocked (displayed-performance evidence only)
-blocker: archived `docs/gpu-follow-6-gate-record.md` reports hardware GL but no connected monitor/vsync/scanout. This review did not recheck display availability. Submitted-frame throughput is not displayed FPS. Historical startup 3.05s exceeds the 2.5s target.
+### VF-4 — Overbright ×2 provenance (INVESTIGATE)
+owns: `packages/voodoo`, `packages/webgl-renderer`
+depends: none
+status: ready
+review-finding: no ×2/overbright/lightmap stage exists in PG's combine units
+(CCU §10.3.1, ACU §10.3.2, texture-combine §10.6.1 — mux/add-local/invert only).
+The ×2 (`modulateLightmap`, `sampler.ts:391`) is plausibly Glide/Quake-II-level
+convention (multipass lightmap `SCALE_OTHER`-style programming saturated in the
+8-bit pipeline), but the "No per-pixel overbright on Voodoo" header asserts a
+hardware negative the manuals don't establish.
 done-when:
-- [ ] Once a measurable display exists, run ≥5-minute 640×480 hardware-backed visible soak with rooms/PVS, boarding/ride, combat, viewmodel/effects, sky/water and settings cycles; no silent fallback or unbounded resources.
-- [ ] Record immutable build/device/refresh, raw samples, p50/p95/p99 and dropped frames; require median work ≤16ms, ≥59 FPS at nominal 60Hz and p95 interval ≤20ms separately. Measure cached-pak-to-first-frame ≤2.5s separately.
-- [ ] If a performance gate misses, permit only the remaining one measured optimization iteration, then report. Keep display blocker separate from fixable startup/content defects and continue independent work.
+- [ ] Grep `../external/quake-2-source/ref_gl/` + Glide docs for the ×2 convention; record the actual provenance (file/symbol).
+- [ ] Relabel helper + profile entry as Glide/game-pipeline policy (`approx:chosen` or manual-with-source); soften the hardware claim.
+- [ ] No math change unless the source shows different rounding/clamp.
 
-### GPU-FOLLOW-7 — Final integrated acceptance
-owns: `BRAIN.md`, `docs`, `.changeset`, `apps/web`, `packages/config`
-depends: all active repair cards above, GPU-FOLLOW-5, GPU-FOLLOW-6
-status: blocked (active repairs and display prerequisites; FOLLOW-5 acceptance archived)
+### VF-5 — Write/scanout default pairing mismatch (INVESTIGATE)
+owns: `packages/voodoo`, `packages/config`
+depends: none
+status: ready
+review-finding: writes default 4x4 (`index.ts:62`) under a `2x2sub+2x2box`
+scanout default (`index.ts:63`) — a mismatched pair by the package's own
+subtract-matrix doctrine; PG notes 3Dfx software often hard-codes 2x2
+(`fbzMode` §9.3.31: *"In some 3Dfx… software, this bit is always '1'"*).
+Mismatch tolerance is guide-silent (separate registers, so tolerated — but
+unverified against MiniGL).
 done-when:
-- [ ] Run full `yarn verify`, `yarn deps:check`, real-asset base1, software/Node and GPU lifecycle/image/gameplay gates after integration. Record skips, failures and exact artifacts; no claim of completion based on archived partial greens.
-- [ ] Reconcile archive claims with current user verdicts; publish separate implementation/correctness/fidelity/display-performance results. Close cards only with their required evidence.
-- [ ] Keep GPU experimental until required gates pass and default rollout is explicitly decided. Commit validated increments with changesets, no push; archive completed cards without erasing unresolved work.
+- [ ] Decide: default `vd_dithermode` to `2x2` for a matched default, or document the mismatch as accepted with rationale.
+- [ ] Whichever way: cvar doc + profile `scanout.default` entry updated; goldens re-pinned only with recorded cause.
+
+### VF-6 — Scanout path label + unmodeled filter modes (INVESTIGATE)
+owns: `packages/voodoo`
+depends: none
+status: ready
+review-finding: the dithered-565 reconstruction path is the *overlay* path
+(PG §6.5.3 overlay formats incl. `111b RGB565 dithered`; desktop formats have
+no dithered option) — if the implementation presents reconstruction as desktop
+scanout, the chain is right but the path label is wrong (unless MiniGL presents
+3D via the overlay — unverified). Unmodeled: PG §17.8 3-bit tap alternative
+and `vidProcCfg` mode `11b` bilinear scaling.
+done-when:
+- [ ] Determine which path MiniGL/Quake-II 3D presentation uses (overlay vs desktop); fix path labels in profile/README/comments.
+- [ ] Scope decision per unmodeled mode (implement vs tracked omission entry): 3-bit tap filter, bilinear-scaling 11b.
+
+### VF-7 — Unimplemented pipeline stages: track + scope (INVESTIGATE)
+owns: `packages/voodoo`
+depends: none
+status: ready
+review-finding: core PG pixel-pipeline stages with no helper and no tracking
+entry: alpha-test (αMode[0], §10.4.1 — the masked-texture path), alpha-blend
+(`Dnew = S·alpha + Dold·beta`, §10.3.3 — translucent water/explosions),
+chroma-key (`fbzMode[1]`, §10.4.3), stipple (`fbzMode[2]/[12]`, §10.4.4),
+depth-bias (`fbzMode[16]` — the hardware coplanar tool, cf. the tie-rule
+rationale), 7 of 8 depth ops (only LESS modeled, Table 10.7), `lodmin > 0`.
+done-when:
+- [ ] One `approx:chosen` NOT-implemented profile entry per stage (suggested priority: alpha-test → alpha-blend → chroma-key → depth-bias → stipple → extra depth ops → lodmin).
+- [ ] No silent gaps remain: every PG §10.3–10.4 stage is either implemented or tracked.
+
+### VF-8 — Uncalibrated numerics: profile entries (INVESTIGATE-docs)
+owns: `packages/voodoo`, `packages/webgl-renderer`
+depends: none
+status: ready
+review-finding: deterministic stand-ins with no `VOODOO_APPROX_PROFILE` entry:
+8-bit bilinear weight precision (PG confirms 4 taps, silent on precision),
+2x2-box mip-generation kernel (PG describes only driver-provided chains),
+single 256-entry gamma LUT vs hardware's 512-entry triple tables with separate
+video/graphics gamma + desktop/overlay select (PG §6.4.4–6.4.5, SP §11.1.3),
+fog caller-side w01 mapping (linear ≠ 1/W-bit space), dither ±0.5-LSB
+amplitude/absolute phase (PG silent; fog-XOR diagrams must NOT be cited as
+color-dither evidence), G-channel `Math.round` half-up asymmetry (`+2` vs `-1`,
+`bayer.ts:53-56`), `vd_lodbias` −0.35 unrepresentable in HW 4.2 format
+(confirming software-side preset status).
+done-when:
+- [ ] One `approx:chosen`/`preset:appearance` entry per item above; code comments point at entries instead of asserting equivalence.
+- [ ] `parseRgbMaxDelta`-style overstatements swept: no *"what the Voodoo does"* phrasing for host-API concepts (`GL_EXT_shared_texture_palette`, NPT).
 
 ---
 
