@@ -8,7 +8,7 @@ in the browser. Yarn 4 monorepo with Turbo. See `BRAIN.md` for architecture
 
 ## Prerequisites
 
-- Node 22 (see `.nvmrc`, CI tests Node 20 + 22 per `.github/workflows/ci.yml`):
+- Node 22 (see `.nvmrc`):
   ```bash
   nvm install   # reads .nvmrc
   nvm use
@@ -80,11 +80,6 @@ tools/bench         headless perf runs
 ```
 
 Dependency rules and frozen interfaces are defined in `BRAIN.md` §§4–6.
-
-## CI
-
-Push/PR runs `corepack enable && yarn install --immutable` then `yarn verify`
-on Node 20 and 22.
 
 ## Troubleshooting
 
