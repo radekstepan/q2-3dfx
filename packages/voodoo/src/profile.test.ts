@@ -16,7 +16,7 @@ const ALLOWED: ReadonlySet<string> = new Set([
 describe('VOODOO_APPROX_PROFILE', () => {
   it('is frozen and pins every setting with a valid source tag', () => {
     expect(Object.isFrozen(VOODOO_APPROX_PROFILE)).toBe(true);
-    expect(VOODOO_APPROX_PROFILE.length).toBe(30);
+    expect(VOODOO_APPROX_PROFILE.length).toBe(37);
     const settings = VOODOO_APPROX_PROFILE.map((e) => e.setting);
     // No duplicates, stable order.
     expect(new Set(settings).size).toBe(settings.length);
@@ -51,6 +51,13 @@ describe('VOODOO_APPROX_PROFILE', () => {
       'lightmap.overbright-x2',
       'depth.z16',
       'depth.wbuffer',
+      'pipeline.alpha-test',
+      'pipeline.alpha-blend',
+      'pipeline.chroma-key',
+      'pipeline.depth-bias',
+      'pipeline.stipple',
+      'pipeline.depth-ops-extra',
+      'pipeline.lodmin',
     ]);
     for (const e of VOODOO_APPROX_PROFILE) {
       expect(Object.isFrozen(e)).toBe(true);
@@ -91,5 +98,26 @@ describe('VOODOO_APPROX_PROFILE', () => {
     expect(by('scanout.bilinear-11b').note).toContain('11b');
     expect(by('lightmap.overbright-x2').source).toBe('approx:chosen');
     expect(by('lightmap.overbright-x2').value).toContain('overbright ? 2 : 1');
+    expect(by('pipeline.alpha-test').source).toBe('approx:chosen');
+    expect(by('pipeline.alpha-test').value).toContain('NOT implemented');
+    expect(by('pipeline.alpha-test').note).toContain('§10.4.1');
+    expect(by('pipeline.alpha-blend').source).toBe('approx:chosen');
+    expect(by('pipeline.alpha-blend').value).toContain('NOT implemented');
+    expect(by('pipeline.alpha-blend').note).toContain('§10.3.3');
+    expect(by('pipeline.chroma-key').source).toBe('approx:chosen');
+    expect(by('pipeline.chroma-key').value).toContain('NOT implemented');
+    expect(by('pipeline.chroma-key').note).toContain('§10.4.3');
+    expect(by('pipeline.depth-bias').source).toBe('approx:chosen');
+    expect(by('pipeline.depth-bias').value).toContain('NOT implemented');
+    expect(by('pipeline.depth-bias').note).toContain('fbzMode[16]');
+    expect(by('pipeline.stipple').source).toBe('approx:chosen');
+    expect(by('pipeline.stipple').value).toContain('NOT implemented');
+    expect(by('pipeline.stipple').note).toContain('§10.4.4');
+    expect(by('pipeline.depth-ops-extra').source).toBe('approx:chosen');
+    expect(by('pipeline.depth-ops-extra').value).toContain('LESS only');
+    expect(by('pipeline.depth-ops-extra').note).toContain('Table 10.7');
+    expect(by('pipeline.lodmin').source).toBe('approx:chosen');
+    expect(by('pipeline.lodmin').value).toContain('NOT implemented');
+    expect(by('pipeline.lodmin').note).toContain('tLOD');
   });
 });

@@ -38,7 +38,7 @@ export interface ApproxEntry {
 
 /**
  * The documented approximation profile. Order is stable (test-pinned):
- * dither, scanout, gamma, LOD, fog, texture upload, depth.
+ * dither, scanout, gamma, LOD, fog, texture upload, depth, pipeline.
  */
 export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Object.freeze([
   Object.freeze({
@@ -220,5 +220,47 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
     value: 'W-buffer NOT implemented',
     source: 'approx:chosen',
     note: 'A true W-buffer needs the Voodoo3 1/W hardware encoding; these helpers are Z-operation only.',
+  }),
+  Object.freeze({
+    setting: 'pipeline.alpha-test',
+    value: 'alpha function (alphaMode[0]) NOT implemented',
+    source: 'approx:chosen',
+    note: 'PG §10.4.1: AlphaSrc alphaOP AlphaRef (alphaMode[3:1] ops Table 10.6, ref alphaMode[31:24]); the masked-texture path is unmodeled — cutout pixels always pass.',
+  }),
+  Object.freeze({
+    setting: 'pipeline.alpha-blend',
+    value: 'alpha blending (alphaMode[4]) NOT implemented',
+    source: 'approx:chosen',
+    note: 'PG §10.3.3: Dnew = S·alpha + Dold·beta (RGB factors alphaMode[15:8], alpha factors alphaMode[23:16], Table 10.4); translucent water/explosions unmodeled — no destination blending.',
+  }),
+  Object.freeze({
+    setting: 'pipeline.chroma-key',
+    value: 'chroma-keying (fbzMode[1]) NOT implemented',
+    source: 'approx:chosen',
+    note: 'PG §10.4.3/Tables 10.8–10.9: chromaKey match (or chromaKey/chromaRange range via chromaRange[28/27/26:24]) blocks RGB writes; no color-keyed kill, no fbiChromaFail count.',
+  }),
+  Object.freeze({
+    setting: 'pipeline.depth-bias',
+    value: 'depth-biasing (fbzMode[16]) NOT implemented',
+    source: 'approx:chosen',
+    note: 'PG §9.3.31 fbzMode[16]: calculated depth (Z or 1/W) biased by the zaColor constant depth (PG §9.3.35 zaColor[15:0]; §9.3.31 bit 16 cites zaColor[15]) to fix coplanar aliasing; tie-keeps-stored is the only coplanar rule.',
+  }),
+  Object.freeze({
+    setting: 'pipeline.stipple',
+    value: 'stipple masking (fbzMode[2]/[12]) NOT implemented',
+    source: 'approx:chosen',
+    note: 'PG §10.4.4 + §9.3.32: rotate mode (stipple[31], rotate-on-pixel) vs 4x8 pattern mode (Table 10.10 X-Y access); no screen-door masking.',
+  }),
+  Object.freeze({
+    setting: 'pipeline.depth-ops-extra',
+    value: '7 of 8 depth ops NOT implemented (LESS only)',
+    source: 'approx:chosen',
+    note: 'PG §10.4.2: fbzMode[7:5] selects 8 ops (Table 10.7); only strictly-less modeled (depthTestLess/testAndWriteDepth16), failures uncounted (no fbiZfuncFail).',
+  }),
+  Object.freeze({
+    setting: 'pipeline.lodmin',
+    value: 'lodmin > 0 NOT implemented (lower clamp is always 0)',
+    source: 'approx:chosen',
+    note: 'PG §9.3.59 tLOD: lod+bias clamps to [lodmin, min(8.0,lodmax)] (4.2 signed); mipLevel/pickMipLevel clamp negatives to 0 — minimum-detail floor unmodeled.',
   }),
 ] as ReadonlyArray<Readonly<ApproxEntry>>);

@@ -366,7 +366,7 @@ done-when:
 ### VF-7 — Unimplemented pipeline stages: track + scope (INVESTIGATE)
 owns: `packages/voodoo`
 depends: none
-status: ready
+status: done
 review-finding: core PG pixel-pipeline stages with no helper and no tracking
 entry: alpha-test (αMode[0], §10.4.1 — the masked-texture path), alpha-blend
 (`Dnew = S·alpha + Dold·beta`, §10.3.3 — translucent water/explosions),
@@ -374,8 +374,8 @@ chroma-key (`fbzMode[1]`, §10.4.3), stipple (`fbzMode[2]/[12]`, §10.4.4),
 depth-bias (`fbzMode[16]` — the hardware coplanar tool, cf. the tie-rule
 rationale), 7 of 8 depth ops (only LESS modeled, Table 10.7), `lodmin > 0`.
 done-when:
-- [ ] One `approx:chosen` NOT-implemented profile entry per stage (suggested priority: alpha-test → alpha-blend → chroma-key → depth-bias → stipple → extra depth ops → lodmin).
-- [ ] No silent gaps remain: every PG §10.3–10.4 stage is either implemented or tracked.
+- [x] One `approx:chosen` NOT-implemented profile entry per stage (suggested priority: alpha-test → alpha-blend → chroma-key → depth-bias → stipple → extra depth ops → lodmin).
+- [x] No silent gaps remain: every PG §10.3–10.4 stage is either implemented or tracked.
 
 ### VF-8 — Uncalibrated numerics: profile entries (INVESTIGATE-docs)
 owns: `packages/voodoo`, `packages/webgl-renderer`

@@ -809,3 +809,15 @@ done-when:
 - [x] Scope decision per unmodeled mode (implement vs tracked omission entry): 3-bit tap filter, bilinear-scaling 11b.
 lane-report:
 - Path relabeled to overlay video-processor (PG §6.5.3; MiniGL unverified — no in-repo MiniGL source). New omissions scanout.tap-3bit / scanout.bilinear-11b. Changeset `.changeset/vf-6-overlay.md`. Scoped gate green (101 passed).
+
+---
+
+### VF-7 — Unimplemented pipeline stages: track + scope (INVESTIGATE)
+owns: `packages/voodoo`
+depends: none
+status: done (2026-11-03, subagent lane; docs/labels only)
+done-when:
+- [x] One `approx:chosen` NOT-implemented profile entry per stage (suggested priority: alpha-test → alpha-blend → chroma-key → depth-bias → stipple → extra depth ops → lodmin).
+- [x] No silent gaps remain: every PG §10.3–10.4 stage is either implemented or tracked.
+lane-report:
+- 7 pipeline.* omission entries (37 total). Anchors verified verbatim. Changeset `.changeset/vf-7-pipeline.md`. Scoped gate green (101 passed).
