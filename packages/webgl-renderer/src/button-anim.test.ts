@@ -6,7 +6,8 @@
 // into the live MiniSurf texId per tick (syncButtonAnim); the GPU must draw
 // the picked frame without a static re-upload (diffuse binds per range).
 import { describe, expect, it } from 'vitest';
-import type { MiniSurf, MiniWorld, RefDef } from '@q2/sw-renderer';
+import type { MiniSurf, MiniWorld } from '@q2/sw-renderer';
+import type { RefDef } from '@q2/renderer-api';
 import { refreshGpuScene, selectGpuScene } from './scene.js';
 import { WebGLRenderer } from './renderer.js';
 import { stubGLFull } from './proof3.test.js';

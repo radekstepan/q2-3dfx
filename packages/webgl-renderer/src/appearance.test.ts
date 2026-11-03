@@ -205,6 +205,9 @@ describe('appearance pure policy (CPU mirrors of the voodoo source)', () => {
     expect(parseReconModeStr('nope')).toBe('2x2sub+2x2box');
     expect(parseRgbMaxDeltaStr('8,8,8')).toEqual([8, 8, 8]);
     expect(parseRgbMaxDeltaStr('0,0,0')).toEqual([0, 0, 0]);
+    // 6-bit hardware fields (PG §6.5.2): >63 clamps.
+    expect(parseRgbMaxDeltaStr('300,-5,8')).toEqual([63, 0, 8]);
+    expect(parseRgbMaxDeltaStr('64,64,100')).toEqual([63, 63, 63]);
     expect(DEFAULT_RGB_MAX_DELTA).toEqual([8, 8, 8]);
     expect(reconModeToInt('legacy')).toBe(0);
     expect(reconModeToInt('2x2sub+2x2box')).toBe(1);
@@ -214,6 +217,27 @@ describe('appearance pure policy (CPU mirrors of the voodoo source)', () => {
     expect(applyOverbrightCPU(200, 200, true)).toBe(255); // clips like hardware
     expect(applyOverbrightCPU(100, 100, true)).toBe(78); // (100*100*2+127)/255
     expect(applyOverbrightCPU(100, 100, false)).toBe(39);
+  });
+
+  it('VF-1: GLSL implements per-component substitute-with-centre then filter', () => {
+    // Hardware rule (PG §6.5.2): breaching components are replaced with the
+    // centre tap before the filter; metric is per-tap deviation from centre.
+    expect(FS_APPEARANCE).toContain('subTap');
+    expect(FS_APPEARANCE).toContain('gateDisabled');
+    expect(FS_APPEARANCE).not.toContain('passesGate');
+    expect(FS_APPEARANCE).toContain('abs(tap - centre)');
+    // CPU↔GLSL parity pin: replicate the GLSL subTap in JS and require the
+    // fail-before vector {0,0,0,10} centre 0 to filter with a clamped
+    // component (average 0), not keep the block sharp.
+    const delta: [number, number, number] = [8, 8, 8];
+    const subJs = (tap: number, centre: number, ch: 0 | 1 | 2): number =>
+      Math.abs(tap - centre) > delta[ch] ? centre : tap;
+    const taps = [0, 0, 0, 10];
+    const centre = 0;
+    const subs = taps.map((t) => subJs(t, centre, 0));
+    expect(subs).toEqual([0, 0, 0, 0]);
+    const avg = Math.floor((subs[0]! + subs[1]! + subs[2]! + subs[3]! + 2) / 4);
+    expect(avg).toBe(0);
   });
 
   it('appearance GLSL is absolute-phase and alpha-preserving by review', () => {

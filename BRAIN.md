@@ -281,27 +281,6 @@ GLSL gate. VF-2/VF-3 next (one more behavioral deviation + labeling). Claim one
 card; keep `packages/voodoo` and its `webgl-renderer` mirror in sync in the
 same PR (duplicated-by-value rule); `yarn verify` green + changeset per card.
 
-### VF-1 — rgbMaxDelta gate: per-component substitute-then-filter (BUG)
-owns: `packages/voodoo`, `packages/webgl-renderer`
-depends: none
-status: ready
-review-finding: PG §6.5.2 (SP §11.1.2 identical): on a threshold breach *"the
-particular component will be replaced with that corresponding component of the
-center pixel before the pixel is used in the filter"* — per-component
-substitute-and-still-filter, gated on each tap's absolute deviation from the
-centre. Implementation (`resolve.ts:319 passesReconstructionThreshold`,
-`:353 passesReconstructionThresholdRow`, mirrored in GLSL
-`appearance.ts:723-792`) rejects the whole 2x2/4x1 block on max−min spread.
-Observably different (e.g. taps {0,0,0,10}, centre 0: hardware filters with one
-clamped component; ours keeps the block sharp). Parser (`resolve.ts:295`,
-`appearance.ts:149`) accepts 0–255; hardware fields are 6-bit (0–63, PG
-§6.5.2 bits 21:16/13:8/5:0).
-done-when:
-- [ ] CPU gates + GLSL gate implement per-component substitute-with-centre then filter; metric is per-tap deviation from centre, not block spread.
-- [ ] Both parsers clamp to 0–63; defaults stay 8,8,8; `0,0,0` still disables.
-- [ ] `scanout.rgbMaxDelta-register` profile entry restated (substitute rule, deviation metric, 6-bit range); mirrored cvar note in `appearance.ts:906` updated.
-- [ ] Fail-before tests: mixed-tap block ({0,0,0,10} centre 0) filters with clamped component; >63 parses clamp; CPU↔GLSL gate parity pin.
-
 ### VF-2 — Fog: inter-entry interpolation + fog provenance (BUG-gap)
 owns: `packages/voodoo`, `packages/webgl-renderer`
 depends: none

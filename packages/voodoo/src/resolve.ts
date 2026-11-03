@@ -258,15 +258,16 @@ export function testAndWriteDepth16(
 // --- Scanout reconstruction thresholds (vidProcCfg/rgbMaxDelta) --------------
 
 /**
- * Per-component rejection thresholds for scanout reconstruction, mirroring
- * the rgbMaxDelta register (prog guide §vidProcCfg): when the 2x2 display
- * taps differ by more than the threshold in any channel, the block holds an
- * edge and must NOT be box-averaged away.
+ * Per-component substitution thresholds for scanout reconstruction,
+ * mirroring the rgbMaxDelta register (prog guide §6.5.2 vidProcCfg,
+ * 6-bit fields: rmax bits 21:16, gmax 13:8, bmax 5:0): when a tap's
+ * absolute deviation from the CENTRE exceeds the threshold in any channel,
+ * that component is replaced with the centre's component before filtering.
  *
  * APPROXIMATION UNTIL HW CAPTURE: the Quake II MiniGL programming of this
  * register is not yet established from a hardware capture, so the default
- * below is a placeholder (smooth gradients pass, hard edges reject); the
- * all-zero value disables the gate (unconditional box).
+ * below is a placeholder (smooth gradients pass, hard edges substitute);
+ * the all-zero value disables the gate (unconditional box).
  */
 export interface RgbMaxDelta {
   r: number;
@@ -284,10 +285,12 @@ export function defaultRgbMaxDelta(): RgbMaxDelta {
 }
 
 /**
- * Parse vd_rgbmaxdelta ('r,g,b', each 0..255, clamped; unparseable or missing
- * components fall back to 0). '0,0,0' disables rejection:
- * passesReconstructionThreshold returns true unconditionally, i.e. an
- * unconditional box. The live voodoo default is {8,8,8} (see
+ * Parse vd_rgbmaxdelta ('r,g,b', each 0..63 clamped; unparseable or missing
+ * components fall back to 0). Hardware fields are 6-bit (PG §6.5.2
+ * rgbMaxDelta bits 21:16/13:8/5:0: rmax 21:16, gmax 13:8, bmax 5:0), so
+ * values >63 clamp to 63. '0,0,0' disables rejection:
+ * substitute/reconstruct helpers return the unconditional box, i.e. an
+ * unconditional average. The live voodoo default is {8,8,8} (see
  * defaultRgbMaxDelta); the parse fallback stays per-component 0 so an
  * explicitly cleared cvar ('0,0,0' as registered in @q2/config) keeps
  * parsing to itself.
@@ -297,24 +300,36 @@ export function parseRgbMaxDelta(s: string): RgbMaxDelta {
   const nums: number[] = [0, 0, 0];
   for (let i = 0; i < 3; i++) {
     const v = Number((parts[i] ?? '').trim());
-    nums[i] = !Number.isFinite(v) ? 0 : v < 0 ? 0 : v > 255 ? 255 : Math.round(v);
+    nums[i] = !Number.isFinite(v) ? 0 : v < 0 ? 0 : v > 63 ? 63 : Math.round(v);
   }
   return { r: nums[0]!, g: nums[1]!, b: nums[2]! };
 }
 
 /**
- * Edge-rejection gate for scanout reconstruction (vidProcCfg/rgbMaxDelta).
- * Returns true when the 2x2 block of packed 0xFFBBGGRR taps is smooth enough
- * to box-filter (per-channel spread <= the matching maxDelta component) and
- * false when any channel spread exceeds it (one-pixel edge: keep sharp, do
- * not blur the dither/edge away). Pure, zero-alloc.
+ * Edge-rejection gate for scanout reconstruction (vidProcCfg/rgbMaxDelta,
+ * PG §6.5.2 / SP §11.1.2).
+ *
+ * Hardware rule: on a threshold breach *"the particular component will be
+ * replaced with that corresponding component of the center pixel before the
+ * pixel is used in the filter"* — per-component substitute-with-centre,
+ * then filter. The metric is per-tap absolute deviation from the CENTRE,
+ * not block max−min spread. Centre is p00 for the 2x2 window (the output
+ * pixel, matching GLSL recon2x2) and p1 for the 4x1 row (matching GLSL
+ * recon4x1's centred [x-1,x+2] window).
+ *
+ * These boolean helpers report whether substitution would occur (true =
+ * every tap within thresholds, i.e. the box averages raw taps). The actual
+ * substitute-then-filter output is computed by substituteTap /
+ * reconstructFiltered2x2 / reconstructFilteredRow below, which the GLSL
+ * mirror implements per-component. Pure, zero-alloc.
  *
  * ALL-ZERO DISABLES THE GATE: maxDelta {0,0,0} returns true
  * unconditionally — an unconditional box (e.g. under the 'legacy' alias).
- * Nonzero thresholds reject per channel; a channel threshold of 0 while others are
- * nonzero still rejects on that channel (any spread > 0 fails), so enable
- * the gate with all three components (e.g. the {8,8,8} comparison profile).
- * Threshold programming is a DETERMINISTIC APPROXIMATION until HW capture.
+ * Nonzero thresholds check per tap per channel; a channel threshold of 0
+ * while others are nonzero still substitutes on any deviation > 0 for that
+ * channel, so enable the gate with all three components (e.g. the {8,8,8}
+ * comparison profile). Threshold programming is a DETERMINISTIC
+ * APPROXIMATION until HW capture.
  */
 export function passesReconstructionThreshold(
   p00: number,
@@ -324,31 +339,22 @@ export function passesReconstructionThreshold(
   maxDelta: RgbMaxDelta,
 ): boolean {
   if (maxDelta.r === 0 && maxDelta.g === 0 && maxDelta.b === 0) return true;
-  const r0 = p00 & 255;
-  const r1 = p10 & 255;
-  const r2 = p01 & 255;
-  const r3 = p11 & 255;
-  const g0 = (p00 >> 8) & 255;
-  const g1 = (p10 >> 8) & 255;
-  const g2 = (p01 >> 8) & 255;
-  const g3 = (p11 >> 8) & 255;
-  const b0 = (p00 >> 16) & 255;
-  const b1 = (p10 >> 16) & 255;
-  const b2 = (p01 >> 16) & 255;
-  const b3 = (p11 >> 16) & 255;
-  const rs = Math.max(r0, r1, r2, r3) - Math.min(r0, r1, r2, r3);
-  if (rs > maxDelta.r) return false;
-  const gs = Math.max(g0, g1, g2, g3) - Math.min(g0, g1, g2, g3);
-  if (gs > maxDelta.g) return false;
-  const bs = Math.max(b0, b1, b2, b3) - Math.min(b0, b1, b2, b3);
-  if (bs > maxDelta.b) return false;
+  const cr = p00 & 255;
+  const cg = (p00 >> 8) & 255;
+  const cb = (p00 >> 16) & 255;
+  const others = [p10, p01, p11];
+  for (const p of others) {
+    if (Math.abs((p & 255) - cr) > maxDelta.r) return false;
+    if (Math.abs(((p >> 8) & 255) - cg) > maxDelta.g) return false;
+    if (Math.abs(((p >> 16) & 255) - cb) > maxDelta.b) return false;
+  }
   return true;
 }
 
 /**
  * Row variant of the edge-rejection gate for the 4x1 filter: same
- * per-channel spread rule over four HORIZONTAL taps. All-zero disables.
- * Pure, zero-alloc.
+ * per-component substitute rule, centre is p1 (the output pixel of the
+ * centred [x-1,x+2] window). All-zero disables. Pure, zero-alloc.
  */
 export function passesReconstructionThresholdRow(
   p0: number,
@@ -358,17 +364,99 @@ export function passesReconstructionThresholdRow(
   maxDelta: RgbMaxDelta,
 ): boolean {
   if (maxDelta.r === 0 && maxDelta.g === 0 && maxDelta.b === 0) return true;
-  const rs =
-    Math.max(p0 & 255, p1 & 255, p2 & 255, p3 & 255) -
-    Math.min(p0 & 255, p1 & 255, p2 & 255, p3 & 255);
-  if (rs > maxDelta.r) return false;
-  const gs =
-    Math.max((p0 >> 8) & 255, (p1 >> 8) & 255, (p2 >> 8) & 255, (p3 >> 8) & 255) -
-    Math.min((p0 >> 8) & 255, (p1 >> 8) & 255, (p2 >> 8) & 255, (p3 >> 8) & 255);
-  if (gs > maxDelta.g) return false;
-  const bs =
-    Math.max((p0 >> 16) & 255, (p1 >> 16) & 255, (p2 >> 16) & 255, (p3 >> 16) & 255) -
-    Math.min((p0 >> 16) & 255, (p1 >> 16) & 255, (p2 >> 16) & 255, (p3 >> 16) & 255);
-  if (bs > maxDelta.b) return false;
+  const cr = p1 & 255;
+  const cg = (p1 >> 8) & 255;
+  const cb = (p1 >> 16) & 255;
+  const others = [p0, p2, p3];
+  for (const p of others) {
+    if (Math.abs((p & 255) - cr) > maxDelta.r) return false;
+    if (Math.abs(((p >> 8) & 255) - cg) > maxDelta.g) return false;
+    if (Math.abs(((p >> 16) & 255) - cb) > maxDelta.b) return false;
+  }
   return true;
+}
+
+/** Extract R channel from packed 0xFFBBGGRR. */
+function chanR(p: number): number {
+  return p & 255;
+}
+/** Extract G channel from packed 0xFFBBGGRR. */
+function chanG(p: number): number {
+  return (p >> 8) & 255;
+}
+/** Extract B channel from packed 0xFFBBGGRR. */
+function chanB(p: number): number {
+  return (p >> 16) & 255;
+}
+
+/** Pack R/G/B channels into 0xFFBBGGRR (alpha always opaque). */
+function packRGB(r: number, g: number, b: number): number {
+  return (0xff000000 | (b << 16) | (g << 8) | r) >>> 0;
+}
+
+/**
+ * Per-component substitute of one tap against the centre (PG §6.5.2):
+ * each channel whose absolute deviation from the centre exceeds the
+ * matching maxDelta component is replaced with the centre's component;
+ * channels within threshold keep the tap's value. All-zero maxDelta
+ * disables substitution (returns the tap unchanged — the caller averages
+ * raw taps into the unconditional box). Pure.
+ */
+export function substituteTap(tap: number, centre: number, maxDelta: RgbMaxDelta): number {
+  if (maxDelta.r === 0 && maxDelta.g === 0 && maxDelta.b === 0) return tap;
+  const tr = chanR(tap);
+  const tg = chanG(tap);
+  const tb = chanB(tap);
+  const cr = chanR(centre);
+  const cg = chanG(centre);
+  const cb = chanB(centre);
+  const r = Math.abs(tr - cr) > maxDelta.r ? cr : tr;
+  const g = Math.abs(tg - cg) > maxDelta.g ? cg : tg;
+  const b = Math.abs(tb - cb) > maxDelta.b ? cb : tb;
+  return packRGB(r, g, b);
+}
+
+/**
+ * Substitute-then-filter for the 2x2 window (centre p00): substitute p10,
+ * p01, p11 against p00 per-component, then box-average with the shader's
+ * floor((sum+2)/4) rule. All-zero maxDelta averages raw taps
+ * (unconditional box). Pure.
+ */
+export function reconstructFiltered2x2(
+  p00: number,
+  p10: number,
+  p01: number,
+  p11: number,
+  maxDelta: RgbMaxDelta,
+): number {
+  const a = p00;
+  const b = substituteTap(p10, p00, maxDelta);
+  const c = substituteTap(p01, p00, maxDelta);
+  const d = substituteTap(p11, p00, maxDelta);
+  const r = ((chanR(a) + chanR(b) + chanR(c) + chanR(d) + 2) / 4) | 0;
+  const g = ((chanG(a) + chanG(b) + chanG(c) + chanG(d) + 2) / 4) | 0;
+  const bl = ((chanB(a) + chanB(b) + chanB(c) + chanB(d) + 2) / 4) | 0;
+  return packRGB(r, g, bl);
+}
+
+/**
+ * Substitute-then-filter for the centred 4x1 row (centre p1): substitute
+ * p0, p2, p3 against p1 per-component, then box-average with
+ * floor((sum+2)/4). All-zero maxDelta averages raw taps. Pure.
+ */
+export function reconstructFilteredRow(
+  p0: number,
+  p1: number,
+  p2: number,
+  p3: number,
+  maxDelta: RgbMaxDelta,
+): number {
+  const a = substituteTap(p0, p1, maxDelta);
+  const b = p1;
+  const c = substituteTap(p2, p1, maxDelta);
+  const d = substituteTap(p3, p1, maxDelta);
+  const r = ((chanR(a) + chanR(b) + chanR(c) + chanR(d) + 2) / 4) | 0;
+  const g = ((chanG(a) + chanG(b) + chanG(c) + chanG(d) + 2) / 4) | 0;
+  const bl = ((chanB(a) + chanB(b) + chanB(c) + chanB(d) + 2) / 4) | 0;
+  return packRGB(r, g, bl);
 }

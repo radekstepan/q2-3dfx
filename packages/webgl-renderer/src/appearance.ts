@@ -142,16 +142,17 @@ export function parseReconModeStr(s: string): ReconModeStr {
 export const DEFAULT_RGB_MAX_DELTA: Readonly<[number, number, number]> = Object.freeze([8, 8, 8] as const);
 
 /**
- * vd_rgbmaxdelta parse (voodoo parseRgbMaxDelta): 'r,g,b', each 0..255
- * clamped/rounded; unparseable components fall back to 0 (so an explicitly
- * cleared '0,0,0' parses to itself and disables edge rejection).
+ * vd_rgbmaxdelta parse (voodoo parseRgbMaxDelta): 'r,g,b', each 0..63
+ * clamped/rounded (hardware 6-bit fields, PG §6.5.2 bits 21:16/13:8/5:0);
+ * unparseable components fall back to 0 (so an explicitly
+ * cleared '0,0,0' parses to itself and disables edge substitution).
  */
 export function parseRgbMaxDeltaStr(s: string): [number, number, number] {
   const parts = s.split(',');
   const out: [number, number, number] = [0, 0, 0];
   for (let i = 0; i < 3; i++) {
     const v = Number((parts[i] ?? '').trim());
-    out[i] = !Number.isFinite(v) ? 0 : v < 0 ? 0 : v > 255 ? 255 : Math.round(v);
+    out[i] = !Number.isFinite(v) ? 0 : v < 0 ? 0 : v > 63 ? 63 : Math.round(v);
   }
   return out;
 }
@@ -713,15 +714,17 @@ void main() {
  * - uDitherOn/uDitherMode: write-matrix dither (4x4 default, 2x2 alias).
  * - uPostfilter: 0 shows the quantized target directly (per-pixel expand,
  *   every pixel rewritten — never stale), then display gamma.
- * - uReconMode: 0 legacy (unconditional 2x2 box, NO subtract, NO edge gate);
- *   1 matched 2x2sub+2x2box (subtract the MODE's 2x2 pattern, edge gate);
- *   2 4x4sub+4x1 (subtract 4x4, centered [x-1,x+2] window, row gate).
+ * - uReconMode: 0 legacy (unconditional 2x2 box, NO subtract, NO substitution);
+ *   1 matched 2x2sub+2x2box (subtract the MODE's 2x2 pattern, substitute);
+ *   2 4x4sub+4x1 (subtract 4x4, centered [x-1,x+2] window, row substitute).
  *   The subtract matrix is dictated by the MODE, never by uDitherMode
  *   (voodoo matched-reinforcement rule); with dither off there is no
  *   subtract (ditherSub = null rule). Taps use absolute screen coordinates
  *   (gl_FragCoord) so tiled/banded work stays seamless.
- * - uRgbMaxDelta: per-component 2x2 spread gate (rejected pixels keep the
- *   dither-subtracted centre tap, sharp); 0,0,0 disables (= unconditional).
+ * - uRgbMaxDelta: per-component substitute-with-centre thresholds (PG §6.5.2,
+ *   6-bit 0..63); 0,0,0 disables (= unconditional box). Breaching components
+ *   are replaced with the centre tap before the box filter (per-tap deviation
+ *   from centre, not block spread).
  * - uGamma: display-stage transfer AFTER reconstruction (RAMDAC placement):
  *   pow(c, 1/gamma), the shader form of gammaLUTValue.
  * - u16bit: 0 = RGB888 debug bypass (gamma on, dither/recon off).
@@ -784,12 +787,16 @@ vec3 quantTap(ivec2 px, ivec2 size) {
   float b5 = floor(v.b / 8.0);
   return vec3(r5 * 8.0 + floor(r5 / 4.0), g6 * 4.0 + floor(g6 / 16.0), b5 * 8.0 + floor(b5 / 4.0));
 }
-bool passesGate(vec3 a, vec3 b, vec3 c, vec3 d) {
-  if (uRgbMaxDelta.r == 0.0 && uRgbMaxDelta.g == 0.0 && uRgbMaxDelta.b == 0.0) return true;
-  vec3 mn = min(min(a, b), min(c, d));
-  vec3 mx = max(max(a, b), max(c, d));
-  vec3 spread = mx - mn;
-  return spread.r <= uRgbMaxDelta.r && spread.g <= uRgbMaxDelta.g && spread.b <= uRgbMaxDelta.b;
+bool gateDisabled() {
+  return uRgbMaxDelta.r == 0.0 && uRgbMaxDelta.g == 0.0 && uRgbMaxDelta.b == 0.0;
+}
+vec3 subTap(vec3 tap, vec3 centre) {
+  vec3 d = abs(tap - centre);
+  return vec3(
+    d.r > uRgbMaxDelta.r ? centre.r : tap.r,
+    d.g > uRgbMaxDelta.g ? centre.g : tap.g,
+    d.b > uRgbMaxDelta.b ? centre.b : tap.b
+  );
 }
 vec3 reconLegacy(ivec2 px, ivec2 size) {
   vec3 a = quantTap(px, size);
@@ -812,8 +819,11 @@ vec3 recon2x2(ivec2 px, ivec2 size) {
     c = clamp(c - subOffAt(subPhase(q2, 1), 1), vec3(0.0), vec3(255.0));
     d = clamp(d - subOffAt(subPhase(q3, 1), 1), vec3(0.0), vec3(255.0));
   }
-  if (passesGate(a, b, c, d)) return floor((a + b + c + d + vec3(2.0)) / 4.0);
-  return a;
+  if (gateDisabled()) return floor((a + b + c + d + vec3(2.0)) / 4.0);
+  b = subTap(b, a);
+  c = subTap(c, a);
+  d = subTap(d, a);
+  return floor((a + b + c + d + vec3(2.0)) / 4.0);
 }
 vec3 recon4x1(ivec2 px, ivec2 size) {
   ivec2 pa = px + ivec2(-1, 0);
@@ -830,8 +840,11 @@ vec3 recon4x1(ivec2 px, ivec2 size) {
     c = clamp(c - subOffAt(subPhase(pc, 0), 0), vec3(0.0), vec3(255.0));
     d = clamp(d - subOffAt(subPhase(pd, 0), 0), vec3(0.0), vec3(255.0));
   }
-  if (passesGate(a, b, c, d)) return floor((a + b + c + d + vec3(2.0)) / 4.0);
-  return b;
+  if (gateDisabled()) return floor((a + b + c + d + vec3(2.0)) / 4.0);
+  a = subTap(a, b);
+  c = subTap(c, b);
+  d = subTap(d, b);
+  return floor((a + b + c + d + vec3(2.0)) / 4.0);
 }
 // Underwater screen warp (DIVERGENCE from ref_gl, user-requested):
 // ref_soft r_scan.c D_WarpScreen mirror in the appearance pass, applied to
@@ -903,7 +916,7 @@ export const APPEARANCE_CVAR_DOC: ReadonlyArray<CvarInterpretation> = Object.fre
   { cvar: 'vd_dithermode', kind: 'live-uniform', note: 'uDitherMode write matrix 4x4 (default) / 2x2; the scanout subtract matrix is dictated by vd_reconmode, never this.' },
   { cvar: 'vd_postfilter', kind: 'live-uniform', note: 'uPostfilter; off shows the quantized target per-pixel (never stale), then display gamma.' },
   { cvar: 'vd_reconmode', kind: 'live-uniform', note: 'uReconMode: matched 2x2sub+2x2box default; legacy = unconditional box alias; 4x4sub+4x1 centered window.' },
-  { cvar: 'vd_rgbmaxdelta', kind: 'live-uniform', note: 'uRgbMaxDelta per-component edge gate; 0,0,0 disables (= unconditional box).' },
+  { cvar: 'vd_rgbmaxdelta', kind: 'live-uniform', note: 'uRgbMaxDelta per-component substitute-with-centre thresholds (6-bit 0..63, per-tap deviation from centre); 0,0,0 disables (= unconditional box).' },
   { cvar: 'vd_16bit', kind: 'live-uniform', note: 'u16bit; =0 is the RGB888 debug bypass (gamma on, dither/reconstruction off), mirroring resolveRGB888.' },
   { cvar: 'vd_overbright', kind: 'live-uniform', note: 'uOverbright modulate x2 + clamp (clipping highlights like hardware); blanket x2 pending the gl_image audit.' },
   { cvar: 'vd_fog', kind: 'live-uniform', note: 'uFogEnabled capability gate; scene contribution (uFogAmount) is 0 in base1 — no haze expected.' },

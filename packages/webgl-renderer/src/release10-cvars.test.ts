@@ -104,12 +104,14 @@ function mirrorResolve(src: Uint8Array, w: number, h: number, ap: AppearanceFram
     const b5 = Math.floor(b / 8);
     return [r5 * 8 + Math.floor(r5 / 4), g6 * 4 + Math.floor(g6 / 16), b5 * 8 + Math.floor(b5 / 4)];
   };
-  const passesGate = (a: RGB, b: RGB, c: RGB, d: RGB): boolean => {
+  const subTapGate = (tap: RGB, centre: RGB): RGB => {
     const [dr, dg, db] = ap.rgbMaxDelta;
-    if (dr === 0 && dg === 0 && db === 0) return true;
-    const spread = (i: 0 | 1 | 2): number =>
-      Math.max(a[i], b[i], c[i], d[i]) - Math.min(a[i], b[i], c[i], d[i]);
-    return spread(0) <= dr && spread(1) <= dg && spread(2) <= db;
+    if (dr === 0 && dg === 0 && db === 0) return tap;
+    return [
+      Math.abs(tap[0] - centre[0]) > dr ? centre[0] : tap[0],
+      Math.abs(tap[1] - centre[1]) > dg ? centre[1] : tap[1],
+      Math.abs(tap[2] - centre[2]) > db ? centre[2] : tap[2],
+    ];
   };
   const sub = (q: RGB, x: number, y: number): RGB => {
     if (!ap.dither) return q; // ditherSub = null rule
@@ -135,7 +137,9 @@ function mirrorResolve(src: Uint8Array, w: number, h: number, ap: AppearanceFram
       } else if (ap.reconMode === '4x4sub+4x1') {
         const pts: Array<[number, number]> = [[x - 1, y], [x, y], [x + 1, y], [x + 2, y]];
         const qs = pts.map(([px, py]) => sub(quant(px, py), px, py));
-        col = passesGate(qs[0]!, qs[1]!, qs[2]!, qs[3]!) ? box(qs[0]!, qs[1]!, qs[2]!, qs[3]!) : qs[1]!;
+        const ctr = qs[1]!;
+        const f = [subTapGate(qs[0]!, ctr), ctr, subTapGate(qs[2]!, ctr), subTapGate(qs[3]!, ctr)];
+        col = box(f[0]!, f[1]!, f[2]!, f[3]!);
       } else {
         const qs: Array<{ q: RGB; px: number; py: number }> = [
           { q: quant(x, y), px: x, py: y },
@@ -144,7 +148,7 @@ function mirrorResolve(src: Uint8Array, w: number, h: number, ap: AppearanceFram
           { q: quant(x + 1, y + 1), px: x + 1, py: y + 1 },
         ].map((t) => ({ ...t, q: sub(t.q, t.px, t.py) }));
         const [a, b, c, d] = [qs[0]!.q, qs[1]!.q, qs[2]!.q, qs[3]!.q];
-        col = passesGate(a, b, c, d) ? box(a, b, c, d) : a;
+        col = box(a, subTapGate(b, a), subTapGate(c, a), subTapGate(d, a));
       }
       const o = (y * w + x) * 3;
       const g = gamma <= 0 || !Number.isFinite(gamma) ? 1 : 1 / gamma;

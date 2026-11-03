@@ -722,3 +722,21 @@ depends: all cards above, GPU-FOLLOW-5, GPU-FOLLOW-6
 status: cleared (was: blocked)
 done-when (still open):
 - [ ] Full `yarn verify`, `yarn deps:check`, real-asset base1, software/Node and GPU lifecycle/image/gameplay gates after integration; reconcile archive claims with user verdicts; keep GPU experimental until gates pass.
+
+---
+
+### VF-1 — rgbMaxDelta gate: per-component substitute-then-filter (BUG)
+owns: `packages/voodoo`, `packages/webgl-renderer`
+depends: none
+status: done (2026-11-03)
+done-when:
+- [x] CPU gates + GLSL gate implement per-component substitute-with-centre then filter; metric is per-tap deviation from centre, not block spread.
+- [x] Both parsers clamp to 0–63; defaults stay 8,8,8; `0,0,0` still disables.
+- [x] `scanout.rgbMaxDelta-register` profile entry restated (substitute rule, deviation metric, 6-bit range); mirrored cvar note in `appearance.ts:906` updated.
+- [x] Fail-before tests: mixed-tap block ({0,0,0,10} centre 0) filters with clamped component; >63 parses clamp; CPU↔GLSL gate parity pin.
+lane-report:
+- New `substituteTap` / `reconstructFiltered2x2` / `reconstructFilteredRow` in `voodoo/src/resolve.ts`; `passesReconstructionThreshold[Row]` now per-tap deviation from centre (p00 / p1); parsers clamp 0..63 per PG §6.5.2 6-bit fields.
+- GLSL `FS_APPEARANCE`: `passesGate` replaced by `gateDisabled` + `subTap` (abs(tap-centre) per component); recon2x2 centres on px, recon4x1 centres on pb; `0,0,0` averages raw taps.
+- Tests: `voodoo policy.test.ts` mixed-tap + 6-bit clamp pins; `webgl-renderer appearance.test.ts` GLSL-structure + parity pin; `release10-cvars.test.ts` CPU mirror updated to substitute.
+- Also fixed pre-existing typecheck break: `button-anim.test.ts` `RefDef` import moved from `@q2/sw-renderer` to `@q2/renderer-api`.
+- Evidence: `turbo run build typecheck lint test --filter=@q2/voodoo --filter=@q2/webgl-renderer --force` 15/15 green (21 webgl-renderer files, 208 passed). Full `yarn verify` still has a flaky `testkit gpu-browser` timeout under load (passes in isolation) + the now-fixed typecheck; scoped gate is the card gate. Changeset `.changeset/vf-1-rgbmaxdelta-substitute.md`. No bench row: pure-policy helpers (zero-alloc) + GLSL ALU delta negligible; no frame-loop path changed.

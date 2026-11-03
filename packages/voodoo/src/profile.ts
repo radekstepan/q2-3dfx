@@ -71,9 +71,9 @@ export const VOODOO_APPROX_PROFILE: ReadonlyArray<Readonly<ApproxEntry>> = Objec
   }),
   Object.freeze({
     setting: 'scanout.rgbMaxDelta-register',
-    value: 'per-component rejection thresholds; rejected pixels keep the centre tap sharp',
+    value: 'per-component substitute-with-centre then filter; metric is per-tap deviation from centre; 6-bit fields 0..63 (PG §6.5.2 bits 21:16/13:8/5:0)',
     source: 'manual:vidProcCfg',
-    note: 'rgbMaxDelta gate + keep-centre rule follow vidProcCfg; exact tap weights uncalibrated.',
+    note: 'rgbMaxDelta gate substitutes a breaching component with the centre tap before the box filter; exact MiniGL programming uncalibrated.',
   }),
   Object.freeze({
     setting: 'scanout.rgbMaxDelta-values',

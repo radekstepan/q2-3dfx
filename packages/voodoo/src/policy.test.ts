@@ -29,7 +29,10 @@ import {
   quantiseDepthFrame,
   quantiseRGB565,
   readVoodooState,
+  reconstructFiltered2x2,
+  reconstructFilteredRow,
   shadePixel,
+  substituteTap,
   testAndWriteDepth16,
 } from './index.js';
 
@@ -207,13 +210,42 @@ describe('quantiseDepth', () => {
 describe('reconstruction threshold gates (vidProcCfg/rgbMaxDelta)', () => {
   const GATE = { r: 8, g: 8, b: 8 };
   const OFF = { r: 0, g: 0, b: 0 };
-  it('zero disables, nonzero rejects per channel', () => {
+  it('zero disables, nonzero rejects per-tap deviation from centre', () => {
     expect(passesReconstructionThreshold(0xff000000, 0xffffffff, 0xff000000, 0xffffffff, OFF)).toBe(true);
     expect(passesReconstructionThreshold(0xff000000, 0xffffffff, 0xff000000, 0xffffffff, GATE)).toBe(false);
     expect(passesReconstructionThreshold(0xff005000, 0xff005500, 0xff005000, 0xff005500, GATE)).toBe(true);
     expect(passesReconstructionThresholdRow(0xff000000, 0xff000000, 0xffffffff, 0xff000000, OFF)).toBe(true);
     expect(passesReconstructionThresholdRow(0xff000000, 0xff000000, 0xffffffff, 0xff000000, GATE)).toBe(false);
     expect(passesReconstructionThresholdRow(0xff005000, 0xff005500, 0xff005000, 0xff005500, GATE)).toBe(true);
+  });
+  it('mixed-tap block filters with the breaching component clamped to centre', () => {
+    // Taps {0,0,0,10} with centre 0 (R channel): deviation 10 > 8, so the
+    // outlier's R substitutes to 0, then the box averages (0+0+0+0)/4 = 0.
+    // All other channels are flat 0. This is the VF-1 fail-before vector:
+    // hardware filters with one clamped component, it does NOT keep the
+    // block sharp.
+    const c0 = (0xff000000 | (0 << 16) | (0 << 8) | 0) >>> 0;
+    const c10 = (0xff000000 | (0 << 16) | (0 << 8) | 10) >>> 0;
+    expect(passesReconstructionThreshold(c0, c0, c0, c10, GATE)).toBe(false);
+    expect(reconstructFiltered2x2(c0, c0, c0, c10, GATE)).toBe(c0);
+    // substituteTap clamps only the breaching channel.
+    const centre = (0xff000000 | (50 << 16) | (50 << 8) | 50) >>> 0;
+    const outlier = (0xff000000 | (50 << 16) | (50 << 8) | 61) >>> 0; // R +11
+    const clamped = substituteTap(outlier, centre, GATE);
+    expect(clamped & 255).toBe(50);
+    expect(((clamped >> 8) & 255)).toBe(50);
+    expect(((clamped >> 16) & 255)).toBe(50);
+    // Within threshold keeps the tap.
+    const near = (0xff000000 | (50 << 16) | (50 << 8) | 55) >>> 0; // R +5
+    expect(substituteTap(near, centre, GATE)).toBe(near);
+    // Row variant: centre is p1.
+    expect(reconstructFilteredRow(c0, c0, c0, c10, GATE)).toBe(c0);
+  });
+  it('parses 6-bit fields: >63 clamps to 63, 0,0,0 still disables', () => {
+    expect(parseRgbMaxDelta('300,-5,8')).toEqual({ r: 63, g: 0, b: 8 });
+    expect(parseRgbMaxDelta('64,64,64')).toEqual({ r: 63, g: 63, b: 63 });
+    expect(parseRgbMaxDelta('100,100,100')).toEqual({ r: 63, g: 63, b: 63 });
+    expect(parseRgbMaxDelta('0,0,0')).toEqual({ r: 0, g: 0, b: 0 });
   });
 });
 
@@ -282,7 +314,7 @@ describe('profile cvar parsing', () => {
     expect(parseRgbMaxDelta('0,0,0')).toEqual({ r: 0, g: 0, b: 0 });
     expect(parseRgbMaxDelta('junk')).toEqual({ r: 0, g: 0, b: 0 });
     expect(parseRgbMaxDelta('8,4')).toEqual({ r: 8, g: 4, b: 0 });
-    expect(parseRgbMaxDelta('300,-5,8')).toEqual({ r: 255, g: 0, b: 8 });
+    expect(parseRgbMaxDelta('300,-5,8')).toEqual({ r: 63, g: 0, b: 8 });
   });
   it('defaults are the matched hardware-correct profile (2x2sub+2x2box, 8,8,8)', () => {
     expect(parseReconMode('')).toBe('2x2sub+2x2box');
